@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Syntax check
+        run: python -m compileall -q termdeck tests
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: CLI smoke
+        run: |
+          python -m termdeck templates codex
+          python -m termdeck workspace-plan --sample > /tmp/termdeck.workspace.json
+          python -m termdeck workspace-plan /tmp/termdeck.workspace.json
+          python -m termdeck palette master --db :memory:
+          python -m termdeck sessions --db :memory:

@@ -1,0 +1,35 @@
+{
+  "name": "sample-dev-workspace",
+  "windows": [
+    {
+      "tabs": [
+        {
+          "command": "{shell}",
+          "name": "shell",
+          "tag": "default"
+        },
+        {
+          "command": "python3 -m http.server 8000",
+          "name": "api",
+          "tag": "dev"
+        },
+        {
+          "command": "pytest",
+          "name": "tests",
+          "tag": "tests"
+        }
+      ],
+      "title": "Development"
+    },
+    {
+      "tabs": [
+        {
+          "command": "codex",
+          "name": "codex",
+          "tag": "ai"
+        }
+      ],
+      "title": "Agents"
+    }
+  ]
+}

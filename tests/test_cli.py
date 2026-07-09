@@ -1,0 +1,771 @@
+import argparse
+import contextlib
+import io
+import json
+import pathlib
+import unittest
+
+from termdeck.cli import _select_records, build_parser, cmd_activity, cmd_archive, cmd_budget_plan, cmd_capture, cmd_control_plan, cmd_diagnostics, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_project_detect, cmd_project_init, cmd_reconcile, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_templates, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
+
+
+class CliTests(unittest.TestCase):
+    def test_parser_has_single_templates_subcommand(self):
+        parser = build_parser()
+        subparsers = [action for action in parser._actions if isinstance(action, argparse._SubParsersAction)]
+        self.assertEqual(len(subparsers), 1)
+        choices = sorted(subparsers[0].choices)
+        self.assertEqual(choices, ['activity', 'adopt-tmux', 'archive', 'budget-plan', 'capture', 'control-plan', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-desktop', 'kill', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'project-detect', 'project-init', 'quickstart', 'recently-closed', 'reconcile', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'templates', 'terminator-workspace', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
+
+
+    def test_shortcuts_command_outputs_json_with_terminator_override(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = pathlib.Path(tmp) / "terminator.conf"
+            cfg.write_text("""[keybindings]
+  new_tab = <Alt>t
+[profiles]
+  [[default]]
+    font = Monospace 12
+""", encoding="utf-8")
+            args = argparse.Namespace(path=cfg, terminator_profile="default", profile="browser", no_terminator=False, json=True)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_shortcuts(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload["action"], "shortcuts")
+            self.assertTrue(any(row["source"] == "terminator" and row["accelerator"] == "<Alt>t" for row in payload["shortcuts"]))
+
+    def test_templates_command_outputs_filtered_json(self):
+        args = argparse.Namespace(query="codex")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cmd_templates(args)
+        self.assertEqual(code, 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["id"], "codex")
+        self.assertIn("available", payload[0])
+
+
+    def test_terminator_workspace_outputs_recipe_json(self):
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "terminator.conf"
+            config_path.write_text("""
+[layouts]
+  [[default]]
+    [[[window0]]]
+      type = Window
+      title = Agents
+    [[[terminal0]]]
+      type = Terminal
+      parent = window0
+      title = codex
+      custom_command = codex
+      use_custom_command = True
+""", encoding="utf-8")
+            args = argparse.Namespace(path=config_path, layout="default", list_layouts=False, output=None)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_terminator_workspace(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload["name"], "terminator-default")
+            self.assertEqual(payload["windows"][0]["title"], "Agents")
+            self.assertEqual(payload["windows"][0]["tabs"][0]["command"], "codex")
+
+    def test_project_detect_outputs_recipe_for_current_directory(self):
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text('{"scripts":{"dev":"vite"}}', encoding="utf-8")
+            args = argparse.Namespace(path=root, include_ai=False, recipe=True)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_project_detect(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            commands = [tab["command"] for window in payload["windows"] for tab in window["tabs"]]
+            self.assertIn("npm run dev", commands)
+
+    def test_project_init_writes_recipe_and_refuses_overwrite_without_force(self):
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "termdeck.workspace.json"
+            args = argparse.Namespace(path=root, include_ai=True, output=output, force=False)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_project_init(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertTrue(output.exists())
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_project_init(args)
+            self.assertEqual(code, 2)
+            payload = json.loads(buffer.getvalue())
+            self.assertFalse(payload["ok"])
+
+
+    def test_tasks_command_outputs_master_snapshot_json(self):
+        from pathlib import Path
+        import os
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                record = store.create("codex-one", "ai", "codex", tmp, window_id="win-1", window_title="Agents", tab_index=0)
+                store.update(record.id, status="running", last_pid=os.getpid())
+            finally:
+                store.close()
+
+            args = argparse.Namespace(db=db_path, all=False, visible_only=False, running_only=False, tag=None, query="codex", json=True, sort="name")
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_tasks(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(len(payload), 1)
+            self.assertEqual(payload[0]["name"], "codex-one")
+            self.assertEqual(payload[0]["window"], "Agents")
+            self.assertEqual(payload[0]["focus_key"], "Alt+1")
+            self.assertEqual(payload[0]["pause_key"], "Ctrl+Alt+1")
+
+
+    def test_activity_command_outputs_headless_capture_classification(self):
+        from pathlib import Path
+        import tempfile
+        from unittest import mock
+        from termdeck.session_store import SessionStore
+
+        class FakeBackend:
+            def capture(self, record, lines=80):
+                return "Approve command? (yes/no)\nOPENAI_API_KEY=sk-proj-1234567890abcdefghijk\n"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                store.create("codex-one", "ai", "codex", tmp, window_id="win-1", window_title="Agents", tab_index=0)
+            finally:
+                store.close()
+
+            args = argparse.Namespace(db=db_path, all=False, visible_only=False, running_only=False, tag=None, query="input", json=True, sort="severity", lines=80, raw=False)
+            buffer = io.StringIO()
+            with mock.patch("termdeck.cli.TmuxBackend", return_value=FakeBackend()):
+                with contextlib.redirect_stdout(buffer):
+                    code = cmd_activity(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload[0]["state"], "needs input")
+            self.assertTrue(payload[0]["redacted"])
+            self.assertNotIn("sk-proj-1234567890abcdefghijk", payload[0]["preview"])
+
+
+    def test_new_command_remembers_template_without_starting_tmux(self):
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            args = argparse.Namespace(
+                db=db_path,
+                target="codex",
+                template=None,
+                command_text=None,
+                name="agent-one",
+                tag=None,
+                cwd=Path(tmp),
+                window_id="win-ai",
+                window_title="Agents",
+                tab_index=None,
+                hidden=False,
+                no_start=True,
+            )
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_new(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["action"], "new")
+            session = payload["sessions"][0]
+            self.assertEqual(session["name"], "agent-one")
+            self.assertEqual(session["tag"], "ai")
+            self.assertEqual(session["command"], "codex")
+            self.assertEqual(session["window_title"], "Agents")
+            self.assertEqual(session["tab_index"], 0)
+            self.assertFalse(session["started"])
+
+
+    def test_windows_command_outputs_aggregate_json(self):
+        from pathlib import Path
+        import os
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                first = store.create("api", "dev", "python3 -m http.server", tmp, window_id="win-dev", window_title="Dev", tab_index=0)
+                second = store.create("codex", "ai", "codex", tmp, window_id="win-agents", window_title="Agents", tab_index=0)
+                store.update(first.id, status="running", last_pid=os.getpid())
+                store.update(second.id, status="new", last_pid=None)
+            finally:
+                store.close()
+
+            args = argparse.Namespace(db=db_path, all=False, visible_only=False, running_only=False, tag=None, query="", json=True, sort="title")
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_windows(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual([row["title"] for row in payload], ["Agents", "Dev"])
+            self.assertEqual(payload[0]["tab_count"], 1)
+            self.assertIn("cpu_percent", payload[1])
+            self.assertIn("state_summary", payload[1])
+
+    def test_diagnostics_command_outputs_json_and_zip_bundle(self):
+        from pathlib import Path
+        import tempfile
+        import zipfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                store.create("api", "dev", "python3 -m http.server", tmp, window_id="dev", window_title="Dev", tab_index=0)
+            finally:
+                store.close()
+
+            args = argparse.Namespace(db=db_path, config=None, output=None)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_diagnostics(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload["schema"], "termdeck.diagnostics")
+            self.assertEqual(payload["sessions"]["counts"]["total"], 1)
+            self.assertFalse(payload["privacy"]["captures_included"])
+
+            out_path = Path(tmp) / "termdeck-diagnostics.zip"
+            zip_args = argparse.Namespace(db=db_path, config=None, output=out_path)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_diagnostics(zip_args)
+            self.assertEqual(code, 0)
+            bundle = json.loads(buffer.getvalue())
+            self.assertTrue(bundle["ok"])
+            self.assertTrue(out_path.exists())
+            with zipfile.ZipFile(out_path) as archive:
+                self.assertIn("diagnostics.json", archive.namelist())
+                self.assertIn("tasks.json", archive.namelist())
+
+    def test_settings_sample_outputs_loadable_json(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cmd_settings_sample(argparse.Namespace())
+        self.assertEqual(code, 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertIn("health", payload)
+        self.assertIn("tags", payload)
+
+
+    def test_reconcile_command_repairs_stale_running_session_json(self):
+        from pathlib import Path
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                record = store.create("codex-one", "ai", "codex", tmp)
+                store.update(record.id, status="running", last_pid=999, visible=True)
+            finally:
+                store.close()
+
+            args = argparse.Namespace(db=db_path, tag=None, all=False, dry_run=False, keep_visible=False)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_reconcile(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload["action"], "reconcile")
+            self.assertEqual(payload["changed"], 1)
+            self.assertEqual(payload["sessions"][0]["after_status"], "stopped")
+            self.assertFalse(payload["sessions"][0]["after_visible"])
+
+            store = SessionStore(db_path)
+            try:
+                refreshed = store.get(record.id)
+                self.assertEqual(refreshed.status, "stopped")  # type: ignore[union-attr]
+                self.assertFalse(refreshed.visible)  # type: ignore[union-attr]
+            finally:
+                store.close()
+
+    def test_health_command_outputs_empty_json_for_empty_db(self):
+        args = argparse.Namespace(db=":memory:", all=False, json=True)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cmd_health(args)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(buffer.getvalue()), [])
+
+    def test_palette_command_outputs_actions(self):
+        args = argparse.Namespace(query="master", db=":memory:", all=False, limit=50)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cmd_palette(args)
+        self.assertEqual(code, 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertEqual(payload[0]["id"], "builtin:master")
+        self.assertEqual(payload[0]["kind"], "builtin")
+
+
+    def test_workspace_export_outputs_recipe_from_session_db(self):
+        from pathlib import Path
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                store.create("api", "dev", "python3 -m http.server", tmp, window_id="win-1", window_title="Dev", tab_index=0)
+            finally:
+                store.close()
+            args = argparse.Namespace(db=db_path, name="demo", tag=None, visible_only=False, running_only=False, all=False, output=None)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_workspace_export(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload["name"], "demo")
+            self.assertEqual(payload["windows"][0]["title"], "Dev")
+            self.assertEqual(payload["windows"][0]["tabs"][0]["name"], "api")
+
+
+    def test_workspace_open_no_start_materialises_recipe_json(self):
+        from pathlib import Path
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            recipe_path = Path(tmp) / "workspace.json"
+            recipe_path.write_text(
+                json.dumps({
+                    "name": "demo",
+                    "windows": [
+                        {"title": "Dev", "tabs": [
+                            {"name": "api", "tag": "dev", "command": "python3 -m http.server", "cwd": "."},
+                            {"name": "tests", "tag": "tests", "command": "pytest", "cwd": "."},
+                        ]}
+                    ],
+                }),
+                encoding="utf-8",
+            )
+            db_path = Path(tmp) / "sessions.sqlite3"
+            args = argparse.Namespace(path=recipe_path, db=db_path, no_start=True, dry_run=False, no_reuse=False)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_workspace_open(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload["action"], "workspace-open")
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["count"], 2)
+            self.assertFalse(payload["start"])
+
+            store = SessionStore(db_path)
+            try:
+                rows = store.list(include_archived=True)
+                self.assertEqual(len(rows), 2)
+                self.assertEqual({row.window_title for row in rows}, {"Dev"})
+                self.assertEqual([row.status for row in rows], ["new", "new"])
+            finally:
+                store.close()
+
+    def test_workspace_open_dry_run_does_not_write_session_db(self):
+        from pathlib import Path
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            recipe_path = Path(tmp) / "workspace.json"
+            recipe_path.write_text('{"name":"dry","tabs":[{"name":"shell","command":"{shell}"}]}', encoding="utf-8")
+            db_path = Path(tmp) / "sessions.sqlite3"
+            args = argparse.Namespace(path=recipe_path, db=db_path, no_start=True, dry_run=True, no_reuse=False)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_workspace_open(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertTrue(payload["dry_run"])
+            self.assertEqual(payload["sessions"][0]["status"], "planned-register")
+
+            store = SessionStore(db_path)
+            try:
+                self.assertEqual(store.list(include_archived=True), [])
+            finally:
+                store.close()
+
+    def test_workspace_plan_sample_outputs_recipe_json(self):
+        args = argparse.Namespace(sample=True, path=None)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cmd_workspace_plan(args)
+        self.assertEqual(code, 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertIn("windows", payload)
+
+    def test_select_records_targets_by_tag_name_and_prefix(self):
+        from pathlib import Path
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                first = store.create("codex-one", "ai", "codex", tmp)
+                second = store.create("pytest", "tests", "pytest", tmp)
+                selected = _select_records(store, [first.id[:6], "tests"])
+                self.assertEqual({record.id for record in selected}, {first.id, second.id})
+            finally:
+                store.close()
+
+    def test_control_plan_command_outputs_safety_json(self):
+        from pathlib import Path
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                store.create("codex-one", "ai", "codex", tmp)
+                store.create("codex-two", "ai", "codex", tmp)
+            finally:
+                store.close()
+            args = argparse.Namespace(db=db_path, action="send", selectors=[], tag="ai", all=False, text="status", no_enter=False)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_control_plan(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload["action"], "send")
+            self.assertEqual(payload["count"], 2)
+            self.assertTrue(payload["requires_confirmation"])
+            self.assertEqual(payload["risk"], "high")
+
+    def test_bulk_send_without_yes_returns_plan_instead_of_executing(self):
+        from pathlib import Path
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                store.create("codex-one", "ai", "codex", tmp)
+                store.create("codex-two", "ai", "codex", tmp)
+            finally:
+                store.close()
+            args = argparse.Namespace(db=db_path, selectors=[], tag="ai", all=False, text=["status"], no_enter=False, dry_run=False, yes=False)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_send(args)
+            self.assertEqual(code, 2)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload["action"], "send")
+            self.assertTrue(payload["requires_confirmation"])
+
+
+
+    def test_budget_plan_sample_and_json_outputs(self):
+        from pathlib import Path
+        import os
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        sample_args = argparse.Namespace(sample=True, path=None)
+        sample_buffer = io.StringIO()
+        with contextlib.redirect_stdout(sample_buffer):
+            sample_code = cmd_budget_plan(sample_args)
+        self.assertEqual(sample_code, 0)
+        self.assertIn("budgets", json.loads(sample_buffer.getvalue()))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            budget_path = Path(tmp) / "budgets.json"
+            budget_path.write_text(json.dumps({"budgets": [{"name": "tight-ai", "tag": "ai", "max_memory": "1B", "action": "inspect"}]}), encoding="utf-8")
+            store = SessionStore(db_path)
+            try:
+                row = store.create("codex-one", "ai", "codex", tmp)
+                store.update(row.id, status="running", last_pid=os.getpid())
+            finally:
+                store.close()
+            args = argparse.Namespace(path=budget_path, sample=False, db=db_path, tag=None, visible_only=False, running_only=False, all=False, violations_only=True, json=True)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_budget_plan(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload["action"], "budget-plan")
+            self.assertEqual(payload["count"], 1)
+            self.assertTrue(payload["sessions"][0]["over_budget"])
+            self.assertEqual(payload["sessions"][0]["budget"]["name"], "tight-ai")
+
+    def test_pause_over_budget_requires_confirmation_before_execution(self):
+        from pathlib import Path
+        import os
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            budget_path = Path(tmp) / "budgets.json"
+            budget_path.write_text(json.dumps({"budgets": [{"name": "scratch-limit", "tag": "scratch", "max_memory": "1B", "action": "pause"}]}), encoding="utf-8")
+            store = SessionStore(db_path)
+            try:
+                row = store.create("runaway", "scratch", "python loop.py", tmp)
+                store.update(row.id, status="running", last_pid=os.getpid())
+            finally:
+                store.close()
+            args = argparse.Namespace(path=budget_path, db=db_path, tag="scratch", visible_only=False, running_only=False, all=False, dry_run=False, yes=False)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_pause_over_budget(args)
+            self.assertEqual(code, 2)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload["action"], "pause-over-budget")
+            self.assertTrue(payload["requires_confirmation"])
+            self.assertIn("budget_reasons", payload)
+
+    def test_capture_redacts_secret_like_output_by_default(self):
+        from pathlib import Path
+        import tempfile
+        from unittest.mock import patch
+        from termdeck.session_store import SessionStore
+
+        class FakeBackend:
+            def capture(self, record, lines=120):
+                return "Authorization: Bearer abcdefghijklmnopqrstuvwxyz\napi_key=sk_test_1234567890abcdef"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                record = store.create("codex-one", "ai", "codex", tmp)
+            finally:
+                store.close()
+
+            args = argparse.Namespace(db=db_path, selectors=[record.id], tag=None, all=False, lines=120, redact=False, raw=False)
+            buffer = io.StringIO()
+            with patch("termdeck.cli.TmuxBackend", lambda: FakeBackend()):
+                with contextlib.redirect_stdout(buffer):
+                    code = cmd_capture(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertTrue(payload[0]["redacted"])
+            self.assertTrue({"Authorization header", "Bearer token"} & set(payload[0]["redaction_labels"]))
+            self.assertNotIn("abcdefghijklmnopqrstuvwxyz", payload[0]["capture"])
+            self.assertNotIn("sk_test_1234567890abcdef", payload[0]["capture"])
+
+    def test_lifecycle_cli_renames_retags_hides_shows_moves_and_archives(self):
+        from pathlib import Path
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                record = store.create("codex-one", "ai", "codex", tmp, window_id="agents", window_title="Agents", tab_index=0)
+                second = store.create("pytest", "tests", "pytest", tmp, window_id="agents", window_title="Agents", tab_index=1)
+            finally:
+                store.close()
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_rename(argparse.Namespace(db=db_path, selector=record.id, name="codex-main"))
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(buffer.getvalue())["sessions"][0]["name"], "codex-main")
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_retag(argparse.Namespace(db=db_path, new_tag="bugbounty", selectors=[record.id], tag=None, all=False))
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(buffer.getvalue())["sessions"][0]["tag"], "bugbounty")
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_hide(argparse.Namespace(db=db_path, selectors=[record.id], tag=None, all=False))
+            self.assertEqual(code, 0)
+            self.assertFalse(json.loads(buffer.getvalue())["sessions"][0]["visible"])
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_show(argparse.Namespace(db=db_path, selectors=[record.id], tag=None, all=False, window_id="visible", window_title="Visible", tab_index=None))
+            self.assertEqual(code, 0)
+            shown = json.loads(buffer.getvalue())["sessions"][0]
+            self.assertTrue(shown["visible"])
+            self.assertEqual(shown["window_title"], "Visible")
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_move(argparse.Namespace(db=db_path, selectors=[record.id, second.id], tag=None, all=False, window_id="ops", window_title="Ops", tab_index=4, hidden=False))
+            self.assertEqual(code, 0)
+            moved = json.loads(buffer.getvalue())["sessions"]
+            self.assertEqual([row["tab_index"] for row in moved], [0, 1])
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_archive(argparse.Namespace(db=db_path, selectors=[record.id], tag=None, all=False))
+            self.assertEqual(code, 0)
+            archived = json.loads(buffer.getvalue())["sessions"][0]
+            self.assertEqual(archived["status"], "archived")
+            self.assertFalse(archived["visible"])
+
+    def test_pin_cli_front_loads_and_protects_kill(self):
+        from pathlib import Path
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                shell = store.create("shell", "dev", "bash", tmp, window_id="main", window_title="Main", tab_index=0)
+                agent = store.create("agent", "ai", "codex", tmp, window_id="main", window_title="Main", tab_index=1)
+            finally:
+                store.close()
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_pin(argparse.Namespace(db=db_path, selectors=[agent.id], tag=None, all=False))
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertTrue(payload["sessions"][0]["pinned"])
+
+            store = SessionStore(db_path)
+            try:
+                visible = store.list(visible_only=True, window_id="main")
+                self.assertEqual([record.id for record in visible], [agent.id, shell.id])
+            finally:
+                store.close()
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_kill(argparse.Namespace(db=db_path, selectors=[agent.id], tag=None, all=False, dry_run=False, yes=True, include_pinned=False))
+            self.assertEqual(code, 1)
+            protected = json.loads(buffer.getvalue())["sessions"][0]
+            self.assertFalse(protected["ok"])
+            self.assertTrue(protected["pinned"])
+            self.assertIn("protected", protected["detail"])
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_unpin(argparse.Namespace(db=db_path, selectors=[agent.id], tag=None, all=False))
+            self.assertEqual(code, 0)
+            self.assertFalse(json.loads(buffer.getvalue())["sessions"][0]["pinned"])
+
+    def test_recently_closed_and_reopen_closed_cli_are_browser_like(self):
+        from pathlib import Path
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                visible = store.create("shell", "dev", "bash", tmp, window_id="dev", window_title="Dev", tab_index=0)
+                hidden = store.create("codex-one", "ai", "codex", tmp, window_id="agents", window_title="Agents", tab_index=3)
+                store.update(hidden.id, visible=False, status="running", last_pid=123, last_opened_at="2026-07-09T00:00:02+00:00")
+                store.update(visible.id, last_opened_at="2026-07-09T00:00:01+00:00")
+            finally:
+                store.close()
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_recently_closed(argparse.Namespace(db=db_path, tag=None, limit=5, json=True))
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload["count"], 1)
+            self.assertEqual(payload["sessions"][0]["id"], hidden.id)
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_reopen_closed(argparse.Namespace(db=db_path, tag=None, limit=1, window_id="main", window_title="Main"))
+            self.assertEqual(code, 0)
+            reopened = json.loads(buffer.getvalue())["sessions"][0]
+            self.assertEqual(reopened["action"], "reopen-closed")
+            self.assertTrue(reopened["visible"])
+            self.assertEqual(reopened["window_title"], "Main")
+            self.assertEqual(reopened["status"], "running")
+
+    def test_search_command_finds_metadata_and_redacted_output(self):
+        from pathlib import Path
+        import tempfile
+        from unittest.mock import patch
+        from termdeck.session_store import SessionStore
+
+        class FakeBackend:
+            def capture(self, record, lines=120):
+                return "ready\nAuthorization: Bearer abcdefghijklmnopqrstuvwxyz\nagent finished status summary"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                store.create("codex-one", "ai", "codex", tmp, window_id="agents", window_title="Agents", tab_index=0)
+            finally:
+                store.close()
+
+            args = argparse.Namespace(
+                db=db_path,
+                query="status summary",
+                tag=None,
+                visible_only=False,
+                running_only=False,
+                all=False,
+                include_output=True,
+                lines=120,
+                snippets=2,
+                limit=100,
+                raw=False,
+                json=True,
+            )
+            buffer = io.StringIO()
+            with patch("termdeck.cli.TmuxBackend", lambda: FakeBackend()):
+                with contextlib.redirect_stdout(buffer):
+                    code = cmd_search(args)
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload["schema"], "termdeck.session-search")
+            self.assertEqual(payload["count"], 1)
+            match = payload["matches"][0]
+            self.assertEqual(match["name"], "codex-one")
+            self.assertEqual(match["output_match_count"], 1)
+            self.assertNotIn("abcdefghijklmnopqrstuvwxyz", json.dumps(payload))
+            self.assertTrue(match["redacted"])
+
+
+
+if __name__ == "__main__":
+    unittest.main()

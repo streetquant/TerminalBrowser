@@ -1,0 +1,37 @@
+{
+  "appearance": {
+    "chrome_theme": "dark",
+    "density": "comfortable",
+    "focus_mode": false,
+    "ui_font": "Sans 11",
+    "ui_font_scale": 1.0,
+    "terminal_palette": "catppuccin",
+    "terminal": {
+      "font": "Monospace 13",
+      "use_system_font": false,
+      "cursor_shape": "block",
+      "cursor_color": "#cdd6f4",
+      "scrollback_lines": 10000
+    }
+  },
+  "health": {
+    "critical_cpu_percent": 300,
+    "critical_memory": "4GiB",
+    "high_cpu_percent": 150,
+    "high_memory": "2GiB",
+    "process_count_warn": 48
+  },
+  "keyboard": {
+    "import_terminator_keybindings": true,
+    "profile": "browser"
+  },
+  "tags": {
+    "ai": {
+      "critical_cpu_percent": 500,
+      "critical_memory": "10GiB",
+      "high_cpu_percent": 250,
+      "high_memory": "6GiB",
+      "process_count_warn": 128
+    }
+  }
+}

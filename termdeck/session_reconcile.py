@@ -1,0 +1,224 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable, Protocol
+
+from .models import ResourceSnapshot, SessionRecord
+from .resources import ResourceSampler
+from .session_store import SessionStore, utc_now
+from .tmux_backend import TmuxBackend, TmuxError
+
+
+class BackendLike(Protocol):
+    def session_exists(self, record: SessionRecord) -> bool: ...
+    def pane_pid(self, record: SessionRecord) -> int | None: ...
+
+
+class SamplerLike(Protocol):
+    def snapshot(self, root_pid: int | None) -> ResourceSnapshot: ...
+
+
+@dataclass(frozen=True)
+class ReconcileRow:
+    """One registry repair decision for a browser-like terminal task."""
+
+    id: str
+    name: str
+    tag: str
+    window_id: str
+    window_title: str
+    before_status: str
+    after_status: str
+    before_visible: bool
+    after_visible: bool
+    before_pid: int | None
+    after_pid: int | None
+    live_session: bool
+    live_process: bool
+    changed: bool
+    planned: bool
+    detail: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "tag": self.tag,
+            "window_id": self.window_id,
+            "window_title": self.window_title,
+            "before_status": self.before_status,
+            "after_status": self.after_status,
+            "before_visible": self.before_visible,
+            "after_visible": self.after_visible,
+            "before_pid": self.before_pid,
+            "after_pid": self.after_pid,
+            "live_session": self.live_session,
+            "live_process": self.live_process,
+            "changed": self.changed,
+            "planned": self.planned,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    dry_run: bool
+    count: int
+    changed: int
+    rows: tuple[ReconcileRow, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "action": "reconcile",
+            "ok": True,
+            "dry_run": self.dry_run,
+            "count": self.count,
+            "changed": self.changed,
+            "sessions": [row.as_dict() for row in self.rows],
+        }
+
+
+def _observe_record(record: SessionRecord, backend: BackendLike, sampler: SamplerLike) -> tuple[bool, int | None, ResourceSnapshot]:
+    try:
+        live_session = backend.session_exists(record)
+    except TmuxError:
+        live_session = False
+    if not live_session:
+        return False, None, sampler.snapshot(None)
+    try:
+        pid = backend.pane_pid(record)
+    except TmuxError:
+        pid = None
+    return True, pid, sampler.snapshot(pid)
+
+
+def _desired_state(
+    record: SessionRecord,
+    *,
+    live_session: bool,
+    pid: int | None,
+    snapshot: ResourceSnapshot,
+    hide_missing: bool,
+) -> tuple[str, bool, int | None, str]:
+    before = record.status.casefold()
+    visible = bool(record.visible)
+
+    if before == "archived":
+        return record.status, visible, record.last_pid, "archived record skipped"
+
+    if live_session and snapshot.exists:
+        status = "paused" if snapshot.state == "T" else "running"
+        return status, visible, pid, "live session observed"
+
+    if live_session and pid is not None and not snapshot.exists:
+        return "missing", visible, pid, "backend reported a pane pid but the process was not found"
+
+    if live_session and pid is None:
+        status = "missing" if before not in {"new", "stopped"} else before
+        return status, visible, None, "live session exists but no pane pid was found"
+
+    if before == "new":
+        return "new", visible, None, "not started yet"
+
+    if before == "stopped":
+        return "stopped", visible, None, "already stopped"
+
+    # Browser-like recovery rule: if a remembered running/paused tab has lost
+    # its hidden backend session, do not leave it looking restorable.
+    after_visible = False if hide_missing else visible
+    return "stopped", after_visible, None, "missing backend session marked stopped"
+
+
+def reconcile_records(
+    records: Iterable[SessionRecord],
+    *,
+    store: SessionStore | None = None,
+    backend: BackendLike | None = None,
+    sampler: SamplerLike | None = None,
+    dry_run: bool = False,
+    hide_missing: bool = True,
+) -> ReconcileResult:
+    """Repair stale remembered session state against the hidden backend.
+
+    TermDeck's browser registry may survive longer than the actual tmux/process
+    tree.  This function reconciles the registry with the live backend before a
+    restore or when the user asks for a CLI health repair. It never starts new
+    processes and it never exposes backend commands.
+    """
+
+    backend = backend or TmuxBackend()
+    sampler = sampler or ResourceSampler()
+    rows: list[ReconcileRow] = []
+
+    for record in records:
+        live_session, pid, snapshot = _observe_record(record, backend, sampler)
+        after_status, after_visible, after_pid, detail = _desired_state(
+            record,
+            live_session=live_session,
+            pid=pid,
+            snapshot=snapshot,
+            hide_missing=hide_missing,
+        )
+        changed = (
+            after_status != record.status
+            or after_visible != record.visible
+            or after_pid != record.last_pid
+        )
+        if changed and store is not None and not dry_run:
+            store.update(
+                record.id,
+                status=after_status,
+                visible=after_visible,
+                last_pid=after_pid,
+                last_opened_at=utc_now(),
+            )
+        rows.append(
+            ReconcileRow(
+                id=record.id,
+                name=record.name,
+                tag=record.tag,
+                window_id=record.window_id,
+                window_title=record.window_title,
+                before_status=record.status,
+                after_status=after_status,
+                before_visible=record.visible,
+                after_visible=after_visible,
+                before_pid=record.last_pid,
+                after_pid=after_pid,
+                live_session=live_session,
+                live_process=bool(snapshot.exists),
+                changed=changed,
+                planned=dry_run,
+                detail=detail,
+            )
+        )
+
+    return ReconcileResult(
+        dry_run=dry_run,
+        count=len(rows),
+        changed=sum(1 for row in rows if row.changed),
+        rows=tuple(rows),
+    )
+
+
+def reconcile_store(
+    store: SessionStore,
+    *,
+    backend: BackendLike | None = None,
+    sampler: SamplerLike | None = None,
+    dry_run: bool = False,
+    hide_missing: bool = True,
+    include_archived: bool = False,
+    tag: str | None = None,
+) -> ReconcileResult:
+    records = store.list(include_archived=include_archived)
+    if tag:
+        records = [record for record in records if record.tag == tag]
+    return reconcile_records(
+        records,
+        store=store,
+        backend=backend,
+        sampler=sampler,
+        dry_run=dry_run,
+        hide_missing=hide_missing,
+    )

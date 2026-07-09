@@ -1,0 +1,28 @@
+{
+  "budgets": [
+    {
+      "name": "default",
+      "tag": "*",
+      "max_cpu_percent": 300,
+      "max_memory": "4GiB",
+      "max_processes": 96,
+      "action": "inspect"
+    },
+    {
+      "name": "ai-agent",
+      "tag": "ai",
+      "max_cpu_percent": 400,
+      "max_memory": "8GiB",
+      "max_processes": 128,
+      "action": "inspect"
+    },
+    {
+      "name": "scratch-runaway-guard",
+      "tag": "scratch",
+      "max_cpu_percent": 150,
+      "max_memory": "1GiB",
+      "max_runtime": "2h",
+      "action": "pause"
+    }
+  ]
+}
