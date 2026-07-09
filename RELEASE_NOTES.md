@@ -1,5 +1,25 @@
 # Release notes
 
+## 0.1.19
+
+This build fixes the most visible interaction papercuts: selected terminal text now goes to the real system clipboard for pasting outside TermDeck, cursor blinking can be disabled, the Sessions pane can move left/right, killed tabs disappear from the Sessions pane, Ctrl-clicking tags multi-selects sessions, helper windows have explicit Close/Esc exits, and periodic UI refresh work is reduced.
+
+### Added or stabilised
+
+- System clipboard writes now use `Gtk.Clipboard.get_for_display` first, with PRIMARY and VTE copy fallbacks retained.
+- Added terminal right-click menu actions for copy, paste, paste primary, select all, and clear selection.
+- Added `appearance.terminal.cursor_blink` and a Terminal options checkbox to stop cursor blinking.
+- Added persistent `appearance.side_pane_position` plus right-click Sessions header actions to move the pane left/right.
+- Sessions pane filters out stopped/killed sessions and drops them from current multi-selection.
+- Ctrl-click on a session tag toggles that session in the multi-selection.
+- Master, search, and overview helper windows now expose explicit Close buttons and Esc close behaviour.
+- Side-pane refresh now skips unchanged rebuilds and background timers run less aggressively.
+
+### Verified
+
+- Python syntax compilation for `termdeck` and `tests`.
+- Unit test suite in the actual repository checkout.
+
 ## 0.1.18
 
 This build strengthens terminal select-to-copy behaviour. Text selected with the cursor is copied into the system clipboard and PRIMARY selection so it can be pasted into other applications immediately, while Ctrl+Shift+C remains available as an explicit fallback.

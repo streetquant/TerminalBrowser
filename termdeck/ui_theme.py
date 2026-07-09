@@ -375,6 +375,7 @@ def apply_terminal_overrides(
     use_system_font: bool | None = None,
     cursor_shape: str | None = None,
     cursor_color: str | None = None,
+    cursor_blink: bool | None = None,
     scrollback_lines: int | None = None,
 ) -> TerminalTheme:
     """Overlay minimal terminal chrome options onto a TerminalTheme.
@@ -392,6 +393,8 @@ def apply_terminal_overrides(
     if cursor_color is not None:
         colour = str(cursor_color).strip()
         updates["cursor_color"] = colour or None
+    if cursor_blink is not None:
+        updates["cursor_blink"] = bool(cursor_blink)
     if scrollback_lines is not None:
         updates["scrollback_lines"] = max(100, int(scrollback_lines))
     if not updates:

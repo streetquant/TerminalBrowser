@@ -76,6 +76,7 @@ class SettingsTests(unittest.TestCase):
                                 "font": "JetBrains Mono 14",
                                 "cursor_shape": "ibeam",
                                 "cursor_color": "#88c0d0",
+                                "cursor_blink": False,
                                 "scrollback_lines": 5000,
                                 "use_system_font": False,
                             },
@@ -88,6 +89,7 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(settings.terminal_font, "JetBrains Mono 14")
             self.assertEqual(settings.terminal_cursor_shape, "ibeam")
             self.assertEqual(settings.terminal_cursor_color, "#88c0d0")
+            self.assertFalse(settings.terminal_cursor_blink)
             self.assertEqual(settings.terminal_scrollback_lines, 5000)
             self.assertEqual(settings.terminal_palette, "nord")
             self.assertEqual(settings.ui_font, "Inter 12")
@@ -96,6 +98,7 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(themed.font, "JetBrains Mono 14")
             self.assertEqual(themed.cursor_shape, "ibeam")
             self.assertEqual(themed.cursor_color, "#88c0d0")
+            self.assertFalse(themed.cursor_blink)
             self.assertEqual(themed.scrollback_lines, 5000)
             css = build_chrome_css(
                 settings.chrome_theme,
@@ -109,7 +112,9 @@ class SettingsTests(unittest.TestCase):
                 path,
                 font="Monospace 16",
                 cursor_shape="underline",
+                cursor_blink=False,
                 scrollback_lines=8000,
+                side_pane_position="left",
                 terminal_palette="one-dark",
                 ui_font="Cantarell 11",
                 ui_font_scale=1.1,
@@ -117,7 +122,9 @@ class SettingsTests(unittest.TestCase):
             reloaded = AppSettings.load(saved)
             self.assertEqual(reloaded.terminal_font, "Monospace 16")
             self.assertEqual(reloaded.terminal_cursor_shape, "underline")
+            self.assertFalse(reloaded.terminal_cursor_blink)
             self.assertEqual(reloaded.terminal_scrollback_lines, 8000)
+            self.assertEqual(reloaded.side_pane_position, "left")
             self.assertEqual(reloaded.terminal_palette, "one-dark")
             self.assertEqual(reloaded.ui_font, "Cantarell 11")
             self.assertAlmostEqual(reloaded.ui_font_scale or 0, 1.1, places=2)

@@ -64,6 +64,20 @@ def _boolean(row: Mapping[str, Any], *names: str, default: bool) -> bool:
     return default
 
 
+def normalise_side_pane_position(value: object | None) -> str:
+    cleaned = str(value or "right").strip().lower().replace("-", "_")
+    aliases = {
+        "left": "left",
+        "start": "left",
+        "right": "right",
+        "end": "right",
+    }
+    if cleaned not in aliases:
+        raise SettingsError("appearance.side_pane_position must be left or right")
+    return aliases[cleaned]
+
+
+
 def _memory(row: Mapping[str, Any], *names: str, default: int) -> int:
     for name in names:
         if name in row and row[name] not in {None, ""}:
@@ -129,7 +143,9 @@ class AppSettings:
     terminal_use_system_font: bool | None = None
     terminal_cursor_shape: str | None = None
     terminal_cursor_color: str | None = None
+    terminal_cursor_blink: bool | None = None
     terminal_scrollback_lines: int | None = None
+    side_pane_position: str = "right"
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppSettings":
@@ -179,6 +195,9 @@ class AppSettings:
         if ui_density not in density_names():
             raise SettingsError(f"appearance.density must be one of: {', '.join(density_names())}")
         focus_mode = _boolean(appearance, "focus_mode", "focus", default=False)
+        side_pane_position = normalise_side_pane_position(
+            appearance.get("side_pane_position", appearance.get("side", appearance.get("sessions_pane", "right")))
+        )
 
         ui_font = None
         if "ui_font" in appearance and appearance.get("ui_font") not in {None, ""}:
@@ -214,6 +233,9 @@ class AppSettings:
         terminal_cursor_color = None
         if "cursor_color" in terminal and terminal.get("cursor_color") not in {None, ""}:
             terminal_cursor_color = str(terminal.get("cursor_color")).strip()
+        terminal_cursor_blink = None
+        if "cursor_blink" in terminal or "cursor_blinking" in terminal:
+            terminal_cursor_blink = _boolean(terminal, "cursor_blink", "cursor_blinking", default=True)
         terminal_scrollback_lines = None
         if "scrollback_lines" in terminal and terminal.get("scrollback_lines") not in {None, ""}:
             terminal_scrollback_lines = max(100, _integer(terminal, "scrollback_lines", default=10000))
@@ -234,7 +256,9 @@ class AppSettings:
             terminal_use_system_font=terminal_use_system_font,
             terminal_cursor_shape=terminal_cursor_shape,
             terminal_cursor_color=terminal_cursor_color,
+            terminal_cursor_blink=terminal_cursor_blink,
             terminal_scrollback_lines=terminal_scrollback_lines,
+            side_pane_position=side_pane_position,
         )
 
     def policy_for_record(self, record) -> HealthPolicy:
@@ -252,6 +276,8 @@ class AppSettings:
             row["cursor_shape"] = self.terminal_cursor_shape
         if self.terminal_cursor_color is not None:
             row["cursor_color"] = self.terminal_cursor_color
+        if self.terminal_cursor_blink is not None:
+            row["cursor_blink"] = self.terminal_cursor_blink
         if self.terminal_scrollback_lines is not None:
             row["scrollback_lines"] = self.terminal_scrollback_lines
         return row
@@ -265,6 +291,7 @@ class AppSettings:
             use_system_font=self.terminal_use_system_font,
             cursor_shape=self.terminal_cursor_shape,
             cursor_color=self.terminal_cursor_color,
+            cursor_blink=self.terminal_cursor_blink,
             scrollback_lines=self.terminal_scrollback_lines,
         )
 
@@ -275,6 +302,7 @@ class AppSettings:
         use_system_font: bool | None = None,
         cursor_shape: str | None = None,
         cursor_color: str | None = None,
+        cursor_blink: bool | None = None,
         scrollback_lines: int | None = None,
         terminal_palette: str | None = None,
     ) -> "AppSettings":
@@ -284,6 +312,7 @@ class AppSettings:
             terminal_use_system_font=use_system_font if use_system_font is not None else self.terminal_use_system_font,
             terminal_cursor_shape=normalise_cursor_shape(cursor_shape) if cursor_shape is not None else self.terminal_cursor_shape,
             terminal_cursor_color=cursor_color if cursor_color is not None else self.terminal_cursor_color,
+            terminal_cursor_blink=bool(cursor_blink) if cursor_blink is not None else self.terminal_cursor_blink,
             terminal_scrollback_lines=scrollback_lines if scrollback_lines is not None else self.terminal_scrollback_lines,
             terminal_palette=normalise_terminal_palette(terminal_palette) if terminal_palette is not None else self.terminal_palette,
         )
@@ -294,6 +323,7 @@ class AppSettings:
             "terminal_palette": self.terminal_palette,
             "density": self.ui_density,
             "focus_mode": self.focus_mode,
+            "side_pane_position": self.side_pane_position,
         }
         if self.ui_font is not None:
             appearance["ui_font"] = self.ui_font
@@ -353,12 +383,14 @@ def save_terminal_options(
     use_system_font: bool | None = None,
     cursor_shape: str | None = None,
     cursor_color: str | None = None,
+    cursor_blink: bool | None = None,
     scrollback_lines: int | None = None,
     terminal_palette: str | None = None,
     chrome_theme: str | None = None,
     density: str | None = None,
     ui_font: str | None = None,
     ui_font_scale: float | None = None,
+    side_pane_position: str | None = None,
 ) -> Path:
     """Persist minimal appearance/terminal options into the user config file."""
 
@@ -372,6 +404,8 @@ def save_terminal_options(
         terminal["cursor_shape"] = normalise_cursor_shape(cursor_shape)
     if cursor_color is not None:
         terminal["cursor_color"] = str(cursor_color).strip()
+    if cursor_blink is not None:
+        terminal["cursor_blink"] = bool(cursor_blink)
     if scrollback_lines is not None:
         terminal["scrollback_lines"] = max(100, int(scrollback_lines))
 
@@ -382,6 +416,8 @@ def save_terminal_options(
         appearance["chrome_theme"] = normalise_chrome_theme(chrome_theme)
     if density is not None:
         appearance["density"] = normalise_density(density)
+    if side_pane_position is not None:
+        appearance["side_pane_position"] = normalise_side_pane_position(side_pane_position)
     if ui_font is not None:
         cleaned = str(ui_font).strip()
         appearance["ui_font"] = normalise_font_description(cleaned, default="Sans 11") if cleaned else ""
@@ -408,6 +444,7 @@ def sample_settings_json() -> str:
             "terminal_palette": "catppuccin",
             "density": "comfortable",
             "focus_mode": False,
+            "side_pane_position": "right",
             "ui_font": "Sans 11",
             "ui_font_scale": 1.0,
             "terminal": {
@@ -415,6 +452,7 @@ def sample_settings_json() -> str:
                 "use_system_font": False,
                 "cursor_shape": "block",
                 "cursor_color": "#cdd6f4",
+                "cursor_blink": False,
                 "scrollback_lines": 10000,
             },
         },

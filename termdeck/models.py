@@ -22,6 +22,7 @@ class TerminalTheme:
     palette: tuple[str, ...] = DEFAULT_PALETTE
     cursor_color: str | None = None
     cursor_shape: str = "block"
+    cursor_blink: bool | None = None
     scrollback_lines: int = 10000
     window_width: int | None = None
     window_height: int | None = None

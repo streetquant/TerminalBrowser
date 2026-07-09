@@ -78,6 +78,28 @@ def _icon_button(label, icon_name, tooltip, handler, *, suggested=False):
     return button
 
 
+def _wire_auxiliary_close(window: Gtk.Window) -> None:
+    # Make helper windows closable even on minimal/tiled window managers.
+    def _close() -> None:
+        try:
+            window.hide()
+        finally:
+            window.destroy()
+
+    def _on_delete(*_args) -> bool:
+        _close()
+        return True
+
+    def _on_key_press(_widget, event: Gdk.EventKey) -> bool:
+        if event.keyval == Gdk.KEY_Escape:
+            _close()
+            return True
+        return False
+
+    window.connect("delete-event", _on_delete)
+    window.connect("key-press-event", _on_key_press)
+
+
 def apply_app_chrome(settings):
     """Install the chrome CSS provider for the process. Returns the CSS text."""
     css = build_chrome_css(
@@ -152,6 +174,12 @@ def apply_theme(terminal: Vte.Terminal, theme: TerminalTheme, *, font_override: 
         terminal.set_cursor_shape(Vte.CursorShape.IBEAM)
     else:
         terminal.set_cursor_shape(Vte.CursorShape.BLOCK)
+    if theme.cursor_blink is not None:
+        try:
+            mode = Vte.CursorBlinkMode.ON if theme.cursor_blink else Vte.CursorBlinkMode.OFF
+            terminal.set_cursor_blink_mode(mode)
+        except Exception:
+            pass
 
 
 
@@ -267,14 +295,24 @@ class AttachTerminal(Gtk.Box):
         except Exception:
             return False
 
-    def _clipboard_text(self, selection) -> str:
+    def _system_clipboard(self, selection):
+        # Use the real GTK display clipboard so selected terminal text can be
+        # pasted into browsers, editors, chat apps, and other external windows.
         try:
-            clipboard = self.terminal.get_clipboard(selection)
+            display = self.terminal.get_display()
+            if display is not None:
+                return Gtk.Clipboard.get_for_display(display, selection)
         except Exception:
-            try:
-                clipboard = Gtk.Clipboard.get(selection)
-            except Exception:
-                return ""
+            pass
+        try:
+            return Gtk.Clipboard.get(selection)
+        except Exception:
+            return None
+
+    def _clipboard_text(self, selection) -> str:
+        clipboard = self._system_clipboard(selection)
+        if clipboard is None:
+            return ""
         try:
             text = clipboard.wait_for_text()
         except Exception:
@@ -333,13 +371,9 @@ class AttachTerminal(Gtk.Box):
     def _set_clipboard_text(self, text: str, selection) -> None:
         if not text:
             return
-        try:
-            clipboard = self.terminal.get_clipboard(selection)
-        except Exception:
-            try:
-                clipboard = Gtk.Clipboard.get(selection)
-            except Exception:
-                return
+        clipboard = self._system_clipboard(selection)
+        if clipboard is None:
+            return
         try:
             clipboard.set_text(text, -1)
             # Best-effort persist for managers that need store().
@@ -412,11 +446,33 @@ class AttachTerminal(Gtk.Box):
         except Exception:
             self._selection_autocopy_source_id = 0
 
+    def _show_terminal_context_menu(self, event: Gdk.EventButton) -> None:
+        menu = Gtk.Menu()
+        entries = [
+            ("Copy selection", self.copy_clipboard),
+            ("Paste", self.paste_clipboard),
+            ("Paste primary", self.paste_primary),
+            ("Select all", lambda: self.terminal.select_all()),
+            ("Clear selection", lambda: self.terminal.unselect_all()),
+        ]
+        for label, handler in entries:
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", lambda _i, h=handler: h())
+            menu.append(item)
+        menu.show_all()
+        try:
+            menu.popup_at_pointer(event)
+        except Exception:
+            menu.popup(None, None, None, None, int(getattr(event, "button", 3) or 3), int(getattr(event, "time", 0) or 0))
+
     def _on_button_press(self, _terminal, event: Gdk.EventButton) -> bool:
         button = int(getattr(event, "button", 0) or 0)
         # Middle-click paste from PRIMARY / last selection (classic terminal).
         if button == 2:
             self.paste_primary()
+            return True
+        if button == 3:
+            self._show_terminal_context_menu(event)
             return True
         return False
 
@@ -467,6 +523,7 @@ class WindowOverview(Gtk.Window):
         self.app_context = app_context
         _style(self, "td-table-window")
         self.set_default_size(920, 420)
+        _wire_auxiliary_close(self)
         self.store = Gtk.ListStore(*([str] * len(self.COLUMNS)))
         self.tree = Gtk.TreeView(model=self.store)
         for idx, column in enumerate(self.COLUMNS):
@@ -486,13 +543,16 @@ class WindowOverview(Gtk.Window):
         refresh = Gtk.Button(label="Refresh")
         refresh.connect("clicked", lambda *_: self.refresh())
         top.pack_start(refresh, False, False, 0)
+        close = Gtk.Button(label="Close")
+        close.connect("clicked", lambda *_: self.destroy())
+        top.pack_start(close, False, False, 0)
         outer.pack_start(top, False, False, 0)
 
         scroller = Gtk.ScrolledWindow()
         scroller.add(self.tree)
         outer.pack_start(scroller, True, True, 0)
         self.add(outer)
-        GLib.timeout_add_seconds(2, self._refresh_timer)
+        GLib.timeout_add_seconds(5, self._refresh_timer)
         self.refresh()
 
     def _refresh_timer(self) -> bool:
@@ -783,6 +843,7 @@ class SessionSearchWindow(Gtk.Window):
         self.app_context = app_context
         _style(self, "td-table-window")
         self.set_default_size(1040, 620)
+        _wire_auxiliary_close(self)
         self.matches_by_id = {}
         self.store = Gtk.ListStore(*([str] * len(self.COLUMNS)))
         self.tree = Gtk.TreeView(model=self.store)
@@ -821,6 +882,9 @@ class SessionSearchWindow(Gtk.Window):
         open_button = Gtk.Button(label="Open")
         open_button.connect("clicked", lambda *_: self.open_selected())
         top.pack_start(open_button, False, False, 0)
+        close = Gtk.Button(label="Close")
+        close.connect("clicked", lambda *_: self.destroy())
+        top.pack_start(close, False, False, 0)
         outer.pack_start(top, False, False, 0)
 
         scroller = Gtk.ScrolledWindow()
@@ -1125,6 +1189,9 @@ class TerminalOptionsDialog(Gtk.Dialog):
 
         self.cursor_color = Gtk.Entry(text=settings.terminal_cursor_color or (theme.cursor_color or ""))
         self.cursor_color.set_placeholder_text("optional, e.g. #cdd6f4")
+        self.cursor_blink = Gtk.CheckButton(label="Blink cursor")
+        cursor_blink = settings.terminal_cursor_blink if settings.terminal_cursor_blink is not None else True
+        self.cursor_blink.set_active(bool(cursor_blink))
 
         self.scrollback = Gtk.SpinButton()
         self.scrollback.set_range(100, 500000)
@@ -1139,13 +1206,23 @@ class TerminalOptionsDialog(Gtk.Dialog):
         if self.palette_combo.get_active() < 0:
             self.palette_combo.set_active(0)
 
+        self.side_position_combo = Gtk.ComboBoxText()
+        for position in ("right", "left"):
+            self.side_position_combo.append_text(position)
+            if position == settings.side_pane_position:
+                self.side_position_combo.set_active(0 if position == "right" else 1)
+        if self.side_position_combo.get_active() < 0:
+            self.side_position_combo.set_active(0)
+
         rows = [
             ("Font", self.font_entry),
             ("", self.system_font),
             ("Cursor shape", self.cursor_combo),
             ("Cursor colour", self.cursor_color),
+            ("Cursor blink", self.cursor_blink),
             ("Scrollback lines", self.scrollback),
             ("Colour palette", self.palette_combo),
+            ("Sessions pane", self.side_position_combo),
         ]
         for index, (label, widget) in enumerate(rows):
             if label:
@@ -1173,8 +1250,10 @@ class TerminalOptionsDialog(Gtk.Dialog):
             "use_system_font": bool(self.system_font.get_active()),
             "cursor_shape": self.cursor_combo.get_active_text() or "block",
             "cursor_color": colour or None,
+            "cursor_blink": bool(self.cursor_blink.get_active()),
             "scrollback_lines": int(self.scrollback.get_value()),
             "terminal_palette": self.palette_combo.get_active_text() or "terminator",
+            "side_pane_position": self.side_position_combo.get_active_text() or "right",
         }
 
 
@@ -1280,6 +1359,7 @@ class SidePane(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=8)
         self.window = window
         self.selected_ids: set[str] = set()
+        self._last_refresh_signature = None
         _style(self, "td-side-pane")
         density = normalise_density(getattr(window.app_context.settings, "ui_density", "comfortable"))
         if density == "compact":
@@ -1287,7 +1367,16 @@ class SidePane(Gtk.Box):
 
         title = Gtk.Label(label="Sessions", xalign=0)
         _style(title, "title", "td-title")
-        self.pack_start(title, False, False, 0)
+        title_event = Gtk.EventBox()
+        title_event.add(title)
+        title_event.set_tooltip_text("Right-click to move the sessions pane left or right")
+        title_event.connect("button-press-event", self._on_header_button_press)
+        self.pack_start(title_event, False, False, 0)
+
+        hint = Gtk.Label(label="Ctrl-click a tag to multi-select · right-click rows for actions", xalign=0)
+        hint.set_line_wrap(True)
+        _style(hint, "td-muted")
+        self.pack_start(hint, False, False, 0)
 
         self.filter_entry = Gtk.SearchEntry(placeholder_text="filter tags/sessions")
         _style(self.filter_entry, "td-search-entry")
@@ -1348,12 +1437,91 @@ class SidePane(Gtk.Box):
         more.set_popup(menu)
         self.pack_start(more, False, False, 0)
 
-        GLib.timeout_add_seconds(2, self._refresh_timer)
+        GLib.timeout_add_seconds(5, self._refresh_timer)
 
     def _refresh_timer(self) -> bool:
         if self.get_mapped() and self.get_visible():
             self.refresh()
         return True
+
+    def _popup_menu(self, menu: Gtk.Menu, event: Gdk.EventButton) -> None:
+        menu.show_all()
+        try:
+            menu.popup_at_pointer(event)
+        except Exception:
+            menu.popup(None, None, None, None, int(getattr(event, "button", 3) or 3), int(getattr(event, "time", 0) or 0))
+
+    def _menu_item(self, label: str, handler) -> Gtk.MenuItem:
+        item = Gtk.MenuItem(label=label)
+        item.connect("activate", lambda *_: handler())
+        return item
+
+    def _on_header_button_press(self, _widget, event: Gdk.EventButton) -> bool:
+        if int(getattr(event, "button", 0) or 0) != 3:
+            return False
+        menu = Gtk.Menu()
+        menu.append(self._menu_item("Move sessions pane to left", lambda: self.window.set_side_pane_position("left")))
+        menu.append(self._menu_item("Move sessions pane to right", lambda: self.window.set_side_pane_position("right")))
+        menu.append(self._menu_item("Toggle focus mode", self.window.toggle_focus_mode))
+        menu.append(self._menu_item("Terminal options", self.window.open_terminal_options))
+        self._popup_menu(menu, event)
+        return True
+
+    def _toggle_record_selection(self, record: SessionRecord, check: Gtk.CheckButton | None = None) -> None:
+        if record.id in self.selected_ids:
+            self.selected_ids.discard(record.id)
+            active = False
+        else:
+            self.selected_ids.add(record.id)
+            active = True
+        if check is not None and check.get_active() != active:
+            check.set_active(active)
+
+    def _on_tag_button_press(self, _widget, event: Gdk.EventButton, record: SessionRecord, check: Gtk.CheckButton) -> bool:
+        button = int(getattr(event, "button", 0) or 0)
+        state = int(getattr(event, "state", 0) or 0)
+        if button == 1 and state & Gdk.ModifierType.CONTROL_MASK:
+            self._toggle_record_selection(record, check)
+            return True
+        if button == 3:
+            self._show_session_menu(record, check, event)
+            return True
+        return False
+
+    def _on_session_button_press(self, _widget, event: Gdk.EventButton, record: SessionRecord, check: Gtk.CheckButton) -> bool:
+        if int(getattr(event, "button", 0) or 0) == 3:
+            self._show_session_menu(record, check, event)
+            return True
+        return False
+
+    def _show_session_menu(self, record: SessionRecord, check: Gtk.CheckButton, event: Gdk.EventButton) -> None:
+        menu = Gtk.Menu()
+        selected_label = "Deselect" if record.id in self.selected_ids else "Select"
+        menu.append(self._menu_item("Open", lambda: self.window.open_session(record)))
+        menu.append(self._menu_item(selected_label, lambda: self._toggle_record_selection(record, check)))
+        menu.append(self._menu_item("Rename", lambda: self.window.rename_session(record)))
+        menu.append(self._menu_item("Retag", lambda: self.window.retag_sessions([record])))
+        menu.append(self._menu_item("Hide", lambda: self.window.hide_tab(record.id)))
+        menu.append(self._menu_item("Kill", lambda: self._kill_records([record])))
+        menu.append(Gtk.SeparatorMenuItem())
+        menu.append(self._menu_item("Move sessions pane to left", lambda: self.window.set_side_pane_position("left")))
+        menu.append(self._menu_item("Move sessions pane to right", lambda: self.window.set_side_pane_position("right")))
+        self._popup_menu(menu, event)
+
+    def _kill_records(self, records: list[SessionRecord]) -> None:
+        if not self.window.app_context.confirm_control_plan(
+            self.window,
+            records,
+            "kill",
+            selection="side pane context menu",
+        ):
+            return
+        for record in records:
+            self.window.stop_session(record)
+            self.selected_ids.discard(record.id)
+        self.refresh()
+        if records:
+            self.window.show_toast(toast_message_for_action("killed", len(records)), kind="danger")
 
     def refresh(self) -> None:
         for child in self.session_box.get_children():
@@ -1362,8 +1530,19 @@ class SidePane(Gtk.Box):
         records = [
             record
             for record in self.window.app_context.store.list()
-            if not query or query in f"{record.name} {record.tag} {record.id} {record.command}".lower()
+            if record.status != "stopped"
+            and (not query or query in f"{record.name} {record.tag} {record.id} {record.command}".lower())
         ]
+        live_ids = {record.id for record in records}
+        self.selected_ids.intersection_update(live_ids)
+        signature = (
+            query,
+            tuple((record.id, record.name, record.tag, record.status, record.visible, record.pinned, record.last_pid) for record in records),
+            tuple(sorted(self.selected_ids)),
+        )
+        if signature == self._last_refresh_signature:
+            return
+        self._last_refresh_signature = signature
         # One tmux list-panes -a + fast /proc trees instead of N×(has-session+list-panes+full /proc).
         pids = self.window.app_context.backend.pane_pids(records)
         if not records:
@@ -1405,7 +1584,11 @@ class SidePane(Gtk.Box):
             top.pack_start(title, True, True, 0)
             chip = Gtk.Label(label=record.tag)
             _style(chip, "td-chip")
-            top.pack_start(chip, False, False, 0)
+            chip_event = Gtk.EventBox()
+            chip_event.add(chip)
+            chip_event.set_tooltip_text("Ctrl-click to add/remove this session from the multi-selection")
+            chip_event.connect("button-press-event", self._on_tag_button_press, record, check)
+            top.pack_start(chip_event, False, False, 0)
             card.pack_start(top, False, False, 0)
 
             meta = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -1432,8 +1615,11 @@ class SidePane(Gtk.Box):
             actions.pack_end(focus, False, False, 0)
             card.pack_start(actions, False, False, 0)
 
+            card_event = Gtk.EventBox()
+            card_event.add(card)
+            card_event.connect("button-press-event", self._on_session_button_press, record, check)
             row = Gtk.ListBoxRow()
-            row.add(card)
+            row.add(card_event)
             self.session_box.add(row)
         self.session_box.show_all()
 
@@ -1590,6 +1776,8 @@ class SidePane(Gtk.Box):
             return
         for record in records:
             self.window.stop_session(record)
+            self.selected_ids.discard(record.id)
+        self.refresh()
         if records:
             self.window.show_toast(toast_message_for_action("killed", len(records)), kind="danger")
 
@@ -1621,6 +1809,7 @@ class MasterWindow(Gtk.Window):
         dens = normalise_density(getattr(app_context.settings, "ui_density", "comfortable"))
         _style(self, f"td-density-{dens}")
         self.set_default_size(1180, 620)
+        _wire_auxiliary_close(self)
         self.store = Gtk.ListStore(*([str] * len(self.COLUMNS)))
         self.tree = Gtk.TreeView(model=self.store)
         _style(self.tree, "td-master-tree")
@@ -1647,6 +1836,9 @@ class MasterWindow(Gtk.Window):
         _style(self.filter_entry, "td-search-entry")
         self.filter_entry.connect("search-changed", lambda *_: self.refresh())
         top.pack_start(self.filter_entry, True, True, 0)
+        close = Gtk.Button(label="Close")
+        close.connect("clicked", lambda *_: self.destroy())
+        top.pack_start(close, False, False, 0)
         clear = Gtk.Button(label="Clear")
         clear.connect("clicked", lambda *_: self.filter_entry.set_text(""))
         top.pack_start(clear, False, False, 0)
@@ -1699,7 +1891,7 @@ class MasterWindow(Gtk.Window):
             actions.pack_start(button, False, False, 0)
         outer.pack_start(actions, False, False, 0)
         self.add(outer)
-        GLib.timeout_add_seconds(2, self._refresh_timer)
+        GLib.timeout_add_seconds(5, self._refresh_timer)
         self.refresh()
 
     def _refresh_timer(self) -> bool:
@@ -2020,9 +2212,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.notebook.set_tab_pos(Gtk.PositionType.TOP)
         self.notebook.set_scrollable(True)
         self.side = SidePane(self)
-        self.paned.pack1(self.notebook, True, False)
-        self.paned.pack2(self.side, False, False)
-        self.paned.set_position(980)
+        self.side_position = app_context.settings.side_pane_position
+        self._pack_side_pane()
 
         root = Gtk.Overlay()
         root.add(self.paned)
@@ -2638,6 +2829,31 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     def focus_side_prompt(self) -> None:
         self.side.prompt.grab_focus()
 
+    def _pack_side_pane(self) -> None:
+        for child in (self.notebook, self.side):
+            try:
+                if child.get_parent() is self.paned:
+                    self.paned.remove(child)
+            except Exception:
+                pass
+        if self.side_position == "left":
+            self.paned.pack1(self.side, False, False)
+            self.paned.pack2(self.notebook, True, False)
+            self.paned.set_position(340)
+        else:
+            self.paned.pack1(self.notebook, True, False)
+            self.paned.pack2(self.side, False, False)
+            self.paned.set_position(980)
+        self.paned.show_all()
+
+    def set_side_pane_position(self, position: str, *, persist: bool = True) -> None:
+        position = "left" if str(position).lower().startswith("left") else "right"
+        self.side_position = position
+        self._pack_side_pane()
+        if persist:
+            self.app_context.apply_side_pane_position(position)
+        self.show_toast(f"Sessions pane moved to {position}", kind="info")
+
     def toggle_side(self) -> None:
         self.side.set_visible(not self.side.get_visible())
 
@@ -2915,10 +3131,12 @@ class TermDeckApplication(Gtk.Application):
         use_system_font: bool,
         cursor_shape: str,
         cursor_color: str | None,
+        cursor_blink: bool,
         scrollback_lines: int,
         terminal_palette: str,
         ui_font: str | None = None,
         ui_font_scale: float | None = None,
+        side_pane_position: str = "right",
     ) -> None:
         save_terminal_options(
             self.settings.path,
@@ -2926,14 +3144,18 @@ class TermDeckApplication(Gtk.Application):
             use_system_font=use_system_font,
             cursor_shape=cursor_shape,
             cursor_color=cursor_color,
+            cursor_blink=cursor_blink,
             scrollback_lines=scrollback_lines,
             terminal_palette=terminal_palette,
             ui_font=ui_font if ui_font is not None else "",
             ui_font_scale=ui_font_scale,
+            side_pane_position=side_pane_position,
         )
         self.settings = AppSettings.load(self.settings.path)
         self.rebuild_theme()
         self.reapply_theme_to_open_terminals()
+        for window in self.windows:
+            window.set_side_pane_position(self.settings.side_pane_position, persist=False)
         # Reload chrome CSS so UI font/scale take effect immediately.
         try:
             self._chrome_css = apply_app_chrome(self.settings)
@@ -2944,6 +3166,12 @@ class TermDeckApplication(Gtk.Application):
                 ui_font=self.settings.ui_font,
                 ui_font_scale=self.settings.ui_font_scale,
             )
+
+    def apply_side_pane_position(self, position: str) -> None:
+        save_terminal_options(self.settings.path, side_pane_position=position)
+        self.settings = AppSettings.load(self.settings.path)
+        for window in self.windows:
+            window.set_side_pane_position(self.settings.side_pane_position, persist=False)
 
     def _show_error(self, title: str, detail: str) -> None:
         dialog = Gtk.MessageDialog(

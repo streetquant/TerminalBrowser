@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.19
+
+- Fixed select-to-copy to write through the real GTK system clipboard for external paste targets, while keeping PRIMARY and VTE fallbacks.
+- Added a terminal right-click menu for copy, paste, paste primary, select all, and clear selection.
+- Added cursor blink configuration and a Terminal options checkbox to disable blinking.
+- Added persistent left/right Sessions pane placement with right-click header controls.
+- Hid stopped/killed sessions from the Sessions pane and added Ctrl-click tag multi-selection.
+- Added explicit Close/Esc behaviour to master/search/overview helper windows.
+- Reduced periodic heavy UI refreshes and skipped unchanged side-pane rebuilds for better responsiveness.
+
 ## 0.1.18
 
 - Strengthened terminal select-to-copy so selected text is synchronised to both the system clipboard and PRIMARY selection.

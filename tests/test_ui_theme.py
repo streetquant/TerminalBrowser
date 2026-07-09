@@ -211,6 +211,10 @@ class UiSurfaceStaticTests(unittest.TestCase):
         self.assertIn("apply_terminal_options", self.gtk)
         self.assertIn("terminal_options", self.palette)
         self.assertIn("cursor_shape", self.theme)
+        self.assertIn("cursor_blink", self.gtk)
+        self.assertIn("set_cursor_blink_mode", self.gtk)
+        self.assertIn("CursorBlinkMode.OFF", self.gtk)
+        self.assertIn("side_pane_position", self.gtk)
         self.assertIn("apply_terminal_overrides", self.theme)
 
     def test_terminal_font_zoom_shortcuts_are_wired(self):
@@ -242,8 +246,27 @@ class UiSurfaceStaticTests(unittest.TestCase):
         self.assertIn("paste_primary", self.gtk)
         self.assertIn("_feed_text", self.gtk)
         self.assertIn("_last_copied_text", self.gtk)
+        self.assertIn("_system_clipboard", self.gtk)
+        self.assertIn("get_for_display", self.gtk)
+        self.assertIn("_show_terminal_context_menu", self.gtk)
+        self.assertIn("Select all", self.gtk)
         self.assertIn("_is_paste_event", self.gtk)
         self.assertIn("feed_child", self.gtk)
+
+    def test_sessions_pane_ux_controls_are_wired(self):
+        self.assertIn("_on_header_button_press", self.gtk)
+        self.assertIn("Move sessions pane to left", self.gtk)
+        self.assertIn("set_side_pane_position", self.gtk)
+        self.assertIn("_on_tag_button_press", self.gtk)
+        self.assertIn("CONTROL_MASK", self.gtk)
+        self.assertIn('record.status != "stopped"', self.gtk)
+        self.assertIn("_last_refresh_signature", self.gtk)
+        self.assertIn("GLib.timeout_add_seconds(5", self.gtk)
+
+    def test_auxiliary_windows_have_explicit_close_paths(self):
+        self.assertIn("_wire_auxiliary_close", self.gtk)
+        self.assertIn("KEY_Escape", self.gtk)
+        self.assertIn('Gtk.Button(label="Close")', self.gtk)
 
     def test_palette_and_launcher_polish(self):
         self.assertIn("td-overlay-dialog", self.gtk)
