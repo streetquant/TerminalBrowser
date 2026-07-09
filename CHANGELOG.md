@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.24
+
+- Fixed periodic refresh timer leaks after helper windows or side-pane widgets are destroyed.
+- Added `_refresh_alive` destroy hooks so overview, master, and side-pane timers return `False` and self-cancel after teardown.
+- Added static regression coverage for timer cleanup paths.
+
 ## 0.1.23
 
 - Fixed side-pane resource staleness introduced by the refresh signature cache.

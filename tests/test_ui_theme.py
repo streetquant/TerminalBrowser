@@ -274,6 +274,12 @@ class UiSurfaceStaticTests(unittest.TestCase):
         self.assertIn("KEY_Escape", self.gtk)
         self.assertIn('Gtk.Button(label="Close")', self.gtk)
 
+    def test_refresh_timers_stop_after_destroy(self):
+        self.assertIn("_refresh_alive", self.gtk)
+        self.assertIn('connect("destroy", lambda *_: setattr(self, "_refresh_alive", False))', self.gtk)
+        self.assertIn('if not getattr(self, "_refresh_alive", False):', self.gtk)
+        self.assertIn("return False", self.gtk)
+
     def test_palette_and_launcher_polish(self):
         self.assertIn("td-overlay-dialog", self.gtk)
         self.assertIn("td-category", self.gtk)

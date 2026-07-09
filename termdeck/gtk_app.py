@@ -522,6 +522,8 @@ class WindowOverview(Gtk.Window):
     def __init__(self, app_context: "TermDeckApplication"):
         super().__init__(title="TermDeck Window Overview")
         self.app_context = app_context
+        self._refresh_alive = True
+        self.connect("destroy", lambda *_: setattr(self, "_refresh_alive", False))
         _style(self, "td-table-window")
         self.set_default_size(920, 420)
         _wire_auxiliary_close(self)
@@ -557,6 +559,8 @@ class WindowOverview(Gtk.Window):
         self.refresh()
 
     def _refresh_timer(self) -> bool:
+        if not getattr(self, "_refresh_alive", False):
+            return False
         if self.get_visible():
             self.refresh()
         return True
@@ -1360,6 +1364,8 @@ class SidePane(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=8)
         self.window = window
         self.selected_ids: set[str] = set()
+        self._refresh_alive = True
+        self.connect("destroy", lambda *_: setattr(self, "_refresh_alive", False))
         self._last_refresh_signature = None
         # Rebuild dynamic CPU/RAM/health rows periodically even when session
         # metadata is unchanged; duplicate refreshes within the same bucket are
@@ -1445,6 +1451,8 @@ class SidePane(Gtk.Box):
         GLib.timeout_add_seconds(5, self._refresh_timer)
 
     def _refresh_timer(self) -> bool:
+        if not getattr(self, "_refresh_alive", False):
+            return False
         if self.get_mapped() and self.get_visible():
             self.refresh()
         return True
@@ -1812,6 +1820,8 @@ class MasterWindow(Gtk.Window):
     def __init__(self, app_context: "TermDeckApplication"):
         super().__init__(title="TermDeck Master Tasks")
         self.app_context = app_context
+        self._refresh_alive = True
+        self.connect("destroy", lambda *_: setattr(self, "_refresh_alive", False))
         _style(self, "td-table-window")
         dens = normalise_density(getattr(app_context.settings, "ui_density", "comfortable"))
         _style(self, f"td-density-{dens}")
@@ -1902,6 +1912,8 @@ class MasterWindow(Gtk.Window):
         self.refresh()
 
     def _refresh_timer(self) -> bool:
+        if not getattr(self, "_refresh_alive", False):
+            return False
         if self.get_visible():
             self.refresh()
         return True

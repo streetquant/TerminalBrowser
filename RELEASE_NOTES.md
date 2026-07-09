@@ -1,5 +1,22 @@
 # Release notes
 
+## 0.1.24
+
+This build tightens the responsiveness work by cleaning up refresh timers. Helper windows and side-pane widgets now mark their refresh timers dead on destroy, allowing GLib to stop calling those timers after the UI surface has closed.
+
+### Added or stabilised
+
+- Added `_refresh_alive` flags to overview, master, and side-pane refresh surfaces.
+- Wired destroy handlers that set `_refresh_alive` to `False`.
+- Updated refresh timer callbacks to return `False` after teardown so GLib self-cancels them.
+- Added static regression coverage for timer cleanup behaviour.
+
+### Verified
+
+- Python syntax compilation for `termdeck` and `tests`.
+- Targeted UI static tests.
+- Unit test suite in the actual repository checkout.
+
 ## 0.1.23
 
 This build completes the side-pane refresh fix by avoiding stale resource badges. The unchanged-signature fast path still prevents redundant row rebuilds, but the signature now includes a timed refresh bucket so CPU, RAM, and health cues are refreshed periodically even when session metadata has not changed.
