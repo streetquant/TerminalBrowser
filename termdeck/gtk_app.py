@@ -2401,6 +2401,26 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if self.master_window is not None and self.master_window.get_visible():
             self.master_window.refresh()
 
+    def _visible_tab_records(self) -> list[SessionRecord]:
+        records = [tab.record for tab in self.tabs.values()]
+        return sorted(records, key=lambda candidate: candidate.tab_index)
+
+    def _hide_tab_records(self, records: list[SessionRecord]) -> None:
+        hidden = 0
+        for candidate in records:
+            was_visible = candidate.id in self.tabs
+            self.hide_tab(candidate.id)
+            if was_visible and candidate.id not in self.tabs:
+                hidden += 1
+        if hidden:
+            self.show_toast(f"Hid {hidden} tab(s)", kind="info")
+
+    def _hide_other_tabs(self, record: SessionRecord) -> None:
+        self._hide_tab_records([candidate for candidate in self._visible_tab_records() if candidate.id != record.id])
+
+    def _hide_tabs_to_right(self, record: SessionRecord) -> None:
+        self._hide_tab_records([candidate for candidate in self._visible_tab_records() if candidate.tab_index > record.tab_index])
+
     def _show_tab_context_menu(self, record: SessionRecord, event: Gdk.EventButton) -> None:
         menu = Gtk.Menu()
         menu.append(self._tab_menu_item("Rename", lambda: self.rename_session(record)))
@@ -2409,6 +2429,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         menu.append(self._tab_menu_item(pin_label, lambda: self._pin_tab(record, not record.pinned)))
         menu.append(Gtk.SeparatorMenuItem())
         menu.append(self._tab_menu_item("Hide tab", lambda: self.hide_tab(record.id)))
+        menu.append(self._tab_menu_item("Hide other tabs", lambda: self._hide_other_tabs(record)))
+        menu.append(self._tab_menu_item("Hide tabs to the right", lambda: self._hide_tabs_to_right(record)))
         menu.append(self._tab_menu_item("Kill session", lambda: self.stop_session(record)))
         menu.append(Gtk.SeparatorMenuItem())
         menu.append(self._tab_menu_item("Move sessions pane to left", lambda: self.set_side_pane_position("left")))
