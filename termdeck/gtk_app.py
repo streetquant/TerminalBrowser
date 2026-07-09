@@ -2381,6 +2381,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         _style(close, "td-tab-close")
         close.set_tooltip_text("Pinned tab: right-click for Unpin and hide" if record.pinned else "Hide tab")
         close.connect("clicked", lambda _b, sid=record.id: self._hide_tab_from_close_button(sid))
+        close.connect("button-press-event", self._on_tab_label_press, record.id)
         label_box.pack_start(close, False, False, 0)
         label_box.show_all()
         return label_box

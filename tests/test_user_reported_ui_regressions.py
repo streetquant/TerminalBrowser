@@ -41,6 +41,7 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn('self._tab_menu_item("Retag", lambda: self.retag_sessions([record]))', main_window)
         self.assertIn('pin_label = "Unpin tab" if record.pinned else "Pin tab"', main_window)
         self.assertIn("Pinned tab: right-click for Unpin and hide", main_window)
+        self.assertIn('close.connect("button-press-event", self._on_tab_label_press, record.id)', main_window)
         self.assertIn("def _hide_tab_from_close_button", main_window)
         self.assertIn("Pinned tab: right-click and choose Unpin and hide tab", main_window)
         self.assertIn("def _unpin_and_hide_tab", main_window)
