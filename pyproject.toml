@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "termdeck"
-version = "0.1.17"
+version = "0.1.26"
 description = "Lightweight browser-like terminal task manager with hidden tmux sessions and Terminator theme import."
 readme = "README.md"
 requires-python = ">=3.10"

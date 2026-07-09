@@ -1,5 +1,24 @@
 # Release notes
 
+## 0.1.26
+
+This build focuses on browser-like tab ergonomics and verified UI responsiveness. Main tabs now have a full right-click action menu, pinned tabs have an explicit close path, Sessions row menus understand multi-selection, and expensive refresh/capture paths have behavioural regression tests rather than only static guards.
+
+### Added or stabilised
+
+- Added a main-tab context menu with rename, retag, pin/unpin, hide, kill, Terminal options, Master tasks, hide-other-tabs, and hide-tabs-to-the-right actions.
+- Added explicit pinned-tab close guidance and **Unpin and hide tab** so pinned tabs no longer look uncloseable.
+- Made Sessions row right-click actions bulk-aware when Ctrl-click selection is active.
+- Debounced heavy search/filter refresh callbacks to avoid per-keystroke row rebuilds.
+- Added short-lived Master captured-output preview caching to reduce repeated tmux capture work during selection and refresh events.
+- Added behavioural tests for debounce coalescing, Master preview caching, and pinned-tab close handling.
+
+### Verified
+
+- Python syntax compilation for `termdeck` and `tests`.
+- Focused UI regression tests, debounce tests, Master preview cache tests, and pinned-tab close behaviour tests.
+- Full unit test suite in the actual repository checkout.
+
 ## 0.1.25
 
 This build makes refresh timing configurable. Users on slower machines can now reduce background refresh churn without changing source code, while the default behaviour remains the same.

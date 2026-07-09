@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.26
+
+- Added browser-style main-tab context menus for rename, retag, pin/unpin, hide, kill, Terminal options, Master tasks, hide-other-tabs, and hide-tabs-to-the-right.
+- Made pinned tabs explicitly closeable through a guided **Unpin and hide tab** path instead of silent close-button no-ops.
+- Made Sessions-pane row menus bulk-aware for Ctrl-click multi-selection, including retag, pin, unpin, hide, and kill actions.
+- Debounced heavy GUI search/filter refreshes and added behavioural tests for refresh coalescing and timer cleanup.
+- Cached Master captured-output previews briefly and added behavioural tests proving repeated previews avoid repeated backend capture calls.
+- Added behavioural tests for pinned-tab close handling and expanded user-reported UI regression coverage.
+
 ## 0.1.25
 
 - Added configurable UI refresh intervals through `appearance.refresh_interval_seconds` / `appearance.ui_refresh_interval_seconds` / `appearance.refresh_seconds`.
