@@ -81,6 +81,11 @@ def _icon_button(label, icon_name, tooltip, handler, *, suggested=False):
 
 def _wire_auxiliary_close(window: Gtk.Window) -> None:
     # Make helper windows closable even on minimal/tiled window managers.
+    try:
+        window.set_deletable(True)
+    except Exception:
+        pass
+
     def _close() -> None:
         try:
             window.hide()
@@ -447,9 +452,8 @@ class AttachTerminal(Gtk.Box):
             return False
 
         self._last_copied_text = text
-        self._set_clipboard_text(text, Gdk.SELECTION_CLIPBOARD)
-        self._set_clipboard_text(text, Gdk.SELECTION_PRIMARY)
-        # Also ask VTE to own the selections (helps some paste targets).
+        # Update VTE first. The durable GTK text owners are installed last so
+        # changing focus or clearing the terminal highlight cannot empty them.
         try:
             if hasattr(self.terminal, "copy_clipboard_format"):
                 self.terminal.copy_clipboard_format(Vte.Format.TEXT)
@@ -462,6 +466,8 @@ class AttachTerminal(Gtk.Box):
                 self.terminal.copy_primary()
         except Exception:
             pass
+        self._set_clipboard_text(text, Gdk.SELECTION_CLIPBOARD)
+        self._set_clipboard_text(text, Gdk.SELECTION_PRIMARY)
         return True
 
     def _on_selection_changed(self, _terminal) -> None:
@@ -1414,7 +1420,7 @@ class SidePane(Gtk.Box):
         # Rebuild dynamic CPU/RAM/health rows periodically even when session
         # metadata is unchanged; duplicate refreshes within the same bucket are
         # skipped to keep the UI responsive.
-        self._refresh_bucket_seconds = max(1.0, float(getattr(window.app_context.settings, "ui_refresh_interval_seconds", 5.0)))
+        self._refresh_bucket_seconds = max(10.0, float(getattr(window.app_context.settings, "ui_refresh_interval_seconds", 5.0)) * 3.0)
         _style(self, "td-side-pane")
         density = normalise_density(getattr(window.app_context.settings, "ui_density", "comfortable"))
         if density == "compact":
@@ -1605,10 +1611,14 @@ class SidePane(Gtk.Box):
             selection="side pane context menu",
         ):
             return
-        for record in records:
-            self.window.stop_session(record)
-            self.selected_ids.discard(record.id)
-        self.refresh()
+        terminate_records = getattr(self.window.app_context, "terminate_records", None)
+        if callable(terminate_records):
+            terminate_records(records)
+        else:
+            for record in records:
+                self.window.stop_session(record)
+                self.selected_ids.discard(record.id)
+            self.refresh()
         if records:
             self.window.show_toast(toast_message_for_action("killed", len(records)), kind="danger")
 
@@ -1865,10 +1875,14 @@ class SidePane(Gtk.Box):
             selection="side pane selection",
         ):
             return
-        for record in records:
-            self.window.stop_session(record)
-            self.selected_ids.discard(record.id)
-        self.refresh()
+        terminate_records = getattr(self.window.app_context, "terminate_records", None)
+        if callable(terminate_records):
+            terminate_records(records)
+        else:
+            for record in records:
+                self.window.stop_session(record)
+                self.selected_ids.discard(record.id)
+            self.refresh()
         if records:
             self.window.show_toast(toast_message_for_action("killed", len(records)), kind="danger")
 
@@ -2239,9 +2253,7 @@ class MasterWindow(Gtk.Window):
             selection="master task selection",
         ):
             return
-        for record in records:
-            self.app_context.backend.terminate(record)
-            self.app_context.store.update(record.id, status="stopped", visible=False)
+        self.app_context.terminate_records(records)
         self.refresh()
 
 
@@ -2946,17 +2958,22 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if session_id:
             self.hide_tab(session_id)
 
-    def hide_tab(self, session_id: str, *, include_pinned: bool = False) -> None:
-        record = self.app_context.store.get(session_id)
-        if record and record.pinned and not include_pinned:
-            return
+    def _remove_tab_widget(self, session_id: str) -> bool:
         tab = self.tabs.pop(session_id, None)
         if not tab:
-            return
+            return False
         page = self.notebook.page_num(tab.widget)
         if page >= 0:
             tab.widget.detach()
             self.notebook.remove_page(page)
+        return True
+
+    def hide_tab(self, session_id: str, *, include_pinned: bool = False) -> None:
+        record = self.app_context.store.get(session_id)
+        if record and record.pinned and not include_pinned:
+            return
+        if not self._remove_tab_widget(session_id):
+            return
         try:
             self.app_context.store.update(session_id, visible=False)
         except KeyError:
@@ -2973,11 +2990,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             self.stop_session(record)
 
     def stop_session(self, record: SessionRecord) -> None:
-        self.app_context.backend.terminate(record)
-        self.app_context.store.update(record.id, status="stopped", visible=False)
-        self.hide_tab(record.id, include_pinned=True)
-        self.side.selected_ids.discard(record.id)
-        self.side.refresh()
+        self.app_context.terminate_records([record])
 
     def open_master_window(self) -> None:
         if self.master_window is not None:
@@ -3330,7 +3343,9 @@ class TermDeckApplication(Gtk.Application):
         self.theme = apply_terminal_palette(self.theme, self.settings.terminal_palette)
         self.theme = self.settings.apply_to_theme(self.theme)
         self.budget = HealthPolicy()
-        self.sampler = ResourceSampler()
+        refresh_ttl = max(1.0, float(self.settings.ui_refresh_interval_seconds))
+        self.backend.pane_cache_ttl = refresh_ttl
+        self.sampler = ResourceSampler(snapshot_cache_ttl=refresh_ttl)
         self.workspace_path = Path(workspace_path).expanduser() if workspace_path else None
         self.windows: list[TermDeckWindow] = []
         self._chrome_css = ""
@@ -3412,6 +3427,27 @@ class TermDeckApplication(Gtk.Application):
         self.settings = AppSettings.load(self.settings.path)
         for window in self.windows:
             window.set_side_pane_position(self.settings.side_pane_position, persist=False)
+
+    def close_session_tabs(self, session_ids: set[str]) -> None:
+        session_ids = set(session_ids)
+        for window in list(self.windows):
+            removed = False
+            for session_id in session_ids:
+                removed = window._remove_tab_widget(session_id) or removed
+            window.side.selected_ids.difference_update(session_ids)
+            if removed:
+                window._renumber_visible_tabs()
+            window.side.refresh()
+
+    def terminate_records(self, records: list[SessionRecord]) -> int:
+        unique = {record.id: record for record in records}
+        if not unique:
+            return 0
+        for record in unique.values():
+            self.backend.terminate(record)
+            self.store.update(record.id, status="stopped", visible=False, last_pid=None)
+        self.close_session_tabs(set(unique))
+        return len(unique)
 
     def _show_error(self, title: str, detail: str) -> None:
         dialog = Gtk.MessageDialog(

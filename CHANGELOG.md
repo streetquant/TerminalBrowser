@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.27
+
+- Made select-to-copy durable across focus and selection changes by installing GTK clipboard ownership after VTE updates its internal selections.
+- Added a regression test that verifies durable clipboard ownership is the final step in the copy pipeline.
+- Shared one cached tmux all-pane snapshot across repeated single-session PID lookups instead of spawning tmux for each UI action.
+- Matched tmux and `/proc` cache lifetimes to the configured UI refresh cadence and reduced unchanged Sessions-pane metric rebuild frequency.
+- Removed killed session tabs from every open TermDeck window, not only the window that initiated the action.
+- Explicitly marked auxiliary windows deletable in addition to their existing Close and Escape paths.
+
 ## 0.1.26
 
 - Added browser-style main-tab context menus for rename, retag, pin/unpin, hide, kill, Terminal options, Master tasks, hide-other-tabs, and hide-tabs-to-the-right.

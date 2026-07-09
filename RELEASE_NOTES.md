@@ -1,5 +1,24 @@
 # Release notes
 
+## 0.1.27
+
+This build fixes clipboard ownership, session lifecycle, auxiliary-window closing, and responsiveness at their integration boundaries.
+
+### Added or stabilised
+
+- Installed durable GTK clipboard text after VTE updates its internal selections.
+- Reused one cached tmux all-pane snapshot for repeated single-session PID lookups.
+- Aligned tmux and process-resource cache lifetimes with the configured UI refresh interval.
+- Reduced unchanged Sessions-pane resource rebuilds while preserving periodic health updates.
+- Removed killed session tabs from every open TermDeck window and cleared stale selections.
+- Explicitly enabled window-manager close controls for auxiliary windows.
+
+### Verified
+
+- Python syntax compilation for `termdeck` and `tests`.
+- Full unit test suite: 309 passed, 11 subtests passed.
+- GitHub repository visibility: private.
+
 ## 0.1.26
 
 This build focuses on browser-like tab ergonomics and verified UI responsiveness. Main tabs now have a full right-click action menu, pinned tabs have an explicit close path, Sessions row menus understand multi-selection, and expensive refresh/capture paths have behavioural regression tests rather than only static guards.

@@ -68,6 +68,21 @@ class TerminalCopyPipelineTest(TestCase):
         self.assertIn(('copy_clipboard_format', gtk_app.Vte.Format.TEXT), terminal.calls)
         self.assertIn('copy_primary', terminal.calls)
 
+    def test_durable_gtk_clipboard_ownership_is_installed_after_vte_copy(self) -> None:
+        events = []
+        terminal = TerminalStub(selected_text="copied text")
+        terminal.copy_clipboard_format = lambda fmt: events.append(("vte-clipboard", fmt))
+        terminal.copy_primary = lambda: events.append(("vte-primary", None))
+        attach = make_attach(terminal, {})
+        attach._set_clipboard_text = lambda text, selection: events.append(("gtk", selection, text))
+
+        self.assertTrue(AttachTerminal._copy_selection_to_clipboards(attach))
+
+        self.assertEqual(events[-2][0], "gtk")
+        self.assertEqual(events[-1][0], "gtk")
+        self.assertEqual(events[-2][2], "copied text")
+        self.assertEqual(events[-1][2], "copied text")
+
     def test_no_text_but_reported_selection_uses_vte_copy_fallbacks(self) -> None:
         terminal = TerminalStub(selected_text='', has_selection=True)
         attach = make_attach(terminal, {})

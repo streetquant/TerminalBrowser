@@ -93,14 +93,20 @@ class TmuxBackend:
         return explicit or f"{record.tmux_name}:0.0"
 
     def pane_pid(self, record: SessionRecord) -> int | None:
-        """Return the live pane pid for a remembered session.
-
-        Uses a single ``list-panes`` call. Missing sessions fail that call the
-        same way ``has-session`` + ``list-panes`` did, without a second spawn.
-        """
+        """Return a pane pid while sharing one cached all-pane snapshot."""
 
         if not self.available:
             return None
+        maps = self._load_pane_maps()
+        if maps is not None:
+            by_target, by_session_active = maps
+            target = self.pane_target(record)
+            if target in by_target:
+                return by_target[target]
+            if target == f"{record.tmux_name}:0.0":
+                return by_session_active.get(record.tmux_name)
+            return None
+
         result = self._run(
             ["list-panes", "-t", self.pane_target(record), "-F", "#{pane_pid}"],
             check=False,

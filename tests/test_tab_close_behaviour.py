@@ -3,7 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
 
-from termdeck.gtk_app import TermDeckWindow
+from termdeck.gtk_app import TermDeckApplication, TermDeckWindow
 from termdeck.session_store import SessionStore
 
 
@@ -47,6 +47,54 @@ class TabCloseBehaviourTest(TestCase):
             self.assertEqual(hidden, [(record.id, {"include_pinned": True})])
             self.assertEqual(toasts, ["Unpinned and hid tab"])
             store.close()
+
+    def test_close_session_tabs_removes_target_from_every_window(self) -> None:
+        calls = []
+
+        def make_window(name: str, removable: bool):
+            side = SimpleNamespace(
+                selected_ids={"keep", "target"},
+                refresh=lambda: calls.append((name, "refresh")),
+            )
+            return SimpleNamespace(
+                side=side,
+                _remove_tab_widget=lambda session_id: calls.append((name, "remove", session_id)) or removable,
+                _renumber_visible_tabs=lambda: calls.append((name, "renumber")),
+            )
+
+        first = make_window("first", True)
+        second = make_window("second", False)
+        app = SimpleNamespace(windows=[first, second])
+
+        TermDeckApplication.close_session_tabs(app, {"target"})
+
+        self.assertNotIn("target", first.side.selected_ids)
+        self.assertNotIn("target", second.side.selected_ids)
+        self.assertIn(("first", "renumber"), calls)
+        self.assertNotIn(("second", "renumber"), calls)
+        self.assertIn(("first", "refresh"), calls)
+        self.assertIn(("second", "refresh"), calls)
+
+    def test_terminate_records_batches_registry_and_cross_window_cleanup(self) -> None:
+        calls = []
+        first = SimpleNamespace(id="first")
+        second = SimpleNamespace(id="second")
+        app = SimpleNamespace(
+            backend=SimpleNamespace(terminate=lambda record: calls.append(("terminate", record.id))),
+            store=SimpleNamespace(
+                update=lambda session_id, **changes: calls.append(("update", session_id, changes))
+            ),
+            close_session_tabs=lambda session_ids: calls.append(("close", session_ids)),
+        )
+
+        count = TermDeckApplication.terminate_records(app, [first, second, first])
+
+        self.assertEqual(count, 2)
+        self.assertEqual(calls[0], ("terminate", "first"))
+        self.assertEqual(calls[1], ("update", "first", {"status": "stopped", "visible": False, "last_pid": None}))
+        self.assertEqual(calls[2], ("terminate", "second"))
+        self.assertEqual(calls[3], ("update", "second", {"status": "stopped", "visible": False, "last_pid": None}))
+        self.assertEqual(calls[4], ("close", {"first", "second"}))
 
 
 if __name__ == "__main__":

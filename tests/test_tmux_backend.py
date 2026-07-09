@@ -46,13 +46,28 @@ class TmuxBackendTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             args=["tmux"],
             returncode=0,
-            stdout="4321\n",
+            stdout="termdeck_dev_test\t0\t0\tpane\t4321\n",
             stderr="",
         )
         with mock.patch.object(backend, "_run", return_value=completed) as run:
             self.assertEqual(backend.pane_pid(record), 4321)
         run.assert_called_once()
         self.assertEqual(run.call_args.args[0][0], "list-panes")
+
+    def test_pane_pid_reuses_shared_all_pane_cache(self):
+        first = _record(id="a", tmux_name="sess_a")
+        second = _record(id="b", tmux_name="sess_b")
+        backend = TmuxBackend(executable="tmux", pane_cache_ttl=60)
+        completed = subprocess.CompletedProcess(
+            args=["tmux"],
+            returncode=0,
+            stdout="sess_a\t0\t0\tpane-a\t111\nsess_b\t0\t0\tpane-b\t222\n",
+            stderr="",
+        )
+        with mock.patch.object(backend, "_run", return_value=completed) as run:
+            self.assertEqual(backend.pane_pid(first), 111)
+            self.assertEqual(backend.pane_pid(second), 222)
+        run.assert_called_once()
 
     def test_pane_pids_batch_maps_default_and_percent_targets(self):
         default = _record(id="a", tmux_name="sess_a")
