@@ -4,7 +4,7 @@ from termdeck.gtk_app import SIDE_PANE_HIDDEN_STATUSES, _show_in_sessions_pane
 from termdeck.models import SessionRecord
 
 
-def make_record(status: str) -> SessionRecord:
+def make_record(status: str, *, visible: bool = True) -> SessionRecord:
     return SessionRecord(
         id=f"session-{status}",
         name="dev",
@@ -16,6 +16,7 @@ def make_record(status: str) -> SessionRecord:
         last_opened_at="2026-07-09T00:00:00Z",
         status=status,
         last_pid=1234,
+        visible=visible,
     )
 
 
@@ -32,6 +33,16 @@ class SessionsPaneVisibilityTest(TestCase):
         for status in ["new", "running", "paused", "remembered", "start-error"]:
             with self.subTest(status=status):
                 self.assertTrue(_show_in_sessions_pane(make_record(status)))
+
+    def test_hidden_running_tabs_are_not_shown_in_sessions_pane(self) -> None:
+        record = make_record("running", visible=False)
+
+        self.assertFalse(_show_in_sessions_pane(record))
+
+    def test_visible_flag_does_not_override_non_live_status(self) -> None:
+        record = make_record("killed", visible=True)
+
+        self.assertFalse(_show_in_sessions_pane(record))
 
     def test_hidden_status_set_documents_kill_aliases(self) -> None:
         self.assertGreaterEqual(SIDE_PANE_HIDDEN_STATUSES, {"stopped", "killed", "dead", "terminated"})

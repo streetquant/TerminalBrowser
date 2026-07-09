@@ -142,7 +142,7 @@ SIDE_PANE_HIDDEN_STATUSES = {"archived", "dead", "killed", "missing", "stopped",
 
 
 def _show_in_sessions_pane(record: SessionRecord) -> bool:
-    return record.status.casefold() not in SIDE_PANE_HIDDEN_STATUSES
+    return bool(record.visible) and record.status.casefold() not in SIDE_PANE_HIDDEN_STATUSES
 
 
 def apply_app_chrome(settings):
