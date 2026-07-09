@@ -5,6 +5,7 @@ import pty
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import gi  # type: ignore
@@ -1360,6 +1361,10 @@ class SidePane(Gtk.Box):
         self.window = window
         self.selected_ids: set[str] = set()
         self._last_refresh_signature = None
+        # Rebuild dynamic CPU/RAM/health rows periodically even when session
+        # metadata is unchanged; duplicate refreshes within the same bucket are
+        # skipped to keep the UI responsive.
+        self._refresh_bucket_seconds = 5.0
         _style(self, "td-side-pane")
         density = normalise_density(getattr(window.app_context.settings, "ui_density", "comfortable"))
         if density == "compact":
@@ -1533,8 +1538,10 @@ class SidePane(Gtk.Box):
         ]
         live_ids = {record.id for record in records}
         self.selected_ids.intersection_update(live_ids)
+        resource_bucket = int(time.monotonic() // self._refresh_bucket_seconds)
         signature = (
             query,
+            resource_bucket,
             tuple((record.id, record.name, record.tag, record.status, record.visible, record.pinned, record.last_pid) for record in records),
             tuple(sorted(self.selected_ids)),
         )

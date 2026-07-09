@@ -1,5 +1,22 @@
 # Release notes
 
+## 0.1.23
+
+This build completes the side-pane refresh fix by avoiding stale resource badges. The unchanged-signature fast path still prevents redundant row rebuilds, but the signature now includes a timed refresh bucket so CPU, RAM, and health cues are refreshed periodically even when session metadata has not changed.
+
+### Added or stabilised
+
+- Added a side-pane `_refresh_bucket_seconds` value for timed dynamic refreshes.
+- Included a `time.monotonic()` bucket in the side-pane refresh signature.
+- Kept the previous blank-pane fix: rows are cleared only after the cache check decides a rebuild is needed.
+- Extended static tests to guard against both blanking and stale-resource regressions.
+
+### Verified
+
+- Python syntax compilation for `termdeck` and `tests`.
+- Targeted UI static tests.
+- Unit test suite in the actual repository checkout.
+
 ## 0.1.22
 
 This build fixes a regression introduced by the responsiveness cache. The Sessions pane now checks its refresh signature before clearing/rebuilding widgets; if nothing changed, it leaves the existing visible rows in place instead of briefly or permanently blanking the pane.

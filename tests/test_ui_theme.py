@@ -261,6 +261,8 @@ class UiSurfaceStaticTests(unittest.TestCase):
         self.assertIn("CONTROL_MASK", self.gtk)
         self.assertIn('record.status != "stopped"', self.gtk)
         self.assertIn("_last_refresh_signature", self.gtk)
+        self.assertIn("_refresh_bucket_seconds", self.gtk)
+        self.assertIn("time.monotonic() // self._refresh_bucket_seconds", self.gtk)
         self.assertIn("GLib.timeout_add_seconds(5", self.gtk)
         refresh_start = self.gtk.index("    def refresh(self) -> None:")
         cache_check = self.gtk.index("if signature == self._last_refresh_signature:", refresh_start)

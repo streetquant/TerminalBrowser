@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.23
+
+- Fixed side-pane resource staleness introduced by the refresh signature cache.
+- Added a timed resource-refresh bucket so unchanged session metadata preserves rows briefly but still rebuilds CPU/RAM/health cues periodically.
+- Extended the static side-pane regression test to require both pre-clear cache checks and timed dynamic refreshes.
+
 ## 0.1.22
 
 - Fixed a side-pane refresh regression where the unchanged-signature fast path could return after clearing all visible session rows.
