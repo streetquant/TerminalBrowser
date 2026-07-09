@@ -1,5 +1,23 @@
 # Release notes
 
+## 0.1.25
+
+This build makes refresh timing configurable. Users on slower machines can now reduce background refresh churn without changing source code, while the default behaviour remains the same.
+
+### Added or stabilised
+
+- Added `appearance.refresh_interval_seconds` with aliases `ui_refresh_interval_seconds` and `refresh_seconds`.
+- Clamped configured refresh intervals to 1–30 seconds.
+- Applied the setting to the side pane, master task window, and window overview timers.
+- Reused the same interval for the side-pane resource refresh bucket, keeping CPU/RAM/health updates periodic but configurable.
+- Added settings and static UI coverage for configurable refresh timing.
+
+### Verified
+
+- Python syntax compilation for `termdeck` and `tests`.
+- Targeted settings and UI static tests.
+- Unit test suite in the actual repository checkout.
+
 ## 0.1.24
 
 This build tightens the responsiveness work by cleaning up refresh timers. Helper windows and side-pane widgets now mark their refresh timers dead on destroy, allowing GLib to stop calling those timers after the UI surface has closed.

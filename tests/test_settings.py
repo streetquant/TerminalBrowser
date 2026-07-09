@@ -71,6 +71,7 @@ class SettingsTests(unittest.TestCase):
                         "appearance": {
                             "ui_font": "Inter 12",
                             "ui_font_scale": 1.15,
+                            "refresh_interval_seconds": 9.5,
                             "terminal_palette": "nord",
                             "terminal": {
                                 "font": "JetBrains Mono 14",
@@ -94,6 +95,7 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(settings.terminal_palette, "nord")
             self.assertEqual(settings.ui_font, "Inter 12")
             self.assertAlmostEqual(settings.ui_font_scale or 0, 1.15, places=2)
+            self.assertAlmostEqual(settings.ui_refresh_interval_seconds, 9.5, places=2)
             themed = settings.apply_to_theme(TerminalTheme())
             self.assertEqual(themed.font, "JetBrains Mono 14")
             self.assertEqual(themed.cursor_shape, "ibeam")

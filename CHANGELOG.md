@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.25
+
+- Added configurable UI refresh intervals through `appearance.refresh_interval_seconds` / `appearance.ui_refresh_interval_seconds` / `appearance.refresh_seconds`.
+- Wired the setting into the side pane, master task window, and window overview timers.
+- Reused the configured interval for side-pane dynamic resource refresh buckets, so slow machines can reduce background churn without code edits.
+- Clamped refresh intervals to 1–30 seconds and added settings/static UI coverage.
+
 ## 0.1.24
 
 - Fixed periodic refresh timer leaks after helper windows or side-pane widgets are destroyed.

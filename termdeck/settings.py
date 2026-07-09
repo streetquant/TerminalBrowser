@@ -135,6 +135,7 @@ class AppSettings:
     terminal_palette: str = "terminator"
     ui_density: str = "comfortable"
     focus_mode: bool = False
+    ui_refresh_interval_seconds: float = 5.0
     # Interface (non-terminal) type. None = GTK default family + TermDeck size ladder.
     ui_font: str | None = None
     ui_font_scale: float | None = None
@@ -195,6 +196,14 @@ class AppSettings:
         if ui_density not in density_names():
             raise SettingsError(f"appearance.density must be one of: {', '.join(density_names())}")
         focus_mode = _boolean(appearance, "focus_mode", "focus", default=False)
+        ui_refresh_interval_seconds = _number(
+            appearance,
+            "refresh_interval_seconds",
+            "ui_refresh_interval_seconds",
+            "refresh_seconds",
+            default=5.0,
+        )
+        ui_refresh_interval_seconds = max(1.0, min(30.0, ui_refresh_interval_seconds))
         side_pane_position = normalise_side_pane_position(
             appearance.get("side_pane_position", appearance.get("side", appearance.get("sessions_pane", "right")))
         )
@@ -250,6 +259,7 @@ class AppSettings:
             terminal_palette=terminal_palette,
             ui_density=ui_density,
             focus_mode=focus_mode,
+            ui_refresh_interval_seconds=ui_refresh_interval_seconds,
             ui_font=ui_font,
             ui_font_scale=ui_font_scale,
             terminal_font=terminal_font,
@@ -323,6 +333,7 @@ class AppSettings:
             "terminal_palette": self.terminal_palette,
             "density": self.ui_density,
             "focus_mode": self.focus_mode,
+            "refresh_interval_seconds": self.ui_refresh_interval_seconds,
             "side_pane_position": self.side_pane_position,
         }
         if self.ui_font is not None:
@@ -444,6 +455,7 @@ def sample_settings_json() -> str:
             "terminal_palette": "catppuccin",
             "density": "comfortable",
             "focus_mode": False,
+            "refresh_interval_seconds": 5.0,
             "side_pane_position": "right",
             "ui_font": "Sans 11",
             "ui_font_scale": 1.0,

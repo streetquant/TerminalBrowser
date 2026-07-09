@@ -555,7 +555,7 @@ class WindowOverview(Gtk.Window):
         scroller.add(self.tree)
         outer.pack_start(scroller, True, True, 0)
         self.add(outer)
-        GLib.timeout_add_seconds(5, self._refresh_timer)
+        GLib.timeout_add_seconds(int(max(1, round(getattr(app_context.settings, "ui_refresh_interval_seconds", 5.0)))), self._refresh_timer)
         self.refresh()
 
     def _refresh_timer(self) -> bool:
@@ -1370,7 +1370,7 @@ class SidePane(Gtk.Box):
         # Rebuild dynamic CPU/RAM/health rows periodically even when session
         # metadata is unchanged; duplicate refreshes within the same bucket are
         # skipped to keep the UI responsive.
-        self._refresh_bucket_seconds = 5.0
+        self._refresh_bucket_seconds = max(1.0, float(getattr(window.app_context.settings, "ui_refresh_interval_seconds", 5.0)))
         _style(self, "td-side-pane")
         density = normalise_density(getattr(window.app_context.settings, "ui_density", "comfortable"))
         if density == "compact":
@@ -1448,7 +1448,7 @@ class SidePane(Gtk.Box):
         more.set_popup(menu)
         self.pack_start(more, False, False, 0)
 
-        GLib.timeout_add_seconds(5, self._refresh_timer)
+        GLib.timeout_add_seconds(int(max(1, round(getattr(window.app_context.settings, "ui_refresh_interval_seconds", 5.0)))), self._refresh_timer)
 
     def _refresh_timer(self) -> bool:
         if not getattr(self, "_refresh_alive", False):
@@ -1908,7 +1908,7 @@ class MasterWindow(Gtk.Window):
             actions.pack_start(button, False, False, 0)
         outer.pack_start(actions, False, False, 0)
         self.add(outer)
-        GLib.timeout_add_seconds(5, self._refresh_timer)
+        GLib.timeout_add_seconds(int(max(1, round(getattr(app_context.settings, "ui_refresh_interval_seconds", 5.0)))), self._refresh_timer)
         self.refresh()
 
     def _refresh_timer(self) -> bool:
