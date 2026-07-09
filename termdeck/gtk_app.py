@@ -1544,15 +1544,47 @@ class SidePane(Gtk.Box):
             return True
         return False
 
+    def _context_records(self, record: SessionRecord) -> list[SessionRecord]:
+        if record.id in self.selected_ids:
+            records = self.selected_records()
+            if records:
+                return records
+        return [record]
+
+    def _context_label(self, action: str, records: list[SessionRecord]) -> str:
+        return f"{action} selected ({len(records)})" if len(records) > 1 else action
+
+    def _hide_records(self, records: list[SessionRecord]) -> None:
+        for record in records:
+            if record.id in self.window.tabs:
+                self.window.hide_tab(record.id)
+            else:
+                hide_records(self.window.app_context.store, [record])
+            self.selected_ids.discard(record.id)
+        self.refresh()
+
+    def _pin_records(self, records: list[SessionRecord]) -> None:
+        if records:
+            pin_records(self.window.app_context.store, records)
+            self.refresh()
+
+    def _unpin_records(self, records: list[SessionRecord]) -> None:
+        if records:
+            unpin_records(self.window.app_context.store, records)
+            self.refresh()
+
     def _show_session_menu(self, record: SessionRecord, check: Gtk.CheckButton, event: Gdk.EventButton) -> None:
         menu = Gtk.Menu()
+        records = self._context_records(record)
         selected_label = "Deselect" if record.id in self.selected_ids else "Select"
         menu.append(self._menu_item("Open", lambda: self.window.open_session(record)))
         menu.append(self._menu_item(selected_label, lambda: self._toggle_record_selection(record, check)))
         menu.append(self._menu_item("Rename", lambda: self.window.rename_session(record)))
-        menu.append(self._menu_item("Retag", lambda: self.window.retag_sessions([record])))
-        menu.append(self._menu_item("Hide", lambda: self.window.hide_tab(record.id)))
-        menu.append(self._menu_item("Kill", lambda: self._kill_records([record])))
+        menu.append(self._menu_item(self._context_label("Retag", records), lambda: self.window.retag_sessions(records)))
+        menu.append(self._menu_item(self._context_label("Pin", records), lambda: self._pin_records(records)))
+        menu.append(self._menu_item(self._context_label("Unpin", records), lambda: self._unpin_records(records)))
+        menu.append(self._menu_item(self._context_label("Hide", records), lambda: self._hide_records(records)))
+        menu.append(self._menu_item(self._context_label("Kill", records), lambda: self._kill_records(records)))
         menu.append(Gtk.SeparatorMenuItem())
         menu.append(self._menu_item("Move sessions pane to left", lambda: self.window.set_side_pane_position("left")))
         menu.append(self._menu_item("Move sessions pane to right", lambda: self.window.set_side_pane_position("right")))
