@@ -2372,7 +2372,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             attention = ""
         text = f"{kind_glyph(kind)} {pin}{attention}{record.name}".strip()
         name = Gtk.Label(label=text)
-        name.set_tooltip_text(f"{record.tag} · {record.command}\nDouble-click to rename")
+        name.set_tooltip_text(f"{record.tag} · {record.command}\nDouble-click to rename · Right-click for tab actions")
         name.set_events(name.get_events() | Gdk.EventMask.BUTTON_PRESS_MASK)
         name.connect("button-press-event", self._on_tab_label_press, record.id)
         label_box.pack_start(name, True, True, 0)
@@ -2385,11 +2385,51 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         label_box.show_all()
         return label_box
 
+    def _tab_menu_item(self, label: str, handler) -> Gtk.MenuItem:
+        item = Gtk.MenuItem(label=label)
+        item.connect("activate", lambda *_: handler())
+        return item
+
+    def _pin_tab(self, record: SessionRecord, pinned: bool) -> None:
+        if pinned:
+            pin_records(self.app_context.store, [record])
+        else:
+            unpin_records(self.app_context.store, [record])
+        updated = self.app_context.store.get(record.id) or record
+        self.refresh_tab_label(updated)
+        self.side.refresh()
+        if self.master_window is not None and self.master_window.get_visible():
+            self.master_window.refresh()
+
+    def _show_tab_context_menu(self, record: SessionRecord, event: Gdk.EventButton) -> None:
+        menu = Gtk.Menu()
+        menu.append(self._tab_menu_item("Rename", lambda: self.rename_session(record)))
+        menu.append(self._tab_menu_item("Retag", lambda: self.retag_sessions([record])))
+        pin_label = "Unpin tab" if record.pinned else "Pin tab"
+        menu.append(self._tab_menu_item(pin_label, lambda: self._pin_tab(record, not record.pinned)))
+        menu.append(Gtk.SeparatorMenuItem())
+        menu.append(self._tab_menu_item("Hide tab", lambda: self.hide_tab(record.id)))
+        menu.append(self._tab_menu_item("Kill session", lambda: self.stop_session(record)))
+        menu.append(Gtk.SeparatorMenuItem())
+        menu.append(self._tab_menu_item("Move sessions pane to left", lambda: self.set_side_pane_position("left")))
+        menu.append(self._tab_menu_item("Move sessions pane to right", lambda: self.set_side_pane_position("right")))
+        menu.append(self._tab_menu_item("Terminal options", self.open_terminal_options))
+        menu.append(self._tab_menu_item("Master tasks", self.open_master_window))
+        menu.show_all()
+        try:
+            menu.popup_at_pointer(event)
+        except Exception:
+            menu.popup(None, None, None, None, int(getattr(event, "button", 3) or 3), int(getattr(event, "time", 0) or 0))
+
     def _on_tab_label_press(self, _widget, event: Gdk.EventButton, session_id: str) -> bool:
-        if event.type == Gdk.EventType.DOUBLE_BUTTON_PRESS and event.button == 1:
-            record = self.app_context.store.get(session_id)
+        button = int(getattr(event, "button", 0) or 0)
+        record = self.app_context.store.get(session_id)
+        if event.type == Gdk.EventType.DOUBLE_BUTTON_PRESS and button == 1:
             if record is not None:
                 self.rename_session(record)
+            return True
+        if button == 3 and record is not None:
+            self._show_tab_context_menu(record, event)
             return True
         return False
 

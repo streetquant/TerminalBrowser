@@ -32,6 +32,21 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn("button == 3", button_press)
         self.assertIn("self._show_terminal_context_menu(event)", button_press)
 
+    def test_main_tab_labels_have_browser_like_right_click_menu(self) -> None:
+        main_window = _section(GTK_APP, "class TermDeckWindow", "class TermDeckApplication")
+        self.assertIn("Right-click for tab actions", main_window)
+        self.assertIn("def _tab_menu_item", main_window)
+        self.assertIn("def _show_tab_context_menu", main_window)
+        self.assertIn('self._tab_menu_item("Rename", lambda: self.rename_session(record))', main_window)
+        self.assertIn('self._tab_menu_item("Retag", lambda: self.retag_sessions([record]))', main_window)
+        self.assertIn('pin_label = "Unpin tab" if record.pinned else "Pin tab"', main_window)
+        self.assertIn('self._tab_menu_item("Hide tab", lambda: self.hide_tab(record.id))', main_window)
+        self.assertIn('self._tab_menu_item("Kill session", lambda: self.stop_session(record))', main_window)
+        self.assertIn('self._tab_menu_item("Terminal options", self.open_terminal_options)', main_window)
+        self.assertIn('self._tab_menu_item("Master tasks", self.open_master_window)', main_window)
+        self.assertIn("button == 3 and record is not None", main_window)
+        self.assertIn("self._show_tab_context_menu(record, event)", main_window)
+
     def test_terminal_options_cover_cursor_blink_and_sessions_pane_side(self) -> None:
         options = _section(GTK_APP, "class TerminalOptionsDialog", "class ActionPaletteDialog")
 
