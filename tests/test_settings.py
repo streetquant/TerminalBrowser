@@ -131,6 +131,29 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(reloaded.ui_font, "Cantarell 11")
             self.assertAlmostEqual(reloaded.ui_font_scale or 0, 1.1, places=2)
 
+    def test_cursor_blinking_alias_loads_and_saves_canonical_cursor_blink(self):
+        from termdeck.models import TerminalTheme
+        from termdeck.settings import save_terminal_options
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps({"appearance": {"terminal": {"cursor_blinking": False}}}),
+                encoding="utf-8",
+            )
+
+            settings = AppSettings.load(path)
+            self.assertFalse(settings.terminal_cursor_blink)
+            self.assertFalse(settings.apply_to_theme(TerminalTheme(cursor_blink=True)).cursor_blink)
+            self.assertEqual(settings.terminal_options_dict()["cursor_blink"], False)
+
+            save_terminal_options(path, cursor_blink=True)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            terminal = payload["appearance"]["terminal"]
+            self.assertEqual(terminal["cursor_blink"], True)
+            self.assertNotIn("cursor_blinking", terminal)
+            self.assertTrue(AppSettings.load(path).terminal_cursor_blink)
+
 
 if __name__ == "__main__":
     unittest.main()

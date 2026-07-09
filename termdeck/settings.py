@@ -439,8 +439,11 @@ def save_terminal_options(
     payload = merge_settings_payload(resolved, {"appearance": appearance})
     # Empty ui_font means "use system" — drop the key if blank after merge.
     app = payload.get("appearance")
-    if isinstance(app, dict) and app.get("ui_font") == "":
-        app.pop("ui_font", None)
+    if isinstance(app, dict):
+        if cursor_blink is not None and isinstance(app.get("terminal"), dict):
+            app["terminal"].pop("cursor_blinking", None)
+        if app.get("ui_font") == "":
+            app.pop("ui_font", None)
     return save_settings_payload(resolved, payload)
 
 
