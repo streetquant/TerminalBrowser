@@ -2808,20 +2808,45 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.side.refresh()
 
     def open_master_window(self) -> None:
-        if self.master_window is None or not self.master_window.get_visible():
-            self.master_window = MasterWindow(self.app_context)
+        if self.master_window is not None:
+            try:
+                if self.master_window.get_realized() and self.master_window.get_visible():
+                    self.master_window.refresh()
+                    self.master_window.present()
+                    return
+            except Exception:
+                pass
+            self.master_window = None
+        self.master_window = MasterWindow(self.app_context)
+        self.master_window.connect("destroy", lambda *_: setattr(self, "master_window", None))
         self.master_window.show_all()
         self.master_window.present()
 
     def open_window_overview(self) -> None:
-        if self.window_overview is None or not self.window_overview.get_visible():
-            self.window_overview = WindowOverview(self.app_context)
+        if self.window_overview is not None:
+            try:
+                if self.window_overview.get_realized() and self.window_overview.get_visible():
+                    self.window_overview.present()
+                    return
+            except Exception:
+                pass
+            self.window_overview = None
+        self.window_overview = WindowOverview(self.app_context)
+        self.window_overview.connect("destroy", lambda *_: setattr(self, "window_overview", None))
         self.window_overview.show_all()
         self.window_overview.present()
 
     def open_search_window(self) -> None:
-        if self.search_window is None or not self.search_window.get_visible():
-            self.search_window = SessionSearchWindow(self.app_context)
+        if self.search_window is not None:
+            try:
+                if self.search_window.get_realized() and self.search_window.get_visible():
+                    self.search_window.present()
+                    return
+            except Exception:
+                pass
+            self.search_window = None
+        self.search_window = SessionSearchWindow(self.app_context)
+        self.search_window.connect("destroy", lambda *_: setattr(self, "search_window", None))
         self.search_window.show_all()
         self.search_window.present()
 

@@ -60,6 +60,7 @@ class UserReportedUiRegressionTests(unittest.TestCase):
 
     def test_master_window_is_closable_and_refresh_work_is_teardown_safe(self) -> None:
         master = _section(GTK_APP, "class MasterWindow", "class TermDeckWindow")
+        main_window = _section(GTK_APP, "class TermDeckWindow", "class TermDeckApplication")
         side = _section(GTK_APP, "class SidePane", "class MasterWindow")
 
         self.assertIn("_wire_auxiliary_close(self)", master)
@@ -70,6 +71,12 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn("return False", master)
         self.assertIn("GLib.timeout_add_seconds", master)
         self.assertIn("ui_refresh_interval_seconds", master)
+        self.assertIn('self.master_window.connect(\"destroy\", lambda *_: setattr(self, \"master_window\", None))', main_window)
+        self.assertIn('self.window_overview.connect(\"destroy\", lambda *_: setattr(self, \"window_overview\", None))', main_window)
+        self.assertIn('self.search_window.connect(\"destroy\", lambda *_: setattr(self, \"search_window\", None))', main_window)
+        self.assertIn("get_realized() and self.master_window.get_visible()", main_window)
+        self.assertIn("get_realized() and self.window_overview.get_visible()", main_window)
+        self.assertIn("get_realized() and self.search_window.get_visible()", main_window)
         self.assertIn("_last_refresh_signature", side)
         self.assertIn("time.monotonic() // self._refresh_bucket_seconds", side)
         self.assertIn("if signature == self._last_refresh_signature:", side)
