@@ -67,6 +67,19 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertNotIn('connect(\"search-changed\", lambda *_: self.refresh())', GTK_APP)
         self.assertNotIn('connect(\"search-changed\", lambda *_: self._refresh_templates())', GTK_APP)
 
+    def test_master_capture_preview_uses_short_lived_cache(self) -> None:
+        master = _section(GTK_APP, "class MasterWindow", "class TermDeckWindow")
+        self.assertIn("self._capture_preview_cache", master)
+        self.assertIn("self._capture_preview_bucket_seconds", master)
+        self.assertIn("def _capture_preview_cache_key", master)
+        self.assertIn("time.monotonic() // self._capture_preview_bucket_seconds", master)
+        self.assertIn("def capture_preview_text", master)
+        self.assertIn("cached = self._capture_preview_cache.get(key)", master)
+        self.assertIn("return cached", master)
+        self.assertIn("backend.capture(record, lines=80)", master)
+        self.assertIn("self._capture_preview_cache = {key: capture}", master)
+        self.assertIn("self.set_capture_text(self.capture_preview_text(record))", master)
+
     def test_master_window_is_closable_and_refresh_work_is_teardown_safe(self) -> None:
         master = _section(GTK_APP, "class MasterWindow", "class TermDeckWindow")
         main_window = _section(GTK_APP, "class TermDeckWindow", "class TermDeckApplication")

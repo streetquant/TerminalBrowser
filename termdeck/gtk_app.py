@@ -1858,6 +1858,11 @@ class MasterWindow(Gtk.Window):
         super().__init__(title="TermDeck Master Tasks")
         self.app_context = app_context
         self._refresh_alive = True
+        self._capture_preview_cache: dict[tuple[str, str, int | None, int], str] = {}
+        self._capture_preview_bucket_seconds = max(
+            1.0,
+            min(3.0, float(getattr(app_context.settings, "ui_refresh_interval_seconds", 5.0))),
+        )
         self.connect("destroy", lambda *_: setattr(self, "_refresh_alive", False))
         _style(self, "td-table-window")
         dens = normalise_density(getattr(app_context.settings, "ui_density", "comfortable"))
@@ -2004,6 +2009,27 @@ class MasterWindow(Gtk.Window):
         buffer = self.capture_view.get_buffer()
         buffer.set_text(text)
 
+    def _capture_preview_cache_key(self, record: SessionRecord) -> tuple[str, str, int | None, int]:
+        bucket = int(time.monotonic() // self._capture_preview_bucket_seconds)
+        return (record.id, record.status, record.last_pid, bucket)
+
+    def capture_preview_text(self, record: SessionRecord) -> str:
+        key = self._capture_preview_cache_key(record)
+        cached = self._capture_preview_cache.get(key)
+        if cached is not None:
+            return cached
+        capture = self.app_context.backend.capture(record, lines=80).rstrip()
+        if capture:
+            redacted = redact_text(capture)
+            capture = redacted.text
+            if redacted.replacements:
+                labels = ", ".join(redacted.labels)
+                capture = f"[TermDeck redacted {redacted.replacements} secret-like value(s): {labels}]\n\n{capture}"
+        if not capture:
+            capture = "No captured output yet, or the hidden session is not currently available."
+        self._capture_preview_cache = {key: capture}
+        return capture
+
     def update_capture_preview(self) -> None:
         records = self.selected_records()
         if not records:
@@ -2015,16 +2041,7 @@ class MasterWindow(Gtk.Window):
             self.set_capture_text(f"{len(records)} sessions selected: {names}{suffix}\nUse the buttons below to control them together.")
             return
         record = records[0]
-        capture = self.app_context.backend.capture(record, lines=80).rstrip()
-        if capture:
-            redacted = redact_text(capture)
-            capture = redacted.text
-            if redacted.replacements:
-                labels = ", ".join(redacted.labels)
-                capture = f"[TermDeck redacted {redacted.replacements} secret-like value(s): {labels}]\n\n{capture}"
-        if not capture:
-            capture = "No captured output yet, or the hidden session is not currently available."
-        self.set_capture_text(capture)
+        self.set_capture_text(self.capture_preview_text(record))
 
     def send_to_selected(self, *, enter: bool) -> None:
         text = self.prompt_entry.get_text()
