@@ -1,5 +1,21 @@
 # Release notes
 
+## 0.1.20
+
+This build targets responsiveness. The hidden tmux backend now caches the expensive `list-panes -a` pane/PID snapshot for a short interval, allowing the side pane, master task view, and window overview to share one tmux query instead of spawning repeated tmux processes during adjacent refreshes.
+
+### Added or stabilised
+
+- Added `TmuxBackend(..., pane_cache_ttl=...)` with a default one-second pane metadata cache.
+- Reused cached pane maps across `pane_pids()` calls while keeping direct `pane_pid()` behaviour unchanged for explicit process controls.
+- Invalidated cached pane metadata after session creation, rename, and termination.
+- Added tests for cache reuse and explicit invalidation refresh.
+
+### Verified
+
+- Python syntax compilation for `termdeck` and `tests`.
+- Unit test suite in the actual repository checkout.
+
 ## 0.1.19
 
 This build fixes the most visible interaction papercuts: selected terminal text now goes to the real system clipboard for pasting outside TermDeck, cursor blinking can be disabled, the Sessions pane can move left/right, killed tabs disappear from the Sessions pane, Ctrl-clicking tags multi-selects sessions, helper windows have explicit Close/Esc exits, and periodic UI refresh work is reduced.

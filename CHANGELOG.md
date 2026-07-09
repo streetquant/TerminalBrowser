@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.20
+
+- Added a short-lived tmux pane/PID cache so multiple UI surfaces can share one `list-panes -a` snapshot instead of repeatedly spawning tmux during refresh.
+- Invalidated the pane cache after session create, rename, and terminate operations so process controls stay fresh.
+- Added backend tests proving repeated `pane_pids` calls reuse the cached snapshot and `invalidate_cache()` forces a refresh.
+
 ## 0.1.19
 
 - Fixed select-to-copy to write through the real GTK system clipboard for external paste targets, while keeping PRIMARY and VTE fallbacks.

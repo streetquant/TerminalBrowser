@@ -82,6 +82,44 @@ class TmuxBackendTests(unittest.TestCase):
         single.assert_called_once_with(record)
         self.assertEqual(pids["only"], 999)
 
+    def test_pane_pids_uses_short_lived_cache(self):
+        first = _record(id="a", tmux_name="sess_a")
+        second = _record(id="b", tmux_name="sess_b")
+        backend = TmuxBackend(executable="tmux", pane_cache_ttl=60)
+        completed = subprocess.CompletedProcess(
+            args=["tmux"],
+            returncode=0,
+            stdout=(
+                "sess_a\t0\t0\t%3\t111\n"
+                "sess_b\t0\t0\t%4\t222\n"
+            ),
+            stderr="",
+        )
+        with mock.patch.object(backend, "_run", return_value=completed) as run:
+            self.assertEqual(backend.pane_pids([first])["a"], 111)
+            self.assertEqual(backend.pane_pids([second])["b"], 222)
+        run.assert_called_once()
+
+    def test_invalidate_cache_forces_next_tmux_refresh(self):
+        record = _record(id="a", tmux_name="sess_a")
+        backend = TmuxBackend(executable="tmux", pane_cache_ttl=60)
+        first = subprocess.CompletedProcess(
+            args=["tmux"],
+            returncode=0,
+            stdout="sess_a\t0\t0\t%3\t111\n",
+            stderr="",
+        )
+        second = subprocess.CompletedProcess(
+            args=["tmux"],
+            returncode=0,
+            stdout="sess_a\t0\t0\t%3\t222\n",
+            stderr="",
+        )
+        with mock.patch.object(backend, "_run", side_effect=[first, second]) as run:
+            self.assertEqual(backend.pane_pids([record])["a"], 111)
+            backend.invalidate_cache()
+            self.assertEqual(backend.pane_pids([record])["a"], 222)
+        self.assertEqual(run.call_count, 2)
 
 if __name__ == "__main__":
     unittest.main()

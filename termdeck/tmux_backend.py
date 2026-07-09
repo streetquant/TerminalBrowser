@@ -5,6 +5,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -21,8 +22,18 @@ class TmuxBackend:
     The GUI calls these methods; users never see or type tmux commands.
     """
 
-    def __init__(self, executable: str = "tmux") -> None:
+    def __init__(self, executable: str = "tmux", *, pane_cache_ttl: float = 1.0) -> None:
         self.executable = executable
+        self.pane_cache_ttl = max(0.0, float(pane_cache_ttl))
+        self._pane_cache_expires_at = 0.0
+        self._pane_cache_by_target: dict[str, int] = {}
+        self._pane_cache_by_session_active: dict[str, int] = {}
+
+    def invalidate_cache(self) -> None:
+        """Drop cached tmux pane metadata after structural changes."""
+        self._pane_cache_expires_at = 0.0
+        self._pane_cache_by_target = {}
+        self._pane_cache_by_session_active = {}
 
     @property
     def available(self) -> bool:
@@ -72,6 +83,7 @@ class TmuxBackend:
         # Make the session visually clean when attached.
         self._run(["set-option", "-t", record.tmux_name, "status", "off"], check=False)
         self._run(["set-option", "-t", record.tmux_name, "remain-on-exit", "on"], check=False)
+        self.invalidate_cache()
 
     def attach_command(self, record: SessionRecord) -> list[str]:
         return [self.executable, "attach-session", "-t", record.tmux_name]
@@ -103,15 +115,18 @@ class TmuxBackend:
         except ValueError:
             return None
 
-    def pane_pids(self, records: Sequence[SessionRecord]) -> dict[str, int | None]:
-        """Resolve pane pids for many sessions with one ``list-panes -a`` when possible.
+    def _load_pane_maps(self) -> tuple[dict[str, int], dict[str, int]] | None:
+        """Return cached tmux pane maps, refreshing with one list-panes call.
 
-        Supports default ``session:win.pane`` targets and adopted ``%pane_id`` targets.
+        UI surfaces can refresh together; without this cache each window/pane
+        asks tmux for the same pane table and the app feels sluggish.  The cache
+        is deliberately short-lived so process controls remain fresh enough for
+        interactive use while avoiding repeated subprocess spawns per repaint.
         """
 
-        out: dict[str, int | None] = {record.id: None for record in records}
-        if not records or not self.available:
-            return out
+        now = time.monotonic()
+        if self.pane_cache_ttl and now < self._pane_cache_expires_at:
+            return self._pane_cache_by_target, self._pane_cache_by_session_active
 
         result = self._run(
             [
@@ -123,10 +138,8 @@ class TmuxBackend:
             check=False,
         )
         if result.returncode != 0:
-            # Fall back to per-session lookups (same results as before).
-            for record in records:
-                out[record.id] = self.pane_pid(record)
-            return out
+            self.invalidate_cache()
+            return None
 
         by_target: dict[str, int] = {}
         by_session_active: dict[str, int] = {}
@@ -141,23 +154,40 @@ class TmuxBackend:
                 continue
             by_target[f"{session_name}:{window_index}.{pane_index}"] = pid
             if pane_id:
-                # tmux pane ids are either bare numbers or already "%N".
                 by_target[pane_id if pane_id.startswith("%") else f"%{pane_id}"] = pid
-            # First pane listed for a session is a reasonable active fallback.
             by_session_active.setdefault(session_name, pid)
 
+        self._pane_cache_by_target = by_target
+        self._pane_cache_by_session_active = by_session_active
+        self._pane_cache_expires_at = now + self.pane_cache_ttl if self.pane_cache_ttl else 0.0
+        return by_target, by_session_active
+
+    def pane_pids(self, records: Sequence[SessionRecord]) -> dict[str, int | None]:
+        """Resolve pane pids for many sessions using a short-lived tmux snapshot.
+
+        Supports default ``session:win.pane`` targets and adopted ``%pane_id`` targets.
+        """
+
+        out: dict[str, int | None] = {record.id: None for record in records}
+        if not records or not self.available:
+            return out
+
+        maps = self._load_pane_maps()
+        if maps is None:
+            # Fall back to per-session lookups (same results as before).
+            for record in records:
+                out[record.id] = self.pane_pid(record)
+            return out
+
+        by_target, by_session_active = maps
         for record in records:
             target = self.pane_target(record)
             if target in by_target:
                 out[record.id] = by_target[target]
+            elif target == f"{record.tmux_name}:0.0":
+                out[record.id] = by_session_active.get(record.tmux_name)
             else:
-                # Preserve previous pane_pid() behaviour: missing target => None
-                # (caller may fall back to last_pid). Do not guess another pane
-                # unless the record uses the default session target shape.
-                if target == f"{record.tmux_name}:0.0":
-                    out[record.id] = by_session_active.get(record.tmux_name)
-                else:
-                    out[record.id] = None
+                out[record.id] = None
         return out
 
     def send_text(self, record: SessionRecord, text: str, enter: bool = True) -> None:
@@ -191,10 +221,12 @@ class TmuxBackend:
     def terminate(self, record: SessionRecord) -> None:
         if self.session_exists(record):
             self._run(["kill-session", "-t", record.tmux_name], check=False)
+        self.invalidate_cache()
 
     def rename(self, record: SessionRecord, new_name: str) -> None:
         if self.session_exists(record):
             self._run(["rename-session", "-t", record.tmux_name, new_name], check=False)
+        self.invalidate_cache()
 
     @staticmethod
     def _signal_process_group(pid: int, sig: signal.Signals) -> None:
