@@ -1524,8 +1524,6 @@ class SidePane(Gtk.Box):
             self.window.show_toast(toast_message_for_action("killed", len(records)), kind="danger")
 
     def refresh(self) -> None:
-        for child in self.session_box.get_children():
-            self.session_box.remove(child)
         query = self.filter_entry.get_text().lower().strip()
         records = [
             record
@@ -1543,6 +1541,8 @@ class SidePane(Gtk.Box):
         if signature == self._last_refresh_signature:
             return
         self._last_refresh_signature = signature
+        for child in self.session_box.get_children():
+            self.session_box.remove(child)
         # One tmux list-panes -a + fast /proc trees instead of N×(has-session+list-panes+full /proc).
         pids = self.window.app_context.backend.pane_pids(records)
         if not records:

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.22
+
+- Fixed a side-pane refresh regression where the unchanged-signature fast path could return after clearing all visible session rows.
+- Moved row removal/rebuild work after the cache-signature check, preserving the current Sessions pane when nothing changed.
+- Added a static regression guard ensuring the side pane checks its refresh signature before clearing widgets.
+
 ## 0.1.21
 
 - Added short-lived per-PID resource snapshot caching so adjacent side pane, master, and overview refreshes do not repeatedly walk `/proc` trees and RSS data for the same process.

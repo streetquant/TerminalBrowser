@@ -1,5 +1,20 @@
 # Release notes
 
+## 0.1.22
+
+This build fixes a regression introduced by the responsiveness cache. The Sessions pane now checks its refresh signature before clearing/rebuilding widgets; if nothing changed, it leaves the existing visible rows in place instead of briefly or permanently blanking the pane.
+
+### Added or stabilised
+
+- Moved side-pane widget clearing after the unchanged-signature fast path.
+- Preserved stopped-session filtering and selected-id pruning while avoiding unnecessary row rebuilds.
+- Added a static regression test proving the cache check happens before `session_box.remove(...)`.
+
+### Verified
+
+- Python syntax compilation for `termdeck` and `tests`.
+- Unit test suite in the actual repository checkout.
+
 ## 0.1.21
 
 This build continues the responsiveness work by caching resource snapshots. After tmux pane metadata is cached, the next expensive repeated operation is `/proc` sampling: walking child process trees, reading process stat data, and summing RSS. TermDeck now reuses a short-lived per-PID resource snapshot across adjacent UI refreshes.

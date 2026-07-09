@@ -262,6 +262,10 @@ class UiSurfaceStaticTests(unittest.TestCase):
         self.assertIn('record.status != "stopped"', self.gtk)
         self.assertIn("_last_refresh_signature", self.gtk)
         self.assertIn("GLib.timeout_add_seconds(5", self.gtk)
+        refresh_start = self.gtk.index("    def refresh(self) -> None:")
+        cache_check = self.gtk.index("if signature == self._last_refresh_signature:", refresh_start)
+        first_clear = self.gtk.index("for child in self.session_box.get_children():", refresh_start)
+        self.assertLess(cache_check, first_clear)
 
     def test_auxiliary_windows_have_explicit_close_paths(self):
         self.assertIn("_wire_auxiliary_close", self.gtk)
