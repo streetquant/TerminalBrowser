@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.21
+
+- Added short-lived per-PID resource snapshot caching so adjacent side pane, master, and overview refreshes do not repeatedly walk `/proc` trees and RSS data for the same process.
+- Added explicit `ResourceSampler.invalidate_cache()` for process-state changes and tests for cache reuse/invalidation.
+- Kept the cache TTL short by default so UI responsiveness improves without stale resource data persisting across interactions.
+
 ## 0.1.20
 
 - Added a short-lived tmux pane/PID cache so multiple UI surfaces can share one `list-panes -a` snapshot instead of repeatedly spawning tmux during refresh.

@@ -206,11 +206,20 @@ class ResourceSampler:
     CPU percentage is calculated like top: 100% roughly means one full CPU core.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, snapshot_cache_ttl: float = 0.75) -> None:
         self._previous: dict[int, tuple[int, int]] = {}
         self._boot_time = _boot_time()
         self._cpu_count = max(1, os.cpu_count() or 1)
         self._jiffies_cache: tuple[float, int] | None = None
+        self.snapshot_cache_ttl = max(0.0, float(snapshot_cache_ttl))
+        self._snapshot_cache: dict[int, tuple[float, ResourceSnapshot]] = {}
+
+    def invalidate_cache(self, root_pid: int | None = None) -> None:
+        """Drop cached resource snapshots after process-state changes."""
+        if root_pid is None:
+            self._snapshot_cache.clear()
+            return
+        self._snapshot_cache.pop(int(root_pid), None)
 
     def _cached_total_jiffies(self) -> int:
         now = time.monotonic()
@@ -223,6 +232,12 @@ class ResourceSampler:
     def snapshot(self, root_pid: int | None) -> ResourceSnapshot:
         if not root_pid:
             return ResourceSnapshot(pid=None, exists=False)
+
+        now = time.monotonic()
+        if self.snapshot_cache_ttl:
+            cached = self._snapshot_cache.get(int(root_pid))
+            if cached is not None and now < cached[0]:
+                return cached[1]
 
         pids = process_tree(root_pid)
         if not pids:
@@ -257,7 +272,7 @@ class ResourceSampler:
             start_epoch = self._boot_time + (root_start / _CLK_TCK)
             runtime = max(0.0, time.time() - start_epoch)
 
-        return ResourceSnapshot(
+        snap = ResourceSnapshot(
             pid=root_pid,
             exists=True,
             state=state,
@@ -266,6 +281,9 @@ class ResourceSampler:
             runtime_seconds=runtime,
             process_count=len(pids),
         )
+        if self.snapshot_cache_ttl:
+            self._snapshot_cache[int(root_pid)] = (now + self.snapshot_cache_ttl, snap)
+        return snap
 
     def snapshots(self, root_pids: list[int | None]) -> list[ResourceSnapshot]:
         """Sample many roots efficiently (shared jiffies cache)."""

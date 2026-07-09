@@ -1,5 +1,22 @@
 # Release notes
 
+## 0.1.21
+
+This build continues the responsiveness work by caching resource snapshots. After tmux pane metadata is cached, the next expensive repeated operation is `/proc` sampling: walking child process trees, reading process stat data, and summing RSS. TermDeck now reuses a short-lived per-PID resource snapshot across adjacent UI refreshes.
+
+### Added or stabilised
+
+- Added `ResourceSampler(..., snapshot_cache_ttl=...)` with a default short-lived snapshot cache.
+- Cached per-PID resource snapshots so side pane, master task view, and overview refreshes can reuse recent process-tree/RSS samples.
+- Added `ResourceSampler.invalidate_cache()` for full or per-PID cache invalidation.
+- Added tests proving snapshot reuse and explicit invalidation resampling.
+
+### Verified
+
+- Python syntax compilation for `termdeck` and `tests`.
+- Targeted resource sampler tests.
+- Unit test suite in the actual repository checkout.
+
 ## 0.1.20
 
 This build targets responsiveness. The hidden tmux backend now caches the expensive `list-panes -a` pane/PID snapshot for a short interval, allowing the side pane, master task view, and window overview to share one tmux query instead of spawning repeated tmux processes during adjacent refreshes.

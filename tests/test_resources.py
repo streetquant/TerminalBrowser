@@ -2,6 +2,7 @@ import os
 import subprocess
 import time
 import unittest
+from unittest import mock
 
 from termdeck.resources import ResourceSampler, format_bytes, process_tree
 
@@ -48,6 +49,24 @@ class ResourceTests(unittest.TestCase):
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         # Full /proc scans are typically multi-ms each; fast walk should be << 50ms total.
         self.assertLess(elapsed_ms, 250.0, f"process_tree too slow: {elapsed_ms:.1f}ms for 100 calls")
+
+
+    def test_snapshot_uses_short_lived_cache(self):
+        sampler = ResourceSampler(snapshot_cache_ttl=60)
+        with mock.patch("termdeck.resources.process_tree", return_value=[123]) as tree,              mock.patch("termdeck.resources._parse_stat", return_value={"utime": 1, "stime": 1, "state": "S", "starttime": 1}),              mock.patch("termdeck.resources._rss_bytes", return_value=4096),              mock.patch.object(sampler, "_cached_total_jiffies", return_value=1000):
+            first = sampler.snapshot(123)
+            second = sampler.snapshot(123)
+        self.assertIs(first, second)
+        tree.assert_called_once_with(123)
+
+    def test_snapshot_cache_invalidation_forces_resample(self):
+        sampler = ResourceSampler(snapshot_cache_ttl=60)
+        with mock.patch("termdeck.resources.process_tree", return_value=[123]) as tree,              mock.patch("termdeck.resources._parse_stat", return_value={"utime": 1, "stime": 1, "state": "S", "starttime": 1}),              mock.patch("termdeck.resources._rss_bytes", return_value=4096),              mock.patch.object(sampler, "_cached_total_jiffies", return_value=1000):
+            first = sampler.snapshot(123)
+            sampler.invalidate_cache(123)
+            second = sampler.snapshot(123)
+        self.assertIsNot(first, second)
+        self.assertEqual(tree.call_count, 2)
 
     def test_format_bytes(self):
         self.assertEqual(format_bytes(1), "1 B")
