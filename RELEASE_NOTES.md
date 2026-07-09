@@ -1,5 +1,21 @@
 # Release notes
 
+## 0.1.18
+
+This build strengthens terminal select-to-copy behaviour. Text selected with the cursor is copied into the system clipboard and PRIMARY selection so it can be pasted into other applications immediately, while Ctrl+Shift+C remains available as an explicit fallback.
+
+### Added or stabilised
+
+- Debounced VTE selection-change handling so double-click, triple-click, keyboard selection, and drag selection all synchronise selected text after VTE settles its selection buffer.
+- Immediate left-button-release copying remains in place for browser-like mouse selection.
+- System clipboard and PRIMARY selection are both updated, with VTE clipboard APIs retained as a fallback for different GTK/VTE backends.
+- Static GUI tests now cover the delayed select-to-copy path and cleanup of scheduled clipboard syncs.
+
+### Verified
+
+- Python syntax compilation for `termdeck` and `tests`.
+- Unit test suite in the actual repository checkout.
+
 ## 0.1.17
 
 This build completes the next visible browser-usability step: global remembered-tab search now has a GTK surface. The feature was already available headlessly in `termdeck search`; it is now reachable from the header and the command palette so users can find terminal tasks without remembering commands.

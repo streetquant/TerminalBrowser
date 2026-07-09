@@ -186,6 +186,7 @@ class AttachTerminal(Gtk.Box):
         self.terminal.connect("selection-changed", self._on_selection_changed)
         self.terminal.connect("button-press-event", self._on_button_press)
         self._selection_pending = False
+        self._selection_autocopy_source_id = 0
         # Last select-to-copy payload — used when pasting back into this terminal
         # (VTE paste_* can miss text we put on the clipboard ourselves).
         self._last_copied_text = ""
@@ -385,11 +386,31 @@ class AttachTerminal(Gtk.Box):
         return True
 
     def _on_selection_changed(self, _terminal) -> None:
-        # Mark that a selection exists; copy on left-button release (after VTE).
+        # Copy every completed terminal selection to the system clipboard.  We
+        # debounce selection-changed so double-click, triple-click, keyboard
+        # selection, and drag selection all converge after VTE has finished
+        # updating the selection buffer.
         try:
             self._selection_pending = bool(self.terminal.get_has_selection())
         except Exception:
             self._selection_pending = False
+        if self._selection_pending:
+            self._queue_selection_copy(delay_ms=120)
+
+    def _queue_selection_copy(self, *, delay_ms: int = 120) -> None:
+        """Schedule select-to-copy after VTE settles the selected text."""
+        source_id = getattr(self, "_selection_autocopy_source_id", 0)
+        if source_id:
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                pass
+        try:
+            self._selection_autocopy_source_id = GLib.timeout_add(
+                delay_ms, self._copy_selection_to_clipboards_idle
+            )
+        except Exception:
+            self._selection_autocopy_source_id = 0
 
     def _on_button_press(self, _terminal, event: Gdk.EventButton) -> bool:
         button = int(getattr(event, "button", 0) or 0)
@@ -400,14 +421,24 @@ class AttachTerminal(Gtk.Box):
         return False
 
     def _on_button_release(self, _terminal, event: Gdk.EventButton) -> bool:
-        # Left-button release after a drag/select → auto-copy (select-to-copy).
+        # Left-button release after a drag/select → immediate auto-copy.  This
+        # keeps the browser-like feel while the selection-changed debounce covers
+        # keyboard/double-click paths that may not deliver a useful release edge.
         button = int(getattr(event, "button", 0) or 0)
         if button == 1:
+            source_id = getattr(self, "_selection_autocopy_source_id", 0)
+            if source_id:
+                try:
+                    GLib.source_remove(source_id)
+                except Exception:
+                    pass
+                self._selection_autocopy_source_id = 0
             # Idle so VTE finishes updating the selection buffer first.
             GLib.idle_add(self._copy_selection_to_clipboards_idle)
         return False
 
     def _copy_selection_to_clipboards_idle(self) -> bool:
+        self._selection_autocopy_source_id = 0
         self._copy_selection_to_clipboards()
         self._selection_pending = False
         return False

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.18
+
+- Strengthened terminal select-to-copy so selected text is synchronised to both the system clipboard and PRIMARY selection.
+- Added delayed selection-change copying to cover double-click, triple-click, keyboard selection, and drag-selection timing edge cases.
+- Kept immediate left-button-release copying for browser-like mouse selection.
+- Expanded static GTK tests to cover the debounced clipboard sync path.
+
 ## 0.1.17
 
 - Added `SessionSearchWindow` so remembered-tab search is available from the GTK header and command palette, not only from the CLI.

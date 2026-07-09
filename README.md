@@ -23,6 +23,7 @@ See `RELEASE_NOTES.md` for the current verified build notes.
 - Configurable per-tag resource budgets with advisory plans and confirmation-gated `pause-over-budget`.
 - JSON workspace recipes for shareable multi-window/multi-tab project layouts.
 - Terminator look-and-feel import for font, palette, foreground/background, cursor, scrollback, window size, and common keybindings.
+- Select-to-copy terminal behaviour: text selected with the cursor is copied to the system clipboard and PRIMARY selection so it can be pasted into other apps immediately.
 - Browser and emacs-safe shortcut profiles with duplicate and terminal-conflict reporting.
 - Browser-style restore of visible windows and tabs without restarting missing/stopped processes.
 - Startup reconciliation checks remembered running/paused tabs against the hidden backend so stale sessions do not restore as if alive.
