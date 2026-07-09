@@ -2379,8 +2379,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         close = Gtk.Button(label="×")
         close.set_relief(Gtk.ReliefStyle.NONE)
         _style(close, "td-tab-close")
-        close.set_tooltip_text("Hide tab")
-        close.connect("clicked", lambda _b, sid=record.id: self.hide_tab(sid))
+        close.set_tooltip_text("Pinned tab: right-click for Unpin and hide" if record.pinned else "Hide tab")
+        close.connect("clicked", lambda _b, sid=record.id: self._hide_tab_from_close_button(sid))
         label_box.pack_start(close, False, False, 0)
         label_box.show_all()
         return label_box
@@ -2389,6 +2389,13 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         item = Gtk.MenuItem(label=label)
         item.connect("activate", lambda *_: handler())
         return item
+
+    def _hide_tab_from_close_button(self, session_id: str) -> None:
+        record = self.app_context.store.get(session_id)
+        if record is not None and record.pinned:
+            self.show_toast("Pinned tab: right-click and choose Unpin and hide tab", kind="warn")
+            return
+        self.hide_tab(session_id)
 
     def _pin_tab(self, record: SessionRecord, pinned: bool) -> None:
         if pinned:
@@ -2400,6 +2407,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.side.refresh()
         if self.master_window is not None and self.master_window.get_visible():
             self.master_window.refresh()
+
+    def _unpin_and_hide_tab(self, record: SessionRecord) -> None:
+        unpin_records(self.app_context.store, [record])
+        self.hide_tab(record.id, include_pinned=True)
+        self.show_toast("Unpinned and hid tab", kind="info")
 
     def _visible_tab_records(self) -> list[SessionRecord]:
         records = [tab.record for tab in self.tabs.values()]
@@ -2429,6 +2441,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         menu.append(self._tab_menu_item(pin_label, lambda: self._pin_tab(record, not record.pinned)))
         menu.append(Gtk.SeparatorMenuItem())
         menu.append(self._tab_menu_item("Hide tab", lambda: self.hide_tab(record.id)))
+        if record.pinned:
+            menu.append(self._tab_menu_item("Unpin and hide tab", lambda: self._unpin_and_hide_tab(record)))
         menu.append(self._tab_menu_item("Hide other tabs", lambda: self._hide_other_tabs(record)))
         menu.append(self._tab_menu_item("Hide tabs to the right", lambda: self._hide_tabs_to_right(record)))
         menu.append(self._tab_menu_item("Kill session", lambda: self.stop_session(record)))
