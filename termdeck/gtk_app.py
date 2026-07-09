@@ -138,6 +138,13 @@ def _connect_debounced_refresh(widget: Gtk.Widget, refresh, *, delay_ms: int = 1
     widget.connect("destroy", _cleanup)
 
 
+SIDE_PANE_HIDDEN_STATUSES = {"archived", "dead", "killed", "missing", "stopped", "terminated"}
+
+
+def _show_in_sessions_pane(record: SessionRecord) -> bool:
+    return record.status.casefold() not in SIDE_PANE_HIDDEN_STATUSES
+
+
 def apply_app_chrome(settings):
     """Install the chrome CSS provider for the process. Returns the CSS text."""
     css = build_chrome_css(
@@ -1610,7 +1617,7 @@ class SidePane(Gtk.Box):
         records = [
             record
             for record in self.window.app_context.store.list()
-            if record.status != "stopped"
+            if _show_in_sessions_pane(record)
             and (not query or query in f"{record.name} {record.tag} {record.id} {record.command}".lower())
         ]
         live_ids = {record.id for record in records}

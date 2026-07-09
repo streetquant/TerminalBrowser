@@ -1,0 +1,43 @@
+from unittest import TestCase
+
+from termdeck.gtk_app import SIDE_PANE_HIDDEN_STATUSES, _show_in_sessions_pane
+from termdeck.models import SessionRecord
+
+
+def make_record(status: str) -> SessionRecord:
+    return SessionRecord(
+        id=f"session-{status}",
+        name="dev",
+        tag="work",
+        command="bash",
+        cwd="/tmp",
+        tmux_name=f"termdeck-{status}",
+        created_at="2026-07-09T00:00:00Z",
+        last_opened_at="2026-07-09T00:00:00Z",
+        status=status,
+        last_pid=1234,
+    )
+
+
+class SessionsPaneVisibilityTest(TestCase):
+    def test_non_live_statuses_are_hidden_from_sessions_pane(self) -> None:
+        for status in ["stopped", "killed", "dead", "terminated", "missing", "archived"]:
+            with self.subTest(status=status):
+                self.assertFalse(_show_in_sessions_pane(make_record(status)))
+
+    def test_hidden_status_filter_is_case_insensitive(self) -> None:
+        self.assertFalse(_show_in_sessions_pane(make_record("KILLED")))
+
+    def test_active_and_recoverable_statuses_stay_visible(self) -> None:
+        for status in ["new", "running", "paused", "remembered", "start-error"]:
+            with self.subTest(status=status):
+                self.assertTrue(_show_in_sessions_pane(make_record(status)))
+
+    def test_hidden_status_set_documents_kill_aliases(self) -> None:
+        self.assertGreaterEqual(SIDE_PANE_HIDDEN_STATUSES, {"stopped", "killed", "dead", "terminated"})
+
+
+if __name__ == "__main__":
+    import unittest
+
+    unittest.main()
