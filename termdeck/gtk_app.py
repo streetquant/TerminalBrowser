@@ -3207,10 +3207,25 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
         keyval = Gdk.keyval_to_lower(event.keyval)
         name = (Gdk.keyval_name(keyval) or "").lower()
-        # Ctrl+Shift+C or Ctrl+C when there is a selection (don't steal shell ^C)
+        # Ctrl+Shift+C always copies; plain Ctrl+C is selection-aware below.
         if ctrl and shift and (keyval in {Gdk.KEY_c, Gdk.KEY_C} or name == "c"):
             return True
         return False
+
+    def _is_plain_ctrl_c_event(self, event: Gdk.EventKey) -> bool:
+        state = self.keymap._clean_state(event.state)
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        keyval = Gdk.keyval_to_lower(event.keyval)
+        name = (Gdk.keyval_name(keyval) or "").lower()
+        return ctrl and not shift and (keyval in {Gdk.KEY_c, Gdk.KEY_C} or name == "c")
+
+    @staticmethod
+    def _terminal_has_selection(attach) -> bool:
+        try:
+            return bool(attach.terminal.get_has_selection())
+        except Exception:
+            return False
 
     def on_terminal_key_press(self, _terminal, event: Gdk.EventKey) -> bool:
         # Capture zoom / clipboard before VTE treats the chord as input.
@@ -3220,6 +3235,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if attach is None:
             return False
         if self._is_copy_event(event):
+            attach.copy_clipboard()
+            return True
+        if self._is_plain_ctrl_c_event(event) and self._terminal_has_selection(attach):
             attach.copy_clipboard()
             return True
         if self._is_paste_event(event):

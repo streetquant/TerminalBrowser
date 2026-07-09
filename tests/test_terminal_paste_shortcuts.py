@@ -19,7 +19,9 @@ class KeyMapStub:
 def make_window(*, paste_matches: bool = False, attach=None):
     window = SimpleNamespace(keymap=KeyMapStub(paste_matches=paste_matches))
     window._is_copy_event = lambda event: TermDeckWindow._is_copy_event(window, event)
+    window._is_plain_ctrl_c_event = lambda event: TermDeckWindow._is_plain_ctrl_c_event(window, event)
     window._is_paste_event = lambda event: TermDeckWindow._is_paste_event(window, event)
+    window._terminal_has_selection = lambda terminal: TermDeckWindow._terminal_has_selection(terminal)
     if attach is not None:
         window._current_attach_terminal = lambda: attach
     return window
