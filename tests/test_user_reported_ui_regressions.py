@@ -58,6 +58,15 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn("check.set_active(active)", side)
         self.assertIn("Ctrl-click a tag to multi-select", side)
 
+    def test_heavy_search_filters_debounce_refresh_work(self) -> None:
+        self.assertIn("def _connect_debounced_refresh", GTK_APP)
+        self.assertIn("GLib.timeout_add(delay_ms, _run)", GTK_APP)
+        self.assertIn('widget.connect(\"search-changed\", _queue)', GTK_APP)
+        self.assertIn('widget.connect(\"destroy\", _cleanup)', GTK_APP)
+        self.assertEqual(GTK_APP.count("        _connect_debounced_refresh("), 5)
+        self.assertNotIn('connect(\"search-changed\", lambda *_: self.refresh())', GTK_APP)
+        self.assertNotIn('connect(\"search-changed\", lambda *_: self._refresh_templates())', GTK_APP)
+
     def test_master_window_is_closable_and_refresh_work_is_teardown_safe(self) -> None:
         master = _section(GTK_APP, "class MasterWindow", "class TermDeckWindow")
         main_window = _section(GTK_APP, "class TermDeckWindow", "class TermDeckApplication")

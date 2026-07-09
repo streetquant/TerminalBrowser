@@ -101,6 +101,43 @@ def _wire_auxiliary_close(window: Gtk.Window) -> None:
     window.connect("key-press-event", _on_key_press)
 
 
+def _connect_debounced_refresh(widget: Gtk.Widget, refresh, *, delay_ms: int = 140) -> None:
+    """Run expensive refresh callbacks after typing pauses instead of per keypress."""
+    source_id = 0
+
+    def _run() -> bool:
+        nonlocal source_id
+        source_id = 0
+        refresh()
+        return False
+
+    def _queue(*_args) -> None:
+        nonlocal source_id
+        if source_id:
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                pass
+            source_id = 0
+        try:
+            source_id = GLib.timeout_add(delay_ms, _run)
+        except Exception:
+            source_id = 0
+            refresh()
+
+    def _cleanup(*_args) -> None:
+        nonlocal source_id
+        if source_id:
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                pass
+            source_id = 0
+
+    widget.connect("search-changed", _queue)
+    widget.connect("destroy", _cleanup)
+
+
 def apply_app_chrome(settings):
     """Install the chrome CSS provider for the process. Returns the CSS text."""
     css = build_chrome_css(
@@ -875,7 +912,7 @@ class SessionSearchWindow(Gtk.Window):
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.query = Gtk.SearchEntry(placeholder_text="search tabs: codex, bugbounty error, api server, pytest")
-        self.query.connect("search-changed", lambda *_: self.refresh())
+        _connect_debounced_refresh(self.query, self.refresh)
         self.query.connect("activate", lambda *_: self.open_selected())
         top.pack_start(self.query, True, True, 0)
         self.include_output = Gtk.CheckButton(label="include captured output")
@@ -1038,7 +1075,7 @@ class CommandDialog(Gtk.Dialog):
 
         self.template_search = Gtk.SearchEntry(placeholder_text="search templates: shell, codex, ssh, npm, tests, logs")
         _style(self.template_search, "td-search-entry")
-        self.template_search.connect("search-changed", lambda *_: self._refresh_templates())
+        _connect_debounced_refresh(self.template_search, self._refresh_templates)
         outer.pack_start(self.template_search, False, False, 0)
 
         scroller = Gtk.ScrolledWindow()
@@ -1289,7 +1326,7 @@ class ActionPaletteDialog(Gtk.Dialog):
 
         self.search = Gtk.SearchEntry(placeholder_text="try: master, codex, pause selected, cpu, ssh, shell")
         _style(self.search, "td-search-entry")
-        self.search.connect("search-changed", lambda *_: self.refresh())
+        _connect_debounced_refresh(self.search, self.refresh)
         self.search.connect("activate", lambda *_: self.response(Gtk.ResponseType.OK))
         outer.pack_start(self.search, False, False, 0)
 
@@ -1391,7 +1428,7 @@ class SidePane(Gtk.Box):
 
         self.filter_entry = Gtk.SearchEntry(placeholder_text="filter tags/sessions")
         _style(self.filter_entry, "td-search-entry")
-        self.filter_entry.connect("search-changed", lambda *_: self.refresh())
+        _connect_debounced_refresh(self.filter_entry, self.refresh)
         self.pack_start(self.filter_entry, False, False, 0)
 
         scroller = Gtk.ScrolledWindow()
@@ -1851,7 +1888,7 @@ class MasterWindow(Gtk.Window):
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.filter_entry = Gtk.SearchEntry(placeholder_text="filter by id, tag, window, health, state, command, directory")
         _style(self.filter_entry, "td-search-entry")
-        self.filter_entry.connect("search-changed", lambda *_: self.refresh())
+        _connect_debounced_refresh(self.filter_entry, self.refresh)
         top.pack_start(self.filter_entry, True, True, 0)
         close = Gtk.Button(label="Close")
         close.connect("clicked", lambda *_: self.destroy())
