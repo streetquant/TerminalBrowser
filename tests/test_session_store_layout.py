@@ -40,7 +40,7 @@ class SessionStoreLayoutTests(unittest.TestCase):
 
                 self.assertEqual([r.id for r in store.restore_candidates(window_id="win-a")], [first.id])
                 fallback_ids = [r.id for r in store.restore_candidates(window_id="empty", limit=10)]
-                self.assertIn(hidden.id, fallback_ids)
+                self.assertNotIn(hidden.id, fallback_ids)
                 self.assertIn(first.id, fallback_ids)
                 self.assertIn(second.id, fallback_ids)
             finally:

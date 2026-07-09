@@ -59,8 +59,7 @@ class SessionStoreTests(unittest.TestCase):
 
                 store.update(visible.id, visible=False)
                 fallback = store.restore_candidates(limit=10)
-                self.assertIn(hidden.id, [record.id for record in fallback])
-                self.assertNotIn(stopped.id, [record.id for record in fallback])
+                self.assertEqual(fallback, [])
             finally:
                 store.close()
 

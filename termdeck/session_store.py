@@ -260,8 +260,8 @@ class SessionStore:
 
         clean_limit = max(1, int(limit))
         rows = self.list(visible_only=True, window_id=window_id, include_stopped=False)
-        if not rows:
-            rows = self.list(include_archived=False, include_stopped=False)
+        if not rows and window_id is not None:
+            rows = self.list(visible_only=True, include_stopped=False)
         return rows[:clean_limit]
 
     def windows_with_visible_sessions(self) -> list[tuple[str, str, list[SessionRecord]]]:
