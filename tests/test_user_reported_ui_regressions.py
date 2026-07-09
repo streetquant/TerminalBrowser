@@ -59,6 +59,10 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn('self._tab_menu_item("Kill session", lambda: self.stop_session(record))', main_window)
         self.assertIn('self._tab_menu_item("Terminal options", self.open_terminal_options)', main_window)
         self.assertIn('self._tab_menu_item("Master tasks", self.open_master_window)', main_window)
+        self.assertIn('self.notebook.connect("page-reordered", self._on_page_reordered)', main_window)
+        self.assertIn("self.notebook.set_tab_reorderable(terminal, True)", main_window)
+        self.assertIn("def _on_page_reordered", main_window)
+        self.assertIn("self._renumber_visible_tabs()", main_window)
         self.assertIn("button == 3 and record is not None", main_window)
         self.assertIn("self._show_tab_context_menu(record, event)", main_window)
 

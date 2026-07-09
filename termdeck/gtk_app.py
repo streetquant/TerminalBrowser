@@ -2323,6 +2323,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.notebook = Gtk.Notebook(scrollable=True)
         self.notebook.set_tab_pos(Gtk.PositionType.TOP)
         self.notebook.set_scrollable(True)
+        self.notebook.connect("page-reordered", self._on_page_reordered)
         self.side = SidePane(self)
         self.side_position = app_context.settings.side_pane_position
         self._pack_side_pane()
@@ -2839,6 +2840,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.tabs[record.id] = tab
         label_box = self._build_tab_label(record)
         page = self.notebook.append_page(terminal, label_box)
+        self.notebook.set_tab_reorderable(terminal, True)
         self.notebook.set_current_page(page)
         terminal.show_all()
         self.side.refresh()
@@ -3070,6 +3072,12 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
     def toggle_side(self) -> None:
         self.side.set_visible(not self.side.get_visible())
+
+    def _on_page_reordered(self, _notebook, _child, _page_num: int) -> None:
+        self._renumber_visible_tabs()
+        self.side.refresh()
+        if self.master_window is not None and self.master_window.get_visible():
+            self.master_window.refresh()
 
     def _renumber_visible_tabs(self) -> None:
         for index in range(self.notebook.get_n_pages()):
