@@ -185,7 +185,9 @@ class UiSurfaceStaticTests(unittest.TestCase):
         self.assertIn("primary_header_actions", self.gtk)
         self.assertIn("overflow_header_actions", self.gtk)
         self.assertIn("utilities-terminal-symbolic", self.gtk)
-        self.assertIn('Gtk.MenuButton(label="More ▾")', self.gtk)
+        self.assertIn('Gtk.MenuButton(label="⋯")', self.gtk)
+        self.assertIn("show_label=False", self.gtk)
+        self.assertIn('"td-header-icon"', self.gtk)
         self.assertIn("set_tooltip_text", self.gtk)
 
     def test_side_pane_session_cards(self):

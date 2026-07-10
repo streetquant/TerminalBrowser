@@ -537,7 +537,7 @@ This is an MVP, not a finished replacement for mature terminals. The implementat
 
 ## Repository hygiene
 
-The repository includes a GitHub Actions workflow under `.github/workflows/ci.yml` that runs syntax checks, unit tests, CLI smoke checks, and an isolated GTK visual-smoke job that uploads the rendered TermDeck frame.
+The repository includes a GitHub Actions workflow under `.github/workflows/ci.yml` that runs syntax checks, unit tests, CLI smoke checks, and an isolated GTK visual-smoke job that uploads desktop and compact TermDeck frames.
 
 ## Development checks
 
@@ -550,6 +550,10 @@ Render the real GTK window in an isolated Xvfb, D-Bus, HOME, database, and tmux 
 
 ```bash
 python3 scripts/render_ui_smoke.py --output /tmp/termdeck-ui-smoke.png
+python3 scripts/render_ui_smoke.py \
+  --output /tmp/termdeck-ui-smoke-compact.png \
+  --window-width 640 \
+  --window-height 520
 ```
 
-The visual smoke harness captures the actual `termdeck gui` entry point, reports the frame dimensions, and separates TermDeck application errors from expected headless desktop-portal warnings. It requires `Xvfb`, ImageMagick, `xwininfo`, `dbus-run-session`, and `tmux`.
+The visual smoke harness captures the actual `termdeck gui` entry point, reports requested and captured dimensions, and fails when the window is clamped instead of honouring the requested compact viewport. It also separates TermDeck application errors from expected headless desktop-portal warnings. It requires `Xvfb`, ImageMagick, `xwininfo`, `xdotool`, `dbus-run-session`, and `tmux`.

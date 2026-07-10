@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.31
+
+- Reduced titlebar minimum width by converting New, Shell, Search, Palette, and More to compact icon controls with preserved tooltips and accessible names.
+- Added ellipsis-aware title and subtitle bounds so long workspace names no longer force the window wider.
+- Marked both `Gtk.Paned` children shrinkable, preserving the preferred desktop split while allowing constrained terminal and Sessions-pane layouts.
+- Extended the real GTK visual-smoke harness with explicit window dimensions, requested-versus-captured reporting, and failure on window-size clamping.
+- Added a `640x520` compact render to CI alongside the desktop frame and upload both screenshots as review artifacts.
+- Added responsive-layout and visual-harness regression coverage; the full suite now passes 321 tests and 11 subtests.
+
 ## 0.1.30
 
 - Added an isolated Xvfb visual-smoke harness that launches the real `termdeck gui` entry point, captures the mapped GTK window, and cleans up its temporary HOME, database, D-Bus session, X server, and tmux server.

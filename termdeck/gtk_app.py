@@ -61,17 +61,22 @@ def _style(widget, *classes):
     return widget
 
 
-def _icon_button(label, icon_name, tooltip, handler, *, suggested=False):
+def _icon_button(label, icon_name, tooltip, handler, *, suggested=False, show_label=True):
     button = Gtk.Button()
-    box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+    box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4 if show_label else 0)
     try:
         image = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON)
         box.pack_start(image, False, False, 0)
     except Exception:
         pass
-    box.pack_start(Gtk.Label(label=label), False, False, 0)
+    if show_label:
+        box.pack_start(Gtk.Label(label=label), False, False, 0)
     button.add(box)
     button.set_tooltip_text(tooltip)
+    try:
+        button.get_accessible().set_name(label)
+    except Exception:
+        pass
     if suggested:
         button.get_style_context().add_class("suggested-action")
         button.get_style_context().add_class("td-accent")
@@ -2386,8 +2391,12 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         title_box.pack_start(status_dot, False, False, 0)
         title_stack = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         title = Gtk.Label(label=f"TermDeck · {self.window_title}", xalign=0)
+        title.set_ellipsize(Pango.EllipsizeMode.END)
+        title.set_max_width_chars(18)
         _style(title, "td-title")
         subtitle = Gtk.Label(label="Terminal workspace", xalign=0)
+        subtitle.set_ellipsize(Pango.EllipsizeMode.END)
+        subtitle.set_max_width_chars(18)
         _style(subtitle, "td-subtitle", "td-muted")
         title_stack.pack_start(title, False, False, 0)
         title_stack.pack_start(subtitle, False, False, 0)
@@ -2398,11 +2407,12 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         # Keep high-frequency actions visible; move secondary controls into a
         # single discoverable overflow menu so the header stays calm at narrow widths.
         primary_header_actions = [
-            ("New", "list-add-symbolic", "New task launcher", self.open_launcher, True),
-            ("Shell", "utilities-terminal-symbolic", "New shell tab", self.new_shell_tab, False),
+            ("New", "list-add-symbolic", "New task launcher", self.open_launcher, True, False),
+            ("Shell", "utilities-terminal-symbolic", "New shell tab", self.new_shell_tab, False, False),
         ]
-        for label, icon, tip, handler, suggested in primary_header_actions:
-            button = _icon_button(label, icon, tip, handler, suggested=suggested)
+        for label, icon, tip, handler, suggested, show_label in primary_header_actions:
+            button = _icon_button(label, icon, tip, handler, suggested=suggested, show_label=show_label)
+            _style(button, "td-header-icon")
             if not suggested:
                 _style(button, "td-ghost-action")
             header.pack_start(button)
@@ -2424,18 +2434,22 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             item.connect("activate", lambda _item, h=handler: h())
             overflow_menu.append(item)
         overflow_menu.show_all()
-        overflow = Gtk.MenuButton(label="More ▾")
-        overflow.set_tooltip_text("Workspace, window, and appearance actions")
+        overflow = Gtk.MenuButton(label="⋯")
+        overflow.set_tooltip_text("More workspace, window, and appearance actions")
+        try:
+            overflow.get_accessible().set_name("More actions")
+        except Exception:
+            pass
         overflow.set_popup(overflow_menu)
-        _style(overflow, "td-header-overflow")
+        _style(overflow, "td-header-overflow", "td-header-icon")
         header.pack_end(overflow)
 
         for label, icon, tip, handler in [
             ("Search", "system-search-symbolic", "Search remembered tabs", self.open_search_window),
             ("Palette", "edit-find-symbolic", "Command palette (Ctrl+Shift+P)", self.open_command_palette),
         ]:
-            button = _icon_button(label, icon, tip, handler, suggested=False)
-            _style(button, "td-ghost-action")
+            button = _icon_button(label, icon, tip, handler, suggested=False, show_label=False)
+            _style(button, "td-ghost-action", "td-header-icon")
             header.pack_end(button)
 
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -3173,12 +3187,12 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             except Exception:
                 pass
         if self.side_position == "left":
-            self.paned.pack1(self.side, False, False)
-            self.paned.pack2(self.notebook, True, False)
+            self.paned.pack1(self.side, False, True)
+            self.paned.pack2(self.notebook, True, True)
             self.paned.set_position(340)
         else:
-            self.paned.pack1(self.notebook, True, False)
-            self.paned.pack2(self.side, False, False)
+            self.paned.pack1(self.notebook, True, True)
+            self.paned.pack2(self.side, False, True)
             self.paned.set_position(980)
         self.paned.show_all()
 

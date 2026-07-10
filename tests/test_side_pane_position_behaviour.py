@@ -59,8 +59,8 @@ class SidePanePositionBehaviourTest(TestCase):
             [
                 ('remove', 'notebook'),
                 ('remove', 'side'),
-                ('pack1', 'side', False, False),
-                ('pack2', 'notebook', True, False),
+                ('pack1', 'side', False, True),
+                ('pack2', 'notebook', True, True),
                 ('position', 340),
                 ('show_all',),
             ],
@@ -76,8 +76,8 @@ class SidePanePositionBehaviourTest(TestCase):
             [
                 ('remove', 'notebook'),
                 ('remove', 'side'),
-                ('pack1', 'notebook', True, False),
-                ('pack2', 'side', False, False),
+                ('pack1', 'notebook', True, True),
+                ('pack2', 'side', False, True),
                 ('position', 980),
                 ('show_all',),
             ],

@@ -90,8 +90,11 @@ button.td-danger-action:hover, button.destructive-action:hover {{
 button.td-header-overflow {{
   background-color: alpha({tokens.fg}, 0.045);
   border-color: alpha({tokens.border}, 0.85);
-  padding-left: 12px;
-  padding-right: 12px;
+}}
+button.td-header-icon {{
+  min-width: 36px;
+  padding-left: 8px;
+  padding-right: 8px;
 }}
 headerbar button.td-header-group-end {{ margin-left: 8px; }}
 .td-title {{

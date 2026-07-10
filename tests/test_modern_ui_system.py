@@ -34,8 +34,12 @@ class ModernUiSystemTests(unittest.TestCase):
     def test_header_uses_primary_actions_and_overflow_menu(self) -> None:
         self.assertIn("primary_header_actions", GTK_APP)
         self.assertIn("overflow_header_actions", GTK_APP)
-        self.assertIn('Gtk.MenuButton(label="More ▾")', GTK_APP)
-        self.assertIn('"td-header-overflow"', GTK_APP)
+        self.assertIn('Gtk.MenuButton(label="⋯")', GTK_APP)
+        self.assertIn('set_name("More actions")', GTK_APP)
+        self.assertIn("show_label=False", GTK_APP)
+        self.assertIn('"td-header-overflow", "td-header-icon"', GTK_APP)
+        self.assertIn("title.set_max_width_chars(18)", GTK_APP)
+        self.assertIn("subtitle.set_max_width_chars(18)", GTK_APP)
         self.assertNotIn("discover_group + manage_group + window_group", GTK_APP)
 
     def test_sessions_pane_has_modern_hierarchy_and_empty_state(self) -> None:

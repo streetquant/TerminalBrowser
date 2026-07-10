@@ -37,6 +37,13 @@ def _wait_for_image(path: Path, timeout: float = 12.0) -> None:
     raise RuntimeError(f"screenshot was not created: {path}")
 
 
+def _parse_identify_size(value: str) -> tuple[int, int]:
+    match = re.search(r"\b(\d+)x(\d+)\b", value)
+    if not match:
+        raise RuntimeError(f"could not parse screenshot dimensions from identify output: {value!r}")
+    return int(match.group(1)), int(match.group(2))
+
+
 def _terminate(process: subprocess.Popen[str] | None) -> None:
     if process is None or process.poll() is not None:
         return
@@ -131,13 +138,18 @@ def render(
     display: str | None = None,
     width: int = 1440,
     height: int = 900,
+    window_width: int | None = None,
+    window_height: int | None = None,
 ) -> dict[str, object]:
+    if (window_width is None) != (window_height is None):
+        raise ValueError("window_width and window_height must be provided together")
     xvfb = _require("Xvfb")
     imagemagick_import = _require("import")
     identify = _require("identify")
     tmux = _require("tmux")
     dbus_run_session = _require("dbus-run-session")
     xwininfo = _require("xwininfo")
+    xdotool = _require("xdotool") if window_width is not None else None
 
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -245,6 +257,16 @@ def render(
                 except RuntimeError as exc:
                     detail = app_stderr.read_text(encoding="utf-8", errors="replace").strip()
                     raise RuntimeError(f"{exc}; application stderr: {detail or 'empty'}") from exc
+                if xdotool is not None and window_width is not None and window_height is not None:
+                    subprocess.run(
+                        [xdotool, "windowsize", "--sync", window_id, str(window_width), str(window_height)],
+                        env=env,
+                        check=True,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=10,
+                    )
                 time.sleep(0.8)
 
                 subprocess.run(
@@ -266,6 +288,8 @@ def render(
                 stderr=subprocess.PIPE,
                 timeout=10,
             )
+            identify_text = identify_result.stdout.strip()
+            actual_width, actual_height = _parse_identify_size(identify_text)
             stderr_text = app_stderr.read_text(encoding="utf-8", errors="replace")
             diagnostic_lines = [
                 line
@@ -278,13 +302,24 @@ def render(
                 for line in diagnostic_lines
                 if not any(marker in line.casefold() for marker in external_markers)
             ]
+            layout_error_lines: list[str] = []
+            if window_width is not None and window_height is not None:
+                if (actual_width, actual_height) != (window_width, window_height):
+                    layout_error_lines.append(
+                        f"requested {window_width}x{window_height}, captured {actual_width}x{actual_height}"
+                    )
             return {
-                "ok": not application_error_lines,
+                "ok": not application_error_lines and not layout_error_lines,
                 "display": active_display,
                 "output": str(output),
                 "bytes": output.stat().st_size,
-                "identify": identify_result.stdout.strip(),
+                "identify": identify_text,
+                "requested_window_size": (
+                    f"{window_width}x{window_height}" if window_width is not None and window_height is not None else None
+                ),
+                "actual_window_size": f"{actual_width}x{actual_height}",
                 "application_error_lines": application_error_lines,
+                "layout_error_lines": layout_error_lines,
                 "environment_warning_count": len(diagnostic_lines) - len(application_error_lines),
             }
         finally:
@@ -305,9 +340,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("/tmp/termdeck-ui-smoke.png"))
     parser.add_argument("--display", default=None, help="explicit X display; default chooses a free display")
+    parser.add_argument("--window-width", type=int, default=None, help="resize the mapped window before capture")
+    parser.add_argument("--window-height", type=int, default=None, help="resize the mapped window before capture")
     args = parser.parse_args()
     try:
-        result = render(args.output, display=args.display)
+        result = render(
+            args.output,
+            display=args.display,
+            window_width=args.window_width,
+            window_height=args.window_height,
+        )
     except Exception as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2), file=sys.stderr)
         return 1

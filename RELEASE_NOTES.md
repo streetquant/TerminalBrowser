@@ -1,5 +1,33 @@
 # Release notes
 
+## 0.1.31
+
+This release makes the redesigned interface genuinely responsive rather than merely desktop-sized.
+
+### Compact titlebar
+
+- Converted all titlebar actions to compact icon controls while retaining clear tooltips and accessibility names.
+- Bounded and ellipsised the workspace title and subtitle so long names cannot dictate the application minimum width.
+- Preserved the existing action hierarchy: New remains the accent action, while Shell, Search, Palette, and More remain visually secondary.
+
+### Flexible workspace split
+
+- Enabled shrinking for both children of the horizontal `Gtk.Paned` layout. The Sessions pane still opens at its preferred desktop width, but it no longer prevents the terminal workspace from fitting a compact window.
+- The same behavior applies whether the Sessions pane is placed on the left or right.
+
+### Enforced responsive verification
+
+- Added `--window-width` and `--window-height` to `scripts/render_ui_smoke.py`.
+- The harness now reports requested and actual frame sizes and fails when GTK or the window manager clamps the requested viewport.
+- CI now renders and uploads both the normal desktop frame and a compact `640x520` frame.
+
+### Verified
+
+- Desktop render: `1290x856`, with zero application or layout errors.
+- Compact render: requested and captured `640x520`, with zero application or layout errors.
+- Full test suite: 321 passed, 11 subtests passed.
+- GitHub repository visibility: private.
+
 ## 0.1.30
 
 This build validates the modern UI through the real GTK runtime and fixes two defects that source-level tests did not expose.
