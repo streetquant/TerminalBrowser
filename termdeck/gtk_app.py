@@ -1063,9 +1063,17 @@ class TerminalTab:
 class WindowNameDialog(Gtk.Dialog):
     """Small window-level naming dialog; tabs are created separately."""
 
-    def __init__(self, parent: Gtk.Window, *, title: str, initial: str = ""):
+    def __init__(
+        self,
+        parent: Gtk.Window | None,
+        *,
+        title: str,
+        initial: str = "",
+        confirm_label: str = "Save",
+        description: str = "",
+    ):
         super().__init__(title=title, transient_for=parent, flags=0)
-        self.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+        self.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, confirm_label, Gtk.ResponseType.OK)
         self.set_default_response(Gtk.ResponseType.OK)
         self.set_modal(True)
         self.set_default_size(420, -1)
@@ -1073,6 +1081,11 @@ class WindowNameDialog(Gtk.Dialog):
         content = self.get_content_area()
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=14)
         content.add(box)
+        if description:
+            intro = Gtk.Label(label=description, xalign=0)
+            intro.set_line_wrap(True)
+            _style(intro, "td-muted")
+            box.pack_start(intro, False, False, 0)
         label = Gtk.Label(label="Window name", xalign=0)
         _style(label, "td-muted")
         box.pack_start(label, False, False, 0)
@@ -2229,7 +2242,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         window_id: str | None = None,
         window_title: str | None = None,
         restore_records: list[SessionRecord] | None = None,
-        open_initial_shell: bool = True,
     ):
         super().__init__(application=app_context, title="TermDeck")
         self.app_context = app_context
@@ -2242,7 +2254,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.window_title = window_title or "Main"
         self.set_title(f"TermDeck · {self.window_title}")
         self._restore_records = restore_records
-        self.open_initial_shell = open_initial_shell
         self.tabs: dict[str, TerminalTab] = {}
         self.master_window: MasterWindow | None = None
         self.window_overview: WindowOverview | None = None
@@ -2358,9 +2369,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if self.focus_mode:
             self.side.set_visible(False)
         self.side.refresh()
-        restored = self.restore_previous_tabs(records=restore_records)
-        if open_initial_shell and not restored and not self.app_context.store.list():
-            self.new_shell_tab()
+        self.restore_previous_tabs(records=restore_records)
 
     def on_delete(self, *_args) -> bool:
         for tab in list(self.tabs.values()):
@@ -2632,19 +2641,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             self.set_window_name(title)
 
     def new_window(self) -> None:
-        default_title = f"Window {len(self.app_context.windows) + 1}"
-        title = self._prompt_window_name(title="New TermDeck window", initial=default_title)
-        if title is None:
-            return
-        win = TermDeckWindow(
-            self.app_context,
-            window_title=title,
-            restore_records=[],
-            open_initial_shell=False,
-        )
-        self.app_context.windows.append(win)
-        win.show_all()
-        win.new_directory_tab()
+        self.app_context.prompt_for_new_window(parent=self)
 
     def _active_directory(self) -> str:
         page = self.notebook.get_current_page()
@@ -3460,6 +3457,47 @@ class TermDeckApplication(Gtk.Application):
         dialog.run()
         dialog.destroy()
 
+    def create_named_window(self, title: str, *, choose_first_directory: bool = True) -> TermDeckWindow:
+        """Create one named window and optionally ask for its first tab directory."""
+
+        clean_title = title.strip() or f"Window {len(self.windows) + 1}"
+        win = TermDeckWindow(
+            self,
+            window_title=clean_title,
+            restore_records=[],
+        )
+        self.windows.append(win)
+        win.show_all()
+        win.present()
+        if choose_first_directory:
+            win.new_directory_tab()
+        return win
+
+    def prompt_for_new_window(
+        self,
+        *,
+        parent: Gtk.Window | None = None,
+        first_run: bool = False,
+    ) -> TermDeckWindow | None:
+        """Prompt for a window name, then create its first directory-backed tab."""
+
+        default_title = f"Window {len(self.windows) + 1}"
+        dialog = WindowNameDialog(
+            parent,
+            title="Create your first TermDeck window" if first_run else "New TermDeck window",
+            initial=default_title,
+            confirm_label="Create window",
+            description="A window groups related directory tabs. Choose its first directory next.",
+        )
+        if parent is None:
+            dialog.set_application(self)
+        response = dialog.run()
+        title = dialog.value()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK or not title:
+            return None
+        return self.create_named_window(title, choose_first_directory=True)
+
     def build_control_plan_for_gui(
         self,
         records: list[SessionRecord],
@@ -3522,7 +3560,6 @@ class TermDeckApplication(Gtk.Application):
             window_id=window_id,
             window_title=title,
             restore_records=[],
-            open_initial_shell=False,
         )
         self.windows.append(win)
         for tab_index, tab in enumerate(recipe_window.tabs):
@@ -3587,8 +3624,8 @@ class TermDeckApplication(Gtk.Application):
                     self.windows.append(win)
                     win.show_all()
             else:
-                win = TermDeckWindow(self, window_id="main", window_title="Main")
-                self.windows.append(win)
+                self.prompt_for_new_window(first_run=True)
+                return
         self.windows[-1].present()
 
 

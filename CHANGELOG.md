@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+- Replaced the fresh-launch `Main` window and implicit current-directory shell with an explicit first-run flow: name the window, then choose its first tab directory.
+- Centralised first-run and additional-window creation through one application-level path so both flows use the same naming and directory-selection behavior.
+- Removed the `open_initial_shell` constructor switch and all automatic current-working-directory tab creation.
+- Cancelling the first-run naming dialog now leaves no generic window or silently launched process; cancelling the directory chooser leaves a valid named empty window with a visible New tab action.
+- Added behavioral coverage for first-run success, cancellation, additional-window reuse, noninteractive window creation, and activation routing.
+- Verified 325 tests and 11 subtests, plus a real Xvfb first-run flow that persisted `Client work` and created a `client-api` tab from the selected directory.
+
 ## 0.2.0
 
 - Simplified the product to one visible hierarchy: named TermDeck windows containing directory-backed tabs.

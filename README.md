@@ -11,8 +11,10 @@ See `RELEASE_NOTES.md` for the current verified build notes.
 
 ## Core workflow
 
-- Name a TermDeck window, such as **Client work**, **Backend**, or **Research**.
-- Press **New tab** or `Ctrl+T` and choose a directory.
+- On a fresh launch, TermDeck asks for the window name first, such as **Client work**, **Backend**, or **Research**.
+- After naming the window, choose the directory for its first tab.
+- TermDeck never silently creates a generic Main window or opens the process working directory.
+- Press **New tab** or `Ctrl+T` to add another directory.
 - TermDeck opens the user's default shell in that directory.
 - The tab is named from the directory's final component. For example, `/home/me/work/client-api` becomes **client-api**, never the full absolute path.
 - Tabs in the same window may use completely different directories.

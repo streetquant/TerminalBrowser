@@ -1,5 +1,31 @@
 # Release notes
 
+## 0.2.1
+
+TermDeck now starts with the same model it presents everywhere else: **create a named window, then choose its first directory-backed tab**.
+
+### First launch
+
+- A fresh profile no longer opens a generic `Main` window.
+- TermDeck asks for the window name first, with examples such as Client work, Backend, and Research.
+- After the name is confirmed, TermDeck opens the directory chooser for the first tab.
+- The chosen directory still supplies the default tab title through its basename.
+- Cancelling the naming dialog creates no window and starts no process.
+- Cancelling only the directory chooser leaves the named window open with its empty-state New tab action.
+
+### One creation path
+
+- First launch and **More → New TermDeck window** now use the same application-level creation routine.
+- The old `open_initial_shell` constructor option was deleted.
+- No GTK window constructor silently opens the process working directory anymore.
+- Saved windows and saved layouts continue restoring without an interactive directory prompt.
+
+### Verified
+
+- Full test suite: 325 passed, 11 subtests passed.
+- Real Xvfb first-run flow: entered `Client work`, selected a temporary `client-api` directory, and verified both the persisted window title and basename-derived running tab.
+- Existing saved-layout visual smoke remains independent of first-run onboarding.
+
 ## 0.2.0
 
 TermDeck now has one clear product model: **a named window groups directory-backed terminal tabs**.
