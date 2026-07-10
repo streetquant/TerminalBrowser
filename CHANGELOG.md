@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.3
+
+- Reduced the main HeaderBar to exactly three concepts: the user-defined window name, New tab, and More.
+- Removed the decorative status dot, the `Directory tabs` subtitle, and the duplicated `TermDeck ·` prefix from the in-app title.
+- Moved Search tabs and Command palette into More while retaining `Ctrl+Shift+P` and all existing keyboard access.
+- Kept the native window-manager title as `TermDeck · <window name>` and fixed its initial assignment order after the custom HeaderBar is installed.
+- Added a dedicated real-GTK header smoke check for exact visible actions, accessible names, native title, and ordered More-menu contents.
+- Verified 330 tests and 11 subtests, the reduced-header lifecycle smoke, and desktop/compact renders with zero application or layout errors.
+
 ## 0.2.2
 
 - Changed the default main layout to terminal-first: the tab strip and active terminal are shown, while the advanced Tabs pane starts hidden.

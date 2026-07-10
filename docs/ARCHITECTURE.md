@@ -6,7 +6,7 @@ TermDeck is organised around one visible hierarchy:
 Named window -> Directory-backed tab -> Hidden tmux-backed shell/process
 ```
 
-A window is the user-defined group. A tab is rooted in one directory and defaults to that directory's basename. The main layout shows only the tab strip and active terminal; the advanced Tabs pane is hidden by default and persisted through `appearance.tabs_pane_visible`. The GUI does not expose task templates, projects, tags, or tmux as peer concepts. SQLite and tmux remain implementation details that provide restore, persistence, and process control.
+A window is the user-defined group. A tab is rooted in one directory and defaults to that directory's basename. The HeaderBar exposes only the window name, New tab, and More; Search and Command palette are overflow actions. The main layout shows only the tab strip and active terminal; the advanced Tabs pane is hidden by default and persisted through `appearance.tabs_pane_visible`. The GUI does not expose task templates, projects, tags, or tmux as peer concepts. SQLite and tmux remain implementation details that provide restore, persistence, and process control.
 
 ## Main modules
 

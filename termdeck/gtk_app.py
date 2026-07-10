@@ -2252,7 +2252,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         )
         self.window_id = window_id or short_id("win")
         self.window_title = window_title or "Main"
-        self.set_title(f"TermDeck · {self.window_title}")
         self._restore_records = restore_records
         self.tabs: dict[str, TerminalTab] = {}
         self.master_window: MasterWindow | None = None
@@ -2267,48 +2266,38 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
         header = Gtk.HeaderBar()
         header.set_show_close_button(True)
-        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        status_dot = Gtk.Label(label="●")
-        _style(status_dot, "td-status-dot")
-        title_box.pack_start(status_dot, False, False, 0)
-        title_stack = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        title = Gtk.Label(label=f"TermDeck · {self.window_title}", xalign=0)
+        title = Gtk.Label(label=self.window_title, xalign=0)
         title.set_ellipsize(Pango.EllipsizeMode.END)
-        title.set_max_width_chars(18)
+        title.set_max_width_chars(28)
         title.set_tooltip_text("Window name · use More → Rename window to change it")
         _style(title, "td-title")
         self.window_title_label = title
-        subtitle = Gtk.Label(label="Directory tabs", xalign=0)
-        subtitle.set_ellipsize(Pango.EllipsizeMode.END)
-        subtitle.set_max_width_chars(18)
-        _style(subtitle, "td-subtitle", "td-muted")
-        title_stack.pack_start(title, False, False, 0)
-        title_stack.pack_start(subtitle, False, False, 0)
-        title_box.pack_start(title_stack, False, False, 0)
-        header.set_custom_title(title_box)
+        header.set_custom_title(title)
         self.set_titlebar(header)
+        self.set_title(f"TermDeck · {self.window_title}")
 
-        # Keep high-frequency actions visible; move secondary controls into a
-        # single discoverable overflow menu so the header stays calm at narrow widths.
-        primary_header_actions = [
-            ("New tab", "list-add-symbolic", "Choose a directory and open a new shell tab", self.new_directory_tab, True, False),
-        ]
-        for label, icon, tip, handler, suggested, show_label in primary_header_actions:
-            button = _icon_button(label, icon, tip, handler, suggested=suggested, show_label=show_label)
-            _style(button, "td-header-icon")
-            if not suggested:
-                _style(button, "td-ghost-action")
-            header.pack_start(button)
+        new_tab = _icon_button(
+            "New tab",
+            "list-add-symbolic",
+            "Choose a directory and open a new shell tab",
+            self.new_directory_tab,
+            suggested=True,
+            show_label=False,
+        )
+        _style(new_tab, "td-header-icon")
+        header.pack_start(new_tab)
 
         overflow_header_actions = [
             ("Rename window", self.rename_window),
             ("New TermDeck window", self.new_window),
+            ("Search tabs", self.open_search_window),
+            ("Command palette", self.open_command_palette),
+            ("Reopen closed tab", self.reopen_last_closed_tab),
+            ("Show/hide Tabs pane", self.toggle_tabs_pane),
             ("Tab manager", self.open_master_window),
             ("Window overview", self.open_window_overview),
             ("Keyboard shortcuts", self.open_shortcut_window),
             ("Terminal appearance", self.open_terminal_options),
-            ("Reopen closed tab", self.reopen_last_closed_tab),
-            ("Show/hide tabs pane", self.toggle_tabs_pane),
         ]
         overflow_menu = Gtk.Menu()
         for label, handler in overflow_header_actions:
@@ -2317,7 +2306,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             overflow_menu.append(item)
         overflow_menu.show_all()
         overflow = Gtk.MenuButton(label="⋯")
-        overflow.set_tooltip_text("More window, tab, and appearance actions")
+        overflow.set_tooltip_text("More window and tab actions")
         try:
             overflow.get_accessible().set_name("More actions")
         except Exception:
@@ -2325,14 +2314,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         overflow.set_popup(overflow_menu)
         _style(overflow, "td-header-overflow", "td-header-icon")
         header.pack_end(overflow)
-
-        for label, icon, tip, handler in [
-            ("Search", "system-search-symbolic", "Search remembered tabs", self.open_search_window),
-            ("Palette", "edit-find-symbolic", "Command palette (Ctrl+Shift+P)", self.open_command_palette),
-        ]:
-            button = _icon_button(label, icon, tip, handler, suggested=False, show_label=False)
-            _style(button, "td-ghost-action", "td-header-icon")
-            header.pack_end(button)
 
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         self.notebook = Gtk.Notebook(scrollable=True)
@@ -2631,7 +2612,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         clean_title = title.strip() or "Window"
         self.window_title = clean_title
         self.set_title(f"TermDeck · {clean_title}")
-        self.window_title_label.set_text(f"TermDeck · {clean_title}")
+        self.window_title_label.set_text(clean_title)
         self.app_context.store.rename_window(self.window_id, clean_title)
         for session_id, tab in self.tabs.items():
             updated = self.app_context.store.get(session_id)

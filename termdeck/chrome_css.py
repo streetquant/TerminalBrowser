@@ -112,7 +112,6 @@ headerbar button.td-header-group-end {{ margin-left: 8px; }}
   font-weight: 700;
   letter-spacing: 0.10em;
 }}
-.td-status-dot {{ color: {tokens.success}; font-size: {size["chip"]}; }}
 .td-side-pane {{
   background-color: {tokens.bg_raised};
   border: 1px solid alpha({tokens.border}, 0.95);

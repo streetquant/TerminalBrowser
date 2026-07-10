@@ -180,15 +180,17 @@ class UiSurfaceStaticTests(unittest.TestCase):
         for name in ("dark", "noir", "system"):
             self.assertIn(f'"{name}"', self.theme)
 
-    def test_headerbar_grouped_icon_actions(self):
+    def test_headerbar_is_reduced_to_title_new_tab_and_more(self):
         self.assertIn("_icon_button", self.gtk)
-        self.assertIn("primary_header_actions", self.gtk)
+        self.assertIn('title = Gtk.Label(label=self.window_title', self.gtk)
+        self.assertIn('new_tab = _icon_button(', self.gtk)
         self.assertIn("overflow_header_actions", self.gtk)
         self.assertIn("list-add-symbolic", self.gtk)
         self.assertIn('Gtk.MenuButton(label="⋯")', self.gtk)
         self.assertIn("show_label=False", self.gtk)
         self.assertIn('"td-header-icon"', self.gtk)
-        self.assertIn("set_tooltip_text", self.gtk)
+        self.assertNotIn("primary_header_actions", self.gtk)
+        self.assertNotIn("td-status-dot", self.gtk)
 
     def test_side_pane_tab_cards(self):
         self.assertIn("td-session-card", self.gtk)

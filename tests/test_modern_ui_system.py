@@ -31,16 +31,21 @@ class ModernUiSystemTests(unittest.TestCase):
         self.assertIn("transition:", css)
         self.assertIn("min-height: 52px", css)
 
-    def test_header_uses_primary_actions_and_overflow_menu(self) -> None:
-        self.assertIn("primary_header_actions", GTK_APP)
+    def test_header_exposes_only_window_name_new_tab_and_overflow(self) -> None:
+        self.assertIn('title = Gtk.Label(label=self.window_title', GTK_APP)
+        self.assertIn("title.set_max_width_chars(28)", GTK_APP)
+        self.assertIn('new_tab = _icon_button(', GTK_APP)
         self.assertIn("overflow_header_actions", GTK_APP)
+        self.assertIn('("Search tabs", self.open_search_window)', GTK_APP)
+        self.assertIn('("Command palette", self.open_command_palette)', GTK_APP)
         self.assertIn('Gtk.MenuButton(label="⋯")', GTK_APP)
         self.assertIn('set_name("More actions")', GTK_APP)
-        self.assertIn("show_label=False", GTK_APP)
         self.assertIn('"td-header-overflow", "td-header-icon"', GTK_APP)
-        self.assertIn("title.set_max_width_chars(18)", GTK_APP)
-        self.assertIn("subtitle.set_max_width_chars(18)", GTK_APP)
-        self.assertNotIn("discover_group + manage_group + window_group", GTK_APP)
+        self.assertNotIn("primary_header_actions", GTK_APP)
+        self.assertNotIn('status_dot = Gtk.Label', GTK_APP)
+        self.assertNotIn('subtitle = Gtk.Label(label="Directory tabs"', GTK_APP)
+        self.assertNotIn('("Search", "system-search-symbolic"', GTK_APP)
+        self.assertNotIn('("Palette", "edit-find-symbolic"', GTK_APP)
 
     def test_tabs_pane_has_modern_hierarchy_and_empty_state(self) -> None:
         self.assertIn('Gtk.Label(label="WINDOW"', GTK_APP)

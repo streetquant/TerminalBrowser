@@ -1,5 +1,38 @@
 # Release notes
 
+## 0.2.3
+
+TermDeck's default chrome now matches the product model literally: **one named window, terminal tabs, New tab, and one More menu**.
+
+### Reduced window header
+
+- The in-app title shows only the user-defined window name, such as `Backend`.
+- Removed the decorative green status dot and the `Directory tabs` subtitle.
+- Removed the repeated `TermDeck ·` prefix from the in-app label.
+- The operating-system/window-manager title still uses `TermDeck · Backend` for identification outside the app.
+- New tab remains the only directly visible action.
+- More is the only secondary-action entry point.
+
+### Consolidated discovery
+
+- Search tabs moved into More.
+- Command palette moved into More.
+- `Ctrl+Shift+P` still opens the command palette directly.
+- Search, Tab manager, Window overview, shortcuts, appearance, reopen, pane visibility, window rename, and new-window creation remain available without crowding the header.
+
+### Runtime hardening
+
+- Fixed initial native-title assignment by setting it after the custom GTK HeaderBar is installed.
+- Added a dedicated Xvfb header smoke check that requires exactly `New tab` and `More actions` as accessible clickable actions.
+- The header smoke also verifies the complete ordered More menu and distinct in-app/native titles.
+
+### Verified
+
+- Full test suite: 330 passed, 11 subtests passed.
+- Reduced-header and Tabs-pane lifecycle smoke: passed.
+- Desktop GTK render: `1290x856`, zero application or layout errors.
+- Compact GTK render: requested and captured `640x520`, zero application or layout errors.
+
 ## 0.2.2
 
 TermDeck now opens as the simpler application model requested: **a named window with terminal tabs, without a duplicate control pane occupying the default layout**.

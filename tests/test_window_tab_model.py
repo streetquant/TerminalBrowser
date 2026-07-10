@@ -146,7 +146,7 @@ class WindowTabModelTests(TestCase):
                 TermDeckWindow.set_window_name(window, "Backend")
 
                 self.assertEqual(window.window_title, "Backend")
-                self.assertEqual(window.window_title_label.text, "TermDeck · Backend")
+                self.assertEqual(window.window_title_label.text, "Backend")
                 self.assertEqual(window.native_title, "TermDeck · Backend")
                 self.assertEqual(tab.record.window_title, "Backend")
                 self.assertEqual(window.side.refresh_count, 1)

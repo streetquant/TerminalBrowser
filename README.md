@@ -18,6 +18,7 @@ See `RELEASE_NOTES.md` for the current verified build notes.
 - TermDeck opens the user's default shell in that directory.
 - The tab is named from the directory's final component. For example, `/home/me/work/client-api` becomes **client-api**, never the full absolute path.
 - Tabs in the same window may use completely different directories.
+- The header shows only the window name, New tab, and More.
 - Use **More → Rename window** to change the group name at any time.
 - Use **More → New TermDeck window** to create another named group.
 
@@ -73,6 +74,10 @@ The report checks runtime dependencies, summarises imported Terminator appearanc
 
 ## Using the GUI
 
+### Window header
+
+The header contains only the current window name, **New tab**, and **More**. Search tabs, Command palette, window controls, restoration, appearance, and advanced managers are grouped inside More. The operating-system title retains the `TermDeck ·` prefix, but the in-app label does not repeat it.
+
 ### Create a tab
 
 Press **New tab** or `Ctrl+T`, choose a directory, and TermDeck opens the default shell there. The directory basename becomes the initial tab title. Double-click the tab title or use its right-click menu to rename it.
@@ -101,7 +106,7 @@ termdeck uninstall-desktop
 
 ## Command palette
 
-Use **Palette** or `Ctrl+Shift+P` to search window actions and remembered tabs. Useful searches include:
+Use **More → Command palette** or `Ctrl+Shift+P` to search window actions and remembered tabs. Useful searches include:
 
 ```text
 new tab
