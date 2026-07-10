@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.28
+
+- Added Ctrl-right-click selection across the complete Sessions card, including its checkbox and action buttons, while preserving existing multi-selection.
+- Updated Sessions-pane guidance and added behavioural coverage for card-wide context selection.
+- Materialised portable workspace placeholders such as `{shell}` immediately before GTK project panes create their sessions.
+- Prevented detected project shells from launching the literal `{shell}` command and dying with status 127.
+- Added a runtime regression test for project-pane command materialisation.
+
 ## 0.1.27
 
 - Made select-to-copy durable across focus and selection changes by installing GTK clipboard ownership after VTE updates its internal selections.

@@ -1,5 +1,23 @@
 # Release notes
 
+## 0.1.28
+
+This build fixes two direct interaction failures in the Sessions pane and detected-project launcher.
+
+### Added or stabilised
+
+- Ctrl-right-click now adds a session to the current multi-selection from the card body, checkbox, tag, Rename button, or Open button before showing context actions.
+- Existing selected sessions remain selected, allowing ergonomic multi-session context actions.
+- GTK project-pane creation now materialises `{shell}` and other supported placeholders at launch time.
+- Detected project shells no longer execute the literal `{shell}` token or produce a dead tmux pane with exit status 127.
+
+### Verified
+
+- Focused pointer-selection and project-pane runtime regressions.
+- Full unit test suite: 312 passed, 11 subtests passed.
+- Python syntax compilation for `termdeck` and `tests`.
+- GitHub repository visibility: private.
+
 ## 0.1.27
 
 This build fixes clipboard ownership, session lifecycle, auxiliary-window closing, and responsiveness at their integration boundaries.

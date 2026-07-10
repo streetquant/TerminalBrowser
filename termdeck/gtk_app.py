@@ -1434,7 +1434,7 @@ class SidePane(Gtk.Box):
         title_event.connect("button-press-event", self._on_header_button_press)
         self.pack_start(title_event, False, False, 0)
 
-        hint = Gtk.Label(label="Ctrl-click a tag to multi-select · right-click rows for actions", xalign=0)
+        hint = Gtk.Label(label="Ctrl-click a tag or Ctrl-right-click anywhere to multi-select · right-click for actions", xalign=0)
         hint.set_line_wrap(True)
         _style(hint, "td-muted")
         self.pack_start(hint, False, False, 0)
@@ -1540,19 +1540,32 @@ class SidePane(Gtk.Box):
         if check is not None and check.get_active() != active:
             check.set_active(active)
 
+    def _select_record_for_context(self, record: SessionRecord, check: Gtk.CheckButton | None = None) -> None:
+        """Add a session to the current selection without clearing peer selections."""
+        self.selected_ids.add(record.id)
+        if check is not None and not check.get_active():
+            check.set_active(True)
+
     def _on_tag_button_press(self, _widget, event: Gdk.EventButton, record: SessionRecord, check: Gtk.CheckButton) -> bool:
         button = int(getattr(event, "button", 0) or 0)
         state = int(getattr(event, "state", 0) or 0)
-        if button == 1 and state & Gdk.ModifierType.CONTROL_MASK:
+        control = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        if button == 1 and control:
             self._toggle_record_selection(record, check)
             return True
         if button == 3:
+            if control:
+                self._select_record_for_context(record, check)
             self._show_session_menu(record, check, event)
             return True
         return False
 
     def _on_session_button_press(self, _widget, event: Gdk.EventButton, record: SessionRecord, check: Gtk.CheckButton) -> bool:
-        if int(getattr(event, "button", 0) or 0) == 3:
+        button = int(getattr(event, "button", 0) or 0)
+        state = int(getattr(event, "state", 0) or 0)
+        if button == 3:
+            if state & Gdk.ModifierType.CONTROL_MASK:
+                self._select_record_for_context(record, check)
             self._show_session_menu(record, check, event)
             return True
         return False
@@ -1677,6 +1690,7 @@ class SidePane(Gtk.Box):
             check = Gtk.CheckButton()
             check.set_active(record.id in self.selected_ids)
             check.connect("toggled", self._on_toggle, record.id)
+            check.connect("button-press-event", self._on_session_button_press, record, check)
             top.pack_start(check, False, False, 0)
             pin = "📌 " if record.pinned else ""
             title = Gtk.Label(label=f"{kind_glyph(kind)} {pin}{record.name}", xalign=0)
@@ -1710,9 +1724,11 @@ class SidePane(Gtk.Box):
             rename = Gtk.Button(label="Rename")
             rename.set_tooltip_text("Rename this tab/session")
             rename.connect("clicked", lambda _b, r=record: self.window.rename_session(r))
+            rename.connect("button-press-event", self._on_session_button_press, record, check)
             actions.pack_end(rename, False, False, 0)
             focus = Gtk.Button(label="Open")
             focus.connect("clicked", lambda _b, r=record: self.window.open_session(r))
+            focus.connect("button-press-event", self._on_session_button_press, record, check)
             actions.pack_end(focus, False, False, 0)
             card.pack_start(actions, False, False, 0)
 
@@ -3525,10 +3541,11 @@ class TermDeckApplication(Gtk.Application):
         )
         self.windows.append(win)
         for tab_index, tab in enumerate(recipe_window.tabs):
+            command = render_command(tab.command, cwd=tab.cwd)
             record = self.store.create(
                 name=tab.name,
                 tag=tab.tag,
-                command=tab.command,
+                command=command,
                 cwd=tab.cwd,
                 window_id=window_id,
                 window_title=title,
