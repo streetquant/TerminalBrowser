@@ -1426,20 +1426,47 @@ class SidePane(Gtk.Box):
         if density == "compact":
             _style(self, "td-density-compact")
 
+        header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        heading_stack = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        eyebrow = Gtk.Label(label="WORKSPACE", xalign=0)
+        _style(eyebrow, "td-eyebrow")
         title = Gtk.Label(label="Sessions", xalign=0)
         _style(title, "title", "td-title")
+        heading_stack.pack_start(eyebrow, False, False, 0)
+        heading_stack.pack_start(title, False, False, 0)
         title_event = Gtk.EventBox()
-        title_event.add(title)
+        title_event.add(heading_stack)
         title_event.set_tooltip_text("Right-click to move the sessions pane left or right")
         title_event.connect("button-press-event", self._on_header_button_press)
-        self.pack_start(title_event, False, False, 0)
+        header_row.pack_start(title_event, True, True, 0)
+        self.count_label = Gtk.Label(label="0 active")
+        _style(self.count_label, "td-count-pill")
+        header_row.pack_end(self.count_label, False, False, 0)
 
-        hint = Gtk.Label(label="Ctrl-click a tag or Ctrl-right-click anywhere to multi-select · right-click for actions", xalign=0)
+        pane_menu = Gtk.Menu()
+        for label, handler in [
+            ("Move pane left", lambda: self.window.set_side_pane_position("left")),
+            ("Move pane right", lambda: self.window.set_side_pane_position("right")),
+            ("Toggle focus mode", self.window.toggle_focus_mode),
+            ("Terminal appearance", self.window.open_terminal_options),
+        ]:
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", lambda _item, h=handler: h())
+            pane_menu.append(item)
+        pane_menu.show_all()
+        pane_more = Gtk.MenuButton(label="⋯")
+        pane_more.set_tooltip_text("Sessions pane options")
+        pane_more.set_popup(pane_menu)
+        _style(pane_more, "td-ghost-action")
+        header_row.pack_end(pane_more, False, False, 0)
+        self.pack_start(header_row, False, False, 0)
+
+        hint = Gtk.Label(label="Ctrl+right-click anywhere on a card to collect sessions", xalign=0)
         hint.set_line_wrap(True)
         _style(hint, "td-muted")
         self.pack_start(hint, False, False, 0)
 
-        self.filter_entry = Gtk.SearchEntry(placeholder_text="filter tags/sessions")
+        self.filter_entry = Gtk.SearchEntry(placeholder_text="Search sessions, tags, or commands")
         _style(self.filter_entry, "td-search-entry")
         _connect_debounced_refresh(self.filter_entry, self.refresh)
         self.pack_start(self.filter_entry, False, False, 0)
@@ -1451,27 +1478,28 @@ class SidePane(Gtk.Box):
         scroller.add(self.session_box)
         self.pack_start(scroller, True, True, 0)
 
-        self.prompt = Gtk.Entry(placeholder_text="send text/prompt to selected sessions")
+        self.prompt = Gtk.Entry(placeholder_text="Send a command or prompt to selected sessions")
+        _style(self.prompt, "td-search-entry")
         self.pack_start(self.prompt, False, False, 0)
 
-        # Primary bulk actions stay visible; secondary live under a menu.
+        # Primary bulk actions remain visible with clear semantic emphasis.
         primary = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         _style(primary, "td-bottom-bar")
-        for label, handler in [
-            ("Send", self.send_prompt),
-            ("Pause", self.pause_selected),
-            ("Resume", self.resume_selected),
-            ("Kill", self.kill_selected),
+        for label, handler, style_class in [
+            ("Send", self.send_prompt, "td-primary-action"),
+            ("Pause", self.pause_selected, "td-ghost-action"),
+            ("Resume", self.resume_selected, "td-ghost-action"),
+            ("Kill", self.kill_selected, "td-danger-action"),
         ]:
             button = Gtk.Button(label=label)
-            if label == "Kill":
-                button.get_style_context().add_class("destructive-action")
+            _style(button, style_class)
             button.connect("clicked", lambda _b, h=handler: h())
             primary.pack_start(button, True, True, 0)
         self.pack_start(primary, False, False, 0)
 
         more = Gtk.MenuButton(label="More actions ▾")
         more.set_tooltip_text("Secondary session controls")
+        _style(more, "td-more-actions")
         menu = Gtk.Menu()
         secondary = [
             ("Launcher", self.window.open_launcher),
@@ -1645,6 +1673,11 @@ class SidePane(Gtk.Box):
         ]
         live_ids = {record.id for record in records}
         self.selected_ids.intersection_update(live_ids)
+        selected_count = len(self.selected_ids)
+        if selected_count:
+            self.count_label.set_text(f"{selected_count} selected · {len(records)} shown")
+        else:
+            self.count_label.set_text(f"{len(records)} active")
         resource_bucket = int(time.monotonic() // self._refresh_bucket_seconds)
         signature = (
             query,
@@ -1660,11 +1693,32 @@ class SidePane(Gtk.Box):
         # One tmux list-panes -a + fast /proc trees instead of N×(has-session+list-panes+full /proc).
         pids = self.window.app_context.backend.pane_pids(records)
         if not records:
-            empty = Gtk.Label(label="No sessions yet.\nOpen a project or create a tab.", xalign=0)
-            empty.set_line_wrap(True)
-            _style(empty, "td-muted")
+            empty_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            _style(empty_card, "td-empty-state")
+            empty_icon = Gtk.Label(label="✦")
+            _style(empty_icon, "td-empty-icon")
+            empty_card.pack_start(empty_icon, False, False, 0)
+            empty_title = Gtk.Label(label="No active sessions", xalign=0.5)
+            _style(empty_title, "td-title")
+            empty_card.pack_start(empty_title, False, False, 0)
+            empty_detail = Gtk.Label(label="Start a shell or open the detected project workspace.", xalign=0.5)
+            empty_detail.set_line_wrap(True)
+            empty_detail.set_justify(Gtk.Justification.CENTER)
+            _style(empty_detail, "td-muted")
+            empty_card.pack_start(empty_detail, False, False, 0)
+            empty_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            shell_button = Gtk.Button(label="New shell")
+            _style(shell_button, "td-primary-action")
+            shell_button.connect("clicked", lambda *_: self.window.new_shell_tab())
+            empty_actions.pack_start(shell_button, True, True, 0)
+            project_button = Gtk.Button(label="Open project")
+            _style(project_button, "td-ghost-action")
+            project_button.connect("clicked", lambda *_: self.window.open_detected_project())
+            empty_actions.pack_start(project_button, True, True, 0)
+            empty_card.pack_start(empty_actions, False, False, 0)
             row = Gtk.ListBoxRow()
-            row.add(empty)
+            row.set_selectable(False)
+            row.add(empty_card)
             self.session_box.add(row)
             self.session_box.show_all()
             return
@@ -1684,11 +1738,14 @@ class SidePane(Gtk.Box):
                 mem = None
             resource = format_resource_cue(snap.cpu_percent if snap.exists else None, mem)
 
-            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin=4)
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5, margin=3)
             _style(card, "td-session-card")
-            top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            if record.id in self.selected_ids:
+                _style(card, "td-session-selected")
+            top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
             check = Gtk.CheckButton()
             check.set_active(record.id in self.selected_ids)
+            check.set_data("termdeck-session-card", card)
             check.connect("toggled", self._on_toggle, record.id)
             check.connect("button-press-event", self._on_session_button_press, record, check)
             top.pack_start(check, False, False, 0)
@@ -1720,13 +1777,15 @@ class SidePane(Gtk.Box):
                 meta.pack_start(res, False, False, 0)
             card.pack_start(meta, False, False, 0)
 
-            actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
             rename = Gtk.Button(label="Rename")
             rename.set_tooltip_text("Rename this tab/session")
+            _style(rename, "td-ghost-action")
             rename.connect("clicked", lambda _b, r=record: self.window.rename_session(r))
             rename.connect("button-press-event", self._on_session_button_press, record, check)
             actions.pack_end(rename, False, False, 0)
             focus = Gtk.Button(label="Open")
+            _style(focus, "td-primary-action")
             focus.connect("clicked", lambda _b, r=record: self.window.open_session(r))
             focus.connect("button-press-event", self._on_session_button_press, record, check)
             actions.pack_end(focus, False, False, 0)
@@ -1741,10 +1800,24 @@ class SidePane(Gtk.Box):
         self.session_box.show_all()
 
     def _on_toggle(self, button: Gtk.CheckButton, session_id: str) -> None:
-        if button.get_active():
+        active = bool(button.get_active())
+        if active:
             self.selected_ids.add(session_id)
         else:
             self.selected_ids.discard(session_id)
+        card = button.get_data("termdeck-session-card")
+        if card is not None:
+            context = card.get_style_context()
+            if active:
+                context.add_class("td-session-selected")
+            else:
+                context.remove_class("td-session-selected")
+        if hasattr(self, "count_label"):
+            selected_count = len(self.selected_ids)
+            visible_count = len([record for record in self.window.app_context.store.list() if _show_in_sessions_pane(record)])
+            self.count_label.set_text(
+                f"{selected_count} selected · {visible_count} active" if selected_count else f"{visible_count} active"
+            )
 
     def selected_records(self) -> list[SessionRecord]:
         records = []
@@ -2307,44 +2380,62 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
         header = Gtk.HeaderBar()
         header.set_show_close_button(True)
-        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        status_dot = Gtk.Label(label="●")
+        _style(status_dot, "td-status-dot")
+        title_box.pack_start(status_dot, False, False, 0)
+        title_stack = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         title = Gtk.Label(label=f"TermDeck · {self.window_title}", xalign=0)
         _style(title, "td-title")
-        subtitle = Gtk.Label(label="browser-like terminal tasks", xalign=0)
+        subtitle = Gtk.Label(label="Terminal workspace", xalign=0)
         _style(subtitle, "td-subtitle", "td-muted")
-        title_box.pack_start(title, False, False, 0)
-        title_box.pack_start(subtitle, False, False, 0)
+        title_stack.pack_start(title, False, False, 0)
+        title_stack.pack_start(subtitle, False, False, 0)
+        title_box.pack_start(title_stack, False, False, 0)
         header.set_custom_title(title_box)
         self.set_titlebar(header)
 
-        # Grouped browser chrome: create · discover · manage · window
-        create_group = [
+        # Keep high-frequency actions visible; move secondary controls into a
+        # single discoverable overflow menu so the header stays calm at narrow widths.
+        primary_header_actions = [
             ("New", "list-add-symbolic", "New task launcher", self.open_launcher, True),
             ("Shell", "utilities-terminal-symbolic", "New shell tab", self.new_shell_tab, False),
-            ("Task", "document-new-symbolic", "New custom task", self.new_command_tab, False),
-            ("Project", "folder-symbolic", "Detected project workspace", self.open_detected_project, False),
         ]
-        discover_group = [
-            ("Palette", "edit-find-symbolic", "Command palette (Ctrl+Shift+P)", self.open_command_palette, False),
-            ("Search", "system-search-symbolic", "Search remembered tabs", self.open_search_window, False),
-        ]
-        manage_group = [
-            ("Master", "utilities-system-monitor-symbolic", "Master task manager", self.open_master_window, False),
-            ("Windows", "view-grid-symbolic", "Window overview", self.open_window_overview, False),
-            ("Keys", "input-keyboard-symbolic", "Keyboard shortcuts", self.open_shortcut_window, False),
-            ("Term", "preferences-desktop-font-symbolic", "Terminal font, cursor, palette, scrollback", self.open_terminal_options, False),
-        ]
-        window_group = [
-            ("Reopen", "edit-undo-symbolic", "Reopen last closed tab", self.reopen_last_closed_tab, False),
-            ("Focus", "view-fullscreen-symbolic", "Toggle focus mode (hide side pane)", self.toggle_focus_mode, False),
-            ("Window", "window-new-symbolic", "New TermDeck window", self.new_window, False),
-        ]
-        for label, icon, tip, handler, suggested in create_group:
-            header.pack_start(_icon_button(label, icon, tip, handler, suggested=suggested))
-        for index, (label, icon, tip, handler, suggested) in enumerate(discover_group + manage_group + window_group):
+        for label, icon, tip, handler, suggested in primary_header_actions:
             button = _icon_button(label, icon, tip, handler, suggested=suggested)
-            if index == 0:
-                button.get_style_context().add_class("td-header-group-end")
+            if not suggested:
+                _style(button, "td-ghost-action")
+            header.pack_start(button)
+
+        overflow_header_actions = [
+            ("New custom task", self.new_command_tab),
+            ("Open detected project", self.open_detected_project),
+            ("Master task manager", self.open_master_window),
+            ("Window overview", self.open_window_overview),
+            ("Keyboard shortcuts", self.open_shortcut_window),
+            ("Terminal appearance", self.open_terminal_options),
+            ("Reopen closed tab", self.reopen_last_closed_tab),
+            ("Toggle focus mode", self.toggle_focus_mode),
+            ("New TermDeck window", self.new_window),
+        ]
+        overflow_menu = Gtk.Menu()
+        for label, handler in overflow_header_actions:
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", lambda _item, h=handler: h())
+            overflow_menu.append(item)
+        overflow_menu.show_all()
+        overflow = Gtk.MenuButton(label="More ▾")
+        overflow.set_tooltip_text("Workspace, window, and appearance actions")
+        overflow.set_popup(overflow_menu)
+        _style(overflow, "td-header-overflow")
+        header.pack_end(overflow)
+
+        for label, icon, tip, handler in [
+            ("Search", "system-search-symbolic", "Search remembered tabs", self.open_search_window),
+            ("Palette", "edit-find-symbolic", "Command palette (Ctrl+Shift+P)", self.open_command_palette),
+        ]:
+            button = _icon_button(label, icon, tip, handler, suggested=False)
+            _style(button, "td-ghost-action")
             header.pack_end(button)
 
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)

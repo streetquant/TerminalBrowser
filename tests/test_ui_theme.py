@@ -182,8 +182,10 @@ class UiSurfaceStaticTests(unittest.TestCase):
 
     def test_headerbar_grouped_icon_actions(self):
         self.assertIn("_icon_button", self.gtk)
-        self.assertIn("create_group", self.gtk)
+        self.assertIn("primary_header_actions", self.gtk)
+        self.assertIn("overflow_header_actions", self.gtk)
         self.assertIn("utilities-terminal-symbolic", self.gtk)
+        self.assertIn('Gtk.MenuButton(label="More ▾")', self.gtk)
         self.assertIn("set_tooltip_text", self.gtk)
 
     def test_side_pane_session_cards(self):

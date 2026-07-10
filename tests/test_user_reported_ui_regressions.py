@@ -93,7 +93,7 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn("self.selected_ids.intersection_update", side)
         self.assertIn("state & Gdk.ModifierType.CONTROL_MASK", side)
         self.assertIn("check.set_active(active)", side)
-        self.assertIn("Ctrl-click a tag or Ctrl-right-click anywhere to multi-select", side)
+        self.assertIn("Ctrl+right-click anywhere on a card to collect sessions", side)
         self.assertIn("def _select_record_for_context", side)
         self.assertIn('check.connect("button-press-event", self._on_session_button_press, record, check)', side)
         self.assertIn('rename.connect("button-press-event", self._on_session_button_press, record, check)', side)

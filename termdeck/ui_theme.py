@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Mapping
 
+from .chrome_css import build_modern_chrome_css
 from .models import DEFAULT_PALETTE, TerminalTheme
 
 CHROME_THEME_NAMES = ("dark", "noir", "system")
@@ -62,48 +63,50 @@ class ChromeTokens:
 CHROME_TOKENS: Mapping[str, ChromeTokens] = {
     "dark": ChromeTokens(
         name="dark",
-        bg="#0d1117",
-        bg_raised="#161b22",
-        bg_sunken="#010409",
-        fg="#e6edf3",
-        fg_muted="#8b949e",
-        border="#30363d",
-        accent="#58a6ff",
-        accent_fg="#0d1117",
-        danger="#f85149",
-        warning="#d29922",
-        success="#3fb950",
+        bg="#090d18",
+        bg_raised="#121a2b",
+        bg_sunken="#060914",
+        fg="#f4f7fb",
+        fg_muted="#94a3b8",
+        border="#27334b",
+        accent="#7c9cff",
+        accent_fg="#07111f",
+        danger="#fb7185",
+        warning="#fbbf24",
+        success="#34d399",
+        card_radius=14,
     ),
     "noir": ChromeTokens(
         name="noir",
-        bg="#050505",
-        bg_raised="#111111",
-        bg_sunken="#000000",
-        fg="#f2f2f2",
-        fg_muted="#8a8a8a",
-        border="#2a2a2a",
-        accent="#39ff14",
-        accent_fg="#050505",
-        danger="#ff3355",
-        warning="#ffcc00",
-        success="#39ff14",
-        card_radius=6,
+        bg="#050607",
+        bg_raised="#111315",
+        bg_sunken="#010203",
+        fg="#f7f8f8",
+        fg_muted="#92999f",
+        border="#292d31",
+        accent="#65f58a",
+        accent_fg="#031107",
+        danger="#ff5f78",
+        warning="#ffd166",
+        success="#65f58a",
+        card_radius=12,
     ),
     "system": ChromeTokens(
         name="system",
         # Light desktop-following shell used when system prefers light.
         # When system prefers dark, effective_chrome_theme() maps to "dark".
-        bg="#f6f8fa",
+        bg="#f3f6fb",
         bg_raised="#ffffff",
-        bg_sunken="#eef1f4",
-        fg="#1f2328",
-        fg_muted="#656d76",
-        border="#d0d7de",
-        accent="#0969da",
+        bg_sunken="#e9eef6",
+        fg="#172033",
+        fg_muted="#667085",
+        border="#d5ddea",
+        accent="#4f66e8",
         accent_fg="#ffffff",
-        danger="#cf222e",
-        warning="#9a6700",
-        success="#1a7f37",
+        danger="#d92d4f",
+        warning="#a15c00",
+        success="#087a55",
+        card_radius=14,
     ),
 }
 
@@ -527,215 +530,17 @@ def build_chrome_css(
         "compact": _css_px(base_size - 1, scale),
     }
 
-    return f"""
-/* TermDeck chrome — theme={tokens.name} density={dens} ui_font={ui_font or "system"} scale={scale:.2f} */
-window, dialog, messagedialog {{
-  background-color: {tokens.bg};
-  color: {tokens.fg};
-}}
-headerbar {{
-  background-image: none;
-  background-color: {tokens.bg_raised};
-  border-bottom: 1px solid {tokens.border};
-  box-shadow: none;
-  padding: 4px 8px;
-  min-height: 42px;
-}}
-headerbar label, headerbar button {{
-  color: {tokens.fg};
-}}
-headerbar button {{
-  background-image: none;
-  background-color: transparent;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  padding: 4px 8px;
-  margin: 0 1px;
-}}
-headerbar button:hover {{
-  background-color: alpha({tokens.accent}, 0.14);
-  border-color: alpha({tokens.accent}, 0.35);
-}}
-headerbar button.suggested-action, button.td-accent {{
-  background-image: none;
-  background-color: {tokens.accent};
-  color: {tokens.accent_fg};
-  border-radius: 8px;
-  border: none;
-  font-weight: 600;
-}}
-headerbar button.td-header-group-end {{
-  margin-left: 8px;
-}}
-/* Interface type — configurable via appearance.ui_font / ui_font_scale. */
-* {{
-  {font_family_css}
-  font-size: {size["base"]};
-}}
-.td-title {{
-  font-weight: 600;
-  font-size: {size["title"]};
-  color: {tokens.fg};
-}}
-.td-subtitle, .dim-label, .td-muted {{
-  color: {tokens.fg_muted};
-  font-size: {size["muted"]};
-}}
-.td-side-pane {{
-  background-color: {tokens.bg_raised};
-  border-left: 1px solid {tokens.border};
-  padding: {margin}px;
-}}
-.td-session-card {{
-  background-color: {tokens.bg};
-  border: 1px solid {tokens.border};
-  border-radius: {radius}px;
-  padding: {pad}px;
-  margin: {margin // 2}px 0;
-}}
-.td-session-card:hover {{
-  border-color: alpha({tokens.accent}, 0.55);
-}}
-.td-chip {{
-  background-color: alpha({tokens.accent}, 0.16);
-  color: {tokens.accent};
-  border-radius: 999px;
-  padding: 2px 10px;
-  font-size: {size["chip"]};
-  font-weight: 600;
-}}
-.td-badge {{
-  border-radius: 999px;
-  padding: 2px 10px;
-  font-size: {size["chip"]};
-  font-weight: 600;
-}}
-.td-badge-ok {{ background-color: alpha({tokens.success}, 0.18); color: {tokens.success}; }}
-.td-badge-warn {{ background-color: alpha({tokens.warning}, 0.18); color: {tokens.warning}; }}
-.td-badge-danger {{ background-color: alpha({tokens.danger}, 0.18); color: {tokens.danger}; }}
-.td-badge-muted {{ background-color: alpha({tokens.fg_muted}, 0.18); color: {tokens.fg_muted}; }}
-.td-badge-info {{ background-color: alpha({tokens.accent}, 0.18); color: {tokens.accent}; }}
-.td-resource {{
-  font-family: {tokens.mono};
-  font-size: {size["chip"]};
-  color: {tokens.fg_muted};
-}}
-.td-mono, .td-accel, .td-id {{
-  font-family: {tokens.mono};
-  font-size: {size["mono"]};
-}}
-.td-table-window, .td-overlay-dialog {{
-  background-color: {tokens.bg};
-}}
-.td-overlay-dialog border, .td-overlay-dialog {{
-  border-radius: 12px;
-}}
-.td-search-entry entry, entry.td-search-entry {{
-  background-color: {tokens.bg_sunken};
-  border: 1px solid {tokens.border};
-  border-radius: 10px;
-  padding: 10px 14px;
-  color: {tokens.fg};
-  min-height: 38px;
-  font-size: {size["base"]};
-}}
-.td-list-row {{
-  padding: {pad}px;
-  border-bottom: 1px solid alpha({tokens.border}, 0.7);
-}}
-.td-list-row:hover {{
-  background-color: alpha({tokens.accent}, 0.08);
-}}
-.td-category {{
-  font-size: {size["chip"]};
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  color: {tokens.accent};
-}}
-notebook header tabs {{
-  background-color: {tokens.bg_raised};
-  border-color: {tokens.border};
-}}
-notebook tab {{
-  background-color: transparent;
-  border-radius: 8px 8px 0 0;
-  padding: 6px 12px;
-  margin: 2px 2px 0 2px;
-  color: {tokens.fg_muted};
-  font-size: {size["base"]};
-}}
-notebook tab:checked {{
-  background-color: {tokens.bg};
-  color: {tokens.fg};
-  box-shadow: inset 0 -2px 0 {tokens.accent};
-}}
-button.td-tab-close {{
-  min-width: 22px;
-  min-height: 22px;
-  padding: 0;
-  border-radius: 999px;
-  font-size: {size["base"]};
-}}
-.td-bottom-bar {{
-  background-color: {tokens.bg_raised};
-  border-top: 1px solid {tokens.border};
-  padding: 8px;
-}}
-.td-bottom-bar button, headerbar button, button {{
-  font-size: {size["button"]};
-  min-height: 30px;
-}}
-.td-toast {{
-  background-color: {tokens.bg_raised};
-  border: 1px solid {tokens.border};
-  border-radius: 10px;
-  padding: 10px 16px;
-  color: {tokens.fg};
-  font-size: {size["base"]};
-  box-shadow: 0 8px 24px alpha(#000000, 0.35);
-}}
-.td-toast.td-toast-success {{ border-color: alpha({tokens.success}, 0.55); }}
-.td-toast.td-toast-warn {{ border-color: alpha({tokens.warning}, 0.55); }}
-.td-toast.td-toast-danger {{ border-color: alpha({tokens.danger}, 0.55); }}
-treeview {{
-  background-color: {tokens.bg};
-  color: {tokens.fg};
-  border: none;
-  font-size: {size["base"]};
-}}
-treeview:selected {{
-  background-color: alpha({tokens.accent}, 0.28);
-  color: {tokens.fg};
-}}
-treeview header button {{
-  background-image: none;
-  background-color: {tokens.bg_raised};
-  color: {tokens.fg_muted};
-  border: none;
-  border-bottom: 1px solid {tokens.border};
-  font-weight: 600;
-  font-size: {size["button"]};
-  padding: 8px 10px;
-}}
-scrollbar slider {{
-  background-color: alpha({tokens.fg_muted}, 0.35);
-  border-radius: 99px;
-  min-width: 10px;
-  min-height: 10px;
-}}
-.td-density-compact * {{
-  font-size: {size["compact"]};
-}}
-.td-density-compact .td-session-card {{
-  padding: 6px 8px;
-}}
-.td-density-compact treeview {{
-  font-size: {size["compact"]};
-}}
-.td-focus-mode .td-side-pane {{
-  opacity: 0.0;
-}}
-"""
+    return build_modern_chrome_css(
+        tokens=tokens,
+        density=dens,
+        ui_font=ui_font,
+        scale=scale,
+        font_family_css=font_family_css,
+        size=size,
+        pad=pad,
+        margin=margin,
+        radius=radius,
+    )
 
 
 def terminal_palette_pack(name: str | None) -> dict[str, object]:

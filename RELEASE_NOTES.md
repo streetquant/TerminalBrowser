@@ -1,5 +1,24 @@
 # Release notes
 
+## 0.1.29
+
+This release gives TermDeck a cohesive modern visual system while preserving its existing terminal, session, and safety behaviour.
+
+### Visual and interaction redesign
+
+- Replaced the flat chrome with layered dark, noir, and system surfaces, softer borders, modern rounded geometry, restrained shadows, and consistent hover/focus states.
+- Reduced header clutter to the most frequent actions and moved secondary workspace, window, shortcut, and appearance controls into a single overflow menu.
+- Redesigned the Sessions pane with clearer hierarchy, active/selected counts, stronger search and prompt surfaces, semantic Send/Pause/Resume/Kill actions, and actionable empty-state guidance.
+- Added persistent visual emphasis for selected sessions and refined cards, badges, tabs, close buttons, tables, menus, dialogs, tooltips, scrollbars, and toasts.
+- Split the generated GTK stylesheet into a dedicated chrome module to keep future visual changes isolated and testable.
+
+### Verified
+
+- Full unit test suite: 316 passed, 11 subtests passed.
+- GTK CSS parser accepted dark, noir, and system themes.
+- Python syntax compilation for `termdeck` and `tests`.
+- GitHub repository visibility: private.
+
 ## 0.1.28
 
 This build fixes two direct interaction failures in the Sessions pane and detected-project launcher.

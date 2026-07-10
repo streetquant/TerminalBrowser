@@ -54,22 +54,21 @@ class GtkAppStaticTests(unittest.TestCase):
         source = GTK_APP.read_text(encoding="utf-8")
         self.assertIn("open_detected_project", source)
         self.assertIn("detect_project", source)
-        # Header uses short icon labels; project remains reachable.
-        self.assertTrue("Project" in source and "folder-symbolic" in source)
+        self.assertIn('("Open detected project", self.open_detected_project)', source)
 
     def test_window_overview_is_exposed_in_gui(self):
         source = GTK_APP.read_text(encoding="utf-8")
         self.assertIn("WindowOverview", source)
         self.assertIn("open_window_overview", source)
         self.assertIn("window_overview", source)
-        self.assertIn("Windows", source)
+        self.assertIn('("Window overview", self.open_window_overview)', source)
 
 
     def test_shortcut_help_is_exposed_in_gui(self):
         source = GTK_APP.read_text(encoding="utf-8")
         self.assertIn("ShortcutWindow", source)
         self.assertIn("open_shortcut_window", source)
-        self.assertIn("input-keyboard-symbolic", source)
+        self.assertIn('("Keyboard shortcuts", self.open_shortcut_window)', source)
         self.assertIn("shortcut_entries", source)
 
     def test_shortcut_window_supports_close_and_column_sort(self):

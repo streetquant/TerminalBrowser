@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.29
+
+- Rebuilt the GTK chrome around layered dark, noir, and system palettes with modern spacing, rounded geometry, elevation, and consistent interactive states.
+- Simplified the main header to high-frequency New, Shell, Search, and Palette actions with secondary workspace controls in a responsive overflow menu.
+- Redesigned the Sessions pane with a workspace hierarchy, live active/selected counts, stronger search and prompt fields, semantic bulk actions, and a guided empty state.
+- Added persistent selected-card styling, clearer health/tag badges, modern tab treatment, refined menus, tooltips, scrollbars, tables, dialogs, and toast feedback.
+- Extracted the chrome stylesheet into a dedicated module and added visual-system regression coverage plus GTK parser verification for every theme.
+
 ## 0.1.28
 
 - Added Ctrl-right-click selection across the complete Sessions card, including its checkbox and action buttons, while preserving existing multi-selection.
