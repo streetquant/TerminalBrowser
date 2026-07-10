@@ -2354,23 +2354,16 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         return False
 
     def _build_tab_label(self, record: SessionRecord) -> Gtk.Box:
-        """Notebook tab with kind glyph, pin, attention cue, and close control."""
+        """Minimal notebook tab containing only the tab name and close control."""
         label_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        kind = kind_for_session(name=record.name, command=record.command, tag=record.tag)
-        pin = "📌" if record.pinned else ""
-        attention = ""
-        try:
-            pid = record.last_pid
-            snap = self.app_context.sampler.snapshot(pid) if pid else None
-            if snap is not None:
-                health = classify_session(record, snap, self.app_context.budget)
-                if should_pause_for_attention(health) or "critical" in health_badge(health).lower():
-                    attention = "●"
-        except Exception:
-            attention = ""
-        text = f"{kind_glyph(kind)} {pin}{attention}{record.name}".strip()
-        name = Gtk.Label(label=text)
-        name.set_tooltip_text(f"{record.cwd} · {record.command}\nDouble-click to rename · Right-click for tab actions")
+        name = Gtk.Label(label=record.name)
+        name.set_ellipsize(Pango.EllipsizeMode.END)
+        name.set_max_width_chars(24)
+        state = "Pinned · " if record.pinned else ""
+        name.set_tooltip_text(
+            f"{state}{record.cwd} · {record.command}\n"
+            "Double-click to rename · Right-click for tab actions"
+        )
         name.set_events(name.get_events() | Gdk.EventMask.BUTTON_PRESS_MASK)
         name.connect("button-press-event", self._on_tab_label_press, record.id)
         label_box.pack_start(name, True, True, 0)

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.4
+
+- Simplified the visible notebook tab to exactly the user-defined tab name and one close control.
+- Removed type/category glyphs, pin emoji, and live health/attention markers from the main tab strip.
+- Added end ellipsis and a 24-character width cap so long directory-derived names remain compact without changing their stored value.
+- Kept pinned-state guidance in tooltips/context actions and retained health/resource detail in the optional Tabs pane and Tab Manager.
+- Added static and real-GTK coverage for exact pinned and renamed tab labels, close-control stability, and absence of visible decoration.
+- Added the minimal tab-strip smoke to the GitHub Actions UI job before desktop and compact rendering.
+- Verified 330 tests and 11 subtests, the tab-strip smoke, and desktop/compact renders with zero application or layout errors.
+
 ## 0.2.3
 
 - Reduced the main HeaderBar to exactly three concepts: the user-defined window name, New tab, and More.

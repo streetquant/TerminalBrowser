@@ -1,5 +1,38 @@
 # Release notes
 
+## 0.2.4
+
+TermDeck's main tab strip now follows the same reduction as its header: **tab name, close control, nothing else**.
+
+### Minimal tab labels
+
+- Each notebook tab displays exactly its stored name.
+- Directory-backed defaults therefore remain plain names such as `client-api`.
+- Explicitly renamed tabs display the new name without an added prefix or icon.
+- Long names use end ellipsis and a 24-character visual cap; the underlying stored name is unchanged.
+
+### Removed visual decoration
+
+- Removed terminal/task category glyphs from the main tab strip.
+- Removed the pin emoji from visible tab titles.
+- Removed live health and attention dots from visible tab titles.
+- These states remain available where they are actionable: pin/unpin in the tab context menu and tooltips, and health/resource information in the optional Tabs pane and Tab Manager.
+
+### Runtime verification
+
+- Added a real GTK tab-strip smoke using a pinned `client-api` tab.
+- Verified that its visible label remains exactly `client-api`.
+- Renamed the same tab to `api-renamed` and verified the visible label updates exactly.
+- Verified one label, one `×` close control, ellipsis behavior, pinned tooltip guidance, and no visible semantic decoration.
+- Wired the smoke into GitHub Actions before desktop and compact rendering.
+
+### Verified
+
+- Full test suite: 330 passed, 11 subtests passed.
+- Minimal tab-strip smoke: passed.
+- Desktop GTK render: `1290x856`, zero application or layout errors.
+- Compact GTK render: requested and captured `640x520`, zero application or layout errors.
+
 ## 0.2.3
 
 TermDeck's default chrome now matches the product model literally: **one named window, terminal tabs, New tab, and one More menu**.

@@ -36,6 +36,7 @@ The project should not compete as another generic terminal. The differentiator i
 Final choice after round 3:
 
 - Minimal HeaderBar containing only the user-defined window name, New tab, and More; discovery and advanced controls live in overflow or shortcuts.
+- Minimal notebook labels containing only the exact tab name and close control; category, pin, health, and attention metadata live outside the main strip.
 - Terminal-first main layout with an optional, persisted Tabs pane for filtering, multi-selection, prompts, status, pause, resume, stop, and restore controls.
 - Tab manager showing ID, window, name, PID, health, state, CPU, RAM, process count, runtime, shortcuts, command, directory, and captured output.
 - Resource monitoring implemented through Linux `/proc` without psutil.

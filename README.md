@@ -25,7 +25,8 @@ See `RELEASE_NOTES.md` for the current verified build notes.
 ## What it does
 
 - Native named windows and directory-backed terminal tabs.
-- Terminal-first main layout: only the tab strip and active terminal are shown by default.
+- Terminal-first main layout: only the minimal tab strip and active terminal are shown by default.
+- Each visible tab contains only its exact name and close control; pin and health metadata stay in contextual/advanced views.
 - Optional **Tabs** pane for search, multi-selection, prompting, pause, resume, hide, archive, and stop actions; toggle it with `F9`, More, or the command palette.
 - `Ctrl+left-click` multi-selection anywhere on a tab card; right-click remains context-menu only.
 - Command palette for window actions, remembered tabs, search, restore, and process controls.
@@ -81,6 +82,10 @@ The header contains only the current window name, **New tab**, and **More**. Sea
 ### Create a tab
 
 Press **New tab** or `Ctrl+T`, choose a directory, and TermDeck opens the default shell there. The directory basename becomes the initial tab title. Double-click the tab title or use its right-click menu to rename it.
+
+### Tab strip
+
+The visible tab strip shows only each tab's name and `×` close control. Category icons, pin emoji, and live health markers are intentionally excluded from the strip. Pinned-state guidance remains in the close tooltip and right-click actions; health and resource details remain in the optional Tabs pane and Tab Manager. Long names are visually ellipsised without changing the stored tab name.
 
 ### Name a window
 

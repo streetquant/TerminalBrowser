@@ -198,10 +198,17 @@ class UiSurfaceStaticTests(unittest.TestCase):
         self.assertIn("health_badge_class", self.gtk)
         self.assertIn("More actions", self.gtk)
 
-    def test_notebook_tab_affordances(self):
-        self.assertIn("_build_tab_label", self.gtk)
-        self.assertIn("kind_glyph", self.gtk)
-        self.assertIn("td-tab-close", self.gtk)
+    def test_notebook_tab_affordances_are_name_and_close_only(self):
+        start = self.gtk.index("    def _build_tab_label")
+        end = self.gtk.index("    def _tab_menu_item", start)
+        tab_label = self.gtk[start:end]
+        self.assertIn("Gtk.Label(label=record.name)", tab_label)
+        self.assertIn("td-tab-close", tab_label)
+        self.assertIn("set_max_width_chars(24)", tab_label)
+        self.assertNotIn("kind_glyph", tab_label)
+        self.assertNotIn("health_badge", tab_label)
+        self.assertNotIn("should_pause_for_attention", tab_label)
+        self.assertNotIn("📌", tab_label)
 
     def test_gui_rename_session_is_wired(self):
         self.assertIn("def rename_session", self.gtk)
