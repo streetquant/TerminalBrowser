@@ -28,6 +28,12 @@ class ShortcutManifestTests(unittest.TestCase):
         self.assertEqual(actions["new_tab"]["accelerator"], "<Alt>t")
         self.assertEqual(actions["new_tab"]["source"], "terminator")
 
+    def test_terminator_import_cannot_displace_ctrl_shift_v_paste(self):
+        report = build_shortcut_report({"paste": "<Alt>v"})
+        actions = {row["action"]: row for row in report["shortcuts"]}
+        self.assertEqual(actions["paste"]["accelerator"], "<Primary><Shift>v")
+        self.assertEqual(actions["paste"]["source"], "default")
+
     def test_emacs_safe_profile_rejects_terminal_conflicting_terminator_binding(self):
         report = build_shortcut_report({"close_term": "<Primary>w"}, profile="emacs-safe")
         actions = {row["action"]: row for row in report["shortcuts"]}

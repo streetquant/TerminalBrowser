@@ -40,9 +40,18 @@ class TerminalPasteShortcutTest(TestCase):
 
         self.assertTrue(TermDeckWindow._is_paste_event(window, event))
 
+    def test_ctrl_shift_v_is_unconditional_system_clipboard_paste(self) -> None:
+        window = make_window(paste_matches=False)
+        event = SimpleNamespace(
+            keyval=gtk_app.Gdk.KEY_v,
+            state=gtk_app.Gdk.ModifierType.CONTROL_MASK | gtk_app.Gdk.ModifierType.SHIFT_MASK,
+        )
+
+        self.assertTrue(TermDeckWindow._is_paste_event(window, event))
+
     def test_keymap_paste_binding_is_respected(self) -> None:
         window = make_window(paste_matches=True)
-        event = SimpleNamespace(keyval=gtk_app.Gdk.KEY_v, state=gtk_app.Gdk.ModifierType.CONTROL_MASK | gtk_app.Gdk.ModifierType.SHIFT_MASK)
+        event = SimpleNamespace(keyval=gtk_app.Gdk.KEY_F8, state=0)
 
         self.assertTrue(TermDeckWindow._is_paste_event(window, event))
 
@@ -63,6 +72,21 @@ class TerminalPasteShortcutTest(TestCase):
 
         self.assertTrue(handled)
         self.assertEqual(calls, ["paste"])
+
+    def test_ctrl_shift_v_handler_routes_system_clipboard_paste_without_keymap_match(self) -> None:
+        calls = []
+        attach = SimpleNamespace(paste_clipboard=lambda: calls.append("clipboard"), copy_clipboard=lambda: calls.append("copy"))
+        window = make_window(paste_matches=False, attach=attach)
+        window.handle_zoom_event = lambda _event: False
+        event = SimpleNamespace(
+            keyval=gtk_app.Gdk.KEY_v,
+            state=gtk_app.Gdk.ModifierType.CONTROL_MASK | gtk_app.Gdk.ModifierType.SHIFT_MASK,
+        )
+
+        handled = TermDeckWindow.on_terminal_key_press(window, None, event)
+
+        self.assertTrue(handled)
+        self.assertEqual(calls, ["clipboard"])
 
 
 if __name__ == "__main__":

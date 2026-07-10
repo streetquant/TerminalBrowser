@@ -1,5 +1,26 @@
 # Release notes
 
+## 0.2.8
+
+`Ctrl+Shift+V` now always pastes the system clipboard into the active terminal.
+
+### Guaranteed clipboard behavior
+
+- The shortcut is handled explicitly before configurable or imported keybindings.
+- It reads `Gdk.SELECTION_CLIPBOARD`, not the primary-selection buffer.
+- Imported Terminator paste bindings can no longer replace `Ctrl+Shift+V` or cause the shortcut report to advertise a different primary paste key.
+- `Ctrl+V`, `Shift+Insert`, and any additional configured paste binding continue to work as secondary paths.
+
+### Verification
+
+- Unit coverage verifies chord recognition even when the keymap reports no paste match.
+- Handler coverage verifies the active terminal receives exactly one clipboard-paste call.
+- A real Xvfb/GTK smoke sets the system clipboard to `termdeck-clipboard-paste-marker`, triggers `Ctrl+Shift+V`, and verifies that exact text is fed once into the active VTE.
+- The clipboard smoke runs in GitHub Actions before visual rendering.
+- Full test suite: 341 passed, 15 subtests passed.
+- Desktop GTK render: `1290x858`, zero application or layout errors.
+- Compact GTK render: requested and captured `640x520`, zero application or layout errors.
+
 ## 0.2.7
 
 TermDeck now has a cohesive visual identity rather than relying on lightly styled GTK defaults. The product model remains unchanged: named windows, directory-backed tabs and the terminal-first layout.

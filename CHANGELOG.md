@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.8
+
+- Made `Ctrl+Shift+V` an unconditional system-clipboard paste shortcut in the active terminal.
+- Prevented imported Terminator keybindings from displacing the standard paste accelerator or making the shortcut report disagree with runtime behavior.
+- Preserved `Ctrl+V`, `Shift+Insert`, and explicitly configured additional paste bindings as secondary paste paths.
+- Added focused shortcut and pipeline tests plus a real GTK clipboard smoke that owns `Gdk.SELECTION_CLIPBOARD`, triggers `Ctrl+Shift+V`, and verifies the exact clipboard text is fed once into the active VTE.
+- Verified 341 tests and 15 subtests, exact one-shot clipboard delivery, and desktop/compact renders with zero application or layout errors.
+
 ## 0.2.7
 
 - Reworked the GTK visual system around a softer layered dark palette with clearer separation between the app background, raised chrome, sunken terminal surface, borders and accent states.

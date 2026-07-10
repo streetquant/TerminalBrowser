@@ -3293,16 +3293,21 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         return None
 
     def _is_paste_event(self, event: Gdk.EventKey) -> bool:
-        """Ctrl+Shift+V, Ctrl+V, or Shift+Insert → paste into terminal."""
-        if self.keymap.matches(event, "paste"):
-            return True
+        """Ctrl+Shift+V, Ctrl+V, or Shift+Insert → system clipboard paste."""
         state = self.keymap._clean_state(event.state)
         ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
         shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
         keyval = Gdk.keyval_to_lower(event.keyval)
         name = (Gdk.keyval_name(keyval) or "").lower()
+        is_v = keyval in {Gdk.KEY_v, Gdk.KEY_V} or name == "v"
+        # Ctrl+Shift+V is unconditional: imported keymaps must not displace the
+        # standard terminal clipboard shortcut.
+        if ctrl and shift and is_v:
+            return True
+        if self.keymap.matches(event, "paste"):
+            return True
         # Ctrl+V (browser-style paste into terminal)
-        if ctrl and not shift and (keyval in {Gdk.KEY_v, Gdk.KEY_V} or name == "v"):
+        if ctrl and not shift and is_v:
             return True
         # Shift+Insert
         if shift and not ctrl and keyval in {Gdk.KEY_Insert, Gdk.KEY_KP_Insert}:

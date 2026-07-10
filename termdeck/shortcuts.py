@@ -113,7 +113,9 @@ PROFILES: Mapping[str, Mapping[str, str]] = {
     "emacs-safe": EMACS_SAFE_SHORTCUTS,
 }
 
-TERMINATOR_IMPORT_ACTIONS = {"new_tab", "close_term", "next_tab", "prev_tab", "copy", "paste"}
+# Paste stays fixed at Ctrl+Shift+V so imported Terminator bindings cannot
+# displace the standard system-clipboard shortcut.
+TERMINATOR_IMPORT_ACTIONS = {"new_tab", "close_term", "next_tab", "prev_tab", "copy"}
 
 PROTECTED_TERMINAL_KEYS: Mapping[str, str] = {
     "<primary>a": "shell/readline beginning of line",

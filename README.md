@@ -451,6 +451,7 @@ Visible tabs are restored on the next launch and grouped by their previous TermD
 | Ctrl+Q | Quit TermDeck, keep all tmux sessions alive |
 | Ctrl+Shift+L | Focus the side-pane command box |
 | Ctrl+Shift+P | Open the command palette |
+| Ctrl+Shift+V | Paste the system clipboard into the active terminal |
 | Shift+Esc / Ctrl+Shift+M | Open Tab manager |
 | Ctrl+Shift+Space | Pause/resume current tab process |
 | Ctrl+Tab | Next tab |
@@ -459,7 +460,7 @@ Visible tabs are restored on the next launch and grouped by their previous TermD
 | Ctrl+Alt+1..9 | Pause/resume that numbered tab process |
 | F9 | Show or hide the Tabs pane |
 
-Terminator keybindings are imported from `~/.config/terminator/config` when present. Inspect the resolved map and any conflicts with:
+Terminator keybindings are imported from `~/.config/terminator/config` when present. `Ctrl+Shift+V` remains fixed as the system-clipboard paste shortcut and cannot be displaced by an imported binding. Inspect the resolved map and any conflicts with:
 
 ```bash
 python3 -m termdeck shortcuts

@@ -98,6 +98,10 @@ jobs:
         run: >-
           xvfb-run -a dbus-run-session --
           .venv-ui/bin/python scripts/check_shortcut_lifecycle_smoke.py
+      - name: Verify Ctrl+Shift+V clipboard paste
+        run: >-
+          xvfb-run -a dbus-run-session --
+          .venv-ui/bin/python scripts/check_clipboard_paste_smoke.py
       - name: Verify polished visual hierarchy
         run: >-
           xvfb-run -a dbus-run-session --
