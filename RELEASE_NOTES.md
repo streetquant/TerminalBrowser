@@ -14,6 +14,8 @@ This build validates the modern UI through the real GTK runtime and fixes two de
 - Added `scripts/render_ui_smoke.py`, which launches the public GUI command inside isolated Xvfb, D-Bus, HOME, SQLite, and tmux environments.
 - The harness captures the mapped TermDeck window, reports its dimensions and image size, separates application errors from expected headless portal warnings, and cleans up every temporary process.
 - Added a dedicated GitHub Actions `ui-smoke` job that provisions system GTK/VTE bindings, runs the harness, and uploads the PNG frame for review.
+- Split CI into Python 3.10–3.12 compatibility checks and a system-Python GTK test job, ensuring PyGObject-dependent tests run with the bindings they require.
+- Updated the workflow to `actions/checkout@v7`, `actions/setup-python@v6`, and `actions/upload-artifact@v7`.
 - Verified a nonblank `1290x856` PNG frame from the real CLI path with zero TermDeck application error lines.
 
 ### Verified

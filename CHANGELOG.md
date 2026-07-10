@@ -7,6 +7,8 @@
 - Fixed `termdeck gui --db ... --workspace ...` by preventing argparse-consumed options from being passed to `Gtk.Application` a second time.
 - Added regression coverage for the GTK card-reference path and the CLI-to-GTK argument boundary.
 - Added a dedicated GitHub Actions `ui-smoke` job that installs GTK/VTE dependencies, renders the real application, and uploads the captured frame as a CI artifact.
+- Repaired CI by separating Python 3.10–3.12 syntax/CLI compatibility checks from the full GTK-enabled test suite, so PyGObject-dependent tests run against system GTK bindings instead of failing during import.
+- Updated GitHub Actions to the current `checkout` v7, `setup-python` v6, and `upload-artifact` v7 major releases.
 - Updated development documentation for the modern overflow header and repeatable real-window visual verification.
 
 ## 0.1.29
