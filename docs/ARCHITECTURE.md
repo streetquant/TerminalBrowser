@@ -27,6 +27,14 @@ A window is the user-defined group. A tab is rooted in one directory and default
 
 The normal creation flow has one decision: choose a directory. TermDeck opens the user's default shell in that directory and derives the initial tab title from its final path component. A separate window-name dialog changes the logical group name and persists that title across every tab in the window.
 
+## Terminal attachment and first-frame geometry
+
+`AttachTerminal` waits for a stable VTE `size-allocate` grid before starting the visible tmux client. It seeds both ends of the PTY with that row/column size and keeps the VTE PTY geometry synchronised on later allocations. This prevents tmux from briefly rendering an `80x24` client inside a maximised terminal and filling the unused area with dotted padding.
+
+## Management surfaces
+
+Tab Manager is a per-tab/process operational table with resource data, output preview and controls. Window Overview aggregates those rows into one read-only summary per named TermDeck window. They deliberately answer different questions and share the same underlying snapshots.
+
 ## Process control
 
 Hiding a tab detaches the visible terminal client but leaves its hidden process alive. Pause/resume signals the process group. Stop is destructive and terminates the hidden tmux session. These lifecycle controls do not change the user-facing window/tab hierarchy.

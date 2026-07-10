@@ -85,7 +85,7 @@ Press **New tab** or `Ctrl+T`, choose a directory, and TermDeck opens the defaul
 
 ### Tab strip
 
-The visible tab strip shows only each tab's name and `×` close control. Category icons, pin emoji, and live health markers are intentionally excluded from the strip. Pinned-state guidance remains in the close tooltip and right-click actions; health and resource details remain in the optional Tabs pane and Tab Manager. Long names are visually ellipsised without changing the stored tab name.
+The visible tab strip shows only each tab's name and `×` close control. Category icons, pin emoji, and live health markers are intentionally excluded from the strip. Pinned state remains in the tab tooltip and right-click actions; the close tooltip explains that the session keeps running, while health and resource details remain in the optional Tabs pane and Tab Manager. Long names are visually ellipsised without changing the stored tab name.
 
 ### Name a window
 
@@ -132,9 +132,11 @@ python3 -m termdeck palette "rename window"
 python3 -m termdeck palette "pause hot"
 ```
 
-## Tab manager
+## Tab Manager and Window Overview
 
-Open **Tab manager** with `Shift+Esc` or `Ctrl+Shift+M`. It provides process and resource details for remembered tabs and supports safe multi-tab controls. Captured previews are redacted by default.
+**Tab Manager** is the detailed, actionable view. It shows one row per tab/process with PID, state, health, CPU, RAM, process count, command, directory, captured output and multi-tab controls. Open it with `Shift+Esc`, `Ctrl+Shift+M`, or **More → Tab manager · per-tab details**.
+
+**Window Overview** is the read-only summary. It shows one row per named TermDeck window with aggregate tab counts, resource load and health. Open it through **More → Window overview · window totals**.
 
 ## Search, activity, and browser recovery
 
@@ -439,9 +441,10 @@ Visible tabs are restored on the next launch and grouped by their previous TermD
 | Shortcut | Action |
 |---|---|
 | Ctrl+T | New shell tab |
-| Ctrl+Shift+T | New command tab |
-| Ctrl+W | Hide current tab, keep tmux session alive |
+| Ctrl+Shift+T | Reopen the most recently closed tab |
+| Ctrl+W | Close current tab, keep its tmux session alive |
 | Ctrl+Shift+W | Stop current session |
+| Ctrl+Q | Quit TermDeck, keep all tmux sessions alive |
 | Ctrl+Shift+L | Focus the side-pane command box |
 | Ctrl+Shift+P | Open the command palette |
 | Shift+Esc / Ctrl+Shift+M | Open Tab manager |
@@ -450,7 +453,7 @@ Visible tabs are restored on the next launch and grouped by their previous TermD
 | Ctrl+Shift+Tab | Previous tab |
 | Alt+1..9 | Jump to tab |
 | Ctrl+Alt+1..9 | Pause/resume that numbered tab process |
-| F9 | Toggle side pane |
+| F9 | Show or hide the Tabs pane |
 
 Terminator keybindings are imported from `~/.config/terminator/config` when present. Inspect the resolved map and any conflicts with:
 
@@ -460,7 +463,7 @@ python3 -m termdeck shortcuts --json
 python3 -m termdeck shortcuts --profile emacs-safe --json
 ```
 
-The default `browser` profile keeps familiar browser keys such as Ctrl+T and Ctrl+W. The `emacs-safe` profile refuses imported bindings that would steal protected shell/readline editing keys. Emacs-style shortcuts such as Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+R, Ctrl+Y, and Ctrl+W are reported as protected terminal keys so users understand what passes through to the running tab process.
+The default `browser` profile keeps familiar browser keys such as Ctrl+T, Ctrl+W and Ctrl+Q. The `emacs-safe` profile refuses imported bindings that would steal protected shell/readline editing keys. Emacs-style shortcuts such as Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+R, Ctrl+Y, and Ctrl+W are reported as protected terminal keys so users understand what passes through to the running tab process.
 
 Print the active shortcut report without launching the GUI:
 

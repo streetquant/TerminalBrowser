@@ -8,23 +8,20 @@ from termdeck.session_store import SessionStore
 
 
 class TabCloseBehaviourTest(TestCase):
-    def test_pinned_close_button_shows_guidance_without_hiding(self) -> None:
+    def test_pinned_close_button_closes_tab_without_unpinning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")
             record = store.create("pinned", "dev", "bash", tmp, tab_index=0)
             store.update(record.id, pinned=True)
             hidden = []
-            toasts = []
             window = SimpleNamespace(
                 app_context=SimpleNamespace(store=store),
-                hide_tab=lambda session_id, **_kwargs: hidden.append(session_id),
-                show_toast=lambda text, **_kwargs: toasts.append(text),
+                hide_tab=lambda session_id, **kwargs: hidden.append((session_id, kwargs)),
             )
 
             TermDeckWindow._hide_tab_from_close_button(window, record.id)
 
-            self.assertEqual(hidden, [])
-            self.assertEqual(toasts, ["Pinned tab: right-click and choose Unpin and hide tab"])
+            self.assertEqual(hidden, [(record.id, {"include_pinned": True})])
             self.assertTrue(store.get(record.id).pinned)
             store.close()
 

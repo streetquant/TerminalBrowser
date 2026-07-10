@@ -1,5 +1,41 @@
 # Release notes
 
+## 0.2.6
+
+This release fixes the startup rendering artifact shown as dotted tmux padding and defines clear close-versus-stop behavior.
+
+### Startup rendering fix
+
+- TermDeck no longer attaches the tmux client at the PTY default `80x24` before GTK finishes sizing the terminal.
+- VTE allocation is debounced briefly, then the PTY and tmux client are created using the final terminal row/column grid.
+- Later resize allocations continue synchronising the PTY geometry.
+- The terminal container, notebook, paned layout and root overlay explicitly expand across the full client area.
+- A real Xvfb/tmux smoke maximises the window and verifies that the first tmux client grid and tmux window grid exactly match the VTE grid, with no initial `80x24` mismatch.
+
+### Close, quit and stop
+
+- `Ctrl+W` closes the active tab in the UI and marks it hidden, but leaves its tmux session and process running.
+- `Ctrl+Shift+T` reopens the most recently closed tab.
+- `Ctrl+Q` closes all TermDeck windows and exits the application while leaving all tmux sessions running and preserving normal restore visibility.
+- `Ctrl+Shift+W` remains the destructive action that stops the active session.
+- The tab `×` control follows the same non-destructive close rule, including for pinned tabs.
+- **More → Quit TermDeck** provides the same session-preserving quit operation.
+
+### Management views
+
+- **Tab Manager · per-tab details** shows one row per tab/process with PID, state, health, CPU/RAM, command, directory, captured output and control actions.
+- **Window Overview · window totals** shows one read-only aggregate row per named window with tab counts, resource load and health.
+
+### Runtime verification
+
+- First attachment: VTE, tmux client and tmux window all used the same final grid.
+- The main paned surface covered the complete GTK client allocation.
+- Real `Ctrl+W` closed one tab while its tmux session remained alive.
+- Real `Ctrl+Q` closed every TermDeck window while all three test sessions remained alive.
+- Full test suite: 337 passed, 15 subtests passed.
+- Desktop GTK render: `1290x856`, zero application or layout errors.
+- Compact GTK render: requested and captured `640x520`, zero application or layout errors.
+
 ## 0.2.5
 
 Search Tabs now tolerates ordinary typing mistakes while remaining predictable and local.

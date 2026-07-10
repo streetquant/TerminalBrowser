@@ -90,6 +90,14 @@ jobs:
         run: >-
           xvfb-run -a dbus-run-session --
           .venv-ui/bin/python scripts/check_fuzzy_search_smoke.py
+      - name: Verify startup terminal geometry
+        run: >-
+          xvfb-run -a dbus-run-session --
+          .venv-ui/bin/python scripts/check_startup_geometry_smoke.py
+      - name: Verify Ctrl+W and Ctrl+Q lifecycle
+        run: >-
+          xvfb-run -a dbus-run-session --
+          .venv-ui/bin/python scripts/check_shortcut_lifecycle_smoke.py
       - name: Render desktop GTK layout
         run: .venv-ui/bin/python scripts/render_ui_smoke.py --output termdeck-ui-smoke-desktop.png
       - name: Render compact GTK layout

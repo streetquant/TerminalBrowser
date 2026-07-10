@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import pty
 import signal
+import struct
 import subprocess
 import sys
+import termios
 import time
 from pathlib import Path
 
@@ -258,7 +261,16 @@ class AttachTerminal(Gtk.Box):
         self.cwd = cwd
         self.theme = theme
         self.process: subprocess.Popen[bytes] | None = None
+        self.pty_obj = None
+        self._detached = False
+        self._spawn_source_id = 0
+        self._spawn_fallback_source_id = 0
+        self._last_allocated_grid = (0, 0)
         self.terminal = Vte.Terminal()
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+        self.terminal.set_hexpand(True)
+        self.terminal.set_vexpand(True)
         apply_theme(self.terminal, theme, font_override=font_override)
         # VTE keeps focus for typing; connect here so Ctrl++/- zoom is not swallowed.
         if key_press_handler is not None:
@@ -267,21 +279,90 @@ class AttachTerminal(Gtk.Box):
         self.terminal.connect_after("button-release-event", self._on_button_release)
         self.terminal.connect("selection-changed", self._on_selection_changed)
         self.terminal.connect("button-press-event", self._on_button_press)
+        self.terminal.connect("size-allocate", self._on_terminal_size_allocate)
+        self.connect("destroy", lambda *_: self._cancel_pending_spawn())
         self._selection_pending = False
         self._selection_autocopy_source_id = 0
         # Last select-to-copy payload — used when pasting back into this terminal
         # (VTE paste_* can miss text we put on the clipboard ourselves).
         self._last_copied_text = ""
         self.pack_start(self.terminal, True, True, 0)
-        self._spawn()
+        # tmux renders dotted padding when a client attaches at the PTY default
+        # 80x24 and the GTK window is resized immediately afterwards. Debounce
+        # the initial allocation so tmux receives the final VTE grid from frame 1.
+        self._spawn_fallback_source_id = GLib.timeout_add(500, self._spawn_fallback)
 
-    def _spawn(self) -> None:
+    @staticmethod
+    def _remove_glib_source(source_id: int) -> None:
+        if not source_id:
+            return
+        try:
+            GLib.source_remove(source_id)
+        except Exception:
+            pass
+
+    def _cancel_pending_spawn(self) -> None:
+        self._remove_glib_source(self._spawn_source_id)
+        self._remove_glib_source(self._spawn_fallback_source_id)
+        self._spawn_source_id = 0
+        self._spawn_fallback_source_id = 0
+
+    def _on_terminal_size_allocate(self, _terminal, _allocation) -> None:
+        columns = max(0, int(self.terminal.get_column_count()))
+        rows = max(0, int(self.terminal.get_row_count()))
+        self._last_allocated_grid = (columns, rows)
+        if self.process is not None:
+            self._sync_pty_geometry(columns=columns, rows=rows)
+            return
+        if self._detached or columns < 2 or rows < 2:
+            return
+        self._remove_glib_source(self._spawn_source_id)
+        self._spawn_source_id = GLib.timeout_add(60, self._spawn_after_stable_allocation)
+
+    def _spawn_after_stable_allocation(self) -> bool:
+        self._spawn_source_id = 0
+        if self.process is not None or self._detached:
+            return False
+        columns, rows = self._last_allocated_grid
+        if columns < 2 or rows < 2:
+            return False
+        self._spawn(columns=columns, rows=rows)
+        return False
+
+    def _spawn_fallback(self) -> bool:
+        self._spawn_fallback_source_id = 0
+        if self.process is not None or self._detached:
+            return False
+        columns = max(2, int(self.terminal.get_column_count() or 80))
+        rows = max(2, int(self.terminal.get_row_count() or 24))
+        self._spawn(columns=columns, rows=rows)
+        return False
+
+    def _sync_pty_geometry(self, *, columns: int, rows: int) -> None:
+        if columns < 2 or rows < 2 or self.pty_obj is None:
+            return
+        try:
+            self.pty_obj.set_size(rows, columns)
+        except Exception:
+            pass
+
+    def _spawn(self, *, columns: int, rows: int) -> None:
+        if self.process is not None or self._detached:
+            return
+        self._cancel_pending_spawn()
         master_fd, slave_fd = pty.openpty()
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
+        winsize = struct.pack("HHHH", rows, columns, 0, 0)
+        for fd in (master_fd, slave_fd):
+            try:
+                fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+            except OSError:
+                pass
         try:
-            pty_obj = Vte.Pty.new_foreign_sync(master_fd, None)
-            self.terminal.set_pty(pty_obj)
+            self.pty_obj = Vte.Pty.new_foreign_sync(master_fd, None)
+            self._sync_pty_geometry(columns=columns, rows=rows)
+            self.terminal.set_pty(self.pty_obj)
             self.process = subprocess.Popen(
                 self.argv,
                 cwd=self.cwd,
@@ -303,6 +384,8 @@ class AttachTerminal(Gtk.Box):
                 pass
 
     def detach(self) -> None:
+        self._detached = True
+        self._cancel_pending_spawn()
         if not self.process or self.process.poll() is not None:
             return
         try:
@@ -594,7 +677,7 @@ class WindowOverview(Gtk.Window):
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        label = Gtk.Label(label="All browser-like windows, aggregated from their terminal tabs")
+        label = Gtk.Label(label="One summary row per named window: tab counts, aggregate resource load, and health")
         label.set_xalign(0)
         top.pack_start(label, True, True, 0)
         refresh = Gtk.Button(label="Refresh")
@@ -1918,9 +2001,15 @@ class MasterWindow(Gtk.Window):
             self.tree.append_column(col)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
+        explanation = Gtk.Label(
+            label="One row per tab/process with resource details, captured output, and control actions.",
+            xalign=0,
+        )
+        explanation.set_line_wrap(True)
+        outer.pack_start(explanation, False, False, 0)
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.filter_entry = Gtk.SearchEntry(placeholder_text="filter by id, window, health, state, command, or directory")
+        self.filter_entry = Gtk.SearchEntry(placeholder_text="filter individual tabs by id, window, health, state, command, or directory")
         _style(self.filter_entry, "td-search-entry")
         _connect_debounced_refresh(self.filter_entry, self.refresh)
         top.pack_start(self.filter_entry, True, True, 0)
@@ -2294,10 +2383,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             ("Command palette", self.open_command_palette),
             ("Reopen closed tab", self.reopen_last_closed_tab),
             ("Show/hide Tabs pane", self.toggle_tabs_pane),
-            ("Tab manager", self.open_master_window),
-            ("Window overview", self.open_window_overview),
+            ("Tab manager · per-tab details", self.open_master_window),
+            ("Window overview · window totals", self.open_window_overview),
             ("Keyboard shortcuts", self.open_shortcut_window),
             ("Terminal appearance", self.open_terminal_options),
+            ("Quit TermDeck", self.quit_termdeck),
         ]
         overflow_menu = Gtk.Menu()
         for label, handler in overflow_header_actions:
@@ -2316,7 +2406,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         header.pack_end(overflow)
 
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self.paned.set_hexpand(True)
+        self.paned.set_vexpand(True)
         self.notebook = Gtk.Notebook(scrollable=True)
+        self.notebook.set_hexpand(True)
+        self.notebook.set_vexpand(True)
         self.notebook.set_tab_pos(Gtk.PositionType.TOP)
         self.notebook.set_scrollable(True)
         self.notebook.connect("page-reordered", self._on_page_reordered)
@@ -2325,6 +2419,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self._pack_side_pane()
 
         root = Gtk.Overlay()
+        root.set_hexpand(True)
+        root.set_vexpand(True)
         root.add(self.paned)
         self.toast_revealer = Gtk.Revealer()
         self.toast_revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
@@ -2370,7 +2466,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         close = Gtk.Button(label="×")
         close.set_relief(Gtk.ReliefStyle.NONE)
         _style(close, "td-tab-close")
-        close.set_tooltip_text("Pinned tab: right-click for Unpin and hide" if record.pinned else "Hide tab")
+        close.set_tooltip_text("Close tab · session keeps running")
         close.connect("clicked", lambda _b, sid=record.id: self._hide_tab_from_close_button(sid))
         close.connect("button-press-event", self._on_tab_label_press, record.id)
         label_box.pack_start(close, False, False, 0)
@@ -2383,11 +2479,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         return item
 
     def _hide_tab_from_close_button(self, session_id: str) -> None:
-        record = self.app_context.store.get(session_id)
-        if record is not None and record.pinned:
-            self.show_toast("Pinned tab: right-click and choose Unpin and hide tab", kind="warn")
-            return
-        self.hide_tab(session_id)
+        self.hide_tab(session_id, include_pinned=True)
 
     def _pin_tab(self, record: SessionRecord, pinned: bool) -> None:
         if pinned:
@@ -2935,10 +3027,21 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                     self.toggle_pause_session(record)
                 return
 
-    def hide_current_tab(self) -> None:
+    def close_current_tab(self) -> None:
         session_id = self.current_session_id()
-        if session_id:
-            self.hide_tab(session_id)
+        if not session_id:
+            return
+        record = self.app_context.store.get(session_id)
+        self.hide_tab(session_id, include_pinned=True)
+        if record is not None:
+            self.show_toast(f"Closed {record.name} · session still running", kind="info")
+
+    def hide_current_tab(self) -> None:
+        # Backward-compatible method name used by older call sites.
+        self.close_current_tab()
+
+    def quit_termdeck(self) -> None:
+        self.app_context.quit_preserving_sessions()
 
     def _remove_tab_widget(self, session_id: str) -> bool:
         tab = self.tabs.pop(session_id, None)
@@ -3231,6 +3334,13 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             return False
 
     def on_terminal_key_press(self, _terminal, event: Gdk.EventKey) -> bool:
+        # App-level close/quit must be handled before VTE consumes Ctrl+W/Q.
+        if self.keymap.matches(event, "quit_app"):
+            self.quit_termdeck()
+            return True
+        if self.keymap.matches(event, "close_term"):
+            self.close_current_tab()
+            return True
         # Capture zoom / clipboard before VTE treats the chord as input.
         if self.handle_zoom_event(event):
             return True
@@ -3252,11 +3362,14 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         key_name = Gdk.keyval_name(event.keyval) or ""
         if self.handle_zoom_event(event):
             return True
+        if self.keymap.matches(event, "quit_app"):
+            self.quit_termdeck()
+            return True
         if self.keymap.matches(event, "new_tab"):
             self.new_directory_tab()
             return True
         if self.keymap.matches(event, "close_term"):
-            self.hide_current_tab()
+            self.close_current_tab()
             return True
         if self.keymap.matches(event, "reopen_closed"):
             self.reopen_last_closed_tab()
@@ -3577,6 +3690,19 @@ class TermDeckApplication(Gtk.Application):
             self._open_recipe_window(recipe_window, recipe.name, index)
             opened += 1
         return opened
+
+    def quit_preserving_sessions(self) -> None:
+        """Close every TermDeck window while leaving tmux sessions alive."""
+
+        for window in list(self.windows):
+            for tab in list(window.tabs.values()):
+                tab.widget.detach()
+            try:
+                window.destroy()
+            except Exception:
+                pass
+        self.windows.clear()
+        self.quit()
 
     def do_activate(self) -> None:
         if not self.backend.available:

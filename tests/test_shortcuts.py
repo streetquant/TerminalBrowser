@@ -12,6 +12,10 @@ class ShortcutManifestTests(unittest.TestCase):
         report = build_shortcut_report()
         actions = {row["action"]: row for row in report["shortcuts"]}
         self.assertEqual(actions["close_term"]["terminal_conflict"], "shell/readline backward kill word")
+        self.assertEqual(actions["close_term"]["accelerator"], "<Primary>w")
+        self.assertEqual(actions["close_term"]["label"], "Close current tab, keep process alive")
+        self.assertEqual(actions["quit_app"]["accelerator"], "<Primary>q")
+        self.assertEqual(actions["quit_app"]["label"], "Quit TermDeck, keep all processes alive")
         self.assertEqual(actions["reopen_closed"]["accelerator"], "<Primary><Shift>t")
         self.assertNotIn("task_launcher", actions)
         self.assertNotIn("new_command", actions)

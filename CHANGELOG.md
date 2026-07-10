@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.6
+
+- Fixed the startup dotted-padding glitch by delaying tmux client attachment until VTE has a stable final grid and seeding the PTY with that exact geometry before launch.
+- Added explicit horizontal and vertical expansion to the terminal container, notebook, paned layout and root overlay so the terminal surface covers the complete client area.
+- Defined browser-style lifecycle shortcuts: `Ctrl+W` closes the active tab while keeping its tmux session alive; `Ctrl+Q` quits TermDeck while keeping every tmux session alive; `Ctrl+Shift+W` remains the destructive stop action.
+- Explicit tab-close actions now close pinned tabs as well; pinning still protects non-explicit cleanup workflows and the pinned state remains stored.
+- Clarified the management views in the UI: Tab Manager provides per-tab/process details and controls, while Window Overview provides read-only totals by named window.
+- Added real GTK/tmux smokes for first-attachment geometry, full client-area coverage, Ctrl+W recovery and Ctrl+Q session preservation.
+- Verified 337 tests and 15 subtests; first VTE/tmux attachment grids matched, all sessions survived close/quit checks, and desktop/compact renders completed with zero application or layout errors.
+
 ## 0.2.5
 
 - Added conservative typo-tolerant matching to Search Tabs and the `termdeck search` CLI.

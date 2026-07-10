@@ -121,10 +121,11 @@ def main() -> int:
                 "Command palette",
                 "Reopen closed tab",
                 "Show/hide Tabs pane",
-                "Tab manager",
-                "Window overview",
+                "Tab manager · per-tab details",
+                "Window overview · window totals",
                 "Keyboard shortcuts",
                 "Terminal appearance",
+                "Quit TermDeck",
             ]
             if menu_labels != expected_menu:
                 raise AssertionError(f"unexpected ordered More menu: {menu_labels}")

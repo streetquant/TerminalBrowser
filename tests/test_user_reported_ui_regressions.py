@@ -14,6 +14,15 @@ def _section(source: str, start_marker: str, end_marker: str) -> str:
 
 
 class UserReportedUiRegressionTests(unittest.TestCase):
+    def test_terminal_attach_waits_for_final_grid_and_seeds_pty_geometry(self) -> None:
+        terminal = _section(GTK_APP, "class AttachTerminal", "class WindowOverview")
+        self.assertIn('self.terminal.connect("size-allocate", self._on_terminal_size_allocate)', terminal)
+        self.assertIn("GLib.timeout_add(60, self._spawn_after_stable_allocation)", terminal)
+        self.assertIn("termios.TIOCSWINSZ", terminal)
+        self.assertIn('struct.pack("HHHH", rows, columns, 0, 0)', terminal)
+        self.assertIn("self.pty_obj.set_size(rows, columns)", terminal)
+        self.assertNotIn("        self._spawn()", terminal)
+
     def test_terminal_selection_syncs_to_external_clipboards_and_has_right_click_menu(self) -> None:
         terminal = _section(GTK_APP, "class AttachTerminal", "class WindowOverview")
         context_menu = _section(terminal, "def _show_terminal_context_menu", "def _on_button_press")
@@ -40,10 +49,10 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn('self._tab_menu_item("Rename", lambda: self.rename_session(record))', main_window)
         self.assertNotIn('self._tab_menu_item("Retag"', main_window)
         self.assertIn('pin_label = "Unpin tab" if record.pinned else "Pin tab"', main_window)
-        self.assertIn("Pinned tab: right-click for Unpin and hide", main_window)
         self.assertIn('close.connect("button-press-event", self._on_tab_label_press, record.id)', main_window)
         self.assertIn("def _hide_tab_from_close_button", main_window)
-        self.assertIn("Pinned tab: right-click and choose Unpin and hide tab", main_window)
+        self.assertIn("self.hide_tab(session_id, include_pinned=True)", main_window)
+        self.assertIn("Close tab · session keeps running", main_window)
         self.assertIn("def _unpin_and_hide_tab", main_window)
         self.assertIn("self.hide_tab(record.id, include_pinned=True)", main_window)
         self.assertIn("Unpinned and hid tab", main_window)

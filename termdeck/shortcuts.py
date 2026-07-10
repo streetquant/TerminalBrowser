@@ -60,7 +60,8 @@ class ShortcutEntry:
 
 ACTION_LABELS: Mapping[str, str] = {
     "new_tab": "New directory tab",
-    "close_term": "Hide current tab, keep process alive",
+    "close_term": "Close current tab, keep process alive",
+    "quit_app": "Quit TermDeck, keep all processes alive",
     "reopen_closed": "Reopen last closed tab",
     "stop_session": "Stop current session",
     "next_tab": "Next tab",
@@ -83,6 +84,7 @@ ACTION_LABELS: Mapping[str, str] = {
 DEFAULT_SHORTCUTS: Mapping[str, str] = {
     "new_tab": "<Primary>t",
     "close_term": "<Primary>w",
+    "quit_app": "<Primary>q",
     "reopen_closed": "<Primary><Shift>t",
     "stop_session": "<Primary><Shift>w",
     "next_tab": "<Primary>Tab",
@@ -123,6 +125,7 @@ PROTECTED_TERMINAL_KEYS: Mapping[str, str] = {
     "<primary>l": "shell clear screen",
     "<primary>n": "shell/readline next history item",
     "<primary>p": "shell/readline previous history item",
+    "<primary>q": "terminal software flow-control resume (XON)",
     "<primary>r": "shell reverse search",
     "<primary>u": "shell/readline kill to start of line",
     "<primary>w": "shell/readline backward kill word",
@@ -139,6 +142,7 @@ PASSTHROUGH_LABELS: Mapping[str, str] = {
     "<primary>l": "Terminal clear screen",
     "<primary>n": "Terminal next history",
     "<primary>p": "Terminal previous history",
+    "<primary>q": "Terminal flow-control resume",
     "<primary>r": "Terminal reverse search",
     "<primary>u": "Terminal kill to line start",
     "<primary>w": "Terminal kill previous word",

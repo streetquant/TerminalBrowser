@@ -66,7 +66,7 @@ class GtkAppStaticTests(unittest.TestCase):
         self.assertIn("WindowOverview", source)
         self.assertIn("open_window_overview", source)
         self.assertIn("window_overview", source)
-        self.assertIn('("Window overview", self.open_window_overview)', source)
+        self.assertIn('("Window overview · window totals", self.open_window_overview)', source)
 
 
     def test_shortcut_help_is_exposed_in_gui(self):

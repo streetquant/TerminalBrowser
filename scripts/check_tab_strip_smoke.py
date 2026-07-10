@@ -97,8 +97,10 @@ def main() -> int:
                 raise AssertionError("tab label width cap changed")
             if close.get_label() != "×":
                 raise AssertionError(f"unexpected close control: {close.get_label()!r}")
-            if "Pinned" not in (close.get_tooltip_text() or ""):
-                raise AssertionError("pinned state is not available through the close tooltip")
+            if "session keeps running" not in (close.get_tooltip_text() or ""):
+                raise AssertionError("close tooltip does not explain session recovery semantics")
+            if "Pinned" not in (label.get_tooltip_text() or ""):
+                raise AssertionError("pinned state is not available through the tab tooltip")
 
             record = next(iter(window.tabs.values())).record
             renamed = app.store.update(record.id, name="api-renamed")
