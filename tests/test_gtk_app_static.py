@@ -25,7 +25,7 @@ class GtkAppStaticTests(unittest.TestCase):
         for node in tree.body:
             if not isinstance(node, ast.ImportFrom) or not node.module or not node.level:
                 continue
-            if node.module in {"command_palette", "task_templates", "shortcuts", "session_store", "models", "master_tasks", "health", "workspace_recipe", "project_detect", "control_plan", "session_lifecycle", "session_search"}:
+            if node.module in {"command_palette", "command_render", "shortcuts", "session_store", "models", "master_tasks", "health", "workspace_recipe", "control_plan", "session_lifecycle", "session_search"}:
                 module = importlib.import_module(f"termdeck.{node.module}")
                 for alias in node.names:
                     if alias.name == "*":
@@ -50,11 +50,16 @@ class GtkAppStaticTests(unittest.TestCase):
         self.assertIn("hide_selected", source)
         self.assertIn("archive_selected", source)
 
-    def test_project_detection_is_exposed_in_gui(self):
+    def test_gui_exposes_only_named_windows_and_directory_tab_creation(self):
         source = GTK_APP.read_text(encoding="utf-8")
-        self.assertIn("open_detected_project", source)
-        self.assertIn("detect_project", source)
-        self.assertIn('("Open detected project", self.open_detected_project)', source)
+        self.assertIn("class WindowNameDialog", source)
+        self.assertIn("def rename_window", source)
+        self.assertIn("def new_directory_tab", source)
+        self.assertIn("Gtk.FileChooserAction.SELECT_FOLDER", source)
+        self.assertIn("directory_tab_name", source)
+        self.assertNotIn("class CommandDialog", source)
+        self.assertNotIn("open_detected_project", source)
+        self.assertNotIn("open_launcher", source)
 
     def test_window_overview_is_exposed_in_gui(self):
         source = GTK_APP.read_text(encoding="utf-8")

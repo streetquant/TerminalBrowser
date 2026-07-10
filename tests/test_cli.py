@@ -5,16 +5,16 @@ import json
 import pathlib
 import unittest
 
-from termdeck.cli import _select_records, build_parser, cmd_activity, cmd_archive, cmd_budget_plan, cmd_capture, cmd_control_plan, cmd_diagnostics, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_project_detect, cmd_project_init, cmd_reconcile, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_templates, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
+from termdeck.cli import _select_records, build_parser, cmd_activity, cmd_archive, cmd_budget_plan, cmd_capture, cmd_control_plan, cmd_diagnostics, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_reconcile, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
 
 
 class CliTests(unittest.TestCase):
-    def test_parser_has_single_templates_subcommand(self):
+    def test_parser_has_single_subcommand_registry_without_templates(self):
         parser = build_parser()
         subparsers = [action for action in parser._actions if isinstance(action, argparse._SubParsersAction)]
         self.assertEqual(len(subparsers), 1)
         choices = sorted(subparsers[0].choices)
-        self.assertEqual(choices, ['activity', 'adopt-tmux', 'archive', 'budget-plan', 'capture', 'control-plan', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-desktop', 'kill', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'project-detect', 'project-init', 'quickstart', 'recently-closed', 'reconcile', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'templates', 'terminator-workspace', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
+        self.assertEqual(choices, ['activity', 'adopt-tmux', 'archive', 'budget-plan', 'capture', 'control-plan', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-desktop', 'kill', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'quickstart', 'recently-closed', 'reconcile', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'terminator-workspace', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
 
 
     def test_shortcuts_command_outputs_json_with_terminator_override(self):
@@ -35,17 +35,6 @@ class CliTests(unittest.TestCase):
             payload = json.loads(buffer.getvalue())
             self.assertEqual(payload["action"], "shortcuts")
             self.assertTrue(any(row["source"] == "terminator" and row["accelerator"] == "<Alt>t" for row in payload["shortcuts"]))
-
-    def test_templates_command_outputs_filtered_json(self):
-        args = argparse.Namespace(query="codex")
-        buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
-            code = cmd_templates(args)
-        self.assertEqual(code, 0)
-        payload = json.loads(buffer.getvalue())
-        self.assertEqual(len(payload), 1)
-        self.assertEqual(payload[0]["id"], "codex")
-        self.assertIn("available", payload[0])
 
 
     def test_terminator_workspace_outputs_recipe_json(self):
@@ -76,46 +65,6 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["name"], "terminator-default")
             self.assertEqual(payload["windows"][0]["title"], "Agents")
             self.assertEqual(payload["windows"][0]["tabs"][0]["command"], "codex")
-
-    def test_project_detect_outputs_recipe_for_current_directory(self):
-        from pathlib import Path
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "package.json").write_text('{"scripts":{"dev":"vite"}}', encoding="utf-8")
-            args = argparse.Namespace(path=root, include_ai=False, recipe=True)
-            buffer = io.StringIO()
-            with contextlib.redirect_stdout(buffer):
-                code = cmd_project_detect(args)
-            self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
-            commands = [tab["command"] for window in payload["windows"] for tab in window["tabs"]]
-            self.assertIn("npm run dev", commands)
-
-    def test_project_init_writes_recipe_and_refuses_overwrite_without_force(self):
-        from pathlib import Path
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            output = root / "termdeck.workspace.json"
-            args = argparse.Namespace(path=root, include_ai=True, output=output, force=False)
-            buffer = io.StringIO()
-            with contextlib.redirect_stdout(buffer):
-                code = cmd_project_init(args)
-            self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
-            self.assertTrue(payload["ok"])
-            self.assertTrue(output.exists())
-
-            buffer = io.StringIO()
-            with contextlib.redirect_stdout(buffer):
-                code = cmd_project_init(args)
-            self.assertEqual(code, 2)
-            payload = json.loads(buffer.getvalue())
-            self.assertFalse(payload["ok"])
-
 
     def test_tasks_command_outputs_master_snapshot_json(self):
         from pathlib import Path
@@ -175,7 +124,7 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("sk-proj-1234567890abcdefghijk", payload[0]["preview"])
 
 
-    def test_new_command_remembers_template_without_starting_tmux(self):
+    def test_new_directory_tab_can_be_remembered_without_starting_tmux(self):
         from pathlib import Path
         import tempfile
 
@@ -183,8 +132,7 @@ class CliTests(unittest.TestCase):
             db_path = Path(tmp) / "sessions.sqlite3"
             args = argparse.Namespace(
                 db=db_path,
-                target="codex",
-                template=None,
+                target=None,
                 command_text=None,
                 name="agent-one",
                 tag=None,
@@ -202,13 +150,15 @@ class CliTests(unittest.TestCase):
             payload = json.loads(buffer.getvalue())
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["action"], "new")
-            session = payload["sessions"][0]
-            self.assertEqual(session["name"], "agent-one")
-            self.assertEqual(session["tag"], "ai")
-            self.assertEqual(session["command"], "codex")
-            self.assertEqual(session["window_title"], "Agents")
-            self.assertEqual(session["tab_index"], 0)
-            self.assertFalse(session["started"])
+            tab = payload["tabs"][0]
+            self.assertEqual(tab["name"], "agent-one")
+            self.assertEqual(tab["cwd"], str(Path(tmp).resolve()))
+            self.assertEqual(tab["source"], "shell")
+            self.assertEqual(tab["window_title"], "Agents")
+            self.assertEqual(tab["tab_index"], 0)
+            self.assertFalse(tab["started"])
+            self.assertNotIn("tag", tab)
+            self.assertNotIn("tmux_name", tab)
 
 
     def test_windows_command_outputs_aggregate_json(self):

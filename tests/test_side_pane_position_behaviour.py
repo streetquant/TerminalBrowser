@@ -100,7 +100,7 @@ class SidePanePositionBehaviourTest(TestCase):
             [
                 ('pack',),
                 ('persist', 'left'),
-                ('toast', 'Sessions pane moved to left', {'kind': 'info'}),
+                ('toast', 'Tabs pane moved to left', {'kind': 'info'}),
             ],
         )
 
@@ -120,7 +120,7 @@ class SidePanePositionBehaviourTest(TestCase):
             calls,
             [
                 ('pack',),
-                ('toast', 'Sessions pane moved to right', {'kind': 'info'}),
+                ('toast', 'Tabs pane moved to right', {'kind': 'info'}),
             ],
         )
 

@@ -97,13 +97,13 @@ def build_desktop_entry(exec_command: str) -> str:
         "Version=1.0",
         "Name=TermDeck",
         "GenericName=Terminal Task Manager",
-        "Comment=Browser-like task manager for terminal processes",
+        "Comment=Named terminal windows with directory-backed tabs",
         f"Exec={exec_command}",
         f"Icon={ICON_NAME}",
         "Terminal=false",
         "StartupNotify=true",
         "Categories=System;TerminalEmulator;Development;Utility;",
-        "Keywords=terminal;tmux;codex;shell;process;task manager;browser tabs;",
+        "Keywords=terminal;tmux;shell;directories;windows;tabs;",
     ]
     return "\n".join(lines) + "\n"
 

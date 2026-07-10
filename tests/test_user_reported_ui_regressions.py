@@ -38,7 +38,7 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn("def _tab_menu_item", main_window)
         self.assertIn("def _show_tab_context_menu", main_window)
         self.assertIn('self._tab_menu_item("Rename", lambda: self.rename_session(record))', main_window)
-        self.assertIn('self._tab_menu_item("Retag", lambda: self.retag_sessions([record]))', main_window)
+        self.assertNotIn('self._tab_menu_item("Retag"', main_window)
         self.assertIn('pin_label = "Unpin tab" if record.pinned else "Pin tab"', main_window)
         self.assertIn("Pinned tab: right-click for Unpin and hide", main_window)
         self.assertIn('close.connect("button-press-event", self._on_tab_label_press, record.id)', main_window)
@@ -56,9 +56,9 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn('self._tab_menu_item("Hide other tabs", lambda: self._hide_other_tabs(record))', main_window)
         self.assertIn('self._tab_menu_item("Hide tabs to the right", lambda: self._hide_tabs_to_right(record))', main_window)
         self.assertIn('candidate.tab_index > record.tab_index', main_window)
-        self.assertIn('self._tab_menu_item("Kill session", lambda: self.stop_session(record))', main_window)
+        self.assertIn('self._tab_menu_item("Stop tab", lambda: self.stop_session(record))', main_window)
         self.assertIn('self._tab_menu_item("Terminal options", self.open_terminal_options)', main_window)
-        self.assertIn('self._tab_menu_item("Master tasks", self.open_master_window)', main_window)
+        self.assertIn('self._tab_menu_item("Tab manager", self.open_master_window)', main_window)
         self.assertIn('self.notebook.connect("page-reordered", self._on_page_reordered)', main_window)
         self.assertIn("self.notebook.set_tab_reorderable(terminal, True)", main_window)
         self.assertIn("def _on_page_reordered", main_window)
@@ -66,7 +66,7 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn("button == 3 and record is not None", main_window)
         self.assertIn("self._show_tab_context_menu(record, event)", main_window)
 
-    def test_terminal_options_cover_cursor_blink_and_sessions_pane_side(self) -> None:
+    def test_terminal_options_cover_cursor_blink_and_tabs_pane_side(self) -> None:
         options = _section(GTK_APP, "class TerminalOptionsDialog", "class ActionPaletteDialog")
 
         self.assertIn('self.cursor_blink = Gtk.CheckButton(label=\"Blink cursor\")', options)
@@ -78,14 +78,14 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn("side_pane_position", SETTINGS)
         self.assertIn("normalise_side_pane_position", SETTINGS)
 
-    def test_sessions_pane_hides_killed_tabs_and_supports_ergonomic_multi_select(self) -> None:
+    def test_tabs_pane_hides_killed_tabs_and_supports_ergonomic_multi_select(self) -> None:
         side = _section(GTK_APP, "class SidePane", "class MasterWindow")
 
         self.assertIn('title_event.connect(\"button-press-event\", self._on_header_button_press)', side)
         self.assertIn("def _on_header_button_press", side)
         self.assertIn("button == 3", side)
-        self.assertIn("Move sessions pane to left", side)
-        self.assertIn("Move sessions pane to right", side)
+        self.assertIn("Move tabs pane to left", side)
+        self.assertIn("Move tabs pane to right", side)
         self.assertIn("SIDE_PANE_HIDDEN_STATUSES", GTK_APP)
         self.assertIn('"killed"', GTK_APP)
         self.assertIn('"terminated"', GTK_APP)
@@ -93,7 +93,7 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn("self.selected_ids.intersection_update", side)
         self.assertIn("state & Gdk.ModifierType.CONTROL_MASK", side)
         self.assertIn("check.set_active(active)", side)
-        self.assertIn("Ctrl+left-click anywhere on a card to select multiple sessions", side)
+        self.assertIn("Ctrl+left-click any tab card to select multiple tabs", side)
         self.assertIn("if button == 1 and state & Gdk.ModifierType.CONTROL_MASK", side)
         self.assertNotIn("def _select_record_for_context", side)
         self.assertIn('check.connect("button-press-event", self._on_session_button_press, record, check)', side)
@@ -105,12 +105,12 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn("def _hide_records", side)
         self.assertIn("def _pin_records", side)
         self.assertIn("def _unpin_records", side)
-        self.assertIn('self._context_label("Retag", records)', side)
+        self.assertNotIn('self._context_label("Retag", records)', side)
         self.assertIn('self._context_label("Pin", records)', side)
         self.assertIn('self._context_label("Unpin", records)', side)
         self.assertIn('self._context_label("Hide", records)', side)
         self.assertIn('self._context_label("Kill", records)', side)
-        self.assertIn("lambda: self.window.retag_sessions(records)", side)
+        self.assertNotIn("lambda: self.window.retag_sessions(records)", side)
         self.assertIn("lambda: self._kill_records(records)", side)
 
     def test_heavy_search_filters_debounce_refresh_work(self) -> None:
@@ -118,7 +118,7 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn("GLib.timeout_add(delay_ms, _run)", GTK_APP)
         self.assertIn('widget.connect(\"search-changed\", _queue)', GTK_APP)
         self.assertIn('widget.connect(\"destroy\", _cleanup)', GTK_APP)
-        self.assertEqual(GTK_APP.count("        _connect_debounced_refresh("), 5)
+        self.assertEqual(GTK_APP.count("        _connect_debounced_refresh("), 4)
         self.assertNotIn('connect(\"search-changed\", lambda *_: self.refresh())', GTK_APP)
         self.assertNotIn('connect(\"search-changed\", lambda *_: self._refresh_templates())', GTK_APP)
 

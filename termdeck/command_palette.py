@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 from .models import SessionRecord
-from .task_templates import TaskTemplate, builtin_templates, render_command
 
 
 @dataclass(frozen=True)
@@ -42,25 +41,34 @@ class PaletteItem:
 
 
 def builtin_palette_items() -> tuple[PaletteItem, ...]:
-    """Return global actions shown before sessions/templates."""
+    """Return global actions shown before remembered tabs."""
     return (
         PaletteItem(
-            id="builtin:new-shell",
-            label="New shell tab",
+            id="builtin:new-tab",
+            label="New directory tab",
             kind="builtin",
-            description="Open the default interactive shell in a new browser-like tab.",
-            payload="new_shell",
-            keywords=("ctrl+t", "terminal", "local"),
+            description="Choose a directory and open the default shell in a new tab named after that directory.",
+            payload="new_tab",
+            keywords=("ctrl+t", "terminal", "folder", "directory", "shell"),
             badge="action",
         ),
         PaletteItem(
-            id="builtin:new-task",
-            label="New task from editable template",
+            id="builtin:rename-window",
+            label="Rename this window",
             kind="builtin",
-            description="Open the task launcher where every template field remains editable.",
-            payload="new_task",
-            keywords=("launcher", "template", "command", "ctrl+alt+n"),
-            badge="action",
+            description="Name this TermDeck window as a group of related directory tabs.",
+            payload="rename_window",
+            keywords=("window", "group", "name", "title"),
+            badge="window",
+        ),
+        PaletteItem(
+            id="builtin:new-window",
+            label="New named window",
+            kind="builtin",
+            description="Create another named TermDeck window, then choose its first tab directory.",
+            payload="new_window",
+            keywords=("window", "group", "new"),
+            badge="window",
         ),
         PaletteItem(
             id="builtin:reopen-closed",
@@ -72,21 +80,12 @@ def builtin_palette_items() -> tuple[PaletteItem, ...]:
             badge="browser",
         ),
         PaletteItem(
-            id="builtin:project-detect",
-            label="Open detected project workspace",
-            kind="builtin",
-            description="Suggest and open browser-like tabs from the current directory: shell, dev server, tests, lint, Docker, logs, and optional agents.",
-            payload="project_detect",
-            keywords=("project", "detect", "workspace", "recipe", "package.json", "pytest", "docker", "onboarding"),
-            badge="project",
-        ),
-        PaletteItem(
             id="builtin:master",
-            label="Open master task window",
+            label="Open Tab manager",
             kind="builtin",
-            description="Show all sessions with PID, CPU, RAM, runtime, focus key, and pause key.",
+            description="Inspect tabs with PID, CPU, RAM, runtime, focus key, and pause key.",
             payload="master",
-            keywords=("task manager", "resources", "cpu", "ram", "shift+esc", "ctrl+shift+m"),
+            keywords=("tab manager", "resources", "cpu", "ram", "shift+esc", "ctrl+shift+m"),
             badge="action",
         ),
         PaletteItem(
@@ -111,7 +110,7 @@ def builtin_palette_items() -> tuple[PaletteItem, ...]:
             id="builtin:windows",
             label="Open window overview",
             kind="builtin",
-            description="Show every TermDeck window with aggregate tabs, CPU, RAM, process count, runtime, and hot-session counts.",
+            description="Show every TermDeck window with aggregate tabs, CPU, RAM, process count, runtime, and attention counts.",
             payload="window_overview",
             keywords=("windows", "overview", "workspace", "resource", "tabs", "cpu", "ram"),
             badge="action",
@@ -127,9 +126,9 @@ def builtin_palette_items() -> tuple[PaletteItem, ...]:
         ),
         PaletteItem(
             id="builtin:restore",
-            label="Restore visible sessions",
+            label="Restore visible tabs",
             kind="builtin",
-            description="Reattach the previous visible sessions for this window without restarting stopped tasks.",
+            description="Reattach the previous visible tabs for this window without restarting stopped processes.",
             payload="restore",
             keywords=("tabs", "workspace", "previous", "resume"),
             badge="action",
@@ -138,7 +137,7 @@ def builtin_palette_items() -> tuple[PaletteItem, ...]:
             id="builtin:toggle-side",
             label="Toggle side pane",
             kind="builtin",
-            description="Show or hide the right-side session controller.",
+            description="Show or hide the tabs pane.",
             payload="toggle_side",
             keywords=("f9", "controller", "sidebar"),
             badge="action",
@@ -147,7 +146,7 @@ def builtin_palette_items() -> tuple[PaletteItem, ...]:
             id="builtin:focus-mode",
             label="Toggle focus mode",
             kind="builtin",
-            description="Hide side chrome for a terminal-first layout; toggle again to restore the session rail.",
+            description="Hide side chrome for a terminal-first layout; toggle again to restore the tabs pane.",
             payload="focus_mode",
             keywords=("focus", "zen", "distraction free", "terminal first", "fullscreen work"),
             badge="view",
@@ -163,9 +162,9 @@ def builtin_palette_items() -> tuple[PaletteItem, ...]:
         ),
         PaletteItem(
             id="builtin:status-selected",
-            label="Ask selected sessions for status",
+            label="Ask selected tabs for status",
             kind="builtin",
-            description="Send a non-mutating status request to the sessions selected in the side pane.",
+            description="Send a non-mutating status request to the tabs selected in the side pane.",
             payload="status_selected",
             keywords=("codex", "summary", "selected", "safe"),
             badge="selected",
@@ -183,23 +182,23 @@ def builtin_palette_items() -> tuple[PaletteItem, ...]:
             id="builtin:rename-current",
             label="Rename current tab",
             kind="builtin",
-            description="Rename the active browser tab/session without restarting its process.",
+            description="Rename the active tab without restarting its process.",
             payload="rename_current",
             keywords=("rename", "title", "tab name", "f2"),
             badge="browser",
         ),
         PaletteItem(
             id="builtin:rename-selected",
-            label="Rename selected session",
+            label="Rename selected tab",
             kind="builtin",
-            description="Rename the first session selected in the side pane (or the current tab).",
+            description="Rename the first tab selected in the side pane, or the current tab.",
             payload="rename_selected",
             keywords=("rename", "selected", "tab name"),
             badge="selected",
         ),
         PaletteItem(
             id="builtin:pause-selected",
-            label="Pause selected sessions",
+            label="Pause selected tabs",
             kind="builtin",
             description="Stop execution of selected process groups until resumed.",
             payload="pause_selected",
@@ -208,7 +207,7 @@ def builtin_palette_items() -> tuple[PaletteItem, ...]:
         ),
         PaletteItem(
             id="builtin:resume-selected",
-            label="Resume selected sessions",
+            label="Resume selected tabs",
             kind="builtin",
             description="Continue selected paused process groups.",
             payload="resume_selected",
@@ -237,25 +236,25 @@ def builtin_palette_items() -> tuple[PaletteItem, ...]:
             id="builtin:hide-selected",
             label="Hide selected tabs",
             kind="builtin",
-            description="Remove selected sessions from visible restore without stopping their processes.",
+            description="Remove selected tabs from visible restore without stopping their processes.",
             payload="hide_selected",
             keywords=("tabs", "browser", "selected", "restore", "lifecycle"),
             badge="selected",
         ),
         PaletteItem(
             id="builtin:pause-hot",
-            label="Pause hot sessions",
+            label="Pause hot tabs",
             kind="builtin",
-            description="Pause sessions classified as high or critical CPU/memory tasks.",
+            description="Pause tabs classified as high or critical CPU/memory processes.",
             payload="pause_hot",
             keywords=("cpu", "ram", "memory", "resource", "budget", "runaway"),
             badge="resource",
         ),
         PaletteItem(
             id="builtin:kill-selected",
-            label="Stop selected sessions",
+            label="Stop selected tabs",
             kind="builtin",
-            description="Kill selected hidden tmux sessions and mark them stopped.",
+            description="Kill the selected tab processes and mark them stopped.",
             payload="kill_selected",
             keywords=("terminate", "close", "danger", "selected"),
             badge="destructive",
@@ -263,9 +262,9 @@ def builtin_palette_items() -> tuple[PaletteItem, ...]:
         ),
         PaletteItem(
             id="builtin:archive-selected",
-            label="Archive selected sessions",
+            label="Archive selected tabs",
             kind="builtin",
-            description="Remove selected sessions from normal views without stopping their processes.",
+            description="Remove selected tabs from normal views without stopping their processes.",
             payload="archive_selected",
             keywords=("hide", "cleanup", "browser", "lifecycle", "selected"),
             badge="selected",
@@ -279,7 +278,7 @@ def session_palette_items(records: Iterable[SessionRecord]) -> list[PaletteItem]
         items.append(
             PaletteItem(
                 id=f"session:{record.id}",
-                label=f"Open {'📌 ' if record.pinned else ''}[{record.tag}] {record.name}",
+                label=f"Open {'📌 ' if record.pinned else ''}{record.name}",
                 kind="session",
                 description=f"{record.command} · {record.cwd}",
                 payload=record.id,
@@ -300,38 +299,10 @@ def session_palette_items(records: Iterable[SessionRecord]) -> list[PaletteItem]
     return items
 
 
-def template_palette_items(templates: Iterable[TaskTemplate] | None = None) -> list[PaletteItem]:
-    items: list[PaletteItem] = []
-    for template in templates if templates is not None else builtin_templates():
-        command = render_command(template.command)
-        items.append(
-            PaletteItem(
-                id=f"template:{template.id}",
-                label=f"Start {template.label}",
-                kind="template",
-                description=f"{command or 'editable command'} · {template.description}",
-                payload=template.id,
-                keywords=(
-                    template.id,
-                    template.label,
-                    template.name,
-                    template.tag,
-                    template.command,
-                    template.description,
-                    *template.requires,
-                ),
-                badge=f"template/{template.tag}",
-            )
-        )
-    return items
+def build_palette_items(records: Iterable[SessionRecord] = ()) -> list[PaletteItem]:
+    """Build the command palette from app actions and remembered tabs."""
 
-
-def build_palette_items(
-    records: Iterable[SessionRecord] = (),
-    templates: Iterable[TaskTemplate] | None = None,
-) -> list[PaletteItem]:
-    """Build the full command palette model in display priority order."""
-    return [*builtin_palette_items(), *session_palette_items(records), *template_palette_items(templates)]
+    return [*builtin_palette_items(), *session_palette_items(records)]
 
 
 def _score(query: str, item: PaletteItem, order: int) -> int:

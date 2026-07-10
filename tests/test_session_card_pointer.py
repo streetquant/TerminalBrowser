@@ -57,22 +57,6 @@ class SessionCardPointerTest(TestCase):
         self.assertFalse(check.get_active())
         self.assertEqual(menus, [])
 
-    def test_ctrl_left_click_on_tag_uses_same_toggle_behaviour(self) -> None:
-        pane, menus = self._pane()
-        record = SimpleNamespace(id="target")
-        check = CheckStub()
-        event = SimpleNamespace(
-            button=1,
-            state=int(gtk_app.Gdk.ModifierType.CONTROL_MASK),
-        )
-
-        handled = SidePane._on_tag_button_press(pane, None, event, record, check)
-
-        self.assertTrue(handled)
-        self.assertEqual(pane.selected_ids, {"existing", "target"})
-        self.assertTrue(check.get_active())
-        self.assertEqual(menus, [])
-
     def test_right_click_opens_menu_without_changing_selection(self) -> None:
         pane, menus = self._pane()
         record = SimpleNamespace(id="target")

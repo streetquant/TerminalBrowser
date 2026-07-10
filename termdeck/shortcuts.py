@@ -59,8 +59,7 @@ class ShortcutEntry:
 
 
 ACTION_LABELS: Mapping[str, str] = {
-    "new_tab": "New shell tab",
-    "new_command": "New custom command tab",
+    "new_tab": "New directory tab",
     "close_term": "Hide current tab, keep process alive",
     "reopen_closed": "Reopen last closed tab",
     "stop_session": "Stop current session",
@@ -68,8 +67,7 @@ ACTION_LABELS: Mapping[str, str] = {
     "prev_tab": "Previous tab",
     "focus_side": "Focus side-pane prompt",
     "launcher": "Open command palette",
-    "task_launcher": "Open browser-style task launcher",
-    "master_window": "Open master task window",
+    "master_window": "Open Tab manager",
     "toggle_side": "Toggle side pane",
     "pause_current": "Pause/resume current tab process",
     "zoom_in": "Increase terminal font size",
@@ -84,7 +82,6 @@ ACTION_LABELS: Mapping[str, str] = {
 # switch to the emacs-safe profile.
 DEFAULT_SHORTCUTS: Mapping[str, str] = {
     "new_tab": "<Primary>t",
-    "new_command": "<Primary><Alt>t",
     "close_term": "<Primary>w",
     "reopen_closed": "<Primary><Shift>t",
     "stop_session": "<Primary><Shift>w",
@@ -92,7 +89,6 @@ DEFAULT_SHORTCUTS: Mapping[str, str] = {
     "prev_tab": "<Primary><Shift>Tab",
     "focus_side": "<Primary><Shift>l",
     "launcher": "<Primary><Shift>p",
-    "task_launcher": "<Primary><Alt>n",
     "master_window": "<Primary><Shift>m",
     "toggle_side": "F9",
     "pause_current": "<Primary><Shift>space",

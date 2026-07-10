@@ -184,15 +184,15 @@ class UiSurfaceStaticTests(unittest.TestCase):
         self.assertIn("_icon_button", self.gtk)
         self.assertIn("primary_header_actions", self.gtk)
         self.assertIn("overflow_header_actions", self.gtk)
-        self.assertIn("utilities-terminal-symbolic", self.gtk)
+        self.assertIn("list-add-symbolic", self.gtk)
         self.assertIn('Gtk.MenuButton(label="⋯")', self.gtk)
         self.assertIn("show_label=False", self.gtk)
         self.assertIn('"td-header-icon"', self.gtk)
         self.assertIn("set_tooltip_text", self.gtk)
 
-    def test_side_pane_session_cards(self):
+    def test_side_pane_tab_cards(self):
         self.assertIn("td-session-card", self.gtk)
-        self.assertIn("td-chip", self.gtk)
+        self.assertNotIn('chip = Gtk.Label(label=record.tag)', self.gtk)
         self.assertIn("health_badge_class", self.gtk)
         self.assertIn("More actions", self.gtk)
 
@@ -257,11 +257,11 @@ class UiSurfaceStaticTests(unittest.TestCase):
         self.assertIn("_is_paste_event", self.gtk)
         self.assertIn("feed_child", self.gtk)
 
-    def test_sessions_pane_ux_controls_are_wired(self):
+    def test_tabs_pane_ux_controls_are_wired(self):
         self.assertIn("_on_header_button_press", self.gtk)
-        self.assertIn("Move sessions pane to left", self.gtk)
+        self.assertIn("Move tabs pane to left", self.gtk)
         self.assertIn("set_side_pane_position", self.gtk)
-        self.assertIn("_on_tag_button_press", self.gtk)
+        self.assertNotIn("_on_tag_button_press", self.gtk)
         self.assertIn("CONTROL_MASK", self.gtk)
         self.assertIn("SIDE_PANE_HIDDEN_STATUSES", self.gtk)
         self.assertIn('"killed"', self.gtk)

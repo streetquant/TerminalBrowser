@@ -22,17 +22,16 @@ from .control_plan import ControlPlan, build_control_plan, render_control_plan_t
 from .health import HealthPolicy, classify_session, health_badge, should_pause_for_attention
 from .master_tasks import filter_rows, row_from_record
 from .models import SessionRecord, TerminalTheme
-from .project_detect import detect_project
 from .redaction import redact_text
 from .resources import ResourceSampler
-from .session_lifecycle import archive_records, hide_records, pin_records, recently_closed_records, rename_record, reopen_closed_records, retag_records, unpin_records
+from .session_lifecycle import archive_records, hide_records, pin_records, recently_closed_records, rename_record, reopen_closed_records, unpin_records
 from .session_reconcile import reconcile_store
 from .session_search import search_sessions
 from .session_store import SessionStore, short_id, utc_now
 from .settings import AppSettings, SettingsError, save_terminal_options
 from .shortcuts import build_shortcut_map, index_from_key_name, shortcut_entries, tab_shortcut
 from .task_snapshot import build_task_snapshot
-from .task_templates import TaskTemplate, render_command, search_templates, template_by_id, template_statuses
+from .command_render import default_shell, directory_tab_name, normalise_directory, render_command
 from .window_snapshot import build_window_snapshots
 from .terminator_config import load_terminator_theme
 from .tmux_backend import TmuxBackend
@@ -896,7 +895,7 @@ class SessionSearchWindow(Gtk.Window):
     output; snippets still pass through the shared redaction path by default.
     """
 
-    COLUMNS = ["ID", "Window", "Name", "Tag", "Status", "Fields", "Output", "Command"]
+    COLUMNS = ["ID", "Window", "Name", "Status", "Fields", "Output", "Command"]
 
     def __init__(self, app_context: "TermDeckApplication"):
         super().__init__(title="TermDeck Search Tabs")
@@ -922,7 +921,7 @@ class SessionSearchWindow(Gtk.Window):
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
         label = Gtk.Label(
-            label="Search remembered terminal tabs by name, tag, command, directory, window, status, and optional recent output.",
+            label="Search remembered terminal tabs by name, command, directory, window, status, and optional recent output.",
             xalign=0,
         )
         label.set_line_wrap(True)
@@ -1003,9 +1002,8 @@ class SessionSearchWindow(Gtk.Window):
                 match.session_id,
                 match.window_title,
                 match.name,
-                match.tag,
                 match.status,
-                ",".join(match.matched_fields) or "-",
+                ",".join(field for field in match.matched_fields if field != "tag") or "-",
                 str(match.output_match_count) if match.output_match_count else "-",
                 match.command,
             ])
@@ -1023,13 +1021,13 @@ class SessionSearchWindow(Gtk.Window):
                 self.set_preview_text("Select a search result to see details and redacted captured-output snippets.")
             return
         lines = [
-            f"{match.name}  [{match.tag}]",
+            f"{match.name}",
             f"ID: {match.session_id}",
             f"Window: {match.window_title}",
             f"Status: {match.status}",
             f"Directory: {match.cwd}",
             f"Command: {match.command}",
-            f"Matched fields: {', '.join(match.matched_fields) or '-'}",
+            f"Matched fields: {', '.join(field for field in match.matched_fields if field != 'tag') or '-'}",
         ]
         if match.output_snippets:
             lines.append("")
@@ -1062,124 +1060,31 @@ class TerminalTab:
         self.widget = widget
 
 
-class CommandDialog(Gtk.Dialog):
-    """Browser-like New Task palette.
+class WindowNameDialog(Gtk.Dialog):
+    """Small window-level naming dialog; tabs are created separately."""
 
-    The dialog starts from plain-language templates, shows missing binaries
-    without hiding the template, and keeps every field editable.
-    """
-
-    def __init__(self, parent: Gtk.Window):
-        super().__init__(title="New terminal task", transient_for=parent, flags=0)
-        self.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, "Create", Gtk.ResponseType.OK)
+    def __init__(self, parent: Gtk.Window, *, title: str, initial: str = ""):
+        super().__init__(title=title, transient_for=parent, flags=0)
+        self.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
         self.set_default_response(Gtk.ResponseType.OK)
         self.set_modal(True)
-        self.set_default_size(760, 520)
-        _style(self, "td-overlay-dialog", "td-table-window")
-        self.status_by_id = {status.template.id: status for status in template_statuses()}
-        self.templates = [status.template for status in self.status_by_id.values()]
-
-        box = self.get_content_area()
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=12)
-        box.add(outer)
-
-        intro = Gtk.Label(
-            label="Pick a task type, edit the command if needed, then create a browser-like terminal tab.",
-            xalign=0,
-        )
-        intro.set_line_wrap(True)
-        _style(intro, "td-muted")
-        outer.pack_start(intro, False, False, 0)
-
-        self.template_search = Gtk.SearchEntry(placeholder_text="search templates: shell, codex, ssh, npm, tests, logs")
-        _style(self.template_search, "td-search-entry")
-        _connect_debounced_refresh(self.template_search, self._refresh_templates)
-        outer.pack_start(self.template_search, False, False, 0)
-
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scroller.set_size_request(640, 190)
-        self.template_box = Gtk.ListBox()
-        self.template_box.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.template_box.connect("row-selected", self._on_template_selected)
-        scroller.add(self.template_box)
-        outer.pack_start(scroller, True, True, 0)
-
-        grid = Gtk.Grid(column_spacing=8, row_spacing=8)
-        outer.pack_start(grid, False, False, 0)
-
-        self.name = Gtk.Entry(placeholder_text="tab name, e.g. api-server")
-        self.tag = Gtk.Entry(placeholder_text="workspace/tag, e.g. dev")
-        self.command = Gtk.Entry(placeholder_text="command, e.g. npm run dev or codex")
-        self.cwd = Gtk.Entry(text=os.getcwd())
-
-        rows = [
-            ("Name", self.name),
-            ("Tag", self.tag),
-            ("Command", self.command),
-            ("Directory", self.cwd),
-        ]
-        for row, (label, widget) in enumerate(rows):
-            grid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1)
-            grid.attach(widget, 1, row, 1, 1)
-
-        self._refresh_templates()
-        if self.templates:
-            self._apply_template(self.templates[0])
-        self.template_search.grab_focus()
+        self.set_default_size(420, -1)
+        _style(self, "td-overlay-dialog")
+        content = self.get_content_area()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=14)
+        content.add(box)
+        label = Gtk.Label(label="Window name", xalign=0)
+        _style(label, "td-muted")
+        box.pack_start(label, False, False, 0)
+        self.entry = Gtk.Entry(text=initial)
+        self.entry.set_activates_default(True)
+        self.entry.set_placeholder_text("e.g. Client work, Backend, Research")
+        box.pack_start(self.entry, False, False, 0)
+        self.entry.select_region(0, -1)
         self.show_all()
 
-    def _refresh_templates(self) -> None:
-        for child in self.template_box.get_children():
-            self.template_box.remove(child)
-        for template in search_templates(self.template_search.get_text(), self.templates):
-            status = self.status_by_id.get(template.id)
-            availability = "available" if status is None or status.available else "missing: " + ", ".join(status.missing)
-            kind = kind_for_session(name=template.name, command=template.command, tag=template.tag)
-            row = Gtk.ListBoxRow()
-            row.template = template  # type: ignore[attr-defined]
-            _style(row, "td-list-row")
-            row_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin=6)
-            cat = Gtk.Label(label=f"{kind_glyph(kind)}  {kind.upper()} · {template.tag}", xalign=0)
-            _style(cat, "td-category")
-            title = Gtk.Label(label=f"{template.label}    {availability}", xalign=0)
-            title.set_ellipsize(Pango.EllipsizeMode.END)
-            _style(title, "td-title")
-            command = Gtk.Label(label=render_command(template.command, cwd=os.getcwd()), xalign=0)
-            command.set_ellipsize(Pango.EllipsizeMode.END)
-            _style(command, "td-mono", "td-muted")
-            description = Gtk.Label(label=template.description, xalign=0)
-            description.set_line_wrap(True)
-            _style(description, "td-muted")
-            row_box.pack_start(cat, False, False, 0)
-            row_box.pack_start(title, False, False, 0)
-            row_box.pack_start(command, False, False, 0)
-            row_box.pack_start(description, False, False, 0)
-            row.add(row_box)
-            self.template_box.add(row)
-        self.template_box.show_all()
-
-    def _on_template_selected(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
-        if row is None:
-            return
-        template = getattr(row, "template", None)
-        if isinstance(template, TaskTemplate):
-            self._apply_template(template)
-
-    def _apply_template(self, template: TaskTemplate) -> None:
-        self.name.set_text(template.name)
-        self.tag.set_text(template.tag)
-        self.command.set_text(render_command(template.command, cwd=self.cwd.get_text() or os.getcwd()))
-
-    def values(self) -> tuple[str, str, str, str]:
-        command = self.command.get_text().strip() or os.environ.get("SHELL", "/bin/sh")
-        name = self.name.get_text().strip() or command.split()[0]
-        tag = self.tag.get_text().strip() or "default"
-        cwd = self.cwd.get_text().strip() or os.getcwd()
-        return name, tag, command, cwd
-
-
-LauncherDialog = CommandDialog
+    def value(self) -> str:
+        return self.entry.get_text().strip()
 
 
 class TerminalOptionsDialog(Gtk.Dialog):
@@ -1282,7 +1187,7 @@ class TerminalOptionsDialog(Gtk.Dialog):
             ("Cursor blink", self.cursor_blink),
             ("Scrollback lines", self.scrollback),
             ("Colour palette", self.palette_combo),
-            ("Sessions pane", self.side_position_combo),
+            ("Tabs pane", self.side_position_combo),
         ]
         for index, (label, widget) in enumerate(rows):
             if label:
@@ -1318,7 +1223,7 @@ class TerminalOptionsDialog(Gtk.Dialog):
 
 
 class ActionPaletteDialog(Gtk.Dialog):
-    """Universal command palette for actions, sessions, and templates."""
+    """Universal command palette for window actions and remembered tabs."""
 
     def __init__(self, parent: Gtk.Window, items: list[PaletteItem]):
         super().__init__(title="Command palette", transient_for=parent, flags=0)
@@ -1335,14 +1240,14 @@ class ActionPaletteDialog(Gtk.Dialog):
         box.add(outer)
 
         intro = Gtk.Label(
-            label="Search actions, sessions, and task templates. Pick a result and press Enter.",
+            label="Search window actions and remembered tabs. Pick a result and press Enter.",
             xalign=0,
         )
         intro.set_line_wrap(True)
         _style(intro, "td-muted")
         outer.pack_start(intro, False, False, 0)
 
-        self.search = Gtk.SearchEntry(placeholder_text="try: master, codex, pause selected, cpu, ssh, shell")
+        self.search = Gtk.SearchEntry(placeholder_text="try: new tab, rename window, search tabs, pause selected")
         _style(self.search, "td-search-entry")
         _connect_debounced_refresh(self.search, self.refresh)
         self.search.connect("activate", lambda *_: self.response(Gtk.ResponseType.OK))
@@ -1433,18 +1338,18 @@ class SidePane(Gtk.Box):
 
         header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         heading_stack = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        eyebrow = Gtk.Label(label="WORKSPACE", xalign=0)
+        eyebrow = Gtk.Label(label="WINDOW", xalign=0)
         _style(eyebrow, "td-eyebrow")
-        title = Gtk.Label(label="Sessions", xalign=0)
+        title = Gtk.Label(label="Tabs", xalign=0)
         _style(title, "title", "td-title")
         heading_stack.pack_start(eyebrow, False, False, 0)
         heading_stack.pack_start(title, False, False, 0)
         title_event = Gtk.EventBox()
         title_event.add(heading_stack)
-        title_event.set_tooltip_text("Right-click to move the sessions pane left or right")
+        title_event.set_tooltip_text("Right-click to move the tabs pane left or right")
         title_event.connect("button-press-event", self._on_header_button_press)
         header_row.pack_start(title_event, True, True, 0)
-        self.count_label = Gtk.Label(label="0 active")
+        self.count_label = Gtk.Label(label="0 tabs")
         _style(self.count_label, "td-count-pill")
         header_row.pack_end(self.count_label, False, False, 0)
 
@@ -1460,18 +1365,18 @@ class SidePane(Gtk.Box):
             pane_menu.append(item)
         pane_menu.show_all()
         pane_more = Gtk.MenuButton(label="⋯")
-        pane_more.set_tooltip_text("Sessions pane options")
+        pane_more.set_tooltip_text("Tabs pane options")
         pane_more.set_popup(pane_menu)
         _style(pane_more, "td-ghost-action")
         header_row.pack_end(pane_more, False, False, 0)
         self.pack_start(header_row, False, False, 0)
 
-        hint = Gtk.Label(label="Ctrl+left-click anywhere on a card to select multiple sessions", xalign=0)
+        hint = Gtk.Label(label="Ctrl+left-click any tab card to select multiple tabs", xalign=0)
         hint.set_line_wrap(True)
         _style(hint, "td-muted")
         self.pack_start(hint, False, False, 0)
 
-        self.filter_entry = Gtk.SearchEntry(placeholder_text="Search sessions, tags, or commands")
+        self.filter_entry = Gtk.SearchEntry(placeholder_text="Search tabs, directories, or commands")
         _style(self.filter_entry, "td-search-entry")
         _connect_debounced_refresh(self.filter_entry, self.refresh)
         self.pack_start(self.filter_entry, False, False, 0)
@@ -1483,7 +1388,7 @@ class SidePane(Gtk.Box):
         scroller.add(self.session_box)
         self.pack_start(scroller, True, True, 0)
 
-        self.prompt = Gtk.Entry(placeholder_text="Send a command or prompt to selected sessions")
+        self.prompt = Gtk.Entry(placeholder_text="Send a command or prompt to selected tabs")
         _style(self.prompt, "td-search-entry")
         self.pack_start(self.prompt, False, False, 0)
 
@@ -1503,15 +1408,14 @@ class SidePane(Gtk.Box):
         self.pack_start(primary, False, False, 0)
 
         more = Gtk.MenuButton(label="More actions ▾")
-        more.set_tooltip_text("Secondary session controls")
+        more.set_tooltip_text("Secondary tab controls")
         _style(more, "td-more-actions")
         menu = Gtk.Menu()
         secondary = [
-            ("Launcher", self.window.open_launcher),
-            ("New shell", self.window.new_shell_tab),
+            ("New tab", self.window.new_directory_tab),
+            ("Rename window", self.window.rename_window),
             ("Palette", self.window.open_command_palette),
             ("Rename", self.rename_selected),
-            ("Retag", self.retag_selected),
             ("Terminal options", self.window.open_terminal_options),
             ("Status", self.send_status),
             ("Pin", self.pin_selected),
@@ -1521,7 +1425,7 @@ class SidePane(Gtk.Box):
             ("Reopen", self.window.reopen_last_closed_tab),
             ("Pause hot", self.pause_hot_sessions),
             ("Restore", self.window.restore_previous_tabs),
-            ("Master", self.window.open_master_window),
+            ("Tab manager", self.window.open_master_window),
         ]
         for label, handler in secondary:
             item = Gtk.MenuItem(label=label)
@@ -1556,8 +1460,8 @@ class SidePane(Gtk.Box):
         if int(getattr(event, "button", 0) or 0) != 3:
             return False
         menu = Gtk.Menu()
-        menu.append(self._menu_item("Move sessions pane to left", lambda: self.window.set_side_pane_position("left")))
-        menu.append(self._menu_item("Move sessions pane to right", lambda: self.window.set_side_pane_position("right")))
+        menu.append(self._menu_item("Move tabs pane to left", lambda: self.window.set_side_pane_position("left")))
+        menu.append(self._menu_item("Move tabs pane to right", lambda: self.window.set_side_pane_position("right")))
         menu.append(self._menu_item("Toggle focus mode", self.window.toggle_focus_mode))
         menu.append(self._menu_item("Terminal options", self.window.open_terminal_options))
         self._popup_menu(menu, event)
@@ -1572,18 +1476,6 @@ class SidePane(Gtk.Box):
             active = True
         if check is not None and check.get_active() != active:
             check.set_active(active)
-
-    def _on_tag_button_press(self, _widget, event: Gdk.EventButton, record: SessionRecord, check: Gtk.CheckButton) -> bool:
-        button = int(getattr(event, "button", 0) or 0)
-        state = int(getattr(event, "state", 0) or 0)
-        control = bool(state & Gdk.ModifierType.CONTROL_MASK)
-        if button == 1 and control:
-            self._toggle_record_selection(record, check)
-            return True
-        if button == 3:
-            self._show_session_menu(record, check, event)
-            return True
-        return False
 
     def _on_session_button_press(self, _widget, event: Gdk.EventButton, record: SessionRecord, check: Gtk.CheckButton) -> bool:
         button = int(getattr(event, "button", 0) or 0)
@@ -1632,14 +1524,13 @@ class SidePane(Gtk.Box):
         menu.append(self._menu_item("Open", lambda: self.window.open_session(record)))
         menu.append(self._menu_item(selected_label, lambda: self._toggle_record_selection(record, check)))
         menu.append(self._menu_item("Rename", lambda: self.window.rename_session(record)))
-        menu.append(self._menu_item(self._context_label("Retag", records), lambda: self.window.retag_sessions(records)))
         menu.append(self._menu_item(self._context_label("Pin", records), lambda: self._pin_records(records)))
         menu.append(self._menu_item(self._context_label("Unpin", records), lambda: self._unpin_records(records)))
         menu.append(self._menu_item(self._context_label("Hide", records), lambda: self._hide_records(records)))
         menu.append(self._menu_item(self._context_label("Kill", records), lambda: self._kill_records(records)))
         menu.append(Gtk.SeparatorMenuItem())
-        menu.append(self._menu_item("Move sessions pane to left", lambda: self.window.set_side_pane_position("left")))
-        menu.append(self._menu_item("Move sessions pane to right", lambda: self.window.set_side_pane_position("right")))
+        menu.append(self._menu_item("Move tabs pane to left", lambda: self.window.set_side_pane_position("left")))
+        menu.append(self._menu_item("Move tabs pane to right", lambda: self.window.set_side_pane_position("right")))
         self._popup_menu(menu, event)
 
     def _kill_records(self, records: list[SessionRecord]) -> None:
@@ -1673,9 +1564,9 @@ class SidePane(Gtk.Box):
         self.selected_ids.intersection_update(live_ids)
         selected_count = len(self.selected_ids)
         if selected_count:
-            self.count_label.set_text(f"{selected_count} selected · {len(records)} shown")
+            self.count_label.set_text(f"{selected_count} selected · {len(records)} tabs")
         else:
-            self.count_label.set_text(f"{len(records)} active")
+            self.count_label.set_text(f"{len(records)} tabs")
         resource_bucket = int(time.monotonic() // self._refresh_bucket_seconds)
         signature = (
             query,
@@ -1696,23 +1587,23 @@ class SidePane(Gtk.Box):
             empty_icon = Gtk.Label(label="✦")
             _style(empty_icon, "td-empty-icon")
             empty_card.pack_start(empty_icon, False, False, 0)
-            empty_title = Gtk.Label(label="No active sessions", xalign=0.5)
+            empty_title = Gtk.Label(label="No tabs in this window", xalign=0.5)
             _style(empty_title, "td-title")
             empty_card.pack_start(empty_title, False, False, 0)
-            empty_detail = Gtk.Label(label="Start a shell or open the detected project workspace.", xalign=0.5)
+            empty_detail = Gtk.Label(label="Choose a directory to open its shell as a tab.", xalign=0.5)
             empty_detail.set_line_wrap(True)
             empty_detail.set_justify(Gtk.Justification.CENTER)
             _style(empty_detail, "td-muted")
             empty_card.pack_start(empty_detail, False, False, 0)
             empty_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            shell_button = Gtk.Button(label="New shell")
+            shell_button = Gtk.Button(label="New tab")
             _style(shell_button, "td-primary-action")
-            shell_button.connect("clicked", lambda *_: self.window.new_shell_tab())
+            shell_button.connect("clicked", lambda *_: self.window.new_directory_tab())
             empty_actions.pack_start(shell_button, True, True, 0)
-            project_button = Gtk.Button(label="Open project")
-            _style(project_button, "td-ghost-action")
-            project_button.connect("clicked", lambda *_: self.window.open_detected_project())
-            empty_actions.pack_start(project_button, True, True, 0)
+            rename_button = Gtk.Button(label="Name window")
+            _style(rename_button, "td-ghost-action")
+            rename_button.connect("clicked", lambda *_: self.window.rename_window())
+            empty_actions.pack_start(rename_button, True, True, 0)
             empty_card.pack_start(empty_actions, False, False, 0)
             row = Gtk.ListBoxRow()
             row.set_selectable(False)
@@ -1752,13 +1643,6 @@ class SidePane(Gtk.Box):
             title.set_ellipsize(Pango.EllipsizeMode.END)
             _style(title, "td-title")
             top.pack_start(title, True, True, 0)
-            chip = Gtk.Label(label=record.tag)
-            _style(chip, "td-chip")
-            chip_event = Gtk.EventBox()
-            chip_event.add(chip)
-            chip_event.set_tooltip_text("Ctrl+left-click to add or remove this session from the multi-selection")
-            chip_event.connect("button-press-event", self._on_tag_button_press, record, check)
-            top.pack_start(chip_event, False, False, 0)
             card.pack_start(top, False, False, 0)
 
             meta = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -1777,7 +1661,7 @@ class SidePane(Gtk.Box):
 
             actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
             rename = Gtk.Button(label="Rename")
-            rename.set_tooltip_text("Rename this tab/session")
+            rename.set_tooltip_text("Rename this tab")
             _style(rename, "td-ghost-action")
             rename.connect("clicked", lambda _b, r=record: self.window.rename_session(r))
             rename.connect("button-press-event", self._on_session_button_press, record, check)
@@ -1814,7 +1698,7 @@ class SidePane(Gtk.Box):
             selected_count = len(self.selected_ids)
             visible_count = len([record for record in self.window.app_context.store.list() if _show_in_sessions_pane(record)])
             self.count_label.set_text(
-                f"{selected_count} selected · {visible_count} active" if selected_count else f"{visible_count} active"
+                f"{selected_count} selected · {visible_count} tabs" if selected_count else f"{visible_count} tabs"
             )
 
     def selected_records(self) -> list[SessionRecord]:
@@ -1903,17 +1787,10 @@ class SidePane(Gtk.Box):
             if current is not None:
                 records = [current]
         if not records:
-            self.window.show_toast("Select a session to rename", kind="warn")
+            self.window.show_toast("Select a tab to rename", kind="warn")
             return
         # Rename acts on one tab at a time (same as CLI rename).
         self.window.rename_session(records[0])
-
-    def retag_selected(self) -> None:
-        records = self.selected_records()
-        if not records:
-            self.window.show_toast("Select sessions to retag", kind="warn")
-            return
-        self.window.retag_sessions(records)
 
     def pause_hot_sessions(self) -> None:
         self.window.pause_hot_sessions()
@@ -1938,7 +1815,7 @@ class SidePane(Gtk.Box):
             flags=0,
             message_type=Gtk.MessageType.QUESTION,
             buttons=Gtk.ButtonsType.OK_CANCEL,
-            text="Archive selected sessions?",
+            text="Archive selected tabs?",
         )
         dialog.format_secondary_text("This removes them from normal browser views but does not stop their processes.")
         response = dialog.run()
@@ -1979,7 +1856,6 @@ class MasterWindow(Gtk.Window):
         "ID",
         "Window",
         "Name",
-        "Tag",
         "Pin",
         "PID",
         "State",
@@ -1995,7 +1871,7 @@ class MasterWindow(Gtk.Window):
     ]
 
     def __init__(self, app_context: "TermDeckApplication"):
-        super().__init__(title="TermDeck Master Tasks")
+        super().__init__(title="TermDeck Tab Manager")
         self.app_context = app_context
         self._refresh_alive = True
         self._capture_preview_cache: dict[tuple[str, str, int | None, int], str] = {}
@@ -2031,7 +1907,7 @@ class MasterWindow(Gtk.Window):
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.filter_entry = Gtk.SearchEntry(placeholder_text="filter by id, tag, window, health, state, command, directory")
+        self.filter_entry = Gtk.SearchEntry(placeholder_text="filter by id, window, health, state, command, or directory")
         _style(self.filter_entry, "td-search-entry")
         _connect_debounced_refresh(self.filter_entry, self.refresh)
         top.pack_start(self.filter_entry, True, True, 0)
@@ -2059,7 +1935,7 @@ class MasterWindow(Gtk.Window):
         outer.pack_start(capture_scroller, False, True, 0)
 
         prompt_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.prompt_entry = Gtk.Entry(placeholder_text="send text to selected sessions; use Send+Enter only when intentional")
+        self.prompt_entry = Gtk.Entry(placeholder_text="send text to selected tabs; use Send+Enter only when intentional")
         prompt_row.pack_start(self.prompt_entry, True, True, 0)
         for label, handler in [
             ("Send text", self.send_text_selected),
@@ -2080,7 +1956,7 @@ class MasterWindow(Gtk.Window):
             ("Pin", self.pin_selected),
             ("Unpin", self.unpin_selected),
             ("Hide", self.hide_selected),
-            ("Kill", self.kill_selected),
+            ("Stop", self.kill_selected),
             ("Archive", self.archive_selected),
             ("Pause Hot", self.pause_hot),
             ("Refresh", self.refresh),
@@ -2139,7 +2015,8 @@ class MasterWindow(Gtk.Window):
                 )
             )
         for row in filter_rows(rows, self.filter_entry.get_text()):
-            iter_ = self.store.append(row.as_list())
+            values = row.as_list()
+            iter_ = self.store.append(values[:3] + values[4:])
             if row.session_id in selected:
                 path = self.store.get_path(iter_)
                 self.tree.get_selection().select_path(path)
@@ -2166,19 +2043,19 @@ class MasterWindow(Gtk.Window):
                 labels = ", ".join(redacted.labels)
                 capture = f"[TermDeck redacted {redacted.replacements} secret-like value(s): {labels}]\n\n{capture}"
         if not capture:
-            capture = "No captured output yet, or the hidden session is not currently available."
+            capture = "No captured output yet, or the hidden tab process is not currently available."
         self._capture_preview_cache = {key: capture}
         return capture
 
     def update_capture_preview(self) -> None:
         records = self.selected_records()
         if not records:
-            self.set_capture_text("Select a session to preview its latest terminal output.")
+            self.set_capture_text("Select a tab to preview its latest terminal output.")
             return
         if len(records) > 1:
             names = ", ".join(record.name for record in records[:6])
             suffix = "..." if len(records) > 6 else ""
-            self.set_capture_text(f"{len(records)} sessions selected: {names}{suffix}\nUse the buttons below to control them together.")
+            self.set_capture_text(f"{len(records)} tabs selected: {names}{suffix}\nUse the buttons below to control them together.")
             return
         record = records[0]
         self.set_capture_text(self.capture_preview_text(record))
@@ -2194,7 +2071,7 @@ class MasterWindow(Gtk.Window):
             "send",
             text=text,
             enter=enter,
-            selection="master task selection",
+            selection="tab manager selection",
         ):
             return
         for record in records:
@@ -2218,7 +2095,7 @@ class MasterWindow(Gtk.Window):
             "send",
             text=text,
             enter=True,
-            selection="master task status request",
+            selection="tab manager status request",
         ):
             return
         for record in records:
@@ -2258,7 +2135,7 @@ class MasterWindow(Gtk.Window):
             self,
             records,
             "pause",
-            selection="master task selection",
+            selection="tab manager selection",
         ):
             return
         for record in records:
@@ -2286,7 +2163,7 @@ class MasterWindow(Gtk.Window):
             self,
             records,
             "pause-hot",
-            selection="master task hot sessions",
+            selection="tab manager hot tabs",
         ):
             return
         for record in records:
@@ -2317,7 +2194,7 @@ class MasterWindow(Gtk.Window):
             flags=0,
             message_type=Gtk.MessageType.QUESTION,
             buttons=Gtk.ButtonsType.OK_CANCEL,
-            text="Archive selected sessions?",
+            text="Archive selected tabs?",
         )
         dialog.format_secondary_text("This removes them from normal browser views but does not stop their processes.")
         response = dialog.run()
@@ -2337,7 +2214,7 @@ class MasterWindow(Gtk.Window):
             self,
             records,
             "kill",
-            selection="master task selection",
+            selection="tab manager selection",
         ):
             return
         self.app_context.terminate_records(records)
@@ -2363,6 +2240,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         )
         self.window_id = window_id or short_id("win")
         self.window_title = window_title or "Main"
+        self.set_title(f"TermDeck · {self.window_title}")
         self._restore_records = restore_records
         self.open_initial_shell = open_initial_shell
         self.tabs: dict[str, TerminalTab] = {}
@@ -2386,8 +2264,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         title = Gtk.Label(label=f"TermDeck · {self.window_title}", xalign=0)
         title.set_ellipsize(Pango.EllipsizeMode.END)
         title.set_max_width_chars(18)
+        title.set_tooltip_text("Window name · use More → Rename window to change it")
         _style(title, "td-title")
-        subtitle = Gtk.Label(label="Terminal workspace", xalign=0)
+        self.window_title_label = title
+        subtitle = Gtk.Label(label="Directory tabs", xalign=0)
         subtitle.set_ellipsize(Pango.EllipsizeMode.END)
         subtitle.set_max_width_chars(18)
         _style(subtitle, "td-subtitle", "td-muted")
@@ -2400,8 +2280,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         # Keep high-frequency actions visible; move secondary controls into a
         # single discoverable overflow menu so the header stays calm at narrow widths.
         primary_header_actions = [
-            ("New", "list-add-symbolic", "New task launcher", self.open_launcher, True, False),
-            ("Shell", "utilities-terminal-symbolic", "New shell tab", self.new_shell_tab, False, False),
+            ("New tab", "list-add-symbolic", "Choose a directory and open a new shell tab", self.new_directory_tab, True, False),
         ]
         for label, icon, tip, handler, suggested, show_label in primary_header_actions:
             button = _icon_button(label, icon, tip, handler, suggested=suggested, show_label=show_label)
@@ -2411,15 +2290,14 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             header.pack_start(button)
 
         overflow_header_actions = [
-            ("New custom task", self.new_command_tab),
-            ("Open detected project", self.open_detected_project),
-            ("Master task manager", self.open_master_window),
+            ("Rename window", self.rename_window),
+            ("New TermDeck window", self.new_window),
+            ("Tab manager", self.open_master_window),
             ("Window overview", self.open_window_overview),
             ("Keyboard shortcuts", self.open_shortcut_window),
             ("Terminal appearance", self.open_terminal_options),
             ("Reopen closed tab", self.reopen_last_closed_tab),
             ("Toggle focus mode", self.toggle_focus_mode),
-            ("New TermDeck window", self.new_window),
         ]
         overflow_menu = Gtk.Menu()
         for label, handler in overflow_header_actions:
@@ -2428,7 +2306,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             overflow_menu.append(item)
         overflow_menu.show_all()
         overflow = Gtk.MenuButton(label="⋯")
-        overflow.set_tooltip_text("More workspace, window, and appearance actions")
+        overflow.set_tooltip_text("More window, tab, and appearance actions")
         try:
             overflow.get_accessible().set_name("More actions")
         except Exception:
@@ -2506,7 +2384,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             attention = ""
         text = f"{kind_glyph(kind)} {pin}{attention}{record.name}".strip()
         name = Gtk.Label(label=text)
-        name.set_tooltip_text(f"{record.tag} · {record.command}\nDouble-click to rename · Right-click for tab actions")
+        name.set_tooltip_text(f"{record.cwd} · {record.command}\nDouble-click to rename · Right-click for tab actions")
         name.set_events(name.get_events() | Gdk.EventMask.BUTTON_PRESS_MASK)
         name.connect("button-press-event", self._on_tab_label_press, record.id)
         label_box.pack_start(name, True, True, 0)
@@ -2571,7 +2449,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     def _show_tab_context_menu(self, record: SessionRecord, event: Gdk.EventButton) -> None:
         menu = Gtk.Menu()
         menu.append(self._tab_menu_item("Rename", lambda: self.rename_session(record)))
-        menu.append(self._tab_menu_item("Retag", lambda: self.retag_sessions([record])))
         pin_label = "Unpin tab" if record.pinned else "Pin tab"
         menu.append(self._tab_menu_item(pin_label, lambda: self._pin_tab(record, not record.pinned)))
         menu.append(Gtk.SeparatorMenuItem())
@@ -2580,12 +2457,12 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             menu.append(self._tab_menu_item("Unpin and hide tab", lambda: self._unpin_and_hide_tab(record)))
         menu.append(self._tab_menu_item("Hide other tabs", lambda: self._hide_other_tabs(record)))
         menu.append(self._tab_menu_item("Hide tabs to the right", lambda: self._hide_tabs_to_right(record)))
-        menu.append(self._tab_menu_item("Kill session", lambda: self.stop_session(record)))
+        menu.append(self._tab_menu_item("Stop tab", lambda: self.stop_session(record)))
         menu.append(Gtk.SeparatorMenuItem())
-        menu.append(self._tab_menu_item("Move sessions pane to left", lambda: self.set_side_pane_position("left")))
-        menu.append(self._tab_menu_item("Move sessions pane to right", lambda: self.set_side_pane_position("right")))
+        menu.append(self._tab_menu_item("Move tabs pane to left", lambda: self.set_side_pane_position("left")))
+        menu.append(self._tab_menu_item("Move tabs pane to right", lambda: self.set_side_pane_position("right")))
         menu.append(self._tab_menu_item("Terminal options", self.open_terminal_options))
-        menu.append(self._tab_menu_item("Master tasks", self.open_master_window))
+        menu.append(self._tab_menu_item("Tab manager", self.open_master_window))
         menu.show_all()
         try:
             menu.popup_at_pointer(event)
@@ -2639,7 +2516,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.notebook.set_tab_label(tab.widget, self._build_tab_label(record))
 
     def rename_session(self, record: SessionRecord) -> SessionRecord | None:
-        """Rename a browser tab/session without touching the running process."""
+        """Rename a tab without touching the running process."""
         new_name = self.prompt_text("Rename tab", f"New name for “{record.name}”:", record.name)
         if new_name is None or new_name == record.name:
             return None
@@ -2658,23 +2535,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 window.side.refresh()
         self.show_toast(f"Renamed to {updated.name}", kind="success")
         return updated
-
-    def retag_sessions(self, records: list[SessionRecord]) -> None:
-        if not records:
-            return
-        sample = records[0].tag
-        new_tag = self.prompt_text("Retag sessions", f"New tag for {len(records)} session(s):", sample)
-        if new_tag is None:
-            return
-        retag_records(self.app_context.store, records, new_tag)
-        for record in records:
-            updated = self.app_context.store.get(record.id)
-            if updated is not None:
-                self.refresh_tab_label(updated)
-        self.side.refresh()
-        if self.master_window is not None and self.master_window.get_visible():
-            self.master_window.refresh()
-        self.show_toast(toast_message_for_action("retagged", len(records), detail=new_tag), kind="success")
 
     def rename_current_session(self) -> None:
         record = self.current_record()
@@ -2737,40 +2597,91 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         ctx = self.get_style_context()
         if self.focus_mode:
             ctx.add_class("td-focus-mode")
-            self.show_toast("Focus mode on · side pane hidden", kind="info")
+            self.show_toast("Focus mode on · tabs pane hidden", kind="info")
         else:
             ctx.remove_class("td-focus-mode")
             self.side.set_visible(True)
             self.side.refresh()
             self.show_toast("Focus mode off", kind="info")
 
-    def open_detected_project(self) -> int:
-        detection = detect_project(os.getcwd(), include_ai=False)
-        opened = 0
-        for index, recipe_window in enumerate(detection.recipe.windows, start=1):
-            self.app_context._open_recipe_window(recipe_window, detection.name, index)
-            opened += 1
-        return opened
+    def _prompt_window_name(self, *, title: str, initial: str) -> str | None:
+        dialog = WindowNameDialog(self, title=title, initial=initial)
+        response = dialog.run()
+        value = dialog.value()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK or not value:
+            return None
+        return value
+
+    def set_window_name(self, title: str) -> None:
+        clean_title = title.strip() or "Window"
+        self.window_title = clean_title
+        self.set_title(f"TermDeck · {clean_title}")
+        self.window_title_label.set_text(f"TermDeck · {clean_title}")
+        self.app_context.store.rename_window(self.window_id, clean_title)
+        for session_id, tab in self.tabs.items():
+            updated = self.app_context.store.get(session_id)
+            if updated is not None:
+                tab.record = updated
+        self.side.refresh()
+        self.show_toast(f"Window renamed to {clean_title}", kind="success")
+
+    def rename_window(self) -> None:
+        title = self._prompt_window_name(title="Rename TermDeck window", initial=self.window_title)
+        if title is not None:
+            self.set_window_name(title)
 
     def new_window(self) -> None:
-        index = len(self.app_context.windows) + 1
-        win = TermDeckWindow(self.app_context, window_title=f"Window {index}")
+        default_title = f"Window {len(self.app_context.windows) + 1}"
+        title = self._prompt_window_name(title="New TermDeck window", initial=default_title)
+        if title is None:
+            return
+        win = TermDeckWindow(
+            self.app_context,
+            window_title=title,
+            restore_records=[],
+            open_initial_shell=False,
+        )
         self.app_context.windows.append(win)
         win.show_all()
+        win.new_directory_tab()
 
-    def open_launcher(self) -> None:
-        dialog = CommandDialog(self)
+    def _active_directory(self) -> str:
+        page = self.notebook.get_current_page()
+        if page >= 0:
+            widget = self.notebook.get_nth_page(page)
+            for tab in self.tabs.values():
+                if tab.widget is widget:
+                    return tab.record.cwd
+        return os.getcwd()
+
+    def choose_tab_directory(self) -> str | None:
+        dialog = Gtk.FileChooserDialog(
+            title="Choose directory for new tab",
+            transient_for=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, "Open tab", Gtk.ResponseType.OK)
+        dialog.set_modal(True)
+        try:
+            dialog.set_current_folder(self._active_directory())
+        except Exception:
+            pass
         response = dialog.run()
-        if response == Gtk.ResponseType.OK:
-            name, tag, command, cwd = dialog.values()
-            dialog.destroy()
-            self.create_session(name, tag, command, cwd)
-        else:
-            dialog.destroy()
+        selected = dialog.get_filename()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK or not selected:
+            return None
+        return normalise_directory(selected)
 
-    def new_shell_tab(self) -> None:
-        shell = os.environ.get("SHELL", "/bin/sh")
-        self.create_session("shell", "default", shell, os.getcwd())
+    def new_directory_tab(self) -> None:
+        directory = self.choose_tab_directory()
+        if directory is not None:
+            self.new_shell_tab(directory)
+
+    def new_shell_tab(self, cwd: str | Path | None = None) -> None:
+        directory = normalise_directory(cwd)
+        self.create_session(directory_tab_name(directory), "terminal", default_shell(), directory)
 
     def open_command_palette(self) -> None:
         items = build_palette_items(self.app_context.store.list())
@@ -2784,9 +2695,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     def execute_palette_item(self, item: PaletteItem) -> None:
         if item.kind == "builtin":
             actions = {
-                "new_shell": self.new_shell_tab,
-                "new_task": self.open_launcher,
-                "project_detect": self.open_detected_project,
+                "new_tab": self.new_directory_tab,
+                "rename_window": self.rename_window,
+                "new_window": self.new_window,
                 "master": self.open_master_window,
                 "window_overview": self.open_window_overview,
                 "shortcuts": self.open_shortcut_window,
@@ -2807,7 +2718,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 "archive_selected": self.side.archive_selected,
                 "rename_selected": self.side.rename_selected,
                 "rename_current": self.rename_current_session,
-                "retag_selected": self.side.retag_selected,
                 "terminal_options": self.open_terminal_options,
             }
             handler = actions.get(item.payload)
@@ -2818,34 +2728,17 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             record = self.app_context.store.get(item.payload)
             if record:
                 self.open_session(record)
-            return
-        if item.kind == "template":
-            try:
-                template = template_by_id(item.payload)
-            except KeyError:
-                return
-            if template.id == "custom":
-                self.open_launcher()
-                return
-            name, tag, command, cwd = template.materialise(os.getcwd())
-            self.create_session(name, tag, command, cwd)
-
-    def new_command_tab(self) -> None:
-        dialog = CommandDialog(self)
-        response = dialog.run()
-        if response == Gtk.ResponseType.OK:
-            name, tag, command, cwd = dialog.values()
-            dialog.destroy()
-            self.create_session(name, tag, command, cwd)
-        else:
-            dialog.destroy()
 
     def create_session(self, name: str, tag: str, command: str, cwd: str) -> None:
+        directory = normalise_directory(cwd)
+        clean_name = name.strip()
+        if not clean_name or clean_name.casefold() in {"shell", "terminal"}:
+            clean_name = directory_tab_name(directory)
         record = self.app_context.store.create(
-            name=name,
-            tag=tag,
-            command=command,
-            cwd=cwd,
+            name=clean_name,
+            tag=tag.strip() or "terminal",
+            command=command.strip() or default_shell(),
+            cwd=directory,
             window_id=self.window_id,
             window_title=self.window_title,
             tab_index=self.notebook.get_n_pages(),
@@ -2859,7 +2752,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
 
     def restore_previous_tabs(self, records: list[SessionRecord] | None = None) -> int:
-        """Reattach remembered tabs for this window without restarting missing tasks."""
+        """Reattach remembered tabs for this window without restarting missing processes."""
         restored = 0
         restore_records = sorted(records, key=lambda row: row.tab_index) if records is not None else self.app_context.store.restore_candidates(
             limit=12,
@@ -3042,7 +2935,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             self,
             records,
             "pause-hot",
-            selection="visible hot sessions",
+            selection="visible hot tabs",
         ):
             return 0
         paused = 0
@@ -3195,7 +3088,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self._pack_side_pane()
         if persist:
             self.app_context.apply_side_pane_position(position)
-        self.show_toast(f"Sessions pane moved to {position}", kind="info")
+        self.show_toast(f"Tabs pane moved to {position}", kind="info")
 
     def toggle_side(self) -> None:
         self.side.set_visible(not self.side.get_visible())
@@ -3385,10 +3278,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if self.handle_zoom_event(event):
             return True
         if self.keymap.matches(event, "new_tab"):
-            self.new_shell_tab()
-            return True
-        if self.keymap.matches(event, "new_command"):
-            self.new_command_tab()
+            self.new_directory_tab()
             return True
         if self.keymap.matches(event, "close_term"):
             self.hide_current_tab()
@@ -3404,9 +3294,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             return True
         if self.keymap.matches(event, "launcher"):
             self.open_command_palette()
-            return True
-        if self.keymap.matches(event, "task_launcher"):
-            self.open_launcher()
             return True
         if self.keymap.matches(event, "pause_current"):
             self.toggle_pause_current_session()
@@ -3620,7 +3507,7 @@ class TermDeckApplication(Gtk.Application):
             flags=0,
             message_type=Gtk.MessageType.WARNING if plan.risk in {"high", "critical"} else Gtk.MessageType.QUESTION,
             buttons=Gtk.ButtonsType.OK_CANCEL,
-            text=f"Confirm {plan.action} for {plan.count} session(s)?",
+            text=f"Confirm {plan.action} for {plan.count} tab(s)?",
         )
         dialog.format_secondary_text(render_control_plan_text(plan))
         response = dialog.run()
@@ -3687,7 +3574,7 @@ class TermDeckApplication(Gtk.Application):
             try:
                 self.open_workspace_recipe(self.workspace_path)
             except WorkspaceRecipeError as exc:
-                self._show_error("Could not open workspace recipe", str(exc))
+                self._show_error("Could not open saved window layout", str(exc))
             if self.windows:
                 self.windows[-1].present()
                 return

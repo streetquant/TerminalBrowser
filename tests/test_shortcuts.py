@@ -13,7 +13,8 @@ class ShortcutManifestTests(unittest.TestCase):
         actions = {row["action"]: row for row in report["shortcuts"]}
         self.assertEqual(actions["close_term"]["terminal_conflict"], "shell/readline backward kill word")
         self.assertEqual(actions["reopen_closed"]["accelerator"], "<Primary><Shift>t")
-        self.assertEqual(actions["task_launcher"]["accelerator"], "<Primary><Alt>n")
+        self.assertNotIn("task_launcher", actions)
+        self.assertNotIn("new_command", actions)
         self.assertEqual(pause_shortcut_for_index(3), "Ctrl+Alt+3")
         self.assertEqual(pause_shortcut_for_index(10), "")
 
@@ -32,7 +33,7 @@ class ShortcutManifestTests(unittest.TestCase):
     def test_render_shortcut_table_is_plain_text(self):
         table = render_shortcut_table(build_shortcut_report())
         self.assertIn("Action", table)
-        self.assertIn("New shell tab", table)
+        self.assertIn("New directory tab", table)
 
 
 if __name__ == "__main__":

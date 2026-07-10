@@ -2,7 +2,6 @@ import unittest
 
 from termdeck.command_palette import build_palette_items, search_palette, serialise_palette_items
 from termdeck.models import SessionRecord
-from termdeck.task_templates import template_by_id
 
 
 class CommandPaletteTests(unittest.TestCase):
@@ -20,12 +19,15 @@ class CommandPaletteTests(unittest.TestCase):
             window_title="Research",
         )
 
-    def test_palette_contains_builtin_session_and_template_items(self):
-        items = build_palette_items([self.sample_record()], templates=[template_by_id("codex")])
+    def test_palette_contains_window_actions_and_sessions_without_templates(self):
+        items = build_palette_items([self.sample_record()])
         ids = {item.id for item in items}
+        self.assertIn("builtin:new-tab", ids)
+        self.assertIn("builtin:rename-window", ids)
+        self.assertIn("builtin:new-window", ids)
         self.assertIn("builtin:master", ids)
         self.assertIn("session:td-demo-001", ids)
-        self.assertIn("template:codex", ids)
+        self.assertFalse(any(item.kind == "template" for item in items))
 
     def test_search_finds_existing_session_by_tag_or_name(self):
         items = build_palette_items([self.sample_record()])

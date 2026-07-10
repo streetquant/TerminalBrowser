@@ -20,7 +20,6 @@ jobs:
         run: python -m compileall -q termdeck tests scripts
       - name: CLI smoke
         run: |
-          python -m termdeck templates codex
           python -m termdeck workspace-plan --sample > /tmp/termdeck.workspace.json
           python -m termdeck workspace-plan /tmp/termdeck.workspace.json
           python -m termdeck palette master --db :memory:

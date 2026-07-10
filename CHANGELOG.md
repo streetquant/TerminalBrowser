@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0
+
+- Simplified the product to one visible hierarchy: named TermDeck windows containing directory-backed tabs.
+- Replaced task creation with a directory chooser; each new tab opens the user's default shell and uses the directory basename as its initial title.
+- Added persistent window naming and a New TermDeck window flow that asks for a group name before choosing the first tab directory.
+- Removed the task launcher, task-template modules, template CLI command, custom-task GUI path, and launcher shortcuts.
+- Removed project detection from the GUI, command palette, quickstart report, CLI, and executable package.
+- Simplified `termdeck new`: removed `--tag`, changed the JSON result from `sessions` to `tabs`, and stopped exposing internal tag/tmux fields in its normal creation response.
+- Removed visible tag chips, Retag actions, and Tag columns from the Tabs pane, Search, and Tab Manager while retaining internal metadata for backward compatibility.
+- Reworded the primary GUI around Window, Tabs, New tab, Rename window, Tab manager, and directory-based search.
+- Preserved restoration of existing remembered tabs, saved window layouts, Terminator imports, snapshots, and hidden tmux processes.
+- Added tests for directory chooser behavior, directory-derived titles, scoped window renaming, timestamp preservation, and removal of obsolete launcher/project surfaces.
+- Verified 319 tests and 11 subtests, plus desktop and compact GTK renders with zero application or layout errors.
+
 ## 0.1.32
 
 - Replaced Ctrl+right-click session collection with standard Ctrl+left-click multi-selection across the complete Sessions card.

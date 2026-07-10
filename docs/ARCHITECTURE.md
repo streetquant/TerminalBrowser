@@ -1,37 +1,39 @@
 # TermDeck architecture
 
-TermDeck is organised around a browser-like process-capsule model:
+TermDeck is organised around one visible hierarchy:
 
 ```text
-Workspace/tag -> Window -> Tab -> hidden tmux-backed terminal task
+Named window -> Directory-backed tab -> Hidden tmux-backed shell/process
 ```
 
-The GUI never exposes tmux. The hidden tmux backend keeps terminal tasks alive when the GTK window closes, while the SQLite session store remembers names, tags, windows, visible tabs, and last-known process state.
+A window is the user-defined group. A tab is rooted in one directory and defaults to that directory's basename. The GUI does not expose task templates, projects, tags, or tmux as peer concepts. SQLite and tmux remain implementation details that provide restore, persistence, and process control.
 
 ## Main modules
 
-- `gtk_app.py`: GTK/VTE shell, tab UI, side pane, master task window, and launcher dialogs.
-- `tmux_backend.py`: hidden tmux operations: create/resume, attach, send text, capture, pause, resume, terminate.
-- `tmux_discovery.py`: parser and adopter for already-running tmux sessions, mapping existing work into external TermDeck process capsules.
-- `session_store.py`: SQLite registry for sessions, window restore metadata, schema migration from the first MVP, and restore candidates.
+- `gtk_app.py`: GTK/VTE named-window UI, directory chooser, tab pane, tab manager, window overview, search, and terminal controls.
+- `command_render.py`: default shell resolution, portable saved-command placeholders, directory normalisation, and directory-derived tab names.
+- `session_launcher.py`: dependency-free creation of one directory-backed tab.
+- `session_store.py`: SQLite registry for tabs, named-window metadata, lifecycle state, schema migration, and restore candidates.
+- `tmux_backend.py`: hidden tmux operations: create/resume, attach, send text, capture, pause, resume, and terminate.
+- `tmux_discovery.py`: migration support for already-running tmux sessions.
 - `resources.py`: Linux `/proc` resource sampling for process trees.
-- `terminator_config.py`: Terminator config parser for fonts, palette, cursor, scrollback, window size, and keybindings.
-- `task_templates.py`: dependency-aware launch templates used by the GUI and CLI.
-- `shortcuts.py`: browser-style shortcut profiles, generated tab focus/pause helpers, Terminator keybinding imports, duplicate detection, and terminal/Emacs conflict reporting.
-- `quickstart.py`: first-run readiness report combining dependency checks, Terminator import status, desktop launcher state, project detection, and recommended next actions.
+- `command_palette.py`: window actions and remembered-tab discovery; it does not contain launch templates.
+- `shortcuts.py`: shortcut profiles, generated tab focus/pause helpers, Terminator imports, duplicate detection, and shell-key conflict reporting.
+- `quickstart.py`: first-run dependency, directory-tab, Terminator appearance, and desktop-launcher report.
+- `workspace_recipe.py`: compatibility and automation format for serialising named windows and tabs. Recipes are not a separate GUI object.
 
-## First-run and keyboard policy
+## Creation model
 
-`quickstart` is the browser-like onboarding surface for a new user: it checks whether the lightweight runtime is available, summarises imported Terminator look-and-feel, detects useful project tabs, and suggests commands that can be copied or wired into a future first-run screen. Shortcut resolution is separate from theme import. The default `browser` profile favours familiar browser keys, while `emacs-safe` refuses Terminator overrides that would steal protected shell/readline editing keys.
+The normal creation flow has one decision: choose a directory. TermDeck opens the user's default shell in that directory and derives the initial tab title from its final path component. A separate window-name dialog changes the logical group name and persists that title across every tab in the window.
 
 ## Process control
 
-Pause/resume is deliberately separate from hiding a tab. Hiding a tab detaches the VTE/tmux client but leaves the task alive. Pause/resume sends stop/continue signals to the process group behind the tmux pane. Stop is the destructive action that kills the hidden tmux session.
+Hiding a tab detaches the visible terminal client but leaves its hidden process alive. Pause/resume signals the process group. Stop is destructive and terminates the hidden tmux session. These lifecycle controls do not change the user-facing window/tab hierarchy.
 
 ## External tmux adoption
 
-TermDeck normally creates one hidden tmux session per tab. `adopt-tmux` is the migration path for users who already have tmux sessions running before they install TermDeck. Adopted sessions are marked as external, keep their original tmux session name, and store an explicit active pane target so capture, send, pause, and resume can act on the correct pane. If an adopted external session disappears, TermDeck reports it as missing instead of recreating it unexpectedly.
+`adopt-tmux` remains a migration utility for existing tmux users. Adopted processes become TermDeck tabs, retain their external tmux identity internally, and are reported missing rather than silently recreated if the external session disappears.
 
 ## Lightweight boundary
 
-The current Linux-first MVP avoids Electron and avoids Python package dependencies. GTK/VTE and PyGObject are system libraries, tmux provides persistence, SQLite stores local metadata, and `/proc` provides resource information.
+TermDeck remains Linux-first and avoids Electron. GTK/VTE and PyGObject are system libraries, tmux provides persistence, SQLite stores local metadata, and `/proc` provides resource information.

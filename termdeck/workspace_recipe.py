@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .task_templates import render_command
+from .command_render import render_command
 
 
 class WorkspaceRecipeError(ValueError):

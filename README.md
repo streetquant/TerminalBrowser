@@ -1,44 +1,39 @@
 # TermDeck
 
-TermDeck is a lightweight Linux-first terminal task manager. It keeps the experience close to a browser: windows, tabs, a right-side control pane, a command palette, and a master task window for every running terminal task.
+TermDeck is a lightweight Linux-first terminal application built around two concepts:
 
-The MVP intentionally avoids Electron. It uses GTK + VTE for native terminal rendering and hidden tmux sessions for persistence. Users never type tmux commands: TermDeck starts, attaches, pauses, resumes, captures, and stops sessions for them.
+1. A **named window** groups related work.
+2. Each **tab** is a terminal shell rooted in a chosen directory.
+
+That is the primary product model. There is no task launcher, template catalogue, or project detector. GTK and VTE provide native terminal rendering, while hidden tmux processes allow tabs to survive UI closure without exposing tmux commands to the user.
 
 See `RELEASE_NOTES.md` for the current verified build notes.
 
+## Core workflow
+
+- Name a TermDeck window, such as **Client work**, **Backend**, or **Research**.
+- Press **New tab** or `Ctrl+T` and choose a directory.
+- TermDeck opens the user's default shell in that directory.
+- The tab is named from the directory's final component. For example, `/home/me/work/client-api` becomes **client-api**, never the full absolute path.
+- Tabs in the same window may use completely different directories.
+- Use **More → Rename window** to change the group name at any time.
+- Use **More → New TermDeck window** to create another named group.
+
 ## What it does
 
-- Browser-like terminal windows and tabs.
-- Browser-like task launcher with editable templates for shell, Codex, Claude Code, OpenCode, npm, pytest, SSH, Docker, logs, and REPLs.
-- Project detection that suggests a ready workspace from `package.json`, Python markers, Makefile targets, Docker files, and logs.
-- Universal command palette for app actions, remembered sessions, templates, resource controls, and selected-session operations.
-- Browser-style search across remembered tabs and optional redacted captured output, exposed in the GUI and CLI.
-- Activity classification for terminal output that needs input, shows errors/warnings, appears ready, or has gone silent.
-- Right-side control pane for filtering, selecting, prompting, pausing, resuming, killing, restoring, and opening the master task window.
-- Master task window with session ID, window, tag, PID, health, status, CPU, RAM, process count, runtime, focus shortcut, pause shortcut, command, directory, and captured output preview.
-- Headless activity monitor that classifies captured terminal output as waiting for input, error, warning, ready/success, silent, not started, or unavailable without exposing tmux commands.
-- Window overview with aggregate tab counts, visible tabs, running/paused/stopped summaries, hot-session counts, CPU, RAM, process count, runtime, and top health per browser-like window.
-- Explicit pause/resume/kill for any terminal task from the UI or CLI.
-- Explicit **Pause hot** for sessions over critical CPU or memory thresholds; TermDeck never auto-freezes work in the background.
-- Configurable per-tag resource budgets with advisory plans and confirmation-gated `pause-over-budget`.
-- JSON workspace recipes for shareable multi-window/multi-tab project layouts.
-- Terminator look-and-feel import for font, palette, foreground/background, cursor, scrollback, window size, and common keybindings.
-- Select-to-copy terminal behaviour: text selected with the cursor is copied to the real system clipboard and PRIMARY selection so it can be pasted into other apps immediately.
-- Terminal right-click menu for copy, paste, paste primary, select all, and clear selection.
-- Main terminal tabs expose a right-click menu for rename, retag, pin/unpin, hide, kill, Terminal options, Master tasks, and browser-style hide-other/hide-right actions.
-- Pinned tabs show explicit close guidance and provide **Unpin and hide tab** from the tab context menu instead of silently ignoring close attempts.
-- Cursor blinking can be disabled from Terminal options or `appearance.terminal.cursor_blink`.
-- Sessions pane can be moved left/right from Terminal options or by right-clicking the Sessions header.
-- Sessions cards support Ctrl+left-click multi-selection anywhere on the card; right-click remains reserved for context actions, including bulk-aware operations on the active selection.
-- Stopped/killed sessions are hidden from the Sessions pane while remaining visible in master/history views.
-- Heavy GUI search/filter fields are debounced, and Master captured-output previews use a short-lived cache to reduce repeated tmux capture work.
-- Browser and emacs-safe shortcut profiles with duplicate and terminal-conflict reporting.
-- Browser-style restore of visible windows and tabs without restarting missing/stopped processes.
-- Startup reconciliation checks remembered running/paused tabs against the hidden backend so stale sessions do not restore as if alive.
-- Browser-tab lifecycle controls for hiding, showing, moving, renaming, retagging, pinning, unpinning, reopening, and archiving sessions without stopping their processes.
-- Reconcile stale remembered tabs before restore, so missing backend sessions do not relaunch unexpectedly.
-- Browser-session snapshots for local backup/restore of the actual remembered window/tab/session state.
-- Adoption of already-running tmux sessions into TermDeck tabs, so migration from existing terminal work does not require restarting tasks.
+- Native named windows and directory-backed terminal tabs.
+- Right-side **Tabs** pane for search, multi-selection, prompting, pause, resume, hide, archive, and kill actions.
+- `Ctrl+left-click` multi-selection anywhere on a tab card; right-click remains context-menu only.
+- Command palette for window actions, remembered tabs, search, restore, and process controls.
+- Tab manager with PID, health, status, CPU, RAM, process count, runtime, command, directory, and captured-output preview.
+- Window overview with aggregate tab and resource information.
+- Browser-style tab rename, pin/unpin, hide, reopen, hide-other, hide-right, and drag reorder.
+- Safe bulk-control plans for destructive or multi-tab operations.
+- Search across remembered tabs and optional redacted captured output.
+- Explicit pause/resume/kill; TermDeck never auto-freezes work in the background.
+- Terminator appearance and shortcut import.
+- Select-to-copy, terminal right-click copy/paste, and configurable cursor/font/scrollback options.
+- Local snapshots and JSON window/tab recipes for backup, migration, and automation. These are storage formats, not additional GUI concepts.
 
 ## System requirements
 
@@ -48,7 +43,7 @@ Linux with:
 sudo apt install tmux python3-gi gir1.2-gtk-3.0 gir1.2-vte-2.91
 ```
 
-No Python package dependency is required for the core project. PyGObject and VTE are system libraries.
+PyGObject and VTE are system libraries. No Electron runtime is used.
 
 ## Run from source
 
@@ -65,101 +60,72 @@ termdeck doctor
 termdeck
 ```
 
-
 ## First-run quickstart
-
-A new user can ask TermDeck for a browser-like setup plan without knowing tmux, VTE, GTK, workspace recipes, or Terminator internals:
 
 ```bash
 python3 -m termdeck quickstart .
-python3 -m termdeck quickstart . --include-ai
 ```
 
-The report checks lightweight runtime dependencies, summarises imported Terminator look-and-feel, detects useful project tabs, checks whether the desktop/app-menu launcher is installed, and prints concrete next actions. This is intended to become the first-run screen in the GUI; the CLI version keeps it testable in headless environments.
+The report checks runtime dependencies, summarises imported Terminator appearance, shows the directory's default tab name, checks the desktop launcher, and prints concrete next actions.
+
+## Using the GUI
+
+### Create a tab
+
+Press **New tab** or `Ctrl+T`, choose a directory, and TermDeck opens the default shell there. The directory basename becomes the initial tab title. Double-click the tab title or use its right-click menu to rename it.
+
+### Name a window
+
+Use **More → Rename window**. The name is saved across every tab belonging to that window and appears in the native window title and TermDeck header.
+
+### Create another window
+
+Use **More → New TermDeck window**. Enter the group name, then choose the first tab's directory.
+
+### Tab pane
+
+The right-side pane shows the current window's tabs. It can be moved left or right from Appearance options or its context menu. Use `Ctrl+left-click` to select several tabs and apply bulk actions.
 
 ## Desktop/app-menu launcher
 
-TermDeck can install a local Linux desktop entry and SVG icon so non-terminal users can open it from the application menu like a browser. This writes only into the user's XDG data directory by default; it does not require sudo.
-
-Preview the files first:
+Preview, install, or remove the local desktop entry:
 
 ```bash
 termdeck install-desktop --dry-run
-```
-
-Install the launcher:
-
-```bash
 termdeck install-desktop
-```
-
-Remove it again:
-
-```bash
 termdeck uninstall-desktop
 ```
 
-When running directly from a source checkout, the generated launcher falls back to `python3 -m termdeck gui`. After `pip install -e .`, it prefers the installed `termdeck gui` entry point.
-
 ## Command palette
 
-Use **Palette** or `Ctrl+Shift+P` to search actions, sessions, and task templates from one browser-like dialog. Search for `search tabs` to open the full remembered-tab search surface. Useful searches include:
+Use **Palette** or `Ctrl+Shift+P` to search window actions and remembered tabs. Useful searches include:
 
 ```text
-master
-cpu ram
+new tab
+rename window
+new window
+search tabs
 pause selected
 pause hot
-codex
-ssh
+tab manager
 restore
 ```
 
-Inspect the same palette model from the CLI:
+Inspect the same model from the CLI:
 
 ```bash
 python3 -m termdeck palette
-python3 -m termdeck palette codex
+python3 -m termdeck palette "rename window"
 python3 -m termdeck palette "pause hot"
 ```
 
+## Tab manager
 
-## Project detection
-
-TermDeck can suggest a browser-like workspace from the current project directory, so a new user does not need to write a recipe by hand. The detector is dependency-free and looks for `package.json` scripts, Node lockfiles, Python project markers, `tests/`, Django `manage.py`, Makefile targets, Docker Compose files, Dockerfiles, and `logs/*.log`.
-
-In the GUI, use **+ Project** or search for **detected project** in the command palette. From the CLI:
-
-```bash
-python3 -m termdeck project-detect .
-python3 -m termdeck project-detect . --recipe > termdeck.workspace.json
-python3 -m termdeck project-init . --include-ai
-python3 -m termdeck workspace-plan termdeck.workspace.json
-python3 -m termdeck workspace-open termdeck.workspace.json --no-start
-```
-
-`project-init` refuses to overwrite an existing `termdeck.workspace.json` unless `--force` is supplied. `--include-ai` adds optional Codex and Claude-style agent tabs without making TermDeck AI-only.
-
-## Task launcher templates
-
-Use **+ New** or **+ Task** to open the editable task launcher. Pick a plain-language template, edit the command if needed, and create the tab. Templates are only presets, so TermDeck still supports arbitrary terminal commands.
-
-```bash
-python3 -m termdeck templates
-python3 -m termdeck templates codex
-```
-
-Missing tools stay visible instead of disappearing. For example, the Codex template still appears even when `codex` is not on PATH, because the user may install it later or edit the command manually.
-
-## Master task window
-
-Open the master task window with **Master**, `Shift+Esc`, or `Ctrl+Shift+M`. It works like a browser task manager for terminal processes: search by session ID, tag, window, health, state, command, or directory; sort columns; select one or many sessions; preview latest captured output; and run safe selected-session actions from one place.
-
-The master prompt has two send modes. **Send text** types into selected sessions without pressing Enter. **Send+Enter** asks for confirmation before submitting the same text to every selected session. Captured previews are redacted by default before display so common tokens and credentials are not copied into the task manager accidentally.
+Open **Tab manager** with `Shift+Esc` or `Ctrl+Shift+M`. It provides process and resource details for remembered tabs and supports safe multi-tab controls. Captured previews are redacted by default.
 
 ## Search, activity, and browser recovery
 
-TermDeck exposes browser-like discovery in both the GUI and CLI. Open **Search** from the header, or search for `search tabs` in the command palette, to find remembered tabs by session ID, name, tag, window, status, command, directory, and optional redacted captured output. Headlessly, `search` provides the same remembered-tab lookup, while `search-output` is for direct cross-session output search with safe snippets by default.
+TermDeck exposes browser-like discovery in both the GUI and CLI. Open **Search** from the header, or search for `search tabs` in the command palette, to find remembered tabs by ID, name, window, status, command, directory, and optional redacted captured output. Headlessly, `search` provides the same remembered-tab lookup, while `search-output` is for direct cross-session output search with safe snippets by default.
 
 ```bash
 python3 -m termdeck search codex
@@ -168,7 +134,7 @@ python3 -m termdeck search-output "needs approval" --tag ai --lines 300 --json -
 python3 -m termdeck activity --tag ai --json
 ```
 
-`activity` turns captured output into browser-task states such as `needs input`, `error`, `warning`, `ready`, `success`, `active`, `silent`, `not started`, and `unavailable`. This gives the future side pane and master window a clean way to show which terminal tabs deserve attention without making the project AI-specific.
+`activity` turns captured output into browser-task states such as `needs input`, `error`, `warning`, `ready`, `success`, `active`, `silent`, `not started`, and `unavailable`. This gives the Tabs pane and Tab manager a clean way to show which terminal tabs deserve attention without making the project AI-specific.
 
 Hidden tabs can be reopened like recently closed browser tabs, and stale remembered sessions can be reconciled before restore:
 
@@ -185,7 +151,7 @@ python3 -m termdeck reconcile --json
 
 Bulk control is treated as a safety-sensitive action. `send`, `kill`, and `pause-hot` produce a structured control plan when the operation affects several sessions, submits text with Enter, or matches common destructive terminal patterns such as recursive delete, hard reset, credential exfiltration, or force pushes. Add `--yes` only after checking the plan.
 
-Terminal captures are redacted by default in both the master task preview and CLI capture output. The redactor covers private-key blocks, AWS keys, GitHub tokens, OpenAI-style keys, Authorization bearer headers, API-key assignments, password/token assignments, and URL credentials. Use `--raw` only when you deliberately need unredacted output.
+Terminal captures are redacted by default in both the Tab manager preview and CLI capture output. The redactor covers private-key blocks, AWS keys, GitHub tokens, OpenAI-style keys, Authorization bearer headers, API-key assignments, password/token assignments, and URL credentials. Use `--raw` only when you deliberately need unredacted output.
 
 ```bash
 python3 -m termdeck control-plan send --tag ai --text "status"
@@ -195,7 +161,7 @@ python3 -m termdeck capture --tag ai --lines 200
 python3 -m termdeck capture --tag ai --lines 200 --raw
 ```
 
-## Headless master task snapshot
+## Headless Tab manager snapshot
 
 The same browser-task-manager model is available without launching GTK/VTE. This is useful for scripts, launchers, CI checks, and future side-pane integrations. It shows the remembered tabs with session ID, window, name, tag, PID, state, health, CPU, RAM, focus shortcut, and pause shortcut.
 
@@ -209,7 +175,7 @@ python3 -m termdeck tasks --running-only --sort ram
 
 ## Headless activity monitor
 
-The activity monitor gives the future side pane and browser-style master window an attention queue without launching GTK/VTE. It captures recent terminal output, redacts sensitive values by default, then classifies each remembered session by what the user probably needs to do next. This is useful for Codex sessions waiting for approval, dev servers reporting errors, test watchers turning green, silent shells, and sessions whose output cannot be captured.
+The activity monitor gives the future side pane and browser-style Tab manager an attention queue without launching GTK/VTE. It captures recent terminal output, redacts sensitive values by default, then classifies each remembered session by what the user probably needs to do next. This is useful for Codex sessions waiting for approval, dev servers reporting errors, test watchers turning green, silent shells, and sessions whose output cannot be captured.
 
 ```bash
 python3 -m termdeck activity
@@ -223,7 +189,7 @@ The command reports browser-ready fields such as `state`, `severity`, `reason`, 
 
 ## Window overview
 
-Open **Windows** from the GUI or search for `windows resource` in the command palette to see the browser-level view. This is the master window-of-windows: it aggregates every remembered tab under its TermDeck window and shows total CPU, RAM, process count, longest runtime, visible tab count, running/paused/stopped summary, hot-session count, critical count, and top health.
+Open **Windows** from the GUI or search for `windows resource` in the command palette to see the browser-level view. This is the Tab manager-of-windows: it aggregates every remembered tab under its TermDeck window and shows total CPU, RAM, process count, longest runtime, visible tab count, running/paused/stopped summary, hot-session count, critical count, and top health.
 
 The same view is available headlessly:
 
@@ -274,7 +240,7 @@ python3 -m termdeck pause-over-budget examples/sample.budgets.json --tag scratch
 
 ## Settings and diagnostics
 
-TermDeck supports a small local JSON settings file for resource-health thresholds. This keeps the master task manager useful across different workloads without adding a heavy preferences system. Generate a starter file with:
+TermDeck supports a small local JSON settings file for resource-health thresholds. This keeps the Tab manager useful across different workloads without adding a heavy preferences system. Generate a starter file with:
 
 ```bash
 termdeck settings-sample > ~/.config/termdeck/config.json
@@ -464,7 +430,7 @@ Visible tabs are restored on the next launch and grouped by their previous TermD
 | Ctrl+Shift+W | Stop current session |
 | Ctrl+Shift+L | Focus the side-pane command box |
 | Ctrl+Shift+P | Open the command palette |
-| Shift+Esc / Ctrl+Shift+M | Open master task window |
+| Shift+Esc / Ctrl+Shift+M | Open Tab manager |
 | Ctrl+Shift+Space | Pause/resume current tab process |
 | Ctrl+Tab | Next tab |
 | Ctrl+Shift+Tab | Previous tab |
@@ -533,7 +499,7 @@ The tmux layer is hidden. It is used because it is lightweight, mature, and lets
 
 ## Current limitations
 
-This is an MVP, not a finished replacement for mature terminals. The implementation is Linux-first and assumes tmux is installed. Resource accounting uses `/proc`, so the master task window is Linux-only. macOS and Windows support should use platform-specific process-group APIs in later releases.
+This is an MVP, not a finished replacement for mature terminals. The implementation is Linux-first and assumes tmux is installed. Resource accounting uses `/proc`, so the Tab manager is Linux-only. macOS and Windows support should use platform-specific process-group APIs in later releases.
 
 ## Repository hygiene
 

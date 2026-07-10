@@ -7,10 +7,9 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .command_render import default_shell, directory_tab_name, normalise_directory
 from .desktop_integration import build_install_plan
-from .project_detect import detect_project
 from .terminator_config import TerminatorConfig
-from .workspace_recipe import recipe_summary_rows
 
 INSTALL_HINT = (
     "Debian/Ubuntu: sudo apt install tmux python3-gi gir1.2-gtk-3.0 gir1.2-vte-2.91 | "
@@ -38,17 +37,17 @@ def _dependency_status() -> dict[str, dict[str, object]]:
         "tmux": {
             "ok": bool(tmux_path),
             "detail": tmux_path or "missing",
-            "required_for": "persistent terminal task sessions",
+            "required_for": "persistent terminal tabs",
         },
         "gdk3": {
             "ok": gdk_ok,
             "detail": "ok" if gdk_ok else "missing",
-            "required_for": "GTK3 windowing (must be pinned before Gtk on dual Gdk systems)",
+            "required_for": "GTK3 windowing",
         },
         "gtk3": {
             "ok": gtk_ok,
             "detail": "ok" if gtk_ok else "missing",
-            "required_for": "native browser-like window and side pane",
+            "required_for": "native named windows and tabs",
         },
         "vte": {
             "ok": vte_ok,
@@ -88,25 +87,12 @@ def _desktop_summary(*, data_home: str | Path | None = None, command: str | None
     }
 
 
-def _project_summary(path: str | Path | None, *, include_ai: bool) -> dict[str, object]:
-    detection = detect_project(path, include_ai=include_ai)
-    rows = recipe_summary_rows(detection.recipe)
+def _directory_summary(path: str | Path | None) -> dict[str, object]:
+    directory = normalise_directory(path)
     return {
-        "root": detection.root,
-        "name": detection.name,
-        "notes": [note.to_dict() for note in detection.notes],
-        "window_count": len(detection.recipe.windows),
-        "tab_count": len(rows),
-        "tabs": [
-            {
-                "window": row["window"],
-                "name": row["name"],
-                "tag": row["tag"],
-                "command": row["command"],
-                "visible": row["visible"],
-            }
-            for row in rows
-        ],
+        "path": directory,
+        "default_tab_name": directory_tab_name(directory),
+        "default_command": default_shell(),
     }
 
 
@@ -114,7 +100,7 @@ def _action(action_id: str, label: str, command: str, why: str) -> dict[str, str
     return {"id": action_id, "label": label, "command": command, "why": why}
 
 
-def _recommended_actions(payload: dict[str, Any], *, path: Path, include_ai: bool) -> list[dict[str, str]]:
+def _recommended_actions(payload: dict[str, Any], *, path: Path) -> list[dict[str, str]]:
     actions: list[dict[str, str]] = []
     dependencies = payload["dependencies"]
     if not all(item["ok"] for item in dependencies.values()):
@@ -122,53 +108,46 @@ def _recommended_actions(payload: dict[str, Any], *, path: Path, include_ai: boo
             "install-dependencies",
             "Install lightweight runtime dependencies",
             INSTALL_HINT,
-            "TermDeck needs tmux for persistence and GTK/VTE for the native lightweight UI.",
+            "TermDeck needs tmux for persistence and GTK/VTE for the native interface.",
         ))
 
-    project = payload["project"]
     actions.append(_action(
-        "write-project-workspace",
-        "Create a project workspace recipe",
-        "python3 -m termdeck project-init " + shlex.quote(str(path)) + (" --include-ai" if include_ai else ""),
-        f"Detected {project['tab_count']} useful tab(s) for this directory.",
-    ))
-    actions.append(_action(
-        "preview-project-workspace",
-        "Preview the detected workspace without starting processes",
-        "python3 -m termdeck project-detect " + shlex.quote(str(path)),
-        "Shows the detected browser windows and tabs before writing a recipe.",
+        "open-directory-tab",
+        "Open this directory as a tab",
+        "python3 -m termdeck new " + shlex.quote(str(path)),
+        f"Creates a shell tab named {directory_tab_name(path)!r}.",
     ))
 
     terminator = payload["terminator"]
     if terminator["found"]:
         actions.append(_action(
             "inspect-terminator-theme",
-            "Inspect imported Terminator look and shortcuts",
+            "Inspect imported Terminator appearance and shortcuts",
             "python3 -m termdeck parse-terminator",
             "Confirms the font, colours, scrollback, and keybindings TermDeck will reuse.",
         ))
         if terminator["layouts"]:
             actions.append(_action(
                 "convert-terminator-layout",
-                "Convert a Terminator layout into TermDeck windows and tabs",
+                "Import an existing Terminator layout",
                 "python3 -m termdeck terminator-workspace --output terminator.workspace.json",
-                "Migrates existing Terminator terminal nodes into browser-style tabs.",
+                "Migration utility for existing multi-window terminal layouts.",
             ))
 
     desktop = payload["desktop"]
     if not desktop["installed"]:
         actions.append(_action(
             "install-app-launcher",
-            "Install browser-like app launcher",
+            "Install desktop app launcher",
             "python3 -m termdeck install-desktop",
-            "Lets users start TermDeck from the desktop/app menu instead of typing a command.",
+            "Lets users start TermDeck from the desktop or app menu.",
         ))
 
     actions.append(_action(
         "launch-gui",
         "Launch TermDeck",
         "python3 -m termdeck gui",
-        "Opens the browser-like terminal task manager.",
+        "Opens the named-window and directory-tab interface.",
     ))
     return actions
 
@@ -176,7 +155,6 @@ def _recommended_actions(payload: dict[str, Any], *, path: Path, include_ai: boo
 def build_quickstart(
     path: str | Path | None = None,
     *,
-    include_ai: bool = False,
     terminator_path: str | Path | None = None,
     data_home: str | Path | None = None,
     desktop_command: str | None = None,
@@ -191,10 +169,14 @@ def build_quickstart(
         "dependencies": _dependency_status(),
         "terminator": _terminator_summary(terminator_path),
         "desktop": _desktop_summary(data_home=data_home, command=desktop_command),
-        "project": _project_summary(root, include_ai=include_ai),
+        "directory": _directory_summary(root),
     }
-    payload["ready_for_gui"] = bool(payload["dependencies"]["tmux"]["ok"] and payload["dependencies"]["gtk3"]["ok"] and payload["dependencies"]["vte"]["ok"])
-    payload["recommended_actions"] = _recommended_actions(payload, path=root, include_ai=include_ai)
+    payload["ready_for_gui"] = bool(
+        payload["dependencies"]["tmux"]["ok"]
+        and payload["dependencies"]["gtk3"]["ok"]
+        and payload["dependencies"]["vte"]["ok"]
+    )
+    payload["recommended_actions"] = _recommended_actions(payload, path=root)
     return payload
 
 

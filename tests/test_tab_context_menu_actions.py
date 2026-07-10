@@ -58,7 +58,6 @@ def make_window(calls):
     return SimpleNamespace(
         _tab_menu_item=lambda label, handler: TermDeckWindow._tab_menu_item(SimpleNamespace(), label, handler),
         rename_session=lambda record: calls.append(("rename", record.id)),
-        retag_sessions=lambda records: calls.append(("retag", [record.id for record in records])),
         _pin_tab=lambda record, pinned: calls.append(("pin", record.id, pinned)),
         hide_tab=lambda session_id: calls.append(("hide", session_id)),
         _unpin_and_hide_tab=lambda record: calls.append(("unpin_hide", record.id)),
@@ -94,18 +93,17 @@ class TabContextMenuActionsTest(TestCase):
             [item.label for item in menu.items],
             [
                 "Rename",
-                "Retag",
                 "Pin tab",
                 "---",
                 "Hide tab",
                 "Hide other tabs",
                 "Hide tabs to the right",
-                "Kill session",
+                "Stop tab",
                 "---",
-                "Move sessions pane to left",
-                "Move sessions pane to right",
+                "Move tabs pane to left",
+                "Move tabs pane to right",
                 "Terminal options",
-                "Master tasks",
+                "Tab manager",
             ],
         )
         self.assertTrue(menu.showed)
@@ -119,7 +117,6 @@ class TabContextMenuActionsTest(TestCase):
             calls,
             [
                 ("rename", "tab-1"),
-                ("retag", ["tab-1"]),
                 ("pin", "tab-1", True),
                 ("hide", "tab-1"),
                 ("hide_other", "tab-1"),
@@ -139,19 +136,18 @@ class TabContextMenuActionsTest(TestCase):
             [item.label for item in menu.items],
             [
                 "Rename",
-                "Retag",
                 "Unpin tab",
                 "---",
                 "Hide tab",
                 "Unpin and hide tab",
                 "Hide other tabs",
                 "Hide tabs to the right",
-                "Kill session",
+                "Stop tab",
                 "---",
-                "Move sessions pane to left",
-                "Move sessions pane to right",
+                "Move tabs pane to left",
+                "Move tabs pane to right",
                 "Terminal options",
-                "Master tasks",
+                "Tab manager",
             ],
         )
 

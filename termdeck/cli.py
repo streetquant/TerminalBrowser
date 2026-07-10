@@ -15,7 +15,6 @@ from .control_plan import build_control_plan
 from .desktop_integration import build_install_plan, install_desktop, uninstall_desktop
 from .diagnostics import build_diagnostic_payload, write_diagnostic_bundle
 from .health import classify_session, health_badge, should_pause_for_attention
-from .project_detect import detect_project, project_detection_json, project_recipe_json
 from .quickstart import build_quickstart
 from .redaction import redact_text
 from .resource_budget import BudgetConfigError, assess_budgets, default_budgets, load_budgets, render_budget_table, sample_budget_json
@@ -28,7 +27,6 @@ from .session_store import DEFAULT_DB_PATH, SessionStore
 from .settings import sample_settings_json
 from .shortcuts import build_shortcut_report, render_shortcut_table, shortcut_entries, shortcut_entries_to_dicts, shortcut_profile_names
 from .task_snapshot import build_task_snapshot, filter_task_snapshot, render_task_table, sort_task_snapshot, task_snapshot_to_dicts
-from .task_templates import serialise_statuses, template_statuses
 from .terminator_config import TerminatorConfig, load_terminator_theme
 from .tmux_backend import TmuxBackend, TmuxError
 from .tmux_discovery import adopt_tmux_sessions, discover_tmux_sessions
@@ -296,7 +294,6 @@ def cmd_terminator_workspace(args: argparse.Namespace) -> int:
 def cmd_quickstart(args: argparse.Namespace) -> int:
     payload = build_quickstart(
         getattr(args, "path", None),
-        include_ai=bool(getattr(args, "include_ai", False)),
         terminator_path=getattr(args, "terminator_config", None),
         data_home=getattr(args, "data_home", None),
         desktop_command=getattr(args, "desktop_command", None),
@@ -304,50 +301,6 @@ def cmd_quickstart(args: argparse.Namespace) -> int:
     _print_json(payload)
     return 0
 
-
-def cmd_project_detect(args: argparse.Namespace) -> int:
-    detection = detect_project(getattr(args, "path", None), include_ai=bool(getattr(args, "include_ai", False)))
-    if getattr(args, "recipe", False):
-        print(project_recipe_json(detection))
-    else:
-        print(project_detection_json(detection))
-    return 0
-
-
-def cmd_project_init(args: argparse.Namespace) -> int:
-    detection = detect_project(getattr(args, "path", None), include_ai=bool(getattr(args, "include_ai", False)))
-    output = Path(getattr(args, "output", None) or "termdeck.workspace.json").expanduser()
-    if output.exists() and not bool(getattr(args, "force", False)):
-        _print_json({
-            "action": "project-init",
-            "ok": False,
-            "error": f"refusing to overwrite existing file: {output}",
-            "output": str(output),
-        })
-        return 2
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(project_recipe_json(detection) + "\n", encoding="utf-8")
-    _print_json({
-        "action": "project-init",
-        "ok": True,
-        "output": str(output),
-        "root": detection.root,
-        "name": detection.name,
-        "windows": len(detection.recipe.windows),
-        "tabs": sum(len(window.tabs) for window in detection.recipe.windows),
-        "notes": [note.to_dict() for note in detection.notes],
-    })
-    return 0
-
-
-def cmd_templates(args: argparse.Namespace) -> int:
-    rows = serialise_statuses(template_statuses())
-    query = (args.query or "").casefold().strip()
-    if query:
-        terms = [term for term in query.split() if term]
-        rows = [row for row in rows if all(term in " ".join(str(row.get(key, "")) for key in ("id", "label", "name", "tag", "command", "description")).casefold() for term in terms)]
-    _print_json(rows)
-    return 0
 
 
 def cmd_palette(args: argparse.Namespace) -> int:
@@ -938,7 +891,7 @@ def _command_from_args(args: argparse.Namespace) -> str | None:
 
 def cmd_new(args: argparse.Namespace) -> int:
     try:
-        fields = resolve_launch_fields(target=getattr(args, "target", None), template_id=getattr(args, "template", None), command=_command_from_args(args), name=getattr(args, "name", None), tag=getattr(args, "tag", None), cwd=getattr(args, "cwd", None))
+        fields = resolve_launch_fields(target=getattr(args, "target", None), command=_command_from_args(args), name=getattr(args, "name", None), tag=getattr(args, "tag", None), cwd=getattr(args, "cwd", None))
     except ValueError as exc:
         _print_json({"action": "new", "count": 0, "ok": False, "error": str(exc), "sessions": []})
         return 2
@@ -1219,7 +1172,7 @@ def _add_config_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="termdeck", description="Browser-like terminal task manager")
+    parser = argparse.ArgumentParser(prog="termdeck", description="Named terminal windows with directory-backed tabs")
     parser.add_argument("--version", action="version", version=f"termdeck {__version__}")
     sub = parser.add_subparsers(dest="command")
 
@@ -1243,9 +1196,8 @@ def build_parser() -> argparse.ArgumentParser:
     shortcuts.add_argument("--json", action="store_true")
     shortcuts.set_defaults(func=cmd_shortcuts)
 
-    quickstart = sub.add_parser("quickstart", help="show first-run setup, detected project tabs, Terminator import, and next actions")
-    quickstart.add_argument("path", nargs="?", type=Path, default=Path.cwd(), help="project directory to inspect")
-    quickstart.add_argument("--include-ai", action="store_true", help="include optional AI-agent tabs in the detected project workspace")
+    quickstart = sub.add_parser("quickstart", help="show first-run setup, directory-tab defaults, Terminator import, and next actions")
+    quickstart.add_argument("path", nargs="?", type=Path, default=Path.cwd(), help="directory to open as a tab")
     quickstart.add_argument("--terminator-config", type=Path, default=None, help="override Terminator config path")
     quickstart.add_argument("--data-home", type=Path, default=None, help="override XDG data home for launcher checks")
     quickstart.add_argument("--desktop-command", default=None, help="override command used in the suggested desktop launcher")
@@ -1275,23 +1227,6 @@ def build_parser() -> argparse.ArgumentParser:
     terminator_workspace.add_argument("--output", type=Path, default=None, help="write workspace JSON to this path")
     terminator_workspace.set_defaults(func=cmd_terminator_workspace)
 
-    project_detect = sub.add_parser("project-detect", help="suggest a browser-like workspace recipe from a project directory")
-    project_detect.add_argument("path", nargs="?", type=Path, default=Path.cwd())
-    project_detect.add_argument("--include-ai", action="store_true", help="include optional Codex/Claude-style agent tabs")
-    project_detect.add_argument("--recipe", action="store_true", help="print only the generated workspace recipe JSON")
-    project_detect.set_defaults(func=cmd_project_detect)
-
-    project_init = sub.add_parser("project-init", help="write a suggested termdeck.workspace.json for a project directory")
-    project_init.add_argument("path", nargs="?", type=Path, default=Path.cwd())
-    project_init.add_argument("--include-ai", action="store_true", help="include optional Codex/Claude-style agent tabs")
-    project_init.add_argument("--output", type=Path, default=Path("termdeck.workspace.json"))
-    project_init.add_argument("--force", action="store_true", help="overwrite an existing output file")
-    project_init.set_defaults(func=cmd_project_init)
-
-    templates = sub.add_parser("templates", help="list browser-like new-tab task templates")
-    templates.add_argument("query", nargs="?", default="")
-    templates.set_defaults(func=cmd_templates)
-
     palette = sub.add_parser("palette", help="list command-palette actions")
     palette.add_argument("query", nargs="?", default="")
     palette.add_argument("--db", type=Path, default=None)
@@ -1314,20 +1249,18 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--json", action="store_true")
     search.set_defaults(func=cmd_search)
 
-    new = sub.add_parser("new", help="create a browser-like terminal task from the CLI")
-    new.add_argument("target", nargs="?", default=None, help="template id or one-word command")
+    new = sub.add_parser("new", help="create a directory-backed terminal tab from the CLI")
+    new.add_argument("target", nargs="?", default=None, help="directory to open; defaults to the current directory")
     new.add_argument("command", nargs="*", help="optional command words; use --command for exact strings")
     new.add_argument("--command", dest="command_string", default=None, help="command string to run")
-    new.add_argument("--template", default=None, help="template id such as shell, codex, ssh, npm-dev")
-    new.add_argument("--name", default=None, help="tab/session name")
-    new.add_argument("--tag", default=None, help="workspace/tag name")
-    new.add_argument("--cwd", type=Path, default=None, help="working directory")
+    new.add_argument("--name", default=None, help="optional tab name; defaults to the directory basename")
+    new.add_argument("--cwd", type=Path, default=None, help="directory to open; overrides the positional target")
     new.add_argument("--window-id", default="main")
     new.add_argument("--window-title", default="Main")
     new.add_argument("--tab-index", type=int, default=None)
-    new.add_argument("--hidden", action="store_true", help="create as hidden from browser restore")
-    new.add_argument("--pinned", action="store_true", help="pin the tab so it stays visible/front-loaded and resists cleanup actions")
-    new.add_argument("--no-start", action="store_true", help="remember the task without starting tmux")
+    new.add_argument("--hidden", action="store_true", help="remember the tab without showing it in the window")
+    new.add_argument("--pinned", action="store_true", help="pin the tab so it stays visible and resists cleanup actions")
+    new.add_argument("--no-start", action="store_true", help="remember the tab without starting its hidden process")
     new.add_argument("--db", type=Path, default=None)
     new.set_defaults(func=cmd_new)
 
@@ -1355,7 +1288,7 @@ def build_parser() -> argparse.ArgumentParser:
     activity.add_argument("--sort", choices=["severity", "state", "name", "tag", "window", "tab"], default="severity")
     activity.set_defaults(func=cmd_activity)
 
-    tasks = sub.add_parser("tasks", help="show the master task-manager table without launching GTK")
+    tasks = sub.add_parser("tasks", help="show the Tab manager table without launching GTK")
     tasks.add_argument("query", nargs="?", default="", help="filter by id, tag, window, health, state, command, or directory")
     tasks.add_argument("--db", type=Path, default=None)
     tasks.add_argument("--tag", default=None)

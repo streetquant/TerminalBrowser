@@ -42,13 +42,13 @@ class ModernUiSystemTests(unittest.TestCase):
         self.assertIn("subtitle.set_max_width_chars(18)", GTK_APP)
         self.assertNotIn("discover_group + manage_group + window_group", GTK_APP)
 
-    def test_sessions_pane_has_modern_hierarchy_and_empty_state(self) -> None:
-        self.assertIn('Gtk.Label(label="WORKSPACE"', GTK_APP)
+    def test_tabs_pane_has_modern_hierarchy_and_empty_state(self) -> None:
+        self.assertIn('Gtk.Label(label="WINDOW"', GTK_APP)
         self.assertIn("self.count_label", GTK_APP)
         self.assertIn('"td-count-pill"', GTK_APP)
         self.assertIn('"td-session-selected"', GTK_APP)
         self.assertIn('"td-empty-state"', GTK_APP)
-        self.assertIn('Gtk.Label(label="No active sessions"', GTK_APP)
+        self.assertIn('Gtk.Label(label="No tabs in this window"', GTK_APP)
         self.assertIn('"td-primary-action"', GTK_APP)
         self.assertIn('"td-danger-action"', GTK_APP)
 

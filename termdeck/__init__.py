@@ -1,3 +1,3 @@
-"""TermDeck: lightweight browser-like terminal task manager."""
+"""TermDeck: named terminal windows with directory-backed tabs."""
 
-__version__ = "0.1.32"
+__version__ = "0.2.0"

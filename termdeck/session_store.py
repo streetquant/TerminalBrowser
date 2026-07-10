@@ -264,6 +264,17 @@ class SessionStore:
             rows = self.list(visible_only=True, include_stopped=False)
         return rows[:clean_limit]
 
+    def rename_window(self, window_id: str, title: str) -> int:
+        """Rename one logical TermDeck window without changing tab timestamps."""
+
+        clean_title = title.strip() or "Window"
+        cursor = self.conn.execute(
+            "UPDATE sessions SET window_title = ? WHERE window_id = ?",
+            (clean_title, window_id),
+        )
+        self.conn.commit()
+        return max(0, int(cursor.rowcount))
+
     def windows_with_visible_sessions(self) -> list[tuple[str, str, list[SessionRecord]]]:
         records = self.visible_records()
         grouped: dict[str, list[SessionRecord]] = {}

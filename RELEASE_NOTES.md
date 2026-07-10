@@ -1,5 +1,49 @@
 # Release notes
 
+## 0.2.0
+
+TermDeck now has one clear product model: **a named window groups directory-backed terminal tabs**.
+
+### Named windows
+
+- Users can rename the current TermDeck window from **More → Rename window**.
+- The window name is persisted across every tab in that logical window without changing tab order or last-opened timestamps.
+- **More → New TermDeck window** asks for the group name, creates the window, and then asks for its first tab directory.
+- The native window title and TermDeck header update immediately after a rename.
+
+### Directory-backed tabs
+
+- **New tab** and `Ctrl+T` now open a folder chooser instead of a task launcher.
+- TermDeck opens the user's default shell in the selected directory.
+- The default tab title is the directory's final component. For example, `/home/user/work/client-api` becomes `client-api`, never the absolute path.
+- Tabs inside one window can use unrelated directories; the window name supplies the grouping context.
+- Explicitly renamed tabs and names stored in existing saved layouts remain unchanged.
+
+### Removed concepts
+
+- Removed the GTK task launcher and editable task-template catalogue.
+- Removed task-template Python modules and the `termdeck templates` command.
+- Removed the custom-task creation path and its shortcuts.
+- Removed project detection from the GUI, command palette, quickstart report, CLI, and package. The `project-detect` and `project-init` commands no longer exist.
+- Simplified `termdeck new`: `--tag` was removed, its JSON result now uses a `tabs` array, and normal creation output omits internal tag and tmux identifiers.
+- Removed tag chips, Retag menu items, and visible Tag columns from the primary GUI.
+- Search and Tab Manager now present tabs by window, name, directory, command, state, and resource information.
+
+### Compatibility
+
+- Existing SQLite data remains readable; internal session and tag fields are retained so upgrades do not discard remembered processes or metadata.
+- Existing visible tabs, hidden tabs, snapshots, saved window/tab recipes, Terminator-layout imports, and adopted tmux processes continue to restore.
+- JSON workspace commands remain as compatibility and automation tools for serialising windows and tabs; they are no longer presented as a separate GUI concept.
+- Advanced process-management CLI commands remain available for scripts and migration workflows.
+
+### Verified
+
+- Full test suite: 319 passed, 11 subtests passed.
+- Desktop GTK render: `1290x856`, with zero application or layout errors.
+- Compact GTK render: requested and captured `640x520`, with zero application or layout errors.
+- Task-launcher, template, and project-detector symbols are absent from executable package code.
+- GitHub repository visibility: private.
+
 ## 0.1.32
 
 This release aligns Sessions-pane multi-selection with standard desktop interaction conventions.

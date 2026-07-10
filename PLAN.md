@@ -2,7 +2,7 @@
 
 ## Initial plan
 
-Build a lightweight browser-like terminal manager for Linux users who already understand browser tabs. The product should not expose tmux or terminal-multiplexer language. It should present windows, tabs, tags, a right-side control pane, a command palette, and a master task window. Every tab may run any terminal task, including Codex, shell, SSH, npm, pytest, logs, Docker, or REPLs.
+Build a lightweight native terminal application with one visible hierarchy: named windows containing directory-backed tabs. The product should not expose tmux, projects, tags, task templates, or terminal-multiplexer language as peer concepts. Each tab runs the user's shell or a remembered command in its directory.
 
 Initial stack: custom app shell, embedded terminal widget, hidden persistent session backend, Terminator visual configuration importer, local SQLite registry, Linux resource sampling, and JSON workspace recipes.
 
@@ -35,8 +35,8 @@ The project should not compete as another generic terminal. The differentiator i
 
 Final choice after round 3:
 
-- Right side pane for session filtering, selection, prompts, status, pause, resume, kill, pause-hot, restore, and master task manager.
-- Master task window showing ID, window, name, tag, PID, health, state, CPU, RAM, process count, runtime, focus shortcut, pause shortcut, command, directory, and captured output.
+- Right-side Tabs pane for filtering, selection, prompts, status, pause, resume, stop, restore, and the Tab manager.
+- Tab manager showing ID, window, name, PID, health, state, CPU, RAM, process count, runtime, shortcuts, command, directory, and captured output.
 - Resource monitoring implemented through Linux `/proc` without psutil.
 - Terminator config importer implemented as a custom parser for nested Terminator config sections.
 - Workspace recipes implemented as dependency-free JSON so project layouts can be shared.
@@ -52,7 +52,7 @@ Deliver a working Linux-first MVP named TermDeck with:
 5. Terminator font, colour, palette, cursor, scrollback, window-size, and common keybinding import.
 6. Right-side session control pane.
 7. Universal command palette.
-8. Master task window with resource usage, health, capture preview, and pause/resume/kill controls.
+8. Tab manager with resource usage, health, capture preview, and pause/resume/kill controls.
 9. Support for any command, not only Codex.
 10. JSON workspace recipe import/export.
 11. CLI smoke commands for doctor, templates, palette, health, sessions, controls, capture, workspace-plan, and workspace-export.
@@ -62,11 +62,11 @@ Deliver a working Linux-first MVP named TermDeck with:
 
 ### 1. Browser-style pause shortcuts
 
-Added Ctrl+Alt+1 through Ctrl+Alt+9 to pause/resume visible tab processes, Ctrl+Shift+Space to toggle the current tab, and pause-key display in the master task window.
+Added Ctrl+Alt+1 through Ctrl+Alt+9 to pause/resume visible tab processes, Ctrl+Shift+Space to toggle the current tab, and pause-key display in the Tab manager.
 
-### 2. Task launcher templates
+### 2. Directory-backed tab creation
 
-Added a searchable New Task launcher with templates for local shell, Codex, Claude Code, OpenCode, npm dev server, pytest, SSH, Docker shell, log tailing, Python REPL, Node REPL, and custom commands. Missing binaries remain visible, and all fields are editable.
+The earlier task-launcher experiment was removed. The production creation flow now asks only for a directory, opens the user's default shell there, and derives the initial tab title from the directory basename.
 
 ### 3. Browser-style restore and window grouping
 
@@ -74,7 +74,7 @@ Added persisted `window_id`, `window_title`, `tab_index`, and `visible` metadata
 
 ### 4. Command palette and health layer
 
-Added a universal command palette for global actions, remembered sessions, and task templates. Added resource health classification for `OK`, `paused`, `missing`, `many processes`, `high CPU`, `critical CPU`, `high memory`, and `critical memory`. Added explicit Pause Hot actions in the side pane, master window, and CLI.
+Added a command palette for named-window actions, remembered tabs, search, restore, and process controls. Added resource health classification for `OK`, `paused`, `missing`, `many processes`, `high CPU`, `critical CPU`, `high memory`, and `critical memory`. Added explicit Pause Hot actions in the side pane, master window, and CLI.
 
 ### 5. Master task manager hardening
 
@@ -99,7 +99,7 @@ Changed terminal capture to redact common secret-like values by default before J
 
 ### 10. Headless master task snapshot
 
-Added `tasks` as a CLI version of the master task window. It builds the same browser-task-manager rows without GTK/VTE, supports text and JSON output, filters by query/tag/visibility/running state, and sorts by health, CPU, RAM, runtime, name, tag, window, tab, or status. This makes the master-window model testable in headless environments and usable by side-pane controllers or launchers.
+Added `tasks` as a CLI version of the Tab manager. It builds the same browser-task-manager rows without GTK/VTE, supports text and JSON output, filters by query/tag/visibility/running state, and sorts by health, CPU, RAM, runtime, name, tag, window, tab, or status. This makes the master-window model testable in headless environments and usable by side-pane controllers or launchers.
 
 ### 11. Safety plan and capture redaction
 
@@ -133,11 +133,11 @@ TermDeck now separates shareable workspace recipes from local browser-session sn
 
 Verification added: snapshot export, schema validation, dry-run import, replace import, restore-plan generation, parser coverage, full compileall, and full unit-test suite.
 
-## v0.1.10 next concrete step: project-to-workspace onboarding
+## v0.2.0 simplification: named windows and directory tabs
 
-TermDeck now includes a dependency-free project detector that creates a browser-like workspace from common project markers. This reduces first-run friction: a user can open a project folder, press **+ Project**, or run `termdeck project-init`, and receive useful terminal tabs for shell, dev server, tests, lint, Docker, logs, and optional AI-agent work without writing a JSON recipe manually.
+The project-detector experiment was removed from the product. TermDeck now exposes one hierarchy: users name a window, choose directories for tabs, and optionally rename those tabs. Workspace recipes remain a compatibility and automation format rather than a third GUI concept.
 
-Verification added: Node/Python/AI detection, generated recipe round-trip through the existing workspace parser, CLI `project-detect` recipe output, `project-init` overwrite safety, GTK static exposure through **+ Project**, command-palette project action, full compileall, and the full unit-test suite.
+Verification covers directory-derived names, named-window persistence, launcher/project symbol removal, command-palette simplification, GTK runtime rendering, and the full unit-test suite.
 
 Current verified suite size: 139 tests.
 
@@ -171,7 +171,7 @@ Current verified suite size: 139 tests.
 
 ## v0.1.14 next concrete step: lifecycle actions in visible UI
 
-The lifecycle model is now exposed through the GUI as well as the CLI. The side pane and master task window can hide or archive selected sessions without killing their processes, and the command palette can discover the same actions through ordinary browser-like search terms. This reduces the gap between the tested headless controller model and the app experience a non-terminal user sees.
+The lifecycle model is now exposed through the GUI as well as the CLI. The side pane and Tab manager can hide or archive selected sessions without killing their processes, and the command palette can discover the same actions through ordinary browser-like search terms. This reduces the gap between the tested headless controller model and the app experience a non-terminal user sees.
 
 Verification added: command-palette lifecycle search, static GTK lifecycle controls, CLI lifecycle smoke checks, full compileall, and the full unit-test suite.
 
