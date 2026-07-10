@@ -1466,7 +1466,7 @@ class SidePane(Gtk.Box):
         header_row.pack_end(pane_more, False, False, 0)
         self.pack_start(header_row, False, False, 0)
 
-        hint = Gtk.Label(label="Ctrl+right-click anywhere on a card to collect sessions", xalign=0)
+        hint = Gtk.Label(label="Ctrl+left-click anywhere on a card to select multiple sessions", xalign=0)
         hint.set_line_wrap(True)
         _style(hint, "td-muted")
         self.pack_start(hint, False, False, 0)
@@ -1573,12 +1573,6 @@ class SidePane(Gtk.Box):
         if check is not None and check.get_active() != active:
             check.set_active(active)
 
-    def _select_record_for_context(self, record: SessionRecord, check: Gtk.CheckButton | None = None) -> None:
-        """Add a session to the current selection without clearing peer selections."""
-        self.selected_ids.add(record.id)
-        if check is not None and not check.get_active():
-            check.set_active(True)
-
     def _on_tag_button_press(self, _widget, event: Gdk.EventButton, record: SessionRecord, check: Gtk.CheckButton) -> bool:
         button = int(getattr(event, "button", 0) or 0)
         state = int(getattr(event, "state", 0) or 0)
@@ -1587,8 +1581,6 @@ class SidePane(Gtk.Box):
             self._toggle_record_selection(record, check)
             return True
         if button == 3:
-            if control:
-                self._select_record_for_context(record, check)
             self._show_session_menu(record, check, event)
             return True
         return False
@@ -1596,9 +1588,10 @@ class SidePane(Gtk.Box):
     def _on_session_button_press(self, _widget, event: Gdk.EventButton, record: SessionRecord, check: Gtk.CheckButton) -> bool:
         button = int(getattr(event, "button", 0) or 0)
         state = int(getattr(event, "state", 0) or 0)
+        if button == 1 and state & Gdk.ModifierType.CONTROL_MASK:
+            self._toggle_record_selection(record, check)
+            return True
         if button == 3:
-            if state & Gdk.ModifierType.CONTROL_MASK:
-                self._select_record_for_context(record, check)
             self._show_session_menu(record, check, event)
             return True
         return False
@@ -1763,7 +1756,7 @@ class SidePane(Gtk.Box):
             _style(chip, "td-chip")
             chip_event = Gtk.EventBox()
             chip_event.add(chip)
-            chip_event.set_tooltip_text("Ctrl-click to add/remove this session from the multi-selection")
+            chip_event.set_tooltip_text("Ctrl+left-click to add or remove this session from the multi-selection")
             chip_event.connect("button-press-event", self._on_tag_button_press, record, check)
             top.pack_start(chip_event, False, False, 0)
             card.pack_start(top, False, False, 0)

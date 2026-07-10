@@ -1,5 +1,28 @@
 # Release notes
 
+## 0.1.32
+
+This release aligns Sessions-pane multi-selection with standard desktop interaction conventions.
+
+### Multi-selection
+
+- Ctrl+left-click now toggles a session from anywhere on its card, including the checkbox, tag, Rename button, and Open button.
+- Existing selected sessions remain selected while another card is added, enabling natural multi-selection.
+- Ctrl+left-click on a selected card removes it from the selection.
+
+### Context menus
+
+- Right-click now opens the session context menu without silently changing the active selection.
+- Holding Ctrl while right-clicking has no selection side effect.
+- Bulk-aware context actions still apply when the right-clicked session is already part of the current selection.
+
+### Verified
+
+- Full test suite: 323 passed, 11 subtests passed.
+- Desktop GTK render: `1290x856`, with zero application or layout errors.
+- Compact GTK render: requested and captured `640x520`, with zero application or layout errors.
+- GitHub repository visibility: private.
+
 ## 0.1.31
 
 This release makes the redesigned interface genuinely responsive rather than merely desktop-sized.

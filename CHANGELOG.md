@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.32
+
+- Replaced Ctrl+right-click session collection with standard Ctrl+left-click multi-selection across the complete Sessions card.
+- Ctrl+left-click now toggles a session from the card body, checkbox, tag, Rename button, or Open button while preserving peer selections.
+- Right-click is now menu-only and no longer changes selection, even when Ctrl is held.
+- Updated Sessions-pane guidance, tag tooltip, README documentation, and pointer regression coverage.
+- Verified 323 tests and 11 subtests, plus desktop and compact GTK renders with zero application or layout errors.
+
 ## 0.1.31
 
 - Reduced titlebar minimum width by converting New, Shell, Search, Palette, and More to compact icon controls with preserved tooltips and accessible names.

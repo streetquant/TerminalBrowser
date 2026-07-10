@@ -29,7 +29,7 @@ See `RELEASE_NOTES.md` for the current verified build notes.
 - Pinned tabs show explicit close guidance and provide **Unpin and hide tab** from the tab context menu instead of silently ignoring close attempts.
 - Cursor blinking can be disabled from Terminal options or `appearance.terminal.cursor_blink`.
 - Sessions pane can be moved left/right from Terminal options or by right-clicking the Sessions header.
-- Sessions rows and tags support right-click actions, with bulk-aware actions when Ctrl-click multi-selection is active.
+- Sessions cards support Ctrl+left-click multi-selection anywhere on the card; right-click remains reserved for context actions, including bulk-aware operations on the active selection.
 - Stopped/killed sessions are hidden from the Sessions pane while remaining visible in master/history views.
 - Heavy GUI search/filter fields are debounced, and Master captured-output previews use a short-lived cache to reduce repeated tmux capture work.
 - Browser and emacs-safe shortcut profiles with duplicate and terminal-conflict reporting.
