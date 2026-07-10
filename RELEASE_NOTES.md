@@ -1,5 +1,40 @@
 # Release notes
 
+## 0.2.7
+
+TermDeck now has a cohesive visual identity rather than relying on lightly styled GTK defaults. The product model remains unchanged: named windows, directory-backed tabs and the terminal-first layout.
+
+### Layered visual system
+
+- Refined the default dark palette to a neutral midnight base with a softer violet-blue accent, cleaner muted text and less saturated borders.
+- The terminal notebook is now an inset, rounded surface with its own shadow and breathing room from the window edges.
+- Header, terminal frame, optional Tabs pane and auxiliary windows use distinct elevation levels instead of sharing nearly identical flat backgrounds.
+- Comfortable mode uses a `10px / 12px / 12px / 12px` notebook inset; compact mode reduces it to `6px / 8px / 8px / 8px`.
+
+### Tabs and primary action
+
+- Tabs are rounded, separated controls rather than connected legacy notebook tabs.
+- Inactive tabs stay quiet; hover introduces a subtle surface and border.
+- The active tab uses an accent-tinted fill, focused border, bottom accent rail and soft shadow.
+- Close controls remain present but visually recede until the tab is active or the pointer hovers them.
+- New tab is now a circular accented action with a matching glow while the More action remains restrained.
+
+### Unified controls and auxiliary views
+
+- Plain GTK buttons now share consistent radius, border, depth, hover, pressed and keyboard-focus states.
+- Menus have roomier rows and separators; scrolled areas and text previews use the same sunken surface treatment.
+- Tab Manager and Window Overview explanatory text uses a quieter section-description style.
+- The optional Tabs pane and its cards use increased radius, cleaner borders and more deliberate elevation.
+
+### Verification
+
+- Full test suite: 338 passed, 15 subtests passed.
+- Real visual-polish smoke verified semantic surface classes, computed notebook margins, one circular primary action and the required active-tab/focus selectors.
+- All prior GTK smokes remained green: startup geometry, Ctrl+W/Ctrl+Q preservation, Tabs-pane lifecycle, header, tab strip and typo-tolerant Search Tabs.
+- Compact render: requested and captured `640x520`, zero application or layout errors.
+- Desktop render: `1290x858`, zero application or layout errors.
+- Compared with the verified 0.2.6 compact frame, 107,290 of 332,800 pixels changed (`32.24%`), confirming a material visual redesign rather than a token-only adjustment.
+
 ## 0.2.6
 
 This release fixes the startup rendering artifact shown as dotted tmux padding and defines clear close-versus-stop behavior.

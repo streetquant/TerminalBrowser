@@ -8,6 +8,10 @@ Named window -> Directory-backed tab -> Hidden tmux-backed shell/process
 
 A window is the user-defined group. A tab is rooted in one directory and defaults to that directory's basename. The HeaderBar exposes only the window name, New tab, and More; Search and Command palette are overflow actions. The notebook strip renders only the exact tab name and close control; category, pin, health, and attention metadata live in contextual or advanced surfaces. The main layout shows only this minimal tab strip and active terminal; the advanced Tabs pane is hidden by default and persisted through `appearance.tabs_pane_visible`. The GUI does not expose task templates, projects, tags, or tmux as peer concepts. SQLite and tmux remain implementation details that provide restore, persistence, and process control.
 
+## Visual system
+
+`ui_theme.py` defines semantic chrome tokens; `chrome_css.py` converts those tokens into one GTK3 stylesheet. The main root, terminal notebook and explanatory copy use semantic classes (`td-main-root`, `td-terminal-notebook`, `td-section-description`) rather than widget-position selectors alone. The terminal notebook owns the inset frame and active-tab hierarchy, while density-specific CSS reduces spacing without changing the information model. A real GTK smoke verifies these classes, computed margins and primary-action structure before CI captures desktop and compact frames.
+
 ## Main modules
 
 - `gtk_app.py`: GTK/VTE named-window UI, directory chooser, tab pane, tab manager, window overview, search, and terminal controls.

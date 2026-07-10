@@ -678,6 +678,7 @@ class WindowOverview(Gtk.Window):
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         label = Gtk.Label(label="One summary row per named window: tab counts, aggregate resource load, and health")
+        _style(label, "td-section-description")
         label.set_xalign(0)
         top.pack_start(label, True, True, 0)
         refresh = Gtk.Button(label="Refresh")
@@ -2005,6 +2006,7 @@ class MasterWindow(Gtk.Window):
             label="One row per tab/process with resource details, captured output, and control actions.",
             xalign=0,
         )
+        _style(explanation, "td-section-description")
         explanation.set_line_wrap(True)
         outer.pack_start(explanation, False, False, 0)
 
@@ -2409,6 +2411,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.paned.set_hexpand(True)
         self.paned.set_vexpand(True)
         self.notebook = Gtk.Notebook(scrollable=True)
+        _style(self.notebook, "td-terminal-notebook")
         self.notebook.set_hexpand(True)
         self.notebook.set_vexpand(True)
         self.notebook.set_tab_pos(Gtk.PositionType.TOP)
@@ -2419,6 +2422,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self._pack_side_pane()
 
         root = Gtk.Overlay()
+        _style(root, "td-main-root")
         root.set_hexpand(True)
         root.set_vexpand(True)
         root.add(self.paned)

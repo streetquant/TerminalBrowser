@@ -26,13 +26,39 @@ window, dialog, messagedialog {{
   color: {tokens.fg};
 }}
 window.background {{ background-color: {tokens.bg}; }}
+.td-main-root {{
+  background-color: {tokens.bg};
+}}
+button {{
+  background-image: none;
+  background-color: alpha({tokens.fg}, 0.045);
+  color: {tokens.fg};
+  border: 1px solid alpha({tokens.border}, 0.88);
+  border-radius: 11px;
+  padding: 6px 12px;
+  box-shadow: 0 2px 7px alpha(#000000, 0.10);
+  transition: 120ms ease-out;
+}}
+button:hover {{
+  background-color: alpha({tokens.accent}, 0.10);
+  border-color: alpha({tokens.accent}, 0.38);
+  box-shadow: 0 4px 12px alpha(#000000, 0.16);
+}}
+button:active {{
+  background-color: alpha({tokens.accent}, 0.17);
+  box-shadow: inset 0 1px 2px alpha(#000000, 0.22);
+}}
+button:focus {{
+  border-color: alpha({tokens.accent}, 0.76);
+  box-shadow: 0 0 0 2px alpha({tokens.accent}, 0.15);
+}}
 headerbar {{
   background-image: none;
   background-color: {tokens.bg_raised};
   border: none;
-  border-bottom: 1px solid alpha({tokens.border}, 0.82);
-  box-shadow: 0 4px 18px alpha(#000000, 0.22);
-  padding: 7px 10px;
+  border-bottom: 1px solid alpha({tokens.border}, 0.72);
+  box-shadow: 0 8px 24px alpha(#000000, 0.24);
+  padding: 8px 12px;
   min-height: 52px;
 }}
 headerbar label, headerbar button {{ color: {tokens.fg}; }}
@@ -40,17 +66,19 @@ headerbar button {{
   background-image: none;
   background-color: transparent;
   border: 1px solid transparent;
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 6px 10px;
   margin: 0 2px;
   min-height: 34px;
+  box-shadow: none;
   transition: 120ms ease-out;
 }}
 headerbar button:hover {{
-  background-color: alpha({tokens.accent}, 0.12);
-  border-color: alpha({tokens.accent}, 0.28);
+  background-color: alpha({tokens.accent}, 0.11);
+  border-color: alpha({tokens.accent}, 0.30);
+  box-shadow: none;
 }}
-headerbar button:active {{ background-color: alpha({tokens.accent}, 0.20); }}
+headerbar button:active {{ background-color: alpha({tokens.accent}, 0.18); }}
 button.td-primary-action, headerbar button.suggested-action, button.td-accent {{
   background-image: none;
   background-color: {tokens.accent};
@@ -88,19 +116,32 @@ button.td-danger-action:hover, button.destructive-action:hover {{
   border-color: alpha({tokens.danger}, 0.60);
 }}
 button.td-header-overflow {{
-  background-color: alpha({tokens.fg}, 0.045);
-  border-color: alpha({tokens.border}, 0.85);
+  background-color: alpha({tokens.fg}, 0.050);
+  border-color: alpha({tokens.border}, 0.78);
 }}
 button.td-header-icon {{
   min-width: 36px;
   padding-left: 8px;
   padding-right: 8px;
 }}
+headerbar button.suggested-action.td-header-icon {{
+  min-width: 38px;
+  min-height: 38px;
+  padding: 0;
+  border-radius: 999px;
+  box-shadow: 0 5px 16px alpha({tokens.accent}, 0.24);
+}}
 headerbar button.td-header-group-end {{ margin-left: 8px; }}
 .td-title {{
   font-weight: 700;
   font-size: {size["title"]};
   color: {tokens.fg};
+  letter-spacing: 0.01em;
+}}
+.td-section-description {{
+  color: {tokens.fg_muted};
+  font-size: {size["muted"]};
+  padding: 2px 2px 8px 2px;
 }}
 .td-subtitle, .dim-label, .td-muted {{
   color: {tokens.fg_muted};
@@ -114,11 +155,11 @@ headerbar button.td-header-group-end {{ margin-left: 8px; }}
 }}
 .td-side-pane {{
   background-color: {tokens.bg_raised};
-  border: 1px solid alpha({tokens.border}, 0.95);
-  border-radius: 16px;
-  box-shadow: 0 10px 30px alpha(#000000, 0.18);
-  padding: {pad}px;
-  margin: {margin}px;
+  border: 1px solid alpha({tokens.border}, 0.82);
+  border-radius: 18px;
+  box-shadow: 0 16px 40px alpha(#000000, 0.24);
+  padding: {pad + 2}px;
+  margin: {margin + 2}px;
 }}
 .td-count-pill {{
   background-color: alpha({tokens.accent}, 0.13);
@@ -130,18 +171,18 @@ headerbar button.td-header-group-end {{ margin-left: 8px; }}
   font-weight: 700;
 }}
 .td-session-card {{
-  background-color: alpha({tokens.fg}, 0.025);
-  border: 1px solid alpha({tokens.border}, 0.92);
+  background-color: alpha({tokens.fg}, 0.030);
+  border: 1px solid alpha({tokens.border}, 0.78);
   border-radius: {radius}px;
   padding: {pad}px;
   margin: {margin // 2}px 0;
-  box-shadow: 0 3px 12px alpha(#000000, 0.10);
+  box-shadow: 0 4px 14px alpha(#000000, 0.12);
   transition: 120ms ease-out;
 }}
 .td-session-card:hover {{
-  background-color: alpha({tokens.accent}, 0.055);
-  border-color: alpha({tokens.accent}, 0.42);
-  box-shadow: 0 6px 18px alpha(#000000, 0.16);
+  background-color: alpha({tokens.accent}, 0.070);
+  border-color: alpha({tokens.accent}, 0.46);
+  box-shadow: 0 8px 22px alpha(#000000, 0.18);
 }}
 .td-session-card.td-session-selected {{
   background-color: alpha({tokens.accent}, 0.11);
@@ -206,29 +247,45 @@ checkbutton check:checked {{ background-color: {tokens.accent}; border-color: {t
 .td-list-row:hover {{ background-color: alpha({tokens.accent}, 0.07); }}
 .td-category {{ font-size: {size["chip"]}; font-weight: 700; letter-spacing: 0.08em; color: {tokens.accent}; }}
 notebook {{ background-color: {tokens.bg_sunken}; border: none; }}
-notebook header {{
-  background-color: {tokens.bg_raised};
-  border-bottom: 1px solid alpha({tokens.border}, 0.85);
-  padding: 5px 8px 0 8px;
+notebook.td-terminal-notebook {{
+  background-color: {tokens.bg_sunken};
+  border: 1px solid alpha({tokens.border}, 0.78);
+  border-radius: 16px;
+  margin: 10px 12px 12px 12px;
+  box-shadow: 0 18px 48px alpha(#000000, 0.28);
 }}
-notebook header tabs {{ background-color: transparent; border-color: transparent; }}
-notebook tab {{
+notebook.td-terminal-notebook header {{
+  background-color: {tokens.bg_raised};
+  border: none;
+  border-bottom: 1px solid alpha({tokens.border}, 0.68);
+  border-radius: 15px 15px 0 0;
+  padding: 7px 8px;
+}}
+notebook.td-terminal-notebook header tabs {{ background-color: transparent; border-color: transparent; }}
+notebook.td-terminal-notebook tab {{
   background-color: transparent;
   border: 1px solid transparent;
-  border-radius: 10px 10px 0 0;
-  padding: 7px 12px;
-  margin: 2px 2px 0 2px;
+  border-radius: 10px;
+  padding: 6px 11px;
+  margin: 1px 3px;
   color: {tokens.fg_muted};
   font-size: {size["base"]};
   transition: 120ms ease-out;
 }}
-notebook tab:hover {{ background-color: alpha({tokens.accent}, 0.07); color: {tokens.fg}; }}
-notebook tab:checked {{
-  background-color: {tokens.bg};
+notebook.td-terminal-notebook tab:hover {{
+  background-color: alpha({tokens.fg}, 0.055);
+  border-color: alpha({tokens.border}, 0.55);
   color: {tokens.fg};
-  border-color: alpha({tokens.border}, 0.85);
-  border-bottom-color: {tokens.bg};
-  box-shadow: inset 0 3px 0 {tokens.accent};
+}}
+notebook.td-terminal-notebook tab:checked {{
+  background-color: alpha({tokens.accent}, 0.14);
+  color: {tokens.fg};
+  border-color: alpha({tokens.accent}, 0.36);
+  box-shadow: inset 0 -2px 0 {tokens.accent}, 0 5px 14px alpha(#000000, 0.18);
+}}
+notebook.td-terminal-notebook > stack {{
+  background-color: {tokens.bg_sunken};
+  border-radius: 0 0 15px 15px;
 }}
 button.td-tab-close {{
   min-width: 22px;
@@ -239,8 +296,16 @@ button.td-tab-close {{
   background-color: transparent;
   color: {tokens.fg_muted};
   font-size: {size["base"]};
+  box-shadow: none;
+  opacity: 0.52;
 }}
-button.td-tab-close:hover {{ background-color: alpha({tokens.danger}, 0.16); color: {tokens.danger}; }}
+notebook.td-terminal-notebook tab:checked button.td-tab-close {{ opacity: 0.82; }}
+button.td-tab-close:hover {{
+  background-color: alpha({tokens.danger}, 0.16);
+  color: {tokens.danger};
+  opacity: 1;
+  box-shadow: none;
+}}
 .td-bottom-bar {{
   background-color: alpha({tokens.fg}, 0.025);
   border: 1px solid alpha({tokens.border}, 0.72);
@@ -261,7 +326,16 @@ button.td-tab-close:hover {{ background-color: alpha({tokens.danger}, 0.16); col
 .td-toast.td-toast-success {{ border-color: alpha({tokens.success}, 0.55); }}
 .td-toast.td-toast-warn {{ border-color: alpha({tokens.warning}, 0.55); }}
 .td-toast.td-toast-danger {{ border-color: alpha({tokens.danger}, 0.55); }}
-treeview {{ background-color: {tokens.bg}; color: {tokens.fg}; border: none; font-size: {size["base"]}; }}
+scrolledwindow {{
+  background-color: {tokens.bg_sunken};
+  border: 1px solid alpha({tokens.border}, 0.72);
+  border-radius: 12px;
+}}
+textview, textview text {{
+  background-color: {tokens.bg_sunken};
+  color: {tokens.fg};
+}}
+treeview {{ background-color: {tokens.bg_sunken}; color: {tokens.fg}; border: none; font-size: {size["base"]}; }}
 treeview:selected {{ background-color: alpha({tokens.accent}, 0.24); color: {tokens.fg}; }}
 treeview header button {{
   background-image: none;
@@ -281,8 +355,9 @@ menu, popover {{
   padding: 6px;
   box-shadow: 0 12px 34px alpha(#000000, 0.30);
 }}
-menuitem {{ border-radius: 8px; padding: 7px 10px; }}
+menuitem {{ border-radius: 9px; padding: 8px 11px; margin: 1px 0; }}
 menuitem:hover {{ background-color: alpha({tokens.accent}, 0.13); color: {tokens.fg}; }}
+separator {{ background-color: alpha({tokens.border}, 0.72); min-height: 1px; margin: 5px 4px; }}
 tooltip {{
   background-color: {tokens.bg_raised};
   color: {tokens.fg};
@@ -301,5 +376,8 @@ scrollbar slider {{
 scrollbar slider:hover {{ background-color: alpha({tokens.accent}, 0.52); }}
 .td-density-compact * {{ font-size: {size["compact"]}; }}
 .td-density-compact .td-session-card {{ padding: 6px 8px; border-radius: 10px; }}
+.td-density-compact notebook.td-terminal-notebook {{ margin: 6px 8px 8px 8px; border-radius: 13px; }}
+.td-density-compact notebook.td-terminal-notebook header {{ border-radius: 12px 12px 0 0; padding: 5px 6px; }}
+.td-density-compact notebook.td-terminal-notebook tab {{ padding: 5px 8px; margin: 1px 2px; }}
 .td-density-compact treeview {{ font-size: {size["compact"]}; }}
 """

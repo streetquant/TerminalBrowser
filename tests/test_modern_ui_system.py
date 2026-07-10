@@ -31,6 +31,24 @@ class ModernUiSystemTests(unittest.TestCase):
         self.assertIn("transition:", css)
         self.assertIn("min-height: 52px", css)
 
+    def test_polished_terminal_surface_has_distinct_depth_and_focus_states(self) -> None:
+        css = build_chrome_css("dark", "comfortable")
+        for selector in (
+            ".td-main-root",
+            "notebook.td-terminal-notebook",
+            "notebook.td-terminal-notebook tab:checked",
+            "headerbar button.suggested-action.td-header-icon",
+            ".td-section-description",
+            "button:focus",
+            "scrolledwindow",
+        ):
+            self.assertIn(selector, css)
+        self.assertIn("margin: 10px 12px 12px 12px", css)
+        self.assertIn("border-radius: 16px", css)
+        self.assertIn("inset 0 -2px 0", css)
+        self.assertIn('"td-terminal-notebook"', GTK_APP)
+        self.assertIn('"td-main-root"', GTK_APP)
+
     def test_header_exposes_only_window_name_new_tab_and_overflow(self) -> None:
         self.assertIn('title = Gtk.Label(label=self.window_title', GTK_APP)
         self.assertIn("title.set_max_width_chars(28)", GTK_APP)

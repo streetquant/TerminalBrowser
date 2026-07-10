@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.7
+
+- Reworked the GTK visual system around a softer layered dark palette with clearer separation between the app background, raised chrome, sunken terminal surface, borders and accent states.
+- Framed the terminal notebook as an inset 16px-radius surface with a dedicated tab bar, deeper shadow and compact-mode spacing overrides.
+- Replaced flat connected tabs with rounded floating tabs; the active tab now uses an accent-tinted surface, focused border, lower accent rail and restrained shadow.
+- Standardised buttons, hover/active/focus states, menus, scrolled views, text previews, side-pane cards and descriptive text so primary and auxiliary windows share one design language.
+- Changed the New tab action into a circular accented control and reduced inactive tab-close prominence until hover or selection.
+- Added semantic `td-main-root`, `td-terminal-notebook` and `td-section-description` hooks plus a real GTK visual-polish smoke in CI.
+- Verified 338 tests and 15 subtests, all existing GTK lifecycle checks, exact `640x520` compact rendering, and a 32.24% compact-frame pixel change from 0.2.6 without application or layout errors.
+
 ## 0.2.6
 
 - Fixed the startup dotted-padding glitch by delaying tmux client attachment until VTE has a stable final grid and seeding the PTY with that exact geometry before launch.

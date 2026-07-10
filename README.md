@@ -79,6 +79,10 @@ The report checks runtime dependencies, summarises imported Terminator appearanc
 
 The header contains only the current window name, **New tab**, and **More**. Search tabs, Command palette, window controls, restoration, appearance, and advanced managers are grouped inside More. The operating-system title retains the `TermDeck ·` prefix, but the in-app label does not repeat it.
 
+### Visual design
+
+TermDeck uses a terminal-first, layered dark interface. The terminal and tab strip sit inside an inset rounded surface, the selected tab receives a restrained accent treatment, and secondary controls recede until hover or keyboard focus. Buttons, menus, search fields, tables, previews and the optional Tabs pane share the same radii, borders and elevation system. Compact density preserves the same hierarchy with reduced spacing.
+
 ### Create a tab
 
 Press **New tab** or `Ctrl+T`, choose a directory, and TermDeck opens the default shell there. The directory basename becomes the initial tab title. Double-click the tab title or use its right-click menu to rename it.
