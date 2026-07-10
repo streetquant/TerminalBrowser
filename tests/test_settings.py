@@ -58,6 +58,41 @@ class SettingsTests(unittest.TestCase):
         self.assertIn("appearance", payload)
         self.assertIn("terminal", payload["appearance"])
 
+    def test_tabs_pane_visibility_defaults_hidden_and_supports_legacy_focus_mode(self):
+        from termdeck.settings import save_terminal_options
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing = AppSettings.load(root / "missing.json")
+            self.assertFalse(missing.tabs_pane_visible)
+
+            explicit_path = root / "explicit.json"
+            explicit_path.write_text(
+                json.dumps({"appearance": {"tabs_pane_visible": True}}),
+                encoding="utf-8",
+            )
+            self.assertTrue(AppSettings.load(explicit_path).tabs_pane_visible)
+
+            hidden_legacy_path = root / "hidden-legacy.json"
+            hidden_legacy_path.write_text(
+                json.dumps({"appearance": {"focus_mode": True}}),
+                encoding="utf-8",
+            )
+            self.assertFalse(AppSettings.load(hidden_legacy_path).tabs_pane_visible)
+
+            visible_legacy_path = root / "visible-legacy.json"
+            visible_legacy_path.write_text(
+                json.dumps({"appearance": {"focus_mode": False}}),
+                encoding="utf-8",
+            )
+            self.assertTrue(AppSettings.load(visible_legacy_path).tabs_pane_visible)
+
+            save_terminal_options(visible_legacy_path, tabs_pane_visible=False)
+            payload = json.loads(visible_legacy_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["appearance"]["tabs_pane_visible"], False)
+            self.assertNotIn("focus_mode", payload["appearance"])
+            self.assertFalse(AppSettings.load(visible_legacy_path).tabs_pane_visible)
+
     def test_terminal_options_load_and_apply_to_theme(self):
         from termdeck.models import TerminalTheme
         from termdeck.settings import save_terminal_options

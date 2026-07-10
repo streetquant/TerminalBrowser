@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2
+
+- Changed the default main layout to terminal-first: the tab strip and active terminal are shown, while the advanced Tabs pane starts hidden.
+- Replaced the legacy `focus_mode` preference with canonical `appearance.tabs_pane_visible`, defaulting to `false`, while preserving inverse compatibility for existing focus-mode configs.
+- Consolidated duplicate pane controls into one persisted **Show/hide Tabs pane** action available from More, the command palette, and `F9`.
+- Synchronised the Tabs-pane preference across every open window and ensured newly created windows inherit the current state.
+- Removed redundant post-construction `show_all()` calls that remapped hidden panes during saved-layout and restored-window creation.
+- Added unit and real-Xvfb smoke coverage for default hiding, `F9`, persistence, legacy migration, cross-window inheritance, and synchronisation.
+- Verified 330 tests and 11 subtests, plus desktop and compact terminal-first GTK renders with zero application or layout errors.
+
 ## 0.2.1
 
 - Replaced the fresh-launch `Main` window and implicit current-directory shell with an explicit first-run flow: name the window, then choose its first tab directory.

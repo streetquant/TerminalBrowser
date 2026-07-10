@@ -58,7 +58,7 @@ class FirstRunWindowFlowTests(TestCase):
         FakeNameDialog.response = Gtk.ResponseType.OK
         FakeNameDialog.supplied_value = "Backend"
 
-    def test_create_named_window_shows_window_then_chooses_first_directory(self) -> None:
+    def test_create_named_window_presents_then_chooses_first_directory(self) -> None:
         app = SimpleNamespace(windows=[])
 
         with patch("termdeck.gtk_app.TermDeckWindow", FakeWindow):
@@ -67,7 +67,7 @@ class FirstRunWindowFlowTests(TestCase):
         self.assertIs(created, FakeWindow.created[0])
         self.assertEqual(created.kwargs["window_title"], "Client work")
         self.assertEqual(created.kwargs["restore_records"], [])
-        self.assertEqual(created.calls, ["show", "present", "choose-directory"])
+        self.assertEqual(created.calls, ["present", "choose-directory"])
         self.assertEqual(app.windows, [created])
 
     def test_create_named_window_can_skip_directory_prompt_for_noninteractive_restore(self) -> None:
@@ -80,7 +80,7 @@ class FirstRunWindowFlowTests(TestCase):
                 choose_first_directory=False,
             )
 
-        self.assertEqual(created.calls, ["show", "present"])
+        self.assertEqual(created.calls, ["present"])
 
     def test_first_run_prompt_names_window_and_requests_first_directory(self) -> None:
         created_window = object()

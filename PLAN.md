@@ -35,7 +35,7 @@ The project should not compete as another generic terminal. The differentiator i
 
 Final choice after round 3:
 
-- Right-side Tabs pane for filtering, selection, prompts, status, pause, resume, stop, restore, and the Tab manager.
+- Terminal-first main layout with an optional, persisted Tabs pane for filtering, multi-selection, prompts, status, pause, resume, stop, and restore controls.
 - Tab manager showing ID, window, name, PID, health, state, CPU, RAM, process count, runtime, shortcuts, command, directory, and captured output.
 - Resource monitoring implemented through Linux `/proc` without psutil.
 - Terminator config importer implemented as a custom parser for nested Terminator config sections.

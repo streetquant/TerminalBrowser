@@ -1370,7 +1370,7 @@ class SidePane(Gtk.Box):
         for label, handler in [
             ("Move pane left", lambda: self.window.set_side_pane_position("left")),
             ("Move pane right", lambda: self.window.set_side_pane_position("right")),
-            ("Toggle focus mode", self.window.toggle_focus_mode),
+            ("Hide tabs pane", self.window.toggle_tabs_pane),
             ("Terminal appearance", self.window.open_terminal_options),
         ]:
             item = Gtk.MenuItem(label=label)
@@ -1475,7 +1475,7 @@ class SidePane(Gtk.Box):
         menu = Gtk.Menu()
         menu.append(self._menu_item("Move tabs pane to left", lambda: self.window.set_side_pane_position("left")))
         menu.append(self._menu_item("Move tabs pane to right", lambda: self.window.set_side_pane_position("right")))
-        menu.append(self._menu_item("Toggle focus mode", self.window.toggle_focus_mode))
+        menu.append(self._menu_item("Hide tabs pane", self.window.toggle_tabs_pane))
         menu.append(self._menu_item("Terminal options", self.window.open_terminal_options))
         self._popup_menu(menu, event)
         return True
@@ -2260,7 +2260,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.shortcut_window: ShortcutWindow | None = None
         self.search_window: SessionSearchWindow | None = None
         self.set_default_size(app_context.theme.window_width or 1280, app_context.theme.window_height or 780)
-        self.focus_mode = bool(getattr(app_context.settings, "focus_mode", False))
+        self.tabs_pane_visible = bool(getattr(app_context.settings, "tabs_pane_visible", False))
         self._toast_source = None
         # Relative point delta from the configured theme font (Ctrl++ / Ctrl+-).
         self.font_zoom_delta = 0
@@ -2308,7 +2308,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             ("Keyboard shortcuts", self.open_shortcut_window),
             ("Terminal appearance", self.open_terminal_options),
             ("Reopen closed tab", self.reopen_last_closed_tab),
-            ("Toggle focus mode", self.toggle_focus_mode),
+            ("Show/hide tabs pane", self.toggle_tabs_pane),
         ]
         overflow_menu = Gtk.Menu()
         for label, handler in overflow_header_actions:
@@ -2359,15 +2359,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
         density = normalise_density(app_context.settings.ui_density)
         _style(self, f"td-density-{density}")
-        if self.focus_mode:
-            _style(self, "td-focus-mode")
-            self.side.set_visible(False)
 
         self.connect("key-press-event", self.on_key_press)
         self.connect("delete-event", self.on_delete)
         self.show_all()
-        if self.focus_mode:
-            self.side.set_visible(False)
+        self.side.set_visible(self.tabs_pane_visible)
         self.side.refresh()
         self.restore_previous_tabs(records=restore_records)
 
@@ -2600,18 +2596,27 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
         self._toast_source = GLib.timeout_add(int(delay * 1000), _hide)
 
-    def toggle_focus_mode(self) -> None:
-        self.focus_mode = not self.focus_mode
-        self.side.set_visible(not self.focus_mode)
-        ctx = self.get_style_context()
-        if self.focus_mode:
-            ctx.add_class("td-focus-mode")
-            self.show_toast("Focus mode on · tabs pane hidden", kind="info")
-        else:
-            ctx.remove_class("td-focus-mode")
-            self.side.set_visible(True)
+    def set_tabs_pane_visible(
+        self,
+        visible: bool,
+        *,
+        persist: bool = True,
+        notify: bool = True,
+    ) -> None:
+        self.tabs_pane_visible = bool(visible)
+        self.side.set_visible(self.tabs_pane_visible)
+        if self.tabs_pane_visible:
             self.side.refresh()
-            self.show_toast("Focus mode off", kind="info")
+        if persist:
+            self.app_context.apply_tabs_pane_visibility(self.tabs_pane_visible)
+        if notify:
+            self.show_toast(
+                "Tabs pane shown" if self.tabs_pane_visible else "Tabs pane hidden",
+                kind="info",
+            )
+
+    def toggle_tabs_pane(self) -> None:
+        self.set_tabs_pane_visible(not self.tabs_pane_visible)
 
     def _prompt_window_name(self, *, title: str, initial: str) -> str | None:
         dialog = WindowNameDialog(self, title=title, initial=initial)
@@ -2702,7 +2707,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 "reopen_closed": self.reopen_last_closed_tab,
                 "restore": self.restore_previous_tabs,
                 "toggle_side": self.toggle_side,
-                "focus_mode": self.toggle_focus_mode,
                 "focus_side": self.focus_side_prompt,
                 "status_selected": self.side.send_status,
                 "pause_selected": self.side.pause_selected,
@@ -3088,7 +3092,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.show_toast(f"Tabs pane moved to {position}", kind="info")
 
     def toggle_side(self) -> None:
-        self.side.set_visible(not self.side.get_visible())
+        self.toggle_tabs_pane()
 
     def _on_page_reordered(self, _notebook, _child, _page_num: int) -> None:
         self._renumber_visible_tabs()
@@ -3426,6 +3430,16 @@ class TermDeckApplication(Gtk.Application):
         for window in self.windows:
             window.set_side_pane_position(self.settings.side_pane_position, persist=False)
 
+    def apply_tabs_pane_visibility(self, visible: bool) -> None:
+        save_terminal_options(self.settings.path, tabs_pane_visible=visible)
+        self.settings = AppSettings.load(self.settings.path)
+        for window in self.windows:
+            window.set_tabs_pane_visible(
+                self.settings.tabs_pane_visible,
+                persist=False,
+                notify=False,
+            )
+
     def close_session_tabs(self, session_ids: set[str]) -> None:
         session_ids = set(session_ids)
         for window in list(self.windows):
@@ -3467,7 +3481,6 @@ class TermDeckApplication(Gtk.Application):
             restore_records=[],
         )
         self.windows.append(win)
-        win.show_all()
         win.present()
         if choose_first_directory:
             win.new_directory_tab()
@@ -3581,7 +3594,6 @@ class TermDeckApplication(Gtk.Application):
             if tab.visible:
                 win.open_session(record, restart_missing=True, remember_layout=False)
         win.side.refresh()
-        win.show_all()
         return win
 
     def open_workspace_recipe(self, path: str | Path) -> int:
@@ -3620,9 +3632,13 @@ class TermDeckApplication(Gtk.Application):
             groups = self.store.windows_with_visible_sessions()
             if groups:
                 for window_id, window_title, records in groups:
-                    win = TermDeckWindow(self, window_id=window_id, window_title=window_title, restore_records=records)
+                    win = TermDeckWindow(
+                        self,
+                        window_id=window_id,
+                        window_title=window_title,
+                        restore_records=records,
+                    )
                     self.windows.append(win)
-                    win.show_all()
             else:
                 self.prompt_for_new_window(first_run=True)
                 return

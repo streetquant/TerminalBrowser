@@ -134,7 +134,7 @@ class AppSettings:
     chrome_theme: str = "dark"
     terminal_palette: str = "terminator"
     ui_density: str = "comfortable"
-    focus_mode: bool = False
+    tabs_pane_visible: bool = False
     ui_refresh_interval_seconds: float = 5.0
     # Interface (non-terminal) type. None = GTK default family + TermDeck size ladder.
     ui_font: str | None = None
@@ -195,7 +195,13 @@ class AppSettings:
         ui_density = normalise_density(appearance.get("density", appearance.get("ui_density", "comfortable")))
         if ui_density not in density_names():
             raise SettingsError(f"appearance.density must be one of: {', '.join(density_names())}")
-        focus_mode = _boolean(appearance, "focus_mode", "focus", default=False)
+        if "tabs_pane_visible" in appearance or "show_tabs_pane" in appearance:
+            tabs_pane_visible = _boolean(appearance, "tabs_pane_visible", "show_tabs_pane", default=False)
+        elif "focus_mode" in appearance or "focus" in appearance:
+            # Backward compatibility: the old focus flag hid the pane when true.
+            tabs_pane_visible = not _boolean(appearance, "focus_mode", "focus", default=False)
+        else:
+            tabs_pane_visible = False
         ui_refresh_interval_seconds = _number(
             appearance,
             "refresh_interval_seconds",
@@ -258,7 +264,7 @@ class AppSettings:
             chrome_theme=chrome_theme,
             terminal_palette=terminal_palette,
             ui_density=ui_density,
-            focus_mode=focus_mode,
+            tabs_pane_visible=tabs_pane_visible,
             ui_refresh_interval_seconds=ui_refresh_interval_seconds,
             ui_font=ui_font,
             ui_font_scale=ui_font_scale,
@@ -332,7 +338,7 @@ class AppSettings:
             "chrome_theme": self.chrome_theme,
             "terminal_palette": self.terminal_palette,
             "density": self.ui_density,
-            "focus_mode": self.focus_mode,
+            "tabs_pane_visible": self.tabs_pane_visible,
             "refresh_interval_seconds": self.ui_refresh_interval_seconds,
             "side_pane_position": self.side_pane_position,
         }
@@ -402,6 +408,7 @@ def save_terminal_options(
     ui_font: str | None = None,
     ui_font_scale: float | None = None,
     side_pane_position: str | None = None,
+    tabs_pane_visible: bool | None = None,
 ) -> Path:
     """Persist minimal appearance/terminal options into the user config file."""
 
@@ -429,6 +436,8 @@ def save_terminal_options(
         appearance["density"] = normalise_density(density)
     if side_pane_position is not None:
         appearance["side_pane_position"] = normalise_side_pane_position(side_pane_position)
+    if tabs_pane_visible is not None:
+        appearance["tabs_pane_visible"] = bool(tabs_pane_visible)
     if ui_font is not None:
         cleaned = str(ui_font).strip()
         appearance["ui_font"] = normalise_font_description(cleaned, default="Sans 11") if cleaned else ""
@@ -442,6 +451,9 @@ def save_terminal_options(
     if isinstance(app, dict):
         if cursor_blink is not None and isinstance(app.get("terminal"), dict):
             app["terminal"].pop("cursor_blinking", None)
+        if tabs_pane_visible is not None:
+            app.pop("focus_mode", None)
+            app.pop("focus", None)
         if app.get("ui_font") == "":
             app.pop("ui_font", None)
     return save_settings_payload(resolved, payload)
@@ -457,7 +469,7 @@ def sample_settings_json() -> str:
             "chrome_theme": "dark",
             "terminal_palette": "catppuccin",
             "density": "comfortable",
-            "focus_mode": False,
+            "tabs_pane_visible": False,
             "refresh_interval_seconds": 5.0,
             "side_pane_position": "right",
             "ui_font": "Sans 11",

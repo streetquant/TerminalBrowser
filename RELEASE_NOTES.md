@@ -1,5 +1,37 @@
 # Release notes
 
+## 0.2.2
+
+TermDeck now opens as the simpler application model requested: **a named window with terminal tabs, without a duplicate control pane occupying the default layout**.
+
+### Terminal-first main window
+
+- Fresh profiles and default settings show only the native tab strip and active terminal.
+- The advanced Tabs pane remains available for bulk selection, prompting, resource controls, and lifecycle actions.
+- Toggle it with `F9`, **More → Show/hide tabs pane**, or the command palette.
+- Visibility persists across launches, synchronises across all open windows, and is inherited by newly created windows.
+
+### Preference migration
+
+- Added canonical `appearance.tabs_pane_visible`, which defaults to `false`.
+- Existing `appearance.focus_mode: true` is interpreted as a hidden Tabs pane.
+- Existing `appearance.focus_mode: false` is interpreted as a visible Tabs pane.
+- The next pane toggle saves only the canonical key and removes legacy focus keys.
+- Removed the duplicate command-palette focus action and the obsolete focus-mode CSS hook.
+
+### Runtime hardening
+
+- Removed redundant application-level `show_all()` calls that could remap a pane after the window constructor had hidden it.
+- Added a real GTK smoke script that verifies the default state, actual `F9` handling, persistence, new-window inheritance, and cross-window synchronisation.
+- Wired that smoke script into the GitHub Actions UI job before desktop and compact rendering.
+
+### Verified
+
+- Full test suite: 330 passed, 11 subtests passed.
+- Real Tabs-pane lifecycle smoke: all six assertions passed.
+- Desktop GTK render: `1290x856`, with zero application or layout errors.
+- Compact GTK render: requested and captured `640x520`, with zero application or layout errors.
+
 ## 0.2.1
 
 TermDeck now starts with the same model it presents everywhere else: **create a named window, then choose its first directory-backed tab**.

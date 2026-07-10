@@ -24,7 +24,8 @@ See `RELEASE_NOTES.md` for the current verified build notes.
 ## What it does
 
 - Native named windows and directory-backed terminal tabs.
-- Right-side **Tabs** pane for search, multi-selection, prompting, pause, resume, hide, archive, and kill actions.
+- Terminal-first main layout: only the tab strip and active terminal are shown by default.
+- Optional **Tabs** pane for search, multi-selection, prompting, pause, resume, hide, archive, and stop actions; toggle it with `F9`, More, or the command palette.
 - `Ctrl+left-click` multi-selection anywhere on a tab card; right-click remains context-menu only.
 - Command palette for window actions, remembered tabs, search, restore, and process controls.
 - Tab manager with PID, health, status, CPU, RAM, process count, runtime, command, directory, and captured-output preview.
@@ -84,9 +85,9 @@ Use **More → Rename window**. The name is saved across every tab belonging to 
 
 Use **More → New TermDeck window**. Enter the group name, then choose the first tab's directory.
 
-### Tab pane
+### Tabs pane
 
-The right-side pane shows the current window's tabs. It can be moved left or right from Appearance options or its context menu. Use `Ctrl+left-click` to select several tabs and apply bulk actions.
+The main window starts terminal-only. Press `F9`, use **More → Show/hide tabs pane**, or search for **Tabs pane** in the command palette when advanced multi-tab controls are needed. The preference persists across launches and applies to every TermDeck window. When visible, the pane can be moved left or right and supports `Ctrl+left-click` bulk selection.
 
 ## Desktop/app-menu launcher
 

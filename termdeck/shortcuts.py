@@ -68,7 +68,7 @@ ACTION_LABELS: Mapping[str, str] = {
     "focus_side": "Focus side-pane prompt",
     "launcher": "Open command palette",
     "master_window": "Open Tab manager",
-    "toggle_side": "Toggle side pane",
+    "toggle_side": "Show or hide Tabs pane",
     "pause_current": "Pause/resume current tab process",
     "zoom_in": "Increase terminal font size",
     "zoom_out": "Decrease terminal font size",

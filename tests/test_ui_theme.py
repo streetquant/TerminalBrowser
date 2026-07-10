@@ -120,7 +120,7 @@ class UiThemeTests(unittest.TestCase):
                             "chrome_theme": "noir",
                             "terminal_palette": "tokyo-night",
                             "density": "compact",
-                            "focus_mode": True,
+                            "tabs_pane_visible": True,
                         }
                     }
                 ),
@@ -130,7 +130,7 @@ class UiThemeTests(unittest.TestCase):
             self.assertEqual(settings.chrome_theme, "noir")
             self.assertEqual(settings.terminal_palette, "tokyo-night")
             self.assertEqual(settings.ui_density, "compact")
-            self.assertTrue(settings.focus_mode)
+            self.assertTrue(settings.tabs_pane_visible)
             summary = settings.budget_summary()
             self.assertEqual(summary["appearance"]["chrome_theme"], "noir")
 
@@ -142,7 +142,7 @@ class UiThemeTests(unittest.TestCase):
             self.assertEqual(settings.chrome_theme, "dark")
             self.assertEqual(settings.terminal_palette, "terminator")
             self.assertEqual(settings.ui_density, "comfortable")
-            self.assertFalse(settings.focus_mode)
+            self.assertFalse(settings.tabs_pane_visible)
 
     def test_normalisers(self):
         self.assertEqual(normalise_chrome_theme("NOIR"), "noir")
@@ -291,18 +291,18 @@ class UiSurfaceStaticTests(unittest.TestCase):
         self.assertIn("td-overlay-dialog", self.gtk)
         self.assertIn("td-category", self.gtk)
         self.assertIn("td-list-row", self.gtk)
-        self.assertIn("focus_mode", self.palette)
+        self.assertIn("toggle-tabs-pane", self.palette)
 
     def test_table_badge_and_density_hooks(self):
         self.assertIn("td-table-window", self.gtk)
         self.assertIn('set_property("family", "Monospace")', self.gtk)
         self.assertIn("td-density-", self.gtk)
 
-    def test_terminal_presets_and_focus_toast(self):
+    def test_terminal_presets_and_tabs_pane_toast(self):
         self.assertIn("apply_terminal_palette", self.gtk)
         self.assertIn("catppuccin", self.theme)
         self.assertIn("tokyo-night", self.theme)
-        self.assertIn("toggle_focus_mode", self.gtk)
+        self.assertIn("toggle_tabs_pane", self.gtk)
         self.assertIn("show_toast", self.gtk)
         self.assertIn("td-toast", self.gtk)
         self.assertIn("toast_message_for_action", self.gtk)

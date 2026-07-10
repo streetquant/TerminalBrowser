@@ -303,5 +303,4 @@ scrollbar slider:hover {{ background-color: alpha({tokens.accent}, 0.52); }}
 .td-density-compact * {{ font-size: {size["compact"]}; }}
 .td-density-compact .td-session-card {{ padding: 6px 8px; border-radius: 10px; }}
 .td-density-compact treeview {{ font-size: {size["compact"]}; }}
-.td-focus-mode .td-side-pane {{ opacity: 0.0; }}
 """

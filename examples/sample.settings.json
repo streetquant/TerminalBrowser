@@ -2,7 +2,7 @@
   "appearance": {
     "chrome_theme": "dark",
     "density": "comfortable",
-    "focus_mode": false,
+    "tabs_pane_visible": false,
     "ui_font": "Sans 11",
     "ui_font_scale": 1.0,
     "terminal_palette": "catppuccin",

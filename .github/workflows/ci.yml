@@ -74,6 +74,10 @@ jobs:
           python3 -m venv --system-site-packages .venv-ui
           .venv-ui/bin/python -m pip install --upgrade pip
           .venv-ui/bin/python -m pip install -e .
+      - name: Verify terminal-first Tabs pane lifecycle
+        run: >-
+          xvfb-run -a dbus-run-session --
+          .venv-ui/bin/python scripts/check_tabs_pane_smoke.py
       - name: Render desktop GTK layout
         run: .venv-ui/bin/python scripts/render_ui_smoke.py --output termdeck-ui-smoke-desktop.png
       - name: Render compact GTK layout
