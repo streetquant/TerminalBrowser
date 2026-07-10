@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.30
+
+- Added an isolated Xvfb visual-smoke harness that launches the real `termdeck gui` entry point, captures the mapped GTK window, and cleans up its temporary HOME, database, D-Bus session, X server, and tmux server.
+- Fixed a runtime Sessions-pane crash caused by unsupported PyGObject `set_data` / `get_data` calls; card references now use normal Python widget attributes.
+- Fixed `termdeck gui --db ... --workspace ...` by preventing argparse-consumed options from being passed to `Gtk.Application` a second time.
+- Added regression coverage for the GTK card-reference path and the CLI-to-GTK argument boundary.
+- Added a dedicated GitHub Actions `ui-smoke` job that installs GTK/VTE dependencies, renders the real application, and uploads the captured frame as a CI artifact.
+- Updated development documentation for the modern overflow header and repeatable real-window visual verification.
+
 ## 0.1.29
 
 - Rebuilt the GTK chrome around layered dark, noir, and system palettes with modern spacing, rounded geometry, elevation, and consistent interactive states.

@@ -48,6 +48,12 @@ class ModernUiSystemTests(unittest.TestCase):
         self.assertIn('"td-primary-action"', GTK_APP)
         self.assertIn('"td-danger-action"', GTK_APP)
 
+    def test_session_card_reference_uses_supported_python_attribute(self) -> None:
+        self.assertIn("check._termdeck_session_card = card", GTK_APP)
+        self.assertIn('getattr(button, "_termdeck_session_card", None)', GTK_APP)
+        self.assertNotIn('set_data("termdeck-session-card"', GTK_APP)
+        self.assertNotIn('get_data("termdeck-session-card"', GTK_APP)
+
 
 if __name__ == "__main__":
     unittest.main()

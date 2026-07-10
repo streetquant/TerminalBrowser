@@ -491,7 +491,7 @@ python3 -m termdeck shortcuts --profile emacs-safe
 python3 -m termdeck shortcuts --no-terminator
 ```
 
-The GUI also exposes this through the **Shortcuts** header button and the command palette action **Show keyboard shortcuts**. The JSON report flags duplicate accelerators, protected terminal-key conflicts, Terminator-imported bindings, and Terminator bindings ignored by the `emacs-safe` profile.
+The GUI also exposes this through **More ▾ → Keyboard shortcuts** and the command palette action **Show keyboard shortcuts**. The JSON report flags duplicate accelerators, protected terminal-key conflicts, Terminator-imported bindings, and Terminator bindings ignored by the `emacs-safe` profile.
 
 ## Terminator import
 
@@ -537,11 +537,19 @@ This is an MVP, not a finished replacement for mature terminals. The implementat
 
 ## Repository hygiene
 
-The repository includes a GitHub Actions workflow under `.github/workflows/ci.yml` that runs syntax checks, unit tests, and basic CLI smoke checks.
+The repository includes a GitHub Actions workflow under `.github/workflows/ci.yml` that runs syntax checks, unit tests, CLI smoke checks, and an isolated GTK visual-smoke job that uploads the rendered TermDeck frame.
 
 ## Development checks
 
 ```bash
-python3 -m compileall -q termdeck tests
-python3 -m unittest discover -s tests -v
+python3 -m compileall -q termdeck tests scripts
+python3 -m pytest tests -q
 ```
+
+Render the real GTK window in an isolated Xvfb, D-Bus, HOME, database, and tmux environment:
+
+```bash
+python3 scripts/render_ui_smoke.py --output /tmp/termdeck-ui-smoke.png
+```
+
+The visual smoke harness captures the actual `termdeck gui` entry point, reports the frame dimensions, and separates TermDeck application errors from expected headless desktop-portal warnings. It requires `Xvfb`, ImageMagick, `xwininfo`, `dbus-run-session`, and `tmux`.

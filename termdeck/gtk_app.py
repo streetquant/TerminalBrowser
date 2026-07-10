@@ -1745,7 +1745,7 @@ class SidePane(Gtk.Box):
             top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
             check = Gtk.CheckButton()
             check.set_active(record.id in self.selected_ids)
-            check.set_data("termdeck-session-card", card)
+            check._termdeck_session_card = card  # type: ignore[attr-defined]
             check.connect("toggled", self._on_toggle, record.id)
             check.connect("button-press-event", self._on_session_button_press, record, check)
             top.pack_start(check, False, False, 0)
@@ -1805,7 +1805,7 @@ class SidePane(Gtk.Box):
             self.selected_ids.add(session_id)
         else:
             self.selected_ids.discard(session_id)
-        card = button.get_data("termdeck-session-card")
+        card = getattr(button, "_termdeck_session_card", None)
         if card is not None:
             context = card.get_style_context()
             if active:
@@ -3700,4 +3700,7 @@ class TermDeckApplication(Gtk.Application):
 
 def run(db_path: str | Path | None = None, workspace_path: str | Path | None = None) -> int:
     app = TermDeckApplication(db_path=db_path, workspace_path=workspace_path)
-    return app.run(sys.argv)
+    # The argparse CLI has already consumed TermDeck-specific flags. Passing
+    # them to Gtk.Application a second time makes GTK reject options such as
+    # --db and --workspace, so expose only the executable name here.
+    return app.run([sys.argv[0]])

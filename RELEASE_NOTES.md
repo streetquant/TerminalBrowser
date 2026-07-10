@@ -1,5 +1,28 @@
 # Release notes
 
+## 0.1.30
+
+This build validates the modern UI through the real GTK runtime and fixes two defects that source-level tests did not expose.
+
+### Runtime fixes
+
+- Replaced unsupported PyGObject `set_data` / `get_data` calls in Sessions-card selection styling with normal Python widget attributes. The previous path crashed when active session cards were rendered.
+- Stopped forwarding argparse-consumed `--db` and `--workspace` options into `Gtk.Application`, which previously made the real `termdeck gui` entry point exit with `Unknown option --db`.
+
+### Visual verification
+
+- Added `scripts/render_ui_smoke.py`, which launches the public GUI command inside isolated Xvfb, D-Bus, HOME, SQLite, and tmux environments.
+- The harness captures the mapped TermDeck window, reports its dimensions and image size, separates application errors from expected headless portal warnings, and cleans up every temporary process.
+- Added a dedicated GitHub Actions `ui-smoke` job that provisions system GTK/VTE bindings, runs the harness, and uploads the PNG frame for review.
+- Verified a nonblank `1290x856` PNG frame from the real CLI path with zero TermDeck application error lines.
+
+### Verified
+
+- Full unit test suite: 318 passed, 11 subtests passed.
+- Python syntax compilation for `termdeck`, `tests`, and `scripts`.
+- Real-window visual smoke render through `termdeck gui --db ... --workspace ...`.
+- GitHub repository visibility: private.
+
 ## 0.1.29
 
 This release gives TermDeck a cohesive modern visual system while preserving its existing terminal, session, and safety behaviour.

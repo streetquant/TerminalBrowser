@@ -26,3 +26,37 @@ jobs:
           python -m termdeck workspace-plan /tmp/termdeck.workspace.json
           python -m termdeck palette master --db :memory:
           python -m termdeck sessions --db :memory:
+
+  ui-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK and visual-smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            dbus-x11 \
+            gir1.2-gtk-3.0 \
+            gir1.2-vte-2.91 \
+            imagemagick \
+            python3-gi \
+            python3-pip \
+            python3-venv \
+            tmux \
+            x11-utils \
+            xvfb
+      - name: Install TermDeck with system GTK bindings
+        run: |
+          python3 -m venv --system-site-packages .venv-ui
+          .venv-ui/bin/python -m pip install --upgrade pip
+          .venv-ui/bin/python -m pip install -e .
+      - name: Render the real GTK application
+        run: .venv-ui/bin/python scripts/render_ui_smoke.py --output termdeck-ui-smoke.png
+      - name: Upload rendered UI frame
+        uses: actions/upload-artifact@v4
+        with:
+          name: termdeck-ui-smoke
+          path: termdeck-ui-smoke.png
+          if-no-files-found: error
+          retention-days: 7
