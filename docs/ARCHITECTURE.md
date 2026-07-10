@@ -18,6 +18,7 @@ A window is the user-defined group. A tab is rooted in one directory and default
 - `tmux_discovery.py`: migration support for already-running tmux sessions.
 - `resources.py`: Linux `/proc` resource sampling for process trees.
 - `command_palette.py`: window actions and remembered-tab discovery; it does not contain launch templates.
+- `session_search.py`: conservative typo-tolerant matching across tab metadata and optional redacted recent output, using bounded edit distance without an external search dependency.
 - `shortcuts.py`: shortcut profiles, generated tab focus/pause helpers, Terminator imports, duplicate detection, and shell-key conflict reporting.
 - `quickstart.py`: first-run dependency, directory-tab, Terminator appearance, and desktop-launcher report.
 - `workspace_recipe.py`: compatibility and automation format for serialising named windows and tabs. Recipes are not a separate GUI object.

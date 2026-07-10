@@ -86,6 +86,10 @@ jobs:
         run: >-
           xvfb-run -a dbus-run-session --
           .venv-ui/bin/python scripts/check_tab_strip_smoke.py
+      - name: Verify typo-tolerant Search Tabs
+        run: >-
+          xvfb-run -a dbus-run-session --
+          .venv-ui/bin/python scripts/check_fuzzy_search_smoke.py
       - name: Render desktop GTK layout
         run: .venv-ui/bin/python scripts/render_ui_smoke.py --output termdeck-ui-smoke-desktop.png
       - name: Render compact GTK layout

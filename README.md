@@ -34,7 +34,7 @@ See `RELEASE_NOTES.md` for the current verified build notes.
 - Window overview with aggregate tab and resource information.
 - Browser-style tab rename, pin/unpin, hide, reopen, hide-other, hide-right, and drag reorder.
 - Safe bulk-control plans for destructive or multi-tab operations.
-- Search across remembered tabs and optional redacted captured output.
+- Typo-tolerant search across remembered tabs and optional redacted recent output.
 - Explicit pause/resume/kill; TermDeck never auto-freezes work in the background.
 - Terminator appearance and shortcut import.
 - Select-to-copy, terminal right-click copy/paste, and configurable cursor/font/scrollback options.
@@ -138,10 +138,11 @@ Open **Tab manager** with `Shift+Esc` or `Ctrl+Shift+M`. It provides process and
 
 ## Search, activity, and browser recovery
 
-TermDeck exposes browser-like discovery in both the GUI and CLI. Open **Search** from the header, or search for `search tabs` in the command palette, to find remembered tabs by ID, name, window, status, command, directory, and optional redacted captured output. Headlessly, `search` provides the same remembered-tab lookup, while `search-output` is for direct cross-session output search with safe snippets by default.
+TermDeck exposes typo-tolerant discovery in both the GUI and CLI. Open **More → Search tabs**, or search for `search tabs` in the command palette, to find remembered tabs by ID, name, window, status, command, directory, and optional redacted recent output. Terms of four or more characters tolerate one edit, or two edits for long words; shorter terms stay literal to avoid noisy matches. Literal matches rank above fuzzy matches. With **Include recent output** enabled, Search Tabs applies the same matching to the latest 120 captured terminal lines. Headlessly, `search` provides the same remembered-tab lookup, while `search-output` remains the direct cross-session output-search command.
 
 ```bash
 python3 -m termdeck search codex
+python3 -m termdeck search pyetst
 python3 -m termdeck search "bugbounty error" --include-output --json
 python3 -m termdeck search-output "needs approval" --tag ai --lines 300 --json --allow-empty
 python3 -m termdeck activity --tag ai --json

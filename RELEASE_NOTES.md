@@ -1,5 +1,34 @@
 # Release notes
 
+## 0.2.5
+
+Search Tabs now tolerates ordinary typing mistakes while remaining predictable and local.
+
+### Typo-tolerant matching
+
+- `pytes` finds `pytest`.
+- Adjacent transpositions such as `pyetst` also find `pytest`.
+- Insertions, deletions, substitutions, and adjacent transpositions are supported through bounded Damerau-Levenshtein distance.
+- Query terms shorter than four characters remain literal, so searches such as `api` do not fuzzily match unrelated `app` tabs.
+- One edit is allowed for ordinary words; long terms may use two edits.
+- Every query term must still match, preserving the existing multi-word AND behavior.
+- Literal matches rank ahead of fuzzy alternatives.
+
+### Recent terminal output
+
+- **Include recent output** applies the same typo tolerance to the latest 120 captured terminal lines.
+- Output is redacted before matching and before snippets are displayed.
+- For example, `compilaton` can find a recent line containing `compilation failed`.
+
+### Verified
+
+- Unit coverage includes metadata typos, transposition, multi-term matching, literal-result priority, short-query noise suppression, and fuzzy recent-output snippets.
+- A real GTK Search Tabs smoke verifies `pytes`, `pyetst`, `api`, and `compilaton` through the actual window model.
+- The fuzzy-search smoke runs in GitHub Actions before desktop and compact rendering.
+- Full test suite: 336 passed, 15 subtests passed.
+- Desktop GTK render: `1290x856`, zero application or layout errors.
+- Compact GTK render: requested and captured `640x520`, zero application or layout errors.
+
 ## 0.2.4
 
 TermDeck's main tab strip now follows the same reduction as its header: **tab name, close control, nothing else**.

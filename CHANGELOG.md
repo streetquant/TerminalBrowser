@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.5
+
+- Added conservative typo-tolerant matching to Search Tabs and the `termdeck search` CLI.
+- Terms of four or more characters now support bounded Damerau-Levenshtein matching for insertion, deletion, substitution, and adjacent transposition; short terms remain literal to suppress noisy results.
+- Applied the same fuzzy matching to opt-in recent terminal-output search after redaction.
+- Kept exact/literal metadata matches ranked above fuzzy alternatives and preserved the all-query-terms-required rule.
+- Updated Search Tabs labels, placeholder, preview guidance, and CLI help to describe typo tolerance and the latest-120-lines output boundary.
+- Added unit and real-GTK coverage for `pytes`, `pyetst`, literal-over-fuzzy ranking, short-query suppression, and `compilaton` matching captured `compilation` output.
+- Verified 336 tests and 15 subtests, all four GTK lifecycle smokes, and desktop/compact renders with zero application or layout errors.
+
 ## 0.2.4
 
 - Simplified the visible notebook tab to exactly the user-defined tab name and one close control.

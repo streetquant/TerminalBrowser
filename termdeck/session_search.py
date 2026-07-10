@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
@@ -98,9 +99,76 @@ def _record_fields(record: SessionRecord) -> dict[str, str]:
     }
 
 
-def _contains_all_terms(text: str, terms: Sequence[str]) -> bool:
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _tokens(text: str) -> tuple[str, ...]:
+    return tuple(_TOKEN_RE.findall(str(text or "").casefold()))
+
+
+def _max_typo_distance(term: str) -> int:
+    """Return a conservative edit-distance allowance for one query term."""
+
+    length = len(term)
+    if length < 4:
+        return 0
+    if length < 9:
+        return 1
+    return 2
+
+
+def _bounded_damerau_levenshtein(left: str, right: str, limit: int) -> int:
+    """Optimal-string-alignment distance, bounded for predictable search cost."""
+
+    if left == right:
+        return 0
+    if limit <= 0 or abs(len(left) - len(right)) > limit:
+        return limit + 1
+
+    previous_previous: list[int] | None = None
+    previous = list(range(len(right) + 1))
+    for left_index, left_char in enumerate(left, start=1):
+        current = [left_index]
+        for right_index, right_char in enumerate(right, start=1):
+            substitution_cost = 0 if left_char == right_char else 1
+            value = min(
+                previous[right_index] + 1,
+                current[right_index - 1] + 1,
+                previous[right_index - 1] + substitution_cost,
+            )
+            if (
+                previous_previous is not None
+                and left_index > 1
+                and right_index > 1
+                and left_char == right[right_index - 2]
+                and left[left_index - 2] == right_char
+            ):
+                value = min(value, previous_previous[right_index - 2] + 1)
+            current.append(value)
+        previous_previous, previous = previous, current
+    return previous[-1]
+
+
+def _term_match_quality(term: str, text: str) -> int:
+    """Return 2 for literal substring, 1 for conservative typo match, else 0."""
+
     haystack = str(text or "").casefold()
-    return all(term in haystack for term in terms)
+    if term in haystack:
+        return 2
+
+    limit = _max_typo_distance(term)
+    if limit <= 0:
+        return 0
+    for token in _tokens(haystack):
+        if abs(len(term) - len(token)) > limit:
+            continue
+        if _bounded_damerau_levenshtein(term, token, limit) <= limit:
+            return 1
+    return 0
+
+
+def _contains_all_terms(text: str, terms: Sequence[str]) -> bool:
+    return all(_term_match_quality(term, text) > 0 for term in terms)
 
 
 def _matched_metadata_fields(record: SessionRecord, terms: Sequence[str]) -> tuple[str, ...]:
@@ -110,8 +178,7 @@ def _matched_metadata_fields(record: SessionRecord, terms: Sequence[str]) -> tup
         return ()
     matched = []
     for name in _FIELD_ORDER:
-        value = fields[name].casefold()
-        if any(term in value for term in terms):
+        if any(_term_match_quality(term, fields[name]) > 0 for term in terms):
             matched.append(name)
     return tuple(matched)
 
@@ -121,6 +188,10 @@ def _metadata_score(record: SessionRecord, query: str, matched_fields: Sequence[
         return 0
     query_cf = query.casefold().strip()
     score = 20 + len(matched_fields) * 3
+    fields = _record_fields(record)
+    for term in _terms(query):
+        quality = max(_term_match_quality(term, value) for value in fields.values())
+        score += 40 if quality == 2 else 5
     if record.name.casefold().startswith(query_cf):
         score += 40
     if record.tag.casefold().startswith(query_cf):
@@ -137,8 +208,7 @@ def _metadata_score(record: SessionRecord, query: str, matched_fields: Sequence[
 def _capture_snippets(capture: str, terms: Sequence[str], *, max_snippets: int) -> tuple[OutputSnippet, ...]:
     snippets: list[OutputSnippet] = []
     for line_number, line in enumerate(str(capture or "").splitlines(), start=1):
-        folded = line.casefold()
-        if any(term in folded for term in terms):
+        if any(_term_match_quality(term, line) > 0 for term in terms):
             bounded = line if len(line) <= 240 else line[:237] + "..."
             snippets.append(OutputSnippet(line_number=line_number, text=bounded))
             if len(snippets) >= max(1, int(max_snippets)):
@@ -157,11 +227,12 @@ def search_sessions(
     max_results: int = 100,
     max_snippets: int = 3,
 ) -> SessionSearchResult:
-    """Search remembered browser tabs by metadata and optional terminal output.
+    """Typo-tolerant search across tab metadata and optional terminal output.
 
-    Output search is opt-in because it may call tmux capture for many sessions.
-    Captures are redacted before matching and serialisation unless ``redact`` is
-    false. This keeps the default behaviour safe for support bundles and demos.
+    Terms of four or more characters use bounded Damerau-Levenshtein matching;
+    shorter terms remain literal to avoid noisy results. Output search is opt-in
+    because it may call tmux capture for many sessions. Captures are redacted
+    before matching and serialisation unless ``redact`` is false.
     """
 
     clean_query = str(query or "").strip()
@@ -186,9 +257,11 @@ def search_sessions(
                 redaction_labels = tuple(redacted_capture.labels)
             else:
                 capture_text = raw_capture
-            if _contains_all_terms(capture_text, terms):
+            output_qualities = tuple(_term_match_quality(term, capture_text) for term in terms)
+            if all(quality > 0 for quality in output_qualities):
                 snippets = _capture_snippets(capture_text, terms, max_snippets=max_snippets)
-                output_score = 12 + len(snippets) * 8
+                quality_bonus = sum(24 if quality == 2 else 3 for quality in output_qualities)
+                output_score = 12 + len(snippets) * 8 + quality_bonus
 
         if not matched_fields and not snippets:
             continue

@@ -921,18 +921,18 @@ class SessionSearchWindow(Gtk.Window):
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
         label = Gtk.Label(
-            label="Search remembered terminal tabs by name, command, directory, window, status, and optional recent output.",
+            label="Typo-tolerant search across tab names, commands, directories, windows, status, and optional recent output.",
             xalign=0,
         )
         label.set_line_wrap(True)
         outer.pack_start(label, False, False, 0)
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.query = Gtk.SearchEntry(placeholder_text="search tabs: codex, bugbounty error, api server, pytest")
+        self.query = Gtk.SearchEntry(placeholder_text="search tabs, including small typos: pyetst, api server, build error")
         _connect_debounced_refresh(self.query, self.refresh)
         self.query.connect("activate", lambda *_: self.open_selected())
         top.pack_start(self.query, True, True, 0)
-        self.include_output = Gtk.CheckButton(label="include captured output")
+        self.include_output = Gtk.CheckButton(label="include recent output")
         self.include_output.connect("toggled", lambda *_: self.refresh())
         top.pack_start(self.include_output, False, False, 0)
         refresh = Gtk.Button(label="Refresh")
@@ -962,7 +962,7 @@ class SessionSearchWindow(Gtk.Window):
         preview_scroller.add(self.preview)
         outer.pack_start(preview_scroller, False, True, 0)
         self.add(outer)
-        self.set_preview_text("Type to search remembered tabs. Enable captured output only when you need recent terminal text.")
+        self.set_preview_text("Type to search tabs. Small typos are tolerated. Enable recent output to search the latest 120 terminal lines.")
         self.query.grab_focus()
         self.show_all()
 
@@ -1008,7 +1008,7 @@ class SessionSearchWindow(Gtk.Window):
                 match.command,
             ])
         if not query:
-            self.set_preview_text("Type to search remembered tabs. Enable captured output only when you need recent terminal text.")
+            self.set_preview_text("Type to search tabs. Small typos are tolerated. Enable recent output to search the latest 120 terminal lines.")
         elif not result.matches:
             self.set_preview_text(f"No remembered terminal tabs matched: {query!r}")
         else:
