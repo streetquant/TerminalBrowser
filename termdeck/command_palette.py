@@ -45,11 +45,11 @@ def builtin_palette_items() -> tuple[PaletteItem, ...]:
     return (
         PaletteItem(
             id="builtin:new-tab",
-            label="New directory tab",
+            label="New shell tab",
             kind="builtin",
-            description="Choose a directory and open the default shell in a new tab named after that directory.",
+            description="Open the default shell immediately in the active terminal directory; use cd to move elsewhere.",
             payload="new_tab",
-            keywords=("ctrl+t", "terminal", "folder", "directory", "shell"),
+            keywords=("ctrl+t", "terminal", "current directory", "cwd", "shell", "cd"),
             badge="action",
         ),
         PaletteItem(
@@ -65,7 +65,7 @@ def builtin_palette_items() -> tuple[PaletteItem, ...]:
             id="builtin:new-window",
             label="New named window",
             kind="builtin",
-            description="Create another named TermDeck window, then choose its first tab directory.",
+            description="Create another named TermDeck window and open its first shell immediately.",
             payload="new_window",
             keywords=("window", "group", "new"),
             badge="window",

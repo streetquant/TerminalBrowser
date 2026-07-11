@@ -1,5 +1,40 @@
 # Release notes
 
+## 0.2.9
+
+New tabs now open immediately. TermDeck no longer asks you to select a directory before creating a shell.
+
+### Immediate New tab
+
+- `Ctrl+T` opens a shell without displaying any dialog.
+- The header New tab button, command palette, Tabs pane empty state and secondary New tab actions use the same direct path.
+- Ctrl+T is handled before VTE, preventing the terminal from consuming the browser-style shortcut.
+- The compatibility method `new_directory_tab()` remains internally available but now delegates to the non-modal New tab action.
+
+### Starting directory
+
+TermDeck chooses the initial directory in this order:
+
+1. The active tmux pane's live `#{pane_current_path}`, including a path reached by typing `cd` in the shell.
+2. The active tab's stored starting directory if tmux cannot report a live path.
+3. The user's home directory when no tab is active.
+
+The tab's initial name remains the basename of that starting directory. You can then use `cd` manually inside the terminal, as in any ordinary shell.
+
+### Window creation
+
+- First launch asks only for the TermDeck window name, then opens the first shell in the user's home directory.
+- **New TermDeck window** asks only for the new window name, then opens its first shell in the current window's active live directory; home is the fallback.
+- There is no folder-selection popup in either flow.
+
+### Verification
+
+- Full test suite: 347 passed, 15 subtests passed.
+- A real GTK/tmux smoke changed the active shell from `starting` to `live-work` with `cd`, pressed Ctrl+T, and verified the new tab directory and name were both `live-work`.
+- The same smoke confirmed zero chooser windows and a running tmux session for the new tab.
+- Desktop render: `1290x858`, zero application or layout errors.
+- Compact render: requested and captured `640x520`, zero application or layout errors.
+
 ## 0.2.8
 
 `Ctrl+Shift+V` now always pastes the system clipboard into the active terminal.

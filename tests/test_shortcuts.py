@@ -43,7 +43,7 @@ class ShortcutManifestTests(unittest.TestCase):
     def test_render_shortcut_table_is_plain_text(self):
         table = render_shortcut_table(build_shortcut_report())
         self.assertIn("Action", table)
-        self.assertIn("New directory tab", table)
+        self.assertIn("New shell tab", table)
 
 
 if __name__ == "__main__":

@@ -100,7 +100,7 @@ def main() -> int:
                 raise AssertionError(
                     f"HeaderBar exposed unexpected actions: {sorted(actions)}"
                 )
-            if actions["New tab"].get_tooltip_text() != "Choose a directory and open a new shell tab":
+            if actions["New tab"].get_tooltip_text() != "Open a shell immediately in the active terminal directory":
                 raise AssertionError("New tab lost its directory-based tooltip")
 
             more = actions["More actions"]

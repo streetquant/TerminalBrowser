@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import Mock, patch
@@ -22,8 +23,8 @@ class FakeWindow:
     def present(self) -> None:
         self.calls.append("present")
 
-    def new_directory_tab(self) -> None:
-        self.calls.append("choose-directory")
+    def new_shell_tab(self, cwd) -> None:
+        self.calls.append(f"shell:{Path(cwd)}")
 
 
 class FakeNameDialog:
@@ -58,36 +59,44 @@ class FirstRunWindowFlowTests(TestCase):
         FakeNameDialog.response = Gtk.ResponseType.OK
         FakeNameDialog.supplied_value = "Backend"
 
-    def test_create_named_window_presents_then_chooses_first_directory(self) -> None:
+    def test_create_named_window_presents_then_opens_initial_shell(self) -> None:
         app = SimpleNamespace(windows=[])
+        initial = Path("/tmp/client-work")
 
         with patch("termdeck.gtk_app.TermDeckWindow", FakeWindow):
-            created = TermDeckApplication.create_named_window(app, "  Client work  ")
+            created = TermDeckApplication.create_named_window(
+                app,
+                "  Client work  ",
+                initial_directory=initial,
+            )
 
         self.assertIs(created, FakeWindow.created[0])
         self.assertEqual(created.kwargs["window_title"], "Client work")
         self.assertEqual(created.kwargs["restore_records"], [])
-        self.assertEqual(created.calls, ["present", "choose-directory"])
+        self.assertEqual(created.calls, ["present", f"shell:{initial}"])
         self.assertEqual(app.windows, [created])
 
-    def test_create_named_window_can_skip_directory_prompt_for_noninteractive_restore(self) -> None:
+    def test_create_named_window_can_skip_initial_shell_for_noninteractive_restore(self) -> None:
         app = SimpleNamespace(windows=[])
 
         with patch("termdeck.gtk_app.TermDeckWindow", FakeWindow):
             created = TermDeckApplication.create_named_window(
                 app,
                 "Restored",
-                choose_first_directory=False,
+                open_initial_tab=False,
             )
 
         self.assertEqual(created.calls, ["present"])
 
-    def test_first_run_prompt_names_window_and_requests_first_directory(self) -> None:
+    def test_first_run_prompt_names_window_and_opens_home_shell(self) -> None:
         created_window = object()
         create_named_window = Mock(return_value=created_window)
         app = SimpleNamespace(windows=[], create_named_window=create_named_window)
 
-        with patch("termdeck.gtk_app.WindowNameDialog", FakeNameDialog):
+        home = Path("/tmp/test-home")
+        with patch("termdeck.gtk_app.WindowNameDialog", FakeNameDialog), patch(
+            "termdeck.gtk_app.Path.home", return_value=home
+        ):
             result = TermDeckApplication.prompt_for_new_window(app, first_run=True)
 
         dialog = FakeNameDialog.created[0]
@@ -95,10 +104,31 @@ class FirstRunWindowFlowTests(TestCase):
         self.assertEqual(dialog.kwargs["title"], "Create your first TermDeck window")
         self.assertEqual(dialog.kwargs["initial"], "Window 1")
         self.assertEqual(dialog.kwargs["confirm_label"], "Create window")
-        self.assertIn("directory tabs", dialog.kwargs["description"])
+        self.assertIn("opens immediately", dialog.kwargs["description"])
+        self.assertIn("use cd", dialog.kwargs["description"])
         self.assertIs(dialog.application, app)
         self.assertTrue(dialog.destroyed)
-        create_named_window.assert_called_once_with("Backend", choose_first_directory=True)
+        create_named_window.assert_called_once_with(
+            "Backend",
+            initial_directory=home,
+            open_initial_tab=True,
+        )
+
+    def test_additional_window_inherits_parent_live_directory(self) -> None:
+        created_window = object()
+        create_named_window = Mock(return_value=created_window)
+        parent = SimpleNamespace(_active_directory=lambda: "/work/live")
+        app = SimpleNamespace(windows=[parent], create_named_window=create_named_window)
+
+        with patch("termdeck.gtk_app.WindowNameDialog", FakeNameDialog):
+            result = TermDeckApplication.prompt_for_new_window(app, parent=parent)
+
+        self.assertIs(result, created_window)
+        create_named_window.assert_called_once_with(
+            "Backend",
+            initial_directory="/work/live",
+            open_initial_tab=True,
+        )
 
     def test_cancelled_first_run_prompt_creates_nothing(self) -> None:
         FakeNameDialog.response = Gtk.ResponseType.CANCEL

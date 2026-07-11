@@ -1509,7 +1509,7 @@ class SidePane(Gtk.Box):
         _style(more, "td-more-actions")
         menu = Gtk.Menu()
         secondary = [
-            ("New tab", self.window.new_directory_tab),
+            ("New tab", self.window.new_tab),
             ("Rename window", self.window.rename_window),
             ("Palette", self.window.open_command_palette),
             ("Rename", self.rename_selected),
@@ -1687,7 +1687,7 @@ class SidePane(Gtk.Box):
             empty_title = Gtk.Label(label="No tabs in this window", xalign=0.5)
             _style(empty_title, "td-title")
             empty_card.pack_start(empty_title, False, False, 0)
-            empty_detail = Gtk.Label(label="Choose a directory to open its shell as a tab.", xalign=0.5)
+            empty_detail = Gtk.Label(label="Open a shell immediately, then use cd to move wherever you need.", xalign=0.5)
             empty_detail.set_line_wrap(True)
             empty_detail.set_justify(Gtk.Justification.CENTER)
             _style(empty_detail, "td-muted")
@@ -1695,7 +1695,7 @@ class SidePane(Gtk.Box):
             empty_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             shell_button = Gtk.Button(label="New tab")
             _style(shell_button, "td-primary-action")
-            shell_button.connect("clicked", lambda *_: self.window.new_directory_tab())
+            shell_button.connect("clicked", lambda *_: self.window.new_tab())
             empty_actions.pack_start(shell_button, True, True, 0)
             rename_button = Gtk.Button(label="Name window")
             _style(rename_button, "td-ghost-action")
@@ -2370,8 +2370,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         new_tab = _icon_button(
             "New tab",
             "list-add-symbolic",
-            "Choose a directory and open a new shell tab",
-            self.new_directory_tab,
+            "Open a shell immediately in the active terminal directory",
+            self.new_tab,
             suggested=True,
             show_label=False,
         )
@@ -2719,40 +2719,29 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.app_context.prompt_for_new_window(parent=self)
 
     def _active_directory(self) -> str:
-        page = self.notebook.get_current_page()
-        if page >= 0:
-            widget = self.notebook.get_nth_page(page)
-            for tab in self.tabs.values():
-                if tab.widget is widget:
-                    return tab.record.cwd
-        return os.getcwd()
+        """Return the active pane's live cwd, then stored cwd, then user home."""
 
-    def choose_tab_directory(self) -> str | None:
-        dialog = Gtk.FileChooserDialog(
-            title="Choose directory for new tab",
-            transient_for=self,
-            action=Gtk.FileChooserAction.SELECT_FOLDER,
-        )
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, "Open tab", Gtk.ResponseType.OK)
-        dialog.set_modal(True)
-        try:
-            dialog.set_current_folder(self._active_directory())
-        except Exception:
-            pass
-        response = dialog.run()
-        selected = dialog.get_filename()
-        dialog.destroy()
-        if response != Gtk.ResponseType.OK or not selected:
-            return None
-        return normalise_directory(selected)
+        record = self.current_record()
+        if record is not None:
+            live_directory = self.app_context.backend.current_directory(record)
+            if live_directory:
+                return normalise_directory(live_directory)
+            if record.cwd:
+                return normalise_directory(record.cwd)
+        return normalise_directory(Path.home())
+
+    def new_tab(self) -> None:
+        """Open a shell immediately; users can change directory inside it."""
+
+        self.new_shell_tab(self._active_directory())
 
     def new_directory_tab(self) -> None:
-        directory = self.choose_tab_directory()
-        if directory is not None:
-            self.new_shell_tab(directory)
+        """Backward-compatible alias for the direct, non-modal New tab action."""
+
+        self.new_tab()
 
     def new_shell_tab(self, cwd: str | Path | None = None) -> None:
-        directory = normalise_directory(cwd)
+        directory = normalise_directory(cwd or Path.home())
         self.create_session(directory_tab_name(directory), "terminal", default_shell(), directory)
 
     def open_command_palette(self) -> None:
@@ -2767,7 +2756,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     def execute_palette_item(self, item: PaletteItem) -> None:
         if item.kind == "builtin":
             actions = {
-                "new_tab": self.new_directory_tab,
+                "new_tab": self.new_tab,
                 "rename_window": self.rename_window,
                 "new_window": self.new_window,
                 "master": self.open_master_window,
@@ -3343,7 +3332,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             return False
 
     def on_terminal_key_press(self, _terminal, event: Gdk.EventKey) -> bool:
-        # App-level close/quit must be handled before VTE consumes Ctrl+W/Q.
+        # Browser-style app actions must be handled before VTE consumes them.
+        if self.keymap.matches(event, "new_tab"):
+            self.new_tab()
+            return True
         if self.keymap.matches(event, "quit_app"):
             self.quit_termdeck()
             return True
@@ -3375,7 +3367,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             self.quit_termdeck()
             return True
         if self.keymap.matches(event, "new_tab"):
-            self.new_directory_tab()
+            self.new_tab()
             return True
         if self.keymap.matches(event, "close_term"):
             self.close_current_tab()
@@ -3567,8 +3559,14 @@ class TermDeckApplication(Gtk.Application):
         dialog.run()
         dialog.destroy()
 
-    def create_named_window(self, title: str, *, choose_first_directory: bool = True) -> TermDeckWindow:
-        """Create one named window and optionally ask for its first tab directory."""
+    def create_named_window(
+        self,
+        title: str,
+        *,
+        initial_directory: str | Path | None = None,
+        open_initial_tab: bool = True,
+    ) -> TermDeckWindow:
+        """Create one named window and optionally open its first shell immediately."""
 
         clean_title = title.strip() or f"Window {len(self.windows) + 1}"
         win = TermDeckWindow(
@@ -3578,8 +3576,8 @@ class TermDeckApplication(Gtk.Application):
         )
         self.windows.append(win)
         win.present()
-        if choose_first_directory:
-            win.new_directory_tab()
+        if open_initial_tab:
+            win.new_shell_tab(initial_directory or Path.home())
         return win
 
     def prompt_for_new_window(
@@ -3588,7 +3586,7 @@ class TermDeckApplication(Gtk.Application):
         parent: Gtk.Window | None = None,
         first_run: bool = False,
     ) -> TermDeckWindow | None:
-        """Prompt for a window name, then create its first directory-backed tab."""
+        """Prompt only for a window name, then open its first shell immediately."""
 
         default_title = f"Window {len(self.windows) + 1}"
         dialog = WindowNameDialog(
@@ -3596,7 +3594,7 @@ class TermDeckApplication(Gtk.Application):
             title="Create your first TermDeck window" if first_run else "New TermDeck window",
             initial=default_title,
             confirm_label="Create window",
-            description="A window groups related directory tabs. Choose its first directory next.",
+            description="A window groups related terminal tabs. Its first shell opens immediately; use cd inside the terminal.",
         )
         if parent is None:
             dialog.set_application(self)
@@ -3605,7 +3603,15 @@ class TermDeckApplication(Gtk.Application):
         dialog.destroy()
         if response != Gtk.ResponseType.OK or not title:
             return None
-        return self.create_named_window(title, choose_first_directory=True)
+        active_directory = None
+        directory_resolver = getattr(parent, "_active_directory", None)
+        if callable(directory_resolver):
+            active_directory = directory_resolver()
+        return self.create_named_window(
+            title,
+            initial_directory=active_directory or Path.home(),
+            open_initial_tab=True,
+        )
 
     def build_control_plan_for_gui(
         self,

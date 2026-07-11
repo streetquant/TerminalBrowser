@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 import unittest
 from unittest import mock
 
@@ -39,6 +40,49 @@ class TmuxBackendTests(unittest.TestCase):
         )
         backend = TmuxBackend(executable="tmux")
         self.assertEqual(backend.pane_target(record), "%7")
+
+    def test_current_directory_reads_live_pane_path(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            record = _record()
+            backend = TmuxBackend(executable="tmux")
+            completed = subprocess.CompletedProcess(
+                args=["tmux"],
+                returncode=0,
+                stdout=f"{tmp}\n",
+                stderr="",
+            )
+            with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+                backend, "_run", return_value=completed
+            ) as run:
+                result = backend.current_directory(record)
+
+            self.assertEqual(result, str(Path(tmp).resolve()))
+            run.assert_called_once_with(
+                [
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "termdeck_dev_test:0.0",
+                    "#{pane_current_path}",
+                ],
+                check=False,
+            )
+
+    def test_current_directory_returns_none_when_tmux_path_is_unavailable(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        failed = subprocess.CompletedProcess(
+            args=["tmux"],
+            returncode=1,
+            stdout="",
+            stderr="missing pane",
+        )
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", return_value=failed
+        ):
+            self.assertIsNone(backend.current_directory(record))
 
     def test_pane_pid_uses_single_list_panes_call(self):
         record = _record()

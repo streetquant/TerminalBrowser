@@ -59,7 +59,7 @@ class ShortcutEntry:
 
 
 ACTION_LABELS: Mapping[str, str] = {
-    "new_tab": "New directory tab",
+    "new_tab": "New shell tab",
     "close_term": "Close current tab, keep process alive",
     "quit_app": "Quit TermDeck, keep all processes alive",
     "reopen_closed": "Reopen last closed tab",

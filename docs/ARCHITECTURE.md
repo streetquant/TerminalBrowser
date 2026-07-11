@@ -14,7 +14,7 @@ A window is the user-defined group. A tab is rooted in one directory and default
 
 ## Main modules
 
-- `gtk_app.py`: GTK/VTE named-window UI, directory chooser, tab pane, tab manager, window overview, search, and terminal controls.
+- `gtk_app.py`: GTK/VTE named-window UI, immediate shell-tab creation, tab pane, tab manager, window overview, search, and terminal controls.
 - `command_render.py`: default shell resolution, portable saved-command placeholders, directory normalisation, and directory-derived tab names.
 - `session_launcher.py`: dependency-free creation of one directory-backed tab.
 - `session_store.py`: SQLite registry for tabs, named-window metadata, lifecycle state, schema migration, and restore candidates.
@@ -29,7 +29,7 @@ A window is the user-defined group. A tab is rooted in one directory and default
 
 ## Creation model
 
-The normal creation flow has one decision: choose a directory. TermDeck opens the user's default shell in that directory and derives the initial tab title from its final path component. A separate window-name dialog changes the logical group name and persists that title across every tab in the window.
+The normal tab-creation flow has no modal decision. TermDeck opens the user's default shell immediately, preferring the active tmux pane's live working directory, then the stored tab directory, then the user's home directory. The initial title comes from that starting directory's final path component; users change location with `cd` inside the terminal. A separate window-name dialog changes the logical group name and persists that title across every tab in the window.
 
 ## Terminal attachment and first-frame geometry
 

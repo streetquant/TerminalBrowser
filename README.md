@@ -12,7 +12,7 @@ See `RELEASE_NOTES.md` for the current verified build notes.
 ## Core workflow
 
 - On a fresh launch, TermDeck asks for the window name first, such as **Client work**, **Backend**, or **Research**.
-- After naming the window, choose the directory for its first tab.
+- After naming the window, its first shell opens immediately in your home directory; use `cd` inside the terminal.
 - TermDeck never silently creates a generic Main window or opens the process working directory.
 - Press **New tab** or `Ctrl+T` to add another directory.
 - TermDeck opens the user's default shell in that directory.
@@ -85,7 +85,7 @@ TermDeck uses a terminal-first, layered dark interface. The terminal and tab str
 
 ### Create a tab
 
-Press **New tab** or `Ctrl+T`, choose a directory, and TermDeck opens the default shell there. The directory basename becomes the initial tab title. Double-click the tab title or use its right-click menu to rename it.
+Press **New tab** or `Ctrl+T` and TermDeck opens the default shell immediately. When a tab is active, the new shell inherits that tmux pane’s live working directory, including a directory reached with `cd`; otherwise it falls back to the stored tab directory or the user’s home directory. The starting directory basename becomes the initial tab title. Use `cd` inside the terminal to move elsewhere, and double-click the tab title or use its right-click menu to rename it.
 
 ### Tab strip
 
@@ -97,7 +97,7 @@ Use **More → Rename window**. The name is saved across every tab belonging to 
 
 ### Create another window
 
-Use **More → New TermDeck window**. Enter the group name, then choose the first tab's directory.
+Use **More → New TermDeck window**. Enter the group name and TermDeck opens its first shell immediately in the active terminal's live directory, falling back to your home directory.
 
 ### Tabs pane
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.9
+
+- Removed the GTK directory chooser from New tab, first-run window creation, and New TermDeck window flows.
+- `Ctrl+T`, the header New tab button, the command palette, the Tabs pane empty state, and secondary New tab actions now open a shell immediately.
+- Added live working-directory inheritance through tmux `#{pane_current_path}` so a new tab follows a `cd` performed inside the active shell rather than relying only on the directory stored at tab creation.
+- Added deterministic fallbacks from live pane cwd to the stored tab directory and then the user's home directory when no tab is active.
+- Made Ctrl+T an explicit terminal-level shortcut so VTE cannot consume it before TermDeck creates the tab.
+- Updated first-run and additional-window creation to ask only for the window name; the first shell opens immediately in home or the parent window's active directory.
+- Added unit and real GTK/tmux coverage for live-cwd lookup, home fallback, immediate tab creation, absence of chooser windows, basename naming, and running-session creation.
+- Verified 347 tests and 15 subtests; real Ctrl+T created a `live-work` tab in the shell's live directory with zero chooser windows, and desktop/compact renders completed with zero application or layout errors.
+
 ## 0.2.8
 
 - Made `Ctrl+Shift+V` an unconditional system-clipboard paste shortcut in the active terminal.

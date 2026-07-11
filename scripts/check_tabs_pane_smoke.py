@@ -84,7 +84,7 @@ def main() -> int:
             if payload.get("appearance", {}).get("tabs_pane_visible") is not True:
                 raise AssertionError("shown Tabs-pane state was not persisted")
 
-            second = app.create_named_window("Research", choose_first_directory=False)
+            second = app.create_named_window("Research", open_initial_tab=False)
             _drain_gtk(Gtk)
             if not second.tabs_pane_visible or not second.side.get_visible():
                 raise AssertionError("new windows did not inherit visible Tabs-pane state")

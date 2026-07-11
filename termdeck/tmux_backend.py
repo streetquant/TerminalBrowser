@@ -92,6 +92,35 @@ class TmuxBackend:
         explicit = getattr(record, "pane_target", None)
         return explicit or f"{record.tmux_name}:0.0"
 
+    def current_directory(self, record: SessionRecord) -> str | None:
+        """Return the active pane's live working directory when tmux can report it."""
+
+        if not self.available:
+            return None
+        result = self._run(
+            [
+                "display-message",
+                "-p",
+                "-t",
+                self.pane_target(record),
+                "#{pane_current_path}",
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        candidate = result.stdout.strip()
+        if not candidate:
+            return None
+        directory = Path(candidate).expanduser()
+        if not directory.is_dir():
+            return None
+        try:
+            directory = directory.resolve()
+        except OSError:
+            directory = directory.absolute()
+        return str(directory)
+
     def pane_pid(self, record: SessionRecord) -> int | None:
         """Return a pane pid while sharing one cached all-pane snapshot."""
 

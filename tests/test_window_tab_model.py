@@ -2,9 +2,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import patch
 
-from termdeck import gtk_app
 from termdeck.command_render import directory_tab_name, normalise_directory
 from termdeck.gtk_app import TermDeckWindow
 from termdeck.session_store import SessionStore
@@ -24,36 +22,6 @@ class SideStub:
 
     def refresh(self) -> None:
         self.refresh_count += 1
-
-
-class DirectoryChooserStub:
-    response = gtk_app.Gtk.ResponseType.OK
-    filename: str | None = None
-    last_instance = None
-
-    def __init__(self, **kwargs) -> None:
-        self.kwargs = kwargs
-        self.current_folder = None
-        self.destroyed = False
-        DirectoryChooserStub.last_instance = self
-
-    def add_buttons(self, *_args) -> None:
-        return None
-
-    def set_modal(self, _modal: bool) -> None:
-        return None
-
-    def set_current_folder(self, folder: str) -> None:
-        self.current_folder = folder
-
-    def run(self):
-        return self.response
-
-    def get_filename(self):
-        return self.filename
-
-    def destroy(self) -> None:
-        self.destroyed = True
 
 
 class WindowTabModelTests(TestCase):
@@ -97,34 +65,69 @@ class WindowTabModelTests(TestCase):
             self.assertEqual(calls[0][1], "terminal")
             self.assertEqual(calls[0][3], str(nested.resolve()))
 
-    def test_directory_chooser_returns_normalised_folder_and_starts_from_active_tab(self) -> None:
+    def test_active_directory_prefers_live_tmux_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            selected = Path(tmp) / "client-api"
-            selected.mkdir()
-            DirectoryChooserStub.response = gtk_app.Gtk.ResponseType.OK
-            DirectoryChooserStub.filename = str(selected)
-            window = SimpleNamespace(_active_directory=lambda: tmp)
+            stored = Path(tmp) / "stored"
+            live = Path(tmp) / "live"
+            stored.mkdir()
+            live.mkdir()
+            record = SimpleNamespace(cwd=str(stored))
+            backend = SimpleNamespace(current_directory=lambda _record: str(live))
+            window = SimpleNamespace(
+                current_record=lambda: record,
+                app_context=SimpleNamespace(backend=backend),
+            )
 
-            with patch("termdeck.gtk_app.Gtk.FileChooserDialog", DirectoryChooserStub):
-                result = TermDeckWindow.choose_tab_directory(window)
+            result = TermDeckWindow._active_directory(window)
 
-            chooser = DirectoryChooserStub.last_instance
-            self.assertEqual(result, str(selected.resolve()))
-            self.assertEqual(chooser.current_folder, tmp)
-            self.assertEqual(chooser.kwargs["action"], gtk_app.Gtk.FileChooserAction.SELECT_FOLDER)
-            self.assertTrue(chooser.destroyed)
+            self.assertEqual(result, str(live.resolve()))
 
-    def test_directory_chooser_cancel_returns_none(self) -> None:
+    def test_active_directory_falls_back_to_stored_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            DirectoryChooserStub.response = gtk_app.Gtk.ResponseType.CANCEL
-            DirectoryChooserStub.filename = tmp
-            window = SimpleNamespace(_active_directory=lambda: tmp)
+            stored = Path(tmp) / "stored"
+            stored.mkdir()
+            record = SimpleNamespace(cwd=str(stored))
+            backend = SimpleNamespace(current_directory=lambda _record: None)
+            window = SimpleNamespace(
+                current_record=lambda: record,
+                app_context=SimpleNamespace(backend=backend),
+            )
 
-            with patch("termdeck.gtk_app.Gtk.FileChooserDialog", DirectoryChooserStub):
-                result = TermDeckWindow.choose_tab_directory(window)
+            result = TermDeckWindow._active_directory(window)
 
-            self.assertIsNone(result)
-            self.assertTrue(DirectoryChooserStub.last_instance.destroyed)
+            self.assertEqual(result, str(stored.resolve()))
+
+    def test_active_directory_uses_home_when_no_tab_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            window = SimpleNamespace(current_record=lambda: None)
+
+            from unittest.mock import patch
+
+            with patch("termdeck.gtk_app.Path.home", return_value=home):
+                result = TermDeckWindow._active_directory(window)
+
+            self.assertEqual(result, str(home.resolve()))
+
+    def test_new_tab_opens_shell_immediately_without_chooser(self) -> None:
+        calls = []
+        window = SimpleNamespace(
+            _active_directory=lambda: "/tmp/client-api",
+            new_shell_tab=lambda cwd: calls.append(cwd),
+        )
+
+        TermDeckWindow.new_tab(window)
+
+        self.assertEqual(calls, ["/tmp/client-api"])
+
+    def test_legacy_new_directory_tab_alias_uses_direct_new_tab(self) -> None:
+        calls = []
+        window = SimpleNamespace(new_tab=lambda: calls.append("new-tab"))
+
+        TermDeckWindow.new_directory_tab(window)
+
+        self.assertEqual(calls, ["new-tab"])
 
     def test_set_window_name_updates_title_and_loaded_tab_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
