@@ -114,20 +114,47 @@ class FirstRunWindowFlowTests(TestCase):
             open_initial_tab=True,
         )
 
-    def test_additional_window_inherits_parent_live_directory(self) -> None:
+    def test_additional_window_opens_shell_in_home_not_parent_directory(self) -> None:
         created_window = object()
         create_named_window = Mock(return_value=created_window)
         parent = SimpleNamespace(_active_directory=lambda: "/work/live")
         app = SimpleNamespace(windows=[parent], create_named_window=create_named_window)
+        home = Path("/tmp/test-home")
 
-        with patch("termdeck.gtk_app.WindowNameDialog", FakeNameDialog):
+        with patch("termdeck.gtk_app.WindowNameDialog", FakeNameDialog), patch(
+            "termdeck.gtk_app.Path.home", return_value=home
+        ):
             result = TermDeckApplication.prompt_for_new_window(app, parent=parent)
 
         self.assertIs(result, created_window)
         create_named_window.assert_called_once_with(
             "Backend",
-            initial_directory="/work/live",
+            initial_directory=home,
             open_initial_tab=True,
+        )
+
+    def test_move_destination_prompt_creates_an_empty_window_for_the_moved_tab(self) -> None:
+        created_window = object()
+        create_named_window = Mock(return_value=created_window)
+        parent = SimpleNamespace()
+        app = SimpleNamespace(windows=[parent], create_named_window=create_named_window)
+        home = Path("/tmp/test-home")
+
+        with patch("termdeck.gtk_app.WindowNameDialog", FakeNameDialog), patch(
+            "termdeck.gtk_app.Path.home", return_value=home
+        ):
+            result = TermDeckApplication.prompt_for_new_window(
+                app,
+                parent=parent,
+                open_initial_tab=False,
+            )
+
+        self.assertIs(result, created_window)
+        self.assertNotIn("first shell", FakeNameDialog.created[0].kwargs["description"])
+        create_named_window.assert_called_once_with(
+            "Backend",
+            initial_directory=home,
+            open_initial_tab=False,
         )
 
     def test_cancelled_first_run_prompt_creates_nothing(self) -> None:
@@ -171,6 +198,47 @@ class FirstRunWindowFlowTests(TestCase):
         reconcile.assert_called_once()
         prompt_for_new_window.assert_called_once_with(first_run=True)
         window_class.assert_not_called()
+
+    def test_activation_restores_and_presents_every_visible_window_group(self) -> None:
+        groups = [
+            ("win-a", "Agents", [SimpleNamespace(id="a1")]),
+            ("win-b", "Ops", [SimpleNamespace(id="b1")]),
+        ]
+        store = SimpleNamespace(windows_with_visible_sessions=lambda: groups)
+        present_calls = []
+        app = SimpleNamespace(
+            backend=SimpleNamespace(available=True),
+            sampler=object(),
+            store=store,
+            windows=[],
+            workspace_path=None,
+            prompt_for_new_window=Mock(),
+            _present_all_windows=lambda: present_calls.append(list(app.windows)),
+        )
+
+        with patch("termdeck.gtk_app.reconcile_store"), patch(
+            "termdeck.gtk_app.TermDeckWindow", FakeWindow
+        ), patch("termdeck.gtk_app.bounded_startup_groups", side_effect=lambda rows: rows):
+            TermDeckApplication.do_activate(app)
+
+        self.assertEqual(len(app.windows), 2)
+        self.assertEqual(app.windows[0].kwargs["window_id"], "win-a")
+        self.assertEqual(app.windows[1].kwargs["window_id"], "win-b")
+        self.assertEqual(app.windows[0].kwargs["window_title"], "Agents")
+        self.assertEqual(app.windows[1].kwargs["window_title"], "Ops")
+        self.assertEqual(len(present_calls), 1)
+        self.assertEqual(present_calls[0], app.windows)
+        app.prompt_for_new_window.assert_not_called()
+
+    def test_present_all_windows_raises_each_restored_window(self) -> None:
+        first = FakeWindow(None)
+        second = FakeWindow(None)
+        app = SimpleNamespace(windows=[first, second])
+
+        TermDeckApplication._present_all_windows(app)
+
+        self.assertEqual(first.calls, ["present"])
+        self.assertEqual(second.calls, ["present"])
 
 
 if __name__ == "__main__":

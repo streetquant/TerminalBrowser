@@ -23,6 +23,9 @@ class TerminalStub:
     def feed_child(self, data: bytes) -> None:
         self.calls.append(("feed_child", data))
 
+    def paste_text(self, text: str) -> None:
+        self.calls.append(("paste_text", text))
+
     def paste_clipboard(self) -> None:
         self.calls.append("paste_clipboard")
 
@@ -53,7 +56,7 @@ def make_attach(clips: dict[object, str], *, last_text: str = "", has_selection:
 
 
 class TerminalPastePipelineTest(TestCase):
-    def test_clipboard_text_feeds_child_binary_and_clears_selection(self) -> None:
+    def test_clipboard_text_uses_vte_paste_handling_and_clears_selection(self) -> None:
         attach, terminal, clipboards = make_attach(
             {gtk_app.Gdk.SELECTION_CLIPBOARD: "hello"},
             has_selection=True,
@@ -64,7 +67,17 @@ class TerminalPastePipelineTest(TestCase):
         self.assertTrue(pasted)
         self.assertEqual(terminal.calls, [])
         clipboards[gtk_app.Gdk.SELECTION_CLIPBOARD].deliver()
-        self.assertEqual(terminal.calls, ["unselect_all", ("feed_child_binary", b"hello")])
+        self.assertEqual(terminal.calls, ["unselect_all", ("paste_text", "hello")])
+
+    def test_clipboard_newline_is_passed_to_vte_as_paste_not_raw_terminal_input(self) -> None:
+        attach, terminal, clipboards = make_attach(
+            {gtk_app.Gdk.SELECTION_CLIPBOARD: "printf hello\n"}
+        )
+
+        AttachTerminal._paste_from_selection(attach, gtk_app.Gdk.SELECTION_CLIPBOARD, prefer_last=True)
+        clipboards[gtk_app.Gdk.SELECTION_CLIPBOARD].deliver()
+
+        self.assertEqual(terminal.calls, [("paste_text", "printf hello\n")])
 
     def test_primary_paste_falls_back_to_clipboard_text(self) -> None:
         attach, terminal, clipboards = make_attach(
@@ -81,7 +94,7 @@ class TerminalPastePipelineTest(TestCase):
         clipboards[gtk_app.Gdk.SELECTION_PRIMARY].deliver()
         self.assertEqual(terminal.calls, [])
         clipboards[gtk_app.Gdk.SELECTION_CLIPBOARD].deliver()
-        self.assertEqual(terminal.calls, [("feed_child_binary", b"from-clipboard")])
+        self.assertEqual(terminal.calls, [("paste_text", "from-clipboard")])
 
     def test_last_select_to_copy_payload_is_used_when_clipboard_is_empty(self) -> None:
         attach, terminal, clipboards = make_attach(
@@ -94,7 +107,7 @@ class TerminalPastePipelineTest(TestCase):
         self.assertTrue(pasted)
         self.assertEqual(terminal.calls, [])
         clipboards[gtk_app.Gdk.SELECTION_CLIPBOARD].deliver()
-        self.assertEqual(terminal.calls, [("feed_child_binary", b"last-copy")])
+        self.assertEqual(terminal.calls, [("paste_text", "last-copy")])
 
     def test_clipboard_paste_falls_back_to_vte_when_no_text_is_available(self) -> None:
         attach, terminal, clipboards = make_attach({gtk_app.Gdk.SELECTION_CLIPBOARD: ""})

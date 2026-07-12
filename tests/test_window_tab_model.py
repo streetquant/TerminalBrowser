@@ -167,16 +167,97 @@ class WindowTabModelTests(TestCase):
 
             self.assertEqual(result, str(home.resolve()))
 
-    def test_new_tab_opens_shell_immediately_without_chooser(self) -> None:
+    def test_default_tab_name_tracks_live_directory_basename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_directory = Path(tmp) / "old-project"
+            new_directory = Path(tmp) / "new-project"
+            old_directory.mkdir()
+            new_directory.mkdir()
+            record = SimpleNamespace(name="old-project", cwd=str(old_directory))
+
+            changes = TermDeckWindow._directory_tracking_changes(record, str(new_directory))
+
+            self.assertEqual(
+                changes,
+                {"cwd": str(new_directory.resolve()), "name": "new-project"},
+            )
+
+    def test_custom_tab_name_remains_an_override_when_directory_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_directory = Path(tmp) / "old-project"
+            new_directory = Path(tmp) / "new-project"
+            old_directory.mkdir()
+            new_directory.mkdir()
+            record = SimpleNamespace(name="API shell", cwd=str(old_directory))
+
+            changes = TermDeckWindow._directory_tracking_changes(record, str(new_directory))
+
+            self.assertEqual(changes, {"cwd": str(new_directory.resolve())})
+
+    def test_tab_directory_refresh_batches_lookup_and_updates_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_directory = root / "old-project"
+            new_directory = root / "new-project"
+            old_directory.mkdir()
+            new_directory.mkdir()
+            store = SessionStore(root / "sessions.sqlite3")
+            try:
+                record = store.create("old-project", "terminal", "bash", old_directory)
+                original_opened_at = record.last_opened_at
+                calls = []
+
+                class Backend:
+                    def current_directories(self, records):
+                        calls.append([candidate.id for candidate in records])
+                        return {record.id: str(new_directory)}
+
+                tab = SimpleNamespace(record=record)
+                side = SideStub()
+                window = SimpleNamespace(
+                    tabs={record.id: tab},
+                    app_context=SimpleNamespace(store=store, backend=Backend()),
+                    side=side,
+                    master_window=None,
+                    _directory_tracking_changes=lambda candidate, live: TermDeckWindow._directory_tracking_changes(
+                        candidate, live
+                    ),
+                )
+
+                def refresh_label(updated):
+                    tab.record = updated
+                    calls.append(("label", updated.name, updated.cwd))
+
+                window.refresh_tab_label = refresh_label
+
+                changed = TermDeckWindow.refresh_tab_directories(window)
+
+                updated = store.get(record.id)
+                self.assertEqual(changed, 1)
+                self.assertEqual(calls[0], [record.id])
+                self.assertEqual(calls[1], ("label", "new-project", str(new_directory.resolve())))
+                self.assertEqual(updated.name, "new-project")  # type: ignore[union-attr]
+                self.assertEqual(updated.cwd, str(new_directory.resolve()))  # type: ignore[union-attr]
+                self.assertEqual(updated.last_opened_at, original_opened_at)  # type: ignore[union-attr]
+                self.assertEqual(side.refresh_count, 1)
+            finally:
+                store.close()
+
+    def test_new_tab_opens_shell_in_home_directory(self) -> None:
         calls = []
         window = SimpleNamespace(
-            _active_directory=lambda: "/tmp/client-api",
             new_shell_tab=lambda cwd: calls.append(cwd),
         )
 
-        TermDeckWindow.new_tab(window)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            from unittest.mock import patch
 
-        self.assertEqual(calls, ["/tmp/client-api"])
+            with patch("termdeck.gtk_app.Path.home", return_value=home):
+                TermDeckWindow.new_tab(window)
+
+        self.assertEqual(calls, [home])
 
     def test_legacy_new_directory_tab_alias_uses_direct_new_tab(self) -> None:
         calls = []

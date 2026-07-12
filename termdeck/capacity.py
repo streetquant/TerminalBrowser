@@ -7,9 +7,12 @@ from .models import SessionRecord
 
 # These are control-plane limits, not limits on running tmux sessions. Background
 # sessions stay alive; the GTK process only materialises a bounded working set.
-STARTUP_WINDOW_LIMIT = 4
 STARTUP_TABS_PER_WINDOW = 12
 STARTUP_TERMINAL_LIMIT = 24
+# Seed at most one remembered window per materialised terminal before filling
+# extra tabs. Keeping this equal to the global terminal budget avoids a second,
+# surprising four-window ceiling while retaining a bounded GTK/VTE working set.
+STARTUP_WINDOW_LIMIT = STARTUP_TERMINAL_LIMIT
 UI_RESOURCE_REFRESH_BUDGET = 128
 SIDE_PANE_ROW_LIMIT = 100
 MASTER_ROW_LIMIT = 500
@@ -58,11 +61,13 @@ def bounded_startup_groups(
     tabs_per_window: int = STARTUP_TABS_PER_WINDOW,
     terminal_limit: int = STARTUP_TERMINAL_LIMIT,
 ) -> list[WindowGroup]:
-    """Choose the terminals GTK should attach without hiding other sessions.
+    """Choose bounded terminal attachments while retaining every window shell.
 
-    Pinned and recently used windows/tabs win the bounded working set. Records
-    omitted here remain visible in the registry and alive in tmux, so search or
-    the Tab manager can open them later without a restart.
+    Pinned and recently used windows/tabs win the bounded working set. Every
+    remembered window remains in the result, including windows that receive no
+    initial attachment. Within the global attachment budget, reserve one slot
+    per window before filling extra tabs so a large window cannot starve a
+    smaller one such as the user's Kaggle window.
     """
 
     clean_window_limit = max(1, int(window_limit))
@@ -78,18 +83,40 @@ def bounded_startup_groups(
         reverse=True,
     )
 
-    selected_groups: list[WindowGroup] = []
-    for _index, (window_id, window_title, records) in candidates[:clean_window_limit]:
-        if remaining <= 0:
-            break
-        take = min(clean_tabs_per_window, remaining)
+    ranked_candidates: list[tuple[int, str, str, list[SessionRecord]]] = []
+    for index, (window_id, window_title, records) in candidates:
         ranked = sorted(
             records,
             key=lambda record: (record.pinned, record.last_opened_at, -record.tab_index),
             reverse=True,
-        )[:take]
-        ranked.sort(key=lambda record: (record.tab_index, record.last_opened_at, record.id))
-        if ranked:
-            selected_groups.append((window_id, window_title, ranked))
-            remaining -= len(ranked)
-    return selected_groups
+        )
+        ranked_candidates.append((index, window_id, window_title, ranked))
+
+    attachable = ranked_candidates[:clean_window_limit]
+    selected: dict[int, list[SessionRecord]] = {index: [] for index, *_rest in ranked_candidates}
+
+    # First make every prioritized window real. Previously, early large windows
+    # exhausted the global terminal budget and prevented later windows from
+    # being recreated at all.
+    for index, _window_id, _window_title, ranked in attachable:
+        if remaining <= 0:
+            break
+        selected[index].append(ranked[0])
+        remaining -= 1
+
+    for index, _window_id, _window_title, ranked in attachable:
+        chosen = selected[index]
+        take = min(clean_tabs_per_window - len(chosen), remaining)
+        if take <= 0:
+            continue
+        chosen.extend(ranked[len(chosen) : len(chosen) + take])
+        remaining -= take
+
+    restored_groups: list[WindowGroup] = []
+    for index, window_id, window_title, _ranked in ranked_candidates:
+        records = sorted(
+            selected[index],
+            key=lambda record: (record.tab_index, record.last_opened_at, record.id),
+        )
+        restored_groups.append((window_id, window_title, records))
+    return restored_groups

@@ -2,11 +2,23 @@
 
 ## 0.2.10
 
-- Restored real terminal scrolling: VTE now has a native scrolled container and fallback scrolling, while attached tmux sessions enable mouse-driven copy-mode history; `Shift` preserves local text selection.
-- Added explicit 2,000-session control-plane defaults: at most 24 startup terminals across 4 windows, 128 process-tree samples per refresh, 100 Tabs-pane cards, and 500 Tab Manager rows.
+- Restored real scrolling behind the tmux attachment: shell panes use tmux copy history, while foreground Codex panes open and navigate Codex's transcript before any Up/Down input is emitted.
+- Prevented wheel movement from cycling Codex prompt history, hid the pager caret while scrollback is being reviewed, and made the first typed key, paste, or ordinary click restore the live composer cursor before delivering input. The Terminator-style scrollbar now has an independent tmux-history range, an opaque trough and thumb, and drag navigation instead of inheriting VTE's empty alternate-screen range.
+- Restored ordinary drag-to-select and automatic copying to both the system clipboard and PRIMARY selection without destroying VTE's visible selection highlight.
+- Routed clipboard text through VTE's bracketed-paste-aware API so `Ctrl+Shift+V` pastes without synthesizing Enter, and explicitly replayed otherwise-unhandled window keys into the active terminal without stealing focus from text fields or losing the first character.
+- Disabled tmux mouse capture for TermDeck sessions so wheel/click activity cannot strand full-screen TUIs such as Codex in tmux copy mode away from their composer.
+- Kept VTE, its PTY client, and the tmux window on the same live character grid after window or Tabs-pane layout changes; hiding the pane now removes it from layout so the terminal reclaims the entire width instead of clipping right-side columns.
+- Sized left- and right-positioned Tabs panes from their scaled minimum width and reflowed them after GTK applies appearance CSS, preventing high UI scales from pushing leading controls off the window edge.
+- Kept default tab names synchronized with each tmux pane's live working-directory basename through the shared batched pane snapshot; an explicit tab rename remains a stable override.
+- Made each Tabs-pane card a single-click navigation target while preserving `Ctrl+left-click` bulk selection and the card controls.
+- Added **Move to window** to every Tab Manager row's right-click menu, including **New window…**, which creates no extra shell; live tabs are reparented with the same VTE widget and tmux client while hidden rows attach only to an already-running session.
+- Added explicit 2,000-session control-plane defaults: at most 24 startup terminals, seeded one per prioritized remembered window across up to 24 windows before filling extra tabs (12 per window), plus 128 process-tree samples per refresh, 100 Tabs-pane cards, and 500 Tab Manager rows.
+- Recreated every remembered named window on relaunch and reserved an attachment for each prioritized window before filling extra tabs, preventing large windows from starving smaller windows such as Kaggle.
+- Restricted Tab Manager **Remove** to unpinned tabs already marked stopped; live, paused, new, and missing selections remain intact.
+- Standardized the destructive action label as **Kill** across Tab Manager, tab menus, the command palette, shortcuts, and documentation; `stopped` remains the internal lifecycle state.
 - Bounded PID churn caches and terminal captures, added adaptive fleet-query deadlines with failure backoff, and made failed snapshots preserve stale lifecycle/PID state without N-way retry fan-out.
 - Batched reconciliation state writes into one SQLite transaction and kept pressure/timeout paths strictly non-destructive; only explicit lifecycle actions can stop sessions.
-- Added synthetic 2,000-session coverage plus a real GTK/tmux wheel smoke that entered copy mode and advanced the history scroll position.
+- Added synthetic 2,000-session coverage plus real GTK checks for Tab Manager window relocation, select-to-copy, the rendered and draggable scrollbar, live-viewport clicks, and first-key delivery after focus leaves the terminal.
 - Replaced blocking clipboard reads with GTK's asynchronous text-request API, including safe late-callback handling after a terminal detaches.
 - Added strict tmux command deadlines and batched session/PID discovery for startup reconciliation and tab restoration.
 - Switched the file-backed session registry to SQLite WAL/NORMAL mode with a one-second lock deadline, retaining the default journal as a compatibility fallback.
@@ -15,7 +27,7 @@
 - Replaced the terminal client's Python `preexec_fn` path with `start_new_session=True` and focused newly opened VTE surfaces immediately.
 - Tightened the header and terminal frame, replaced the oversized circular New-tab action with a compact semantic control, removed persistent-surface transitions and broad shadows, and restored readable tab-name widths.
 - Added shortcut hints and accessible close names without adding visible chrome.
-- Verified 373 tests and 15 subtests; the real wheel smoke entered tmux copy mode and advanced the history position. The prior nine GTK/tmux lifecycle smokes remained covered, with a 78 ms first attachment and 23 ms Ctrl+T handler in their verification run. Desktop and exact `640x520` renders completed with zero layout errors.
+- Verified 435 tests and 23 subtests plus real GTK/tmux lifecycle smokes, including select-to-copy, cross-window tab relocation into a newly created destination, remembered-window startup seeding, killed-tab history, first-key delivery into a waiting PTY, live cwd labels, high-scale Tabs-pane bounds/navigation, tmux/Codex wheel and thumb-drag routing without a roaming pager cursor or composer history input, and synchronized resize grids.
 
 ## 0.2.9
 
@@ -50,7 +62,7 @@
 
 - Fixed the startup dotted-padding glitch by delaying tmux client attachment until VTE has a stable final grid and seeding the PTY with that exact geometry before launch.
 - Added explicit horizontal and vertical expansion to the terminal container, notebook, paned layout and root overlay so the terminal surface covers the complete client area.
-- Defined browser-style lifecycle shortcuts: `Ctrl+W` closes the active tab while keeping its tmux session alive; `Ctrl+Q` quits TermDeck while keeping every tmux session alive; `Ctrl+Shift+W` remains the destructive stop action.
+- Defined browser-style lifecycle shortcuts: `Ctrl+W` closes the active tab while keeping its tmux session alive; `Ctrl+Q` quits TermDeck while keeping every tmux session alive; `Ctrl+Shift+W` remains the destructive kill action.
 - Explicit tab-close actions now close pinned tabs as well; pinning still protects non-explicit cleanup workflows and the pinned state remains stored.
 - Clarified the management views in the UI: Tab Manager provides per-tab/process details and controls, while Window Overview provides read-only totals by named window.
 - Added real GTK/tmux smokes for first-attachment geometry, full client-area coverage, Ctrl+W recovery and Ctrl+Q session preservation.

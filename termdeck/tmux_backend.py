@@ -43,16 +43,21 @@ class TmuxBackend:
         self._pane_cache_expires_at = 0.0
         self._pane_cache_by_target: dict[str, int] = {}
         self._pane_cache_by_session_active: dict[str, int] = {}
+        self._pane_cwd_by_target: dict[str, str] = {}
+        self._pane_cwd_by_session_active: dict[str, str] = {}
         self._pane_snapshot_timed_out = False
         self._pane_snapshot_stale = False
         self._pane_snapshot_retry_at = 0.0
         self._interactive_config_retry_at = 0.0
+        self._scroll_views: dict[str, str] = {}
 
     def invalidate_cache(self) -> None:
         """Drop cached tmux pane metadata after structural changes."""
         self._pane_cache_expires_at = 0.0
         self._pane_cache_by_target = {}
         self._pane_cache_by_session_active = {}
+        self._pane_cwd_by_target = {}
+        self._pane_cwd_by_session_active = {}
         self._pane_snapshot_timed_out = False
         self._pane_snapshot_stale = False
         self._pane_snapshot_retry_at = 0.0
@@ -171,16 +176,18 @@ class TmuxBackend:
         return [self.executable, "attach-session", "-t", record.tmux_name]
 
     def configure_interactive_session(self, record: SessionRecord) -> None:
-        """Enable tmux-native wheel history with bounded per-pane history.
+        """Keep pointer input application-owned with bounded pane history.
 
-        VTE's own scrollback cannot reconstruct output consumed by tmux's
-        full-screen client. Session-local mouse mode makes the wheel enter tmux
-        copy mode, while a finite history limit keeps thousands of panes from
-        growing without bound. Failure is non-fatal: attaching still works.
+        TermDeck and VTE own scrolling and focus. Enabling tmux mouse capture
+        makes an ordinary wheel gesture enter copy mode, where subsequent keys
+        move a history cursor instead of reaching a full-screen TUI composer.
+        Explicitly disable that capture while retaining a finite history limit.
+        Failure is non-fatal: attaching still works.
         """
 
         if not self.available:
             return
+        self._scroll_views.pop(record.id, None)
         now = time.monotonic()
         if now < self._interactive_config_retry_at:
             return
@@ -190,14 +197,154 @@ class TmuxBackend:
                 "-t",
                 record.tmux_name,
                 "mouse",
-                "on",
+                "off",
                 ";",
                 "set-option",
                 "-t",
                 record.tmux_name,
                 "history-limit",
                 str(self.history_limit),
+                ";",
+                "set-option",
+                "-w",
+                "-t",
+                self.pane_target(record),
+                "window-size",
+                "latest",
+                ";",
+                "copy-mode",
+                "-q",
+                "-t",
+                self.pane_target(record),
             ],
+            check=False,
+            timeout=self.query_timeout,
+        )
+        if result.returncode != 0:
+            self._interactive_config_retry_at = now + self.failure_backoff
+
+    def scroll_view_active(self, record: SessionRecord) -> bool:
+        return record.id in self._scroll_views
+
+    def scroll_session(self, record: SessionRecord, lines: int) -> bool:
+        """Scroll tmux history or Codex's transcript without typing in its composer."""
+
+        amount = int(lines)
+        if not amount or not self.available:
+            return False
+        target = self.pane_target(record)
+        view = self._scroll_views.get(record.id)
+        if view is None:
+            # Scrolling down at the live bottom is a no-op and must not open a
+            # history surface.
+            if amount > 0:
+                return False
+            current = self._run(
+                [
+                    "display-message",
+                    "-p",
+                    "-t",
+                    target,
+                    "#{pane_current_command}",
+                ],
+                check=False,
+                timeout=self.query_timeout,
+            )
+            if current.returncode != 0:
+                return False
+            command = Path(current.stdout.strip()).name.casefold()
+            view = (
+                "codex-transcript"
+                if command == "codex" or command.startswith("codex-")
+                else "tmux-history"
+            )
+
+        if view == "codex-transcript":
+            repetitions = max(1, abs(amount))
+            key = "Up" if amount < 0 else "Down"
+            if repetitions > 24:
+                # A scrollbar drag can jump hundreds of history lines. Codex's
+                # transcript pager accepts page keys, avoiding a flood of one
+                # arrow sequence per line while wheel-sized deltas stay precise.
+                repetitions = (repetitions + 23) // 24
+                key = "PageUp" if amount < 0 else "PageDown"
+            count = str(repetitions)
+            keys = []
+            if record.id not in self._scroll_views:
+                # Codex's alternate screen has no emulator scrollback. Open its
+                # transcript before navigation so Up never reaches the composer.
+                keys = ["send-keys", "-t", target, "C-t", ";"]
+            keys.extend(
+                [
+                    "send-keys",
+                    "-t",
+                    target,
+                    "-N",
+                    count,
+                    key,
+                ]
+            )
+        else:
+            count = str(max(1, abs(amount)))
+            keys = []
+            if record.id not in self._scroll_views:
+                keys = ["copy-mode", "-t", target, ";"]
+            keys.extend(
+                [
+                    "send-keys",
+                    "-X",
+                    "-t",
+                    target,
+                    "-N",
+                    count,
+                    "scroll-up" if amount < 0 else "scroll-down",
+                ]
+            )
+        result = self._run(
+            keys,
+            check=False,
+            timeout=self.query_timeout,
+        )
+        if result.returncode != 0:
+            return False
+        self._scroll_views[record.id] = view
+        return True
+
+    def restore_live_session(self, record: SessionRecord) -> None:
+        """Return a focused pane from historical copy mode to its live TUI."""
+
+        if not self.available:
+            return
+        now = time.monotonic()
+        if now < self._interactive_config_retry_at:
+            return
+        view = self._scroll_views.pop(record.id, None)
+        commands = []
+        if view == "codex-transcript":
+            commands = ["send-keys", "-t", self.pane_target(record), "C-t", ";"]
+        commands.extend(
+            [
+                "set-option",
+                "-t",
+                record.tmux_name,
+                "mouse",
+                "off",
+                ";",
+                "set-option",
+                "-w",
+                "-t",
+                self.pane_target(record),
+                "window-size",
+                "latest",
+                ";",
+                "copy-mode",
+                "-q",
+                "-t",
+                self.pane_target(record),
+            ]
+        )
+        result = self._run(
+            commands,
             check=False,
             timeout=self.query_timeout,
         )
@@ -227,6 +374,10 @@ class TmuxBackend:
         if result.returncode != 0:
             return None
         candidate = result.stdout.strip()
+        return self._normalise_pane_directory(candidate)
+
+    @staticmethod
+    def _normalise_pane_directory(candidate: str) -> str | None:
         if not candidate:
             return None
         directory = Path(candidate).expanduser()
@@ -237,6 +388,22 @@ class TmuxBackend:
         except OSError:
             directory = directory.absolute()
         return str(directory)
+
+    def current_directories(self, records: Sequence[SessionRecord]) -> dict[str, str | None]:
+        """Resolve live pane directories for many sessions from one cached snapshot."""
+
+        out: dict[str, str | None] = {record.id: None for record in records}
+        if not records or not self.available:
+            return out
+        if self._load_pane_maps(len(records)) is None:
+            return out
+        for record in records:
+            target = self.pane_target(record)
+            candidate = self._pane_cwd_by_target.get(target)
+            if candidate is None and target == f"{record.tmux_name}:0.0":
+                candidate = self._pane_cwd_by_session_active.get(record.tmux_name)
+            out[record.id] = self._normalise_pane_directory(candidate or "")
+        return out
 
     def pane_pid(self, record: SessionRecord) -> int | None:
         """Return a pane pid while sharing one cached all-pane snapshot."""
@@ -294,7 +461,7 @@ class TmuxBackend:
                 "list-panes",
                 "-a",
                 "-F",
-                "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{pane_pid}",
+                "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_current_path}",
             ],
             check=False,
             timeout=self._query_timeout_for(record_count),
@@ -303,6 +470,8 @@ class TmuxBackend:
             self._pane_cache_expires_at = 0.0
             self._pane_cache_by_target = {}
             self._pane_cache_by_session_active = {}
+            self._pane_cwd_by_target = {}
+            self._pane_cwd_by_session_active = {}
             self._pane_snapshot_timed_out = result.returncode == 124
             self._pane_snapshot_stale = True
             self._pane_snapshot_retry_at = now + self.failure_backoff
@@ -310,22 +479,35 @@ class TmuxBackend:
 
         by_target: dict[str, int] = {}
         by_session_active: dict[str, int] = {}
+        cwd_by_target: dict[str, str] = {}
+        cwd_by_session_active: dict[str, str] = {}
         for line in result.stdout.splitlines():
-            parts = line.split("\t")
-            if len(parts) != 5:
+            parts = line.split("\t", 5)
+            if len(parts) not in {5, 6}:
                 continue
-            session_name, window_index, pane_index, pane_id, pane_pid = parts
+            session_name, window_index, pane_index, pane_id, pane_pid = parts[:5]
+            pane_cwd = parts[5] if len(parts) == 6 else ""
             try:
                 pid = int(pane_pid)
             except ValueError:
                 continue
-            by_target[f"{session_name}:{window_index}.{pane_index}"] = pid
+            target = f"{session_name}:{window_index}.{pane_index}"
+            by_target[target] = pid
+            if pane_cwd:
+                cwd_by_target[target] = pane_cwd
             if pane_id:
-                by_target[pane_id if pane_id.startswith("%") else f"%{pane_id}"] = pid
+                pane_key = pane_id if pane_id.startswith("%") else f"%{pane_id}"
+                by_target[pane_key] = pid
+                if pane_cwd:
+                    cwd_by_target[pane_key] = pane_cwd
             by_session_active.setdefault(session_name, pid)
+            if pane_cwd:
+                cwd_by_session_active.setdefault(session_name, pane_cwd)
 
         self._pane_cache_by_target = by_target
         self._pane_cache_by_session_active = by_session_active
+        self._pane_cwd_by_target = cwd_by_target
+        self._pane_cwd_by_session_active = cwd_by_session_active
         self._pane_cache_expires_at = now + self.pane_cache_ttl if self.pane_cache_ttl else 0.0
         self._pane_snapshot_timed_out = False
         self._pane_snapshot_stale = False
@@ -399,6 +581,7 @@ class TmuxBackend:
         return pid
 
     def terminate(self, record: SessionRecord) -> None:
+        self._scroll_views.pop(record.id, None)
         if self.session_exists(record):
             self._run(["kill-session", "-t", record.tmux_name], check=False)
         self.invalidate_cache()

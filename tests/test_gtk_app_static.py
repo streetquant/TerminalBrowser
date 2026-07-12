@@ -47,8 +47,9 @@ class GtkAppStaticTests(unittest.TestCase):
         self.assertIn("send_text_selected", source)
         self.assertIn("send_enter_selected", source)
         self.assertIn("update_capture_preview", source)
-        self.assertIn("hide_selected", source)
+        self.assertIn("remove_selected", source)
         self.assertIn("archive_selected", source)
+        self.assertIn('("Remove", self.remove_selected)', source)
 
     def test_gui_exposes_only_named_windows_and_immediate_shell_tabs(self):
         source = GTK_APP.read_text(encoding="utf-8")

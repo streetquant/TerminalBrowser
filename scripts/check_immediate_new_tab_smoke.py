@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify Ctrl+T opens a shell immediately in the active pane's live cwd."""
+"""Verify Ctrl+T opens a shell immediately in the home directory."""
 
 from __future__ import annotations
 
@@ -111,13 +111,13 @@ def main() -> int:
             if len(created) != 1:
                 raise AssertionError(f"expected one new tab record, found {len(created)}")
             new_record = created[0]
-            if Path(new_record.cwd) != live.resolve():
+            if Path(new_record.cwd) != home.resolve():
                 raise AssertionError(
-                    f"new tab used {new_record.cwd!r}, expected live cwd {str(live.resolve())!r}"
+                    f"new tab used {new_record.cwd!r}, expected home {str(home.resolve())!r}"
                 )
-            if new_record.name != live.name:
+            if new_record.name != home.name:
                 raise AssertionError(
-                    f"new tab name {new_record.name!r} did not use directory basename {live.name!r}"
+                    f"new tab name {new_record.name!r} did not use home basename {home.name!r}"
                 )
             if not app.backend.session_exists(new_record):
                 raise AssertionError("new tab tmux session was not started")
@@ -136,6 +136,7 @@ def main() -> int:
                         "shortcut": "Ctrl+T",
                         "stored_start_directory": str(starting.resolve()),
                         "live_active_directory": str(live.resolve()),
+                        "home_directory": str(home.resolve()),
                         "new_tab_directory": new_record.cwd,
                         "new_tab_name": new_record.name,
                         "chooser_windows": len(chooser_windows),

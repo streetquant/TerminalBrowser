@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Verify Ctrl+Shift+V pastes the system clipboard into the active VTE."""
+"""Verify clipboard paste and first-key delivery into the active VTE."""
 
 from __future__ import annotations
 
 import json
 import os
+import shlex
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -102,6 +104,57 @@ def main() -> int:
                     f"system clipboard text was not fed exactly once: {fed!r}"
                 )
 
+            # The first ordinary key pressed while header chrome owns focus
+            # must be replayed into VTE, not lost to the old widget.
+            key_marker = root / "unfocused-first-key.txt"
+            ready_marker = root / "unfocused-ready"
+            record = window.current_record()
+            if record is None:
+                raise AssertionError("no current record was available for keyboard routing")
+            _drain_gtk(Gtk, until=lambda: attach.process is not None)
+            command = (
+                f": > {shlex.quote(str(ready_marker))}; "
+                f"stty -icanon -echo min 1 time 0; "
+                f"dd bs=1 count=1 of={shlex.quote(str(key_marker))} 2>/dev/null; "
+                "stty icanon echo"
+            )
+            app.backend.send_text(record, command)
+            _drain_gtk(Gtk, until=ready_marker.exists)
+
+            def _find_new_tab_button(widget):
+                if isinstance(widget, Gtk.Button) and widget.get_style_context().has_class("td-new-tab"):
+                    return widget
+                if isinstance(widget, Gtk.Container):
+                    for child in widget.get_children():
+                        found = _find_new_tab_button(child)
+                        if found is not None:
+                            return found
+                return None
+
+            chrome_button = _find_new_tab_button(window.get_titlebar())
+            if chrome_button is None:
+                raise AssertionError("New tab header control was not found")
+            chrome_button.grab_focus()
+            _drain_gtk(Gtk, until=lambda: window.get_focus() is chrome_button)
+            gdk_window = window.get_window()
+            if gdk_window is None:
+                raise AssertionError("TermDeck window was not realised")
+            xid = gdk_window.get_xid()
+            subprocess.run(
+                ["xdotool", "key", "--window", str(xid), "x"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _drain_gtk(
+                Gtk,
+                until=lambda: key_marker.exists() and key_marker.stat().st_size >= 1,
+            )
+            if key_marker.read_bytes() != b"x":
+                raise AssertionError("the first unfocused key did not reach the terminal exactly once")
+            if window.get_focus() is not attach.terminal:
+                raise AssertionError("keyboard routing did not restore VTE focus")
+
             print(
                 json.dumps(
                     {
@@ -110,6 +163,7 @@ def main() -> int:
                         "selection": "Gdk.SELECTION_CLIPBOARD",
                         "pasted_text": marker,
                         "feed_count": len(fed),
+                        "unfocused_first_key": "x",
                     },
                     indent=2,
                     sort_keys=True,

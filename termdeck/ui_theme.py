@@ -63,49 +63,51 @@ class ChromeTokens:
 CHROME_TOKENS: Mapping[str, ChromeTokens] = {
     "dark": ChromeTokens(
         name="dark",
-        bg="#05070f",
-        bg_raised="#0d1322",
-        bg_sunken="#020409",
-        fg="#f2f5ff",
-        fg_muted="#93a0ba",
-        border="#28324e",
-        accent="#8a8dff",
-        accent_fg="#07081a",
-        danger="#ff6480",
-        warning="#f8c85c",
-        success="#45e0a6",
-        card_radius=16,
+        # Deep navy base with clearly separated surface layers
+        bg="#0b0d14",
+        bg_raised="#161c2e",
+        bg_sunken="#070910",
+        fg="#e8ecff",
+        fg_muted="#8896b8",
+        border="#2e3f66",
+        accent="#7c83ff",
+        accent_fg="#06071a",
+        danger="#ff5370",
+        warning="#ffcb6b",
+        success="#3ddba6",
+        card_radius=14,
     ),
     "noir": ChromeTokens(
         name="noir",
-        bg="#050607",
-        bg_raised="#111315",
-        bg_sunken="#010203",
-        fg="#f7f8f8",
-        fg_muted="#92999f",
-        border="#292d31",
-        accent="#65f58a",
-        accent_fg="#031107",
-        danger="#ff5f78",
-        warning="#ffd166",
-        success="#65f58a",
+        # Pure charcoal with emerald accent — high contrast, no blue tint
+        bg="#0d0e0f",
+        bg_raised="#1a1d20",
+        bg_sunken="#080909",
+        fg="#f0f2f3",
+        fg_muted="#8a9299",
+        border="#333a40",
+        accent="#4deba0",
+        accent_fg="#021409",
+        danger="#ff4d6b",
+        warning="#ffc84a",
+        success="#4deba0",
         card_radius=12,
     ),
     "system": ChromeTokens(
         name="system",
-        # Light desktop-following shell used when system prefers light.
+        # Clean light shell — follows desktop when system prefers light.
         # When system prefers dark, effective_chrome_theme() maps to "dark".
-        bg="#f3f6fb",
+        bg="#f0f4fb",
         bg_raised="#ffffff",
-        bg_sunken="#e9eef6",
-        fg="#172033",
-        fg_muted="#667085",
-        border="#d5ddea",
-        accent="#4f66e8",
+        bg_sunken="#e4eaf5",
+        fg="#131d30",
+        fg_muted="#5a6c88",
+        border="#c5d0e0",
+        accent="#3d5ce8",
         accent_fg="#ffffff",
-        danger="#d92d4f",
-        warning="#a15c00",
-        success="#087a55",
+        danger="#c7213e",
+        warning="#8f5200",
+        success="#0a6b47",
         card_radius=14,
     ),
 }
@@ -509,16 +511,17 @@ def build_chrome_css(
     if dens == "compact":
         scale *= 0.95
 
-    # Default ladder when no ui_font is set (matches previous readable sizes).
-    base_size = 14.0
+    # Default ladder when no ui_font is set (readable at normal DPI).
+    base_size = 13.0
     font_family_css = ""
     if ui_font:
-        family, parsed_size = parse_font_description(ui_font, default="Sans 11")
+        family, parsed_size = parse_font_description(ui_font, default="Sans 12")
         # Escape quotes in family for CSS.
         safe_family = family.replace("\\", "\\\\").replace('"', '\\"')
         font_family_css = f'font-family: "{safe_family}", Cantarell, "Noto Sans", sans-serif;'
-        # Treat the configured size as the UI base (not VTE size).
-        base_size = max(9.0, min(28.0, parsed_size))
+        # Enforce a readable floor: UI chrome should never go below 12px regardless
+        # of what the terminal font size is configured to.
+        base_size = max(12.0, min(28.0, parsed_size))
 
     size = {
         "base": _css_px(base_size, scale),

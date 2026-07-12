@@ -100,8 +100,8 @@ def main() -> int:
                 raise AssertionError(
                     f"HeaderBar exposed unexpected actions: {sorted(actions)}"
                 )
-            if actions["New tab"].get_tooltip_text() != "New tab · Ctrl+T · opens in the active terminal directory":
-                raise AssertionError("New tab lost its directory-based tooltip")
+            if actions["New tab"].get_tooltip_text() != "New tab · Ctrl+T · opens in the home directory":
+                raise AssertionError("New tab lost its home-directory tooltip")
 
             more = actions["More actions"]
             if not isinstance(more, Gtk.MenuButton):

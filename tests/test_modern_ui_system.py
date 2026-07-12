@@ -27,7 +27,8 @@ class ModernUiSystemTests(unittest.TestCase):
             ".td-header-overflow",
         ):
             self.assertIn(selector, css)
-        self.assertIn("box-shadow:", css)
+        # box-shadow is a GTK Sass helper not supported in app CSS; we use outline instead
+        self.assertIn("outline:", css)
         self.assertNotIn("transition:", css)
         self.assertIn("min-height: 46px", css)
         self.assertNotIn("0 18px 48px", css)
@@ -42,13 +43,20 @@ class ModernUiSystemTests(unittest.TestCase):
             ".td-section-description",
             "button:focus",
             "scrolledwindow",
+            "scrollbar.td-terminal-scrollbar",
         ):
             self.assertIn(selector, css)
         self.assertIn("margin: 6px 8px 8px 8px", css)
         self.assertIn("border-radius: 14px", css)
-        self.assertIn("inset 0 -2px 0", css)
+        # Active tab uses border-bottom underline instead of box-shadow inset
+        self.assertIn("border-bottom: 2px solid", css)
         self.assertIn('"td-terminal-notebook"', GTK_APP)
         self.assertIn('"td-main-root"', GTK_APP)
+        self.assertIn('"td-terminal-scrollbar"', GTK_APP)
+        self.assertIn("scrollbar.td-terminal-scrollbar trough", css)
+        self.assertIn("scrollbar.td-terminal-scrollbar slider", css)
+        self.assertIn("min-width: 14px", css)
+        self.assertIn("min-height: 24px", css)
 
     def test_tab_labels_reserve_readable_width(self) -> None:
         self.assertIn("name.set_width_chars(min(20, max(4, len(record.name))))", GTK_APP)

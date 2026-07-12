@@ -77,6 +77,7 @@ class TerminalSelectAutocopyTriggersTest(TestCase):
         removed = []
         idle_callbacks = []
         attach = SimpleNamespace(
+            terminal=TerminalStub(has_selection=True),
             _selection_autocopy_source_id=33,
             _copy_selection_to_clipboards_idle=lambda: False,
         )
@@ -94,10 +95,13 @@ class TerminalSelectAutocopyTriggersTest(TestCase):
     def test_non_left_button_release_does_not_queue_idle_copy(self) -> None:
         idle_callbacks = []
         attach = SimpleNamespace(
+            terminal=TerminalStub(has_selection=False),
             _selection_autocopy_source_id=0,
             _copy_selection_to_clipboards_idle=lambda: False,
+            prepare_for_live_input=lambda: None,
+            scroll_to_bottom=lambda: None,
         )
-        event = SimpleNamespace(button=3)
+        event = SimpleNamespace(button=3, state=0)
 
         with patch("termdeck.gtk_app.GLib.idle_add", lambda callback: idle_callbacks.append(callback) or 77):
             handled = AttachTerminal._on_button_release(attach, None, event)

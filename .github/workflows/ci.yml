@@ -78,6 +78,14 @@ jobs:
         run: >-
           xvfb-run -a dbus-run-session --
           .venv-ui/bin/python scripts/check_tabs_pane_smoke.py
+      - name: Verify every remembered window restores
+        run: >-
+          xvfb-run -a dbus-run-session --
+          .venv-ui/bin/python scripts/check_window_restore_smoke.py
+      - name: Verify Tab Manager window relocation
+        run: >-
+          xvfb-run -a dbus-run-session --
+          .venv-ui/bin/python scripts/check_tab_manager_move_smoke.py
       - name: Verify minimal header chrome
         run: >-
           xvfb-run -a dbus-run-session --
@@ -102,6 +110,10 @@ jobs:
         run: >-
           xvfb-run -a dbus-run-session --
           .venv-ui/bin/python scripts/check_clipboard_paste_smoke.py
+      - name: Verify terminal select-to-copy
+        run: >-
+          xvfb-run -a dbus-run-session --
+          .venv-ui/bin/python scripts/check_terminal_select_copy_smoke.py
       - name: Verify immediate Ctrl+T tab creation
         run: >-
           xvfb-run -a dbus-run-session --
@@ -110,6 +122,10 @@ jobs:
         run: >-
           xvfb-run -a dbus-run-session --
           .venv-ui/bin/python scripts/check_visual_polish_smoke.py
+      - name: Verify wheel scrolling never becomes TUI key input
+        run: >-
+          xvfb-run -a dbus-run-session --
+          .venv-ui/bin/python scripts/check_terminal_scroll_smoke.py
       - name: Render desktop GTK layout
         run: .venv-ui/bin/python scripts/render_ui_smoke.py --output termdeck-ui-smoke-desktop.png
       - name: Render compact GTK layout

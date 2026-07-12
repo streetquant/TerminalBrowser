@@ -1,13 +1,14 @@
+import signal
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest import mock
 
-from termdeck.gtk_app import AttachTerminal, Gtk
+from termdeck.gtk_app import AttachTerminal, Gdk, Gtk
 from termdeck.models import TerminalTheme
 
 
 class TerminalMouseBehaviourTest(TestCase):
-    def test_terminal_has_real_scroller_and_fallback_scroll_support(self) -> None:
+    def test_terminal_has_terminator_style_scrollbar_without_arrow_key_fallback(self) -> None:
         ready, _argv = Gtk.init_check([])
         if not ready:
             self.skipTest("GTK display is unavailable")
@@ -16,15 +17,132 @@ class TerminalMouseBehaviourTest(TestCase):
         ):
             attach = AttachTerminal(["true"], "/tmp", TerminalTheme())
             try:
-                self.assertIs(attach.scroller.get_child(), attach.terminal)
-                horizontal, vertical = attach.scroller.get_policy()
-                self.assertEqual(horizontal, Gtk.PolicyType.NEVER)
-                self.assertEqual(vertical, Gtk.PolicyType.AUTOMATIC)
-                self.assertTrue(attach.terminal.get_enable_fallback_scrolling())
+                attach.show_all()
+                self.assertEqual(
+                    attach.terminal_row.get_children(),
+                    [attach.terminal, attach.scrollbar],
+                )
+                adjustment = attach.scrollbar.get_adjustment()
+                self.assertIsNot(adjustment, attach.terminal.get_vadjustment())
+                self.assertGreater(adjustment.get_upper(), adjustment.get_page_size())
+                self.assertEqual(
+                    adjustment.get_value(),
+                    adjustment.get_upper() - adjustment.get_page_size(),
+                )
+                self.assertTrue(attach.scrollbar.get_visible())
+                self.assertTrue(
+                    attach.scrollbar.get_style_context().has_class("td-terminal-scrollbar")
+                )
+                self.assertFalse(attach.terminal.get_enable_fallback_scrolling())
                 self.assertFalse(attach.terminal.get_scroll_on_output())
                 self.assertTrue(attach.terminal.get_scroll_on_keystroke())
             finally:
                 attach.destroy()
+
+    def test_dragging_terminal_scrollbar_routes_delta_to_session_history(self) -> None:
+        calls = []
+        adjustment = mock.Mock()
+        adjustment.get_value.return_value = 70.0
+        attach = SimpleNamespace(
+            _scrollbar_syncing=False,
+            _last_scrollbar_value=90.0,
+            _scroll_handler=lambda lines: calls.append(lines) or True,
+            _set_history_cursor_hidden=lambda hidden: calls.append(("cursor-hidden", hidden)),
+        )
+
+        AttachTerminal._on_scrollbar_value_changed(attach, adjustment)
+
+        self.assertEqual(calls, [-20, ("cursor-hidden", True)])
+        self.assertEqual(attach._last_scrollbar_value, 70.0)
+
+    def test_history_cursor_is_hidden_until_live_input_resumes(self) -> None:
+        terminal = mock.Mock()
+        confirm_hidden = mock.Mock()
+        attach = SimpleNamespace(
+            terminal=terminal,
+            _history_cursor_hidden=False,
+            _cursor_hide_source_id=0,
+            _remove_glib_source=lambda source_id: None,
+            _confirm_history_cursor_hidden=confirm_hidden,
+        )
+
+        with mock.patch("termdeck.gtk_app.GLib.timeout_add", return_value=42) as timeout_add:
+            AttachTerminal._set_history_cursor_hidden(attach, True)
+
+        terminal.feed.assert_called_once_with(b"\x1b[?25l")
+        timeout_add.assert_called_once_with(40, confirm_hidden)
+        self.assertEqual(attach._cursor_hide_source_id, 42)
+        self.assertTrue(attach._history_cursor_hidden)
+
+        AttachTerminal._set_history_cursor_hidden(attach, False)
+
+        terminal.feed.assert_called_with(b"\x1b[?25h")
+        self.assertEqual(attach._cursor_hide_source_id, 0)
+        self.assertFalse(attach._history_cursor_hidden)
+
+    def test_history_cursor_hide_is_reasserted_after_the_terminal_redraw(self) -> None:
+        terminal = mock.Mock()
+        attach = SimpleNamespace(
+            terminal=terminal,
+            _cursor_hide_source_id=42,
+            _history_cursor_hidden=True,
+            _detached=False,
+        )
+
+        keep_source = AttachTerminal._confirm_history_cursor_hidden(attach)
+
+        self.assertFalse(keep_source)
+        self.assertEqual(attach._cursor_hide_source_id, 0)
+        terminal.feed.assert_called_once_with(b"\x1b[?25l")
+
+    def test_wheel_up_moves_real_scrollback_without_feeding_child_input(self) -> None:
+        adjustment = mock.Mock()
+        adjustment.get_step_increment.return_value = 1.0
+        adjustment.get_lower.return_value = 0.0
+        adjustment.get_upper.return_value = 200.0
+        adjustment.get_page_size.return_value = 20.0
+        adjustment.get_value.return_value = 180.0
+        terminal = SimpleNamespace(get_vadjustment=lambda: adjustment)
+        attach = SimpleNamespace(terminal=terminal)
+        event = SimpleNamespace(direction=Gdk.ScrollDirection.UP, delta_y=0.0)
+
+        handled = AttachTerminal._on_terminal_scroll(attach, terminal, event)
+
+        self.assertTrue(handled)
+        adjustment.set_value.assert_called_once_with(177.0)
+
+    def test_tmux_scroll_handler_owns_wheel_before_vte_fallback(self) -> None:
+        calls = []
+        adjustment = mock.Mock()
+        terminal = SimpleNamespace(get_vadjustment=lambda: adjustment)
+        attach = SimpleNamespace(
+            terminal=terminal,
+            _scroll_handler=lambda lines: calls.append(lines) or True,
+            _set_history_cursor_hidden=lambda hidden: calls.append(("cursor-hidden", hidden)),
+        )
+        event = SimpleNamespace(direction=Gdk.ScrollDirection.UP, delta_y=0.0)
+
+        handled = AttachTerminal._on_terminal_scroll(attach, terminal, event)
+
+        self.assertTrue(handled)
+        self.assertEqual(calls, [-3, ("cursor-hidden", True)])
+        adjustment.get_value.assert_not_called()
+
+    def test_smooth_wheel_delta_is_clamped_to_scrollback_bounds(self) -> None:
+        adjustment = mock.Mock()
+        adjustment.get_step_increment.return_value = 1.0
+        adjustment.get_lower.return_value = 0.0
+        adjustment.get_upper.return_value = 200.0
+        adjustment.get_page_size.return_value = 20.0
+        adjustment.get_value.return_value = 2.0
+        terminal = SimpleNamespace(get_vadjustment=lambda: adjustment)
+        attach = SimpleNamespace(terminal=terminal)
+        event = SimpleNamespace(direction=Gdk.ScrollDirection.SMOOTH, delta_y=-5.0)
+
+        handled = AttachTerminal._on_terminal_scroll(attach, terminal, event)
+
+        self.assertTrue(handled)
+        adjustment.set_value.assert_called_once_with(0.0)
 
     def test_middle_click_pastes_primary_and_consumes_event(self) -> None:
         calls = []
@@ -55,6 +173,9 @@ class TerminalMouseBehaviourTest(TestCase):
     def test_left_click_does_not_consume_press_event(self) -> None:
         calls = []
         attach = SimpleNamespace(
+            terminal=SimpleNamespace(grab_focus=lambda: calls.append("focus")),
+            prepare_for_live_input=lambda: calls.append("live"),
+            scroll_to_bottom=lambda: calls.append("bottom"),
             paste_primary=lambda: calls.append("paste_primary"),
             _show_terminal_context_menu=lambda event: calls.append(("menu", event)),
         )
@@ -64,6 +185,114 @@ class TerminalMouseBehaviourTest(TestCase):
 
         self.assertFalse(handled)
         self.assertEqual(calls, [])
+
+    def test_left_release_without_selection_returns_to_live_terminal(self) -> None:
+        calls = []
+        attach = SimpleNamespace(
+            terminal=SimpleNamespace(
+                get_has_selection=lambda: False,
+                grab_focus=lambda: calls.append("focus"),
+            ),
+            _selection_autocopy_source_id=0,
+            prepare_for_live_input=lambda: calls.append("live"),
+            scroll_to_bottom=lambda: calls.append("bottom"),
+        )
+        event = SimpleNamespace(button=1, state=0)
+
+        handled = AttachTerminal._on_button_release(attach, None, event)
+
+        self.assertFalse(handled)
+        self.assertEqual(calls, ["live", "bottom", "focus"])
+
+    def test_shift_left_release_without_selection_preserves_scrollback_position(self) -> None:
+        calls = []
+        attach = SimpleNamespace(
+            terminal=SimpleNamespace(
+                get_has_selection=lambda: False,
+                grab_focus=lambda: calls.append("focus"),
+            ),
+            _selection_autocopy_source_id=0,
+            prepare_for_live_input=lambda: calls.append("live"),
+            scroll_to_bottom=lambda: calls.append("bottom"),
+        )
+        event = SimpleNamespace(button=1, state=Gdk.ModifierType.SHIFT_MASK)
+
+        handled = AttachTerminal._on_button_release(attach, None, event)
+
+        self.assertFalse(handled)
+        self.assertEqual(calls, [])
+
+    def test_shift_left_click_keeps_scrollback_position_for_selection(self) -> None:
+        calls = []
+        attach = SimpleNamespace(
+            terminal=SimpleNamespace(grab_focus=lambda: calls.append("focus")),
+            prepare_for_live_input=lambda: calls.append("live"),
+            scroll_to_bottom=lambda: calls.append("bottom"),
+            paste_primary=lambda: calls.append("paste_primary"),
+            _show_terminal_context_menu=lambda event: calls.append(("menu", event)),
+        )
+        event = SimpleNamespace(button=1, state=Gdk.ModifierType.SHIFT_MASK)
+
+        handled = AttachTerminal._on_button_press(attach, None, event)
+
+        self.assertFalse(handled)
+        self.assertEqual(calls, [])
+
+    def test_live_input_restores_tui_and_forces_immediate_geometry_sync(self) -> None:
+        calls = []
+        attach = SimpleNamespace(
+            _set_history_cursor_hidden=lambda hidden: calls.append(("cursor-hidden", hidden)),
+            reset_scrollbar=lambda: calls.append("scrollbar-bottom"),
+            _live_focus_handler=lambda: calls.append("restore"),
+            request_geometry_sync=lambda **kwargs: calls.append(("geometry", kwargs)),
+        )
+
+        AttachTerminal.prepare_for_live_input(attach)
+
+        self.assertEqual(
+            calls,
+            [
+                "scrollbar-bottom",
+                "restore",
+                ("cursor-hidden", False),
+                ("geometry", {"delay_ms": 0}),
+            ],
+        )
+
+    def test_forced_geometry_sync_resizes_pty_and_signals_tmux_client(self) -> None:
+        pty_obj = mock.Mock()
+        process = SimpleNamespace(pid=4321, poll=lambda: None)
+        attach = SimpleNamespace(
+            pty_obj=pty_obj,
+            process=process,
+            _last_synced_grid=(120, 40),
+        )
+
+        with mock.patch("termdeck.gtk_app.os.getpgid", return_value=7654), mock.patch(
+            "termdeck.gtk_app.os.killpg"
+        ) as killpg:
+            AttachTerminal._sync_pty_geometry(
+                attach,
+                columns=120,
+                rows=40,
+                force=True,
+            )
+
+        pty_obj.set_size.assert_called_once_with(40, 120)
+        killpg.assert_called_once_with(7654, signal.SIGWINCH)
+        self.assertEqual(attach._last_synced_grid, (120, 40))
+
+    def test_unchanged_geometry_does_not_repeat_non_forced_sync(self) -> None:
+        pty_obj = mock.Mock()
+        attach = SimpleNamespace(
+            pty_obj=pty_obj,
+            process=None,
+            _last_synced_grid=(120, 40),
+        )
+
+        AttachTerminal._sync_pty_geometry(attach, columns=120, rows=40)
+
+        pty_obj.set_size.assert_not_called()
 
     def test_missing_button_does_not_consume_press_event(self) -> None:
         calls = []

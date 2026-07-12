@@ -49,7 +49,7 @@ def make_attach(terminal: TerminalStub, clipboards: dict[object, ClipboardStub])
 
 
 class TerminalCopyPipelineTest(TestCase):
-    def test_selected_text_is_written_to_clipboard_and_primary(self) -> None:
+    def test_selected_text_uses_durable_clipboard_and_vte_owned_primary(self) -> None:
         terminal = TerminalStub(selected_text='copied text')
         clipboards = {
             gtk_app.Gdk.SELECTION_CLIPBOARD: ClipboardStub(),
@@ -62,13 +62,13 @@ class TerminalCopyPipelineTest(TestCase):
         self.assertTrue(copied)
         self.assertEqual(attach._last_copied_text, 'copied text')
         self.assertEqual(clipboards[gtk_app.Gdk.SELECTION_CLIPBOARD].text, 'copied text')
-        self.assertEqual(clipboards[gtk_app.Gdk.SELECTION_PRIMARY].text, 'copied text')
+        self.assertEqual(clipboards[gtk_app.Gdk.SELECTION_PRIMARY].text, '')
         self.assertTrue(clipboards[gtk_app.Gdk.SELECTION_CLIPBOARD].stored)
-        self.assertTrue(clipboards[gtk_app.Gdk.SELECTION_PRIMARY].stored)
+        self.assertFalse(clipboards[gtk_app.Gdk.SELECTION_PRIMARY].stored)
         self.assertIn(('copy_clipboard_format', gtk_app.Vte.Format.TEXT), terminal.calls)
         self.assertIn('copy_primary', terminal.calls)
 
-    def test_durable_gtk_clipboard_ownership_is_installed_after_vte_copy(self) -> None:
+    def test_durable_clipboard_is_installed_without_reclaiming_primary(self) -> None:
         events = []
         terminal = TerminalStub(selected_text="copied text")
         terminal.copy_clipboard_format = lambda fmt: events.append(("vte-clipboard", fmt))
@@ -78,10 +78,11 @@ class TerminalCopyPipelineTest(TestCase):
 
         self.assertTrue(AttachTerminal._copy_selection_to_clipboards(attach))
 
-        self.assertEqual(events[-2][0], "gtk")
-        self.assertEqual(events[-1][0], "gtk")
-        self.assertEqual(events[-2][2], "copied text")
-        self.assertEqual(events[-1][2], "copied text")
+        self.assertEqual(events[-1], ("gtk", gtk_app.Gdk.SELECTION_CLIPBOARD, "copied text"))
+        self.assertNotIn(
+            ("gtk", gtk_app.Gdk.SELECTION_PRIMARY, "copied text"),
+            events,
+        )
 
     def test_no_text_but_reported_selection_uses_vte_copy_fallbacks(self) -> None:
         terminal = TerminalStub(selected_text='', has_selection=True)

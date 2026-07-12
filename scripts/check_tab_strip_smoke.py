@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import tempfile
 import time
 from pathlib import Path
@@ -43,9 +44,13 @@ def main() -> int:
         home = root / "home"
         tmux_tmp = root / "tmux"
         workdir = root / "client-api"
+        live_workdir = root / "live-cwd"
+        renamed_workdir = root / "renamed-cwd"
         home.mkdir()
         tmux_tmp.mkdir(mode=0o700)
         workdir.mkdir()
+        live_workdir.mkdir()
+        renamed_workdir.mkdir()
         os.environ["HOME"] = str(home)
         os.environ["TMUX_TMPDIR"] = str(tmux_tmp)
         os.environ["NO_AT_BRIDGE"] = "1"
@@ -105,8 +110,33 @@ def main() -> int:
                 raise AssertionError("pinned state is not available through the tab tooltip")
 
             record = next(iter(window.tabs.values())).record
+            app.backend.send_text(record, f"cd {shlex.quote(str(live_workdir))}")
+            _drain_gtk(
+                Gtk,
+                until=lambda: app.backend.current_directory(record) == str(live_workdir.resolve()),
+            )
+            app.backend.invalidate_cache()
+            if window.refresh_tab_directories() != 1:
+                raise AssertionError("live cwd refresh did not update the directory-derived tab")
+            tracked_label, _tracked_close = _tab_parts(Gtk, window)
+            if tracked_label.get_text() != "live-cwd":
+                raise AssertionError(
+                    f"tab name did not follow live cwd: {tracked_label.get_text()!r}"
+                )
+
+            record = app.store.get(record.id)
+            if record is None:
+                raise AssertionError("tracked tab disappeared from the registry")
             renamed = app.store.update(record.id, name="api-renamed")
             window.refresh_tab_label(renamed)
+            app.backend.send_text(renamed, f"cd {shlex.quote(str(renamed_workdir))}")
+            _drain_gtk(
+                Gtk,
+                until=lambda: app.backend.current_directory(renamed) == str(renamed_workdir.resolve()),
+            )
+            app.backend.invalidate_cache()
+            if window.refresh_tab_directories() != 1:
+                raise AssertionError("custom-named tab cwd did not refresh")
             _drain_gtk(Gtk)
             renamed_label, renamed_close = _tab_parts(Gtk, window)
             if renamed_label.get_text() != "api-renamed":
@@ -119,6 +149,7 @@ def main() -> int:
                     {
                         "ok": True,
                         "initial_label": "client-api",
+                        "tracked_cwd_label": "live-cwd",
                         "renamed_label": "api-renamed",
                         "visible_decoration": False,
                         "close_control": "×",

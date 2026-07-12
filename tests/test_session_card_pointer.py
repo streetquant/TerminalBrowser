@@ -73,6 +73,69 @@ class SessionCardPointerTest(TestCase):
         self.assertFalse(check.get_active())
         self.assertEqual(menus, [("target", check, event)])
 
+    def test_single_click_row_activation_opens_that_session(self) -> None:
+        opened = []
+        record = SimpleNamespace(id="target")
+        pane = SimpleNamespace(window=SimpleNamespace(open_session=opened.append))
+        row = SimpleNamespace(_termdeck_session_record=record)
+
+        SidePane._on_session_row_activated(pane, None, row)
+
+        self.assertEqual(opened, [record])
+
+    def test_non_session_row_activation_is_ignored(self) -> None:
+        opened = []
+        pane = SimpleNamespace(window=SimpleNamespace(open_session=opened.append))
+
+        SidePane._on_session_row_activated(pane, None, SimpleNamespace())
+
+        self.assertEqual(opened, [])
+
+    def test_plain_left_click_on_card_opens_that_session(self) -> None:
+        opened = []
+        record = SimpleNamespace(id="target")
+        pane = SimpleNamespace(
+            window=SimpleNamespace(open_session=opened.append),
+            _on_session_button_press=lambda *_args: False,
+        )
+        event = SimpleNamespace(button=1)
+
+        handled = SidePane._on_session_card_press(
+            pane,
+            SimpleNamespace(),
+            event,
+            record,
+            CheckStub(),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(opened, [record])
+
+    def test_ctrl_click_card_remains_bulk_selection(self) -> None:
+        opened = []
+        delegated = []
+        record = SimpleNamespace(id="target")
+        pane = SimpleNamespace(
+            window=SimpleNamespace(open_session=opened.append),
+            _on_session_button_press=lambda *args: delegated.append(args) or True,
+        )
+        event = SimpleNamespace(
+            button=1,
+            state=int(gtk_app.Gdk.ModifierType.CONTROL_MASK),
+        )
+
+        handled = SidePane._on_session_card_press(
+            pane,
+            SimpleNamespace(),
+            event,
+            record,
+            CheckStub(),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(len(delegated), 1)
+        self.assertEqual(opened, [])
+
 
 if __name__ == "__main__":
     import unittest

@@ -23,7 +23,159 @@ def _record(**kwargs) -> SessionRecord:
 
 
 class TmuxBackendTests(unittest.TestCase):
-    def test_interactive_session_enables_mouse_scrolling_and_bounded_history(self):
+    def test_scroll_down_at_live_bottom_does_not_enter_history(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+        ), mock.patch.object(backend, "_run") as run:
+            handled = backend.scroll_session(record, 3)
+
+        self.assertFalse(handled)
+        self.assertFalse(backend.scroll_view_active(record))
+        run.assert_not_called()
+
+    def test_scroll_codex_opens_transcript_before_navigating(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        command = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="codex\n", stderr=""
+        )
+        scrolled = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="", stderr=""
+        )
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", side_effect=[command, scrolled]
+        ) as run:
+            handled = backend.scroll_session(record, -3)
+
+        self.assertTrue(handled)
+        self.assertTrue(backend.scroll_view_active(record))
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    [
+                        "display-message",
+                        "-p",
+                        "-t",
+                        backend.pane_target(record),
+                        "#{pane_current_command}",
+                    ],
+                    check=False,
+                    timeout=backend.query_timeout,
+                ),
+                mock.call(
+                    [
+                        "send-keys",
+                        "-t",
+                        backend.pane_target(record),
+                        "C-t",
+                        ";",
+                        "send-keys",
+                        "-t",
+                        backend.pane_target(record),
+                        "-N",
+                        "3",
+                        "Up",
+                    ],
+                    check=False,
+                    timeout=backend.query_timeout,
+                ),
+            ],
+        )
+
+    def test_scroll_shell_uses_tmux_copy_mode_not_child_arrow_keys(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        command = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="bash\n", stderr=""
+        )
+        scrolled = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="", stderr=""
+        )
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", side_effect=[command, scrolled]
+        ) as run:
+            handled = backend.scroll_session(record, -3)
+
+        self.assertTrue(handled)
+        self.assertTrue(backend.scroll_view_active(record))
+        self.assertEqual(
+            run.call_args_list[-1],
+            mock.call(
+                [
+                    "copy-mode",
+                    "-t",
+                    backend.pane_target(record),
+                    ";",
+                    "send-keys",
+                    "-X",
+                    "-t",
+                    backend.pane_target(record),
+                    "-N",
+                    "3",
+                    "scroll-up",
+                ],
+                check=False,
+                timeout=backend.query_timeout,
+            ),
+        )
+
+    def test_subsequent_codex_wheel_does_not_toggle_transcript_closed(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        backend._scroll_views[record.id] = "codex-transcript"
+        completed = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="", stderr=""
+        )
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", return_value=completed
+        ) as run:
+            handled = backend.scroll_session(record, 4)
+
+        self.assertTrue(handled)
+        run.assert_called_once_with(
+            [
+                "send-keys",
+                "-t",
+                backend.pane_target(record),
+                "-N",
+                "4",
+                "Down",
+            ],
+            check=False,
+            timeout=backend.query_timeout,
+        )
+
+    def test_large_codex_scrollbar_jump_uses_page_navigation(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        backend._scroll_views[record.id] = "codex-transcript"
+        completed = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="", stderr=""
+        )
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+        ), mock.patch.object(backend, "_run", return_value=completed) as run:
+            handled = backend.scroll_session(record, -96)
+
+        self.assertTrue(handled)
+        run.assert_called_once_with(
+            [
+                "send-keys",
+                "-t",
+                backend.pane_target(record),
+                "-N",
+                "4",
+                "PageUp",
+            ],
+            check=False,
+            timeout=backend.query_timeout,
+        )
+
+    def test_interactive_session_leaves_pointer_with_tui_and_bounds_history(self):
         record = _record()
         backend = TmuxBackend(executable="tmux", history_limit=2500)
         completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
@@ -38,17 +190,111 @@ class TmuxBackendTests(unittest.TestCase):
                 "-t",
                 record.tmux_name,
                 "mouse",
-                "on",
+                "off",
                 ";",
                 "set-option",
                 "-t",
                 record.tmux_name,
                 "history-limit",
                 "2500",
+                ";",
+                "set-option",
+                "-w",
+                "-t",
+                backend.pane_target(record),
+                "window-size",
+                "latest",
+                ";",
+                "copy-mode",
+                "-q",
+                "-t",
+                backend.pane_target(record),
             ],
             check=False,
             timeout=backend.query_timeout,
         )
+
+    def test_restore_live_session_disables_mouse_and_leaves_copy_mode(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", return_value=completed
+        ) as run:
+            backend.restore_live_session(record)
+
+        run.assert_called_once_with(
+            [
+                "set-option",
+                "-t",
+                record.tmux_name,
+                "mouse",
+                "off",
+                ";",
+                "set-option",
+                "-w",
+                "-t",
+                backend.pane_target(record),
+                "window-size",
+                "latest",
+                ";",
+                "copy-mode",
+                "-q",
+                "-t",
+                backend.pane_target(record),
+            ],
+            check=False,
+            timeout=backend.query_timeout,
+        )
+
+    def test_restore_live_codex_transcript_closes_it_before_live_input(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        backend._scroll_views[record.id] = "codex-transcript"
+        completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", return_value=completed
+        ) as run:
+            backend.restore_live_session(record)
+
+        self.assertFalse(backend.scroll_view_active(record))
+        run.assert_called_once_with(
+            [
+                "send-keys",
+                "-t",
+                backend.pane_target(record),
+                "C-t",
+                ";",
+                "set-option",
+                "-t",
+                record.tmux_name,
+                "mouse",
+                "off",
+                ";",
+                "set-option",
+                "-w",
+                "-t",
+                backend.pane_target(record),
+                "window-size",
+                "latest",
+                ";",
+                "copy-mode",
+                "-q",
+                "-t",
+                backend.pane_target(record),
+            ],
+            check=False,
+            timeout=backend.query_timeout,
+        )
+
+    def test_terminate_forgets_tracked_scroll_view(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        backend._scroll_views[record.id] = "tmux-history"
+        with mock.patch.object(backend, "session_exists", return_value=False):
+            backend.terminate(record)
+
+        self.assertFalse(backend.scroll_view_active(record))
 
     def test_interactive_configuration_failure_backs_off(self):
         first = _record(id="first", tmux_name="first")
@@ -110,6 +356,39 @@ class TmuxBackendTests(unittest.TestCase):
                 check=False,
                 timeout=backend.query_timeout,
             )
+
+    def test_current_directories_share_batched_pane_snapshot(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            first_directory = Path(tmp) / "first"
+            second_directory = Path(tmp) / "second"
+            first_directory.mkdir()
+            second_directory.mkdir()
+            first = _record(id="a", tmux_name="sess_a")
+            second = _record(id="b", tmux_name="sess_b", pane_target="%9", external=True)
+            backend = TmuxBackend(executable="tmux", pane_cache_ttl=60)
+            completed = subprocess.CompletedProcess(
+                args=["tmux"],
+                returncode=0,
+                stdout=(
+                    f"sess_a\t0\t0\t%3\t111\t{first_directory}\n"
+                    f"sess_b\t1\t2\t%9\t222\t{second_directory}\n"
+                ),
+                stderr="",
+            )
+            with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+                backend, "_run", return_value=completed
+            ) as run:
+                directories = backend.current_directories([first, second])
+                pids = backend.pane_pids([first, second])
+
+            self.assertEqual(
+                directories,
+                {"a": str(first_directory.resolve()), "b": str(second_directory.resolve())},
+            )
+            self.assertEqual(pids, {"a": 111, "b": 222})
+            run.assert_called_once()
 
     def test_session_exists_many_uses_one_bounded_list_call(self):
         first = _record(id="a", tmux_name="sess_a")

@@ -27,7 +27,7 @@ class SessionStoreLayoutTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_restore_candidates_are_window_specific_then_recent_fallback(self):
+    def test_restore_candidates_stay_scoped_to_the_requested_window(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")
             try:
@@ -39,10 +39,11 @@ class SessionStoreLayoutTests(unittest.TestCase):
                 store.update(hidden.id, status="running")
 
                 self.assertEqual([r.id for r in store.restore_candidates(window_id="win-a")], [first.id])
-                fallback_ids = [r.id for r in store.restore_candidates(window_id="empty", limit=10)]
-                self.assertNotIn(hidden.id, fallback_ids)
-                self.assertIn(first.id, fallback_ids)
-                self.assertIn(second.id, fallback_ids)
+                # An empty/unknown window must not pull in every other window's
+                # visible tabs — that collapsed multi-window restore into one.
+                self.assertEqual(store.restore_candidates(window_id="empty", limit=10), [])
+                self.assertEqual([r.id for r in store.restore_candidates(window_id="win-b")], [second.id])
+                self.assertNotIn(hidden.id, [r.id for r in store.restore_candidates(limit=10)])
             finally:
                 store.close()
 

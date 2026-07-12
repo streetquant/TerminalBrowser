@@ -300,12 +300,16 @@ class SessionStore:
         return [self._row_to_record(row) for row in rows]
 
     def restore_candidates(self, limit: int = 12, *, window_id: str | None = None) -> list[SessionRecord]:
-        """Return sessions that should be reattached on app/window startup."""
+        """Return sessions that should be reattached on app/window startup.
+
+        When ``window_id`` is set, only that named window's visible tabs are
+        returned. A previous global fallback (any visible tab from any window)
+        reassigned foreign tabs into the empty window on Restore and collapsed
+        multi-window layouts down to a single window after relaunch.
+        """
 
         clean_limit = max(1, int(limit))
         rows = self.list(visible_only=True, window_id=window_id, include_stopped=False)
-        if not rows and window_id is not None:
-            rows = self.list(visible_only=True, include_stopped=False)
         return rows[:clean_limit]
 
     def rename_window(self, window_id: str, title: str) -> int:

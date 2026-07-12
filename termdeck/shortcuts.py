@@ -63,7 +63,7 @@ ACTION_LABELS: Mapping[str, str] = {
     "close_term": "Close current tab, keep process alive",
     "quit_app": "Quit TermDeck, keep all processes alive",
     "reopen_closed": "Reopen last closed tab",
-    "stop_session": "Stop current session",
+    "stop_session": "Kill current session",
     "next_tab": "Next tab",
     "prev_tab": "Previous tab",
     "focus_side": "Focus side-pane prompt",

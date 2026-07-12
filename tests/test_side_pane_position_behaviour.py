@@ -5,12 +5,16 @@ from termdeck.gtk_app import TermDeckWindow
 
 
 class ChildStub:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, preferred_width=(0, 0)) -> None:
         self.name = name
         self.parent = None
+        self.preferred_width = preferred_width
 
     def get_parent(self):
         return self.parent
+
+    def get_preferred_width(self):
+        return self.preferred_width
 
     def __repr__(self) -> str:
         return self.name
@@ -82,6 +86,14 @@ class SidePanePositionBehaviourTest(TestCase):
                 ('show_all',),
             ],
         )
+
+    def test_pack_side_pane_expands_for_scaled_sidebar_minimum(self) -> None:
+        window = make_pack_window('left')
+        window.side.preferred_width = (444, 574)
+
+        TermDeckWindow._pack_side_pane(window)
+
+        self.assertIn(('position', 444), window.paned.calls)
 
     def test_set_side_pane_position_persists_repacks_and_toasts(self) -> None:
         calls = []

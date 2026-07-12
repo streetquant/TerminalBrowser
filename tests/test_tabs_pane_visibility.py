@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from termdeck.gtk_app import SidePane, TermDeckApplication, TermDeckWindow
+from termdeck.gtk_app import SidePane, TermDeckApplication, TermDeckWindow, _tabs_pane_records
+from termdeck.session_store import SessionStore
 from termdeck.settings import AppSettings
 
 
@@ -40,6 +41,7 @@ class TabsPaneVisibilityTests(unittest.TestCase):
         window = SimpleNamespace(
             tabs_pane_visible=False,
             side=side,
+            _pack_side_pane=lambda: events.append(("layout", "repacked")),
             app_context=app_context,
             show_toast=lambda message, **kwargs: events.append(("toast", message, kwargs)),
         )
@@ -52,6 +54,7 @@ class TabsPaneVisibilityTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
+                ("layout", "repacked"),
                 ("persist", True),
                 ("toast", "Tabs pane shown", {"kind": "info"}),
             ],
@@ -66,6 +69,7 @@ class TabsPaneVisibilityTests(unittest.TestCase):
         window = SimpleNamespace(
             tabs_pane_visible=True,
             side=side,
+            _pack_side_pane=lambda: events.append(("layout", "repacked")),
             app_context=app_context,
             show_toast=lambda message, **kwargs: events.append(("toast", message, kwargs)),
         )
@@ -75,7 +79,13 @@ class TabsPaneVisibilityTests(unittest.TestCase):
         self.assertFalse(window.tabs_pane_visible)
         self.assertFalse(side.visible)
         self.assertEqual(side.refresh_count, 0)
-        self.assertEqual(events, [("toast", "Tabs pane hidden", {"kind": "info"})])
+        self.assertEqual(
+            events,
+            [
+                ("layout", "repacked"),
+                ("toast", "Tabs pane hidden", {"kind": "info"}),
+            ],
+        )
 
     def test_toggle_uses_the_window_visibility_state(self) -> None:
         calls = []
@@ -87,6 +97,47 @@ class TabsPaneVisibilityTests(unittest.TestCase):
         TermDeckWindow.toggle_tabs_pane(window)
 
         self.assertEqual(calls, [True])
+
+    def test_tabs_pane_records_only_include_the_current_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                mine = store.create(
+                    "shell-a",
+                    "terminal",
+                    "bash",
+                    tmp,
+                    window_id="win-a",
+                    window_title="A",
+                    tab_index=0,
+                    visible=True,
+                )
+                store.create(
+                    "shell-b",
+                    "terminal",
+                    "bash",
+                    tmp,
+                    window_id="win-b",
+                    window_title="B",
+                    tab_index=0,
+                    visible=True,
+                )
+                store.create(
+                    "hidden-a",
+                    "terminal",
+                    "bash",
+                    tmp,
+                    window_id="win-a",
+                    window_title="A",
+                    tab_index=1,
+                    visible=False,
+                )
+
+                rows = _tabs_pane_records(store, "win-a")
+
+                self.assertEqual([row.id for row in rows], [mine.id])
+            finally:
+                store.close()
 
     def test_application_persists_and_synchronises_all_windows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

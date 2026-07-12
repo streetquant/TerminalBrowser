@@ -34,7 +34,7 @@ from .master_tasks import filter_rows
 from .models import SessionRecord, TerminalTheme
 from .redaction import redact_text
 from .resources import ResourceSampler
-from .session_lifecycle import archive_records, hide_records, pin_records, recently_closed_records, rename_record, reopen_closed_records, unpin_records
+from .session_lifecycle import archive_records, hide_records, move_records, pin_records, recently_closed_records, rename_record, reopen_closed_records, unpin_records
 from .session_reconcile import reconcile_store
 from .session_search import search_sessions
 from .session_store import SessionStore, short_id, utc_now
@@ -158,10 +158,44 @@ def _connect_debounced_refresh(widget: Gtk.Widget, refresh, *, delay_ms: int = 1
 
 
 SIDE_PANE_HIDDEN_STATUSES = {"archived", "dead", "killed", "missing", "stopped", "terminated"}
+KILLED_HISTORY_STATUSES = {"dead", "killed", "stopped", "terminated"}
+
+
+def _partition_master_rows(records, rows):
+    """Separate durable killed-tab history from currently actionable tabs."""
+
+    history_ids = {
+        record.id
+        for record in records
+        if record.status.casefold() in KILLED_HISTORY_STATUSES
+    }
+    return (
+        [row for row in rows if row.session_id not in history_ids],
+        [row for row in rows if row.session_id in history_ids],
+    )
 
 
 def _show_in_sessions_pane(record: SessionRecord) -> bool:
     return bool(record.visible) and record.status.casefold() not in SIDE_PANE_HIDDEN_STATUSES
+
+
+def _tabs_pane_records(store, window_id: str, query: str = "") -> list[SessionRecord]:
+    """Return registry rows that belong in one window's Tabs pane.
+
+    The shared SQLite store holds every named window. The side pane must only
+    list tabs for its own ``window_id``; otherwise every window's pane shows
+    every other window's tabs.
+    """
+    needle = (query or "").lower().strip()
+    return [
+        record
+        for record in store.list(window_id=window_id)
+        if _show_in_sessions_pane(record)
+        and (
+            not needle
+            or needle in f"{record.name} {record.tag} {record.id} {record.command}".lower()
+        )
+    ]
 
 
 def apply_app_chrome(settings):
@@ -261,6 +295,9 @@ class AttachTerminal(Gtk.Box):
         theme: TerminalTheme,
         *,
         key_press_handler=None,
+        live_focus_handler=None,
+        scroll_handler=None,
+        scrollback_extent: int | None = None,
         font_override: str | None = None,
     ):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
@@ -272,34 +309,74 @@ class AttachTerminal(Gtk.Box):
         self._detached = False
         self._spawn_source_id = 0
         self._spawn_fallback_source_id = 0
+        self._resize_sync_source_id = 0
+        self._cursor_hide_source_id = 0
         self._last_allocated_grid = (0, 0)
+        self._last_synced_grid = (0, 0)
+        self._live_focus_handler = None
+        self._scroll_handler = None
+        self._key_press_handler_id = 0
+        self._history_cursor_hidden = False
         self.terminal = Vte.Terminal()
         self.set_hexpand(True)
         self.set_vexpand(True)
         self.terminal.set_hexpand(True)
         self.terminal.set_vexpand(True)
         apply_theme(self.terminal, theme, font_override=font_override)
-        # A VTE terminal is scrollable, but GTK only exposes its adjustment and
-        # scrollbar when it is hosted by a ScrolledWindow. tmux mouse mode
-        # handles full-screen history; fallback scrolling covers unconsumed
-        # events and non-tmux child output.
-        self.scroller = Gtk.ScrolledWindow()
-        self.scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.scroller.set_hexpand(True)
-        self.scroller.set_vexpand(True)
+        # Match Terminator's terminal layout: VTE and a persistent scrollbar
+        # share one row, with the bar representing the history behind tmux.
+        self.terminal_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.terminal_row.set_hexpand(True)
+        self.terminal_row.set_vexpand(True)
+        # VTE sees the tmux client in its alternate screen, whose adjustment has
+        # no history range and therefore no drawable thumb. Keep a small proxy
+        # adjustment for the history owner behind tmux instead.
+        extent = float(max(100, int(scrollback_extent or theme.scrollback_lines)))
+        page_size = min(24.0, extent - 1.0)
+        self.scroll_adjustment = Gtk.Adjustment.new(
+            extent - page_size,
+            0.0,
+            extent,
+            3.0,
+            page_size,
+            page_size,
+        )
+        self._scrollbar_syncing = False
+        self._last_scrollbar_value = float(self.scroll_adjustment.get_value())
+        self.scrollbar = Gtk.Scrollbar.new(
+            Gtk.Orientation.VERTICAL,
+            adjustment=self.scroll_adjustment,
+        )
+        _style(self.scrollbar, "td-terminal-scrollbar")
+        self.scrollbar.get_style_context().remove_class("overlay-indicator")
+        self.scrollbar.set_size_request(16, -1)
+        self.scrollbar.set_hexpand(False)
+        self.scrollbar.set_vexpand(True)
+        self.scrollbar.set_opacity(1.0)
+        self.scroll_adjustment.connect(
+            "value-changed",
+            self._on_scrollbar_value_changed,
+        )
+        # Do not let VTE translate wheel motion into Up/Down keypresses for an
+        # alternate-screen application. In Codex that cycles prompt history
+        # instead of moving through terminal content.
         try:
-            self.terminal.set_enable_fallback_scrolling(True)
+            self.terminal.set_enable_fallback_scrolling(False)
         except Exception:
             pass
         self.terminal.set_scroll_on_output(False)
         self.terminal.set_scroll_on_keystroke(True)
         # VTE keeps focus for typing; connect here so Ctrl++/- zoom is not swallowed.
-        if key_press_handler is not None:
-            self.terminal.connect("key-press-event", key_press_handler)
+        self.rebind_window_handlers(
+            key_press_handler=key_press_handler,
+            live_focus_handler=live_focus_handler,
+            scroll_handler=scroll_handler,
+        )
         # Select-to-copy: run *after* VTE handles the release so the selection exists.
         self.terminal.connect_after("button-release-event", self._on_button_release)
         self.terminal.connect("selection-changed", self._on_selection_changed)
         self.terminal.connect("button-press-event", self._on_button_press)
+        self.terminal.connect("scroll-event", self._on_terminal_scroll)
         self.terminal.connect("size-allocate", self._on_terminal_size_allocate)
         self.connect("destroy", lambda *_: self._cancel_pending_spawn())
         self._selection_pending = False
@@ -307,12 +384,63 @@ class AttachTerminal(Gtk.Box):
         # Last select-to-copy payload — used when pasting back into this terminal
         # (VTE paste_* can miss text we put on the clipboard ourselves).
         self._last_copied_text = ""
-        self.scroller.add(self.terminal)
-        self.pack_start(self.scroller, True, True, 0)
+        self.terminal_row.pack_start(self.terminal, True, True, 0)
+        self.terminal_row.pack_start(self.scrollbar, False, True, 0)
+        self.pack_start(self.terminal_row, True, True, 0)
         # tmux renders dotted padding when a client attaches at the PTY default
         # 80x24 and the GTK window is resized immediately afterwards. Debounce
         # the initial allocation so tmux receives the final VTE grid from frame 1.
         self._spawn_fallback_source_id = GLib.timeout_add(500, self._spawn_fallback)
+
+    def rebind_window_handlers(
+        self,
+        *,
+        key_press_handler,
+        live_focus_handler,
+        scroll_handler=None,
+    ) -> None:
+        """Retarget window-owned callbacks when this live widget is reparented."""
+
+        if self._key_press_handler_id:
+            try:
+                self.terminal.disconnect(self._key_press_handler_id)
+            except Exception:
+                pass
+            self._key_press_handler_id = 0
+        if callable(key_press_handler):
+            self._key_press_handler_id = self.terminal.connect(
+                "key-press-event",
+                key_press_handler,
+            )
+        self._live_focus_handler = live_focus_handler
+        self._scroll_handler = scroll_handler
+
+    def apply_window_theme(self, theme: TerminalTheme, *, font_override: str) -> None:
+        apply_theme(self.terminal, theme, font_override=font_override)
+        if self._history_cursor_hidden:
+            self._set_history_cursor_hidden(True)
+
+    def _set_history_cursor_hidden(self, hidden: bool) -> None:
+        """Hide a pager's roaming caret while preserving the live cursor style."""
+
+        self._remove_glib_source(self._cursor_hide_source_id)
+        self._cursor_hide_source_id = 0
+        self._history_cursor_hidden = bool(hidden)
+        self.terminal.feed(b"\x1b[?25l" if self._history_cursor_hidden else b"\x1b[?25h")
+        if self._history_cursor_hidden:
+            # The tmux/Codex redraw triggered by the scroll command arrives on
+            # the PTY asynchronously. Reassert once after that frame so its
+            # pager caret cannot flash back into the reviewed content.
+            self._cursor_hide_source_id = GLib.timeout_add(
+                40,
+                self._confirm_history_cursor_hidden,
+            )
+
+    def _confirm_history_cursor_hidden(self) -> bool:
+        self._cursor_hide_source_id = 0
+        if self._history_cursor_hidden and not self._detached:
+            self.terminal.feed(b"\x1b[?25l")
+        return False
 
     @staticmethod
     def _remove_glib_source(source_id: int) -> None:
@@ -326,8 +454,12 @@ class AttachTerminal(Gtk.Box):
     def _cancel_pending_spawn(self) -> None:
         self._remove_glib_source(self._spawn_source_id)
         self._remove_glib_source(self._spawn_fallback_source_id)
+        self._remove_glib_source(self._resize_sync_source_id)
+        self._remove_glib_source(self._cursor_hide_source_id)
         self._spawn_source_id = 0
         self._spawn_fallback_source_id = 0
+        self._resize_sync_source_id = 0
+        self._cursor_hide_source_id = 0
 
     def _on_terminal_size_allocate(self, _terminal, _allocation) -> None:
         columns = max(0, int(self.terminal.get_column_count()))
@@ -335,6 +467,10 @@ class AttachTerminal(Gtk.Box):
         self._last_allocated_grid = (columns, rows)
         if self.process is not None:
             self._sync_pty_geometry(columns=columns, rows=rows)
+            # VTE updates its character grid as part of allocation. Read it
+            # again after GTK finishes the frame so a Paned/window expansion
+            # cannot leave tmux at the previous, smaller grid.
+            self.request_geometry_sync()
             return
         if self._detached or columns < 2 or rows < 2:
             return
@@ -351,6 +487,25 @@ class AttachTerminal(Gtk.Box):
         self._spawn(columns=columns, rows=rows)
         return False
 
+    def request_geometry_sync(self, *, delay_ms: int = 45) -> None:
+        if self._detached:
+            return
+        self._remove_glib_source(self._resize_sync_source_id)
+        self._resize_sync_source_id = GLib.timeout_add(
+            max(0, int(delay_ms)),
+            self._sync_after_stable_geometry,
+        )
+
+    def _sync_after_stable_geometry(self) -> bool:
+        self._resize_sync_source_id = 0
+        if self._detached or self.process is None:
+            return False
+        columns = max(0, int(self.terminal.get_column_count()))
+        rows = max(0, int(self.terminal.get_row_count()))
+        self._last_allocated_grid = (columns, rows)
+        self._sync_pty_geometry(columns=columns, rows=rows, force=True)
+        return False
+
     def _spawn_fallback(self) -> bool:
         self._spawn_fallback_source_id = 0
         if self.process is not None or self._detached:
@@ -360,13 +515,25 @@ class AttachTerminal(Gtk.Box):
         self._spawn(columns=columns, rows=rows)
         return False
 
-    def _sync_pty_geometry(self, *, columns: int, rows: int) -> None:
+    def _sync_pty_geometry(self, *, columns: int, rows: int, force: bool = False) -> None:
         if columns < 2 or rows < 2 or self.pty_obj is None:
+            return
+        grid = (columns, rows)
+        if grid == self._last_synced_grid and not force:
             return
         try:
             self.pty_obj.set_size(rows, columns)
+            self._last_synced_grid = grid
         except Exception:
-            pass
+            return
+        # VTE may already have applied the same kernel winsize by the time a
+        # debounced layout callback runs. An explicit SIGWINCH makes the tmux
+        # client re-read it even when a repeated TIOCSWINSZ is a no-op.
+        if self.process is not None and self.process.poll() is None:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGWINCH)
+            except (OSError, ProcessLookupError):
+                pass
 
     def _spawn(self, *, columns: int, rows: int) -> None:
         if self.process is not None or self._detached:
@@ -383,6 +550,7 @@ class AttachTerminal(Gtk.Box):
                 pass
         try:
             self.pty_obj = Vte.Pty.new_foreign_sync(master_fd, None)
+            self._last_synced_grid = (0, 0)
             self._sync_pty_geometry(columns=columns, rows=rows)
             self.terminal.set_pty(self.pty_obj)
             self.process = subprocess.Popen(
@@ -431,8 +599,63 @@ class AttachTerminal(Gtk.Box):
         """Paste PRIMARY selection into the shell as input (middle-click)."""
         self._paste_from_selection(Gdk.SELECTION_PRIMARY, prefer_last=True)
 
+    def scroll_to_bottom(self) -> None:
+        """Return the VTE viewport to the live terminal screen."""
+
+        self.reset_scrollbar()
+        try:
+            adjustment = self.terminal.get_vadjustment()
+            bottom = max(
+                adjustment.get_lower(),
+                adjustment.get_upper() - adjustment.get_page_size(),
+            )
+            adjustment.set_value(bottom)
+        except Exception:
+            pass
+
+    def _set_scrollbar_value(self, value: float) -> None:
+        adjustment = self.scroll_adjustment
+        lower = float(adjustment.get_lower())
+        upper = max(
+            lower,
+            float(adjustment.get_upper()) - float(adjustment.get_page_size()),
+        )
+        self._scrollbar_syncing = True
+        try:
+            adjustment.set_value(min(upper, max(lower, float(value))))
+            self._last_scrollbar_value = float(adjustment.get_value())
+        finally:
+            self._scrollbar_syncing = False
+
+    def _move_scrollbar(self, lines: int) -> None:
+        self._set_scrollbar_value(self._last_scrollbar_value + int(lines))
+
+    def reset_scrollbar(self) -> None:
+        adjustment = self.scroll_adjustment
+        self._set_scrollbar_value(
+            float(adjustment.get_upper()) - float(adjustment.get_page_size())
+        )
+
+    def _on_scrollbar_value_changed(self, adjustment) -> None:
+        if self._scrollbar_syncing:
+            return
+        previous = float(self._last_scrollbar_value)
+        requested = float(adjustment.get_value())
+        delta = int(round(requested - previous))
+        if not delta:
+            return
+        handler = self._scroll_handler
+        try:
+            if callable(handler) and handler(delta):
+                self._set_history_cursor_hidden(True)
+                self._last_scrollbar_value = requested
+                return
+        except Exception:
+            pass
+        self._set_scrollbar_value(previous)
+
     def _feed_text(self, text: str) -> bool:
-        """Inject text into the terminal PTY as if the user typed it."""
+        """Paste text through VTE so bracketed-paste mode can prevent submit."""
         if not text:
             return False
         # Avoid pasting the active highlight into itself weirdly — clear selection.
@@ -441,7 +664,15 @@ class AttachTerminal(Gtk.Box):
                 self.terminal.unselect_all()
         except Exception:
             pass
-        data = text.encode("utf-8") if isinstance(text, str) else bytes(text)
+        clean_text = text if isinstance(text, str) else bytes(text).decode("utf-8", errors="replace")
+        try:
+            # Unlike feed_child(), paste_text() applies VTE's clipboard
+            # processing, including bracketed paste when the child enables it.
+            self.terminal.paste_text(clean_text)
+            return True
+        except Exception:
+            pass
+        data = clean_text.encode("utf-8")
         try:
             if hasattr(self.terminal, "feed_child_binary"):
                 self.terminal.feed_child_binary(data)
@@ -450,6 +681,118 @@ class AttachTerminal(Gtk.Box):
             pass
         try:
             self.terminal.feed_child(data)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _key_event_bytes(event: Gdk.EventKey) -> bytes | None:
+        """Encode one GTK key press for direct delivery to the child PTY."""
+
+        keyval = int(getattr(event, "keyval", 0) or 0)
+        state = int(getattr(event, "state", 0) or 0)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        alt = bool(state & Gdk.ModifierType.MOD1_MASK)
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        modifier = 1 + int(shift) + (2 * int(alt)) + (4 * int(ctrl))
+
+        simple = {
+            Gdk.KEY_Return: b"\r",
+            Gdk.KEY_KP_Enter: b"\r",
+            Gdk.KEY_Tab: b"\t",
+            Gdk.KEY_BackSpace: b"\x7f",
+            Gdk.KEY_Escape: b"\x1b",
+        }
+        if keyval == Gdk.KEY_ISO_Left_Tab:
+            return b"\x1b[Z"
+        if keyval in simple:
+            return simple[keyval]
+
+        final_keys = {
+            Gdk.KEY_Up: "A",
+            Gdk.KEY_Down: "B",
+            Gdk.KEY_Right: "C",
+            Gdk.KEY_Left: "D",
+            Gdk.KEY_Home: "H",
+            Gdk.KEY_End: "F",
+        }
+        if keyval in final_keys:
+            final = final_keys[keyval]
+            return (f"\x1b[{final}" if modifier == 1 else f"\x1b[1;{modifier}{final}").encode()
+
+        tilde_keys = {
+            Gdk.KEY_Insert: 2,
+            Gdk.KEY_Delete: 3,
+            Gdk.KEY_Page_Up: 5,
+            Gdk.KEY_Page_Down: 6,
+            Gdk.KEY_F5: 15,
+            Gdk.KEY_F6: 17,
+            Gdk.KEY_F7: 18,
+            Gdk.KEY_F8: 19,
+            Gdk.KEY_F9: 20,
+            Gdk.KEY_F10: 21,
+            Gdk.KEY_F11: 23,
+            Gdk.KEY_F12: 24,
+        }
+        if keyval in tilde_keys:
+            number = tilde_keys[keyval]
+            return (f"\x1b[{number}~" if modifier == 1 else f"\x1b[{number};{modifier}~").encode()
+
+        function_keys = {
+            Gdk.KEY_F1: "P",
+            Gdk.KEY_F2: "Q",
+            Gdk.KEY_F3: "R",
+            Gdk.KEY_F4: "S",
+        }
+        if keyval in function_keys:
+            final = function_keys[keyval]
+            return (f"\x1bO{final}" if modifier == 1 else f"\x1b[1;{modifier}{final}").encode()
+
+        codepoint = int(Gdk.keyval_to_unicode(keyval) or 0)
+        if not codepoint:
+            return None
+        character = chr(codepoint)
+        if ctrl:
+            lowered = character.casefold()
+            if "a" <= lowered <= "z":
+                data = bytes([ord(lowered) - ord("a") + 1])
+            elif character in {" ", "@", "2"}:
+                data = b"\x00"
+            elif character in {"[", "3"}:
+                data = b"\x1b"
+            elif character in {"\\", "4"}:
+                data = b"\x1c"
+            elif character in {"]", "5"}:
+                data = b"\x1d"
+            elif character in {"^", "6"}:
+                data = b"\x1e"
+            elif character in {"_", "7", "/"}:
+                data = b"\x1f"
+            elif character in {"?", "8"}:
+                data = b"\x7f"
+            else:
+                return None
+        else:
+            data = character.encode("utf-8")
+        return (b"\x1b" + data) if alt else data
+
+    def feed_key_event(self, event: Gdk.EventKey) -> bool:
+        """Deliver the first key pressed while another window control had focus."""
+
+        data = self._key_event_bytes(event)
+        if not data:
+            return False
+        try:
+            if self.pty_obj is not None:
+                os.write(self.pty_obj.get_fd(), data)
+                return True
+        except (AttributeError, BlockingIOError, OSError):
+            pass
+        try:
+            if hasattr(self.terminal, "feed_child_binary"):
+                self.terminal.feed_child_binary(data)
+            else:
+                self.terminal.feed_child(data)
             return True
         except Exception:
             return False
@@ -587,8 +930,10 @@ class AttachTerminal(Gtk.Box):
             return False
 
         self._last_copied_text = text
-        # Update VTE first. The durable GTK text owners are installed last so
-        # changing focus or clearing the terminal highlight cannot empty them.
+        # Let VTE keep PRIMARY ownership so the selected range stays visibly
+        # highlighted. Reclaiming PRIMARY through Gtk.Clipboard.set_text()
+        # immediately clears VTE's selection. CLIPBOARD is separate, so keep a
+        # durable plain-text owner there for paste after the highlight clears.
         try:
             if hasattr(self.terminal, "copy_clipboard_format"):
                 self.terminal.copy_clipboard_format(Vte.Format.TEXT)
@@ -602,7 +947,6 @@ class AttachTerminal(Gtk.Box):
         except Exception:
             pass
         self._set_clipboard_text(text, Gdk.SELECTION_CLIPBOARD)
-        self._set_clipboard_text(text, Gdk.SELECTION_PRIMARY)
         return True
 
     def _on_selection_changed(self, _terminal) -> None:
@@ -653,6 +997,11 @@ class AttachTerminal(Gtk.Box):
 
     def _on_button_press(self, _terminal, event: Gdk.EventButton) -> bool:
         button = int(getattr(event, "button", 0) or 0)
+        if button == 1:
+            # Let VTE see the complete press/drag/release gesture first. Live
+            # viewport restoration happens on release only when no selection
+            # was created, so ordinary drag-to-copy does not get cancelled.
+            return False
         # Middle-click paste from PRIMARY / last selection (classic terminal).
         if button == 2:
             self.paste_primary()
@@ -662,21 +1011,85 @@ class AttachTerminal(Gtk.Box):
             return True
         return False
 
+    def _on_terminal_scroll(self, terminal, event: Gdk.EventScroll) -> bool:
+        """Scroll the owning session without synthesizing composer key input."""
+
+        direction = getattr(event, "direction", None)
+        if direction not in {
+            Gdk.ScrollDirection.UP,
+            Gdk.ScrollDirection.DOWN,
+            Gdk.ScrollDirection.SMOOTH,
+        }:
+            return False
+        if direction == Gdk.ScrollDirection.UP:
+            delta = -3.0
+        elif direction == Gdk.ScrollDirection.DOWN:
+            delta = 3.0
+        else:
+            delta = float(getattr(event, "delta_y", 0.0) or 0.0)
+        handler = getattr(self, "_scroll_handler", None)
+        if callable(handler):
+            line_delta = int(round(delta))
+            if not line_delta and delta:
+                line_delta = -1 if delta < 0 else 1
+            try:
+                if line_delta and handler(line_delta):
+                    self._set_history_cursor_hidden(True)
+                    mover = getattr(self, "_move_scrollbar", None)
+                    if callable(mover):
+                        mover(line_delta)
+                    return True
+            except Exception:
+                pass
+        adjustment = terminal.get_vadjustment()
+        step = max(1.0, float(adjustment.get_step_increment() or 1.0))
+        lower = float(adjustment.get_lower())
+        upper = max(
+            lower,
+            float(adjustment.get_upper()) - float(adjustment.get_page_size()),
+        )
+        value = float(adjustment.get_value()) + (delta * step)
+        adjustment.set_value(min(upper, max(lower, value)))
+        return True
+
+    def prepare_for_live_input(self) -> None:
+        self.reset_scrollbar()
+        handler = self._live_focus_handler
+        if callable(handler):
+            try:
+                handler()
+            except Exception:
+                pass
+        self._set_history_cursor_hidden(False)
+        self.request_geometry_sync(delay_ms=0)
+
     def _on_button_release(self, _terminal, event: Gdk.EventButton) -> bool:
         # Left-button release after a drag/select → immediate auto-copy.  This
         # keeps the browser-like feel while the selection-changed debounce covers
         # keyboard/double-click paths that may not deliver a useful release edge.
         button = int(getattr(event, "button", 0) or 0)
         if button == 1:
-            source_id = getattr(self, "_selection_autocopy_source_id", 0)
-            if source_id:
-                try:
-                    GLib.source_remove(source_id)
-                except Exception:
-                    pass
-                self._selection_autocopy_source_id = 0
-            # Idle so VTE finishes updating the selection buffer first.
-            GLib.idle_add(self._copy_selection_to_clipboards_idle)
+            try:
+                has_selection = bool(self.terminal.get_has_selection())
+            except Exception:
+                has_selection = False
+            if has_selection:
+                source_id = getattr(self, "_selection_autocopy_source_id", 0)
+                if source_id:
+                    try:
+                        GLib.source_remove(source_id)
+                    except Exception:
+                        pass
+                    self._selection_autocopy_source_id = 0
+                # Idle so VTE finishes updating the selection buffer first.
+                GLib.idle_add(self._copy_selection_to_clipboards_idle)
+            elif not (
+                int(getattr(event, "state", 0) or 0)
+                & Gdk.ModifierType.SHIFT_MASK
+            ):
+                self.prepare_for_live_input()
+                self.scroll_to_bottom()
+                self.terminal.grab_focus()
         return False
 
     def _copy_selection_to_clipboards_idle(self) -> bool:
@@ -1533,6 +1946,8 @@ class SidePane(Gtk.Box):
         scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self.session_box = Gtk.ListBox()
         self.session_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.session_box.set_activate_on_single_click(True)
+        self.session_box.connect("row-activated", self._on_session_row_activated)
         scroller.add(self.session_box)
         self.pack_start(scroller, True, True, 0)
 
@@ -1636,6 +2051,41 @@ class SidePane(Gtk.Box):
             return True
         return False
 
+    def _on_session_row_activated(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        record = getattr(row, "_termdeck_session_record", None)
+        if record is not None:
+            self.window.open_session(record)
+
+    def _on_session_card_press(
+        self,
+        card_event: Gtk.EventBox,
+        event: Gdk.EventButton,
+        record: SessionRecord,
+        check: Gtk.CheckButton,
+    ) -> bool:
+        if self._on_session_button_press(card_event, event, record, check):
+            return True
+        if int(getattr(event, "button", 0) or 0) != 1:
+            return False
+
+        # Buttons and the checkbox own their click. Some GTK themes propagate
+        # their press to the containing EventBox before emitting ``clicked``;
+        # do not turn Rename, Open, or selection into an extra navigation.
+        try:
+            source = Gtk.get_event_widget(event)
+        except Exception:
+            source = None
+        while source is not None and source is not card_event:
+            if isinstance(source, Gtk.Button):
+                return False
+            try:
+                source = source.get_parent()
+            except Exception:
+                break
+
+        self.window.open_session(record)
+        return True
+
     def _context_records(self, record: SessionRecord) -> list[SessionRecord]:
         if record.id in self.selected_ids:
             records = self.selected_records()
@@ -1717,12 +2167,11 @@ class SidePane(Gtk.Box):
             self._last_refresh_signature = None
             return
         query = self.filter_entry.get_text().lower().strip()
-        matching_records = [
-            record
-            for record in self.window.app_context.store.list()
-            if _show_in_sessions_pane(record)
-            and (not query or query in f"{record.name} {record.tag} {record.id} {record.command}".lower())
-        ]
+        matching_records = _tabs_pane_records(
+            self.window.app_context.store,
+            self.window.window_id,
+            query,
+        )
         live_ids = {record.id for record in matching_records}
         self._visible_record_count = len(matching_records)
         self.selected_ids.intersection_update(live_ids)
@@ -1781,6 +2230,7 @@ class SidePane(Gtk.Box):
             empty_card.pack_start(empty_actions, False, False, 0)
             row = Gtk.ListBoxRow()
             row.set_selectable(False)
+            row.set_activatable(False)
             row.add(empty_card)
             self.session_box.add(row)
             self.session_box.show_all()
@@ -1846,9 +2296,17 @@ class SidePane(Gtk.Box):
             card.pack_start(actions, False, False, 0)
 
             card_event = Gtk.EventBox()
+            card_event.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
             card_event.add(card)
-            card_event.connect("button-press-event", self._on_session_button_press, record, check)
+            card_event.connect("button-press-event", self._on_session_card_press, record, check)
             row = Gtk.ListBoxRow()
+            # GtkListBox only emits its single-click activation path for rows
+            # that participate in pointer selection. The list itself remains
+            # in SelectionMode.NONE, so this enables activation without adding
+            # a second visual selection state beside the explicit checkbox.
+            row.set_selectable(True)
+            row.set_activatable(True)
+            row._termdeck_session_record = record  # type: ignore[attr-defined]
             row.add(card_event)
             self.session_box.add(row)
         self.session_box.show_all()
@@ -2038,6 +2496,27 @@ class MasterWindow(Gtk.Window):
         "Directory",
     ]
 
+    def _build_session_tree(self, model: Gtk.ListStore) -> Gtk.TreeView:
+        tree = Gtk.TreeView(model=model)
+        _style(tree, "td-master-tree")
+        tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        tree.get_selection().connect("changed", lambda *_: self.update_capture_preview())
+        tree.get_selection().connect("changed", lambda *_: self.update_remove_sensitivity())
+        tree.connect("button-press-event", self._on_tree_button_press)
+        for idx, column in enumerate(self.COLUMNS):
+            renderer = Gtk.CellRendererText()
+            if column in {"ID", "PID", "Focus Key", "Pause Key", "CPU", "RAM"}:
+                renderer.set_property("family", "Monospace")
+            if column == "Health":
+                renderer.set_property("weight", 600)
+            col = Gtk.TreeViewColumn(column, renderer, text=idx)
+            col.set_resizable(True)
+            col.set_sort_column_id(idx)
+            if column in {"Command", "Directory", "Health"}:
+                col.set_expand(True)
+            tree.append_column(col)
+        return tree
+
     def __init__(self, app_context: "TermDeckApplication"):
         super().__init__(title="TermDeck Tab Manager")
         self.app_context = app_context
@@ -2054,27 +2533,16 @@ class MasterWindow(Gtk.Window):
         self.set_default_size(1180, 620)
         _wire_auxiliary_close(self)
         self.store = Gtk.ListStore(*([str] * len(self.COLUMNS)))
-        self.tree = Gtk.TreeView(model=self.store)
-        _style(self.tree, "td-master-tree")
-        self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
-        self.tree.get_selection().connect("changed", lambda *_: self.update_capture_preview())
-        for idx, column in enumerate(self.COLUMNS):
-            renderer = Gtk.CellRendererText()
-            if column in {"ID", "PID", "Focus Key", "Pause Key", "CPU", "RAM"}:
-                renderer.set_property("family", "Monospace")
-            if column == "Health":
-                # Badge-like emphasis via weight; colour comes from CSS selection.
-                renderer.set_property("weight", 600)
-            col = Gtk.TreeViewColumn(column, renderer, text=idx)
-            col.set_resizable(True)
-            col.set_sort_column_id(idx)
-            if column in {"Command", "Directory", "Health"}:
-                col.set_expand(True)
-            self.tree.append_column(col)
+        self.history_store = Gtk.ListStore(*([str] * len(self.COLUMNS)))
+        self.tree = self._build_session_tree(self.store)
+        self.history_tree = self._build_session_tree(self.history_store)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
         explanation = Gtk.Label(
-            label="One row per tab/process with resource details, captured output, and control actions.",
+            label=(
+                "Tabs contains current processes; Killed history keeps stopped tabs until Remove. "
+                "Right-click a row to move that tab to another or a new window."
+            ),
             xalign=0,
         )
         _style(explanation, "td-section-description")
@@ -2097,9 +2565,19 @@ class MasterWindow(Gtk.Window):
         top.pack_start(clear, False, False, 0)
         outer.pack_start(top, False, False, 0)
 
-        scroller = Gtk.ScrolledWindow()
-        scroller.add(self.tree)
-        outer.pack_start(scroller, True, True, 0)
+        self.view_notebook = Gtk.Notebook()
+        for label, tree in (
+            ("Tabs", self.tree),
+            ("Killed history", self.history_tree),
+        ):
+            scroller = Gtk.ScrolledWindow()
+            scroller.add(tree)
+            self.view_notebook.append_page(scroller, Gtk.Label(label=label))
+        self.view_notebook.connect_after(
+            "switch-page",
+            lambda *_: self.refresh(),
+        )
+        outer.pack_start(self.view_notebook, True, True, 0)
 
         self.capture_view = Gtk.TextView()
         self.capture_view.set_editable(False)
@@ -2133,14 +2611,17 @@ class MasterWindow(Gtk.Window):
             ("Resume", self.resume_selected),
             ("Pin", self.pin_selected),
             ("Unpin", self.unpin_selected),
-            ("Hide", self.hide_selected),
-            ("Stop", self.kill_selected),
+            ("Remove", self.remove_selected),
+            ("Kill", self.kill_selected),
             ("Archive", self.archive_selected),
             ("Pause Hot", self.pause_hot),
             ("Refresh", self.refresh),
         ]:
             button = Gtk.Button(label=label)
             button.connect("clicked", lambda _b, h=handler: h())
+            if label == "Remove":
+                self.remove_button = button
+                button.set_tooltip_text("Permanently forget selected stopped tabs")
             actions.pack_start(button, False, False, 0)
         outer.pack_start(actions, False, False, 0)
         self.add(outer)
@@ -2154,13 +2635,18 @@ class MasterWindow(Gtk.Window):
             self.refresh()
         return True
 
-    def selected_ids(self) -> list[str]:
-        model, paths = self.tree.get_selection().get_selected_rows()
+    @staticmethod
+    def _selected_ids_for_tree(tree: Gtk.TreeView) -> list[str]:
+        model, paths = tree.get_selection().get_selected_rows()
         ids = []
         for path in paths:
             iter_ = model.get_iter(path)
             ids.append(model.get_value(iter_, 0))
         return ids
+
+    def selected_ids(self) -> list[str]:
+        tree = self.history_tree if self.view_notebook.get_current_page() == 1 else self.tree
+        return self._selected_ids_for_tree(tree)
 
     def selected_records(self) -> list[SessionRecord]:
         records = []
@@ -2170,9 +2656,87 @@ class MasterWindow(Gtk.Window):
                 records.append(record)
         return records
 
+    def _move_record_to_window(self, record: SessionRecord, destination: "TermDeckWindow") -> None:
+        if self.app_context.move_tab_to_window(record.id, destination) is None:
+            self.refresh()
+
+    def _move_record_to_new_window(self, record: SessionRecord) -> None:
+        destination = self.app_context.prompt_for_new_window(
+            parent=self,
+            open_initial_tab=False,
+        )
+        if destination is not None:
+            self._move_record_to_window(record, destination)
+
+    def _show_row_context_menu(self, record: SessionRecord, event: Gdk.EventButton) -> None:
+        menu = Gtk.Menu()
+        move_item = Gtk.MenuItem(label="Move to window")
+        destinations = self.app_context.available_move_windows(record)
+        submenu = Gtk.Menu()
+        if destinations:
+            for destination in destinations:
+                item = Gtk.MenuItem(label=destination.window_title)
+                item.connect(
+                    "activate",
+                    lambda _item, target=destination: self._move_record_to_window(record, target),
+                )
+                submenu.append(item)
+        else:
+            unavailable = Gtk.MenuItem(label="No other open windows")
+            unavailable.set_sensitive(False)
+            submenu.append(unavailable)
+        new_window = Gtk.MenuItem(label="New window…")
+        new_window.connect(
+            "activate",
+            lambda _item: self._move_record_to_new_window(record),
+        )
+        submenu.append(new_window)
+        move_item.set_submenu(submenu)
+        menu.append(move_item)
+        menu.show_all()
+        # Keep a reference while the popup is active. This also gives the real
+        # GTK smoke a stable way to verify the menu created by a pointer click.
+        self._row_context_menu = menu
+        try:
+            menu.popup_at_pointer(event)
+        except Exception:
+            menu.popup(
+                None,
+                None,
+                None,
+                None,
+                int(getattr(event, "button", 3) or 3),
+                int(getattr(event, "time", 0) or 0),
+            )
+
+    def _on_tree_button_press(self, _tree, event: Gdk.EventButton) -> bool:
+        if int(getattr(event, "button", 0) or 0) != 3:
+            return False
+        target = _tree.get_path_at_pos(
+            int(getattr(event, "x", 0) or 0),
+            int(getattr(event, "y", 0) or 0),
+        )
+        if target is None:
+            return False
+        path, column = target[0], target[1]
+        selection = _tree.get_selection()
+        selection.unselect_all()
+        selection.select_path(path)
+        _tree.set_cursor(path, column, False)
+        model = _tree.get_model()
+        iter_ = model.get_iter(path)
+        session_id = model.get_value(iter_, 0)
+        record = self.app_context.store.get(session_id)
+        if record is None:
+            return False
+        self._show_row_context_menu(record, event)
+        return True
+
     def refresh(self, *_args) -> None:
-        selected = set(self.selected_ids())
+        selected_tabs = set(self._selected_ids_for_tree(self.tree))
+        selected_history = set(self._selected_ids_for_tree(self.history_tree))
         self.store.clear()
+        self.history_store.clear()
         records = self.app_context.store.list()
         items = build_task_snapshot(
             records,
@@ -2182,20 +2746,28 @@ class MasterWindow(Gtk.Window):
             snapshot_refresh_limit=UI_RESOURCE_REFRESH_BUDGET,
         )
         matching = filter_rows([item.row for item in items], self.filter_entry.get_text())
-        shown = matching[:MASTER_ROW_LIMIT]
-        if len(shown) < len(matching):
-            self.count_label.set_text(f"{len(shown)} shown · {len(matching)} matching · {len(records)} total")
-        elif len(matching) != len(records):
-            self.count_label.set_text(f"{len(matching)} matching · {len(records)} total")
+        tab_rows, history_rows = _partition_master_rows(records, matching)
+        showing_history = self.view_notebook.get_current_page() == 1
+        current_rows = history_rows if showing_history else tab_rows
+        shown = current_rows[:MASTER_ROW_LIMIT]
+        if len(shown) < len(current_rows):
+            self.count_label.set_text(f"{len(shown)} shown · {len(current_rows)} matching · {len(records)} total")
+        elif len(current_rows) != len(records):
+            self.count_label.set_text(f"{len(current_rows)} matching · {len(records)} total")
         else:
             self.count_label.set_text(f"{len(records)} tabs")
-        for row in shown:
-            values = row.as_list()
-            iter_ = self.store.append(values[:3] + values[4:])
-            if row.session_id in selected:
-                path = self.store.get_path(iter_)
-                self.tree.get_selection().select_path(path)
+        for model, tree, rows, selected in (
+            (self.store, self.tree, tab_rows, selected_tabs),
+            (self.history_store, self.history_tree, history_rows, selected_history),
+        ):
+            for row in rows[:MASTER_ROW_LIMIT]:
+                values = row.as_list()
+                iter_ = model.append(values[:3] + values[4:])
+                if row.session_id in selected:
+                    path = model.get_path(iter_)
+                    tree.get_selection().select_path(path)
         self.update_capture_preview()
+        self.update_remove_sensitivity()
 
     def set_capture_text(self, text: str) -> None:
         buffer = self.capture_view.get_buffer()
@@ -2279,8 +2851,27 @@ class MasterWindow(Gtk.Window):
 
     def focus_selected(self, *_args) -> None:
         records = self.selected_records()
-        if records and self.app_context.windows:
-            self.app_context.windows[-1].open_session(records[0])
+        if not records:
+            return
+        record = records[0]
+        target = self.app_context.window_for_tab(record.id)
+        if target is None:
+            target = next(
+                (
+                    window
+                    for window in self.app_context.windows
+                    if window.window_id == record.window_id
+                ),
+                None,
+            )
+        if target is None:
+            return
+        target.open_session(
+            record,
+            restart_missing=False,
+            remember_layout=False,
+        )
+        target.present()
 
     def rename_selected(self, *_args) -> None:
         records = self.selected_records()
@@ -2346,19 +2937,50 @@ class MasterWindow(Gtk.Window):
             self.app_context.store.update(record.id, status="paused", last_pid=new_pid)
         self.refresh()
 
-    def hide_selected(self, *_args) -> None:
+    def remove_selected(self, *_args) -> None:
+        """Remove selected tabs from the manager display and session registry.
+
+        Remove is post-stop cleanup only. It never signals a process and never
+        deletes a live, paused, new, missing, or pinned tab.
+        """
+
         records = self.selected_records()
-        if not records:
+        if not records or any(
+            record.status.casefold() != "stopped" or record.pinned
+            for record in records
+        ):
+            MasterWindow.update_remove_sensitivity(self)
             return
         for record in records:
-            hidden_in_live_window = False
             for window in self.app_context.windows:
-                if record.id in window.tabs:
-                    window.hide_tab(record.id)
-                    hidden_in_live_window = True
-            if not hidden_in_live_window:
-                hide_records(self.app_context.store, [record])
+                if record.id in getattr(window, "tabs", {}):
+                    remove_widget = getattr(window, "_remove_tab_widget", None)
+                    if callable(remove_widget) and remove_widget(record.id):
+                        renumber = getattr(window, "_renumber_visible_tabs", None)
+                        if callable(renumber):
+                            renumber()
+                        side = getattr(window, "side", None)
+                        refresh_side = getattr(side, "refresh", None) if side is not None else None
+                        if callable(refresh_side):
+                            refresh_side()
+            try:
+                self.app_context.store.delete(record.id)
+            except Exception:
+                pass
         self.refresh()
+
+    def update_remove_sensitivity(self) -> None:
+        records = self.selected_records()
+        allowed = bool(records) and all(
+            record.status.casefold() == "stopped" and not record.pinned
+            for record in records
+        )
+        button = getattr(self, "remove_button", None)
+        if button is not None:
+            button.set_sensitive(allowed)
+
+    # Backward-compatible alias used by older call sites / tests.
+    hide_selected = remove_selected
 
     def archive_selected(self, *_args) -> None:
         records = self.selected_records()
@@ -2423,6 +3045,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.set_default_size(app_context.theme.window_width or 1280, app_context.theme.window_height or 780)
         self.tabs_pane_visible = bool(getattr(app_context.settings, "tabs_pane_visible", False))
         self._toast_source = None
+        self._tab_directory_refresh_alive = True
+        self._terminal_layout_sync_source_id = 0
+        self._side_pane_layout_source_id = 0
         # Relative point delta from the configured theme font (Ctrl++ / Ctrl+-).
         self.font_zoom_delta = 0
 
@@ -2441,7 +3066,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         new_tab = _icon_button(
             "New tab",
             "list-add-symbolic",
-            "New tab · Ctrl+T · opens in the active terminal directory",
+            "New tab · Ctrl+T · opens in the home directory",
             self.new_tab,
             suggested=False,
             show_label=False,
@@ -2514,15 +3139,42 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
         self.connect("key-press-event", self.on_key_press)
         self.connect("delete-event", self.on_delete)
+        self.connect("destroy", self._on_destroy)
         self.show_all()
         self.side.set_visible(self.tabs_pane_visible)
+        if self.tabs_pane_visible:
+            self._queue_side_pane_layout_repack()
         self.side.refresh()
         self.restore_previous_tabs(records=restore_records)
+        GLib.timeout_add_seconds(
+            int(max(1, round(getattr(app_context.settings, "ui_refresh_interval_seconds", 5.0)))),
+            self._refresh_tab_directories_timer,
+        )
 
     def on_delete(self, *_args) -> bool:
+        # Detach VTE clients only. Leave tab rows visible so browser-style
+        # multi-window restore can reopen this named window on the next launch.
         for tab in list(self.tabs.values()):
             tab.widget.detach()
         return False
+
+    def _on_destroy(self, *_args) -> None:
+        self._tab_directory_refresh_alive = False
+        if self._terminal_layout_sync_source_id:
+            try:
+                GLib.source_remove(self._terminal_layout_sync_source_id)
+            except Exception:
+                pass
+            self._terminal_layout_sync_source_id = 0
+        if self._side_pane_layout_source_id:
+            try:
+                GLib.source_remove(self._side_pane_layout_source_id)
+            except Exception:
+                pass
+            self._side_pane_layout_source_id = 0
+        windows = getattr(self.app_context, "windows", None)
+        if isinstance(windows, list) and self in windows:
+            windows.remove(self)
 
     def _build_tab_label(self, record: SessionRecord) -> Gtk.Box:
         """Minimal notebook tab containing only the tab name and close control."""
@@ -2608,7 +3260,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             menu.append(self._tab_menu_item("Unpin and hide tab", lambda: self._unpin_and_hide_tab(record)))
         menu.append(self._tab_menu_item("Hide other tabs", lambda: self._hide_other_tabs(record)))
         menu.append(self._tab_menu_item("Hide tabs to the right", lambda: self._hide_tabs_to_right(record)))
-        menu.append(self._tab_menu_item("Stop tab", lambda: self.stop_session(record)))
+        menu.append(self._tab_menu_item("Kill tab", lambda: self.stop_session(record)))
         menu.append(Gtk.SeparatorMenuItem())
         menu.append(self._tab_menu_item("Move tabs pane to left", lambda: self.set_side_pane_position("left")))
         menu.append(self._tab_menu_item("Move tabs pane to right", lambda: self.set_side_pane_position("right")))
@@ -2665,6 +3317,60 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if page < 0:
             return
         self.notebook.set_tab_label(tab.widget, self._build_tab_label(record))
+
+    @staticmethod
+    def _directory_tracking_changes(record: SessionRecord, live_directory: str) -> dict[str, str]:
+        old_directory = normalise_directory(record.cwd)
+        new_directory = normalise_directory(live_directory)
+        if old_directory == new_directory:
+            return {}
+        changes = {"cwd": new_directory}
+        # Default names follow cwd; a deliberate custom rename remains an
+        # override because it no longer matches the previous cwd basename.
+        if record.name == directory_tab_name(old_directory):
+            changes["name"] = directory_tab_name(new_directory)
+        return changes
+
+    def refresh_tab_directories(self) -> int:
+        records = [tab.record for tab in self.tabs.values()]
+        resolve_many = getattr(self.app_context.backend, "current_directories", None)
+        if not records or not callable(resolve_many):
+            return 0
+        try:
+            live_by_id = resolve_many(records)
+        except Exception:
+            return 0
+        changed = 0
+        for session_id, tab in list(self.tabs.items()):
+            live_directory = live_by_id.get(session_id)
+            if not live_directory:
+                continue
+            record = self.app_context.store.get(session_id) or tab.record
+            changes = self._directory_tracking_changes(record, live_directory)
+            if not changes:
+                continue
+            try:
+                updated = self.app_context.store.update(
+                    session_id,
+                    last_opened_at=record.last_opened_at,
+                    **changes,
+                )
+            except KeyError:
+                continue
+            self.refresh_tab_label(updated)
+            changed += 1
+        if changed:
+            self.side.refresh()
+            if self.master_window is not None and self.master_window.get_visible():
+                self.master_window.refresh()
+        return changed
+
+    def _refresh_tab_directories_timer(self) -> bool:
+        if not getattr(self, "_tab_directory_refresh_alive", False):
+            return False
+        if self.get_mapped() and self.get_visible():
+            self.refresh_tab_directories()
+        return True
 
     def rename_session(self, record: SessionRecord) -> SessionRecord | None:
         """Rename a tab without touching the running process."""
@@ -2751,8 +3457,14 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     ) -> None:
         self.tabs_pane_visible = bool(visible)
         self.side.set_visible(self.tabs_pane_visible)
+        repack = getattr(self, "_pack_side_pane", None)
+        if callable(repack):
+            repack()
         if self.tabs_pane_visible:
             self.side.refresh()
+            queue_repack = getattr(self, "_queue_side_pane_layout_repack", None)
+            if callable(queue_repack):
+                queue_repack()
         if persist:
             self.app_context.apply_tabs_pane_visibility(self.tabs_pane_visible)
         if notify:
@@ -2807,9 +3519,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         return normalise_directory(Path.home())
 
     def new_tab(self) -> None:
-        """Open a shell immediately; users can change directory inside it."""
+        """Open a shell immediately in the home directory."""
 
-        self.new_shell_tab(self._active_directory())
+        self.new_shell_tab(Path.home())
 
     def new_directory_tab(self) -> None:
         """Backward-compatible alias for the direct, non-modal New tab action."""
@@ -3025,10 +3737,14 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if remember_layout:
             layout_changes = {
                 "visible": True,
-                "window_id": self.window_id,
-                "window_title": self.window_title,
                 "tab_index": self.notebook.get_n_pages(),
             }
+            # Never reassign a tab that already belongs to another named window.
+            # Stealing window_id here is what collapses multi-window restore into
+            # whichever window last opened the tab (search, palette, or Restore).
+            if not record.window_id or record.window_id == self.window_id:
+                layout_changes["window_id"] = self.window_id
+                layout_changes["window_title"] = self.window_title
         record = self.app_context.store.update(
             record.id,
             last_opened_at=utc_now(),
@@ -3047,6 +3763,13 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             record.cwd,
             self.app_context.theme,
             key_press_handler=self.on_terminal_key_press,
+            live_focus_handler=lambda r=record: self._restore_live_terminal(r),
+            scroll_handler=lambda lines, r=record: self._scroll_terminal(r, lines),
+            scrollback_extent=getattr(
+                self.app_context.backend,
+                "history_limit",
+                self.app_context.theme.scrollback_lines,
+            ),
             font_override=self.zoomed_font(),
         )
         tab = TerminalTab(record, terminal)
@@ -3068,16 +3791,44 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if page >= 0:
             self.notebook.set_current_page(page)
             try:
-                self.app_context.store.update(
-                    session_id,
-                    visible=True,
-                    window_id=self.window_id,
-                    window_title=self.window_title,
-                    tab_index=page,
-                )
+                updates = {"visible": True, "tab_index": page}
+                if not tab.record.window_id or tab.record.window_id == self.window_id:
+                    updates["window_id"] = self.window_id
+                    updates["window_title"] = self.window_title
+                self.app_context.store.update(session_id, **updates)
             except KeyError:
                 pass
+            tab.widget.prepare_for_live_input()
             tab.widget.terminal.grab_focus()
+            self.present()
+
+    def _restore_live_terminal(self, record: SessionRecord) -> None:
+        restore = getattr(self.app_context.backend, "restore_live_session", None)
+        if callable(restore):
+            restore(record)
+
+    def _scroll_terminal(self, record: SessionRecord, lines: int) -> bool:
+        scroll = getattr(self.app_context.backend, "scroll_session", None)
+        return bool(scroll(record, lines)) if callable(scroll) else False
+
+    def _sync_current_terminal_geometry(self) -> bool:
+        self._terminal_layout_sync_source_id = 0
+        session_id = self.current_session_id()
+        tab = self.tabs.get(session_id) if session_id else None
+        if tab is not None:
+            tab.widget.request_geometry_sync(delay_ms=0)
+        return False
+
+    def _queue_current_terminal_geometry_sync(self) -> None:
+        if self._terminal_layout_sync_source_id:
+            try:
+                GLib.source_remove(self._terminal_layout_sync_source_id)
+            except Exception:
+                pass
+        self._terminal_layout_sync_source_id = GLib.timeout_add(
+            80,
+            self._sync_current_terminal_geometry,
+        )
 
     def current_session_id(self) -> str | None:
         page = self.notebook.get_current_page()
@@ -3272,6 +4023,53 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     def focus_side_prompt(self) -> None:
         self.side.prompt.grab_focus()
 
+    def _queue_side_pane_layout_repack(self) -> None:
+        if self._side_pane_layout_source_id:
+            try:
+                GLib.source_remove(self._side_pane_layout_source_id)
+            except Exception:
+                pass
+        self._side_pane_layout_source_id = GLib.idle_add(
+            self._repack_side_pane_after_style,
+        )
+
+    def _repack_side_pane_after_style(self) -> bool:
+        self._side_pane_layout_source_id = 0
+        self._pack_side_pane()
+        return False
+
+    def _side_pane_layout_width(self) -> int:
+        """Return a sidebar width that cannot clip its scaled UI controls."""
+
+        minimum = 0
+        get_preferred_width = getattr(self.side, "get_preferred_width", None)
+        if callable(get_preferred_width):
+            try:
+                minimum, _natural = get_preferred_width()
+            except Exception:
+                minimum = 0
+        return max(340, int(minimum))
+
+    def _paned_layout_width(self) -> int:
+        get_allocated_width = getattr(self.paned, "get_allocated_width", None)
+        if callable(get_allocated_width):
+            try:
+                available = int(get_allocated_width())
+            except Exception:
+                available = 0
+            if available > 400:
+                return available
+        get_default_size = getattr(self, "get_default_size", None)
+        if callable(get_default_size):
+            try:
+                default_width, _default_height = get_default_size()
+                if int(default_width) > 400:
+                    return int(default_width)
+            except Exception:
+                pass
+        # Retain the historical 980px divider fallback for a 340px right pane.
+        return 1320
+
     def _pack_side_pane(self) -> None:
         for child in (self.notebook, self.side):
             try:
@@ -3279,20 +4077,39 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                     self.paned.remove(child)
             except Exception:
                 pass
+        if not bool(getattr(self, "tabs_pane_visible", True)):
+            # Hiding a GtkPaned child does not reliably surrender its previous
+            # allocation. Unparent the pane so the notebook receives every
+            # available pixel instead of retaining a sidebar-sized dead strip.
+            self.paned.pack1(self.notebook, True, True)
+            self.paned.show_all()
+            self.side.set_visible(False)
+            sync_geometry = getattr(self, "_queue_current_terminal_geometry_sync", None)
+            if callable(sync_geometry):
+                sync_geometry()
+            return
+        side_width = TermDeckWindow._side_pane_layout_width(self)
         if self.side_position == "left":
             self.paned.pack1(self.side, False, True)
             self.paned.pack2(self.notebook, True, True)
-            self.paned.set_position(340)
+            self.paned.set_position(side_width)
         else:
             self.paned.pack1(self.notebook, True, True)
             self.paned.pack2(self.side, False, True)
-            self.paned.set_position(980)
+            available = TermDeckWindow._paned_layout_width(self)
+            self.paned.set_position(max(1, available - side_width))
         self.paned.show_all()
+        sync_geometry = getattr(self, "_queue_current_terminal_geometry_sync", None)
+        if callable(sync_geometry):
+            sync_geometry()
 
     def set_side_pane_position(self, position: str, *, persist: bool = True) -> None:
         position = "left" if str(position).lower().startswith("left") else "right"
         self.side_position = position
         self._pack_side_pane()
+        queue_repack = getattr(self, "_queue_side_pane_layout_repack", None)
+        if bool(getattr(self, "tabs_pane_visible", True)) and callable(queue_repack):
+            queue_repack()
         if persist:
             self.app_context.apply_side_pane_position(position)
         self.show_toast(f"Tabs pane moved to {position}", kind="info")
@@ -3312,7 +4129,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             for session_id, tab in self.tabs.items():
                 if tab.widget is widget:
                     try:
-                        self.app_context.store.update(
+                        tab.record = self.app_context.store.update(
                             session_id,
                             tab_index=index,
                             window_id=self.window_id,
@@ -3491,9 +4308,60 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             attach.copy_clipboard()
             return True
         if self._is_paste_event(event):
+            record_getter = getattr(self, "current_record", None)
+            record = record_getter() if callable(record_getter) else None
+            backend = getattr(getattr(self, "app_context", None), "backend", None)
+            active = getattr(backend, "scroll_view_active", None)
+            if record is not None and callable(active) and active(record):
+                self._restore_live_terminal(record)
+                show_cursor = getattr(attach, "_set_history_cursor_hidden", None)
+                if callable(show_cursor):
+                    show_cursor(False)
+                reset_scrollbar = getattr(attach, "reset_scrollbar", None)
+                if callable(reset_scrollbar):
+                    reset_scrollbar()
             attach.paste_clipboard()
             return True
+        record_getter = getattr(self, "current_record", None)
+        record = record_getter() if callable(record_getter) else None
+        backend = getattr(getattr(self, "app_context", None), "backend", None)
+        active = getattr(backend, "scroll_view_active", None)
+        if record is not None and callable(active) and active(record):
+            self._restore_live_terminal(record)
+            show_cursor = getattr(attach, "_set_history_cursor_hidden", None)
+            if callable(show_cursor):
+                show_cursor(False)
+            reset_scrollbar = getattr(attach, "reset_scrollbar", None)
+            if callable(reset_scrollbar):
+                reset_scrollbar()
         return False
+
+    @staticmethod
+    def _is_text_input_focus(widget) -> bool:
+        return isinstance(widget, (Gtk.Entry, Gtk.TextView))
+
+    def _route_unhandled_key_to_terminal(self, event: Gdk.EventKey) -> bool:
+        """Focus VTE for keys pressed on non-editable window chrome."""
+
+        attach = self._current_attach_terminal()
+        if attach is None:
+            return False
+        try:
+            focus = self.get_focus()
+        except Exception:
+            focus = None
+        if focus is attach.terminal or self._is_text_input_focus(focus):
+            return False
+        attach.prepare_for_live_input()
+        attach.scroll_to_bottom()
+        attach.terminal.grab_focus()
+        # GTK chooses the key-event target before this handler runs. Merely
+        # moving focus therefore loses the first character (or lets the old
+        # control consume it). Deliver the existing event directly to the PTY and
+        # consume the original dispatch so every key arrives exactly once.
+        if self.on_terminal_key_press(attach.terminal, event):
+            return True
+        return attach.feed_key_event(event)
 
     def on_key_press(self, _widget, event: Gdk.EventKey) -> bool:
         key_name = Gdk.keyval_name(event.keyval) or ""
@@ -3548,7 +4416,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             else:
                 return False
             return True
-        return False
+        return self._route_unhandled_key_to_terminal(event)
 
 
 class TermDeckApplication(Gtk.Application):
@@ -3635,8 +4503,6 @@ class TermDeckApplication(Gtk.Application):
         self.settings = AppSettings.load(self.settings.path)
         self.rebuild_theme()
         self.reapply_theme_to_open_terminals()
-        for window in self.windows:
-            window.set_side_pane_position(self.settings.side_pane_position, persist=False)
         # Reload chrome CSS so UI font/scale take effect immediately.
         try:
             self._chrome_css = apply_app_chrome(self.settings)
@@ -3646,6 +4512,11 @@ class TermDeckApplication(Gtk.Application):
                 self.settings.ui_density,
                 ui_font=self.settings.ui_font,
                 ui_font_scale=self.settings.ui_font_scale,
+            )
+        for window in self.windows:
+            window.set_side_pane_position(
+                self.settings.side_pane_position,
+                persist=False,
             )
 
     def apply_side_pane_position(self, position: str) -> None:
@@ -3674,6 +4545,130 @@ class TermDeckApplication(Gtk.Application):
             if removed:
                 window._renumber_visible_tabs()
             window.side.refresh()
+
+    def window_for_tab(self, session_id: str) -> TermDeckWindow | None:
+        """Return the open window that currently owns a materialised tab."""
+
+        for window in self.windows:
+            if session_id in window.tabs:
+                return window
+        return None
+
+    def available_move_windows(self, record: SessionRecord) -> list[TermDeckWindow]:
+        """List open destination windows, excluding the tab's current owner."""
+
+        source = self.window_for_tab(record.id)
+        source_window_id = source.window_id if source is not None else record.window_id
+        destinations = [
+            window
+            for window in self.windows
+            if window.window_id != source_window_id
+        ]
+        return sorted(
+            destinations,
+            key=lambda window: (window.window_title.casefold(), window.window_id),
+        )
+
+    def _refresh_tab_management_views(self) -> None:
+        refreshed: set[int] = set()
+        for window in self.windows:
+            for auxiliary in (window.master_window, window.window_overview):
+                if auxiliary is None or id(auxiliary) in refreshed:
+                    continue
+                try:
+                    if auxiliary.get_visible():
+                        auxiliary.refresh()
+                        refreshed.add(id(auxiliary))
+                except Exception:
+                    continue
+
+    def move_tab_to_window(
+        self,
+        session_id: str,
+        destination: TermDeckWindow,
+    ) -> SessionRecord | None:
+        """Move one tab to an open window without restarting its tmux task."""
+
+        if not any(window is destination for window in self.windows):
+            return None
+        record = self.store.get(session_id)
+        if record is None:
+            return None
+        source = self.window_for_tab(session_id)
+        if source is destination or (source is None and record.window_id == destination.window_id):
+            return record
+
+        result = move_records(
+            self.store,
+            [record],
+            window_id=destination.window_id,
+            window_title=destination.window_title,
+            visible=True,
+        )
+        if not result:
+            return None
+        updated = self.store.get(session_id)
+        if updated is None:
+            return None
+
+        tab = source.tabs.pop(session_id, None) if source is not None else None
+        if tab is not None:
+            page = source.notebook.page_num(tab.widget)
+            if page >= 0:
+                source.notebook.remove_page(page)
+            tab.record = updated
+            tab.widget.rebind_window_handlers(
+                key_press_handler=destination.on_terminal_key_press,
+                live_focus_handler=lambda r=updated: destination._restore_live_terminal(r),
+                scroll_handler=lambda lines, r=updated: destination._scroll_terminal(r, lines),
+            )
+            tab.widget.apply_window_theme(
+                self.theme,
+                font_override=destination.zoomed_font(),
+            )
+            destination.tabs[session_id] = tab
+            position = min(max(0, updated.tab_index), destination.notebook.get_n_pages())
+            destination.notebook.insert_page(
+                tab.widget,
+                destination._build_tab_label(updated),
+                position,
+            )
+            destination.notebook.set_tab_reorderable(tab.widget, True)
+            destination.notebook.set_current_page(destination.notebook.page_num(tab.widget))
+            tab.widget.show_all()
+            tab.widget.prepare_for_live_input()
+            tab.widget.terminal.grab_focus()
+        else:
+            # A manager row may represent a hidden live tab or a stopped tab.
+            # Reattach only when the tmux session still exists; never recreate it.
+            destination.open_session(
+                updated,
+                restart_missing=False,
+                remember_layout=False,
+                refresh_side=False,
+            )
+            reopened = destination.tabs.get(session_id)
+            if reopened is not None:
+                position = min(max(0, updated.tab_index), destination.notebook.get_n_pages() - 1)
+                destination.notebook.reorder_child(reopened.widget, position)
+
+        if source is not None:
+            source._renumber_visible_tabs()
+            source.side.refresh()
+        destination._renumber_visible_tabs()
+        destination.side.refresh()
+        destination.present()
+        if session_id in destination.tabs:
+            destination._focus_session(session_id)
+            destination._queue_current_terminal_geometry_sync()
+            detail = f"Moved {updated.name} here"
+            kind = "success"
+        else:
+            detail = f"Moved {updated.name} here · session is stopped"
+            kind = "info"
+        destination.show_toast(detail, kind=kind)
+        self._refresh_tab_management_views()
+        return self.store.get(session_id)
 
     def terminate_records(self, records: list[SessionRecord]) -> int:
         unique = {record.id: record for record in records}
@@ -3721,8 +4716,9 @@ class TermDeckApplication(Gtk.Application):
         *,
         parent: Gtk.Window | None = None,
         first_run: bool = False,
+        open_initial_tab: bool = True,
     ) -> TermDeckWindow | None:
-        """Prompt only for a window name, then open its first shell immediately."""
+        """Prompt for a window name and optionally open its first shell."""
 
         default_title = f"Window {len(self.windows) + 1}"
         dialog = WindowNameDialog(
@@ -3730,7 +4726,12 @@ class TermDeckApplication(Gtk.Application):
             title="Create your first TermDeck window" if first_run else "New TermDeck window",
             initial=default_title,
             confirm_label="Create window",
-            description="A window groups related terminal tabs. Its first shell opens immediately; use cd inside the terminal.",
+            description=(
+                "A window groups related terminal tabs. Its first shell opens immediately; "
+                "use cd inside the terminal."
+                if open_initial_tab
+                else "A window groups related terminal tabs. The selected tab will move into it."
+            ),
         )
         if parent is None:
             dialog.set_application(self)
@@ -3739,14 +4740,13 @@ class TermDeckApplication(Gtk.Application):
         dialog.destroy()
         if response != Gtk.ResponseType.OK or not title:
             return None
-        active_directory = None
-        directory_resolver = getattr(parent, "_active_directory", None)
-        if callable(directory_resolver):
-            active_directory = directory_resolver()
+        # Interactive creation follows the same contract as New tab: its first
+        # shell starts in the user's home directory. Relocation creates an empty
+        # destination so the moved live terminal is its only tab.
         return self.create_named_window(
             title,
-            initial_directory=active_directory or Path.home(),
-            open_initial_tab=True,
+            initial_directory=Path.home(),
+            open_initial_tab=open_initial_tab,
         )
 
     def build_control_plan_for_gui(
@@ -3884,13 +4884,24 @@ class TermDeckApplication(Gtk.Application):
             resource_sample_limit=UI_RESOURCE_REFRESH_BUDGET,
         )
 
+        # Drop destroyed windows so a single-instance re-activate does not skip
+        # restore while holding stale ApplicationWindow references.
+        live_windows = []
+        for window in self.windows:
+            try:
+                if window.get_realized():
+                    live_windows.append(window)
+            except Exception:
+                continue
+        self.windows = live_windows
+
         if not self.windows and self.workspace_path is not None:
             try:
                 self.open_workspace_recipe(self.workspace_path)
             except WorkspaceRecipeError as exc:
                 self._show_error("Could not open saved window layout", str(exc))
             if self.windows:
-                self.windows[-1].present()
+                self._present_all_windows()
                 return
 
         if not self.windows:
@@ -3907,7 +4918,16 @@ class TermDeckApplication(Gtk.Application):
             else:
                 self.prompt_for_new_window(first_run=True)
                 return
-        self.windows[-1].present()
+        self._present_all_windows()
+
+    def _present_all_windows(self) -> None:
+        """Raise every restored named window, not only the last one created."""
+
+        for window in self.windows:
+            try:
+                window.present()
+            except Exception:
+                continue
 
 
 def run(db_path: str | Path | None = None, workspace_path: str | Path | None = None) -> int:
