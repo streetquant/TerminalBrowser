@@ -41,6 +41,14 @@ terminalbrowser
 | Command palette | `Ctrl+Shift+P` |
 | Settings | `Ctrl+,` |
 
+## Using with Codex / Claude Code
+
+TerminalBrowser shines as a multi-agent cockpit. See **[docs/codex-claude-workflow.md](docs/codex-claude-workflow.md)** for:
+- How to launch 3+ agents in parallel with a single workspace recipe
+- The agent approval loop (click card → answer → back to work)
+- CLI commands to monitor, capture output, and steer agents by tag
+- Full day workflow diagram
+
 ## License
 
 MIT
