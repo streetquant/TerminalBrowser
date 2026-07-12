@@ -94,22 +94,52 @@ How a single Codex / Claude Code tab moves through states during a session.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Running : terminalbrowser opens tab\ncodex / claude starts
+    direction TB
 
-    Running --> NeedsInput : agent asks a question\nor waits for approval
-    NeedsInput --> Running : you click tab, answer, press Enter
+    [*] --> New : workspace recipe loaded\nor tab created manually
 
-    Running --> Paused : you run: tb pause codex-api\n(frees CPU while you review)
-    Paused --> Running : you run: tb resume codex-api
+    New --> Running : terminalbrowser starts\ncodex / claude process
 
-    Running --> Done : agent finishes task
-    Done --> Running : you send next task:\ntb send codex-api "next: add tests"
+    state Running {
+        direction LR
+        Thinking : 🤔 Thinking\n(agent is working)
+        Writing  : ✏️ Writing code\n(agent is editing)
+        Thinking --> Writing
+        Writing  --> Thinking
+    }
 
-    Running --> Stopped : tb kill codex-api
+    Running --> NeedsInput : agent prints a question\nor awaits y/n approval
+
+    state NeedsInput {
+        Highlight : 💬 card highlights\nin side pane (F9)
+    }
+
+    NeedsInput --> Running : click card → focus tab\ntype answer → Enter
+
+    Running --> Paused  : tb pause codex-api\n→ SIGSTOP sent to tmux pane\n→ CPU freed immediately
+    Paused  --> Running : tb resume codex-api\n→ SIGCONT — picks up exactly\n   where it left off
+
+    Running --> Done : agent prints completion\nor exits cleanly
+
+    Done --> Running : tb send codex-api\n"next task: add tests"
+
+    Running --> Hidden : right-click → Hide\n(tab disappears from strip\n but tmux still alive)
+    Hidden  --> Running : F9 side pane\n→ click card → focus
+
+    Running --> Stopped : tb kill codex-api\n→ tmux pane closed
+    Paused  --> Stopped : tb kill codex-api
+    Hidden  --> Stopped : tb kill codex-api
+
     Stopped --> [*]
 
-    Running --> Hidden : you hide tab (keeps tmux alive)
-    Hidden --> Running : click card in side pane → focus
+    note right of Paused
+        💡 Use pause to free CPU\n        while reviewing diffs\n        or waiting for CI.
+        Agent resumes from\n        exact same position.
+    end note
+
+    note right of NeedsInput
+        💡 tb activity --tag ai\n        shows all agents\n        needing attention\n        across every tab.
+    end note
 ```
 
 ---
@@ -199,6 +229,42 @@ gantt
     Close TerminalBrowser            :done, 17:00, 1m
     Agents keep running in tmux      :active, 17:01, 59m
     Reopen tomorrow — tabs restored  :active, 18:00, 1m
+```
+
+---
+
+## 7. Advanced Agent Controls
+
+These are the power moves once you have multiple agents running.
+
+```mermaid
+flowchart TD
+    subgraph Pause["Pause • Resume"]
+        P1["tb pause codex-api\n→ freeze one agent"]
+        P2["tb pause --tag ai\n→ freeze ALL agents"]
+        P3["tb pause-hot --all\n→ auto-freeze high-CPU"]
+        P4["tb resume --tag ai\n→ unfreeze all at once"]
+    end
+
+    subgraph Broadcast["Broadcast to all tabs"]
+        B1["tb send --tag ai 'status'\n→ every agent gets it"]
+        B2["tb send --tag ai 'stop and summarise'\n→ graceful checkpoint"]
+        B3["tb send --tag ai 'continue' --no-enter\n→ stage text, don't submit"]
+    end
+
+    subgraph Observe["Observe without switching tabs"]
+        O1["tb activity --tag ai\n→ who needs attention?"]
+        O2["tb capture --tag ai --lines 200\n→ all output in one view"]
+        O3["tb search-output 'error' --tag ai\n→ find issues across all tabs"]
+        O4["tb tasks --tag ai --sort cpu\n→ resource usage table"]
+    end
+
+    subgraph Lifecycle["Lifecycle without losing work"]
+        L1["right-click → Hide\n→ gone from strip, still running"]
+        L2["tb rename codex-api braze-agent\n→ rename without restart"]
+        L3["tb move codex-api --window Agents\n→ reorganise windows live"]
+        L4["terminalbrowser (after reboot)\n→ all tabs auto-restore"]
+    end
 ```
 
 ---
