@@ -1,7 +1,0 @@
-{
-  "database": "dolt",
-  "backend": "dolt",
-  "dolt_mode": "embedded",
-  "dolt_database": "termdeck",
-  "project_id": "98ef10ff-f221-497b-829b-a7711e9d8ee7"
-}

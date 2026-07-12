@@ -36,3 +36,7 @@ dist/
 .dolt/
 .beads-credential-key
 .beads/proxieddb/
+
+# Local/generated files
+user-prompt.md
+.beads/
