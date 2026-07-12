@@ -201,20 +201,16 @@ TerminalBrowser shines as a multi-agent cockpit. See **[docs/codex-claude-workfl
 - CLI commands to monitor, capture output, and steer agents by tag
 - Full day workflow Gantt
 
-### Quick install for Codex / Claude Code
+### Quick install using Codex / Claude Code
 
-Copy-paste this into your Codex or Claude Code session to set up TerminalBrowser in the repo:
+Paste this prompt into Codex or Claude Code and it will install TerminalBrowser on your machine:
 
-```bash
-# Install system dependencies (Debian/Ubuntu)
-sudo apt update && sudo apt install -y tmux python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-vte-2.91
-
-# Clone and install
-git clone https://github.com/streetquant/TerminalBrowser.git ~/terminalbrowser
-cd ~/terminalbrowser && pip install -e .
-
-# Verify
-terminalbrowser --version
+```
+Install TerminalBrowser from https://github.com/streetquant/TerminalBrowser by:
+1. Installing system dependencies for this OS (tmux, GTK3, VTE, python3-gi)
+2. Cloning the repo into ~/terminalbrowser
+3. Running pip install -e . inside it
+4. Verifying with: terminalbrowser --version
 ```
 
 ## License
