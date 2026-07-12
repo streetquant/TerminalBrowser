@@ -1,0 +1,1 @@
+{"id":"int-ec245a7141369976eb3698f6b5e29b84","kind":"field_change","created_at":"2026-07-11T17:41:54.597085544Z","actor":"quanshayan","issue_id":"termdeck-jui","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Scrolling restored and 2,000-session default control plane implemented, documented, and verified."}}

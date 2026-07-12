@@ -10,11 +10,12 @@ A window is the user-defined group. A tab is rooted in one directory and default
 
 ## Visual system
 
-`ui_theme.py` defines semantic chrome tokens; `chrome_css.py` converts those tokens into one GTK3 stylesheet. The main root, terminal notebook and explanatory copy use semantic classes (`td-main-root`, `td-terminal-notebook`, `td-section-description`) rather than widget-position selectors alone. The terminal notebook owns the inset frame and active-tab hierarchy, while density-specific CSS reduces spacing without changing the information model. A real GTK smoke verifies these classes, computed margins and primary-action structure before CI captures desktop and compact frames.
+`ui_theme.py` defines semantic chrome tokens; `chrome_css.py` converts those tokens into one GTK3 stylesheet. The main root, terminal notebook and explanatory copy use semantic classes (`td-main-root`, `td-terminal-notebook`, `td-section-description`) rather than widget-position selectors alone. The terminal notebook owns the compact frame and active-tab hierarchy, while density-specific CSS reduces spacing without changing the information model. Large shadows and broad CSS transitions are deliberately absent from persistent surfaces. A real GTK smoke verifies these classes, computed margins and New-tab action structure before CI captures desktop and compact frames.
 
 ## Main modules
 
 - `gtk_app.py`: GTK/VTE named-window UI, immediate shell-tab creation, tab pane, tab manager, window overview, search, and terminal controls.
+- `capacity.py`: explicit startup, GTK-model, and per-refresh working-set limits for large registries.
 - `command_render.py`: default shell resolution, portable saved-command placeholders, directory normalisation, and directory-derived tab names.
 - `session_launcher.py`: dependency-free creation of one directory-backed tab.
 - `session_store.py`: SQLite registry for tabs, named-window metadata, lifecycle state, schema migration, and restore candidates.
@@ -34,6 +35,20 @@ The normal tab-creation flow has no modal decision. TermDeck opens the user's de
 ## Terminal attachment and first-frame geometry
 
 `AttachTerminal` waits for a stable VTE `size-allocate` grid before starting the visible tmux client. It seeds both ends of the PTY with that row/column size and keeps the VTE PTY geometry synchronised on later allocations. This prevents tmux from briefly rendering an `80x24` client inside a maximised terminal and filling the unused area with dotted padding.
+
+The VTE is hosted by `Gtk.ScrolledWindow` with fallback scrolling enabled and scroll-on-output disabled. TermDeck enables tmux mouse mode per attached session, so wheel events enter tmux copy mode and traverse the history that tmux actually owns; an outer VTE buffer alone cannot reconstruct full-screen tmux output. `Shift` bypasses mouse reporting for local VTE selection.
+
+## Responsiveness boundary
+
+GTK owns the UI thread, while VTE performs the terminal rendering natively. Clipboard reads use GTK's asynchronous request API so an unavailable clipboard owner cannot block input. Startup reconciliation and tab restoration query tmux in batches, reuse the short-lived pane snapshot, and bound every subprocess call. Adaptive deadlines allow a 2,000-row response more time than a single-pane lookup, while failure backoff prevents retry storms. A failed all-pane query is stale state: it preserves last-known PIDs/lifecycle state and never expands into one synchronous query per tab. Capture skips redundant existence checks and clamps requested history.
+
+The default large-registry contract attaches no more than 24 VTE terminals across 4 windows (12 per window), samples 128 process trees per UI refresh in round-robin order, materialises 100 Tabs-pane cards, and materialises 500 Tab Manager rows. Registry iteration and filtering may inspect lightweight metadata for all 2,000 sessions, but GTK widget creation and `/proc` traversal stay bounded. PID churn caches retain at most 4,096 entries. Reconciliation writes changed runtime states through one SQLite transaction. Omitted or temporarily unsampled sessions remain alive and addressable.
+
+The optional Tabs pane performs no store, tmux, `/proc`, or widget-rebuild work while hidden. The file-backed SQLite registry uses WAL/NORMAL mode and a bounded lock wait; unsupported filesystems retain SQLite's compatible default journal. No pressure or health path invokes lifecycle controls automatically.
+
+## Frankenterm boundary
+
+Frankenterm is a useful reference for passive-first observation, delta capture with explicit gaps, tiered scrollback, bounded batch retrieval, and pressure hysteresis. TermDeck adopts those control-plane principles where they fit its existing GTK/VTE/tmux architecture. It does not embed Frankenterm or depend on WezTerm. Fleet-wide transcript indexing would belong behind an optional capture/indexing interface rather than on GTK's main thread.
 
 ## Management surfaces
 

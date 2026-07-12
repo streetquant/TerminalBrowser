@@ -86,7 +86,7 @@ def main() -> int:
                 raise AssertionError("terminal notebook lost its polished surface class")
 
             margin = notebook_context.get_margin(Gtk.StateFlags.NORMAL)
-            expected_margin = {"top": 10, "right": 12, "bottom": 12, "left": 12}
+            expected_margin = {"top": 6, "right": 8, "bottom": 8, "left": 8}
             actual_margin = {
                 "top": int(margin.top),
                 "right": int(margin.right),
@@ -102,21 +102,21 @@ def main() -> int:
             notebook_allocation = notebook.get_allocation()
 
             header = window.get_titlebar()
-            primary_buttons = [
+            new_tab_buttons = [
                 child
                 for child in header.get_children()
                 if isinstance(child, Gtk.Button)
-                and child.get_style_context().has_class("suggested-action")
+                and child.get_style_context().has_class("td-new-tab")
             ]
-            if len(primary_buttons) != 1:
+            if len(new_tab_buttons) != 1:
                 raise AssertionError(
-                    f"expected one circular primary action, found {len(primary_buttons)}"
+                    f"expected one compact new-tab action, found {len(new_tab_buttons)}"
                 )
 
             css = app._chrome_css
             required_css = (
                 "notebook.td-terminal-notebook tab:checked",
-                "headerbar button.suggested-action.td-header-icon",
+                "headerbar button.td-new-tab.td-header-icon",
                 "button:focus",
                 ".td-section-description",
             )
@@ -135,7 +135,7 @@ def main() -> int:
                         "notebook_size": (
                             f"{notebook_allocation.width}x{notebook_allocation.height}"
                         ),
-                        "primary_action_count": len(primary_buttons),
+                        "new_tab_action_count": len(new_tab_buttons),
                         "css_bytes": len(css.encode("utf-8")),
                     },
                     indent=2,

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "termdeck"
-version = "0.2.9"
+version = "0.2.10"
 description = "Native named terminal windows with directory-backed tabs and hidden tmux persistence."
 readme = "README.md"
 requires-python = ">=3.10"

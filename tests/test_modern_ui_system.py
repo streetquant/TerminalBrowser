@@ -15,7 +15,7 @@ class ModernUiSystemTests(unittest.TestCase):
         self.assertNotEqual(tokens.bg_raised, tokens.bg_sunken)
         self.assertGreaterEqual(tokens.card_radius, 12)
 
-    def test_css_has_elevated_surfaces_and_interaction_states(self) -> None:
+    def test_css_has_lean_surfaces_and_interaction_states(self) -> None:
         css = build_chrome_css("dark", "comfortable")
         for selector in (
             ".td-session-card.td-session-selected",
@@ -28,8 +28,9 @@ class ModernUiSystemTests(unittest.TestCase):
         ):
             self.assertIn(selector, css)
         self.assertIn("box-shadow:", css)
-        self.assertIn("transition:", css)
-        self.assertIn("min-height: 52px", css)
+        self.assertNotIn("transition:", css)
+        self.assertIn("min-height: 46px", css)
+        self.assertNotIn("0 18px 48px", css)
 
     def test_polished_terminal_surface_has_distinct_depth_and_focus_states(self) -> None:
         css = build_chrome_css("dark", "comfortable")
@@ -37,17 +38,21 @@ class ModernUiSystemTests(unittest.TestCase):
             ".td-main-root",
             "notebook.td-terminal-notebook",
             "notebook.td-terminal-notebook tab:checked",
-            "headerbar button.suggested-action.td-header-icon",
+            "headerbar button.td-new-tab.td-header-icon",
             ".td-section-description",
             "button:focus",
             "scrolledwindow",
         ):
             self.assertIn(selector, css)
-        self.assertIn("margin: 10px 12px 12px 12px", css)
-        self.assertIn("border-radius: 16px", css)
+        self.assertIn("margin: 6px 8px 8px 8px", css)
+        self.assertIn("border-radius: 14px", css)
         self.assertIn("inset 0 -2px 0", css)
         self.assertIn('"td-terminal-notebook"', GTK_APP)
         self.assertIn('"td-main-root"', GTK_APP)
+
+    def test_tab_labels_reserve_readable_width(self) -> None:
+        self.assertIn("name.set_width_chars(min(20, max(4, len(record.name))))", GTK_APP)
+        self.assertIn("name.set_max_width_chars(20)", GTK_APP)
 
     def test_header_exposes_only_window_name_new_tab_and_overflow(self) -> None:
         self.assertIn('title = Gtk.Label(label=self.window_title', GTK_APP)
@@ -58,6 +63,7 @@ class ModernUiSystemTests(unittest.TestCase):
         self.assertIn('("Command palette", self.open_command_palette)', GTK_APP)
         self.assertIn('Gtk.MenuButton(label="⋯")', GTK_APP)
         self.assertIn('set_name("More actions")', GTK_APP)
+        self.assertIn('"td-new-tab", "td-header-icon"', GTK_APP)
         self.assertIn('"td-header-overflow", "td-header-icon"', GTK_APP)
         self.assertNotIn("primary_header_actions", GTK_APP)
         self.assertNotIn('status_dot = Gtk.Label', GTK_APP)

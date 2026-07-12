@@ -2,8 +2,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from termdeck.models import ResourceSnapshot
-from termdeck.session_reconcile import reconcile_store
+from termdeck.models import ResourceSnapshot, SessionRecord
+from termdeck.session_reconcile import reconcile_records, reconcile_store
 from termdeck.session_store import SessionStore
 
 
@@ -28,7 +28,148 @@ class FakeSampler:
         return self.snapshots.get(root_pid, ResourceSnapshot(pid=root_pid, exists=False))
 
 
+class BatchBackend(FakeBackend):
+    def __init__(self, live: dict[str, int | None]):
+        super().__init__(live)
+        self.exists_many_calls = 0
+        self.pane_pids_calls = 0
+
+    def session_exists(self, record):
+        raise AssertionError("batch reconciliation should not query sessions individually")
+
+    def pane_pid(self, record):
+        raise AssertionError("batch reconciliation should not query pane pids individually")
+
+    def session_exists_many(self, records):
+        self.exists_many_calls += 1
+        return {record.id: record.id in self.live for record in records}
+
+    def pane_pids(self, records):
+        self.pane_pids_calls += 1
+        return {record.id: self.live.get(record.id) for record in records}
+
+
+class BudgetSampler:
+    def __init__(self):
+        self.calls = []
+
+    def snapshots(self, root_pids, *, refresh_limit=None):
+        self.calls.append((len(root_pids), refresh_limit))
+        return [
+            ResourceSnapshot(pid=pid, exists=pid is not None, state="unknown" if pid else "missing")
+            for pid in root_pids
+        ]
+
+    def snapshot(self, _root_pid):
+        raise AssertionError("fleet reconciliation should use the batch sampler")
+
+
+class BulkStore:
+    def __init__(self):
+        self.calls = []
+
+    def update_runtime_states(self, updates):
+        self.calls.append(list(updates))
+
+    def update(self, *_args, **_kwargs):
+        raise AssertionError("fleet reconciliation should use one bulk database update")
+
+
+class StalePaneBackend(BatchBackend):
+    pane_snapshot_stale = True
+
+
 class SessionReconcileTests(unittest.TestCase):
+    def test_stale_pane_snapshot_never_turns_sessions_missing(self):
+        running = SessionRecord(
+            id="running",
+            name="running",
+            tag="ai",
+            command="codex",
+            cwd="/tmp",
+            tmux_name="running",
+            created_at="now",
+            last_opened_at="now",
+            status="running",
+            last_pid=101,
+        )
+        paused = SessionRecord(
+            id="paused",
+            name="paused",
+            tag="ai",
+            command="claude",
+            cwd="/tmp",
+            tmux_name="paused",
+            created_at="now",
+            last_opened_at="now",
+            status="paused",
+            last_pid=202,
+        )
+        backend = StalePaneBackend({"running": 101, "paused": 202})
+        sampler = BudgetSampler()
+
+        result = reconcile_records([running, paused], backend=backend, sampler=sampler)
+
+        self.assertEqual(sampler.calls, [])
+        self.assertEqual([row.after_status for row in result.rows], ["running", "paused"])
+        self.assertTrue(all(row.after_visible for row in result.rows))
+
+    def test_two_thousand_sessions_use_bounded_sampling_and_one_store_write(self):
+        records = [
+            SessionRecord(
+                id=f"td-{index}",
+                name=f"agent-{index}",
+                tag="ai",
+                command="codex",
+                cwd="/tmp",
+                tmux_name=f"agent-{index}",
+                created_at="now",
+                last_opened_at="now",
+                status="new",
+            )
+            for index in range(2000)
+        ]
+        backend = BatchBackend({record.id: 20_000 + index for index, record in enumerate(records)})
+        sampler = BudgetSampler()
+        store = BulkStore()
+
+        result = reconcile_records(
+            records,
+            store=store,
+            backend=backend,
+            sampler=sampler,
+            resource_sample_limit=128,
+        )
+
+        self.assertEqual(result.count, 2000)
+        self.assertEqual(result.changed, 2000)
+        self.assertEqual(sampler.calls, [(2000, 128)])
+        self.assertEqual(len(store.calls), 1)
+        self.assertEqual(len(store.calls[0]), 2000)
+        self.assertEqual(backend.exists_many_calls, 1)
+        self.assertEqual(backend.pane_pids_calls, 1)
+
+    def test_many_sessions_use_two_backend_snapshots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                first = store.create("first", "dev", "bash", tmp)
+                second = store.create("second", "dev", "bash", tmp)
+                backend = BatchBackend({first.id: 101, second.id: 202})
+                sampler = FakeSampler(
+                    {
+                        101: ResourceSnapshot(pid=101, exists=True, state="S"),
+                        202: ResourceSnapshot(pid=202, exists=True, state="S"),
+                    }
+                )
+
+                result = reconcile_store(store, backend=backend, sampler=sampler)
+
+                self.assertEqual(result.count, 2)
+                self.assertEqual(backend.exists_many_calls, 1)
+                self.assertEqual(backend.pane_pids_calls, 1)
+            finally:
+                store.close()
     def test_missing_running_session_is_marked_stopped_and_hidden(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")

@@ -1,5 +1,59 @@
 # Release notes
 
+## 0.2.10
+
+TermDeck is leaner on screen and much harder to stall. The rendering stack remains GTK/VTE; this release removes avoidable synchronous Python-side work instead of replacing the native terminal engine.
+
+### Responsive interaction
+
+- Clipboard paste requests are asynchronous, so a slow or unavailable clipboard owner cannot block GTK input.
+- Every tmux subprocess has a deadline.
+- Startup reconciliation and restore discover all sessions and pane PIDs in bounded batches instead of issuing per-tab queries.
+- If an all-pane query times out, TermDeck uses recent recorded PIDs and does not fan out into more blocking calls.
+- The optional Tabs pane performs no database, tmux, process-sampling, or widget-rebuild work while hidden.
+- The file-backed session registry uses SQLite WAL/NORMAL mode and waits at most one second for a competing writer.
+- Terminal clients use `start_new_session=True`, avoiding Python work between fork and exec.
+
+### Scrollback that works through tmux
+
+- The terminal is now hosted by a native GTK scrolled container with VTE fallback scrolling enabled.
+- Mouse-wheel events enter tmux copy mode, which owns the real full-screen terminal history; `q`/`Esc` returns to live output.
+- `Shift` plus drag bypasses tmux mouse reporting for local select-to-copy behavior.
+- Active output does not snap the view to the bottom while history is being reviewed.
+
+### Default 2,000-session control plane
+
+- Startup attaches no more than 24 terminal widgets across 4 windows and 12 tabs per window. The remaining tmux sessions stay alive and searchable.
+- UI refreshes rotate through at most 128 process trees; pending rows remain live and display `sampling` rather than being misclassified as missing.
+- The Tabs pane and Tab Manager materialise at most 100 cards and 500 rows respectively, while filtering still considers the registry.
+- PID caches are capped at 4,096 entries, capture requests at 10,000 lines, and tmux pane history at 2,000 lines.
+- Large tmux snapshots receive adaptive bounded deadlines. Failures back off, retain stale state, and do not become thousands of per-session retries.
+- Reconciliation writes all changed runtime states in one transaction. No timeout, cache pressure, or health classification pauses or stops a session automatically.
+
+Frankenterm informed the passive, bounded, stale-not-dead control-plane design. TermDeck remains a GTK/VTE/tmux application; Frankenterm's tiered transcript storage and delta indexing are candidates for an optional future history service, not a runtime dependency.
+
+### Leaner terminal-first UI
+
+- Tab labels reserve readable natural width and cap long names at 20 characters; short names no longer collapse to a row of ellipses.
+- The New-tab action is a compact accent control rather than an oversized glowing circle.
+- The HeaderBar and notebook frame use less padding, leaving more room for the terminal.
+- Persistent controls and surfaces no longer use broad shadows or CSS transitions.
+- New-tab, More, and close-tab controls include shortcut-aware tooltips and accessible names.
+
+### Why no Rust or C rewrite
+
+VTE already handles terminal parsing and drawing in native code, while GTK owns the native widget stack. The observed stalls were synchronous clipboard, tmux, process-sampling, and widget-rebuild paths on GTK's main thread. Removing those paths delivers the useful performance gain without adding a second implementation or toolchain. A native helper remains an option only if profiling later identifies CPU-heavy Python logic outside VTE.
+
+### Verification
+
+- Full test suite: 373 passed, 15 subtests passed.
+- Synthetic fleet test: 2,000 sessions with a 128-process refresh budget and one batched reconciliation write.
+- Real GTK/tmux scrolling smoke: wheel input entered copy mode and advanced the scroll position.
+- All nine real GTK/tmux lifecycle smokes passed.
+- Verification-run first attachment: 78.04 ms; immediate Ctrl+T handler: 23.38 ms.
+- Desktop render: `1290x846`, zero layout errors.
+- Compact render: requested and captured `640x520`, zero layout errors.
+
 ## 0.2.9
 
 New tabs now open immediately. TermDeck no longer asks you to select a directory before creating a shell.

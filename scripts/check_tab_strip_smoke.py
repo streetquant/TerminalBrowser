@@ -93,7 +93,9 @@ def main() -> int:
                 raise AssertionError(f"decorated tab label leaked into strip: {label.get_text()!r}")
             if label.get_ellipsize() != Pango.EllipsizeMode.END:
                 raise AssertionError("tab label is not ellipsized at the end")
-            if label.get_max_width_chars() != 24:
+            if label.get_width_chars() != len("client-api"):
+                raise AssertionError("tab label does not reserve readable natural width")
+            if label.get_max_width_chars() != 20:
                 raise AssertionError("tab label width cap changed")
             if close.get_label() != "×":
                 raise AssertionError(f"unexpected close control: {close.get_label()!r}")

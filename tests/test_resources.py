@@ -68,6 +68,39 @@ class ResourceTests(unittest.TestCase):
         self.assertIsNot(first, second)
         self.assertEqual(tree.call_count, 2)
 
+    def test_two_thousand_roots_obey_round_robin_refresh_budget(self):
+        sampler = ResourceSampler(snapshot_cache_ttl=0)
+        roots = list(range(1, 2001))
+        stat = {"utime": 1, "stime": 1, "state": "S", "starttime": 1}
+        with mock.patch("termdeck.resources.process_tree", side_effect=lambda pid: [pid]) as tree, \
+             mock.patch("termdeck.resources._parse_stat", return_value=stat), \
+             mock.patch("termdeck.resources._rss_bytes", return_value=4096), \
+             mock.patch.object(sampler, "_cached_total_jiffies", return_value=1000):
+            first = sampler.snapshots(roots, refresh_limit=128)
+            second = sampler.snapshots(roots, refresh_limit=128)
+
+        self.assertEqual(len(first), 2000)
+        self.assertEqual(len(second), 2000)
+        self.assertEqual(tree.call_count, 256)
+        self.assertEqual(sum(snapshot.state == "unknown" for snapshot in first), 1872)
+        first_sampled = {snapshot.pid for snapshot in first if snapshot.state != "unknown"}
+        second_sampled = {snapshot.pid for snapshot in second if snapshot.state != "unknown"}
+        self.assertTrue(first_sampled.isdisjoint(second_sampled))
+
+    def test_pid_churn_caches_are_bounded(self):
+        sampler = ResourceSampler(snapshot_cache_ttl=60, max_cache_entries=4)
+        stat = {"utime": 1, "stime": 1, "state": "S", "starttime": 1}
+        with mock.patch("termdeck.resources.process_tree", side_effect=lambda pid: [pid]), \
+             mock.patch("termdeck.resources._parse_stat", return_value=stat), \
+             mock.patch("termdeck.resources._rss_bytes", return_value=4096), \
+             mock.patch.object(sampler, "_cached_total_jiffies", return_value=1000):
+            for pid in range(1, 11):
+                sampler.snapshot(pid)
+
+        self.assertLessEqual(len(sampler._snapshot_cache), 4)
+        self.assertLessEqual(len(sampler._previous), 4)
+        self.assertEqual(set(sampler._snapshot_cache), {7, 8, 9, 10})
+
     def test_format_bytes(self):
         self.assertEqual(format_bytes(1), "1 B")
         self.assertEqual(format_bytes(1024), "1.0 KiB")

@@ -204,7 +204,8 @@ class UiSurfaceStaticTests(unittest.TestCase):
         tab_label = self.gtk[start:end]
         self.assertIn("Gtk.Label(label=record.name)", tab_label)
         self.assertIn("td-tab-close", tab_label)
-        self.assertIn("set_max_width_chars(24)", tab_label)
+        self.assertIn("set_width_chars(min(20, max(4, len(record.name))))", tab_label)
+        self.assertIn("set_max_width_chars(20)", tab_label)
         self.assertNotIn("kind_glyph", tab_label)
         self.assertNotIn("health_badge", tab_label)
         self.assertNotIn("should_pause_for_attention", tab_label)

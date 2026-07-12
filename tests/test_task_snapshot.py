@@ -11,12 +11,25 @@ class FakeBackend:
     available = False
 
 
+class StaleBackend:
+    available = True
+    pane_snapshot_stale = True
+
+    def pane_pids(self, records):
+        return {row.id: row.last_pid for row in records}
+
+
 class FakeSampler:
     def __init__(self, snapshots: dict[int | None, ResourceSnapshot]):
         self.snapshots = snapshots
 
     def snapshot(self, pid: int | None) -> ResourceSnapshot:
         return self.snapshots.get(pid, ResourceSnapshot(pid=pid, exists=False))
+
+
+class FailingSampler:
+    def snapshot(self, _pid):
+        raise AssertionError("stale backend data must not be sampled as authoritative")
 
 
 def record(session_id: str, name: str, *, pid: int | None, tab_index: int = 0, tag: str = "dev") -> SessionRecord:
@@ -39,6 +52,14 @@ def record(session_id: str, name: str, *, pid: int | None, tab_index: int = 0, t
 
 
 class TaskSnapshotTests(unittest.TestCase):
+    def test_stale_backend_snapshot_renders_sampling_instead_of_dead(self) -> None:
+        row = record("td-stale", "codex", pid=101)
+
+        items = build_task_snapshot([row], backend=StaleBackend(), sampler=FailingSampler())
+
+        self.assertEqual(items[0].health.label, "sampling")
+        self.assertEqual(items[0].row.state, "running")
+
     def test_build_snapshot_uses_remembered_pid_when_tmux_is_unavailable(self) -> None:
         pid = os.getpid()
         items = build_task_snapshot(

@@ -92,6 +92,23 @@ def _observe_record(record: SessionRecord, backend: BackendLike, sampler: Sample
     return True, pid, sampler.snapshot(pid)
 
 
+def _sample_many(
+    sampler: SamplerLike,
+    root_pids: list[int | None],
+    *,
+    refresh_limit: int | None,
+) -> list[ResourceSnapshot]:
+    sample_many = getattr(sampler, "snapshots", None)
+    if callable(sample_many):
+        if refresh_limit is None:
+            return list(sample_many(root_pids))
+        try:
+            return list(sample_many(root_pids, refresh_limit=refresh_limit))
+        except TypeError:
+            pass
+    return [sampler.snapshot(pid) for pid in root_pids]
+
+
 def _desired_state(
     record: SessionRecord,
     *,
@@ -107,8 +124,9 @@ def _desired_state(
         return record.status, visible, record.last_pid, "archived record skipped"
 
     if live_session and snapshot.exists:
-        status = "paused" if snapshot.state == "T" else "running"
-        return status, visible, pid, "live session observed"
+        status = "paused" if snapshot.state == "T" or (snapshot.state == "unknown" and before == "paused") else "running"
+        detail = "live session observed; resource sample deferred" if snapshot.state == "unknown" else "live session observed"
+        return status, visible, pid, detail
 
     if live_session and pid is not None and not snapshot.exists:
         return "missing", visible, pid, "backend reported a pane pid but the process was not found"
@@ -137,6 +155,7 @@ def reconcile_records(
     sampler: SamplerLike | None = None,
     dry_run: bool = False,
     hide_missing: bool = True,
+    resource_sample_limit: int | None = None,
 ) -> ReconcileResult:
     """Repair stale remembered session state against the hidden backend.
 
@@ -149,9 +168,64 @@ def reconcile_records(
     backend = backend or TmuxBackend()
     sampler = sampler or ResourceSampler()
     rows: list[ReconcileRow] = []
+    record_list = list(records)
 
-    for record in records:
-        live_session, pid, snapshot = _observe_record(record, backend, sampler)
+    # GUI startup may restore dozens of tabs. Prefer two bounded backend
+    # snapshots over one has-session + pane lookup per record.
+    live_by_id: dict[str, bool] | None = None
+    pids_by_id: dict[str, int | None] | None = None
+    exists_many = getattr(backend, "session_exists_many", None)
+    if callable(exists_many):
+        try:
+            live_by_id = dict(exists_many(record_list))
+        except TmuxError:
+            live_by_id = None
+    pane_pids = getattr(backend, "pane_pids", None)
+    if live_by_id is not None and callable(pane_pids):
+        live_records = [record for record in record_list if live_by_id.get(record.id, False)]
+        try:
+            pids_by_id = dict(pane_pids(live_records))
+        except TmuxError:
+            pids_by_id = None
+
+    observations: list[tuple[SessionRecord, bool, int | None, ResourceSnapshot]] = []
+    if live_by_id is None:
+        for record in record_list:
+            live_session, pid, snapshot = _observe_record(record, backend, sampler)
+            observations.append((record, live_session, pid, snapshot))
+    else:
+        resolved: list[tuple[SessionRecord, bool, int | None]] = []
+        for record in record_list:
+            live_session = bool(live_by_id.get(record.id, False))
+            if not live_session:
+                pid = None
+            else:
+                try:
+                    pid = pids_by_id.get(record.id) if pids_by_id is not None else backend.pane_pid(record)
+                except TmuxError:
+                    pid = None
+            resolved.append((record, live_session, pid))
+        if getattr(backend, "pane_snapshot_stale", False):
+            # A failed tmux control-plane query returned remembered PIDs. Do
+            # not use those stale identifiers as proof that sessions died or
+            # changed state; wait for a successful bounded pane snapshot.
+            snapshots = [
+                ResourceSnapshot(pid=pid, exists=live_session, state="unknown")
+                for _record, live_session, pid in resolved
+            ]
+        else:
+            snapshots = _sample_many(
+                sampler,
+                [pid if live_session else None for _record, live_session, pid in resolved],
+                refresh_limit=resource_sample_limit,
+            )
+        observations = [
+            (record, live_session, pid, snapshot)
+            for (record, live_session, pid), snapshot in zip(resolved, snapshots)
+        ]
+
+    pending_updates: list[tuple[str, str, bool, int | None]] = []
+    for record, live_session, pid, snapshot in observations:
         after_status, after_visible, after_pid, detail = _desired_state(
             record,
             live_session=live_session,
@@ -165,13 +239,7 @@ def reconcile_records(
             or after_pid != record.last_pid
         )
         if changed and store is not None and not dry_run:
-            store.update(
-                record.id,
-                status=after_status,
-                visible=after_visible,
-                last_pid=after_pid,
-                last_opened_at=utc_now(),
-            )
+            pending_updates.append((record.id, after_status, after_visible, after_pid))
         rows.append(
             ReconcileRow(
                 id=record.id,
@@ -193,6 +261,20 @@ def reconcile_records(
             )
         )
 
+    if pending_updates and store is not None and not dry_run:
+        update_many = getattr(store, "update_runtime_states", None)
+        if callable(update_many):
+            update_many(pending_updates)
+        else:
+            for session_id, status, visible, last_pid in pending_updates:
+                store.update(
+                    session_id,
+                    status=status,
+                    visible=visible,
+                    last_pid=last_pid,
+                    last_opened_at=utc_now(),
+                )
+
     return ReconcileResult(
         dry_run=dry_run,
         count=len(rows),
@@ -210,6 +292,7 @@ def reconcile_store(
     hide_missing: bool = True,
     include_archived: bool = False,
     tag: str | None = None,
+    resource_sample_limit: int | None = None,
 ) -> ReconcileResult:
     records = store.list(include_archived=include_archived)
     if tag:
@@ -221,4 +304,5 @@ def reconcile_store(
         sampler=sampler,
         dry_run=dry_run,
         hide_missing=hide_missing,
+        resource_sample_limit=resource_sample_limit,
     )

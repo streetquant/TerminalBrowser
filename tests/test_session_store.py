@@ -7,6 +7,20 @@ from termdeck.session_store import SessionStore
 
 
 class SessionStoreTests(unittest.TestCase):
+    def test_file_registry_uses_responsive_sqlite_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                journal_mode = store.conn.execute("PRAGMA journal_mode").fetchone()[0]
+                synchronous = store.conn.execute("PRAGMA synchronous").fetchone()[0]
+                busy_timeout = store.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+                self.assertEqual(str(journal_mode).casefold(), "wal")
+                self.assertEqual(int(synchronous), 1)  # SQLite NORMAL
+                self.assertEqual(int(busy_timeout), 1000)
+            finally:
+                store.close()
+
     def test_create_update_list(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")
@@ -20,6 +34,28 @@ class SessionStoreTests(unittest.TestCase):
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0].id, record.id)
                 self.assertEqual(store.tags(), ["dev"])
+            finally:
+                store.close()
+
+    def test_runtime_reconciliation_updates_are_batched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                first = store.create("first", "ai", "codex", tmp)
+                second = store.create("second", "ai", "claude", tmp)
+
+                count = store.update_runtime_states(
+                    [
+                        (first.id, "running", True, 101),
+                        (second.id, "paused", False, 202),
+                    ]
+                )
+
+                self.assertEqual(count, 2)
+                refreshed_first = store.get(first.id)
+                refreshed_second = store.get(second.id)
+                self.assertEqual((refreshed_first.status, refreshed_first.visible, refreshed_first.last_pid), ("running", True, 101))
+                self.assertEqual((refreshed_second.status, refreshed_second.visible, refreshed_second.last_pid), ("paused", False, 202))
             finally:
                 store.close()
 

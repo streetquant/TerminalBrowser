@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,9 +39,28 @@ class SessionStore:
         self.path = Path(path).expanduser() if path else DEFAULT_DB_PATH
         if self.path != Path(":memory:"):
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
+        # Keep the GUI responsive if a second TermDeck/CLI process briefly
+        # holds the registry, and avoid a full fsync for every tab-state update.
+        self.conn = sqlite3.connect(str(self.path), timeout=1.0)
         self.conn.row_factory = sqlite3.Row
+        self._configure_connection()
         self._init_schema()
+
+    def _configure_connection(self) -> None:
+        self.conn.execute("PRAGMA busy_timeout = 1000")
+        self.conn.execute("PRAGMA temp_store = MEMORY")
+        if self.path == Path(":memory:"):
+            return
+        try:
+            mode = self.conn.execute("PRAGMA journal_mode = WAL").fetchone()
+            if mode and str(mode[0]).casefold() == "wal":
+                # WAL + NORMAL preserves database consistency while avoiding
+                # a storage flush on every small UI metadata transaction.
+                self.conn.execute("PRAGMA synchronous = NORMAL")
+        except sqlite3.DatabaseError:
+            # Some unusual filesystems cannot host WAL sidecars. SQLite's
+            # default journal remains a safe compatibility fallback.
+            pass
 
     def close(self) -> None:
         self.conn.close()
@@ -185,6 +205,30 @@ class SessionStore:
         updated = SessionRecord(**data)
         self.upsert(updated)
         return updated
+
+    def update_runtime_states(
+        self,
+        updates: Iterable[tuple[str, str, bool, int | None]],
+    ) -> int:
+        """Apply reconciliation state changes in one SQLite transaction."""
+
+        rows = list(updates)
+        if not rows:
+            return 0
+        observed_at = utc_now()
+        self.conn.executemany(
+            """
+            UPDATE sessions
+            SET status = ?, visible = ?, last_pid = ?, last_opened_at = ?
+            WHERE id = ?
+            """,
+            [
+                (status, 1 if visible else 0, last_pid, observed_at, session_id)
+                for session_id, status, visible, last_pid in rows
+            ],
+        )
+        self.conn.commit()
+        return len(rows)
 
     def get(self, session_id: str) -> SessionRecord | None:
         row = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()

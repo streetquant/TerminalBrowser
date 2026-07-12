@@ -29,6 +29,8 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         button_press = _section(terminal, "def _on_button_press", "def _copy_selection_to_clipboards_idle")
 
         self.assertIn("Gtk.Clipboard.get_for_display", terminal)
+        self.assertIn("clipboard.request_text", terminal)
+        self.assertNotIn("wait_for_text", terminal)
         self.assertIn("Gdk.SELECTION_CLIPBOARD", terminal)
         self.assertIn("Gdk.SELECTION_PRIMARY", terminal)
         self.assertIn("self._last_copied_text", terminal)
@@ -52,7 +54,8 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn('close.connect("button-press-event", self._on_tab_label_press, record.id)', main_window)
         self.assertIn("def _hide_tab_from_close_button", main_window)
         self.assertIn("self.hide_tab(session_id, include_pinned=True)", main_window)
-        self.assertIn("Close tab · session keeps running", main_window)
+        self.assertIn("Ctrl+W · session keeps running", main_window)
+        self.assertIn("close.get_accessible().set_name", main_window)
         self.assertIn("def _unpin_and_hide_tab", main_window)
         self.assertIn("self.hide_tab(record.id, include_pinned=True)", main_window)
         self.assertIn("Unpinned and hid tab", main_window)

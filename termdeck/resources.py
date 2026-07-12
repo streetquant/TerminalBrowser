@@ -206,13 +206,20 @@ class ResourceSampler:
     CPU percentage is calculated like top: 100% roughly means one full CPU core.
     """
 
-    def __init__(self, *, snapshot_cache_ttl: float = 0.75) -> None:
+    def __init__(
+        self,
+        *,
+        snapshot_cache_ttl: float = 0.75,
+        max_cache_entries: int = 4096,
+    ) -> None:
         self._previous: dict[int, tuple[int, int]] = {}
         self._boot_time = _boot_time()
         self._cpu_count = max(1, os.cpu_count() or 1)
         self._jiffies_cache: tuple[float, int] | None = None
         self.snapshot_cache_ttl = max(0.0, float(snapshot_cache_ttl))
+        self.max_cache_entries = max(1, int(max_cache_entries))
         self._snapshot_cache: dict[int, tuple[float, ResourceSnapshot]] = {}
+        self._bulk_refresh_cursor = 0
 
     def invalidate_cache(self, root_pid: int | None = None) -> None:
         """Drop cached resource snapshots after process-state changes."""
@@ -229,6 +236,18 @@ class ResourceSampler:
         self._jiffies_cache = (now, value)
         return value
 
+    def _prune_caches(self) -> None:
+        """Bound PID churn without evicting the whole working set at once."""
+
+        while len(self._snapshot_cache) > self.max_cache_entries:
+            oldest = next(iter(self._snapshot_cache))
+            self._snapshot_cache.pop(oldest, None)
+            self._previous.pop(oldest, None)
+        while len(self._previous) > self.max_cache_entries:
+            oldest = next(iter(self._previous))
+            self._previous.pop(oldest, None)
+            self._snapshot_cache.pop(oldest, None)
+
     def snapshot(self, root_pid: int | None) -> ResourceSnapshot:
         if not root_pid:
             return ResourceSnapshot(pid=None, exists=False)
@@ -237,11 +256,19 @@ class ResourceSampler:
         if self.snapshot_cache_ttl:
             cached = self._snapshot_cache.get(int(root_pid))
             if cached is not None and now < cached[0]:
+                self._snapshot_cache.pop(int(root_pid), None)
+                self._snapshot_cache[int(root_pid)] = cached
                 return cached[1]
 
         pids = process_tree(root_pid)
         if not pids:
-            return ResourceSnapshot(pid=root_pid, exists=False)
+            snap = ResourceSnapshot(pid=root_pid, exists=False)
+            self._previous.pop(int(root_pid), None)
+            if self.snapshot_cache_ttl:
+                self._snapshot_cache.pop(int(root_pid), None)
+                self._snapshot_cache[int(root_pid)] = (now + self.snapshot_cache_ttl, snap)
+            self._prune_caches()
+            return snap
 
         total_proc_jiffies = 0
         memory = 0
@@ -260,7 +287,8 @@ class ResourceSampler:
 
         total_jiffies = self._cached_total_jiffies()
         cpu_percent = 0.0
-        previous = self._previous.get(root_pid)
+        # Reinsert to keep dict order as a tiny LRU for the bounded churn cache.
+        previous = self._previous.pop(root_pid, None)
         if previous and total_jiffies > previous[1]:
             proc_delta = max(0, total_proc_jiffies - previous[0])
             total_delta = max(1, total_jiffies - previous[1])
@@ -282,13 +310,63 @@ class ResourceSampler:
             process_count=len(pids),
         )
         if self.snapshot_cache_ttl:
+            self._snapshot_cache.pop(int(root_pid), None)
             self._snapshot_cache[int(root_pid)] = (now + self.snapshot_cache_ttl, snap)
+        self._prune_caches()
         return snap
 
-    def snapshots(self, root_pids: list[int | None]) -> list[ResourceSnapshot]:
-        """Sample many roots efficiently (shared jiffies cache)."""
+    def snapshots(
+        self,
+        root_pids: list[int | None],
+        *,
+        refresh_limit: int | None = None,
+    ) -> list[ResourceSnapshot]:
+        """Sample many roots with an optional round-robin refresh budget.
 
-        return [self.snapshot(pid) for pid in root_pids]
+        A GTK refresh over thousands of agents must not synchronously walk every
+        process tree. Fresh cache entries are always reused. At most
+        ``refresh_limit`` stale/missing entries are sampled; the rest retain a
+        stale snapshot or a lightweight "known by the mux, sample pending"
+        placeholder until a later round.
+        """
+
+        if refresh_limit is None:
+            return [self.snapshot(pid) for pid in root_pids]
+
+        clean_limit = max(0, int(refresh_limit))
+        now = time.monotonic()
+        unique_pids = list(dict.fromkeys(int(pid) for pid in root_pids if pid))
+        chosen: set[int] = set()
+        if unique_pids and clean_limit:
+            index = self._bulk_refresh_cursor % len(unique_pids)
+            inspected = 0
+            while inspected < len(unique_pids) and len(chosen) < clean_limit:
+                pid = unique_pids[index]
+                cached = self._snapshot_cache.get(pid)
+                if cached is None or now >= cached[0]:
+                    chosen.add(pid)
+                index = (index + 1) % len(unique_pids)
+                inspected += 1
+            self._bulk_refresh_cursor = index
+
+        refreshed = {pid: self.snapshot(pid) for pid in chosen}
+        results: list[ResourceSnapshot] = []
+        for root_pid in root_pids:
+            if not root_pid:
+                results.append(ResourceSnapshot(pid=None, exists=False))
+                continue
+            pid = int(root_pid)
+            if pid in refreshed:
+                results.append(refreshed[pid])
+                continue
+            cached = self._snapshot_cache.get(pid)
+            if cached is not None:
+                results.append(cached[1])
+                continue
+            # pane_pids supplied this PID, so represent it as live-but-pending
+            # instead of falsely marking the remembered session missing.
+            results.append(ResourceSnapshot(pid=pid, exists=True, state="unknown"))
+        return results
 
 
 def format_bytes(value: int) -> str:

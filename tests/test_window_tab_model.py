@@ -25,6 +25,63 @@ class SideStub:
 
 
 class WindowTabModelTests(TestCase):
+    def test_stale_backend_pid_preserves_live_status_without_sampling(self) -> None:
+        class Sampler:
+            def snapshot(self, _pid):
+                raise AssertionError("stale pane data must not mark a live tab stopped")
+
+        window = SimpleNamespace(
+            app_context=SimpleNamespace(
+                backend=SimpleNamespace(pane_snapshot_stale=True),
+                sampler=Sampler(),
+            )
+        )
+        running = SimpleNamespace(status="running")
+        paused = SimpleNamespace(status="paused")
+
+        self.assertEqual(TermDeckWindow.observed_status(window, running, 101), "running")
+        self.assertEqual(TermDeckWindow.observed_status(window, paused, 202), "paused")
+
+    def test_restore_batches_backend_queries_and_refreshes_side_once(self) -> None:
+        records = [
+            SimpleNamespace(id="second", tab_index=1),
+            SimpleNamespace(id="first", tab_index=0),
+        ]
+        calls = []
+
+        class Backend:
+            def session_exists_many(self, candidates):
+                calls.append(("exists", [record.id for record in candidates]))
+                return {record.id: True for record in candidates}
+
+            def pane_pids(self, candidates):
+                calls.append(("pids", [record.id for record in candidates]))
+                return {record.id: index for index, record in enumerate(candidates, start=101)}
+
+        side = SideStub()
+        window = SimpleNamespace(
+            app_context=SimpleNamespace(backend=Backend()),
+            tabs={},
+            side=side,
+        )
+
+        def open_session(record, **kwargs):
+            calls.append(("open", record.id, kwargs))
+            window.tabs[record.id] = object()
+
+        window.open_session = open_session
+
+        restored = TermDeckWindow.restore_previous_tabs(window, records=records)
+
+        self.assertEqual(restored, 2)
+        self.assertEqual(calls[0], ("exists", ["first", "second"]))
+        self.assertEqual(calls[1], ("pids", ["first", "second"]))
+        self.assertEqual([call[1] for call in calls[2:]], ["first", "second"])
+        self.assertTrue(all(call[2]["known_live"] for call in calls[2:]))
+        self.assertTrue(all(call[2]["known_pid_resolved"] for call in calls[2:]))
+        self.assertTrue(all(not call[2]["refresh_side"] for call in calls[2:]))
+        self.assertEqual(side.refresh_count, 1)
+
     def test_directory_tab_name_uses_only_final_component(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             nested = Path(tmp) / "client-api"

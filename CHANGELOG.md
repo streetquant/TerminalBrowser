@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.10
+
+- Restored real terminal scrolling: VTE now has a native scrolled container and fallback scrolling, while attached tmux sessions enable mouse-driven copy-mode history; `Shift` preserves local text selection.
+- Added explicit 2,000-session control-plane defaults: at most 24 startup terminals across 4 windows, 128 process-tree samples per refresh, 100 Tabs-pane cards, and 500 Tab Manager rows.
+- Bounded PID churn caches and terminal captures, added adaptive fleet-query deadlines with failure backoff, and made failed snapshots preserve stale lifecycle/PID state without N-way retry fan-out.
+- Batched reconciliation state writes into one SQLite transaction and kept pressure/timeout paths strictly non-destructive; only explicit lifecycle actions can stop sessions.
+- Added synthetic 2,000-session coverage plus a real GTK/tmux wheel smoke that entered copy mode and advanced the history scroll position.
+- Replaced blocking clipboard reads with GTK's asynchronous text-request API, including safe late-callback handling after a terminal detaches.
+- Added strict tmux command deadlines and batched session/PID discovery for startup reconciliation and tab restoration.
+- Switched the file-backed session registry to SQLite WAL/NORMAL mode with a one-second lock deadline, retaining the default journal as a compatibility fallback.
+- Prevented an all-pane timeout from expanding into one synchronous tmux lookup per tab, while preserving the last known live state during transient backend stalls.
+- Stopped the hidden-by-default Tabs pane from querying SQLite, tmux, `/proc`, or rebuilding widgets until it is visible.
+- Replaced the terminal client's Python `preexec_fn` path with `start_new_session=True` and focused newly opened VTE surfaces immediately.
+- Tightened the header and terminal frame, replaced the oversized circular New-tab action with a compact semantic control, removed persistent-surface transitions and broad shadows, and restored readable tab-name widths.
+- Added shortcut hints and accessible close names without adding visible chrome.
+- Verified 373 tests and 15 subtests; the real wheel smoke entered tmux copy mode and advanced the history position. The prior nine GTK/tmux lifecycle smokes remained covered, with a 78 ms first attachment and 23 ms Ctrl+T handler in their verification run. Desktop and exact `640x520` renders completed with zero layout errors.
+
 ## 0.2.9
 
 - Removed the GTK directory chooser from New tab, first-run window creation, and New TermDeck window flows.

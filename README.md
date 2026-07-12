@@ -81,7 +81,7 @@ The header contains only the current window name, **New tab**, and **More**. Sea
 
 ### Visual design
 
-TermDeck uses a terminal-first, layered dark interface. The terminal and tab strip sit inside an inset rounded surface, the selected tab receives a restrained accent treatment, and secondary controls recede until hover or keyboard focus. Buttons, menus, search fields, tables, previews and the optional Tabs pane share the same radii, borders and elevation system. Compact density preserves the same hierarchy with reduced spacing.
+TermDeck uses a terminal-first, layered dark interface. The terminal and tab strip sit inside a compact rounded surface, the selected tab receives a restrained accent treatment, and secondary controls recede until hover or keyboard focus. Buttons, menus, search fields, tables, previews and the optional Tabs pane share crisp borders and consistent radii without costly decorative animation or broad shadows. Compact density preserves the same hierarchy with reduced spacing.
 
 ### Create a tab
 
@@ -102,6 +102,25 @@ Use **More → New TermDeck window**. Enter the group name and TermDeck opens it
 ### Tabs pane
 
 The main window starts terminal-only. Press `F9`, use **More → Show/hide tabs pane**, or search for **Tabs pane** in the command palette when advanced multi-tab controls are needed. The preference persists across launches and applies to every TermDeck window. When visible, the pane can be moved left or right and supports `Ctrl+left-click` bulk selection.
+
+### Scrolling and large fleets
+
+The mouse wheel now scrolls the active tmux pane's real history by entering tmux copy mode. Press `q` or `Esc` to leave copy mode. The VTE terminal also lives inside a native GTK scrolled container for fallback/non-tmux scroll events. Because tmux mouse reporting receives ordinary pointer gestures, hold `Shift` while dragging when you want to select and auto-copy terminal text locally.
+
+TermDeck's default GUI is a bounded control plane for a registry of 2,000 or more sessions; it does not try to render 2,000 VTE widgets at once:
+
+- Startup restores at most 4 windows, 12 tabs per window, and 24 attached terminals. Every omitted tmux session stays alive and remains searchable/openable.
+- One UI refresh samples at most 128 process trees. Unsampled live panes show `sampling` and rotate into a later refresh instead of being reported dead.
+- The optional Tabs pane materialises at most 100 cards and Tab Manager at most 500 rows. Filtering happens before the cap, so a specific session can still be found.
+- PID caches retain at most 4,096 entries; terminal capture is one tmux query capped at 10,000 lines; tmux history remains bounded at 2,000 lines per pane.
+- Fleet snapshots use adaptive deadlines plus retry backoff. A timeout or failed snapshot is treated as stale control-plane data, not evidence that all sessions died, and never fans out into thousands of fallback connections.
+- Resource pressure, buffer limits, and query failures never trigger automatic pause or stop. Only an explicit user-confirmed lifecycle action can terminate a session.
+
+These limits protect TermDeck's management process, not the host from the cost of the agent processes themselves. Running 2,000 coding agents still requires appropriate RAM, process/file-descriptor limits, and provider capacity.
+
+### What Frankenterm contributes
+
+[Frankenterm](https://github.com/Dicklesworthstone/frankenterm) is useful as an architecture reference, not a direct TermDeck dependency. Its strongest applicable ideas are passive/event-driven observation, bounded batch text retrieval, tiered scrollback, explicit data-gap reporting, and one pressure signal with hysteresis. This release applies the bounded-working-set and stale-not-dead parts to TermDeck's GTK/tmux control plane. A future optional history/indexing sidecar could borrow its delta-extraction and tiered-storage model if TermDeck needs fleet-wide searchable transcripts; replacing tmux/VTE with Frankenterm's WezTerm-based runtime would be a separate product-level migration.
 
 ## Desktop/app-menu launcher
 

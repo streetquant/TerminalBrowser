@@ -20,10 +20,17 @@ gi.require_version("Gdk", "3.0")
 gi.require_version("Vte", "2.91")
 from gi.repository import Gdk, GLib, Gtk, Pango, Vte  # type: ignore  # noqa: E402
 
+from .capacity import (
+    MASTER_ROW_LIMIT,
+    SIDE_PANE_ROW_LIMIT,
+    UI_RESOURCE_REFRESH_BUDGET,
+    bounded_registry_records,
+    bounded_startup_groups,
+)
 from .command_palette import PaletteItem, build_palette_items, search_palette
 from .control_plan import ControlPlan, build_control_plan, render_control_plan_text
 from .health import HealthPolicy, classify_session, health_badge, should_pause_for_attention
-from .master_tasks import filter_rows, row_from_record
+from .master_tasks import filter_rows
 from .models import SessionRecord, TerminalTheme
 from .redaction import redact_text
 from .resources import ResourceSampler
@@ -32,7 +39,7 @@ from .session_reconcile import reconcile_store
 from .session_search import search_sessions
 from .session_store import SessionStore, short_id, utc_now
 from .settings import AppSettings, SettingsError, save_terminal_options
-from .shortcuts import build_shortcut_map, index_from_key_name, shortcut_entries, tab_shortcut
+from .shortcuts import build_shortcut_map, index_from_key_name, shortcut_entries
 from .task_snapshot import build_task_snapshot
 from .command_render import default_shell, directory_tab_name, normalise_directory, render_command
 from .window_snapshot import build_window_snapshots
@@ -272,6 +279,20 @@ class AttachTerminal(Gtk.Box):
         self.terminal.set_hexpand(True)
         self.terminal.set_vexpand(True)
         apply_theme(self.terminal, theme, font_override=font_override)
+        # A VTE terminal is scrollable, but GTK only exposes its adjustment and
+        # scrollbar when it is hosted by a ScrolledWindow. tmux mouse mode
+        # handles full-screen history; fallback scrolling covers unconsumed
+        # events and non-tmux child output.
+        self.scroller = Gtk.ScrolledWindow()
+        self.scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.scroller.set_hexpand(True)
+        self.scroller.set_vexpand(True)
+        try:
+            self.terminal.set_enable_fallback_scrolling(True)
+        except Exception:
+            pass
+        self.terminal.set_scroll_on_output(False)
+        self.terminal.set_scroll_on_keystroke(True)
         # VTE keeps focus for typing; connect here so Ctrl++/- zoom is not swallowed.
         if key_press_handler is not None:
             self.terminal.connect("key-press-event", key_press_handler)
@@ -286,7 +307,8 @@ class AttachTerminal(Gtk.Box):
         # Last select-to-copy payload — used when pasting back into this terminal
         # (VTE paste_* can miss text we put on the clipboard ourselves).
         self._last_copied_text = ""
-        self.pack_start(self.terminal, True, True, 0)
+        self.scroller.add(self.terminal)
+        self.pack_start(self.scroller, True, True, 0)
         # tmux renders dotted padding when a client attaches at the PTY default
         # 80x24 and the GTK window is resized immediately afterwards. Debounce
         # the initial allocation so tmux receives the final VTE grid from frame 1.
@@ -371,7 +393,7 @@ class AttachTerminal(Gtk.Box):
                 stdout=slave_fd,
                 stderr=slave_fd,
                 close_fds=True,
-                preexec_fn=os.setsid,
+                start_new_session=True,
             )
             try:
                 self.terminal.watch_child(self.process.pid)
@@ -446,38 +468,64 @@ class AttachTerminal(Gtk.Box):
         except Exception:
             return None
 
-    def _clipboard_text(self, selection) -> str:
-        clipboard = self._system_clipboard(selection)
-        if clipboard is None:
-            return ""
-        try:
-            text = clipboard.wait_for_text()
-        except Exception:
-            text = None
-        if isinstance(text, (bytes, bytearray)):
-            text = text.decode("utf-8", errors="replace")
-        return text if isinstance(text, str) else ""
-
     def _paste_from_selection(self, selection, *, prefer_last: bool = False) -> bool:
-        """Paste into this terminal. Prefer real clipboard, then last select-to-copy."""
-        text = self._clipboard_text(selection)
-        if not text and prefer_last:
-            text = self._last_copied_text or ""
-        if not text and selection != Gdk.SELECTION_CLIPBOARD:
-            text = self._clipboard_text(Gdk.SELECTION_CLIPBOARD)
-        if not text and prefer_last:
-            text = self._last_copied_text or ""
-        if text:
-            return self._feed_text(text)
-        # Last resort: VTE's own paste (async; may no-op after our set_text path).
-        try:
-            if selection == Gdk.SELECTION_PRIMARY:
-                self.terminal.paste_primary()
-            else:
-                self.terminal.paste_clipboard()
+        """Request clipboard text without blocking GTK's main loop."""
+
+        def _normalise(text) -> str:
+            if isinstance(text, (bytes, bytearray)):
+                return text.decode("utf-8", errors="replace")
+            return text if isinstance(text, str) else ""
+
+        def _vte_fallback() -> None:
+            if getattr(self, "_detached", False):
+                return
+            try:
+                if selection == Gdk.SELECTION_PRIMARY:
+                    self.terminal.paste_primary()
+                else:
+                    self.terminal.paste_clipboard()
+            except Exception:
+                pass
+
+        def _finish(text, *, allow_clipboard_fallback: bool) -> None:
+            if getattr(self, "_detached", False):
+                return
+            clean_text = _normalise(text)
+            if clean_text:
+                self._feed_text(clean_text)
+                return
+            if prefer_last and self._last_copied_text:
+                self._feed_text(self._last_copied_text)
+                return
+            if allow_clipboard_fallback and selection != Gdk.SELECTION_CLIPBOARD:
+                if _request(Gdk.SELECTION_CLIPBOARD, lambda fallback: _finish(fallback, allow_clipboard_fallback=False)):
+                    return
+            _vte_fallback()
+
+        def _request(requested_selection, callback) -> bool:
+            clipboard = self._system_clipboard(requested_selection)
+            if clipboard is None:
+                return False
+
+            def _received(_clipboard, text, *_args) -> None:
+                callback(text)
+
+            try:
+                clipboard.request_text(_received, None)
+                return True
+            except TypeError:
+                try:
+                    clipboard.request_text(_received)
+                    return True
+                except Exception:
+                    return False
+            except Exception:
+                return False
+
+        if _request(selection, lambda text: _finish(text, allow_clipboard_fallback=True)):
             return True
-        except Exception:
-            return False
+        _finish(None, allow_clipboard_fallback=True)
+        return True
 
     def _selected_text(self) -> str:
         """Return the current selection as plain text, or empty string."""
@@ -711,6 +759,7 @@ class WindowOverview(Gtk.Window):
             backend=self.app_context.backend,
             sampler=self.app_context.sampler,
             policy=self.app_context.budget,
+            snapshot_refresh_limit=UI_RESOURCE_REFRESH_BUDGET,
         )
         for row in build_window_snapshots(items):
             self.store.append([
@@ -1421,6 +1470,8 @@ class SidePane(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=8)
         self.window = window
         self.selected_ids: set[str] = set()
+        self._visible_record_count = 0
+        self._shown_record_count = 0
         self._refresh_alive = True
         self.connect("destroy", lambda *_: setattr(self, "_refresh_alive", False))
         self._last_refresh_signature = None
@@ -1649,21 +1700,39 @@ class SidePane(Gtk.Box):
         if records:
             self.window.show_toast(toast_message_for_action("killed", len(records)), kind="danger")
 
+    def _update_count_label(self) -> None:
+        selected_count = len(self.selected_ids)
+        total = self._visible_record_count
+        shown = self._shown_record_count
+        display = f"{shown} shown · {total} tabs" if shown < total else f"{total} tabs"
+        if selected_count:
+            display = f"{selected_count} selected · {display}"
+        self.count_label.set_text(display)
+
     def refresh(self) -> None:
+        # The pane is optional and hidden by default. Direct refresh requests
+        # still arrive as tabs change; do no tmux, /proc, or widget work until
+        # the user actually opens it.
+        if not self.get_visible():
+            self._last_refresh_signature = None
+            return
         query = self.filter_entry.get_text().lower().strip()
-        records = [
+        matching_records = [
             record
             for record in self.window.app_context.store.list()
             if _show_in_sessions_pane(record)
             and (not query or query in f"{record.name} {record.tag} {record.id} {record.command}".lower())
         ]
-        live_ids = {record.id for record in records}
+        live_ids = {record.id for record in matching_records}
+        self._visible_record_count = len(matching_records)
         self.selected_ids.intersection_update(live_ids)
-        selected_count = len(self.selected_ids)
-        if selected_count:
-            self.count_label.set_text(f"{selected_count} selected · {len(records)} tabs")
-        else:
-            self.count_label.set_text(f"{len(records)} tabs")
+        records = bounded_registry_records(
+            matching_records,
+            limit=SIDE_PANE_ROW_LIMIT,
+            preferred_ids=self.selected_ids,
+        )
+        self._shown_record_count = len(records)
+        self._update_count_label()
         resource_bucket = int(time.monotonic() // self._refresh_bucket_seconds)
         signature = (
             query,
@@ -1676,8 +1745,16 @@ class SidePane(Gtk.Box):
         self._last_refresh_signature = signature
         for child in self.session_box.get_children():
             self.session_box.remove(child)
-        # One tmux list-panes -a + fast /proc trees instead of N×(has-session+list-panes+full /proc).
-        pids = self.window.app_context.backend.pane_pids(records)
+        # The model and resource working set stays bounded even when the
+        # registry contains thousands of live background sessions.
+        items = build_task_snapshot(
+            records,
+            backend=self.window.app_context.backend,
+            sampler=self.window.app_context.sampler,
+            policy=self.window.app_context.budget,
+            snapshot_refresh_limit=UI_RESOURCE_REFRESH_BUDGET,
+        )
+        items_by_id = {item.record.id: item for item in items}
         if not records:
             empty_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
             _style(empty_card, "td-empty-state")
@@ -1709,10 +1786,8 @@ class SidePane(Gtk.Box):
             self.session_box.show_all()
             return
         for record in records:
-            pid = pids.get(record.id)
-            if pid is None:
-                pid = record.last_pid
-            snap = self.window.app_context.sampler.snapshot(pid)
+            item = items_by_id[record.id]
+            snap = item.snapshot
             health = classify_session(record, snap, self.window.app_context.budget)
             badge = health_badge(health)
             kind = kind_for_session(name=record.name, command=record.command, tag=record.tag)
@@ -1792,11 +1867,7 @@ class SidePane(Gtk.Box):
             else:
                 context.remove_class("td-session-selected")
         if hasattr(self, "count_label"):
-            selected_count = len(self.selected_ids)
-            visible_count = len([record for record in self.window.app_context.store.list() if _show_in_sessions_pane(record)])
-            self.count_label.set_text(
-                f"{selected_count} selected · {visible_count} tabs" if selected_count else f"{visible_count} tabs"
-            )
+            self._update_count_label()
 
     def selected_records(self) -> list[SessionRecord]:
         records = []
@@ -2015,6 +2086,9 @@ class MasterWindow(Gtk.Window):
         _style(self.filter_entry, "td-search-entry")
         _connect_debounced_refresh(self.filter_entry, self.refresh)
         top.pack_start(self.filter_entry, True, True, 0)
+        self.count_label = Gtk.Label(label="0 tabs")
+        _style(self.count_label, "td-count-pill")
+        top.pack_start(self.count_label, False, False, 0)
         close = Gtk.Button(label="Close")
         close.connect("clicked", lambda *_: self.destroy())
         top.pack_start(close, False, False, 0)
@@ -2099,26 +2173,23 @@ class MasterWindow(Gtk.Window):
     def refresh(self, *_args) -> None:
         selected = set(self.selected_ids())
         self.store.clear()
-        rows = []
         records = self.app_context.store.list()
-        pids = self.app_context.backend.pane_pids(records)
-        for record in records:
-            pid = pids.get(record.id)
-            if pid is None:
-                pid = record.last_pid
-            snap = self.app_context.sampler.snapshot(pid)
-            shortcut = tab_shortcut(record.tab_index + 1) if record.visible else tab_shortcut(0)
-            rows.append(
-                row_from_record(
-                    record,
-                    pid=pid,
-                    snapshot=snap,
-                    focus_key=shortcut.focus,
-                    pause_key=shortcut.pause_toggle,
-                    policy=self.app_context.budget,
-                )
-            )
-        for row in filter_rows(rows, self.filter_entry.get_text()):
+        items = build_task_snapshot(
+            records,
+            backend=self.app_context.backend,
+            sampler=self.app_context.sampler,
+            policy=self.app_context.budget,
+            snapshot_refresh_limit=UI_RESOURCE_REFRESH_BUDGET,
+        )
+        matching = filter_rows([item.row for item in items], self.filter_entry.get_text())
+        shown = matching[:MASTER_ROW_LIMIT]
+        if len(shown) < len(matching):
+            self.count_label.set_text(f"{len(shown)} shown · {len(matching)} matching · {len(records)} total")
+        elif len(matching) != len(records):
+            self.count_label.set_text(f"{len(matching)} matching · {len(records)} total")
+        else:
+            self.count_label.set_text(f"{len(records)} tabs")
+        for row in shown:
             values = row.as_list()
             iter_ = self.store.append(values[:3] + values[4:])
             if row.session_id in selected:
@@ -2370,12 +2441,12 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         new_tab = _icon_button(
             "New tab",
             "list-add-symbolic",
-            "Open a shell immediately in the active terminal directory",
+            "New tab · Ctrl+T · opens in the active terminal directory",
             self.new_tab,
-            suggested=True,
+            suggested=False,
             show_label=False,
         )
-        _style(new_tab, "td-header-icon")
+        _style(new_tab, "td-new-tab", "td-header-icon")
         header.pack_start(new_tab)
 
         overflow_header_actions = [
@@ -2398,7 +2469,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             overflow_menu.append(item)
         overflow_menu.show_all()
         overflow = Gtk.MenuButton(label="⋯")
-        overflow.set_tooltip_text("More window and tab actions")
+        overflow.set_tooltip_text("More actions · Ctrl+Shift+P opens the command palette")
         try:
             overflow.get_accessible().set_name("More actions")
         except Exception:
@@ -2458,7 +2529,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         label_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         name = Gtk.Label(label=record.name)
         name.set_ellipsize(Pango.EllipsizeMode.END)
-        name.set_max_width_chars(24)
+        name.set_width_chars(min(20, max(4, len(record.name))))
+        name.set_max_width_chars(20)
         state = "Pinned · " if record.pinned else ""
         name.set_tooltip_text(
             f"{state}{record.cwd} · {record.command}\n"
@@ -2470,7 +2542,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         close = Gtk.Button(label="×")
         close.set_relief(Gtk.ReliefStyle.NONE)
         _style(close, "td-tab-close")
-        close.set_tooltip_text("Close tab · session keeps running")
+        close.set_tooltip_text(f"Close {record.name} · Ctrl+W · session keeps running")
+        try:
+            close.get_accessible().set_name(f"Close {record.name}")
+        except Exception:
+            pass
         close.connect("clicked", lambda _b, sid=record.id: self._hide_tab_from_close_button(sid))
         close.connect("button-press-event", self._on_tab_label_press, record.id)
         label_box.pack_start(close, False, False, 0)
@@ -2807,7 +2883,13 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.app_context.backend.create_or_resume(record)
         pid = self.app_context.backend.pane_pid(record)
         record = self.app_context.store.update(record.id, status="running", last_pid=pid)
-        self.open_session(record)
+        self.open_session(
+            record,
+            known_live=True,
+            known_pid=pid,
+            known_pid_resolved=True,
+            refresh_side=False,
+        )
         self.side.refresh()
 
 
@@ -2819,11 +2901,38 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             window_id=self.window_id,
         )
         remember_layout = records is None
+        pending = [record for record in restore_records if record.id not in self.tabs]
+        live_by_id: dict[str, bool] | None = None
+        pids_by_id: dict[str, int | None] = {}
+        pids_resolved = False
+        exists_many = getattr(self.app_context.backend, "session_exists_many", None)
+        if callable(exists_many):
+            try:
+                live_by_id = dict(exists_many(pending))
+                live_records = [record for record in pending if live_by_id.get(record.id, False)]
+                pane_pids = getattr(self.app_context.backend, "pane_pids", None)
+                if callable(pane_pids):
+                    pids_by_id = dict(pane_pids(live_records))
+                    pids_resolved = True
+            except Exception:
+                # Preserve the existing per-session fallback when a third-party
+                # backend cannot provide a batch snapshot.
+                live_by_id = None
+                pids_by_id = {}
+                pids_resolved = False
         for record in restore_records:
             if record.id in self.tabs:
                 continue
             before = len(self.tabs)
-            self.open_session(record, restart_missing=False, remember_layout=remember_layout)
+            self.open_session(
+                record,
+                restart_missing=False,
+                remember_layout=remember_layout,
+                known_live=live_by_id.get(record.id) if live_by_id is not None else None,
+                known_pid=pids_by_id.get(record.id),
+                known_pid_resolved=pids_resolved,
+                refresh_side=False,
+            )
             if len(self.tabs) > before:
                 restored += 1
         self.side.refresh()
@@ -2856,6 +2965,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         return reopened
 
     def observed_status(self, record: SessionRecord, pid: int | None) -> str:
+        if getattr(self.app_context.backend, "pane_snapshot_stale", False):
+            if record.status == "paused":
+                return "paused"
+            if record.status in {"running", "missing"}:
+                return "running"
         snap = self.app_context.sampler.snapshot(pid)
         if snap.exists:
             return "paused" if snap.state == "T" else "running"
@@ -2881,14 +2995,31 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if self.master_window and self.master_window.get_visible():
             self.master_window.refresh()
 
-    def open_session(self, record: SessionRecord, restart_missing: bool = True, remember_layout: bool = True) -> None:
-        if not self.app_context.backend.session_exists(record):
+    def open_session(
+        self,
+        record: SessionRecord,
+        restart_missing: bool = True,
+        remember_layout: bool = True,
+        *,
+        known_live: bool | None = None,
+        known_pid: int | None = None,
+        known_pid_resolved: bool = False,
+        refresh_side: bool = True,
+    ) -> None:
+        live_session = self.app_context.backend.session_exists(record) if known_live is None else known_live
+        if not live_session:
             if not restart_missing:
                 self.app_context.store.update(record.id, status="stopped", last_pid=None, visible=False)
-                self.side.refresh()
+                if refresh_side:
+                    self.side.refresh()
                 return
             self.app_context.backend.create_or_resume(record)
-        pid = self.app_context.backend.pane_pid(record)
+            known_pid = None
+        pid = (
+            known_pid
+            if live_session and known_live is not None and known_pid_resolved
+            else self.app_context.backend.pane_pid(record)
+        )
         status = self.observed_status(record, pid)
         layout_changes = {}
         if remember_layout:
@@ -2908,6 +3039,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if record.id in self.tabs:
             self._focus_session(record.id)
             return
+        configure = getattr(self.app_context.backend, "configure_interactive_session", None)
+        if callable(configure):
+            configure(record)
         terminal = AttachTerminal(
             self.app_context.backend.attach_command(record),
             record.cwd,
@@ -2922,7 +3056,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.notebook.set_tab_reorderable(terminal, True)
         self.notebook.set_current_page(page)
         terminal.show_all()
-        self.side.refresh()
+        terminal.terminal.grab_focus()
+        if refresh_side:
+            self.side.refresh()
 
     def _focus_session(self, session_id: str) -> None:
         tab = self.tabs.get(session_id)
@@ -3694,7 +3830,15 @@ class TermDeckApplication(Gtk.Application):
             pid = self.backend.pane_pid(record)
             record = self.store.update(record.id, status="running", last_pid=pid, visible=tab.visible)
             if tab.visible:
-                win.open_session(record, restart_missing=True, remember_layout=False)
+                win.open_session(
+                    record,
+                    restart_missing=True,
+                    remember_layout=False,
+                    known_live=True,
+                    known_pid=pid,
+                    known_pid_resolved=True,
+                    refresh_side=False,
+                )
         win.side.refresh()
         return win
 
@@ -3732,7 +3876,13 @@ class TermDeckApplication(Gtk.Application):
             return
         # Repair stale registry state before browser-style restore so lost
         # backend sessions do not reappear as live tabs after a crash/reboot.
-        reconcile_store(self.store, backend=self.backend, sampler=self.sampler, hide_missing=True)
+        reconcile_store(
+            self.store,
+            backend=self.backend,
+            sampler=self.sampler,
+            hide_missing=True,
+            resource_sample_limit=UI_RESOURCE_REFRESH_BUDGET,
+        )
 
         if not self.windows and self.workspace_path is not None:
             try:
@@ -3744,7 +3894,7 @@ class TermDeckApplication(Gtk.Application):
                 return
 
         if not self.windows:
-            groups = self.store.windows_with_visible_sessions()
+            groups = bounded_startup_groups(self.store.windows_with_visible_sessions())
             if groups:
                 for window_id, window_title, records in groups:
                     win = TermDeckWindow(

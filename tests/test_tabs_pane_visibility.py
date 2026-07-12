@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from termdeck.gtk_app import TermDeckApplication, TermDeckWindow
+from termdeck.gtk_app import SidePane, TermDeckApplication, TermDeckWindow
 from termdeck.settings import AppSettings
 
 
@@ -21,6 +21,16 @@ class SideStub:
 
 
 class TabsPaneVisibilityTests(unittest.TestCase):
+    def test_hidden_pane_refresh_skips_store_backend_and_widget_work(self) -> None:
+        pane = SimpleNamespace(
+            get_visible=lambda: False,
+            _last_refresh_signature=("stale",),
+        )
+
+        SidePane.refresh(pane)
+
+        self.assertIsNone(pane._last_refresh_signature)
+
     def test_showing_tabs_pane_persists_and_refreshes(self) -> None:
         events = []
         side = SideStub()

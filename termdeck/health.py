@@ -121,6 +121,16 @@ def evaluate_health(
             suggested_action="resume when needed",
         )
 
+    if snapshot.state == "unknown" and snapshot.process_count == 0:
+        return SessionHealth(
+            label="sampling",
+            severity=1,
+            level="blue",
+            hint="live pane is waiting for its bounded resource-sampling turn",
+            reason="resource sample pending",
+            suggested_action="wait for the next refresh",
+        )
+
     extra: list[str] = []
     if snapshot.cpu_percent >= policy.high_cpu_percent:
         extra.append(f"high CPU {snapshot.cpu_percent:.1f}%")

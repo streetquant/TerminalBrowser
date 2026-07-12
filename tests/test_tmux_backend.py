@@ -4,7 +4,7 @@ import unittest
 from unittest import mock
 
 from termdeck.models import SessionRecord
-from termdeck.tmux_backend import TmuxBackend
+from termdeck.tmux_backend import TmuxBackend, TmuxError
 
 
 def _record(**kwargs) -> SessionRecord:
@@ -23,6 +23,46 @@ def _record(**kwargs) -> SessionRecord:
 
 
 class TmuxBackendTests(unittest.TestCase):
+    def test_interactive_session_enables_mouse_scrolling_and_bounded_history(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux", history_limit=2500)
+        completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", return_value=completed
+        ) as run:
+            backend.configure_interactive_session(record)
+
+        run.assert_called_once_with(
+            [
+                "set-option",
+                "-t",
+                record.tmux_name,
+                "mouse",
+                "on",
+                ";",
+                "set-option",
+                "-t",
+                record.tmux_name,
+                "history-limit",
+                "2500",
+            ],
+            check=False,
+            timeout=backend.query_timeout,
+        )
+
+    def test_interactive_configuration_failure_backs_off(self):
+        first = _record(id="first", tmux_name="first")
+        second = _record(id="second", tmux_name="second")
+        backend = TmuxBackend(executable="tmux", failure_backoff=60)
+        failed = subprocess.CompletedProcess(args=["tmux"], returncode=124, stdout="", stderr="timeout")
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", return_value=failed
+        ) as run:
+            backend.configure_interactive_session(first)
+            backend.configure_interactive_session(second)
+
+        run.assert_called_once()
+
     def test_attach_command_shape(self):
         record = _record()
         backend = TmuxBackend(executable="tmux")
@@ -68,7 +108,139 @@ class TmuxBackendTests(unittest.TestCase):
                     "#{pane_current_path}",
                 ],
                 check=False,
+                timeout=backend.query_timeout,
             )
+
+    def test_session_exists_many_uses_one_bounded_list_call(self):
+        first = _record(id="a", tmux_name="sess_a")
+        second = _record(id="b", tmux_name="sess_b")
+        backend = TmuxBackend(executable="tmux", query_timeout=0.2)
+        completed = subprocess.CompletedProcess(
+            args=["tmux"],
+            returncode=0,
+            stdout="sess_b\nunrelated\n",
+            stderr="",
+        )
+
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", return_value=completed
+        ) as run:
+            result = backend.session_exists_many([first, second])
+
+        self.assertEqual(result, {"a": False, "b": True})
+        run.assert_called_once_with(
+            ["list-sessions", "-F", "#{session_name}"],
+            check=False,
+            timeout=0.2,
+        )
+
+    def test_session_batch_timeout_preserves_prior_live_state(self):
+        running = _record(id="live", status="running")
+        stopped = _record(id="stopped", status="stopped")
+        backend = TmuxBackend(executable="tmux")
+        timed_out = subprocess.CompletedProcess(
+            args=["tmux"],
+            returncode=124,
+            stdout="",
+            stderr="tmux command timed out",
+        )
+
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", return_value=timed_out
+        ):
+            result = backend.session_exists_many([running, stopped])
+
+        self.assertEqual(result, {"live": True, "stopped": False})
+
+    def test_session_batch_failure_is_stale_not_dead(self):
+        running = _record(id="live", status="running")
+        stopped = _record(id="stopped", status="stopped")
+        backend = TmuxBackend(executable="tmux")
+        failed = subprocess.CompletedProcess(
+            args=["tmux"],
+            returncode=1,
+            stdout="",
+            stderr="server busy",
+        )
+
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", return_value=failed
+        ):
+            result = backend.session_exists_many([running, stopped])
+
+        self.assertEqual(result, {"live": True, "stopped": False})
+
+    def test_pane_snapshot_timeout_does_not_expand_into_per_session_calls(self):
+        first = _record(id="a", tmux_name="sess_a", last_pid=111)
+        second = _record(id="b", tmux_name="sess_b", last_pid=222)
+        backend = TmuxBackend(executable="tmux")
+        timed_out = subprocess.CompletedProcess(
+            args=["tmux"],
+            returncode=124,
+            stdout="",
+            stderr="tmux command timed out",
+        )
+
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", return_value=timed_out
+        ) as run:
+            result = backend.pane_pids([first, second])
+
+        self.assertEqual(result, {"a": 111, "b": 222})
+        run.assert_called_once()
+
+    def test_fleet_snapshot_failure_has_backoff_and_never_fans_out(self):
+        records = [_record(id=f"td-{index}", tmux_name=f"sess-{index}", last_pid=index) for index in range(2000)]
+        backend = TmuxBackend(executable="tmux", failure_backoff=60)
+        failed = subprocess.CompletedProcess(args=["tmux"], returncode=1, stdout="", stderr="busy")
+
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", return_value=failed
+        ) as run:
+            first = backend.pane_pids(records)
+            second = backend.pane_pids(records)
+
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(first["td-1999"], 1999)
+        self.assertEqual(second, first)
+        self.assertTrue(backend.pane_snapshot_stale)
+        self.assertGreater(backend._query_timeout_for(2000), backend.query_timeout)
+        self.assertLessEqual(backend._query_timeout_for(2000), backend.command_timeout)
+
+    def test_capture_is_one_bounded_tmux_call(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux", max_capture_lines=500)
+        completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="tail\n", stderr="")
+        with mock.patch.object(backend, "_run", return_value=completed) as run:
+            captured = backend.capture(record, lines=5000)
+
+        self.assertEqual(captured, "tail\n")
+        run.assert_called_once_with(
+            ["capture-pane", "-t", backend.pane_target(record), "-p", "-S", "-500"],
+            check=False,
+            timeout=backend._query_timeout_for(500),
+        )
+
+    def test_run_returns_bounded_failure_for_nonchecking_query(self):
+        backend = TmuxBackend(executable="tmux", command_timeout=0.1)
+        expired = subprocess.TimeoutExpired(["tmux", "list-sessions"], 0.1)
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch(
+            "termdeck.tmux_backend.subprocess.run", side_effect=expired
+        ) as run:
+            result = backend._run(["list-sessions"], check=False)
+
+        self.assertEqual(result.returncode, 124)
+        self.assertIn("timed out", result.stderr)
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.1)
+
+    def test_run_raises_clear_error_for_timed_out_command(self):
+        backend = TmuxBackend(executable="tmux", command_timeout=0.1)
+        expired = subprocess.TimeoutExpired(["tmux", "new-session"], 0.1)
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch(
+            "termdeck.tmux_backend.subprocess.run", side_effect=expired
+        ):
+            with self.assertRaisesRegex(TmuxError, "timed out after 0.1s"):
+                backend._run(["new-session"])
 
     def test_current_directory_returns_none_when_tmux_path_is_unavailable(self):
         record = _record()

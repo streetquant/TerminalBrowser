@@ -48,6 +48,7 @@ def build_task_snapshot(
     sampler: ResourceSampler | None = None,
     policy: HealthPolicy | None = None,
     policy_resolver: Callable[[SessionRecord], HealthPolicy] | None = None,
+    snapshot_refresh_limit: int | None = None,
 ) -> list[TaskSnapshotItem]:
     """Build testable browser-task-manager rows for remembered sessions.
 
@@ -63,16 +64,40 @@ def build_task_snapshot(
     if backend.available and hasattr(backend, "pane_pids"):
         batch_pids = backend.pane_pids(record_list)
 
-    items: list[TaskSnapshotItem] = []
+    resolved_pids: list[int | None] = []
     for record in record_list:
-        row_policy = policy_resolver(record) if policy_resolver else policy
         if record.id in batch_pids:
             pid = batch_pids[record.id]
             if pid is None:
                 pid = record.last_pid
         else:
             pid = _live_pid(record, backend)
-        snapshot = sampler.snapshot(pid)
+        resolved_pids.append(pid)
+
+    sample_many = getattr(sampler, "snapshots", None)
+    if getattr(backend, "pane_snapshot_stale", False):
+        snapshots = [
+            ResourceSnapshot(
+                pid=pid,
+                exists=record.status.casefold() in {"running", "paused", "missing"},
+                state="unknown",
+            )
+            for record, pid in zip(record_list, resolved_pids)
+        ]
+    elif callable(sample_many):
+        if snapshot_refresh_limit is None:
+            snapshots = list(sample_many(resolved_pids))
+        else:
+            try:
+                snapshots = list(sample_many(resolved_pids, refresh_limit=snapshot_refresh_limit))
+            except TypeError:
+                snapshots = [sampler.snapshot(pid) for pid in resolved_pids]
+    else:
+        snapshots = [sampler.snapshot(pid) for pid in resolved_pids]
+
+    items: list[TaskSnapshotItem] = []
+    for record, pid, snapshot in zip(record_list, resolved_pids, snapshots):
+        row_policy = policy_resolver(record) if policy_resolver else policy
         health = evaluate_health(record, snapshot, row_policy)
         shortcut = tab_shortcut(record.tab_index + 1) if record.visible else tab_shortcut(0)
         row = row_from_record(
