@@ -84,15 +84,21 @@ Close TerminalBrowser, reboot the machine, reopen — all tabs come back. Agents
 ## Install
 
 ```bash
-pip install terminalbrowser
+# System dependencies (Ubuntu/Debian)
+sudo apt install tmux python3-gi gir1.2-gtk-3.0 gir1.2-vte-2.91
+
+# Install from source
+git clone https://github.com/streetquant/TerminalBrowser.git
+cd TerminalBrowser
+pip install -e .
 ```
 
-Requires: Python 3.11+, GTK 3, VTE, tmux.
+Requires: Python 3.10+, GTK 3, VTE, tmux.
 
 ## Run
 
 ```bash
-terminalbrowser
+termdeck
 ```
 
 ## Keyboard shortcuts

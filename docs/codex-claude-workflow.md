@@ -43,7 +43,7 @@ Create a workspace recipe file once, launch everything in one command.
 
 ```mermaid
 flowchart TD
-    A(["📄 agents.workspace.json"]) --> B["terminalbrowser gui\n--workspace agents.workspace.json"]
+    A(["📄 agents.workspace.json"]) --> B["termdeck gui\n--workspace agents.workspace.json"]
 
     B --> W1
     B --> W2
@@ -98,7 +98,7 @@ stateDiagram-v2
 
     [*] --> New : workspace recipe loaded\nor tab created manually
 
-    New --> Running : terminalbrowser starts\ncodex / claude process
+    New --> Running : termdeck starts\ncodex / claude process
 
     state Running {
         direction LR
@@ -263,7 +263,7 @@ flowchart TD
         L1["right-click → Hide\n→ gone from strip, still running"]
         L2["tb rename codex-api braze-agent\n→ rename without restart"]
         L3["tb move codex-api --window Agents\n→ reorganise windows live"]
-        L4["terminalbrowser (after reboot)\n→ all tabs auto-restore"]
+        L4["termdeck (after reboot)\n→ all tabs auto-restore"]
     end
 ```
 
@@ -273,7 +273,7 @@ flowchart TD
 
 | What you want | How |
 |---|---|
-| Launch all agents at once | `terminalbrowser gui --workspace agents.workspace.json` |
+| Launch all agents at once | `termdeck gui --workspace agents.workspace.json` |
 | See who needs attention | `tb activity --tag ai` |
 | Read all agent output | `tb capture --tag ai --lines 200` |
 | Send a message to all agents | `tb send --tag ai "status"` |
@@ -281,4 +281,4 @@ flowchart TD
 | Pause runaway agent | `tb pause claude-review` |
 | Pause all high-CPU agents | `tb pause-hot --all` |
 | Resume paused agents | `tb resume --tag ai` |
-| Restart after reboot | `terminalbrowser` — tabs auto-restore |
+| Restart after reboot | `termdeck` — tabs auto-restore |
