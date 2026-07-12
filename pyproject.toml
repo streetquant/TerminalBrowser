@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "termdeck"
+name = "terminalbrowser"
 version = "0.2.10"
 description = "Native named terminal windows with directory-backed tabs and hidden tmux persistence."
 readme = "README.md"
@@ -24,7 +24,7 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-termdeck = "termdeck.cli:main"
+terminalbrowser = "termdeck.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

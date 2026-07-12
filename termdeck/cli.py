@@ -1172,7 +1172,7 @@ def _add_config_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="termdeck", description="Named terminal windows with directory-backed tabs")
+    parser = argparse.ArgumentParser(prog="terminalbrowser", description="Named terminal windows with directory-backed tabs")
     parser.add_argument("--version", action="version", version=f"termdeck {__version__}")
     sub = parser.add_subparsers(dest="command")
 
