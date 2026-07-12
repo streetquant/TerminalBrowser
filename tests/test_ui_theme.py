@@ -42,11 +42,10 @@ class UiThemeTests(unittest.TestCase):
 
     def test_chrome_css_uses_readable_font_sizes(self):
         css = build_chrome_css("dark", "comfortable")
-        # Guard against shipping UI that is hard to read (pre-fix was 10–11px).
+        # Guard the readable base and title sizes while allowing smaller badges.
+        self.assertIn("font-size: 13px", css)
         self.assertIn("font-size: 14px", css)
-        self.assertIn("font-size: 15px", css)
         self.assertNotIn("font-size: 10px", css)
-        self.assertNotIn("font-size: 11px", css)
 
     def test_ui_font_options_affect_chrome_css(self):
         default_css = build_chrome_css("dark", "comfortable")

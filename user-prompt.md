@@ -193,3 +193,10 @@ Workspace: /8tb/projects/softwares/termdeck/termdeck
 ~~~text
 so how can I launch the remianing windows if only 4 is allowed?
 ~~~
+
+## 2026-07-12T23:10:13Z - Codex
+Workspace: /8tb/projects/softwares/termdeck/termdeck
+
+~~~text
+name this repo TerminalBrowser update the readme keep it short and succinct, commit the code and push it to github, make it public
+~~~

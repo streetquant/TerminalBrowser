@@ -1,16 +1,13 @@
 # TerminalBrowser
 
-A Linux-first GTK + VTE terminal application. Named windows group related work; each tab is a shell rooted in a chosen directory. Tabs survive UI closure via hidden tmux — no tmux knowledge required.
+A Linux terminal workspace built with GTK, VTE, and tmux. Group terminal tabs in named windows and keep sessions alive across restarts.
 
 ## Features
 
-- **Named windows** — group terminals by project or context
-- **Directory-backed tabs** — every tab opens in a specific path
-- **Persistent sessions** — tabs survive app restarts via tmux
-- **Side pane** — search, filter, multi-select, pause, resume, kill tabs (`F9` to toggle)
-- **Command palette** — keyboard-first access to all actions
-- **Themes** — built-in light/dark themes with density control
-- **Workspace recipes** — launch predefined sets of tabs in one click
+- Named windows and directory-backed tabs
+- Persistent sessions powered by tmux
+- Searchable tab manager with pause, resume, and kill actions
+- Command palette, themes, and workspace recipes
 
 ## Install
 
@@ -18,24 +15,13 @@ A Linux-first GTK + VTE terminal application. Named windows group related work; 
 pip install terminalbrowser
 ```
 
-Requires: Python 3.11+, GTK 3, VTE, tmux.
+Requires Python 3.11+, GTK 3, VTE, and tmux.
 
 ## Run
 
 ```bash
 terminalbrowser
 ```
-
-## Keyboard shortcuts
-
-| Action | Key |
-|---|---|
-| New tab | `Ctrl+Shift+T` |
-| Close tab | `Ctrl+Shift+W` |
-| Next / prev tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
-| Toggle side pane | `F9` |
-| Command palette | `Ctrl+Shift+P` |
-| Settings | `Ctrl+,` |
 
 ## License
 

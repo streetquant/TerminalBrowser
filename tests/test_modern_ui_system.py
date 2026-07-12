@@ -46,10 +46,10 @@ class ModernUiSystemTests(unittest.TestCase):
             "scrollbar.td-terminal-scrollbar",
         ):
             self.assertIn(selector, css)
-        self.assertIn("margin: 6px 8px 8px 8px", css)
-        self.assertIn("border-radius: 14px", css)
+        self.assertIn("margin: 4px 4px 4px 4px", css)
+        self.assertIn("border-radius: 12px", css)
         # Active tab uses border-bottom underline instead of box-shadow inset
-        self.assertIn("border-bottom: 2px solid", css)
+        self.assertIn("border-bottom: 3px solid", css)
         self.assertIn('"td-terminal-notebook"', GTK_APP)
         self.assertIn('"td-main-root"', GTK_APP)
         self.assertIn('"td-terminal-scrollbar"', GTK_APP)
