@@ -514,7 +514,13 @@ def build_chrome_css(
 
     # Default ladder when no ui_font is set (readable at normal DPI).
     base_size = 13.0
-    font_family_css = ""
+    # Pin a sans-serif UI stack by default so app chrome never inherits the
+    # system GTK font (which may be a large monospace face); an explicit
+    # ui_font choice below always wins.
+    font_family_css = (
+        'font-family: "Inter", "SF Pro Text", "Segoe UI", Cantarell, '
+        '"Noto Sans", sans-serif;'
+    )
     if ui_font:
         family, parsed_size = parse_font_description(ui_font, default="Sans 12")
         # Escape quotes in family for CSS.
