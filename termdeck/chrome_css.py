@@ -203,6 +203,7 @@ button {{
   border: 1px solid {btn_border};
   border-radius: 8px;
   padding: 5px 13px;
+  box-shadow: none;
   transition: background-color 130ms ease-out, border-color 130ms ease-out;
 }}
 button:hover {{
@@ -234,12 +235,22 @@ headerbar button {{
   padding: 5px 10px;
   margin: 0 1px;
   min-height: 30px;
+  box-shadow: none;
 }}
 headerbar button:hover {{
   background-color: {hov_bg};
   border-color: transparent;
 }}
 headerbar button:active {{ background-color: {act_bg}; }}
+headerbar button:focus {{
+  outline: none;
+  border-color: transparent;
+  background-color: {hov_bg};
+}}
+headerbar button.td-new-tab:focus {{
+  background-color: {t.accent};
+  border-color: {acc_edge};
+}}
 button.td-primary-action, headerbar button.suggested-action, button.td-accent {{
   background-color: {t.accent};
   background-image: none;
@@ -452,6 +463,7 @@ notebook.td-terminal-notebook tab {{
   border: none;
   border-bottom: 2px solid transparent;
   border-radius: 0;
+  box-shadow: none;
   padding: 8px 14px;
   margin: 0 1px;
   color: {t.fg_muted};
@@ -467,6 +479,7 @@ notebook.td-terminal-notebook tab:checked {{
   background-image: none;
   color: {t.fg};
   border-bottom: 2px solid {t.accent};
+  box-shadow: none;
   font-weight: 600;
 }}
 notebook.td-terminal-notebook > stack {{
