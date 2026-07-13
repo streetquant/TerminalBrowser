@@ -3777,8 +3777,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         label_box = self._build_tab_label(record)
         page = self.notebook.append_page(terminal, label_box)
         self.notebook.set_tab_reorderable(terminal, True)
-        self.notebook.set_current_page(page)
         terminal.show_all()
+        self.notebook.set_current_page(page)
         terminal.terminal.grab_focus()
         if refresh_side:
             self.side.refresh()
