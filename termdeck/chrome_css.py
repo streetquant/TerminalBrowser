@@ -94,9 +94,6 @@ def build_modern_chrome_css(
     dng_hov_bg = _rgba(t.danger, 0.12)
     dng_hov_b  = _rgba(t.danger, 0.70)
 
-    # New-tab — accent glyph on a quiet surface
-    ntab_hov_bg = _rgba(t.accent, 0.12)
-
     # Chips / pills — neutral gray, small and quiet
     pill_bg     = _rgba(t.fg, 0.07)
     pill_border = _rgba(t.border, 0.80)
@@ -252,15 +249,18 @@ button.td-header-overflow {{
 }}
 button.td-header-overflow:hover {{ color: {t.fg}; }}
 button.td-new-tab {{
-  background-color: transparent;
+  background-color: {t.accent};
   background-image: none;
-  color: {t.accent};
-  border-color: transparent;
+  color: {t.accent_fg};
+  border: 1px solid {acc_edge};
   font-weight: 600;
 }}
 button.td-new-tab:hover {{
-  background-color: {ntab_hov_bg};
-  border-color: transparent;
+  background-color: {acc_hov};
+  border-color: {acc_hov};
+}}
+button.td-new-tab:active {{
+  background-color: {acc_act};
 }}
 button.td-header-icon {{
   min-width: 36px;
