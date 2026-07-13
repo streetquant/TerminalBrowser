@@ -40,3 +40,5 @@ dist/
 # Local/generated files
 user-prompt.md
 .beads/
+codex-session-id.txt
+.ai-bridge/
