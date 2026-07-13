@@ -157,6 +157,42 @@ window, dialog, messagedialog {{
   color: {t.fg};
 }}
 window.background {{ background-color: {t.bg}; }}
+/* Base surface reset — own every surface; never inherit the system GTK theme */
+list, row {{
+  background-color: transparent;
+  color: {t.fg};
+}}
+row:selected {{
+  background-color: {card_sel_bg};
+  color: {t.fg};
+}}
+viewport, scrolledwindow, frame {{ background-color: transparent; }}
+separator {{ background-color: {hairline}; }}
+textview, textview text {{
+  background-color: transparent;
+  color: {t.fg};
+  caret-color: {t.fg};
+}}
+treeview.view {{
+  background-color: transparent;
+  color: {t.fg};
+}}
+treeview.view:selected {{
+  background-color: {card_sel_bg};
+  color: {t.fg};
+}}
+treeview header button {{
+  background-color: {t.bg_raised};
+  background-image: none;
+  color: {t.fg_muted};
+  border: none;
+  border-bottom: 1px solid {hairline};
+  border-radius: 0;
+}}
+selection {{
+  background-color: {t.accent};
+  color: {t.accent_fg};
+}}
 .td-main-root {{
   background-color: {t.bg};
 }}

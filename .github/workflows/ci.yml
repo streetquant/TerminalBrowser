@@ -12,10 +12,12 @@ jobs:
       matrix:
         python-version: ['3.10', '3.11', '3.12']
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Install TermDeck
+        run: pip install -e .
       - name: Syntax check
         run: python -m compileall -q termdeck tests scripts
       - name: CLI smoke
@@ -29,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
       - name: Install GTK test dependencies
         run: |
           sudo apt-get update
@@ -53,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
       - name: Install GTK and visual-smoke dependencies
         run: |
           sudo apt-get update
@@ -135,7 +137,7 @@ jobs:
           --window-width 640
           --window-height 520
       - name: Upload rendered UI frames
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: termdeck-ui-smoke
           path: termdeck-ui-smoke-*.png
