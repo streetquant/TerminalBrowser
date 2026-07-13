@@ -13,7 +13,7 @@ class ModernUiSystemTests(unittest.TestCase):
         tokens = resolve_chrome_tokens("dark")
         self.assertNotEqual(tokens.bg, tokens.bg_raised)
         self.assertNotEqual(tokens.bg_raised, tokens.bg_sunken)
-        self.assertGreaterEqual(tokens.card_radius, 12)
+        self.assertGreaterEqual(tokens.card_radius, 8)
 
     def test_css_has_lean_surfaces_and_interaction_states(self) -> None:
         css = build_chrome_css("dark", "comfortable")
@@ -27,9 +27,9 @@ class ModernUiSystemTests(unittest.TestCase):
             ".td-header-overflow",
         ):
             self.assertIn(selector, css)
-        # box-shadow is a GTK Sass helper not supported in app CSS; we use outline instead
+        # Focus states use outline rings; hovers animate with short transitions
         self.assertIn("outline:", css)
-        self.assertNotIn("transition:", css)
+        self.assertIn("transition:", css)
         self.assertIn("min-height: 46px", css)
         self.assertNotIn("0 18px 48px", css)
 
@@ -46,10 +46,11 @@ class ModernUiSystemTests(unittest.TestCase):
             "scrollbar.td-terminal-scrollbar",
         ):
             self.assertIn(selector, css)
-        self.assertIn("margin: 4px 4px 4px 4px", css)
-        self.assertIn("border-radius: 12px", css)
-        # Active tab uses border-bottom underline instead of box-shadow inset
-        self.assertIn("border-bottom: 3px solid", css)
+        # Terminal notebook is docked edge-to-edge; no floating card margins
+        self.assertIn("margin: 0;", css)
+        self.assertIn("border-radius: 8px", css)
+        # Active tab uses a slim accent underline instead of box-shadow inset
+        self.assertIn("border-bottom: 2px solid", css)
         self.assertIn('"td-terminal-notebook"', GTK_APP)
         self.assertIn('"td-main-root"', GTK_APP)
         self.assertIn('"td-terminal-scrollbar"', GTK_APP)
