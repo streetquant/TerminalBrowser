@@ -118,9 +118,10 @@ def build_modern_chrome_css(
     # List rows
     row_border = _rgba(t.border, 0.45)
 
-    # Notebook tabs — flat strip, accent underline marks the active tab
+    # Notebook tabs — flat strip, accent underline + faint accent tint marks
+    # the active tab so the working surface has a quiet colour identity
     tab_hov_bg = _rgba(t.fg, 0.05)
-    tab_sel_bg = _rgba(t.fg, 0.07)
+    tab_sel_bg = _rgba(t.accent, 0.10)
 
     # Tab close — neutral hover, not alarming red
     tc_hov_bg = _rgba(t.fg, 0.12)
@@ -138,11 +139,14 @@ def build_modern_chrome_css(
     # Treeview selected
     tv_sel_bg = _rgba(t.accent, 0.22)
 
-    # Scrollbars — neutral thumbs, no accent
-    sb_slider   = _rgba(t.fg_muted, 0.35)
-    sb_sl_hov   = _rgba(t.fg_muted, 0.60)
-    sb_term_sl  = _rgba(t.fg_muted, 0.50)
-    sb_term_hov = _rgba(t.fg_muted, 0.75)
+    # Scrollbars — slim neutral pill that widens/brightens under the pointer
+    # and only takes the accent while actively dragged (the one moment the
+    # thumb is the primary object on screen).
+    sb_slider   = _rgba(t.fg_muted, 0.30)
+    sb_sl_hov   = _rgba(t.fg_muted, 0.55)
+    sb_drag     = _rgba(t.accent, 0.85)
+    sb_term_sl  = _rgba(t.fg_muted, 0.38)
+    sb_term_hov = _rgba(t.fg_muted, 0.62)
 
     compact_card_radius = max(6, radius - 2)
 
@@ -519,7 +523,7 @@ button.td-tab-close:hover {{
   background-color: {mn_bg};
   background-image: none;
   border: 1px solid {hairline};
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 10px 16px;
   color: {t.fg};
   font-size: {size["base"]};
@@ -554,11 +558,11 @@ menu, popover {{
   background-image: none;
   color: {t.fg};
   border: 1px solid {hairline};
-  border-radius: 10px;
-  padding: 5px;
+  border-radius: 12px;
+  padding: 6px;
   box-shadow: 0 10px 32px {shadow};
 }}
-menuitem {{ border-radius: 6px; padding: 7px 10px; margin: 1px 0; }}
+menuitem {{ border-radius: 7px; padding: 7px 10px; margin: 1px 0; }}
 menuitem:hover {{ background-color: {mi_hov_bg}; color: {t.fg}; }}
 separator {{ background-color: {hairline_soft}; min-height: 1px; margin: 5px 4px; }}
 tooltip {{
@@ -571,39 +575,48 @@ tooltip {{
 }}
 paned > separator {{ background-color: {hairline}; min-width: 1px; min-height: 1px; }}
 scrollbar {{ background-color: transparent; }}
+scrollbar trough {{ background-color: transparent; border: none; }}
 scrollbar slider {{
   background-color: {sb_slider};
   border-radius: 99px;
   min-width: 6px;
-  min-height: 20px;
+  min-height: 24px;
   transition: background-color 130ms ease-out;
 }}
-scrollbar slider:hover {{ background-color: {sb_sl_hov}; }}
+scrollbar:hover slider {{ background-color: {sb_sl_hov}; }}
+scrollbar slider:active {{ background-color: {sb_drag}; }}
 scrollbar.td-terminal-scrollbar {{
   opacity: 1;
   background-image: none;
-  background-color: {t.bg_sunken};
-  border-left: 1px solid {hairline_soft};
+  background-color: transparent;
+  border: none;
   min-width: 14px;
 }}
 scrollbar.td-terminal-scrollbar trough {{
   background-image: none;
   background-color: transparent;
   border: none;
-  min-width: 12px;
+  min-width: 14px;
 }}
 scrollbar.td-terminal-scrollbar slider {{
   background-image: none;
   background-color: {sb_term_sl};
   border: none;
   border-radius: 99px;
-  min-width: 8px;
-  min-height: 24px;
-  margin: 2px 3px;
+  min-width: 5px;
+  min-height: 28px;
+  margin: 3px 4px;
+  transition: background-color 130ms ease-out, min-width 130ms ease-out, margin 130ms ease-out;
 }}
-scrollbar.td-terminal-scrollbar slider:hover,
-scrollbar.td-terminal-scrollbar slider:active {{
+scrollbar.td-terminal-scrollbar:hover slider {{
   background-color: {sb_term_hov};
+  min-width: 9px;
+  margin: 3px 2px;
+}}
+scrollbar.td-terminal-scrollbar slider:active {{
+  background-color: {sb_drag};
+  min-width: 9px;
+  margin: 3px 2px;
 }}
 .td-density-compact * {{ font-size: {size["compact"]}; }}
 .td-density-compact .td-session-card {{ padding: 5px 8px; border-radius: {compact_card_radius}px; }}

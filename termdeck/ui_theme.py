@@ -63,19 +63,20 @@ class ChromeTokens:
 CHROME_TOKENS: Mapping[str, ChromeTokens] = {
     "dark": ChromeTokens(
         name="dark",
-        # Neutral graphite surfaces with a single restrained blue accent —
-        # flat and professional, in the spirit of mature terminal apps.
-        bg="#16181d",
-        bg_raised="#1d2026",
-        bg_sunken="#101216",
-        fg="#dde1e8",
-        fg_muted="#8b93a1",
-        border="#2b2f37",
-        accent="#5b8cff",
-        accent_fg="#ffffff",
-        danger="#ef5f74",
-        warning="#e0b56a",
-        success="#43cf9c",
+        # Deep graphite surfaces with a soft periwinkle accent (Tokyo Night
+        # family) — flat and professional, with a clearer raised/sunken
+        # hierarchy and dark-on-accent primary buttons for a premium feel.
+        bg="#14161b",
+        bg_raised="#1b1e25",
+        bg_sunken="#0e1013",
+        fg="#e3e7ee",
+        fg_muted="#9099ab",
+        border="#282d36",
+        accent="#7aa2f7",
+        accent_fg="#0d1117",
+        danger="#f0637a",
+        warning="#e5b567",
+        success="#41d0a5",
         card_radius=8,
     ),
     "noir": ChromeTokens(
