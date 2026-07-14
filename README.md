@@ -1,4 +1,4 @@
-# TerminalBrowser
+# TerminalBrowser: Browsers are all you need.... yes even for terminals
 
 > A browser for your terminal — not the web.
 
