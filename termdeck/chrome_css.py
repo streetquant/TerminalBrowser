@@ -314,6 +314,25 @@ button.td-new-tab:hover {{
 button.td-new-tab:active {{
   background-color: {tv_sel_bg};
 }}
+entry.td-title-entry, entry.td-tab-name-entry {{
+  background-color: {inf_bg};
+  background-image: none;
+  color: {t.fg};
+  border: 1px solid {t.accent};
+  border-radius: 6px;
+  padding: 1px 6px;
+  margin: 0;
+  min-height: 0;
+  box-shadow: none;
+}}
+entry.td-title-entry:focus, entry.td-tab-name-entry:focus {{
+  border: 1px solid {t.accent};
+  box-shadow: none;
+}}
+entry.td-title-entry selection, entry.td-tab-name-entry selection {{
+  background-color: {t.accent};
+  color: {tab_sel_bg};
+}}
 button.td-header-icon {{
   min-width: 36px;
   padding-left: 8px;

@@ -3095,9 +3095,23 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         title.set_tooltip_text("Window name · double-click to rename")
         _style(title, "td-title")
         self.window_title_label = title
+        # Inline rename: a stack swaps the title label for an entry in place,
+        # so renaming happens where the name lives (no modal dialog).
+        title_entry = Gtk.Entry()
+        title_entry.set_alignment(0.5)
+        title_entry.set_width_chars(28)
+        title_entry.set_max_width_chars(28)
+        _style(title_entry, "td-title-entry")
+        self._window_title_entry = title_entry
+        title_stack = Gtk.Stack()
+        title_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        title_stack.add_named(title, "label")
+        title_stack.add_named(title_entry, "entry")
+        title_stack.set_visible_child(title)
+        self._window_title_stack = title_stack
         title_event = Gtk.EventBox()
         title_event.set_visible_window(False)
-        title_event.add(title)
+        title_event.add(title_stack)
         title_event.set_events(title_event.get_events() | Gdk.EventMask.BUTTON_PRESS_MASK)
         title_event.connect("button-press-event", self._on_window_title_press)
         header.set_custom_title(title_event)
@@ -3157,10 +3171,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.notebook.set_tab_pos(Gtk.PositionType.TOP)
         self.notebook.set_scrollable(True)
         self.notebook.connect("page-reordered", self._on_page_reordered)
-        # Browser-style new-tab button docked at the end of the tab strip,
-        # complementing the headerbar action (GTK hides action widgets when
-        # the notebook has no pages, so the headerbar button still covers
-        # the empty state).
+        # Browser-style new-tab button floating just after the last tab
+        # (like Chrome/Firefox). It lives in the chrome overlay and is
+        # re-anchored on every strip re-layout; the headerbar + still
+        # covers the zero-tab state.
         strip_new_tab = _icon_button(
             "New tab",
             "list-add-symbolic",
@@ -3246,10 +3260,73 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if isinstance(windows, list) and self in windows:
             windows.remove(self)
 
+    def _begin_inline_rename(
+        self,
+        stack: "Gtk.Stack",
+        label: "Gtk.Label",
+        entry: "Gtk.Entry",
+        current: str,
+        commit,
+    ) -> None:
+        """Swap a label for an in-place entry (Chrome/Claude-style rename).
+
+        ``commit(text)`` is called with the trimmed value on Enter or focus-out;
+        Escape cancels. Re-entrancy is guarded so a focus-out fired while we are
+        already tearing down does not double-commit.
+        """
+        if getattr(entry, "_td_editing", False):
+            return
+        entry._td_editing = True  # type: ignore[attr-defined]
+        entry.set_text(current)
+        stack.set_visible_child(entry)
+        entry.grab_focus()
+        entry.select_region(0, -1)
+
+        def _finish(text_value, *, save: bool) -> None:
+            if not getattr(entry, "_td_editing", False):
+                return
+            entry._td_editing = False  # type: ignore[attr-defined]
+            for handler_id in getattr(entry, "_td_handlers", []):
+                try:
+                    entry.disconnect(handler_id)
+                except Exception:
+                    pass
+            entry._td_handlers = []  # type: ignore[attr-defined]
+            stack.set_visible_child(label)
+            if save:
+                cleaned = (text_value or "").strip()
+                if cleaned and cleaned != current:
+                    commit(cleaned)
+
+        def _on_activate(_e):
+            _finish(entry.get_text(), save=True)
+
+        def _on_key(_e, key_event):
+            if key_event.keyval == Gdk.KEY_Escape:
+                _finish(None, save=False)
+                return True
+            return False
+
+        def _on_focus_out(_e, _event):
+            _finish(entry.get_text(), save=True)
+            return False
+
+        entry._td_handlers = [  # type: ignore[attr-defined]
+            entry.connect("activate", _on_activate),
+            entry.connect("key-press-event", _on_key),
+            entry.connect("focus-out-event", _on_focus_out),
+        ]
+
     def _on_window_title_press(self, _widget, event: Gdk.EventButton) -> bool:
-        """Double-click the window title in the headerbar to rename it."""
+        """Double-click the window title in the headerbar to rename it in place."""
         if event.type == Gdk.EventType.DOUBLE_BUTTON_PRESS and int(getattr(event, "button", 0) or 0) == 1:
-            self.rename_window()
+            self._begin_inline_rename(
+                self._window_title_stack,
+                self.window_title_label,
+                self._window_title_entry,
+                self.window_title,
+                lambda text: self.set_window_name(text),
+            )
             return True
         return False
 
@@ -3281,10 +3358,14 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             return False
         x, y = coords
         alloc = tab_label.get_allocation()
-        gap = 6
+        # The label allocation excludes the tab's own CSS horizontal padding
+        # (8-14px per side), so x+width sits *inside* the tab. Clear the tab's
+        # right padding plus a gap so the + never overlaps the tab edge.
+        tab_right_pad = 16
+        gap = 8
         btn_w = btn.get_allocated_width() or 30
         btn_h = btn.get_allocated_height() or 30
-        left = x + alloc.width + gap
+        left = x + alloc.width + tab_right_pad + gap
         # If the strip has scrolled the last tab past the visible notebook
         # width, fall back to the headerbar button rather than overlapping.
         strip_right = self.notebook.get_allocated_width()
@@ -3308,9 +3389,32 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             f"{state}{record.cwd} · {record.command}\n"
             "Double-click to rename · Right-click for tab actions"
         )
-        name.set_events(name.get_events() | Gdk.EventMask.BUTTON_PRESS_MASK)
-        name.connect("button-press-event", self._on_tab_label_press, record.id)
-        label_box.pack_start(name, True, True, 0)
+        # Inline rename: a stack swaps the tab name label for an entry, driven
+        # by _begin_inline_rename. A Gtk.Label has no input window, so the
+        # double-click never fired before — wrap it in an EventBox that owns a
+        # real window and receives the button events.
+        name_entry = Gtk.Entry()
+        name_entry.set_width_chars(min(20, max(4, len(record.name))))
+        name_entry.set_max_width_chars(20)
+        _style(name_entry, "td-tab-name-entry")
+        name_stack = Gtk.Stack()
+        name_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        name_stack.add_named(name, "label")
+        name_stack.add_named(name_entry, "entry")
+        name_stack.set_visible_child(name)
+        name_event = Gtk.EventBox()
+        name_event.set_visible_window(False)
+        name_event.add(name_stack)
+        name_event.set_events(name_event.get_events() | Gdk.EventMask.BUTTON_PRESS_MASK)
+        name_event.connect(
+            "button-press-event",
+            self._on_tab_label_press,
+            record.id,
+            name_stack,
+            name,
+            name_entry,
+        )
+        label_box.pack_start(name_event, True, True, 0)
         close = Gtk.Button(label="×")
         close.set_relief(Gtk.ReliefStyle.NONE)
         _style(close, "td-tab-close")
@@ -3392,17 +3496,54 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         except Exception:
             menu.popup(None, None, None, None, int(getattr(event, "button", 3) or 3), int(getattr(event, "time", 0) or 0))
 
-    def _on_tab_label_press(self, _widget, event: Gdk.EventButton, session_id: str) -> bool:
+    def _on_tab_label_press(
+        self,
+        _widget,
+        event: Gdk.EventButton,
+        session_id: str,
+        name_stack=None,
+        name_label=None,
+        name_entry=None,
+    ) -> bool:
         button = int(getattr(event, "button", 0) or 0)
         record = self.app_context.store.get(session_id)
         if event.type == Gdk.EventType.DOUBLE_BUTTON_PRESS and button == 1:
             if record is not None:
-                self.rename_session(record)
+                if name_stack is not None and name_label is not None and name_entry is not None:
+                    self._begin_inline_rename(
+                        name_stack,
+                        name_label,
+                        name_entry,
+                        record.name,
+                        lambda text, rid=record.id: self._commit_tab_rename(rid, text),
+                    )
+                else:
+                    self.rename_session(record)
             return True
         if button == 3 and record is not None:
             self._show_tab_context_menu(record, event)
             return True
         return False
+
+    def _commit_tab_rename(self, session_id: str, new_name: str) -> None:
+        """Persist an inline tab rename without opening the modal dialog."""
+        record = self.app_context.store.get(session_id)
+        if record is None or not new_name or new_name == record.name:
+            return
+        result = rename_record(self.app_context.store, record, new_name)
+        if not result.ok:
+            self.show_toast(result.detail or "Rename failed", kind="danger")
+            return
+        updated = self.app_context.store.get(record.id) or record
+        self.refresh_tab_label(updated)
+        self.side.refresh()
+        if self.master_window is not None and self.master_window.get_visible():
+            self.master_window.refresh()
+        for window in self.app_context.windows:
+            if window is not self and record.id in window.tabs:
+                window.refresh_tab_label(updated)
+                window.side.refresh()
+        self.show_toast(f"Renamed to {updated.name}", kind="success")
 
     def prompt_text(self, title: str, label: str, initial: str = "") -> str | None:
         """Simple modal text prompt. Returns None when cancelled."""
