@@ -416,6 +416,7 @@ class AttachTerminal(Gtk.Box):
         self._scroll_handler = scroll_handler
 
     def apply_window_theme(self, theme: TerminalTheme, *, font_override: str) -> None:
+        self.theme = theme
         apply_theme(self.terminal, theme, font_override=font_override)
         if self._history_cursor_hidden:
             self._set_history_cursor_hidden(True)
@@ -427,6 +428,20 @@ class AttachTerminal(Gtk.Box):
         self._cursor_hide_source_id = 0
         self._history_cursor_hidden = bool(hidden)
         self.terminal.feed(b"\x1b[?25l" if self._history_cursor_hidden else b"\x1b[?25h")
+        # tmux/Codex redraws can re-enable the DEC cursor mid-review, so also
+        # recolour the caret into the background while history is open. Colour
+        # is emulator-side state the child never rewrites, so it cannot race.
+        try:
+            if self._history_cursor_hidden:
+                self.terminal.set_color_cursor(rgba(self.theme.background_color, "#000000"))
+                self.terminal.set_color_cursor_foreground(rgba(self.theme.foreground_color, "#d3d7cf"))
+            else:
+                self.terminal.set_color_cursor(
+                    rgba(self.theme.cursor_color) if self.theme.cursor_color else None
+                )
+                self.terminal.set_color_cursor_foreground(None)
+        except Exception:
+            pass
         if self._history_cursor_hidden:
             # The tmux/Codex redraw triggered by the scroll command arrives on
             # the PTY asynchronously. Reassert once after that frame so its
@@ -636,6 +651,13 @@ class AttachTerminal(Gtk.Box):
             float(adjustment.get_upper()) - float(adjustment.get_page_size())
         )
 
+    def _scrollbar_at_live_edge(self) -> bool:
+        """True when the proxy scrollbar sits at the live (bottom) edge."""
+
+        adjustment = self.scroll_adjustment
+        bottom = float(adjustment.get_upper()) - float(adjustment.get_page_size())
+        return float(adjustment.get_value()) >= bottom - 0.5
+
     def _on_scrollbar_value_changed(self, adjustment) -> None:
         if self._scrollbar_syncing:
             return
@@ -647,8 +669,12 @@ class AttachTerminal(Gtk.Box):
         handler = self._scroll_handler
         try:
             if callable(handler) and handler(delta):
-                self._set_history_cursor_hidden(True)
                 self._last_scrollbar_value = requested
+                if delta > 0 and self._scrollbar_at_live_edge():
+                    # Dragged back to the live edge — leave the history view.
+                    self.prepare_for_live_input()
+                else:
+                    self._set_history_cursor_hidden(True)
                 return
         except Exception:
             pass
@@ -1034,10 +1060,16 @@ class AttachTerminal(Gtk.Box):
                 line_delta = -1 if delta < 0 else 1
             try:
                 if line_delta and handler(line_delta):
-                    self._set_history_cursor_hidden(True)
                     mover = getattr(self, "_move_scrollbar", None)
                     if callable(mover):
                         mover(line_delta)
+                    if line_delta > 0 and self._scrollbar_at_live_edge():
+                        # Scrolled back down to the live edge — return to the
+                        # live screen instead of leaving the history pager
+                        # frozen until the next keypress.
+                        self.prepare_for_live_input()
+                    else:
+                        self._set_history_cursor_hidden(True)
                     return True
             except Exception:
                 pass
