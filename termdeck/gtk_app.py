@@ -3089,13 +3089,18 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
         header = Gtk.HeaderBar()
         header.set_show_close_button(True)
-        title = Gtk.Label(label=self.window_title, xalign=0)
+        title = Gtk.Label(label=self.window_title, xalign=0.5)
         title.set_ellipsize(Pango.EllipsizeMode.END)
         title.set_max_width_chars(28)
-        title.set_tooltip_text("Window name · use More → Rename window to change it")
+        title.set_tooltip_text("Window name · double-click to rename")
         _style(title, "td-title")
         self.window_title_label = title
-        header.set_custom_title(title)
+        title_event = Gtk.EventBox()
+        title_event.set_visible_window(False)
+        title_event.add(title)
+        title_event.set_events(title_event.get_events() | Gdk.EventMask.BUTTON_PRESS_MASK)
+        title_event.connect("button-press-event", self._on_window_title_press)
+        header.set_custom_title(title_event)
         self.set_titlebar(header)
         self.set_title(f"TermDeck · {self.window_title}")
 
@@ -3165,9 +3170,17 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             show_label=False,
         )
         _style(strip_new_tab, "td-new-tab", "td-tabstrip-new")
-        strip_new_tab.set_valign(Gtk.Align.CENTER)
+        strip_new_tab.set_halign(Gtk.Align.START)
+        strip_new_tab.set_valign(Gtk.Align.START)
         strip_new_tab.show_all()
-        self.notebook.set_action_widget(strip_new_tab, Gtk.PackType.END)
+        strip_new_tab.set_no_show_all(True)
+        self._strip_new_tab = strip_new_tab
+        self._strip_new_tab_idle = 0
+        self.notebook.connect("size-allocate", lambda *_a: self._queue_strip_new_tab_position())
+        self.notebook.connect("map", lambda *_a: self._queue_strip_new_tab_position())
+        self.notebook.connect("page-added", lambda *_a: self._queue_strip_new_tab_position())
+        self.notebook.connect("page-removed", lambda *_a: self._queue_strip_new_tab_position())
+        self.notebook.connect("page-reordered", lambda *_a: self._queue_strip_new_tab_position())
         self.side = SidePane(self)
         self.side_position = app_context.settings.side_pane_position
         self._pack_side_pane()
@@ -3177,6 +3190,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         root.set_hexpand(True)
         root.set_vexpand(True)
         root.add(self.paned)
+        self._chrome_root = root
+        root.add_overlay(strip_new_tab)
         self.toast_revealer = Gtk.Revealer()
         self.toast_revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
         self.toast_revealer.set_transition_duration(160)
@@ -3230,6 +3245,56 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         windows = getattr(self.app_context, "windows", None)
         if isinstance(windows, list) and self in windows:
             windows.remove(self)
+
+    def _on_window_title_press(self, _widget, event: Gdk.EventButton) -> bool:
+        """Double-click the window title in the headerbar to rename it."""
+        if event.type == Gdk.EventType.DOUBLE_BUTTON_PRESS and int(getattr(event, "button", 0) or 0) == 1:
+            self.rename_window()
+            return True
+        return False
+
+    def _queue_strip_new_tab_position(self) -> None:
+        """Coalesce re-anchoring of the floating new-tab button to idle."""
+        if getattr(self, "_strip_new_tab_idle", 0):
+            return
+        self._strip_new_tab_idle = GLib.idle_add(self._position_strip_new_tab)
+
+    def _position_strip_new_tab(self) -> bool:
+        """Park the + button just to the right of the last tab, like a browser."""
+        self._strip_new_tab_idle = 0
+        btn = getattr(self, "_strip_new_tab", None)
+        root = getattr(self, "_chrome_root", None)
+        if btn is None or root is None:
+            return False
+        pages = self.notebook.get_n_pages()
+        if pages <= 0:
+            btn.hide()
+            return False
+        last = self.notebook.get_nth_page(pages - 1)
+        tab_label = self.notebook.get_tab_label(last) if last is not None else None
+        if tab_label is None or not tab_label.get_mapped():
+            btn.hide()
+            return False
+        coords = tab_label.translate_coordinates(root, 0, 0)
+        if coords is None:
+            btn.hide()
+            return False
+        x, y = coords
+        alloc = tab_label.get_allocation()
+        gap = 6
+        btn_w = btn.get_allocated_width() or 30
+        btn_h = btn.get_allocated_height() or 30
+        left = x + alloc.width + gap
+        # If the strip has scrolled the last tab past the visible notebook
+        # width, fall back to the headerbar button rather than overlapping.
+        strip_right = self.notebook.get_allocated_width()
+        if left + btn_w > strip_right:
+            btn.hide()
+            return False
+        btn.set_margin_start(max(0, left))
+        btn.set_margin_top(max(0, y + (alloc.height - btn_h) // 2))
+        btn.show()
+        return False
 
     def _build_tab_label(self, record: SessionRecord) -> Gtk.Box:
         """Minimal notebook tab containing only the tab name and close control."""

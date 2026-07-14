@@ -326,11 +326,11 @@ headerbar button.td-new-tab.td-header-icon {{
   border-radius: 8px;
 }}
 headerbar button.td-header-group-end {{ margin-left: 8px; }}
-notebook.td-terminal-notebook button.td-tabstrip-new {{
-  min-width: 30px;
-  min-height: 30px;
+button.td-tabstrip-new {{
+  min-width: 28px;
+  min-height: 28px;
   padding: 0;
-  margin: 4px 6px;
+  margin: 0;
   border-radius: 7px;
 }}
 .td-title {{
