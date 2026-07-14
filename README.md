@@ -21,7 +21,7 @@ flowchart TD
 
     W2 --> T4["Tab: codex-api\ncodex • ~/projects/api"]
     W2 --> T5["Tab: claude-review\nclaude • ~/projects/api"]
-    W2 --> T6["Tab: codex-frontend\ncodex • ~/projects/frontend"]
+    W2 --> T6["Tab: opencode-frontend\nopencode • ~/projects/frontend"]
 
     style App fill:#1e1e2e,color:#cdd6f4,stroke:#89b4fa
     style W1 fill:#313244,color:#cdd6f4,stroke:#a6e3a1
@@ -192,7 +192,7 @@ Close TerminalBrowser, reboot the machine, reopen — all tabs come back. Agents
 | Command palette | `Ctrl+Shift+P` |
 | Settings | `Ctrl+,` |
 
-## Using with Codex / Claude Code
+## Using with Codex / Claude Code / OpenCode
 
 TerminalBrowser shines as a multi-agent cockpit. See **[docs/codex-claude-workflow.md](docs/codex-claude-workflow.md)** for:
 - How to launch 3+ agents in parallel with a single workspace recipe
@@ -201,9 +201,11 @@ TerminalBrowser shines as a multi-agent cockpit. See **[docs/codex-claude-workfl
 - CLI commands to monitor, capture output, and steer agents by tag
 - Full day workflow Gantt
 
-### Quick install using Codex / Claude Code
+You can use TerminalBrowser with Codex, Claude Code, and OpenCode side by side. Give each agent its own tab or tag, then monitor and steer them from the same workspace.
 
-Paste this prompt into Codex or Claude Code and it will install TerminalBrowser on your machine:
+### Quick install using Codex / Claude Code / OpenCode
+
+Paste this prompt into Codex, Claude Code, or OpenCode and it will install TerminalBrowser on your machine:
 
 ```
 Install TerminalBrowser from https://github.com/streetquant/TerminalBrowser by:
