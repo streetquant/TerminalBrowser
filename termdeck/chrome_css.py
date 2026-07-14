@@ -120,8 +120,8 @@ def build_modern_chrome_css(
 
     # Notebook tabs — flat strip, accent underline + faint accent tint marks
     # the active tab so the working surface has a quiet colour identity
-    tab_hov_bg = _rgba(t.fg, 0.05)
-    tab_sel_bg = _rgba(t.accent, 0.10)
+    tab_hov_bg = _rgba(t.fg, 0.06)
+    tab_sel_bg = _rgba(t.accent, 0.13)
 
     # Tab close — neutral hover, not alarming red
     tc_hov_bg = _rgba(t.fg, 0.12)
@@ -144,9 +144,10 @@ def build_modern_chrome_css(
     # thumb is the primary object on screen).
     sb_slider   = _rgba(t.fg_muted, 0.30)
     sb_sl_hov   = _rgba(t.fg_muted, 0.55)
-    sb_drag     = _rgba(t.accent, 0.85)
-    sb_term_sl  = _rgba(t.fg_muted, 0.38)
-    sb_term_hov = _rgba(t.fg_muted, 0.62)
+    sb_drag     = _rgba(t.accent, 0.90)
+    sb_term_sl  = _rgba(t.fg_muted, 0.35)
+    sb_term_hov = _rgba(t.fg, 0.50)
+    sb_gutter   = _rgba(t.fg, 0.05)
 
     compact_card_radius = max(6, radius - 2)
 
@@ -493,7 +494,7 @@ notebook.td-terminal-notebook tab {{
   background-color: transparent;
   border: none;
   border-bottom: 2px solid transparent;
-  border-radius: 0;
+  border-radius: 8px 8px 0 0;
   box-shadow: none;
   padding: 8px 14px;
   margin: 0 1px;
@@ -555,9 +556,9 @@ button.td-tab-close:hover {{
   font-size: {size["base"]};
   box-shadow: 0 6px 24px {shadow};
 }}
-.td-toast.td-toast-success {{ border-color: {ts_ok_b}; }}
-.td-toast.td-toast-warn    {{ border-color: {ts_wn_b}; }}
-.td-toast.td-toast-danger  {{ border-color: {ts_dn_b}; }}
+.td-toast.td-toast-success {{ border-color: {ts_ok_b}; border-left: 3px solid {t.success}; }}
+.td-toast.td-toast-warn    {{ border-color: {ts_wn_b}; border-left: 3px solid {t.warning}; }}
+.td-toast.td-toast-danger  {{ border-color: {ts_dn_b}; border-left: 3px solid {t.danger}; }}
 scrolledwindow {{
   background-color: {t.bg_sunken};
   border: 1px solid {hairline_soft};
@@ -599,7 +600,13 @@ tooltip {{
   padding: 6px 10px;
   box-shadow: 0 4px 16px {shadow};
 }}
-paned > separator {{ background-color: {hairline}; min-width: 1px; min-height: 1px; }}
+paned > separator {{
+  background-color: {hairline};
+  min-width: 1px;
+  min-height: 1px;
+  transition: background-color 130ms ease-out;
+}}
+paned > separator:hover {{ background-color: {foc_ring}; }}
 scrollbar {{ background-color: transparent; }}
 scrollbar trough {{ background-color: transparent; border: none; }}
 scrollbar slider {{
@@ -607,9 +614,9 @@ scrollbar slider {{
   border-radius: 99px;
   min-width: 6px;
   min-height: 24px;
-  transition: background-color 130ms ease-out;
+  transition: background-color 130ms ease-out, min-width 130ms ease-out;
 }}
-scrollbar:hover slider {{ background-color: {sb_sl_hov}; }}
+scrollbar:hover slider {{ background-color: {sb_sl_hov}; min-width: 8px; }}
 scrollbar slider:active {{ background-color: {sb_drag}; }}
 scrollbar.td-terminal-scrollbar {{
   opacity: 1;
@@ -622,7 +629,13 @@ scrollbar.td-terminal-scrollbar trough {{
   background-image: none;
   background-color: transparent;
   border: none;
+  border-radius: 99px;
   min-width: 14px;
+  margin: 2px 1px;
+  transition: background-color 130ms ease-out;
+}}
+scrollbar.td-terminal-scrollbar:hover trough {{
+  background-color: {sb_gutter};
 }}
 scrollbar.td-terminal-scrollbar slider {{
   background-image: none;
@@ -648,6 +661,6 @@ scrollbar.td-terminal-scrollbar slider:active {{
 .td-density-compact .td-session-card {{ padding: 5px 8px; border-radius: {compact_card_radius}px; }}
 .td-density-compact notebook.td-terminal-notebook {{ margin: 0; }}
 .td-density-compact notebook.td-terminal-notebook header {{ padding: 0 3px; }}
-.td-density-compact notebook.td-terminal-notebook tab {{ padding: 5px 10px; margin: 0 1px; }}
+.td-density-compact notebook.td-terminal-notebook tab {{ padding: 5px 10px; margin: 0 1px; border-radius: 7px 7px 0 0; }}
 .td-density-compact treeview {{ font-size: {size["compact"]}; }}
 """

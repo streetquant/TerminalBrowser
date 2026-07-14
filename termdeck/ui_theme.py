@@ -63,36 +63,40 @@ class ChromeTokens:
 CHROME_TOKENS: Mapping[str, ChromeTokens] = {
     "dark": ChromeTokens(
         name="dark",
-        # Deep graphite surfaces with a soft periwinkle accent (Tokyo Night
-        # family) — flat and professional, with a clearer raised/sunken
-        # hierarchy and dark-on-accent primary buttons for a premium feel.
-        bg="#14161b",
-        bg_raised="#1b1e25",
-        bg_sunken="#0e1013",
-        fg="#e3e7ee",
-        fg_muted="#9099ab",
-        border="#282d36",
-        accent="#7aa2f7",
-        accent_fg="#0d1117",
-        danger="#f0637a",
-        warning="#e5b567",
-        success="#41d0a5",
+        # Ink-and-indigo: deep blue-black surfaces with a luminous periwinkle
+        # accent (Tokyo Night family). Every surface carries the same cool
+        # undertone so the chrome reads as one material, and the semantic
+        # hues (rose / amber / teal) are drawn from the same palette so
+        # badges, toasts and status marks feel native rather than bolted on.
+        bg="#0f121a",
+        bg_raised="#161b26",
+        bg_sunken="#0a0d13",
+        fg="#e7ecf8",
+        fg_muted="#94a0b8",
+        border="#293145",
+        accent="#82aaff",
+        accent_fg="#0a0e17",
+        danger="#f7768e",
+        warning="#e0af68",
+        success="#4fd6be",
         card_radius=8,
     ),
     "noir": ChromeTokens(
         name="noir",
-        # Pure charcoal with a soft emerald accent — high contrast, no blue tint
-        bg="#0e0f10",
-        bg_raised="#161819",
-        bg_sunken="#0a0b0b",
-        fg="#e8eaec",
-        fg_muted="#8f959b",
-        border="#26292c",
-        accent="#34d399",
-        accent_fg="#04120b",
+        # Pure charcoal with a crisp emerald accent — high contrast, no blue
+        # tint. Deeper base and brighter accent than before so the working
+        # surface recedes and interactive marks pop.
+        bg="#0c0d0f",
+        bg_raised="#141619",
+        bg_sunken="#070809",
+        fg="#eceef1",
+        fg_muted="#939aa2",
+        border="#25292e",
+        accent="#3ddc97",
+        accent_fg="#03110a",
         danger="#f2556c",
         warning="#e3b341",
-        success="#34d399",
+        success="#3ddc97",
         card_radius=8,
     ),
     "system": ChromeTokens(
