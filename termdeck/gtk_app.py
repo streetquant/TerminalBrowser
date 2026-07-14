@@ -3152,6 +3152,22 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.notebook.set_tab_pos(Gtk.PositionType.TOP)
         self.notebook.set_scrollable(True)
         self.notebook.connect("page-reordered", self._on_page_reordered)
+        # Browser-style new-tab button docked at the end of the tab strip,
+        # complementing the headerbar action (GTK hides action widgets when
+        # the notebook has no pages, so the headerbar button still covers
+        # the empty state).
+        strip_new_tab = _icon_button(
+            "New tab",
+            "list-add-symbolic",
+            "New tab · Ctrl+T · opens in the home directory",
+            self.new_tab,
+            suggested=False,
+            show_label=False,
+        )
+        _style(strip_new_tab, "td-new-tab", "td-tabstrip-new")
+        strip_new_tab.set_valign(Gtk.Align.CENTER)
+        strip_new_tab.show_all()
+        self.notebook.set_action_widget(strip_new_tab, Gtk.PackType.END)
         self.side = SidePane(self)
         self.side_position = app_context.settings.side_pane_position
         self._pack_side_pane()
