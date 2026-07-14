@@ -73,6 +73,10 @@ def _style(widget, *classes):
 def _icon_button(label, icon_name, tooltip, handler, *, suggested=False, show_label=True):
     button = Gtk.Button()
     box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4 if show_label else 0)
+    # Keep icon/label optically centred even when CSS enforces a larger
+    # square hit target than the natural content size.
+    box.set_halign(Gtk.Align.CENTER)
+    box.set_valign(Gtk.Align.CENTER)
     try:
         image = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON)
         box.pack_start(image, False, False, 0)
@@ -3104,6 +3108,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             show_label=False,
         )
         _style(new_tab, "td-new-tab", "td-header-icon")
+        # Keep the button a centred square instead of stretching to the full
+        # headerbar height (noticeable at large UI font scales).
+        new_tab.set_valign(Gtk.Align.CENTER)
         header.pack_start(new_tab)
 
         overflow_header_actions = [

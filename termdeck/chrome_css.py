@@ -248,8 +248,8 @@ headerbar button:focus {{
   background-color: {hov_bg};
 }}
 headerbar button.td-new-tab:focus {{
-  background-color: {t.accent};
-  border-color: {acc_edge};
+  background-color: {card_sel_bg};
+  border-color: {t.accent};
 }}
 button.td-primary-action, headerbar button.suggested-action, button.td-accent {{
   background-color: {t.accent};
@@ -296,18 +296,19 @@ button.td-header-overflow {{
 }}
 button.td-header-overflow:hover {{ color: {t.fg}; }}
 button.td-new-tab {{
-  background-color: {t.accent};
+  background-color: {inf_bg};
   background-image: none;
-  color: {t.accent_fg};
-  border: 1px solid {acc_edge};
+  color: {t.accent};
+  border: 1px solid {inf_b};
   font-weight: 600;
 }}
 button.td-new-tab:hover {{
-  background-color: {acc_hov};
-  border-color: {acc_hov};
+  background-color: {card_sel_bg};
+  border-color: {t.accent};
+  color: {t.accent};
 }}
 button.td-new-tab:active {{
-  background-color: {acc_act};
+  background-color: {tv_sel_bg};
 }}
 button.td-header-icon {{
   min-width: 36px;
@@ -315,8 +316,8 @@ button.td-header-icon {{
   padding-right: 8px;
 }}
 headerbar button.td-new-tab.td-header-icon {{
-  min-width: 38px;
-  min-height: 38px;
+  min-width: 36px;
+  min-height: 36px;
   padding: 0;
   border-radius: 8px;
 }}
