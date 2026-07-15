@@ -185,6 +185,33 @@ def _show_in_sessions_pane(record: SessionRecord) -> bool:
     return bool(record.visible) and record.status.casefold() not in SIDE_PANE_HIDDEN_STATUSES
 
 
+# ---------------------------------------------------------------------------
+# Modifier-only key guard
+# ---------------------------------------------------------------------------
+# Keyvals that carry no printable input and must NOT exit the scroll view when
+# pressed.  Covers every common modifier key across X11 and Wayland layouts.
+_MODIFIER_ONLY_KEYVALS: frozenset[int] = frozenset((
+    Gdk.KEY_Shift_L,    Gdk.KEY_Shift_R,
+    Gdk.KEY_Control_L,  Gdk.KEY_Control_R,
+    Gdk.KEY_Alt_L,      Gdk.KEY_Alt_R,
+    Gdk.KEY_Meta_L,     Gdk.KEY_Meta_R,
+    Gdk.KEY_Super_L,    Gdk.KEY_Super_R,   # Windows / Command key
+    Gdk.KEY_Hyper_L,    Gdk.KEY_Hyper_R,
+    Gdk.KEY_Caps_Lock,
+    Gdk.KEY_Num_Lock,
+    Gdk.KEY_Scroll_Lock,
+    Gdk.KEY_ISO_Level3_Shift,              # AltGr
+    Gdk.KEY_ISO_Level5_Shift,
+    Gdk.KEY_Mode_switch,
+    Gdk.KEY_Multi_key,
+))
+
+
+def _is_modifier_only_keyval(keyval: int) -> bool:
+    """Return True when *keyval* is a bare modifier key with no text payload."""
+    return keyval in _MODIFIER_ONLY_KEYVALS
+
+
 def _tabs_pane_records(store, window_id: str, query: str = "") -> list[SessionRecord]:
     """Return registry rows that belong in one window's Tabs pane.
 
@@ -4780,13 +4807,17 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         backend = getattr(getattr(self, "app_context", None), "backend", None)
         active = getattr(backend, "scroll_view_active", None)
         if record is not None and callable(active) and active(record):
-            self._restore_live_terminal(record)
-            show_cursor = getattr(attach, "_set_history_cursor_hidden", None)
-            if callable(show_cursor):
-                show_cursor(False)
-            reset_scrollbar = getattr(attach, "reset_scrollbar", None)
-            if callable(reset_scrollbar):
-                reset_scrollbar()
+            # Do NOT snap back to live when the user presses a bare modifier
+            # key (Ctrl, Alt, Super/Win, Shift, …).  Modifier-only events carry
+            # no printable input so they must not interrupt a scroll session.
+            if not _is_modifier_only_keyval(event.keyval):
+                self._restore_live_terminal(record)
+                show_cursor = getattr(attach, "_set_history_cursor_hidden", None)
+                if callable(show_cursor):
+                    show_cursor(False)
+                reset_scrollbar = getattr(attach, "reset_scrollbar", None)
+                if callable(reset_scrollbar):
+                    reset_scrollbar()
         return False
 
     @staticmethod
