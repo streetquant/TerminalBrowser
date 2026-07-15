@@ -179,10 +179,10 @@ class UiSurfaceStaticTests(unittest.TestCase):
         for name in ("dark", "noir", "system"):
             self.assertIn(f'"{name}"', self.theme)
 
-    def test_headerbar_is_reduced_to_title_new_tab_and_more(self):
+    def test_headerbar_is_reduced_to_title_new_window_and_more(self):
         self.assertIn("_icon_button", self.gtk)
         self.assertIn('title = Gtk.Label(label=self.window_title', self.gtk)
-        self.assertIn('new_tab = _icon_button(', self.gtk)
+        self.assertIn('new_window_btn = _icon_button(', self.gtk)
         self.assertIn("overflow_header_actions", self.gtk)
         self.assertIn("list-add-symbolic", self.gtk)
         self.assertIn('Gtk.MenuButton(label="⋯")', self.gtk)

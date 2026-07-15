@@ -3118,19 +3118,19 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.set_titlebar(header)
         self.set_title(f"TermDeck · {self.window_title}")
 
-        new_tab = _icon_button(
-            "New tab",
+        new_window_btn = _icon_button(
+            "New window",
             "list-add-symbolic",
-            "New tab · Ctrl+T · opens in the home directory",
-            self.new_tab,
+            "New window · opens with a shell in the home directory",
+            self.new_window_direct,
             suggested=False,
             show_label=False,
         )
-        _style(new_tab, "td-new-tab", "td-header-icon")
+        _style(new_window_btn, "td-new-tab", "td-header-icon")
         # Keep the button a centred square instead of stretching to the full
         # headerbar height (noticeable at large UI font scales).
-        new_tab.set_valign(Gtk.Align.CENTER)
-        header.pack_start(new_tab)
+        new_window_btn.set_valign(Gtk.Align.CENTER)
+        header.pack_start(new_window_btn)
 
         overflow_header_actions = [
             ("Rename window", self.rename_window),
@@ -3766,6 +3766,21 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
     def new_window(self) -> None:
         self.app_context.prompt_for_new_window(parent=self)
+
+    def new_window_direct(self) -> None:
+        """Open a new window immediately, without the name dialog.
+
+        Used by the headerbar + so the click is instant: the window opens as
+        "Window N" with its first shell in the home directory, and it can be
+        renamed in place by double-clicking its title.
+        """
+
+        ctx = self.app_context
+        ctx.create_named_window(
+            f"Window {len(ctx.windows) + 1}",
+            initial_directory=Path.home(),
+            open_initial_tab=True,
+        )
 
     def _active_directory(self) -> str:
         """Return the active pane's live cwd, then stored cwd, then user home."""
