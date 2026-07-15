@@ -48,6 +48,9 @@ class TerminalMouseBehaviourTest(TestCase):
             _last_scrollbar_value=90.0,
             _scroll_handler=lambda lines: calls.append(lines) or True,
             _set_history_cursor_hidden=lambda hidden: calls.append(("cursor-hidden", hidden)),
+            _scrollbar_at_live_edge=lambda: False,
+            _set_scrollbar_value=lambda v: None,
+            _arm_scroll_idle_resume=lambda: None,
         )
 
         AttachTerminal._on_scrollbar_value_changed(attach, adjustment)
@@ -119,6 +122,9 @@ class TerminalMouseBehaviourTest(TestCase):
             terminal=terminal,
             _scroll_handler=lambda lines: calls.append(lines) or True,
             _set_history_cursor_hidden=lambda hidden: calls.append(("cursor-hidden", hidden)),
+            _move_scrollbar=lambda lines: None,
+            _scrollbar_at_live_edge=lambda: False,
+            _arm_scroll_idle_resume=lambda: None,
         )
         event = SimpleNamespace(direction=Gdk.ScrollDirection.UP, delta_y=0.0)
 
@@ -241,6 +247,8 @@ class TerminalMouseBehaviourTest(TestCase):
     def test_live_input_restores_tui_and_forces_immediate_geometry_sync(self) -> None:
         calls = []
         attach = SimpleNamespace(
+            _scroll_idle_source_id=0,
+            _remove_glib_source=lambda source_id: None,
             _set_history_cursor_hidden=lambda hidden: calls.append(("cursor-hidden", hidden)),
             reset_scrollbar=lambda: calls.append("scrollbar-bottom"),
             _live_focus_handler=lambda: calls.append("restore"),

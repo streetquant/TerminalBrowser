@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify clipboard paste and first-key delivery into the active VTE."""
+"""Verify text/image clipboard paste and first-key delivery into the active VTE."""
 
 from __future__ import annotations
 
@@ -11,6 +11,10 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import gi
+
+gi.require_version("GdkPixbuf", "2.0")
 
 
 def _drain_gtk(Gtk, *, until=None, timeout: float = 5.0) -> None:
@@ -61,6 +65,7 @@ def main() -> int:
             encoding="utf-8",
         )
 
+        from gi.repository import GdkPixbuf
         from termdeck.gtk_app import Gdk, Gtk, TermDeckApplication
 
         app = TermDeckApplication(
@@ -103,6 +108,35 @@ def main() -> int:
                 raise AssertionError(
                     f"system clipboard text was not fed exactly once: {fed!r}"
                 )
+
+            clipboard_image = GdkPixbuf.Pixbuf.new(
+                GdkPixbuf.Colorspace.RGB,
+                True,
+                8,
+                2,
+                2,
+            )
+            clipboard_image.fill(0x336699FF)
+            clipboard.set_image(clipboard_image)
+            if hasattr(clipboard, "store"):
+                clipboard.store()
+            _drain_gtk(Gtk)
+
+            fed.clear()
+            handled = window.on_terminal_key_press(attach.terminal, event)
+            _drain_gtk(Gtk, until=lambda: bool(fed))
+            if not handled:
+                raise AssertionError("image Ctrl+Shift+V was not consumed by TermDeck")
+            if len(fed) != 1:
+                raise AssertionError(f"clipboard image path was not fed exactly once: {fed!r}")
+            image_path = Path(fed[0])
+            if image_path.suffix != ".png" or not image_path.is_file():
+                raise AssertionError(f"clipboard image was not materialised as PNG: {fed[0]!r}")
+            saved_image = GdkPixbuf.Pixbuf.new_from_file(str(image_path))
+            if (saved_image.get_width(), saved_image.get_height()) != (2, 2):
+                raise AssertionError("materialised clipboard image has the wrong dimensions")
+            image_path.unlink()
+            attach._clipboard_image_paths.discard(str(image_path))
 
             # The first ordinary key pressed while header chrome owns focus
             # must be replayed into VTE, not lost to the old widget.
@@ -162,7 +196,8 @@ def main() -> int:
                         "shortcut": "Ctrl+Shift+V",
                         "selection": "Gdk.SELECTION_CLIPBOARD",
                         "pasted_text": marker,
-                        "feed_count": len(fed),
+                        "image_path_suffix": image_path.suffix,
+                        "image_dimensions": [2, 2],
                         "unfocused_first_key": "x",
                     },
                     indent=2,

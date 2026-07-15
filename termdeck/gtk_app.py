@@ -3,11 +3,13 @@ from __future__ import annotations
 import fcntl
 import os
 import pty
+import shlex
 import signal
 import struct
 import subprocess
 import sys
 import termios
+import tempfile
 import time
 from pathlib import Path
 
@@ -321,6 +323,8 @@ class AttachTerminal(Gtk.Box):
         self._scroll_handler = None
         self._key_press_handler_id = 0
         self._history_cursor_hidden = False
+        self._scroll_idle_source_id = 0
+        self._clipboard_image_paths: set[str] = set()
         self.terminal = Vte.Terminal()
         self.set_hexpand(True)
         self.set_vexpand(True)
@@ -475,10 +479,12 @@ class AttachTerminal(Gtk.Box):
         self._remove_glib_source(self._spawn_fallback_source_id)
         self._remove_glib_source(self._resize_sync_source_id)
         self._remove_glib_source(self._cursor_hide_source_id)
+        self._remove_glib_source(self._scroll_idle_source_id)
         self._spawn_source_id = 0
         self._spawn_fallback_source_id = 0
         self._resize_sync_source_id = 0
         self._cursor_hide_source_id = 0
+        self._scroll_idle_source_id = 0
 
     def _on_terminal_size_allocate(self, _terminal, _allocation) -> None:
         columns = max(0, int(self.terminal.get_column_count()))
@@ -595,6 +601,7 @@ class AttachTerminal(Gtk.Box):
     def detach(self) -> None:
         self._detached = True
         self._cancel_pending_spawn()
+        self._cleanup_clipboard_images()
         if not self.process or self.process.poll() is not None:
             return
         try:
@@ -679,6 +686,9 @@ class AttachTerminal(Gtk.Box):
                     self.prepare_for_live_input()
                 else:
                     self._set_history_cursor_hidden(True)
+                    # Arm the inactivity timer so streaming resumes
+                    # automatically if the user stops dragging the scrollbar.
+                    self._arm_scroll_idle_resume()
                 return
         except Exception:
             pass
@@ -841,8 +851,50 @@ class AttachTerminal(Gtk.Box):
         except Exception:
             return None
 
+    def _paste_clipboard_image(self, image) -> bool:
+        """Save a clipboard pixbuf and paste its shell-safe PNG path."""
+        if image is None or getattr(self, "_detached", False):
+            return False
+        fd = -1
+        path = ""
+        try:
+            fd, path = tempfile.mkstemp(prefix="terminalbrowser-clipboard-", suffix=".png")
+            os.close(fd)
+            fd = -1
+            if not image.savev(path, "png", [], []):
+                raise OSError("clipboard image could not be encoded as PNG")
+            if not self._feed_text(shlex.quote(path)):
+                raise OSError("clipboard image path could not be pasted")
+            paths = getattr(self, "_clipboard_image_paths", None)
+            if paths is None:
+                paths = set()
+                self._clipboard_image_paths = paths
+            paths.add(path)
+            return True
+        except Exception:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if path:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return False
+
+    def _cleanup_clipboard_images(self) -> None:
+        paths = getattr(self, "_clipboard_image_paths", set())
+        for path in tuple(paths):
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        paths.clear()
+
     def _paste_from_selection(self, selection, *, prefer_last: bool = False) -> bool:
-        """Request clipboard text without blocking GTK's main loop."""
+        """Request clipboard text or an image without blocking GTK's main loop."""
 
         def _normalise(text) -> str:
             if isinstance(text, (bytes, bytearray)):
@@ -860,22 +912,54 @@ class AttachTerminal(Gtk.Box):
             except Exception:
                 pass
 
-        def _finish(text, *, allow_clipboard_fallback: bool) -> None:
+        def _finish_without_payload(*, allow_clipboard_fallback: bool) -> None:
+            if getattr(self, "_detached", False):
+                return
+            if prefer_last and self._last_copied_text:
+                self._feed_text(self._last_copied_text)
+                return
+            if allow_clipboard_fallback and selection != Gdk.SELECTION_CLIPBOARD:
+                if _request_text(
+                    Gdk.SELECTION_CLIPBOARD,
+                    lambda fallback: _finish_text(
+                        fallback,
+                        requested_selection=Gdk.SELECTION_CLIPBOARD,
+                        allow_clipboard_fallback=False,
+                    ),
+                ):
+                    return
+            _vte_fallback()
+
+        def _finish_image(image, *, allow_clipboard_fallback: bool) -> None:
+            if getattr(self, "_detached", False):
+                return
+            if image is not None and self._paste_clipboard_image(image):
+                return
+            _finish_without_payload(allow_clipboard_fallback=allow_clipboard_fallback)
+
+        def _finish_text(
+            text,
+            *,
+            requested_selection,
+            allow_clipboard_fallback: bool,
+        ) -> None:
             if getattr(self, "_detached", False):
                 return
             clean_text = _normalise(text)
             if clean_text:
                 self._feed_text(clean_text)
                 return
-            if prefer_last and self._last_copied_text:
-                self._feed_text(self._last_copied_text)
+            if requested_selection == Gdk.SELECTION_CLIPBOARD and _request_image(
+                requested_selection,
+                lambda image: _finish_image(
+                    image,
+                    allow_clipboard_fallback=allow_clipboard_fallback,
+                ),
+            ):
                 return
-            if allow_clipboard_fallback and selection != Gdk.SELECTION_CLIPBOARD:
-                if _request(Gdk.SELECTION_CLIPBOARD, lambda fallback: _finish(fallback, allow_clipboard_fallback=False)):
-                    return
-            _vte_fallback()
+            _finish_without_payload(allow_clipboard_fallback=allow_clipboard_fallback)
 
-        def _request(requested_selection, callback) -> bool:
+        def _request_text(requested_selection, callback) -> bool:
             clipboard = self._system_clipboard(requested_selection)
             if clipboard is None:
                 return False
@@ -895,9 +979,36 @@ class AttachTerminal(Gtk.Box):
             except Exception:
                 return False
 
-        if _request(selection, lambda text: _finish(text, allow_clipboard_fallback=True)):
+        def _request_image(requested_selection, callback) -> bool:
+            clipboard = self._system_clipboard(requested_selection)
+            if clipboard is None or not hasattr(clipboard, "request_image"):
+                return False
+
+            def _received(_clipboard, image, *_args) -> None:
+                callback(image)
+
+            try:
+                clipboard.request_image(_received, None)
+                return True
+            except TypeError:
+                try:
+                    clipboard.request_image(_received)
+                    return True
+                except Exception:
+                    return False
+            except Exception:
+                return False
+
+        if _request_text(
+            selection,
+            lambda text: _finish_text(
+                text,
+                requested_selection=selection,
+                allow_clipboard_fallback=True,
+            ),
+        ):
             return True
-        _finish(None, allow_clipboard_fallback=True)
+        _finish_without_payload(allow_clipboard_fallback=True)
         return True
 
     def _selected_text(self) -> str:
@@ -1074,6 +1185,9 @@ class AttachTerminal(Gtk.Box):
                         self.prepare_for_live_input()
                     else:
                         self._set_history_cursor_hidden(True)
+                        # Arm the inactivity timer so streaming resumes
+                        # automatically if the user stops scrolling.
+                        self._arm_scroll_idle_resume()
                     return True
             except Exception:
                 pass
@@ -1088,7 +1202,31 @@ class AttachTerminal(Gtk.Box):
         adjustment.set_value(min(upper, max(lower, value)))
         return True
 
+    # ------------------------------------------------------------------ #
+    # Scroll-idle auto-resume                                              #
+    # After the user stops scrolling for SCROLL_IDLE_MS milliseconds,     #
+    # automatically exit tmux copy-mode and resume live streaming output. #
+    # ------------------------------------------------------------------ #
+    SCROLL_IDLE_MS: int = 2000
+
+    def _arm_scroll_idle_resume(self) -> None:
+        """(Re)start the inactivity timer that returns to the live screen."""
+        self._remove_glib_source(self._scroll_idle_source_id)
+        self._scroll_idle_source_id = GLib.timeout_add(
+            self.SCROLL_IDLE_MS,
+            self._scroll_idle_resume,
+        )
+
+    def _scroll_idle_resume(self) -> bool:
+        """Timer callback: exit history view and resume streaming if idle."""
+        self._scroll_idle_source_id = 0
+        if not self._detached:
+            self.prepare_for_live_input()
+        return False
+
     def prepare_for_live_input(self) -> None:
+        self._remove_glib_source(self._scroll_idle_source_id)
+        self._scroll_idle_source_id = 0
         self.reset_scrollbar()
         handler = self._live_focus_handler
         if callable(handler):
