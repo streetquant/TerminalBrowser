@@ -9,6 +9,8 @@ class MenuItemStub:
     def __init__(self, *, label: str = "") -> None:
         self.label = label
         self.handler = None
+        self.submenu = None
+        self.sensitive = True
 
     def connect(self, signal: str, handler) -> None:
         if signal != "activate":
@@ -18,6 +20,12 @@ class MenuItemStub:
     def activate(self) -> None:
         if self.handler is not None:
             self.handler(self)
+
+    def set_submenu(self, submenu) -> None:
+        self.submenu = submenu
+
+    def set_sensitive(self, value: bool) -> None:
+        self.sensitive = value
 
 
 class SeparatorStub:
@@ -64,9 +72,14 @@ def make_window(calls):
         _hide_other_tabs=lambda record: calls.append(("hide_other", record.id)),
         _hide_tabs_to_right=lambda record: calls.append(("hide_right", record.id)),
         stop_session=lambda record: calls.append(("kill", record.id)),
+        _move_tab_to_new_window=lambda record: calls.append(("move_new_window", record.id)),
         set_side_pane_position=lambda position: calls.append(("side", position)),
         open_terminal_options=lambda: calls.append(("terminal_options",)),
         open_master_window=lambda: calls.append(("master",)),
+        app_context=SimpleNamespace(
+            available_move_windows=lambda record: [],
+            move_tab_to_window=lambda session_id, target: None,
+        ),
     )
 
 
@@ -84,7 +97,8 @@ class TabContextMenuActionsTest(TestCase):
             "termdeck.gtk_app.Gtk.MenuItem", MenuItemStub
         ), patch("termdeck.gtk_app.Gtk.SeparatorMenuItem", SeparatorStub):
             TermDeckWindow._show_tab_context_menu(window, record, event)
-        return MenuStub.created[-1], calls, record, event
+        # created[0] is the top-level menu; created[1] is the Move-to-window submenu.
+        return MenuStub.created[0], calls, record, event
 
     def test_unpinned_tab_context_menu_labels_and_actions(self) -> None:
         menu, calls, _record, event = self._show_menu(pinned=False)
@@ -99,6 +113,8 @@ class TabContextMenuActionsTest(TestCase):
                 "Hide other tabs",
                 "Hide tabs to the right",
                 "Kill tab",
+                "---",
+                "Move to window",
                 "---",
                 "Move tabs pane to left",
                 "Move tabs pane to right",
@@ -143,6 +159,8 @@ class TabContextMenuActionsTest(TestCase):
                 "Hide other tabs",
                 "Hide tabs to the right",
                 "Kill tab",
+                "---",
+                "Move to window",
                 "---",
                 "Move tabs pane to left",
                 "Move tabs pane to right",

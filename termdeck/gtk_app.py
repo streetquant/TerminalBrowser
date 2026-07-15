@@ -3611,6 +3611,15 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     def _hide_tabs_to_right(self, record: SessionRecord) -> None:
         self._hide_tab_records([candidate for candidate in self._visible_tab_records() if candidate.tab_index > record.tab_index])
 
+    def _move_tab_to_new_window(self, record: SessionRecord) -> None:
+        """Open a new TermDeck window and move *record* into it."""
+        destination = self.app_context.prompt_for_new_window(
+            parent=self,
+            open_initial_tab=False,
+        )
+        if destination is not None:
+            self.app_context.move_tab_to_window(record.id, destination)
+
     def _show_tab_context_menu(self, record: SessionRecord, event: Gdk.EventButton) -> None:
         menu = Gtk.Menu()
         menu.append(self._tab_menu_item("Rename", lambda: self.rename_session(record)))
@@ -3624,11 +3633,41 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         menu.append(self._tab_menu_item("Hide tabs to the right", lambda: self._hide_tabs_to_right(record)))
         menu.append(self._tab_menu_item("Kill tab", lambda: self.stop_session(record)))
         menu.append(Gtk.SeparatorMenuItem())
+        # --- Move to window submenu -------------------------------------------
+        move_item = Gtk.MenuItem(label="Move to window")
+        submenu = Gtk.Menu()
+        destinations = self.app_context.available_move_windows(record)
+        if destinations:
+            for destination in destinations:
+                item = Gtk.MenuItem(label=destination.window_title)
+                item.connect(
+                    "activate",
+                    lambda _item, target=destination: (
+                        self.app_context.move_tab_to_window(record.id, target)
+                    ),
+                )
+                submenu.append(item)
+        else:
+            unavailable = Gtk.MenuItem(label="No other open windows")
+            unavailable.set_sensitive(False)
+            submenu.append(unavailable)
+        new_win_item = Gtk.MenuItem(label="New window…")
+        new_win_item.connect(
+            "activate",
+            lambda _item: self._move_tab_to_new_window(record),
+        )
+        submenu.append(new_win_item)
+        move_item.set_submenu(submenu)
+        menu.append(move_item)
+        # ----------------------------------------------------------------------
+        menu.append(Gtk.SeparatorMenuItem())
         menu.append(self._tab_menu_item("Move tabs pane to left", lambda: self.set_side_pane_position("left")))
         menu.append(self._tab_menu_item("Move tabs pane to right", lambda: self.set_side_pane_position("right")))
         menu.append(self._tab_menu_item("Terminal options", self.open_terminal_options))
         menu.append(self._tab_menu_item("Tab manager", self.open_master_window))
         menu.show_all()
+        # Keep a reference so the menu widget stays alive during the popup.
+        self._tab_context_menu = menu
         try:
             menu.popup_at_pointer(event)
         except Exception:
