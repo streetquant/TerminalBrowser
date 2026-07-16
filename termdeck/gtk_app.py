@@ -2436,7 +2436,7 @@ class SidePane(Gtk.Box):
             self.session_box.add(row)
             self.session_box.show_all()
             return
-        for record in records:
+        for row_idx, record in enumerate(records):
             item = items_by_id[record.id]
             snap = item.snapshot
             health = classify_session(record, snap, self.window.app_context.budget)
@@ -2483,6 +2483,20 @@ class SidePane(Gtk.Box):
             card.pack_start(meta, False, False, 0)
 
             actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+            # ---- Move-up / move-down buttons --------------------------------
+            move_up = Gtk.Button(label="▲")
+            move_up.set_tooltip_text("Move tab up")
+            _style(move_up, "td-ghost-action")
+            move_up.set_sensitive(row_idx > 0)
+            move_up.connect("clicked", lambda _b, r=record: self._move_tab_up(r))
+            actions.pack_start(move_up, False, False, 0)
+            move_dn = Gtk.Button(label="▼")
+            move_dn.set_tooltip_text("Move tab down")
+            _style(move_dn, "td-ghost-action")
+            move_dn.set_sensitive(row_idx < len(records) - 1)
+            move_dn.connect("clicked", lambda _b, r=record: self._move_tab_down(r))
+            actions.pack_start(move_dn, False, False, 0)
+            # -----------------------------------------------------------------
             rename = Gtk.Button(label="Rename")
             rename.set_tooltip_text("Rename this tab")
             _style(rename, "td-ghost-action")
@@ -2511,6 +2525,39 @@ class SidePane(Gtk.Box):
             row.add(card_event)
             self.session_box.add(row)
         self.session_box.show_all()
+
+    # -----------------------------------------------------------------------
+    # Tab reordering from the side pane
+    # -----------------------------------------------------------------------
+
+    def _move_tab_in_notebook(self, record: "SessionRecord", delta: int) -> None:
+        """Shift *record*'s notebook page by *delta* positions (+1 down, -1 up).
+
+        The GtkNotebook ``page-reordered`` signal fires automatically, which
+        triggers ``_renumber_visible_tabs`` on the window and persists the new
+        ``tab_index`` for every affected tab via the store.  The side pane is
+        then refreshed by ``_on_page_reordered`` as well.
+        """
+        tab = self.window.tabs.get(record.id)
+        if tab is None:
+            return
+        notebook = self.window.notebook
+        current = notebook.page_num(tab.widget)
+        if current < 0:
+            return
+        target = current + delta
+        pages = notebook.get_n_pages()
+        if target < 0 or target >= pages:
+            return
+        notebook.reorder_child(tab.widget, target)
+
+    def _move_tab_up(self, record: "SessionRecord") -> None:
+        """Move *record* one position earlier (towards index 0)."""
+        self._move_tab_in_notebook(record, -1)
+
+    def _move_tab_down(self, record: "SessionRecord") -> None:
+        """Move *record* one position later (towards the last index)."""
+        self._move_tab_in_notebook(record, +1)
 
     def _on_toggle(self, button: Gtk.CheckButton, session_id: str) -> None:
         active = bool(button.get_active())
