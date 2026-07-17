@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import os
 import pty
+import re
 import shlex
 import signal
 import struct
