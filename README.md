@@ -1,7 +1,7 @@
 # T-1000: The terminal manager that never breaks down
 
 <p align="center">
-  <img src="docs/assets/t1000-mascot.png" alt="T-1000 mascot" width="320" />
+  <img src="t1000.png" alt="T-1000 mascot" width="320" />
 </p>
 
 > Named after the T-1000 from *Terminator 2: Judgment Day* — the antagonist that could not be stopped, never crashed, and kept coming back no matter what.
