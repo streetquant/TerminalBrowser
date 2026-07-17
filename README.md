@@ -1,16 +1,20 @@
-# TerminalBrowser: Browsers are all you need.... yes even for terminals
+# T-1000: The terminal manager that never breaks down
 
-> A browser for your terminal — not the web.
+<p align="center">
+  <img src="docs/assets/t1000-mascot.png" alt="T-1000 mascot" width="320" />
+</p>
 
-You already know how to use a browser: open tabs, name your windows, switch between sessions, search across everything, and nothing disappears when you close it. TerminalBrowser brings that exact mental model to your terminal work.
+> Named after the T-1000 from *Terminator 2: Judgment Day* — the antagonist that could not be stopped, never crashed, and kept coming back no matter what.
 
-Each tab is a live shell. Each window is a named workspace. Sessions survive restarts via tmux — invisibly, with no tmux knowledge needed. It’s the browser UX you’re already fluent in, applied to the terminal you actually live in.
+You already know how to use a browser: open tabs, name your windows, switch between sessions, search across everything, and nothing disappears when you close it. T-1000 brings that exact mental model to your terminal work.
 
-## How it’s structured
+Each tab is a live shell. Each window is a named workspace. Sessions survive restarts via tmux — invisibly, with no tmux knowledge needed. It's the browser UX you're already fluent in, applied to the terminal you actually live in. And like the machine it's named after: it does not crash, does not lose your work, and keeps running.
+
+## How it's structured
 
 ```mermaid
 flowchart TD
-    App(["TerminalBrowser"])
+    App(["T-1000"])
 
     App --> W1["Window: Backend\n(named workspace)"]
     App --> W2["Window: Agents\n(named workspace)"]
@@ -53,13 +57,13 @@ Each **Window** is a named group (like a browser window). Each **Tab** is a live
 sudo apt update
 sudo apt install -y tmux python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-vte-2.91 git python3-pip
 
-# 2. Install TerminalBrowser
+# 2. Install T-1000
 git clone https://github.com/streetquant/TerminalBrowser.git
 cd TerminalBrowser
 pip install -e .
 
 # 3. Run
-terminalbrowser
+t1000
 ```
 
 ### 🏹 Arch Linux / Manjaro
@@ -68,13 +72,13 @@ terminalbrowser
 # 1. System dependencies
 sudo pacman -S --needed tmux python-gobject gtk3 vte3 git python-pip
 
-# 2. Install TerminalBrowser
+# 2. Install T-1000
 git clone https://github.com/streetquant/TerminalBrowser.git
 cd TerminalBrowser
 pip install -e . --break-system-packages
 
 # 3. Run
-terminalbrowser
+t1000
 ```
 
 ### 🌶️ Fedora / RHEL / CentOS
@@ -83,13 +87,13 @@ terminalbrowser
 # 1. System dependencies
 sudo dnf install -y tmux python3-gobject gtk3 vte291 git python3-pip
 
-# 2. Install TerminalBrowser
+# 2. Install T-1000
 git clone https://github.com/streetquant/TerminalBrowser.git
 cd TerminalBrowser
 pip install -e .
 
 # 3. Run
-terminalbrowser
+t1000
 ```
 
 ### 🍎 macOS (partial support)
@@ -103,18 +107,18 @@ terminalbrowser
 # 2. System dependencies
 brew install tmux pygobject3 gtk+3 vte3
 
-# 3. Install TerminalBrowser
+# 3. Install T-1000
 git clone https://github.com/streetquant/TerminalBrowser.git
 cd TerminalBrowser
 pip3 install -e .
 
 # 4. Run (may require XQuartz for display)
-terminalbrowser
+t1000
 ```
 
 ### 🪩 Windows (WSL2 only)
 
-> ⚠️ TerminalBrowser does not run natively on Windows. Use WSL2 with an Ubuntu distro.
+> ⚠️ T-1000 does not run natively on Windows. Use WSL2 with an Ubuntu distro.
 
 ```powershell
 # 1. Enable WSL2 and install Ubuntu (PowerShell as Administrator)
@@ -133,7 +137,7 @@ sudo apt install -y tmux python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-vte-2
 git clone https://github.com/streetquant/TerminalBrowser.git
 cd TerminalBrowser
 pip install -e .
-terminalbrowser
+t1000
 ```
 
 ## Features
@@ -151,35 +155,35 @@ terminalbrowser
 ### Pause / resume any session
 Free up CPU from a runaway agent without killing it. The tmux session keeps existing — just frozen.
 ```bash
-terminalbrowser pause codex-api          # pause one agent
-terminalbrowser pause --tag ai           # pause all agents
-terminalbrowser resume --tag ai          # resume all at once
-terminalbrowser pause-hot --all          # auto-pause anything using high CPU
+t1000 pause codex-api          # pause one agent
+t1000 pause --tag ai           # pause all agents
+t1000 resume --tag ai          # resume all at once
+t1000 pause-hot --all          # auto-pause anything using high CPU
 ```
 
 ### Broadcast a command to all agents at once
 Send the same text to every tab in a tag group — like texting all your agents simultaneously.
 ```bash
-terminalbrowser send --tag ai "status"                    # ask all agents for status
-terminalbrowser send --tag ai "stop and summarise"        # graceful checkpoint
-terminalbrowser send --tag ai "continue" --no-enter       # stage input, don’t submit yet
+t1000 send --tag ai "status"                    # ask all agents for status
+t1000 send --tag ai "stop and summarise"        # graceful checkpoint
+t1000 send --tag ai "continue" --no-enter       # stage input, don't submit yet
 ```
 
 ### Read all agent output without switching tabs
 ```bash
-terminalbrowser capture --tag ai --lines 200             # last 200 lines from every agent
-terminalbrowser activity --tag ai                        # who needs attention right now?
-terminalbrowser search-output "needs approval" --tag ai  # find specific text across all tabs
+t1000 capture --tag ai --lines 200             # last 200 lines from every agent
+t1000 activity --tag ai                        # who needs attention right now?
+t1000 search-output "needs approval" --tag ai  # find specific text across all tabs
 ```
 
 ### Workspace recipes — one command to start everything
 ```bash
-terminalbrowser gui --workspace agents.workspace.json
+t1000 gui --workspace agents.workspace.json
 ```
 One JSON file defines all windows, tabs, commands, and directories. Reopen any time and everything restores exactly.
 
 ### Sessions survive reboots
-Close TerminalBrowser, reboot the machine, reopen — all tabs come back. Agents that were mid-task can be resumed exactly where they were.
+Close T-1000, reboot the machine, reopen — all tabs come back. Agents that were mid-task can be resumed exactly where they were.
 
 ## Keyboard shortcuts
 
@@ -194,25 +198,25 @@ Close TerminalBrowser, reboot the machine, reopen — all tabs come back. Agents
 
 ## Using with Codex / Claude Code / OpenCode
 
-TerminalBrowser shines as a multi-agent cockpit. See **[docs/codex-claude-workflow.md](docs/codex-claude-workflow.md)** for:
+T-1000 shines as a multi-agent cockpit. See **[docs/codex-claude-workflow.md](docs/codex-claude-workflow.md)** for:
 - How to launch 3+ agents in parallel with a single workspace recipe
 - The agent lifecycle state machine (running → needs input → paused → done)
 - The approval loop — click card in side pane, answer, back to work
 - CLI commands to monitor, capture output, and steer agents by tag
 - Full day workflow Gantt
 
-You can use TerminalBrowser with Codex, Claude Code, and OpenCode side by side. Give each agent its own tab or tag, then monitor and steer them from the same workspace.
+You can use T-1000 with Codex, Claude Code, and OpenCode side by side. Give each agent its own tab or tag, then monitor and steer them from the same workspace.
 
 ### Quick install using Codex / Claude Code / OpenCode
 
-Paste this prompt into Codex, Claude Code, or OpenCode and it will install TerminalBrowser on your machine:
+Paste this prompt into Codex, Claude Code, or OpenCode and it will install T-1000 on your machine:
 
 ```
-Install TerminalBrowser from https://github.com/streetquant/TerminalBrowser by:
+Install T-1000 from https://github.com/streetquant/TerminalBrowser by:
 1. Installing system dependencies for this OS (tmux, GTK3, VTE, python3-gi)
-2. Cloning the repo into ~/terminalbrowser
+2. Cloning the repo into ~/t1000
 3. Running pip install -e . inside it
-4. Verifying with: terminalbrowser --version
+4. Verifying with: t1000 --version
 ```
 
 ## License

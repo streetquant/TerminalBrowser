@@ -3,14 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "terminalbrowser"
+name = "t1000"
 version = "0.2.10"
-description = "Native named terminal windows with directory-backed tabs and hidden tmux persistence."
+description = "The terminal manager that never breaks down — named after the T-1000 from Terminator 2."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "TermDeck contributors"}]
-keywords = ["terminal", "tmux", "gtk", "vte", "terminator", "codex", "process-manager"]
+keywords = ["terminal", "tmux", "gtk", "vte", "t1000", "codex", "process-manager"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: X11 Applications :: GTK",
@@ -24,7 +24,7 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-terminalbrowser = "termdeck.cli:main"
+t1000 = "termdeck.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
