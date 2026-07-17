@@ -2190,6 +2190,7 @@ class SidePane(Gtk.Box):
             ("Pause hot", self.pause_hot_sessions),
             ("Restore", self.window.restore_previous_tabs),
             ("Tab manager", self.window.open_master_window),
+            ("Process monitor", self.window.open_process_monitor_window),
         ]
         for label, handler in secondary:
             item = Gtk.MenuItem(label=label)
@@ -3287,6 +3288,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self._restore_records = restore_records
         self.tabs: dict[str, TerminalTab] = {}
         self.master_window: MasterWindow | None = None
+        self.process_monitor_window: ProcessMonitorWindow | None = None
         self.window_overview: WindowOverview | None = None
         self.shortcut_window: ShortcutWindow | None = None
         self.search_window: SessionSearchWindow | None = None
@@ -4499,6 +4501,23 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.master_window.show_all()
         self.master_window.present()
 
+    def open_process_monitor_window(self) -> None:
+        if self.process_monitor_window is not None:
+            try:
+                if self.process_monitor_window.get_realized() and self.process_monitor_window.get_visible():
+                    self.process_monitor_window._scan()
+                    self.process_monitor_window.present()
+                    return
+            except Exception:
+                pass
+            self.process_monitor_window = None
+        self.process_monitor_window = ProcessMonitorWindow(self.app_context)
+        self.process_monitor_window.connect(
+            "destroy", lambda *_: setattr(self, "process_monitor_window", None)
+        )
+        self.process_monitor_window.show_all()
+        self.process_monitor_window.present()
+
     def open_window_overview(self) -> None:
         if self.window_overview is not None:
             try:
@@ -4927,6 +4946,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             return True
         if self.keymap.matches(event, "master_window") or (key_name == "Escape" and int(event.state & Gdk.ModifierType.SHIFT_MASK)):
             self.open_master_window()
+            return True
+        if (key_name in ("e", "E")
+                and int(event.state & Gdk.ModifierType.CONTROL_MASK)
+                and int(event.state & Gdk.ModifierType.SHIFT_MASK)):
+            self.open_process_monitor_window()
             return True
         if self.keymap.matches(event, "toggle_side"):
             self.toggle_side()
@@ -5459,6 +5483,238 @@ class TermDeckApplication(Gtk.Application):
                 window.present()
             except Exception:
                 continue
+
+
+# ---------------------------------------------------------------------------
+# Process Monitor — floating dashboard for aborted / errored tabs
+# ---------------------------------------------------------------------------
+
+_ERROR_PATTERNS = re.compile(
+    r"(?i)(traceback|error:|exception:|killed|oom|segfault|abort|panic|"
+    r"failed|fatal|command not found|permission denied|no such file|killed by signal)"
+)
+
+
+def _classify_tail(tail: str) -> str:
+    """Return a short label describing what the tail output looks like."""
+    if not tail.strip():
+        return "(no output)"
+    m = _ERROR_PATTERNS.search(tail)
+    if m:
+        return m.group(0)[:40]
+    return "(no error keywords)"
+
+
+class ProcessMonitorWindow(Gtk.Window):
+    """Auto-refreshing dashboard that surfaces tabs whose process died or
+    produced error output.  Opens from More-actions menu or Ctrl+Shift+E.
+
+    A tab is considered *flagged* when:
+      - its stored status is 'stopped' or 'missing', OR
+      - its PID is gone while status is still 'running', OR
+      - the last 60 lines of its pane output match _ERROR_PATTERNS.
+    """
+
+    _POLL_SECONDS = 5
+    _CAPTURE_LINES = 60
+
+    def __init__(self, app_context) -> None:
+        super().__init__(title="Process Monitor")
+        self.app_context = app_context
+        self.set_default_size(1100, 600)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+
+        # --- toolbar ---
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bar.set_margin_top(4)
+        bar.set_margin_bottom(4)
+        bar.set_margin_start(8)
+        bar.set_margin_end(8)
+
+        self._status_label = Gtk.Label(label="Scanning…")
+        self._status_label.set_halign(Gtk.Align.START)
+        bar.pack_start(self._status_label, True, True, 0)
+
+        refresh_btn = Gtk.Button(label="↺ Refresh")
+        refresh_btn.connect("clicked", lambda *_: self._scan())
+        bar.pack_end(refresh_btn, False, False, 0)
+
+        close_btn = Gtk.Button(label="Close")
+        close_btn.connect("clicked", lambda *_: self.destroy())
+        bar.pack_end(close_btn, False, False, 0)
+
+        # --- scrolled list ---
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+
+        self._store = Gtk.ListStore(
+            str,   # 0 id
+            str,   # 1 name
+            str,   # 2 window
+            str,   # 3 status
+            str,   # 4 health
+            str,   # 5 flag reason
+            str,   # 6 tail preview (last non-empty line)
+        )
+        self._tree = Gtk.TreeView(model=self._store)
+        self._tree.set_rules_hint(True)
+        self._tree.set_activate_on_single_click(False)
+
+        cols = [
+            ("Name",    1, 160),
+            ("Window",  2, 120),
+            ("Status",  3,  80),
+            ("Health",  4,  80),
+            ("Reason",  5, 180),
+            ("Last output", 6, 380),
+        ]
+        for title, col_idx, width in cols:
+            renderer = Gtk.CellRendererText()
+            renderer.set_property("ellipsize", 3)  # PANGO_ELLIPSIZE_END
+            column = Gtk.TreeViewColumn(title, renderer, text=col_idx)
+            column.set_min_width(width)
+            column.set_resizable(True)
+            column.set_sort_column_id(col_idx)
+            self._tree.append_column(column)
+
+        scroll.add(self._tree)
+
+        # --- tail detail panel ---
+        self._detail_buf = Gtk.TextBuffer()
+        detail_view = Gtk.TextView(buffer=self._detail_buf)
+        detail_view.set_editable(False)
+        detail_view.set_monospace(True)
+        detail_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        detail_scroll = Gtk.ScrolledWindow()
+        detail_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        detail_scroll.set_min_content_height(160)
+        detail_scroll.add(detail_view)
+
+        self._tree.connect("cursor-changed", self._on_row_selected)
+
+        paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        paned.pack1(scroll, resize=True, shrink=False)
+        paned.pack2(detail_scroll, resize=True, shrink=False)
+        paned.set_position(340)
+
+        hint = Gtk.Label(
+            label="Shows tabs that have stopped unexpectedly or produced error output. "
+                  "Select a row to see the full tail. Auto-refreshes every 5 s."
+        )
+        hint.set_halign(Gtk.Align.START)
+        hint.set_margin_start(8)
+        hint.set_margin_bottom(4)
+        hint.set_line_wrap(True)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        vbox.pack_start(bar, False, False, 0)
+        vbox.pack_start(hint, False, False, 0)
+        vbox.pack_start(paned, True, True, 0)
+        self.add(vbox)
+
+        # per-row raw tail cache for the detail panel
+        self._tail_cache: dict[str, str] = {}
+
+        self._timer_id: int | None = None
+        self.connect("destroy", self._on_destroy)
+        self._scan()
+        self._start_timer()
+
+    # ------------------------------------------------------------------
+    def _start_timer(self) -> None:
+        self._timer_id = GLib.timeout_add_seconds(self._POLL_SECONDS, self._timer_tick)
+
+    def _timer_tick(self) -> bool:
+        if not self.get_realized() or not self.get_visible():
+            return True
+        self._scan()
+        return True
+
+    def _on_destroy(self, *_) -> None:
+        if self._timer_id is not None:
+            try:
+                GLib.source_remove(self._timer_id)
+            except Exception:
+                pass
+            self._timer_id = None
+
+    # ------------------------------------------------------------------
+    def _scan(self) -> None:
+        backend = self.app_context.backend
+        sampler = self.app_context.sampler
+        records = self.app_context.store.list()
+
+        flagged: list[tuple] = []
+        for record in records:
+            flag_reason = self._check_record(record, backend, sampler)
+            if flag_reason is None:
+                continue
+            tail_raw = backend.capture(record, lines=self._CAPTURE_LINES)
+            last_line = ""
+            for ln in reversed(tail_raw.splitlines()):
+                if ln.strip():
+                    last_line = ln.strip()[:120]
+                    break
+            self._tail_cache[record.id] = tail_raw
+            from .health import health_badge, evaluate_health
+            from .models import ResourceSnapshot
+            pid = record.last_pid
+            snap = sampler.snapshot(pid) if pid else ResourceSnapshot(pid=pid, exists=False)
+            health = health_badge(evaluate_health(record, snap, self.app_context.budget))
+            flagged.append((
+                record.id,
+                record.name,
+                record.window_title,
+                record.status,
+                health,
+                flag_reason,
+                last_line,
+            ))
+
+        # preserve selection
+        sel_id: str | None = None
+        sel_model, sel_iter = self._tree.get_selection().get_selected()
+        if sel_iter:
+            sel_id = self._store.get_value(sel_iter, 0)
+
+        self._store.clear()
+        new_sel_iter = None
+        for row in flagged:
+            it = self._store.append(row)
+            if row[0] == sel_id:
+                new_sel_iter = it
+
+        if new_sel_iter:
+            self._tree.get_selection().select_iter(new_sel_iter)
+
+        ts = GLib.DateTime.new_now_local().format("%H:%M:%S")
+        self._status_label.set_text(
+            f"{len(flagged)} flagged tab(s) — last scan {ts}"
+        )
+
+    def _check_record(self, record, backend, sampler) -> str | None:
+        """Return a short reason string if the tab should be flagged, else None."""
+        status = record.status
+        if status in ("stopped", "missing"):
+            return f"status={status}"
+        # PID gone while still marked running
+        if status == "running" and record.last_pid:
+            pid = backend.pane_pid(record)
+            if pid is None:
+                return "PID gone (unexpected exit)"
+        # Scan output for error patterns
+        tail = backend.capture(record, lines=self._CAPTURE_LINES)
+        if tail and _ERROR_PATTERNS.search(tail):
+            return "error output: " + _classify_tail(tail)
+        return None
+
+    def _on_row_selected(self, tree_view) -> None:
+        model, it = tree_view.get_selection().get_selected()
+        if it is None:
+            return
+        session_id = model.get_value(it, 0)
+        tail = self._tail_cache.get(session_id, "")
+        self._detail_buf.set_text(tail)
 
 
 def run(db_path: str | Path | None = None, workspace_path: str | Path | None = None) -> int:

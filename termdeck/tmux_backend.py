@@ -549,6 +549,10 @@ class TmuxBackend:
 
     def send_text(self, record: SessionRecord, text: str, enter: bool = True) -> None:
         self.create_or_resume(record)
+        # Exit copy-mode / Codex transcript view before sending so keys reach
+        # the live composer rather than feeding the history cursor.
+        if self.scroll_view_active(record):
+            self.restore_live_session(record)
         if text:
             self._run(["send-keys", "-t", self.pane_target(record), "-l", text])
         if enter:
