@@ -1231,25 +1231,31 @@ class AttachTerminal(Gtk.Box):
         return True
 
     # ------------------------------------------------------------------ #
-    # Scroll-idle auto-resume                                              #
-    # After the user stops scrolling for SCROLL_IDLE_MS milliseconds,     #
-    # automatically exit tmux copy-mode and resume live streaming output. #
+    # Scroll-idle auto-resume  (DISABLED)                                 #
+    # Auto-resuming after scroll inactivity snaps the viewport back to    #
+    # the composer while the user is actively reading history — the       #
+    # inactivity timer is the root cause of the "pulled-down" bug.        #
+    # Reading mode now persists until the user explicitly returns:        #
+    #   • scrolls back down to the live edge                              #
+    #   • presses a key while VTE has focus                               #
+    #   • left-clicks the terminal surface (without creating a selection) #
     # ------------------------------------------------------------------ #
-    SCROLL_IDLE_MS: int = 2000
+    SCROLL_IDLE_MS: int = 2000  # retained for reference; timer is not armed
 
     def _arm_scroll_idle_resume(self) -> None:
-        """(Re)start the inactivity timer that returns to the live screen."""
-        self._remove_glib_source(self._scroll_idle_source_id)
-        self._scroll_idle_source_id = GLib.timeout_add(
-            self.SCROLL_IDLE_MS,
-            self._scroll_idle_resume,
-        )
+        """No-op: the auto-resume-on-idle timer is intentionally disabled.
+
+        Arming this timer caused the viewport to snap back to the live
+        terminal bottom whenever the user paused reading for two seconds,
+        interrupting any scroll session where focus remained in the composer
+        or the user simply stopped to read without typing.  The timer is
+        preserved as dead code so the method is safe to call from paths that
+        were not updated; it will never schedule a callback.
+        """
 
     def _scroll_idle_resume(self) -> bool:
-        """Timer callback: exit history view and resume streaming if idle."""
+        """Legacy timer callback — never scheduled; kept for safety."""
         self._scroll_idle_source_id = 0
-        if not self._detached:
-            self.prepare_for_live_input()
         return False
 
     def prepare_for_live_input(self) -> None:
