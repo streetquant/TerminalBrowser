@@ -40,6 +40,23 @@ class UiThemeTests(unittest.TestCase):
         self.assertNotEqual(resolve_chrome_tokens("dark").bg, resolve_chrome_tokens("system").bg)
         self.assertNotEqual(resolve_chrome_tokens("dark").bg, resolve_chrome_tokens("noir").bg)
 
+    def test_chrome_css_parses_with_gtk3(self):
+        try:
+            import gi
+
+            gi.require_version("Gtk", "3.0")
+            from gi.repository import Gtk
+        except (ImportError, ValueError) as exc:
+            self.skipTest(f"GTK3 bindings unavailable: {exc}")
+
+        for name in chrome_theme_names():
+            for density in density_names():
+                with self.subTest(theme=name, density=density):
+                    provider = Gtk.CssProvider()
+                    provider.load_from_data(
+                        build_chrome_css(name, density).encode("utf-8")
+                    )
+
     def test_chrome_css_uses_readable_font_sizes(self):
         css = build_chrome_css("dark", "comfortable")
         # Guard the readable base and title sizes while allowing smaller badges.

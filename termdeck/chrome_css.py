@@ -602,12 +602,12 @@ tooltip {{
 }}
 paned > separator {{
   background-color: {hairline};
+  background-image: none;
   min-width: 1px;
   min-height: 1px;
-  max-width: 1px;
   padding: 0;
+  margin: 0;
   border: none;
-  -gtk-icon-size: 0;
   transition: background-color 130ms ease-out;
 }}
 paned > separator:hover {{ background-color: {foc_ring}; }}
