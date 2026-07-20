@@ -196,13 +196,29 @@ class FirstRunWindowFlowTests(TestCase):
             TermDeckApplication.do_activate(app)
 
         reconcile.assert_called_once()
+        self.assertTrue(reconcile.call_args.kwargs["recover_missing"])
         prompt_for_new_window.assert_called_once_with(first_run=True)
         window_class.assert_not_called()
 
     def test_activation_restores_and_presents_every_visible_window_group(self) -> None:
+        agent_records = [
+            SimpleNamespace(
+                id=f"a{index}",
+                pinned=False,
+                last_opened_at=f"2026-07-17T23:00:{index:02d}+00:00",
+                tab_index=index,
+            )
+            for index in range(30)
+        ]
+        ops_record = SimpleNamespace(
+            id="b1",
+            pinned=False,
+            last_opened_at="2026-07-17T22:59:00+00:00",
+            tab_index=0,
+        )
         groups = [
-            ("win-a", "Agents", [SimpleNamespace(id="a1")]),
-            ("win-b", "Ops", [SimpleNamespace(id="b1")]),
+            ("win-a", "Agents", agent_records),
+            ("win-b", "Ops", [ops_record]),
         ]
         store = SimpleNamespace(windows_with_visible_sessions=lambda: groups)
         present_calls = []
@@ -218,7 +234,7 @@ class FirstRunWindowFlowTests(TestCase):
 
         with patch("termdeck.gtk_app.reconcile_store"), patch(
             "termdeck.gtk_app.TermDeckWindow", FakeWindow
-        ), patch("termdeck.gtk_app.bounded_startup_groups", side_effect=lambda rows: rows):
+        ):
             TermDeckApplication.do_activate(app)
 
         self.assertEqual(len(app.windows), 2)
@@ -226,6 +242,8 @@ class FirstRunWindowFlowTests(TestCase):
         self.assertEqual(app.windows[1].kwargs["window_id"], "win-b")
         self.assertEqual(app.windows[0].kwargs["window_title"], "Agents")
         self.assertEqual(app.windows[1].kwargs["window_title"], "Ops")
+        self.assertEqual(app.windows[0].kwargs["restore_records"], agent_records)
+        self.assertEqual(app.windows[1].kwargs["restore_records"], groups[1][2])
         self.assertEqual(len(present_calls), 1)
         self.assertEqual(present_calls[0], app.windows)
         app.prompt_for_new_window.assert_not_called()
@@ -239,6 +257,26 @@ class FirstRunWindowFlowTests(TestCase):
 
         self.assertEqual(first.calls, ["present"])
         self.assertEqual(second.calls, ["present"])
+
+    def test_shutdown_persistence_runs_once_and_reuses_the_result(self) -> None:
+        expected = object()
+        app = SimpleNamespace(
+            store=object(),
+            backend=object(),
+            _shutdown_persistence_started=False,
+            _last_persistence_result=None,
+        )
+
+        with patch(
+            "termdeck.gtk_app.persist_live_sessions",
+            return_value=expected,
+        ) as persist:
+            first = TermDeckApplication.persist_for_shutdown(app)
+            second = TermDeckApplication.persist_for_shutdown(app)
+
+        self.assertIs(first, expected)
+        self.assertIs(second, expected)
+        persist.assert_called_once_with(app.store, app.backend)
 
 
 if __name__ == "__main__":

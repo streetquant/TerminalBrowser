@@ -1,13 +1,187 @@
+import json
 import os
 import subprocess
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from termdeck.resources import ResourceSampler, format_bytes, process_tree
+from termdeck.resources import (
+    ResourceSampler,
+    _primary_codex_session_id,
+    format_bytes,
+    observe_recovery_command,
+    observe_recovery_metadata,
+    process_tree,
+    safe_codex_recovery_command,
+)
 
 
 class ResourceTests(unittest.TestCase):
+    def test_codex_recovery_command_preserves_only_restart_safe_flags(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        self.assertEqual(
+            safe_codex_recovery_command(["/usr/bin/codex", "--yolo", "--search"]),
+            "codex --yolo --search",
+        )
+        self.assertEqual(
+            safe_codex_recovery_command(
+                ["/usr/bin/codex", "--yolo", "--search"],
+                session_id=session_id,
+            ),
+            f"codex --yolo --search resume {session_id}",
+        )
+        self.assertEqual(
+            safe_codex_recovery_command(
+                ["/usr/bin/codex", "--yolo", "resume", session_id]
+            ),
+            f"codex --yolo resume {session_id}",
+        )
+        self.assertIsNone(safe_codex_recovery_command(["bash", "-lc", "codex --yolo"]))
+        self.assertIsNone(safe_codex_recovery_command(["codex", "fix this private prompt"]))
+        self.assertIsNone(safe_codex_recovery_command(["codex", "resume", "latest"]))
+        self.assertIsNone(
+            safe_codex_recovery_command(["codex", "--config", "api_key=secret"])
+        )
+
+    def test_primary_codex_session_id_excludes_subagent_rollouts(self):
+        primary_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        subagent_id = "019f72ee-6244-7322-b922-660fcdcc91e7"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proc = root / "proc"
+            fd_dir = proc / "123" / "fd"
+            fd_dir.mkdir(parents=True)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            primary = sessions / f"rollout-primary-{primary_id}.jsonl"
+            subagent = sessions / f"rollout-subagent-{subagent_id}.jsonl"
+            primary.write_text(
+                json.dumps(
+                    {
+                        "payload": {
+                            "id": primary_id,
+                            "cwd": "/workspace/project",
+                            "originator": "codex-tui",
+                            "source": "cli",
+                        }
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            subagent.write_text(
+                json.dumps(
+                    {
+                        "payload": {
+                            "id": subagent_id,
+                            "cwd": "/workspace/project",
+                            "originator": "codex-tui",
+                            "source": {
+                                "subagent": {
+                                    "thread_spawn": {"parent_thread_id": primary_id}
+                                }
+                            },
+                        }
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (fd_dir / "5").symlink_to(primary)
+            (fd_dir / "6").symlink_to(subagent)
+
+            with mock.patch("termdeck.resources._PROC", str(proc)), mock.patch(
+                "termdeck.resources._process_cwd",
+                return_value="/workspace/project",
+            ):
+                observed = _primary_codex_session_id(123)
+
+        self.assertEqual(observed, primary_id)
+
+    def test_recovery_observation_finds_codex_below_terminal_and_shell_wrappers(self):
+        argv_by_pid = {
+            100: ("/home/arch/.local/bin/kiro-cli-term",),
+            101: ("/usr/bin/bash",),
+            102: ("/usr/bin/codex", "--yolo"),
+            103: ("/usr/bin/rg", "needle"),
+        }
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        with mock.patch("termdeck.resources.process_tree", return_value=[100, 101, 102, 103]), mock.patch(
+            "termdeck.resources._process_argv",
+            side_effect=lambda pid: argv_by_pid[pid],
+        ), mock.patch(
+            "termdeck.resources._parse_stat",
+            return_value={"tty_nr": 86, "pgrp": 102, "tpgid": 102},
+        ), mock.patch(
+            "termdeck.resources._process_cwd",
+            return_value="/8tb/projects/example",
+        ), mock.patch(
+            "termdeck.resources._primary_codex_session_id",
+            side_effect=lambda pid: session_id if pid == 102 else None,
+        ):
+            observed, command, cwd = observe_recovery_metadata(100)
+
+        self.assertTrue(observed)
+        self.assertEqual(command, f"codex --yolo resume {session_id}")
+        self.assertEqual(cwd, "/8tb/projects/example")
+
+    def test_recovery_observation_prefers_native_exact_uuid_over_node_launcher(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        argv_by_pid = {
+            100: ("bash",),
+            101: ("/usr/bin/node", "/usr/bin/codex", "--yolo"),
+            102: ("/usr/bin/codex", "--yolo"),
+        }
+
+        def argv(pid):
+            if pid == 101:
+                return ("/usr/bin/codex", "--yolo")
+            return argv_by_pid[pid]
+
+        with mock.patch(
+            "termdeck.resources.process_tree",
+            return_value=[100, 101, 102],
+        ), mock.patch(
+            "termdeck.resources._process_argv",
+            side_effect=argv,
+        ), mock.patch(
+            "termdeck.resources._parse_stat",
+            return_value={"tty_nr": 86, "pgrp": 200, "tpgid": 200},
+        ), mock.patch(
+            "termdeck.resources._process_cwd",
+            return_value="/workspace/project",
+        ), mock.patch(
+            "termdeck.resources._primary_codex_session_id",
+            side_effect=lambda pid: session_id if pid == 102 else None,
+        ):
+            observed, command, cwd = observe_recovery_metadata(100)
+
+        self.assertTrue(observed)
+        self.assertEqual(command, f"codex --yolo resume {session_id}")
+        self.assertEqual(cwd, "/workspace/project")
+
+    def test_recovery_observation_distinguishes_idle_shell_from_unreadable_tree(self):
+        with mock.patch("termdeck.resources.process_tree", return_value=[100, 101]), mock.patch(
+            "termdeck.resources._process_argv",
+            side_effect=[("kiro-cli-term",), ("bash",)],
+        ):
+            self.assertEqual(observe_recovery_command(100), (True, None))
+
+        with mock.patch("termdeck.resources.process_tree", return_value=[]):
+            self.assertEqual(observe_recovery_command(100), (False, None))
+
+    def test_background_codex_is_not_marked_for_foreground_replay(self):
+        with mock.patch("termdeck.resources.process_tree", return_value=[100, 101]), mock.patch(
+            "termdeck.resources._process_argv",
+            side_effect=[("bash",), ("codex", "--yolo")],
+        ), mock.patch(
+            "termdeck.resources._parse_stat",
+            return_value={"tty_nr": 86, "pgrp": 101, "tpgid": 100},
+        ):
+            self.assertEqual(observe_recovery_command(100), (True, None))
+
     def test_current_process_snapshot(self):
         sampler = ResourceSampler()
         first = sampler.snapshot(os.getpid())

@@ -50,6 +50,8 @@ class SessionRecord:
     pinned: bool = False
     pane_target: str | None = None
     external: bool = False
+    recovery_command: str | None = None
+    recovery_cwd: str | None = None
 
 
 @dataclass(frozen=True)

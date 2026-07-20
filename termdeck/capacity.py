@@ -5,13 +5,10 @@ from collections.abc import Iterable
 from .models import SessionRecord
 
 
-# These are control-plane limits, not limits on running tmux sessions. Background
-# sessions stay alive; the GTK process only materialises a bounded working set.
+# Explicit callers may still request a bounded attachment plan. The GUI startup
+# path deliberately does not use these limits: it restores every visible tab.
 STARTUP_TABS_PER_WINDOW = 12
 STARTUP_TERMINAL_LIMIT = 24
-# Seed at most one remembered window per materialised terminal before filling
-# extra tabs. Keeping this equal to the global terminal budget avoids a second,
-# surprising four-window ceiling while retaining a bounded GTK/VTE working set.
 STARTUP_WINDOW_LIMIT = STARTUP_TERMINAL_LIMIT
 UI_RESOURCE_REFRESH_BUDGET = 128
 SIDE_PANE_ROW_LIMIT = 100
@@ -67,7 +64,7 @@ def bounded_startup_groups(
     remembered window remains in the result, including windows that receive no
     initial attachment. Within the global attachment budget, reserve one slot
     per window before filling extra tabs so a large window cannot starve a
-    smaller one such as the user's Kaggle window.
+    smaller one.
     """
 
     clean_window_limit = max(1, int(window_limit))
@@ -95,9 +92,6 @@ def bounded_startup_groups(
     attachable = ranked_candidates[:clean_window_limit]
     selected: dict[int, list[SessionRecord]] = {index: [] for index, *_rest in ranked_candidates}
 
-    # First make every prioritized window real. Previously, early large windows
-    # exhausted the global terminal budget and prevented later windows from
-    # being recreated at all.
     for index, _window_id, _window_title, ranked in attachable:
         if remaining <= 0:
             break

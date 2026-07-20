@@ -189,6 +189,65 @@ class SessionReconcileTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_startup_recovery_preserves_every_internal_tab_for_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                visible = store.create(
+                    "codex",
+                    "ai",
+                    "codex --yolo",
+                    tmp,
+                    window_id="agents",
+                    window_title="Agents",
+                    tab_index=3,
+                )
+                hidden = store.create(
+                    "shell",
+                    "dev",
+                    "bash",
+                    tmp,
+                    window_id="agents",
+                    window_title="Agents",
+                    tab_index=4,
+                    visible=False,
+                )
+                stopped = store.create("stopped", "dev", "bash", tmp)
+                external = store.create("adopted", "dev", "bash", tmp)
+                store.update(visible.id, status="running", last_pid=101)
+                store.update(hidden.id, status="paused", last_pid=202)
+                store.update(stopped.id, status="stopped", visible=False, last_pid=None)
+                store.update(external.id, status="running", external=True, last_pid=303)
+
+                result = reconcile_store(
+                    store,
+                    backend=FakeBackend({}),
+                    sampler=FakeSampler({}),
+                    recover_missing=True,
+                )
+
+                recovered_visible = store.get(visible.id)
+                recovered_hidden = store.get(hidden.id)
+                preserved_stopped = store.get(stopped.id)
+                unavailable_external = store.get(external.id)
+                self.assertEqual(recovered_visible.status, "recovery-pending")  # type: ignore[union-attr]
+                self.assertTrue(recovered_visible.visible)  # type: ignore[union-attr]
+                self.assertIsNone(recovered_visible.last_pid)  # type: ignore[union-attr]
+                self.assertEqual(recovered_visible.window_id, "agents")  # type: ignore[union-attr]
+                self.assertEqual(recovered_visible.window_title, "Agents")  # type: ignore[union-attr]
+                self.assertEqual(recovered_visible.tab_index, 3)  # type: ignore[union-attr]
+                self.assertEqual(recovered_visible.command, "codex --yolo")  # type: ignore[union-attr]
+                self.assertEqual(recovered_visible.cwd, tmp)  # type: ignore[union-attr]
+                self.assertEqual(recovered_hidden.status, "recovery-pending")  # type: ignore[union-attr]
+                self.assertFalse(recovered_hidden.visible)  # type: ignore[union-attr]
+                self.assertEqual(preserved_stopped.status, "stopped")  # type: ignore[union-attr]
+                self.assertFalse(preserved_stopped.visible)  # type: ignore[union-attr]
+                self.assertEqual(unavailable_external.status, "stopped")  # type: ignore[union-attr]
+                self.assertFalse(unavailable_external.visible)  # type: ignore[union-attr]
+                self.assertEqual(result.changed, 3)
+            finally:
+                store.close()
+
     def test_live_paused_process_repairs_status_without_hiding(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")

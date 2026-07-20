@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
+import shlex
 import time
+import uuid
 from collections import defaultdict, deque
+from pathlib import Path
+from typing import Sequence
 
 from .models import ResourceSnapshot
 
@@ -16,6 +21,23 @@ _CHILDREN_CACHE_TTL = 0.75
 _children_cache: tuple[float, dict[int, list[int]]] | None = None
 _children_file_supported: bool | None = None
 
+# Automatic crash replay must stay narrower than ordinary user-entered shell
+# commands. These flags do not carry prompts, paths, config values, tokens, or
+# other user data. Value-bearing options and positional arguments are rejected
+# as a whole rather than partially replayed with changed semantics.
+_CODEX_RESTART_FLAGS = frozenset(
+    {
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "--full-auto",
+        "--no-alt-screen",
+        "--oss",
+        "--search",
+        "--strict-config",
+        "--yolo",
+    }
+)
+
 
 def _read_text(path: str) -> str | None:
     try:
@@ -23,6 +45,194 @@ def _read_text(path: str) -> str | None:
             return handle.read()
     except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
         return None
+
+
+def _process_argv(pid: int) -> tuple[str, ...] | None:
+    """Read one bounded argv vector from proc without consulting shell text."""
+
+    try:
+        with open(f"{_PROC}/{pid}/cmdline", "rb") as handle:
+            data = handle.read(65537)
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+    if not data or len(data) > 65536:
+        return None
+    return tuple(
+        part.decode("utf-8", errors="replace")
+        for part in data.rstrip(b"\0").split(b"\0")
+        if part
+    )
+
+
+def _process_cwd(pid: int) -> str | None:
+    """Read one process cwd while it is still live and resolvable."""
+
+    try:
+        directory = Path(os.readlink(f"{_PROC}/{pid}/cwd"))
+        if not directory.is_absolute() or not directory.is_dir():
+            return None
+        return str(directory.resolve())
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+
+
+def _canonical_codex_session_id(value: object) -> str | None:
+    """Return one canonical UUID, rejecting names and malformed identifiers."""
+
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _primary_codex_session_id(pid: int) -> str | None:
+    """Find the primary Codex TUI session UUID held open by one process.
+
+    A Codex process can own rollout files for its primary conversation and for
+    several spawned subagents. The primary rollout metadata uses ``source``
+    ``"cli"``; subagent metadata uses a structured source object. Reading only
+    the bounded first JSONL record avoids inspecting prompts or transcript data.
+    """
+
+    proc_cwd = _process_cwd(pid)
+    candidates: list[tuple[int, int, str]] = []
+    try:
+        fd_names = os.listdir(f"{_PROC}/{pid}/fd")
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+
+    for fd_name in fd_names:
+        try:
+            target = os.readlink(f"{_PROC}/{pid}/fd/{fd_name}")
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+            continue
+        if "/sessions/" not in target or not target.endswith(".jsonl"):
+            continue
+        try:
+            with open(target, "r", encoding="utf-8", errors="replace") as handle:
+                first_line = handle.readline(65537)
+            if not first_line or len(first_line) > 65536:
+                continue
+            payload = json.loads(first_line).get("payload", {})
+            if not isinstance(payload, dict) or payload.get("source") != "cli":
+                continue
+            session_id = _canonical_codex_session_id(payload.get("id"))
+            if session_id is None:
+                continue
+            metadata_cwd = payload.get("cwd")
+            rank = 0 if proc_cwd and metadata_cwd == proc_cwd else 1
+            try:
+                modified_ns = os.stat(target).st_mtime_ns
+            except OSError:
+                modified_ns = 0
+            candidates.append((rank, -modified_ns, session_id))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+
+    if not candidates:
+        return None
+    candidates.sort()
+    best_rank = candidates[0][0]
+    best = [row for row in candidates if row[0] == best_rank]
+    # The newest primary rollout is deterministic if a process briefly retains
+    # more than one primary descriptor during a resume transition.
+    return best[0][2]
+
+
+def safe_codex_recovery_command(
+    argv: Sequence[str],
+    *,
+    session_id: str | None = None,
+) -> str | None:
+    """Return a canonical restart-safe Codex command, or reject the argv.
+
+    Only value-free launch flags and one exact UUID are persisted. Positional
+    prompts, names, config overrides, paths, remote addresses, and unknown
+    options are rejected rather than replayed with changed or unsafe semantics.
+    """
+
+    if not argv or Path(str(argv[0])).name.casefold() != "codex":
+        return None
+    args = [str(part) for part in argv[1:]]
+    resume_id: str | None = None
+    if "resume" in args:
+        resume_index = args.index("resume")
+        launch_flags = args[:resume_index]
+        resume_args = args[resume_index + 1 :]
+        if len(resume_args) != 1:
+            return None
+        resume_id = _canonical_codex_session_id(resume_args[0])
+        if resume_id is None:
+            return None
+    else:
+        launch_flags = args
+
+    if any(part not in _CODEX_RESTART_FLAGS for part in launch_flags):
+        return None
+
+    observed_id = _canonical_codex_session_id(session_id) if session_id else None
+    if resume_id and observed_id and resume_id != observed_id:
+        return None
+    exact_id = resume_id or observed_id
+    command = ["codex", *launch_flags]
+    if exact_id:
+        command.extend(["resume", exact_id])
+    return shlex.join(command)
+
+
+def observe_recovery_metadata(
+    root_pid: int,
+) -> tuple[bool, str | None, str | None]:
+    """Observe a safe resumable command and its cwd below a managed pane.
+
+    The boolean distinguishes an idle, readable process tree from a vanished
+    or unreadable one. Callers may clear a stale snapshot only for the former.
+    Walking descendants handles terminal wrappers whose tmux pane process is
+    not the shell or foreground TUI itself.
+    """
+
+    pids = process_tree(root_pid)
+    if not pids:
+        return False, None, None
+    observed = False
+    weaker_codex: tuple[str, str | None] | None = None
+    for pid in pids:
+        argv = _process_argv(pid)
+        if argv is None:
+            continue
+        observed = True
+        session_id = _primary_codex_session_id(pid)
+        command = safe_codex_recovery_command(argv, session_id=session_id)
+        if command is not None:
+            stat = _parse_stat(pid)
+            if not stat:
+                continue
+            # The native Codex process can be a child of its Node launcher but
+            # shares that launcher's foreground process group. Requiring the
+            # candidate's group to own its TTY excludes background agents.
+            if int(stat.get("tty_nr", 0)) == 0 or int(
+                stat.get("pgrp", -1)
+            ) != int(stat.get("tpgid", -2)):
+                continue
+            cwd = _process_cwd(pid)
+            if session_id is not None:
+                return True, command, cwd
+            # Node and containment launchers can be visited before the native
+            # Codex process that owns the rollout file. Retain the weaker
+            # observation only as a fallback after every foreground candidate
+            # has been inspected.
+            if weaker_codex is None:
+                weaker_codex = (command, cwd)
+    if weaker_codex is not None:
+        return True, weaker_codex[0], weaker_codex[1]
+    return observed, None, None
+
+
+def observe_recovery_command(root_pid: int) -> tuple[bool, str | None]:
+    """Compatibility wrapper returning only the observed recovery command."""
+
+    observed, command, _cwd = observe_recovery_metadata(root_pid)
+    return observed, command
 
 
 def _parse_stat(pid: int) -> dict[str, int | str] | None:
@@ -40,6 +250,8 @@ def _parse_stat(pid: int) -> dict[str, int | str] | None:
             "state": rest[0],
             "ppid": int(rest[1]),
             "pgrp": int(rest[2]),
+            "tty_nr": int(rest[4]),
+            "tpgid": int(rest[5]),
             "utime": int(rest[11]),
             "stime": int(rest[12]),
             "starttime": int(rest[19]),

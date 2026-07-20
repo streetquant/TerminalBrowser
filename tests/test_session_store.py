@@ -34,6 +34,71 @@ class SessionStoreTests(unittest.TestCase):
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0].id, record.id)
                 self.assertEqual(store.tags(), ["dev"])
+                self.assertIsNone(rows[0].recovery_command)
+                self.assertIsNone(rows[0].recovery_cwd)
+            finally:
+                store.close()
+
+    def test_recovery_metadata_updates_are_batched_without_reordering_tabs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                first = store.create("first", "terminal", "/bin/bash", tmp)
+                second = store.create("second", "terminal", "/bin/bash", tmp)
+                second = store.update(
+                    second.id,
+                    recovery_command="codex --search",
+                    recovery_cwd=str(Path(tmp) / "old"),
+                    last_opened_at=second.last_opened_at,
+                )
+                first_opened_at = first.last_opened_at
+                second_opened_at = second.last_opened_at
+
+                recovery_cwd = str(Path(tmp) / "repo")
+                count = store.update_recovery_metadata(
+                    [
+                        (first.id, "codex --yolo", recovery_cwd),
+                        (second.id, None, str(Path(tmp) / "ignored")),
+                    ]
+                )
+
+                self.assertEqual(count, 2)
+                self.assertEqual(store.get(first.id).recovery_command, "codex --yolo")  # type: ignore[union-attr]
+                self.assertEqual(store.get(first.id).recovery_cwd, recovery_cwd)  # type: ignore[union-attr]
+                self.assertIsNone(store.get(second.id).recovery_command)  # type: ignore[union-attr]
+                self.assertIsNone(store.get(second.id).recovery_cwd)  # type: ignore[union-attr]
+                self.assertEqual(store.get(first.id).last_opened_at, first_opened_at)  # type: ignore[union-attr]
+                self.assertEqual(store.get(second.id).last_opened_at, second_opened_at)  # type: ignore[union-attr]
+            finally:
+                store.close()
+
+    def test_exact_codex_uuid_is_not_downgraded_by_launcher_only_observation(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        exact = f"codex --yolo resume {session_id}"
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                record = store.create("agent", "ai", "/bin/bash", tmp)
+                store.update(
+                    record.id,
+                    recovery_command=exact,
+                    recovery_cwd=str(Path(tmp) / "exact"),
+                )
+
+                weaker_count = store.update_recovery_metadata(
+                    [(record.id, "codex --yolo", str(Path(tmp) / "weaker"))]
+                )
+                preserved = store.get(record.id)
+
+                self.assertEqual(weaker_count, 0)
+                self.assertEqual(preserved.recovery_command, exact)  # type: ignore[union-attr]
+                self.assertEqual(preserved.recovery_cwd, str(Path(tmp) / "exact"))  # type: ignore[union-attr]
+
+                clear_count = store.update_recovery_metadata([(record.id, None, None)])
+                cleared = store.get(record.id)
+                self.assertEqual(clear_count, 1)
+                self.assertIsNone(cleared.recovery_command)  # type: ignore[union-attr]
+                self.assertIsNone(cleared.recovery_cwd)  # type: ignore[union-attr]
             finally:
                 store.close()
 
@@ -139,6 +204,8 @@ class SessionStoreTests(unittest.TestCase):
                 self.assertEqual(record.window_title, "Main")  # type: ignore[union-attr]
                 self.assertEqual(record.tab_index, 0)  # type: ignore[union-attr]
                 self.assertTrue(record.visible)  # type: ignore[union-attr]
+                self.assertIsNone(record.recovery_command)  # type: ignore[union-attr]
+                self.assertIsNone(record.recovery_cwd)  # type: ignore[union-attr]
             finally:
                 store.close()
 

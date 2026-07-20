@@ -28,13 +28,13 @@ from .capacity import (
     SIDE_PANE_ROW_LIMIT,
     UI_RESOURCE_REFRESH_BUDGET,
     bounded_registry_records,
-    bounded_startup_groups,
 )
 from .command_palette import PaletteItem, build_palette_items, search_palette
 from .control_plan import ControlPlan, build_control_plan, render_control_plan_text
 from .health import HealthPolicy, classify_session, health_badge, should_pause_for_attention
 from .master_tasks import filter_rows
 from .models import SessionRecord, TerminalTheme
+from .persistence import PersistenceResult, persist_live_sessions
 from .redaction import redact_text
 from .resources import ResourceSampler
 from .session_lifecycle import archive_records, hide_records, move_records, pin_records, recently_closed_records, rename_record, reopen_closed_records, unpin_records
@@ -47,7 +47,7 @@ from .task_snapshot import build_task_snapshot
 from .command_render import default_shell, directory_tab_name, normalise_directory, render_command
 from .window_snapshot import build_window_snapshots
 from .terminator_config import load_terminator_theme
-from .tmux_backend import TmuxBackend
+from .tmux_backend import TmuxBackend, TmuxError
 from .ui_theme import (
     apply_terminal_palette,
     build_chrome_css,
@@ -3855,13 +3855,22 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     def refresh_tab_directories(self) -> int:
         records = [tab.record for tab in self.tabs.values()]
         resolve_many = getattr(self.app_context.backend, "current_directories", None)
-        if not records or not callable(resolve_many):
+        observe_recovery = getattr(self.app_context.backend, "recovery_metadata", None)
+        if not records or (not callable(resolve_many) and not callable(observe_recovery)):
             return 0
-        try:
-            live_by_id = resolve_many(records)
-        except Exception:
-            return 0
-        changed = 0
+        live_by_id: dict[str, str | None] = {}
+        if callable(resolve_many):
+            try:
+                live_by_id = dict(resolve_many(records))
+            except Exception:
+                live_by_id = {}
+        recovery_by_id: dict[str, tuple[str | None, str | None]] = {}
+        if callable(observe_recovery):
+            try:
+                recovery_by_id = dict(observe_recovery(records))
+            except Exception:
+                recovery_by_id = {}
+        changed_ids: set[str] = set()
         for session_id, tab in list(self.tabs.items()):
             live_directory = live_by_id.get(session_id)
             if not live_directory:
@@ -3879,12 +3888,37 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             except KeyError:
                 continue
             self.refresh_tab_label(updated)
-            changed += 1
-        if changed:
+            changed_ids.add(session_id)
+        recovery_updates = []
+        for session_id, (command, recovery_cwd) in recovery_by_id.items():
+            tab = self.tabs.get(session_id)
+            if tab is None:
+                continue
+            record = self.app_context.store.get(session_id) or tab.record
+            if (
+                getattr(record, "recovery_command", None) == command
+                and getattr(record, "recovery_cwd", None) == recovery_cwd
+            ):
+                continue
+            recovery_updates.append((session_id, command, recovery_cwd))
+        if recovery_updates:
+            try:
+                self.app_context.store.update_recovery_metadata(recovery_updates)
+            except Exception:
+                recovery_updates = []
+            else:
+                changed_ids.update(
+                    session_id for session_id, _command, _cwd in recovery_updates
+                )
+                for session_id, _command, _cwd in recovery_updates:
+                    updated = self.app_context.store.get(session_id)
+                    if updated is not None:
+                        self.refresh_tab_label(updated)
+        if changed_ids:
             self.side.refresh()
             if self.master_window is not None and self.master_window.get_visible():
                 self.master_window.refresh()
-        return changed
+        return len(changed_ids)
 
     def _refresh_tab_directories_timer(self) -> bool:
         if not getattr(self, "_tab_directory_refresh_alive", False):
@@ -4142,7 +4176,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
 
     def restore_previous_tabs(self, records: list[SessionRecord] | None = None) -> int:
-        """Reattach remembered tabs for this window without restarting missing processes."""
+        """Reattach live tabs and relaunch remembered crash-recovery tabs."""
         restored = 0
         restore_records = sorted(records, key=lambda row: row.tab_index) if records is not None else self.app_context.store.restore_candidates(
             limit=12,
@@ -4172,15 +4206,27 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             if record.id in self.tabs:
                 continue
             before = len(self.tabs)
-            self.open_session(
-                record,
-                restart_missing=False,
-                remember_layout=remember_layout,
-                known_live=live_by_id.get(record.id) if live_by_id is not None else None,
-                known_pid=pids_by_id.get(record.id),
-                known_pid_resolved=pids_resolved,
-                refresh_side=False,
-            )
+            try:
+                self.open_session(
+                    record,
+                    restart_missing=True,
+                    remember_layout=remember_layout,
+                    known_live=live_by_id.get(record.id) if live_by_id is not None else None,
+                    known_pid=pids_by_id.get(record.id),
+                    known_pid_resolved=pids_resolved,
+                    refresh_side=False,
+                )
+            except (OSError, TmuxError):
+                # One unavailable command/socket must not abort construction of
+                # the window or hide the rest of its remembered tabs. Keep the
+                # failed row visible so a later Restore/startup can retry it.
+                self.app_context.store.update(
+                    record.id,
+                    status="start-error",
+                    last_pid=None,
+                    visible=bool(getattr(record, "visible", True)),
+                )
+                continue
             if len(self.tabs) > before:
                 restored += 1
         self.side.refresh()
@@ -4223,7 +4269,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             return "paused" if snap.state == "T" else "running"
         if record.status == "paused":
             return "paused"
-        return record.status if record.status in {"new", "stopped"} else "stopped"
+        return record.status if record.status in {"new", "recovery-pending", "stopped"} else "stopped"
 
     def toggle_pause_by_index(self, one_based: int) -> None:
         records = self.app_context.store.list()
@@ -5005,6 +5051,8 @@ class TermDeckApplication(Gtk.Application):
         self.workspace_path = Path(workspace_path).expanduser() if workspace_path else None
         self.windows: list[TermDeckWindow] = []
         self._chrome_css = ""
+        self._shutdown_persistence_started = False
+        self._last_persistence_result: PersistenceResult | None = None
 
     def do_startup(self) -> None:
         Gtk.Application.do_startup(self)
@@ -5017,6 +5065,25 @@ class TermDeckApplication(Gtk.Application):
                 ui_font=self.settings.ui_font,
                 ui_font_scale=self.settings.ui_font_scale,
             )
+
+    def persist_for_shutdown(self) -> PersistenceResult | None:
+        """Persist exact recoverable state once before the application exits."""
+
+        if self._shutdown_persistence_started:
+            return self._last_persistence_result
+        self._shutdown_persistence_started = True
+        self._last_persistence_result = persist_live_sessions(self.store, self.backend)
+        return self._last_persistence_result
+
+    def do_shutdown(self) -> None:
+        try:
+            self.persist_for_shutdown()
+        except Exception:
+            # Persistence failures are reported by the explicit CLI/service path;
+            # never trap the desktop application in a failed shutdown sequence.
+            pass
+        finally:
+            Gtk.Application.do_shutdown(self)
 
     def rebuild_theme(self) -> TerminalTheme:
         theme = load_terminator_theme()
@@ -5238,7 +5305,14 @@ class TermDeckApplication(Gtk.Application):
             return 0
         for record in unique.values():
             self.backend.terminate(record)
-            self.store.update(record.id, status="stopped", visible=False, last_pid=None)
+            self.store.update(
+                record.id,
+                status="stopped",
+                visible=False,
+                last_pid=None,
+                recovery_command=None,
+                recovery_cwd=None,
+            )
         self.close_session_tabs(set(unique))
         return len(unique)
 
@@ -5443,6 +5517,7 @@ class TermDeckApplication(Gtk.Application):
             backend=self.backend,
             sampler=self.sampler,
             hide_missing=True,
+            recover_missing=True,
             resource_sample_limit=UI_RESOURCE_REFRESH_BUDGET,
         )
 
@@ -5467,7 +5542,7 @@ class TermDeckApplication(Gtk.Application):
                 return
 
         if not self.windows:
-            groups = bounded_startup_groups(self.store.windows_with_visible_sessions())
+            groups = self.store.windows_with_visible_sessions()
             if groups:
                 for window_id, window_title, records in groups:
                     win = TermDeckWindow(

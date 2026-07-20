@@ -5,7 +5,7 @@ import json
 import pathlib
 import unittest
 
-from termdeck.cli import _select_records, build_parser, cmd_activity, cmd_archive, cmd_budget_plan, cmd_capture, cmd_control_plan, cmd_diagnostics, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_reconcile, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
+from termdeck.cli import _select_records, build_parser, cmd_activity, cmd_archive, cmd_budget_plan, cmd_capture, cmd_checkpoint, cmd_control_plan, cmd_diagnostics, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_reconcile, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
 
 
 class CliTests(unittest.TestCase):
@@ -14,7 +14,7 @@ class CliTests(unittest.TestCase):
         subparsers = [action for action in parser._actions if isinstance(action, argparse._SubParsersAction)]
         self.assertEqual(len(subparsers), 1)
         choices = sorted(subparsers[0].choices)
-        self.assertEqual(choices, ['activity', 'adopt-tmux', 'archive', 'budget-plan', 'capture', 'control-plan', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-desktop', 'kill', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'quickstart', 'recently-closed', 'reconcile', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'terminator-workspace', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
+        self.assertEqual(choices, ['activity', 'adopt-tmux', 'archive', 'budget-plan', 'capture', 'checkpoint', 'control-plan', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-checkpoint-service', 'install-desktop', 'kill', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'quickstart', 'recently-closed', 'reconcile', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'terminator-workspace', 'uninstall-checkpoint-service', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
 
 
     def test_shortcuts_command_outputs_json_with_terminator_override(self):

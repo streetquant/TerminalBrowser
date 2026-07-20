@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from termdeck.activity import (
@@ -46,6 +47,16 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(classify_activity(record, "WARNING deprecated option\n").state, "warning")
         self.assertIn(classify_activity(record, "12 tests passed in 1.2s\n").state, {"success", "ready"})
         self.assertEqual(classify_activity(record, "\n\n").state, "not started")
+
+    def test_empty_recovery_pending_capture_surfaces_exact_restore_blocker(self):
+        record = replace(
+            self._record("worker", "python worker.py"),
+            status="recovery-pending",
+        )
+        item = classify_activity(record, "\n")
+        self.assertEqual(item.state, "recovery pending")
+        self.assertEqual(item.level, "red")
+        self.assertEqual(item.suggested_action, "inspect checkpoint status")
 
     def test_redacts_secret_like_capture_in_preview(self):
         record = self._record("api", "python server.py")

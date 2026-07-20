@@ -116,6 +116,7 @@ def _desired_state(
     pid: int | None,
     snapshot: ResourceSnapshot,
     hide_missing: bool,
+    recover_missing: bool,
 ) -> tuple[str, bool, int | None, str]:
     before = record.status.casefold()
     visible = bool(record.visible)
@@ -138,8 +139,21 @@ def _desired_state(
     if before == "new":
         return "new", visible, None, "not started yet"
 
+    if before == "recovery-pending":
+        return "recovery-pending", visible, None, "exact recovery is still pending"
+
     if before == "stopped":
         return "stopped", visible, None, "already stopped"
+
+    if (
+        recover_missing
+        and not getattr(record, "external", False)
+        and before in {"running", "paused", "missing", "remembered", "start-error"}
+    ):
+        # A host crash removes tmux along with its child processes. Preserve a
+        # distinct recovery state so startup cannot confuse a lost process with
+        # a deliberately new tab and silently replay its launch command.
+        return "recovery-pending", visible, None, "missing managed session requires exact recovery"
 
     # Browser-like recovery rule: if a remembered running/paused tab has lost
     # its hidden backend session, do not leave it looking restorable.
@@ -155,14 +169,17 @@ def reconcile_records(
     sampler: SamplerLike | None = None,
     dry_run: bool = False,
     hide_missing: bool = True,
+    recover_missing: bool = False,
     resource_sample_limit: int | None = None,
 ) -> ReconcileResult:
     """Repair stale remembered session state against the hidden backend.
 
     TermDeck's browser registry may survive longer than the actual tmux/process
     tree.  This function reconciles the registry with the live backend before a
-    restore or when the user asks for a CLI health repair. It never starts new
-    processes and it never exposes backend commands.
+    restore or when the user asks for a CLI health repair. When
+    ``recover_missing`` is enabled, missing managed sessions become restartable
+    ``new`` records without changing their visibility or layout. This function
+    never starts new processes and it never exposes backend commands.
     """
 
     backend = backend or TmuxBackend()
@@ -232,6 +249,7 @@ def reconcile_records(
             pid=pid,
             snapshot=snapshot,
             hide_missing=hide_missing,
+            recover_missing=recover_missing,
         )
         changed = (
             after_status != record.status
@@ -290,6 +308,7 @@ def reconcile_store(
     sampler: SamplerLike | None = None,
     dry_run: bool = False,
     hide_missing: bool = True,
+    recover_missing: bool = False,
     include_archived: bool = False,
     tag: str | None = None,
     resource_sample_limit: int | None = None,
@@ -304,5 +323,6 @@ def reconcile_store(
         sampler=sampler,
         dry_run=dry_run,
         hide_missing=hide_missing,
+        recover_missing=recover_missing,
         resource_sample_limit=resource_sample_limit,
     )

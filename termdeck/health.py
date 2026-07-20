@@ -102,6 +102,15 @@ def evaluate_health(
                 reason="no live process has been observed",
                 suggested_action="open session",
             )
+        if status == "recovery-pending":
+            return SessionHealth(
+                label="recovery pending",
+                severity=3,
+                level="red",
+                hint="the previous process requires an exact Codex UUID or checkpoint",
+                reason="exact process recovery has not completed",
+                suggested_action="inspect checkpoint status",
+            )
         return SessionHealth(
             label="missing",
             severity=3,

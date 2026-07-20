@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import sqlite3
 import uuid
 from collections.abc import Iterable
@@ -15,6 +16,20 @@ APP_DIR = Path.home() / ".local" / "share" / "termdeck"
 DEFAULT_DB_PATH = APP_DIR / "sessions.sqlite3"
 
 _SAFE = re.compile(r"[^a-zA-Z0-9_]+")
+
+
+def _has_exact_codex_resume(command: str | None) -> bool:
+    if not command:
+        return False
+    try:
+        parts = shlex.split(command)
+        index = parts.index("resume")
+        if Path(parts[0]).name.casefold() != "codex" or index + 2 != len(parts):
+            return False
+        uuid.UUID(parts[index + 1])
+    except (ValueError, IndexError):
+        return False
+    return True
 
 
 def utc_now() -> str:
@@ -85,7 +100,9 @@ class SessionStore:
                 visible INTEGER NOT NULL DEFAULT 1,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 pane_target TEXT,
-                external INTEGER NOT NULL DEFAULT 0
+                external INTEGER NOT NULL DEFAULT 0,
+                recovery_command TEXT,
+                recovery_cwd TEXT
             )
             """
         )
@@ -96,6 +113,8 @@ class SessionStore:
         self._ensure_column("pinned", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("pane_target", "TEXT")
         self._ensure_column("external", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("recovery_command", "TEXT")
+        self._ensure_column("recovery_cwd", "TEXT")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_tag ON sessions(tag)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_window ON sessions(window_id, tab_index)")
@@ -146,6 +165,8 @@ class SessionStore:
             pinned=bool(pinned),
             pane_target=None,
             external=False,
+            recovery_command=None,
+            recovery_cwd=None,
         )
         self.upsert(record)
         return record
@@ -159,11 +180,13 @@ class SessionStore:
             """
             INSERT INTO sessions (
                 id, name, tag, command, cwd, tmux_name, created_at, last_opened_at,
-                status, last_pid, window_id, window_title, tab_index, visible, pane_target, external, pinned
+                status, last_pid, window_id, window_title, tab_index, visible, pane_target, external, pinned,
+                recovery_command, recovery_cwd
             )
             VALUES (
                 :id, :name, :tag, :command, :cwd, :tmux_name, :created_at, :last_opened_at,
-                :status, :last_pid, :window_id, :window_title, :tab_index, :visible, :pane_target, :external, :pinned
+                :status, :last_pid, :window_id, :window_title, :tab_index, :visible, :pane_target, :external, :pinned,
+                :recovery_command, :recovery_cwd
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -180,7 +203,9 @@ class SessionStore:
                 visible = excluded.visible,
                 pinned = excluded.pinned,
                 pane_target = excluded.pane_target,
-                external = excluded.external
+                external = excluded.external,
+                recovery_command = excluded.recovery_command,
+                recovery_cwd = excluded.recovery_cwd
             """,
             payload,
         )
@@ -229,6 +254,68 @@ class SessionStore:
         )
         self.conn.commit()
         return len(rows)
+
+    def update_recovery_commands(
+        self,
+        updates: Iterable[tuple[str, str | None]],
+    ) -> int:
+        """Compatibility helper for callers without recovery cwd metadata."""
+
+        return self.update_recovery_metadata(
+            (session_id, command, None) for session_id, command in updates
+        )
+
+    def update_recovery_metadata(
+        self,
+        updates: Iterable[tuple[str, str | None, str | None]],
+    ) -> int:
+        """Persist changed crash-relaunch commands and cwd values atomically."""
+
+        requested = [
+            (session_id, command, cwd if command else None)
+            for session_id, command, cwd in updates
+        ]
+        if not requested:
+            return 0
+        identifiers = [session_id for session_id, _command, _cwd in requested]
+        placeholders = ",".join("?" for _ in identifiers)
+        existing = {
+            str(row["id"]): (row["recovery_command"], row["recovery_cwd"])
+            for row in self.conn.execute(
+                f"SELECT id, recovery_command, recovery_cwd FROM sessions WHERE id IN ({placeholders})",
+                identifiers,
+            ).fetchall()
+        }
+        rows = []
+        for session_id, command, cwd in requested:
+            previous_command, previous_cwd = existing.get(session_id, (None, None))
+            if (
+                _has_exact_codex_resume(previous_command)
+                and command is not None
+                and not _has_exact_codex_resume(command)
+            ):
+                # A launcher-only observation is weaker than the exact UUID
+                # already persisted. Preserve the exact command until a new
+                # exact UUID is observed or the process tree proves Codex ended
+                # by reporting command=None.
+                rows.append((session_id, previous_command, previous_cwd))
+            else:
+                rows.append((session_id, command, cwd))
+        before = self.conn.total_changes
+        self.conn.executemany(
+            """
+            UPDATE sessions
+            SET recovery_command = ?, recovery_cwd = ?
+            WHERE id = ? AND external = 0
+              AND (recovery_command IS NOT ? OR recovery_cwd IS NOT ?)
+            """,
+            [
+                (command, cwd, session_id, command, cwd)
+                for session_id, command, cwd in rows
+            ],
+        )
+        self.conn.commit()
+        return max(0, self.conn.total_changes - before)
 
     def get(self, session_id: str) -> SessionRecord | None:
         row = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
@@ -387,4 +474,6 @@ class SessionStore:
             pinned=bool(row["pinned"]),
             pane_target=row["pane_target"],
             external=bool(row["external"]),
+            recovery_command=row["recovery_command"],
+            recovery_cwd=row["recovery_cwd"],
         )

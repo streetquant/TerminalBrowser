@@ -6,6 +6,7 @@ from unittest import TestCase
 from termdeck.command_render import directory_tab_name, normalise_directory
 from termdeck.gtk_app import TermDeckWindow
 from termdeck.session_store import SessionStore
+from termdeck.tmux_backend import TmuxError
 
 
 class LabelStub:
@@ -79,7 +80,75 @@ class WindowTabModelTests(TestCase):
         self.assertEqual([call[1] for call in calls[2:]], ["first", "second"])
         self.assertTrue(all(call[2]["known_live"] for call in calls[2:]))
         self.assertTrue(all(call[2]["known_pid_resolved"] for call in calls[2:]))
+        self.assertTrue(all(call[2]["restart_missing"] for call in calls[2:]))
         self.assertTrue(all(not call[2]["refresh_side"] for call in calls[2:]))
+        self.assertEqual(side.refresh_count, 1)
+
+    def test_restore_restarts_selected_tabs_when_the_backend_was_lost(self) -> None:
+        record = SimpleNamespace(id="crashed", tab_index=0)
+        calls = []
+
+        class Backend:
+            def session_exists_many(self, candidates):
+                return {candidate.id: False for candidate in candidates}
+
+            def pane_pids(self, _candidates):
+                raise AssertionError("missing sessions have no pane pids")
+
+        side = SideStub()
+        window = SimpleNamespace(
+            app_context=SimpleNamespace(backend=Backend()),
+            tabs={},
+            side=side,
+        )
+
+        def open_session(candidate, **kwargs):
+            calls.append((candidate.id, kwargs))
+            window.tabs[candidate.id] = object()
+
+        window.open_session = open_session
+
+        restored = TermDeckWindow.restore_previous_tabs(window, records=[record])
+
+        self.assertEqual(restored, 1)
+        self.assertEqual(calls[0][0], "crashed")
+        self.assertFalse(calls[0][1]["known_live"])
+        self.assertTrue(calls[0][1]["restart_missing"])
+        self.assertEqual(side.refresh_count, 1)
+
+    def test_failed_crash_restart_keeps_the_tab_visible_and_recoverable(self) -> None:
+        record = SimpleNamespace(id="crashed", tab_index=0, visible=True)
+        updates = []
+
+        class Backend:
+            def session_exists_many(self, candidates):
+                return {candidate.id: False for candidate in candidates}
+
+            def pane_pids(self, _candidates):
+                return {}
+
+        side = SideStub()
+        window = SimpleNamespace(
+            app_context=SimpleNamespace(
+                backend=Backend(),
+                store=SimpleNamespace(
+                    update=lambda session_id, **changes: updates.append((session_id, changes))
+                ),
+            ),
+            tabs={},
+            side=side,
+            open_session=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                TmuxError("backend unavailable")
+            ),
+        )
+
+        restored = TermDeckWindow.restore_previous_tabs(window, records=[record])
+
+        self.assertEqual(restored, 0)
+        self.assertEqual(
+            updates,
+            [("crashed", {"status": "start-error", "last_pid": None, "visible": True})],
+        )
         self.assertEqual(side.refresh_count, 1)
 
     def test_directory_tab_name_uses_only_final_component(self) -> None:
@@ -239,6 +308,53 @@ class WindowTabModelTests(TestCase):
                 self.assertEqual(updated.name, "new-project")  # type: ignore[union-attr]
                 self.assertEqual(updated.cwd, str(new_directory.resolve()))  # type: ignore[union-attr]
                 self.assertEqual(updated.last_opened_at, original_opened_at)  # type: ignore[union-attr]
+                self.assertEqual(side.refresh_count, 1)
+            finally:
+                store.close()
+
+    def test_tab_metadata_refresh_persists_and_clears_safe_recovery_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                first = store.create("first", "terminal", "/bin/bash", tmp)
+                second = store.create("second", "terminal", "/bin/bash", tmp)
+                second = store.update(
+                    second.id,
+                    recovery_command="codex --yolo",
+                    recovery_cwd=str(Path(tmp) / "old-repo"),
+                )
+                first_recovery_cwd = str(Path(tmp) / "first-repo")
+
+                class Backend:
+                    def current_directories(self, records):
+                        return {record.id: record.cwd for record in records}
+
+                    def recovery_metadata(self, records):
+                        return {
+                            first.id: ("codex --yolo", first_recovery_cwd),
+                            second.id: (None, None),
+                        }
+
+                side = SideStub()
+                window = SimpleNamespace(
+                    tabs={
+                        first.id: SimpleNamespace(record=first),
+                        second.id: SimpleNamespace(record=second),
+                    },
+                    app_context=SimpleNamespace(store=store, backend=Backend()),
+                    side=side,
+                    master_window=None,
+                    _directory_tracking_changes=lambda candidate, live: {},
+                    refresh_tab_label=lambda _record: None,
+                )
+
+                changed = TermDeckWindow.refresh_tab_directories(window)
+
+                self.assertEqual(changed, 2)
+                self.assertEqual(store.get(first.id).recovery_command, "codex --yolo")  # type: ignore[union-attr]
+                self.assertEqual(store.get(first.id).recovery_cwd, first_recovery_cwd)  # type: ignore[union-attr]
+                self.assertIsNone(store.get(second.id).recovery_command)  # type: ignore[union-attr]
+                self.assertIsNone(store.get(second.id).recovery_cwd)  # type: ignore[union-attr]
                 self.assertEqual(side.refresh_count, 1)
             finally:
                 store.close()

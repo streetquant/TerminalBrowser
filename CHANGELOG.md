@@ -2,6 +2,11 @@
 
 ## 0.2.10
 
+- Added reboot-safe exact Codex recovery: TermDeck identifies the primary foreground Codex rollout UUID, excludes subagent rollouts, stores only a validated `codex ... resume <UUID>` command, prefers the native Codex process over launcher wrappers, and prevents weaker periodic observations from downgrading an exact saved UUID.
+- Added DMTCP-backed process checkpoints for TermDeck-managed tabs. New process trees launch under a private per-tab coordinator; shutdown commits an atomic last-good image set and manifest, and reboot restores Python interpreters, shells, local process memory, open files supported by DMTCP, and execution position instead of merely replaying the command.
+- Made crash recovery fail closed. A previously running tab becomes `recovery-pending`; startup restores an exact Codex UUID or a validated process checkpoint, otherwise it remains an explicit recovery error and never starts a substitute/random process. Deliberately new tabs still launch normally, and Kill deletes stale checkpoints so stopped work cannot resurrect.
+- Added `t1000 checkpoint --all` plus user- and system-level checkpoint-service installers. The strict system service is ordered after `user@UID.service` while active, so inverse shutdown ordering checkpoints before the user manager, tmux scopes, required mounts, and tab processes are stopped.
+- Added signed DMTCP runtime validation and an end-to-end kill/restore smoke proving that a Python process retained the same random in-memory identity and continued its counter after restoration. Existing processes created before DMTCP wrapping are reported as a one-time migration limitation rather than being falsely described as checkpointed.
 - Restored real scrolling behind the tmux attachment: shell panes use tmux copy history, while foreground Codex panes open and navigate Codex's transcript before any Up/Down input is emitted.
 - Prevented wheel movement from cycling Codex prompt history, hid the pager caret while scrollback is being reviewed, and made the first typed key, paste, or ordinary click restore the live composer cursor before delivering input. The Terminator-style scrollbar now has an independent tmux-history range, an opaque trough and thumb, and drag navigation instead of inheriting VTE's empty alternate-screen range.
 - Restored ordinary drag-to-select and automatic copying to both the system clipboard and PRIMARY selection without destroying VTE's visible selection highlight.
@@ -12,8 +17,9 @@
 - Kept default tab names synchronized with each tmux pane's live working-directory basename through the shared batched pane snapshot; an explicit tab rename remains a stable override.
 - Made each Tabs-pane card a single-click navigation target while preserving `Ctrl+left-click` bulk selection and the card controls.
 - Added **Move to window** to every Tab Manager row's right-click menu, including **New window…**, which creates no extra shell; live tabs are reparented with the same VTE widget and tmux client while hidden rows attach only to an already-running session.
-- Added explicit 2,000-session control-plane defaults: at most 24 startup terminals, seeded one per prioritized remembered window across up to 24 windows before filling extra tabs (12 per window), plus 128 process-tree samples per refresh, 100 Tabs-pane cards, and 500 Tab Manager rows.
-- Recreated every remembered named window on relaunch and reserved an attachment for each prioritized window before filling extra tabs, preventing large windows from starving smaller windows such as Kaggle.
+- Added explicit large-registry control-plane defaults for 128 process-tree samples per refresh, 100 Tabs-pane cards, and 500 Tab Manager rows while restoring every visible remembered terminal at startup.
+- Recreated every remembered named window and every visible tab on relaunch instead of deferring tabs behind a startup attachment cap.
+- Persisted a separate crash-recovery snapshot for a live foreground Codex invocation and its exact process working directory, then relaunch it there with restart-safe flags such as `--yolo` before returning to the tab's saved shell; command and cwd updates are atomic, a deleted recovery directory falls back to the saved tab directory, and terminal output, prompts, config overrides, background jobs, and adopted sessions are never auto-replayed.
 - Restricted Tab Manager **Remove** to unpinned tabs already marked stopped; live, paused, new, and missing selections remain intact.
 - Standardized the destructive action label as **Kill** across Tab Manager, tab menus, the command palette, shortcuts, and documentation; `stopped` remains the internal lifecycle state.
 - Bounded PID churn caches and terminal captures, added adaptive fleet-query deadlines with failure backoff, and made failed snapshots preserve stale lifecycle/PID state without N-way retry fan-out.
@@ -27,7 +33,7 @@
 - Replaced the terminal client's Python `preexec_fn` path with `start_new_session=True` and focused newly opened VTE surfaces immediately.
 - Tightened the header and terminal frame, replaced the oversized circular New-tab action with a compact semantic control, removed persistent-surface transitions and broad shadows, and restored readable tab-name widths.
 - Added shortcut hints and accessible close names without adding visible chrome.
-- Verified 435 tests and 23 subtests plus real GTK/tmux lifecycle smokes, including select-to-copy, cross-window tab relocation into a newly created destination, remembered-window startup seeding, killed-tab history, first-key delivery into a waiting PTY, live cwd labels, high-scale Tabs-pane bounds/navigation, tmux/Codex wheel and thumb-drag routing without a roaming pager cursor or composer history input, and synchronized resize grids.
+- Verified 510 tests plus real GTK/tmux and DMTCP lifecycle smokes, including a 30-tab empty-backend recovery that resumes an exact Codex UUID in its saved process cwd, validated-checkpoint restoration, Python memory identity/counter continuation after kill/restart, select-to-copy, cross-window tab relocation, remembered-window startup seeding, killed-tab history, first-key delivery into a waiting PTY, live cwd labels, high-scale Tabs-pane bounds/navigation, tmux/Codex wheel and thumb-drag routing without a roaming pager cursor or composer history input, and synchronized resize grids.
 
 ## 0.2.9
 

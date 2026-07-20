@@ -9,7 +9,9 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+from .checkpointing import CheckpointResult, DmtcpCheckpointManager
 from .models import SessionRecord
+from .resources import observe_recovery_metadata, safe_codex_recovery_command
 
 
 class TmuxError(RuntimeError):
@@ -32,6 +34,8 @@ class TmuxBackend:
         failure_backoff: float = 1.0,
         history_limit: int = 2000,
         max_capture_lines: int = 10000,
+        recovery_scan_limit: int = 128,
+        checkpoint_manager: DmtcpCheckpointManager | None = None,
     ) -> None:
         self.executable = executable
         self.pane_cache_ttl = max(0.0, float(pane_cache_ttl))
@@ -40,6 +44,9 @@ class TmuxBackend:
         self.failure_backoff = max(0.05, float(failure_backoff))
         self.history_limit = max(100, int(history_limit))
         self.max_capture_lines = max(100, int(max_capture_lines))
+        self.recovery_scan_limit = max(1, int(recovery_scan_limit))
+        self.checkpoints = checkpoint_manager or DmtcpCheckpointManager()
+        self._recovery_scan_cursor = 0
         self._pane_cache_expires_at = 0.0
         self._pane_cache_by_target: dict[str, int] = {}
         self._pane_cache_by_session_active: dict[str, int] = {}
@@ -127,6 +134,14 @@ class TmuxBackend:
             return record.status.casefold() in {"running", "paused", "missing"}
         return result.returncode == 0
 
+    @staticmethod
+    def _server_is_absent(result: subprocess.CompletedProcess[str]) -> bool:
+        detail = str(result.stderr or "").casefold()
+        return "no server running on" in detail or (
+            ("no such file or directory" in detail or "connection refused" in detail)
+            and ("error connecting to" in detail or "connect failed" in detail)
+        )
+
     def session_exists_many(self, records: Sequence[SessionRecord]) -> dict[str, bool]:
         """Resolve many sessions with one bounded tmux query."""
 
@@ -139,6 +154,11 @@ class TmuxBackend:
             timeout=self._query_timeout_for(len(records)),
         )
         if result.returncode != 0:
+            if self._server_is_absent(result):
+                # This is the normal post-reboot state, not a busy control
+                # plane. Report the sessions missing so startup recovery can
+                # relaunch every remembered managed tab from durable records.
+                return out
             # A failed control-plane snapshot is not proof that thousands of
             # independent sessions died. Keep the last known lifecycle state;
             # a later successful bounded query will reconcile it.
@@ -154,8 +174,65 @@ class TmuxBackend:
             return
         if getattr(record, "external", False):
             raise TmuxError(f"adopted tmux session not found: {record.tmux_name}")
-        Path(record.cwd).expanduser().mkdir(parents=True, exist_ok=True)
-        command = record.command.strip() or os.environ.get("SHELL", "/bin/sh")
+        launch_directory = Path(record.cwd).expanduser()
+        launch_directory.mkdir(parents=True, exist_ok=True)
+        original_command = record.command.strip() or os.environ.get("SHELL", "/bin/sh")
+        command = original_command
+        recovery_pending = record.status.casefold() == "recovery-pending"
+        # A lost process may resume only an exact UUID-bound Codex session.
+        # Launcher-only snapshots remain useful for observation/UI but are never
+        # executable recovery state.
+        recovery = self._exact_codex_recovery(record)
+        if recovery:
+            raw_recovery_cwd = (getattr(record, "recovery_cwd", None) or "").strip()
+            if raw_recovery_cwd:
+                recovery_directory = Path(raw_recovery_cwd).expanduser()
+                if recovery_directory.is_absolute() and recovery_directory.is_dir():
+                    try:
+                        launch_directory = recovery_directory.resolve()
+                    except OSError:
+                        launch_directory = recovery_directory
+            # A shell-backed tab should remain useful after the recovered TUI
+            # exits. Only append an exact, argument-free known shell; malformed
+            # or non-shell launch metadata cannot become shell syntax here.
+            try:
+                launch_argv = shlex.split(original_command)
+            except ValueError:
+                launch_argv = []
+            shell_names = {
+                "bash",
+                "csh",
+                "dash",
+                "elvish",
+                "fish",
+                "ksh",
+                "nu",
+                "sh",
+                "tcsh",
+                "zsh",
+            }
+            if len(launch_argv) == 1 and Path(launch_argv[0]).name.casefold() in shell_names:
+                command = f"{recovery}; exec {shlex.join(launch_argv)}"
+            else:
+                command = recovery
+            # Keep the recovered shell under DMTCP so a later non-Codex command
+            # in the same tab can be checkpointed without recreating the tab.
+            command = self.checkpoints.wrap_launch_command(record, command)
+        else:
+            checkpoint_command = self.checkpoints.restart_command(record)
+            if checkpoint_command:
+                launch_directory = self.checkpoints.session_dir(record)
+                # Exact recovery is fail-closed. A stale or incompatible image
+                # must remain an explicit failed restore; replaying the launch
+                # command would create a different process state.
+                command = checkpoint_command
+            elif recovery_pending:
+                raise TmuxError(
+                    "exact process recovery is unavailable; no Codex session UUID "
+                    "or validated process checkpoint was saved"
+                )
+            else:
+                command = self.checkpoints.wrap_launch_command(record, original_command)
         # tmux accepts the command as one shell command argument, which preserves
         # normal shell syntax for commands such as "npm run dev" or "codex".
         self._run([
@@ -164,7 +241,7 @@ class TmuxBackend:
             "-s",
             record.tmux_name,
             "-c",
-            str(Path(record.cwd).expanduser()),
+            str(launch_directory),
             command,
         ])
         # Make the session visually clean when attached.
@@ -547,6 +624,116 @@ class TmuxBackend:
                 out[record.id] = None
         return out
 
+    def recovery_metadata(
+        self,
+        records: Sequence[SessionRecord],
+        *,
+        bounded: bool = True,
+    ) -> dict[str, tuple[str | None, str | None]]:
+        """Observe safe crash-relaunch commands and cwd values together.
+
+        Periodic UI refreshes use a bounded round-robin scan. Shutdown and
+        explicit checkpoint operations set ``bounded=False`` so every live tab
+        gets one final exact-session observation before durable state is saved.
+        """
+
+        candidates = [record for record in records if not getattr(record, "external", False)]
+        if not candidates:
+            return {}
+        pids = self.pane_pids(candidates)
+        if self._pane_snapshot_stale:
+            return {}
+        live = [record for record in candidates if pids.get(record.id)]
+        if not live:
+            return {}
+        if bounded:
+            start = self._recovery_scan_cursor % len(live)
+            count = min(len(live), self.recovery_scan_limit)
+            selected = [live[(start + offset) % len(live)] for offset in range(count)]
+            self._recovery_scan_cursor = (start + count) % len(live)
+        else:
+            selected = live
+        out: dict[str, tuple[str | None, str | None]] = {}
+        for record in selected:
+            pid = pids.get(record.id)
+            assert pid is not None
+            observed, command, cwd = observe_recovery_metadata(pid)
+            if observed:
+                out[record.id] = (command, cwd if command else None)
+        return out
+
+    def recovery_commands(self, records: Sequence[SessionRecord]) -> dict[str, str | None]:
+        """Return command-only recovery observations for older callers."""
+
+        return {
+            session_id: command
+            for session_id, (command, _cwd) in self.recovery_metadata(records).items()
+        }
+
+    @staticmethod
+    def _exact_codex_recovery(record: SessionRecord) -> str | None:
+        raw = (getattr(record, "recovery_command", None) or "").strip()
+        if not raw:
+            return None
+        try:
+            command = safe_codex_recovery_command(shlex.split(raw))
+        except ValueError:
+            return None
+        if command is None:
+            return None
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return None
+        return command if "resume" in parts else None
+
+    def checkpoint_records(
+        self,
+        records: Sequence[SessionRecord],
+    ) -> list[CheckpointResult]:
+        """Persist exact restart state for every selected live managed tab."""
+
+        rows = list(records)
+        live_by_id = self.session_exists_many(rows)
+        results: list[CheckpointResult] = []
+        for record in rows:
+            if getattr(record, "external", False):
+                results.append(
+                    CheckpointResult(
+                        record.id,
+                        "checkpoint",
+                        False,
+                        False,
+                        "external tmux sessions cannot be checkpointed",
+                    )
+                )
+                continue
+            if not live_by_id.get(record.id, False):
+                results.append(
+                    CheckpointResult(
+                        record.id,
+                        "checkpoint",
+                        False,
+                        False,
+                        "managed tmux session is not running",
+                    )
+                )
+                continue
+            exact_codex = self._exact_codex_recovery(record)
+            if exact_codex:
+                results.append(
+                    CheckpointResult(
+                        record.id,
+                        "codex-resume",
+                        True,
+                        True,
+                        "exact Codex session UUID persisted",
+                    )
+                )
+                continue
+            results.append(self.checkpoints.checkpoint(record))
+        return results
+
     def send_text(self, record: SessionRecord, text: str, enter: bool = True) -> None:
         self.create_or_resume(record)
         # Exit copy-mode / Codex transcript view before sending so keys reach
@@ -588,6 +775,9 @@ class TmuxBackend:
         self._scroll_views.pop(record.id, None)
         if self.session_exists(record):
             self._run(["kill-session", "-t", record.tmux_name], check=False)
+        # A deliberate Stop/Kill must not resurrect stale process memory on the
+        # next TermDeck launch. Browser-style Hide leaves the checkpoint intact.
+        self.checkpoints.clear(record)
         self.invalidate_cache()
 
     def rename(self, record: SessionRecord, new_name: str) -> None:

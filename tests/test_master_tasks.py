@@ -54,6 +54,10 @@ class MasterTaskTests(unittest.TestCase):
         snap = ResourceSnapshot(pid=None, exists=False)
         self.assertEqual(state_from_snapshot(self.record(status="paused"), snap), "paused")
         self.assertEqual(state_from_snapshot(self.record(status="running"), snap), "stopped")
+        self.assertEqual(
+            state_from_snapshot(self.record(status="recovery-pending"), snap),
+            "recovery-pending",
+        )
 
     def test_filter_rows_uses_all_query_tokens(self):
         snap = ResourceSnapshot(pid=1, exists=True, state="S")

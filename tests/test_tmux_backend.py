@@ -1,8 +1,10 @@
 import subprocess
+import tempfile
 from pathlib import Path
 import unittest
 from unittest import mock
 
+from termdeck.checkpointing import CheckpointResult
 from termdeck.models import SessionRecord
 from termdeck.tmux_backend import TmuxBackend, TmuxError
 
@@ -22,7 +24,243 @@ def _record(**kwargs) -> SessionRecord:
     return SessionRecord(**base)
 
 
+class FakeCheckpointManager:
+    def __init__(self, *, restart_command=None):
+        self._restart_command = restart_command
+        self.wrapped = []
+        self.checkpointed = []
+        self.cleared = []
+
+    def wrap_launch_command(self, record, command):
+        self.wrapped.append((record.id, command))
+        return f"wrapped({command})"
+
+    def restart_command(self, record):
+        return self._restart_command
+
+    def session_dir(self, record):
+        return Path("/checkpoints") / record.id
+
+    def checkpoint(self, record):
+        self.checkpointed.append(record.id)
+        return CheckpointResult(record.id, "checkpoint", True, True, "saved", 1)
+
+    def clear(self, record):
+        self.cleared.append(record.id)
+
+
 class TmuxBackendTests(unittest.TestCase):
+    def test_crash_restart_relaunches_exact_codex_session_then_returns_to_the_shell(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        with tempfile.TemporaryDirectory() as tmp:
+            shell_cwd = Path(tmp) / "shell"
+            recovery_cwd = Path(tmp) / "repo"
+            shell_cwd.mkdir()
+            recovery_cwd.mkdir()
+            record = _record(
+                command="/bin/bash",
+                cwd=str(shell_cwd),
+                recovery_command=f"codex --yolo resume {session_id}",
+                recovery_cwd=str(recovery_cwd),
+                status="new",
+            )
+            checkpoints = FakeCheckpointManager()
+            backend = TmuxBackend(executable="tmux", checkpoint_manager=checkpoints)
+            completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(backend, "session_exists", return_value=False), mock.patch.object(
+                backend, "_run", return_value=completed
+            ) as run:
+                backend.create_or_resume(record)
+
+            self.assertEqual(
+                run.call_args_list[0],
+                mock.call(
+                    [
+                        "new-session",
+                        "-d",
+                        "-s",
+                        record.tmux_name,
+                        "-c",
+                        str(recovery_cwd.resolve()),
+                        f"wrapped(codex --yolo resume {session_id}; exec /bin/bash)",
+                    ]
+                ),
+            )
+
+    def test_missing_recovery_directory_falls_back_to_the_saved_tab_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record = _record(
+                command="/bin/bash",
+                cwd=tmp,
+                recovery_command="codex --yolo",
+                recovery_cwd=str(Path(tmp) / "deleted-repo"),
+            )
+            backend = TmuxBackend(executable="tmux")
+            completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(backend, "session_exists", return_value=False), mock.patch.object(
+                backend, "_run", return_value=completed
+            ) as run:
+                backend.create_or_resume(record)
+
+            self.assertEqual(run.call_args_list[0].args[0][5], tmp)
+
+    def test_untrusted_recovery_metadata_is_never_executed(self):
+        record = _record(
+            command="/bin/bash",
+            recovery_command="codex --config api_key=secret",
+            status="new",
+        )
+        checkpoints = FakeCheckpointManager()
+        backend = TmuxBackend(executable="tmux", checkpoint_manager=checkpoints)
+        completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(backend, "session_exists", return_value=False), mock.patch.object(
+            backend, "_run", return_value=completed
+        ) as run:
+            backend.create_or_resume(record)
+
+        self.assertEqual(run.call_args_list[0].args[0][-1], "wrapped(/bin/bash)")
+        self.assertNotIn("api_key=secret", run.call_args_list[0].args[0][-1])
+
+    def test_missing_process_tree_restores_checkpoint_without_command_replay(self):
+        checkpoints = FakeCheckpointManager(restart_command="restart-image")
+        record = _record(command="python worker.py", status="recovery-pending")
+        backend = TmuxBackend(executable="tmux", checkpoint_manager=checkpoints)
+        completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(backend, "session_exists", return_value=False), mock.patch.object(
+            backend, "_run", return_value=completed
+        ) as run:
+            backend.create_or_resume(record)
+
+        launch = run.call_args_list[0].args[0]
+        self.assertEqual(launch[5], str(Path("/checkpoints") / record.id))
+        self.assertEqual(launch[-1], "restart-image")
+        self.assertNotIn("python worker.py", launch[-1])
+
+    def test_recovery_pending_without_exact_state_fails_closed(self):
+        checkpoints = FakeCheckpointManager()
+        record = _record(
+            command="codex --yolo",
+            recovery_command="codex --yolo",
+            status="recovery-pending",
+        )
+        backend = TmuxBackend(executable="tmux", checkpoint_manager=checkpoints)
+
+        with mock.patch.object(backend, "session_exists", return_value=False), self.assertRaisesRegex(
+            TmuxError,
+            "exact process recovery is unavailable",
+        ), mock.patch.object(backend, "_run") as run:
+            backend.create_or_resume(record)
+
+        run.assert_not_called()
+        self.assertEqual(checkpoints.wrapped, [])
+
+    def test_deliberately_new_codex_tab_may_start_a_new_session(self):
+        checkpoints = FakeCheckpointManager()
+        record = _record(command="codex --yolo", status="new")
+        backend = TmuxBackend(executable="tmux", checkpoint_manager=checkpoints)
+        completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(backend, "session_exists", return_value=False), mock.patch.object(
+            backend,
+            "_run",
+            return_value=completed,
+        ) as run:
+            backend.create_or_resume(record)
+
+        self.assertEqual(run.call_args_list[0].args[0][-1], "wrapped(codex --yolo)")
+
+    def test_checkpoint_records_uses_exact_codex_uuid_without_memory_image(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        checkpoints = FakeCheckpointManager()
+        record = _record(recovery_command=f"codex --yolo resume {session_id}")
+        backend = TmuxBackend(checkpoint_manager=checkpoints)
+
+        with mock.patch.object(
+            backend,
+            "session_exists_many",
+            return_value={record.id: True},
+        ):
+            results = backend.checkpoint_records([record])
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].action, "codex-resume")
+        self.assertTrue(results[0].exact)
+        self.assertEqual(checkpoints.checkpointed, [])
+
+    def test_checkpoint_records_checkpoints_non_codex_process(self):
+        checkpoints = FakeCheckpointManager()
+        record = _record(command="python worker.py")
+        backend = TmuxBackend(checkpoint_manager=checkpoints)
+
+        with mock.patch.object(
+            backend,
+            "session_exists_many",
+            return_value={record.id: True},
+        ):
+            results = backend.checkpoint_records([record])
+
+        self.assertEqual(results[0].action, "checkpoint")
+        self.assertTrue(results[0].exact)
+        self.assertEqual(checkpoints.checkpointed, [record.id])
+
+    def test_terminate_clears_stale_process_checkpoint(self):
+        checkpoints = FakeCheckpointManager()
+        record = _record()
+        backend = TmuxBackend(checkpoint_manager=checkpoints)
+
+        with mock.patch.object(backend, "session_exists", return_value=False):
+            backend.terminate(record)
+
+        self.assertEqual(checkpoints.cleared, [record.id])
+
+    def test_recovery_command_observation_skips_external_sessions_and_unknown_pids(self):
+        internal = _record(id="internal", tmux_name="internal")
+        missing = _record(id="missing", tmux_name="missing")
+        external = _record(id="external", tmux_name="external", external=True)
+        backend = TmuxBackend(executable="tmux")
+
+        with mock.patch.object(
+            backend,
+            "pane_pids",
+            return_value={"internal": 101, "missing": None, "external": 303},
+        ), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata",
+            return_value=(True, "codex --yolo", "/workspace/internal"),
+        ) as observe:
+            metadata = backend.recovery_metadata([internal, missing, external])
+
+        self.assertEqual(
+            metadata,
+            {"internal": ("codex --yolo", "/workspace/internal")},
+        )
+        observe.assert_called_once_with(101)
+
+    def test_recovery_command_observation_round_robins_with_a_bounded_scan(self):
+        records = [
+            _record(id=f"record-{index}", tmux_name=f"record-{index}")
+            for index in range(5)
+        ]
+        backend = TmuxBackend(executable="tmux", recovery_scan_limit=2)
+        pids = {record.id: 100 + index for index, record in enumerate(records)}
+
+        with mock.patch.object(backend, "pane_pids", return_value=pids), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata",
+            return_value=(True, "codex --yolo", "/workspace"),
+        ) as observe:
+            first = backend.recovery_metadata(records)
+            second = backend.recovery_metadata(records)
+
+        self.assertEqual(set(first), {"record-0", "record-1"})
+        self.assertEqual(set(second), {"record-2", "record-3"})
+        self.assertEqual(
+            [call.args[0] for call in observe.call_args_list],
+            [100, 101, 102, 103],
+        )
+
     def test_scroll_down_at_live_bottom_does_not_enter_history(self):
         record = _record()
         backend = TmuxBackend(executable="tmux")
@@ -430,6 +668,33 @@ class TmuxBackendTests(unittest.TestCase):
             result = backend.session_exists_many([running, stopped])
 
         self.assertEqual(result, {"live": True, "stopped": False})
+
+    def test_session_batch_missing_server_reports_every_session_gone(self):
+        running = _record(id="live", status="running")
+        stopped = _record(id="stopped", status="stopped")
+        backend = TmuxBackend(executable="tmux")
+        errors = (
+            "error connecting to /run/user/1000/tmux-1000/default "
+            "(No such file or directory)",
+            "error connecting to /run/user/1000/tmux-1000/default "
+            "(Connection refused)",
+            "no server running on /run/user/1000/tmux-1000/default",
+        )
+
+        for stderr in errors:
+            with self.subTest(stderr=stderr):
+                no_server = subprocess.CompletedProcess(
+                    args=["tmux"],
+                    returncode=1,
+                    stdout="",
+                    stderr=stderr,
+                )
+                with mock.patch(
+                    "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+                ), mock.patch.object(backend, "_run", return_value=no_server):
+                    result = backend.session_exists_many([running, stopped])
+
+                self.assertEqual(result, {"live": False, "stopped": False})
 
     def test_session_batch_failure_is_stale_not_dead(self):
         running = _record(id="live", status="running")

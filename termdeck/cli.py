@@ -15,6 +15,7 @@ from .control_plan import build_control_plan
 from .desktop_integration import build_install_plan, install_desktop, uninstall_desktop
 from .diagnostics import build_diagnostic_payload, write_diagnostic_bundle
 from .health import classify_session, health_badge, should_pause_for_attention
+from .persistence import persist_live_sessions
 from .quickstart import build_quickstart
 from .redaction import redact_text
 from .resource_budget import BudgetConfigError, assess_budgets, default_budgets, load_budgets, render_budget_table, sample_budget_json
@@ -25,6 +26,13 @@ from .session_launcher import create_new_session, launch_payload, resolve_launch
 from .session_search import render_search_table, search_sessions
 from .session_store import DEFAULT_DB_PATH, SessionStore
 from .settings import sample_settings_json
+from .shutdown_service import (
+    ShutdownServiceError,
+    install_system_checkpoint_service,
+    install_user_checkpoint_service,
+    uninstall_system_checkpoint_service,
+    uninstall_user_checkpoint_service,
+)
 from .shortcuts import build_shortcut_report, render_shortcut_table, shortcut_entries, shortcut_entries_to_dicts, shortcut_profile_names
 from .task_snapshot import build_task_snapshot, filter_task_snapshot, render_task_table, sort_task_snapshot, task_snapshot_to_dicts
 from .terminator_config import TerminatorConfig, load_terminator_theme
@@ -268,6 +276,59 @@ def cmd_uninstall_desktop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_install_checkpoint_service(args: argparse.Namespace) -> int:
+    try:
+        if bool(getattr(args, "system", False)):
+            user = getattr(args, "user", None)
+            uid = getattr(args, "uid", None)
+            home = getattr(args, "home", None)
+            if user is None or uid is None or home is None:
+                raise ShutdownServiceError("--system requires --user, --uid, and --home")
+            result = install_system_checkpoint_service(
+                executable=getattr(args, "executable", None),
+                user=user,
+                uid=uid,
+                home=home,
+                required_mounts=tuple(getattr(args, "required_mount", ()) or ()),
+                unit_dir=getattr(args, "unit_dir", None),
+                enable=not bool(getattr(args, "no_enable", False)),
+            )
+        else:
+            result = install_user_checkpoint_service(
+                executable=getattr(args, "executable", None),
+                unit_dir=getattr(args, "unit_dir", None),
+                enable=not bool(getattr(args, "no_enable", False)),
+            )
+    except ShutdownServiceError as exc:
+        _print_json({"action": "install-checkpoint-service", "ok": False, "error": str(exc)})
+        return 1
+    payload = result.as_dict()
+    payload["ok"] = True
+    _print_json(payload)
+    return 0
+
+
+def cmd_uninstall_checkpoint_service(args: argparse.Namespace) -> int:
+    try:
+        if bool(getattr(args, "system", False)):
+            result = uninstall_system_checkpoint_service(
+                unit_dir=getattr(args, "unit_dir", None),
+                disable=not bool(getattr(args, "no_disable", False)),
+            )
+        else:
+            result = uninstall_user_checkpoint_service(
+                unit_dir=getattr(args, "unit_dir", None),
+                disable=not bool(getattr(args, "no_disable", False)),
+            )
+    except ShutdownServiceError as exc:
+        _print_json({"action": "uninstall-checkpoint-service", "ok": False, "error": str(exc)})
+        return 1
+    payload = result.as_dict()
+    payload["ok"] = True
+    _print_json(payload)
+    return 0
+
+
 def cmd_parse_terminator(args: argparse.Namespace) -> int:
     config = TerminatorConfig.from_path(args.path) if args.path else TerminatorConfig.from_default_path()
     print(config.to_json(args.profile))
@@ -505,7 +566,13 @@ def _run_targeted_control(args: argparse.Namespace, action: str) -> int:
                         rows.append(_control_row(record, action, False, pid=record.last_pid, detail="pinned tab protected; pass --include-pinned to stop it"))
                         continue
                     backend.terminate(record)
-                    store.update(record.id, status="stopped", visible=False)
+                    store.update(
+                        record.id,
+                        status="stopped",
+                        visible=False,
+                        recovery_command=None,
+                        recovery_cwd=None,
+                    )
                     rows.append(_control_row(record, action, True, pid=record.last_pid, detail="marked stopped"))
             except TmuxError as exc:
                 rows.append(_control_row(record, action, False, pid=record.last_pid, detail=str(exc)))
@@ -981,6 +1048,34 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     _print_json(result.as_dict())
     return 0
 
+
+def cmd_checkpoint(args: argparse.Namespace) -> int:
+    """Persist exact resumable state for selected live managed tabs."""
+
+    store = SessionStore(args.db)
+    try:
+        explicit = bool(
+            getattr(args, "selectors", None)
+            or getattr(args, "tag", None)
+            or getattr(args, "all", False)
+        )
+        if explicit:
+            selected = _target_records_from_args(store, args)
+        else:
+            selected = store.list(include_archived=False, include_stopped=False)
+        selected = [
+            record
+            for record in selected
+            if record.status not in {"archived", "stopped"}
+            and not getattr(record, "external", False)
+        ]
+        result = persist_live_sessions(store, TmuxBackend(), records=selected)
+    finally:
+        store.close()
+    _print_json(result.as_dict())
+    return 0 if result.failed_count == 0 else 1
+
+
 def cmd_restore_plan(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
     try:
@@ -1215,6 +1310,29 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall_desktop_parser.add_argument("--data-home", type=Path, default=None)
     uninstall_desktop_parser.set_defaults(func=cmd_uninstall_desktop)
 
+    install_checkpoint_service = sub.add_parser(
+        "install-checkpoint-service",
+        help="install and enable the user shutdown checkpoint hook",
+    )
+    install_checkpoint_service.add_argument("--executable", type=Path, default=None)
+    install_checkpoint_service.add_argument("--unit-dir", type=Path, default=None)
+    install_checkpoint_service.add_argument("--system", action="store_true", help="install the strict system-level shutdown-ordered service")
+    install_checkpoint_service.add_argument("--user", default=None, help="target user name for --system")
+    install_checkpoint_service.add_argument("--uid", type=int, default=None, help="target numeric uid for --system")
+    install_checkpoint_service.add_argument("--home", type=Path, default=None, help="target home directory for --system")
+    install_checkpoint_service.add_argument("--required-mount", action="append", type=Path, default=[], help="mount path that must remain available during checkpointing")
+    install_checkpoint_service.add_argument("--no-enable", action="store_true")
+    install_checkpoint_service.set_defaults(func=cmd_install_checkpoint_service)
+
+    uninstall_checkpoint_service = sub.add_parser(
+        "uninstall-checkpoint-service",
+        help="disable and remove the user shutdown checkpoint hook",
+    )
+    uninstall_checkpoint_service.add_argument("--unit-dir", type=Path, default=None)
+    uninstall_checkpoint_service.add_argument("--system", action="store_true", help="remove the strict system-level service")
+    uninstall_checkpoint_service.add_argument("--no-disable", action="store_true")
+    uninstall_checkpoint_service.set_defaults(func=cmd_uninstall_checkpoint_service)
+
     parse = sub.add_parser("parse-terminator", help="print imported Terminator theme as JSON")
     parse.add_argument("--path", type=Path, default=None)
     parse.add_argument("--profile", default="default")
@@ -1444,6 +1562,13 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--dry-run", action="store_true", help="show registry repairs without writing them")
     reconcile.add_argument("--keep-visible", action="store_true", help="do not hide tabs whose backend session has disappeared")
     reconcile.set_defaults(func=cmd_reconcile)
+
+    checkpoint = sub.add_parser(
+        "checkpoint",
+        help="persist exact Codex session IDs and checkpoint other live process trees",
+    )
+    _add_targeting_args(checkpoint)
+    checkpoint.set_defaults(func=cmd_checkpoint)
 
     restore = sub.add_parser("restore-plan", help="show the browser windows/tabs that would reopen")
     restore.add_argument("--db", type=Path, default=None)

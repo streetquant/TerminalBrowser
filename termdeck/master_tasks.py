@@ -76,7 +76,7 @@ def state_from_snapshot(record: SessionRecord, snap: ResourceSnapshot) -> str:
         return "paused" if snap.state == "T" else "running"
     if record.status == "paused":
         return "paused"
-    return record.status if record.status in {"new", "stopped", "archived"} else "stopped"
+    return record.status if record.status in {"new", "recovery-pending", "stopped", "archived"} else "stopped"
 
 
 def row_from_record(

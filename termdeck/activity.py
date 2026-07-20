@@ -159,6 +159,8 @@ def classify_activity(record: SessionRecord, capture: str, *, capture_available:
     if not tail.strip():
         if record.status == "new":
             return ActivityItem(record, "not started", "grey", 1, "no terminal output has been produced yet", "open session", preview, redacted, labels)
+        if record.status == "recovery-pending":
+            return ActivityItem(record, "recovery pending", "red", 3, "exact process recovery has not completed", "inspect checkpoint status", preview, redacted, labels)
         if record.status in {"stopped", "archived"}:
             return ActivityItem(record, record.status, "grey", 1, f"session is {record.status}", "restart or archive", preview, redacted, labels)
         return ActivityItem(record, "silent", "grey", 1, "no recent visible output", "focus only if unexpected", preview, redacted, labels)

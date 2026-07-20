@@ -88,9 +88,35 @@ class TabCloseBehaviourTest(TestCase):
 
         self.assertEqual(count, 2)
         self.assertEqual(calls[0], ("terminate", "first"))
-        self.assertEqual(calls[1], ("update", "first", {"status": "stopped", "visible": False, "last_pid": None}))
+        self.assertEqual(
+            calls[1],
+            (
+                "update",
+                "first",
+                {
+                    "status": "stopped",
+                    "visible": False,
+                    "last_pid": None,
+                    "recovery_command": None,
+                    "recovery_cwd": None,
+                },
+            ),
+        )
         self.assertEqual(calls[2], ("terminate", "second"))
-        self.assertEqual(calls[3], ("update", "second", {"status": "stopped", "visible": False, "last_pid": None}))
+        self.assertEqual(
+            calls[3],
+            (
+                "update",
+                "second",
+                {
+                    "status": "stopped",
+                    "visible": False,
+                    "last_pid": None,
+                    "recovery_command": None,
+                    "recovery_cwd": None,
+                },
+            ),
+        )
         self.assertEqual(calls[4], ("close", {"first", "second"}))
 
 

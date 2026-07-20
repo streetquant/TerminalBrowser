@@ -39,6 +39,15 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(health.label, "missing")
         self.assertTrue(health.is_attention)
 
+    def test_recovery_pending_is_not_presented_as_a_restartable_missing_task(self) -> None:
+        health = evaluate_health(
+            record(status="recovery-pending"),
+            ResourceSnapshot(pid=None, exists=False),
+        )
+        self.assertEqual(health.label, "recovery pending")
+        self.assertEqual(health.suggested_action, "inspect checkpoint status")
+        self.assertTrue(health.is_attention)
+
     def test_critical_memory_wins_over_high_cpu(self) -> None:
         policy = HealthPolicy(high_cpu_percent=100.0, critical_cpu_percent=300.0, high_memory_bytes=1024, critical_memory_bytes=2048)
         health = evaluate_health(

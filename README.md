@@ -182,8 +182,17 @@ t1000 gui --workspace agents.workspace.json
 ```
 One JSON file defines all windows, tabs, commands, and directories. Reopen any time and everything restores exactly.
 
-### Sessions survive reboots
-Close T-1000, reboot the machine, reopen — all tabs come back. Agents that were mid-task can be resumed exactly where they were.
+### Exact sessions survive reboots
+TermDeck restores the same tab layout and uses two exact recovery layers. Foreground Codex tabs persist the primary conversation UUID and reopen with `codex resume <UUID>`; other newly managed local process trees use DMTCP checkpoints so supported Python, shell, and local process memory resumes from the saved execution state rather than rerunning the command.
+
+```bash
+t1000 checkpoint --all                    # inspect/save exact state now
+t1000 install-checkpoint-service          # user-level compatibility hook
+sudo t1000 install-checkpoint-service \
+  --system --user "$USER" --uid "$(id -u)" --home "$HOME"
+```
+
+The strict system service checkpoints before the user manager and its tmux scopes stop. DMTCP must be installed and available in the target user's `PATH`. Processes created before DMTCP wrapping cannot be checkpointed retroactively; after a reboot they are shown as `recovery-pending` instead of being silently replaced by a newly started command.
 
 ## Keyboard shortcuts
 
