@@ -2,6 +2,7 @@
 
 ## 0.2.10
 
+- Added fail-closed legacy Codex archive recovery for tabs saved before exact UUID persistence. Startup reads only bounded primary `source="cli"` metadata, matches exact project directories or unique near-time sessions, prevents duplicate UUID resumes, and restores unprovable shell-backed tabs as shells without calling them exact conversations.
 - Fixed rebooted Codex tabs being launched below DMTCP, whose default checkpoint signal conflicts with Codex. New and recovered Codex commands now bypass DMTCP completely and resume directly by their exact UUID.
 - Kept exact Codex recovery metadata durable through both containment and shutdown races: a primary `source="cli"` rollout remains authoritative when bubblewrap gives the native process no host controlling TTY, and late shutdown observations can no longer erase an already persisted UUID after tmux teardown begins.
 - Added reboot-safe exact Codex recovery: TermDeck identifies the primary foreground Codex rollout UUID, excludes subagent rollouts, stores only a validated `codex ... resume <UUID>` command, prefers the native Codex process over launcher wrappers, and prevents weaker periodic observations from downgrading an exact saved UUID.
@@ -35,7 +36,7 @@
 - Replaced the terminal client's Python `preexec_fn` path with `start_new_session=True` and focused newly opened VTE surfaces immediately.
 - Tightened the header and terminal frame, replaced the oversized circular New-tab action with a compact semantic control, removed persistent-surface transitions and broad shadows, and restored readable tab-name widths.
 - Added shortcut hints and accessible close names without adding visible chrome.
-- Verified the full test suite plus real GTK/tmux recovery, including a 30-tab empty-backend recovery that resumes an exact Codex UUID in its saved process cwd, explicit rejection of automatic DMTCP for production tabs, select-to-copy, cross-window tab relocation, remembered-window startup seeding, killed-tab history, first-key delivery into a waiting PTY, live cwd labels, high-scale Tabs-pane bounds/navigation, tmux/Codex wheel and thumb-drag routing without a roaming pager cursor or composer history input, and synchronized resize grids.
+- Verified 524 tests plus real GTK/tmux recovery, including a 30-tab empty-backend recovery that resumes an exact Codex UUID in its saved process cwd, legacy archive reconstruction, explicit rejection of automatic DMTCP for production tabs, select-to-copy, cross-window tab relocation, remembered-window startup seeding, killed-tab history, first-key delivery into a waiting PTY, live cwd labels, high-scale Tabs-pane bounds/navigation, tmux/Codex wheel and thumb-drag routing without a roaming pager cursor or composer history input, and synchronized resize grids.
 
 ## 0.2.9
 

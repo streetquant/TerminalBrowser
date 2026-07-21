@@ -29,6 +29,7 @@ from .capacity import (
     UI_RESOURCE_REFRESH_BUDGET,
     bounded_registry_records,
 )
+from .codex_archive import LegacyRecoveryResult, repair_legacy_recovery
 from .command_palette import PaletteItem, build_palette_items, search_palette
 from .control_plan import ControlPlan, build_control_plan, render_control_plan_text
 from .health import HealthPolicy, classify_session, health_badge, should_pause_for_attention
@@ -5053,6 +5054,8 @@ class TermDeckApplication(Gtk.Application):
         self._chrome_css = ""
         self._shutdown_persistence_started = False
         self._last_persistence_result: PersistenceResult | None = None
+        self._legacy_recovery_checked = False
+        self._last_legacy_recovery_result: LegacyRecoveryResult | None = None
 
     def do_startup(self) -> None:
         Gtk.Application.do_startup(self)
@@ -5520,6 +5523,19 @@ class TermDeckApplication(Gtk.Application):
             recover_missing=True,
             resource_sample_limit=UI_RESOURCE_REFRESH_BUDGET,
         )
+
+        # Older TermDeck versions sometimes persisted only ``codex --yolo``
+        # instead of the primary UUID. Reconciliation first identifies every
+        # missing process as recovery-pending; then this bounded source=cli
+        # archive pass can repair it on the first startup after a reboot.
+        # Unambiguous sessions resume exactly, while safe shell-backed leftovers
+        # regain their tab surface without being misrepresented as conversations.
+        if not getattr(self, "_legacy_recovery_checked", False):
+            self._legacy_recovery_checked = True
+            try:
+                self._last_legacy_recovery_result = repair_legacy_recovery(self.store)
+            except Exception:
+                self._last_legacy_recovery_result = None
 
         # Drop destroyed windows so a single-instance re-activate does not skip
         # restore while holding stale ApplicationWindow references.

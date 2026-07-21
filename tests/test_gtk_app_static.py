@@ -25,12 +25,20 @@ class GtkAppStaticTests(unittest.TestCase):
         for node in tree.body:
             if not isinstance(node, ast.ImportFrom) or not node.module or not node.level:
                 continue
-            if node.module in {"command_palette", "command_render", "shortcuts", "session_store", "models", "master_tasks", "health", "workspace_recipe", "control_plan", "session_lifecycle", "session_search"}:
+            if node.module in {"codex_archive", "command_palette", "command_render", "shortcuts", "session_store", "models", "master_tasks", "health", "workspace_recipe", "control_plan", "session_lifecycle", "session_search"}:
                 module = importlib.import_module(f"termdeck.{node.module}")
                 for alias in node.names:
                     if alias.name == "*":
                         continue
                     self.assertTrue(hasattr(module, alias.name), f"{node.module}.{alias.name} is imported by gtk_app.py but missing")
+
+    def test_archive_recovery_runs_after_startup_reconciliation(self):
+        source = GTK_APP.read_text(encoding="utf-8")
+        reconcile_call = source.index("reconcile_store(\n            self.store")
+        recovery_call = source.index("repair_legacy_recovery(self.store)", reconcile_call)
+        window_restore = source.index("groups = self.store.windows_with_visible_sessions()", recovery_call)
+        self.assertLess(reconcile_call, recovery_call)
+        self.assertLess(recovery_call, window_restore)
 
     def test_termdeck_window_has_no_duplicate_method_definitions(self):
         tree = ast.parse(GTK_APP.read_text(encoding="utf-8"))
