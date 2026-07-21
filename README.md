@@ -180,19 +180,19 @@ t1000 search-output "needs approval" --tag ai  # find specific text across all t
 ```bash
 t1000 gui --workspace agents.workspace.json
 ```
-One JSON file defines all windows, tabs, commands, and directories. Reopen any time and everything restores exactly.
+One JSON file defines all windows, tabs, commands, and directories. TermDeck restores the window and tab layout; process recovery follows the rules below.
 
-### Exact sessions survive reboots
-TermDeck restores the same tab layout and uses two exact recovery layers. Foreground Codex tabs persist the primary conversation UUID and reopen directly with `codex resume <UUID>`; Codex is never wrapped in DMTCP because both programs use the same default checkpoint signal. Other newly managed local process trees use DMTCP checkpoints so supported Python, shell, and local process memory resumes from the saved execution state rather than rerunning the command.
+### Exact Codex sessions survive reboots
+Foreground Codex tabs persist the primary conversation UUID and reopen directly with `codex resume <UUID>`. The same conversation, working directory, and safe value-free launch flags return in a new operating-system process.
 
 ```bash
-t1000 checkpoint --all                    # inspect/save exact state now
+t1000 checkpoint --all                    # inspect/save exact Codex recovery state
 t1000 install-checkpoint-service          # user-level compatibility hook
 sudo t1000 install-checkpoint-service \
   --system --user "$USER" --uid "$(id -u)" --home "$HOME"
 ```
 
-The strict system service checkpoints before the user manager and its tmux scopes stop. DMTCP must be installed and available in the target user's `PATH`. Processes created before DMTCP wrapping cannot be checkpointed retroactively; after a reboot they are shown as `recovery-pending` instead of being silently replaced by a newly started command.
+The strict system service performs a final exact-UUID scan before the user manager and tmux scopes stop. Ordinary shells and jobs remain alive across TermDeck GUI restarts because tmux owns them, but their instruction-level memory is not generically restored after an operating-system reboot. Automatic DMTCP wrapping is disabled: real tmux PTYs exposed application-signal conflicts, fork-path failures, and indefinite drains on external network sockets. Long-running non-Codex work should use its own durable checkpoints and idempotent resume command. A missing uncheckpointed process fails closed as `recovery-pending`; TermDeck never silently reruns it from the beginning.
 
 ## Keyboard shortcuts
 

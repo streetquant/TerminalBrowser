@@ -30,12 +30,31 @@ class DmtcpCheckpointManagerTests(unittest.TestCase):
     def _which(name: str) -> str:
         return f"/usr/bin/{name}"
 
-    def test_wrap_launch_command_uses_one_private_coordinator_per_tab(self):
+    def test_process_checkpointing_is_disabled_by_default_for_tmux_tabs(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch(
             "termdeck.checkpointing.shutil.which",
             side_effect=self._which,
         ):
             manager = DmtcpCheckpointManager(root=tmp)
+            record = _record()
+
+            self.assertFalse(manager.available)
+            self.assertEqual(manager.wrap_launch_command(record, record.command), record.command)
+            self.assertIsNone(manager.restart_command(record))
+            self.assertIn("disabled for TermDeck tmux tabs", manager.unavailable_detail())
+            result = manager.checkpoint(record)
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.exact)
+        self.assertEqual(result.action, "unsupported")
+        self.assertIn("disabled for TermDeck tmux tabs", result.detail)
+
+    def test_wrap_launch_command_uses_one_private_coordinator_per_tab(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "termdeck.checkpointing.shutil.which",
+            side_effect=self._which,
+        ):
+            manager = DmtcpCheckpointManager(root=tmp, enabled=True)
             record = _record()
             command = manager.wrap_launch_command(record, record.command)
             argv = shlex.split(command)
@@ -43,6 +62,7 @@ class DmtcpCheckpointManagerTests(unittest.TestCase):
         self.assertEqual(argv[0], "/usr/bin/dmtcp_launch")
         self.assertIn("--new-coordinator", argv)
         self.assertEqual(argv[argv.index("--coord-port") + 1], "0")
+        self.assertEqual(argv[argv.index("--ckpt-signal") + 1], "30")
         self.assertEqual(argv[-3:], ["/bin/sh", "-lc", "python worker.py"])
         self.assertIn(str(Path(tmp) / record.id / "coordinator.port"), argv)
 
@@ -51,7 +71,7 @@ class DmtcpCheckpointManagerTests(unittest.TestCase):
             "termdeck.checkpointing.shutil.which",
             side_effect=self._which,
         ):
-            manager = DmtcpCheckpointManager(root=tmp)
+            manager = DmtcpCheckpointManager(root=tmp, enabled=True)
             record = _record()
             directory = manager.session_dir(record)
             directory.mkdir(parents=True)
@@ -62,6 +82,7 @@ class DmtcpCheckpointManagerTests(unittest.TestCase):
                     {
                         "schema": CHECKPOINT_SCHEMA,
                         "session_id": record.id,
+                        "checkpoint_signal": manager.checkpoint_signal,
                         "files": [image.name],
                     }
                 ),
@@ -72,7 +93,7 @@ class DmtcpCheckpointManagerTests(unittest.TestCase):
             self.assertIsNotNone(command)
             argv = shlex.split(command or "")
 
-        self.assertEqual(argv[0], "/usr/bin/dmtcp_restart")
+        self.assertEqual(argv[:3], ["/usr/bin/env", "DMTCP_SIGCKPT=30", "/usr/bin/dmtcp_restart"])
         self.assertEqual(argv[-1], str(image))
 
     def test_checkpoint_commits_only_after_images_exist(self):
@@ -80,7 +101,7 @@ class DmtcpCheckpointManagerTests(unittest.TestCase):
             "termdeck.checkpointing.shutil.which",
             side_effect=self._which,
         ):
-            manager = DmtcpCheckpointManager(root=tmp)
+            manager = DmtcpCheckpointManager(root=tmp, enabled=True)
             record = _record()
             directory = manager.session_dir(record)
             directory.mkdir(parents=True)
@@ -115,7 +136,7 @@ class DmtcpCheckpointManagerTests(unittest.TestCase):
             "termdeck.checkpointing.shutil.which",
             side_effect=self._which,
         ):
-            manager = DmtcpCheckpointManager(root=tmp)
+            manager = DmtcpCheckpointManager(root=tmp, enabled=True)
             record = _record()
             directory = manager.session_dir(record)
             directory.mkdir(parents=True)
@@ -125,6 +146,7 @@ class DmtcpCheckpointManagerTests(unittest.TestCase):
             old_manifest = {
                 "schema": CHECKPOINT_SCHEMA,
                 "session_id": record.id,
+                "checkpoint_signal": manager.checkpoint_signal,
                 "files": [image.name],
             }
             manager.manifest_file(record).write_text(

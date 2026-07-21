@@ -15,7 +15,7 @@ from .control_plan import build_control_plan
 from .desktop_integration import build_install_plan, install_desktop, uninstall_desktop
 from .diagnostics import build_diagnostic_payload, write_diagnostic_bundle
 from .health import classify_session, health_badge, should_pause_for_attention
-from .persistence import persist_live_sessions
+from .persistence import persist_live_sessions, persistence_candidates
 from .quickstart import build_quickstart
 from .redaction import redact_text
 from .resource_budget import BudgetConfigError, assess_budgets, default_budgets, load_budgets, render_budget_table, sample_budget_json
@@ -1054,21 +1054,20 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
 
     store = SessionStore(args.db)
     try:
-        explicit = bool(
+        targeted = bool(
             getattr(args, "selectors", None)
             or getattr(args, "tag", None)
-            or getattr(args, "all", False)
         )
-        if explicit:
+        if targeted:
             selected = _target_records_from_args(store, args)
+            selected = [
+                record
+                for record in selected
+                if record.status not in {"archived", "stopped"}
+                and not getattr(record, "external", False)
+            ]
         else:
-            selected = store.list(include_archived=False, include_stopped=False)
-        selected = [
-            record
-            for record in selected
-            if record.status not in {"archived", "stopped"}
-            and not getattr(record, "external", False)
-        ]
+            selected = persistence_candidates(store)
         result = persist_live_sessions(store, TmuxBackend(), records=selected)
     finally:
         store.close()

@@ -18,14 +18,23 @@ class PersistenceResult:
         return sum(1 for row in self.checkpoints if row.ok and row.exact)
 
     @property
+    def unsupported_count(self) -> int:
+        return sum(1 for row in self.checkpoints if row.action == "unsupported")
+
+    @property
     def failed_count(self) -> int:
-        return sum(1 for row in self.checkpoints if not row.ok)
+        return sum(
+            1
+            for row in self.checkpoints
+            if not row.ok and row.action != "unsupported"
+        )
 
     def as_dict(self) -> dict[str, object]:
         return {
             "metadata_updates": self.metadata_updates,
             "checkpoint_count": len(self.checkpoints),
             "exact_count": self.exact_count,
+            "unsupported_count": self.unsupported_count,
             "failed_count": self.failed_count,
             "sessions": [row.as_dict() for row in self.checkpoints],
         }
@@ -34,10 +43,12 @@ class PersistenceResult:
 def persistence_candidates(store: SessionStore) -> list[SessionRecord]:
     """Return managed records whose process state may still be live."""
 
+    live_statuses = {"running", "paused", "missing"}
     return [
         record
         for record in store.list(include_archived=False, include_stopped=False)
         if not getattr(record, "external", False)
+        and record.status.casefold() in live_statuses
     ]
 
 

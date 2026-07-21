@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify window restore with exact Codex and validated-checkpoint paths."""
+"""Verify window restore with exact Codex and an injected recovery backend."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def main() -> int:
         from termdeck.gtk_app import Gtk, TermDeckApplication, _tabs_pane_records
 
         class SmokeCheckpointManager:
-            """Simulate already validated images; DMTCP has its own live smoke."""
+            """Simulate an explicitly injected validated-image recovery backend."""
 
             def __init__(self, directory: Path) -> None:
                 self.directory = directory

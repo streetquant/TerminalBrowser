@@ -125,6 +125,20 @@ class TmuxBackendTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[0].args[0][-1], "wrapped(/bin/bash)")
         self.assertNotIn("api_key=secret", run.call_args_list[0].args[0][-1])
 
+    def test_default_backend_launches_new_non_codex_tabs_without_dmtcp(self):
+        record = _record(command="/bin/bash", status="new")
+        backend = TmuxBackend(executable="tmux")
+        completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(backend, "session_exists", return_value=False), mock.patch.object(
+            backend, "_run", return_value=completed
+        ) as run:
+            backend.create_or_resume(record)
+
+        self.assertEqual(run.call_args_list[0].args[0][-1], "/bin/bash")
+        self.assertNotIn("dmtcp", run.call_args_list[0].args[0][-1].casefold())
+        self.assertFalse(backend.checkpoints.available)
+
     def test_missing_process_tree_restores_checkpoint_without_command_replay(self):
         checkpoints = FakeCheckpointManager(restart_command="restart-image")
         record = _record(command="python worker.py", status="recovery-pending")

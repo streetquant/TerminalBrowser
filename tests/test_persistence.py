@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from termdeck.checkpointing import CheckpointResult
-from termdeck.persistence import persist_live_sessions, persistence_candidates
+from termdeck.persistence import PersistenceResult, persist_live_sessions, persistence_candidates
 from termdeck.session_store import SessionStore
 
 
@@ -95,6 +95,25 @@ class PersistenceTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_unsupported_process_types_are_reported_without_failing_persistence(self):
+        result = PersistenceResult(
+            0,
+            (
+                CheckpointResult(
+                    "td-worker",
+                    "unsupported",
+                    False,
+                    False,
+                    "application-level checkpoint required",
+                ),
+            ),
+        )
+
+        self.assertEqual(result.exact_count, 0)
+        self.assertEqual(result.unsupported_count, 1)
+        self.assertEqual(result.failed_count, 0)
+        self.assertEqual(result.as_dict()["unsupported_count"], 1)
+
     def test_candidates_exclude_stopped_archived_and_external_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")
@@ -103,10 +122,14 @@ class PersistenceTests(unittest.TestCase):
                 stopped = store.create("stopped", "dev", "python stopped.py", tmp)
                 archived = store.create("archived", "dev", "python archived.py", tmp)
                 external = store.create("external", "dev", "python external.py", tmp)
+                start_error = store.create("start-error", "dev", "python broken.py", tmp)
+                recovery_pending = store.create("pending", "dev", "python pending.py", tmp)
                 store.update(running.id, status="running")
                 store.update(stopped.id, status="stopped")
                 store.update(archived.id, status="archived")
                 store.update(external.id, status="running", external=True)
+                store.update(start_error.id, status="start-error")
+                store.update(recovery_pending.id, status="recovery-pending")
 
                 selected = persistence_candidates(store)
 

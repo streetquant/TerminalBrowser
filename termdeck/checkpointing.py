@@ -15,8 +15,14 @@ from typing import Iterable
 from .models import SessionRecord
 from .session_store import APP_DIR
 
-CHECKPOINT_SCHEMA = "termdeck.process-checkpoint.v1"
+CHECKPOINT_SCHEMA = "termdeck.process-checkpoint.v2"
 DEFAULT_CHECKPOINT_ROOT = APP_DIR / "checkpoints"
+DEFAULT_DMTCP_CHECKPOINT_SIGNAL = 30
+_DMTCP_SUPPORTED_CHECKPOINT_SIGNALS = frozenset({10, 12, 23, 24, 25, 26, 27, 28, 29, 30, 31})
+DMTCP_DISABLED_DETAIL = (
+    "DMTCP is disabled for TermDeck tmux tabs because PTY child processes, "
+    "application signal handlers, and external sockets cannot be restored safely"
+)
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 
@@ -49,13 +55,13 @@ def _utc_now() -> str:
 
 
 class DmtcpCheckpointManager:
-    """Checkpoint TermDeck-managed process trees with DMTCP.
+    """Experimental DMTCP checkpoint manager, disabled for tmux tabs by default.
 
-    Each tab owns one DMTCP coordinator and checkpoint directory. A completed
-    checkpoint is exposed only after all image files exist and an atomic local
-    manifest has been written. The previous completed generation is retained
-    until the next generation commits, so an interrupted checkpoint cannot
-    destroy the last restorable state.
+    DMTCP process images remain available for isolated testing and explicitly
+    injected backends. Production TermDeck tabs do not launch or restart below
+    DMTCP: real tmux PTYs showed signal-handler conflicts, fork-path assertions,
+    and indefinite external-socket drains. Exact Codex UUID recovery is handled
+    separately and remains enabled.
     """
 
     def __init__(
@@ -65,12 +71,22 @@ class DmtcpCheckpointManager:
         launch_executable: str = "dmtcp_launch",
         command_executable: str = "dmtcp_command",
         restart_executable: str = "dmtcp_restart",
+        checkpoint_signal: int = DEFAULT_DMTCP_CHECKPOINT_SIGNAL,
+        enabled: bool = False,
         timeout_seconds: float = 180.0,
     ) -> None:
         self.root = Path(root).expanduser() if root else DEFAULT_CHECKPOINT_ROOT
         self.launch_executable = launch_executable
         self.command_executable = command_executable
         self.restart_executable = restart_executable
+        self.enabled = bool(enabled)
+        clean_signal = int(checkpoint_signal)
+        if clean_signal not in _DMTCP_SUPPORTED_CHECKPOINT_SIGNALS:
+            raise ValueError(
+                "unsupported DMTCP checkpoint signal; use one of "
+                f"{sorted(_DMTCP_SUPPORTED_CHECKPOINT_SIGNALS)}"
+            )
+        self.checkpoint_signal = clean_signal
         self.timeout_seconds = max(5.0, float(timeout_seconds))
 
     @staticmethod
@@ -79,7 +95,7 @@ class DmtcpCheckpointManager:
 
     @property
     def available(self) -> bool:
-        return all(
+        return self.enabled and all(
             self._resolved_executable(name)
             for name in (
                 self.launch_executable,
@@ -89,6 +105,8 @@ class DmtcpCheckpointManager:
         )
 
     def unavailable_detail(self) -> str:
+        if not self.enabled:
+            return DMTCP_DISABLED_DETAIL
         missing = [
             name
             for name in (
@@ -137,7 +155,11 @@ class DmtcpCheckpointManager:
             return None
         if not isinstance(payload, dict):
             return None
-        if payload.get("schema") != CHECKPOINT_SCHEMA or payload.get("session_id") != record.id:
+        if (
+            payload.get("schema") != CHECKPOINT_SCHEMA
+            or payload.get("session_id") != record.id
+            or payload.get("checkpoint_signal") != self.checkpoint_signal
+        ):
             return None
         names = payload.get("files")
         if not isinstance(names, list) or not names:
@@ -179,6 +201,8 @@ class DmtcpCheckpointManager:
                 str(self.port_file(record)),
                 "--ckptdir",
                 str(directory),
+                "--ckpt-signal",
+                str(self.checkpoint_signal),
                 "--ckpt-open-files",
                 "/bin/sh",
                 "-lc",
@@ -200,9 +224,12 @@ class DmtcpCheckpointManager:
         except FileNotFoundError:
             pass
         restart = self._resolved_executable(self.restart_executable) or self.restart_executable
+        env = self._resolved_executable("env") or "/usr/bin/env"
         files = [str(directory / str(name)) for name in manifest["files"]]  # type: ignore[index]
         return shlex.join(
             [
+                env,
+                f"DMTCP_SIGCKPT={self.checkpoint_signal}",
                 restart,
                 "--new-coordinator",
                 "--coord-port",
@@ -254,6 +281,14 @@ class DmtcpCheckpointManager:
     def checkpoint(self, record: SessionRecord) -> CheckpointResult:
         if getattr(record, "external", False):
             return CheckpointResult(record.id, "checkpoint", False, False, "external tmux sessions cannot be checkpointed")
+        if not self.enabled:
+            return CheckpointResult(
+                record.id,
+                "unsupported",
+                False,
+                False,
+                DMTCP_DISABLED_DETAIL,
+            )
         if not self.available:
             return CheckpointResult(record.id, "checkpoint", False, False, self.unavailable_detail())
         try:
@@ -300,6 +335,7 @@ class DmtcpCheckpointManager:
         manifest = {
             "schema": CHECKPOINT_SCHEMA,
             "session_id": record.id,
+            "checkpoint_signal": self.checkpoint_signal,
             "created_at": _utc_now(),
             "command": record.command,
             "cwd": record.cwd,
