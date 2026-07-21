@@ -215,9 +215,9 @@ class TmuxBackend:
                 command = f"{recovery}; exec {shlex.join(launch_argv)}"
             else:
                 command = recovery
-            # Keep the recovered shell under DMTCP so a later non-Codex command
-            # in the same tab can be checkpointed without recreating the tab.
-            command = self.checkpoints.wrap_launch_command(record, command)
+            # Codex owns durable conversation state and uses SIGUSR2 itself.
+            # Never place either exact Codex recovery or its trailing shell under
+            # DMTCP: doing so steals signal 12 from Codex and can prevent startup.
         else:
             checkpoint_command = self.checkpoints.restart_command(record)
             if checkpoint_command:
@@ -232,7 +232,11 @@ class TmuxBackend:
                     "or validated process checkpoint was saved"
                 )
             else:
-                command = self.checkpoints.wrap_launch_command(record, original_command)
+                command = (
+                    original_command
+                    if self._is_codex_launch_command(original_command)
+                    else self.checkpoints.wrap_launch_command(record, original_command)
+                )
         # tmux accepts the command as one shell command argument, which preserves
         # normal shell syntax for commands such as "npm run dev" or "codex".
         self._run([
@@ -669,6 +673,14 @@ class TmuxBackend:
             session_id: command
             for session_id, (command, _cwd) in self.recovery_metadata(records).items()
         }
+
+    @staticmethod
+    def _is_codex_launch_command(command: str) -> bool:
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            return False
+        return safe_codex_recovery_command(argv) is not None
 
     @staticmethod
     def _exact_codex_recovery(record: SessionRecord) -> str | None:

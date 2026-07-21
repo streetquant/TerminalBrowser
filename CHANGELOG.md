@@ -2,6 +2,8 @@
 
 ## 0.2.10
 
+- Fixed rebooted Codex tabs being launched below DMTCP, whose default checkpoint signal conflicts with Codex. New and recovered Codex commands now bypass DMTCP completely and resume directly by their exact UUID.
+- Kept exact Codex recovery metadata durable through both containment and shutdown races: a primary `source="cli"` rollout remains authoritative when bubblewrap gives the native process no host controlling TTY, and late shutdown observations can no longer erase an already persisted UUID after tmux teardown begins.
 - Added reboot-safe exact Codex recovery: TermDeck identifies the primary foreground Codex rollout UUID, excludes subagent rollouts, stores only a validated `codex ... resume <UUID>` command, prefers the native Codex process over launcher wrappers, and prevents weaker periodic observations from downgrading an exact saved UUID.
 - Added DMTCP-backed process checkpoints for TermDeck-managed tabs. New process trees launch under a private per-tab coordinator; shutdown commits an atomic last-good image set and manifest, and reboot restores Python interpreters, shells, local process memory, open files supported by DMTCP, and execution position instead of merely replaying the command.
 - Made crash recovery fail closed. A previously running tab becomes `recovery-pending`; startup restores an exact Codex UUID or a validated process checkpoint, otherwise it remains an explicit recovery error and never starts a substitute/random process. Deliberately new tabs still launch normally, and Kill deletes stale checkpoints so stopped work cannot resurrect.

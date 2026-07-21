@@ -183,7 +183,7 @@ t1000 gui --workspace agents.workspace.json
 One JSON file defines all windows, tabs, commands, and directories. Reopen any time and everything restores exactly.
 
 ### Exact sessions survive reboots
-TermDeck restores the same tab layout and uses two exact recovery layers. Foreground Codex tabs persist the primary conversation UUID and reopen with `codex resume <UUID>`; other newly managed local process trees use DMTCP checkpoints so supported Python, shell, and local process memory resumes from the saved execution state rather than rerunning the command.
+TermDeck restores the same tab layout and uses two exact recovery layers. Foreground Codex tabs persist the primary conversation UUID and reopen directly with `codex resume <UUID>`; Codex is never wrapped in DMTCP because both programs use the same default checkpoint signal. Other newly managed local process trees use DMTCP checkpoints so supported Python, shell, and local process memory resumes from the saved execution state rather than rerunning the command.
 
 ```bash
 t1000 checkpoint --all                    # inspect/save exact state now

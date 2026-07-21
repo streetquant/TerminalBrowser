@@ -67,9 +67,14 @@ def persist_live_sessions(
             observed = dict(observe(selected))
         except Exception:
             observed = {}
+        # Shutdown observation races with desktop/session teardown. A readable
+        # shell after Codex has already received SIGTERM is not evidence that a
+        # previously persisted UUID is obsolete. Final persistence may add or
+        # replace resumable metadata, but it must never erase durable exact state.
         updates = [
-            (session_id, command, cwd if command else None)
+            (session_id, command, cwd)
             for session_id, (command, cwd) in observed.items()
+            if command is not None
         ]
         if updates:
             metadata_updates = store.update_recovery_metadata(updates)

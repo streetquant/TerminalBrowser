@@ -67,6 +67,34 @@ class PersistenceTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_shutdown_observation_never_erases_persisted_exact_codex_uuid(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                record = store.create("agent", "ai", "/bin/bash", tmp)
+                store.update(record.id, status="running", last_pid=101)
+                store.update_recovery_metadata(
+                    [(record.id, f"codex --yolo resume {session_id}", tmp)]
+                )
+                backend = RecordingBackend({record.id: (None, None)})
+
+                result = persist_live_sessions(store, backend)
+                refreshed = store.get(record.id)
+
+                self.assertEqual(result.metadata_updates, 0)
+                self.assertEqual(result.exact_count, 1)
+                self.assertEqual(
+                    refreshed.recovery_command,  # type: ignore[union-attr]
+                    f"codex --yolo resume {session_id}",
+                )
+                self.assertEqual(
+                    backend.checkpoint_records_seen[0].recovery_command,
+                    f"codex --yolo resume {session_id}",
+                )
+            finally:
+                store.close()
+
     def test_candidates_exclude_stopped_archived_and_external_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")

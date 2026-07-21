@@ -83,10 +83,11 @@ class TmuxBackendTests(unittest.TestCase):
                         record.tmux_name,
                         "-c",
                         str(recovery_cwd.resolve()),
-                        f"wrapped(codex --yolo resume {session_id}; exec /bin/bash)",
+                        f"codex --yolo resume {session_id}; exec /bin/bash",
                     ]
                 ),
             )
+            self.assertEqual(checkpoints.wrapped, [])
 
     def test_missing_recovery_directory_falls_back_to_the_saved_tab_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -171,7 +172,8 @@ class TmuxBackendTests(unittest.TestCase):
         ) as run:
             backend.create_or_resume(record)
 
-        self.assertEqual(run.call_args_list[0].args[0][-1], "wrapped(codex --yolo)")
+        self.assertEqual(run.call_args_list[0].args[0][-1], "codex --yolo")
+        self.assertEqual(checkpoints.wrapped, [])
 
     def test_checkpoint_records_uses_exact_codex_uuid_without_memory_image(self):
         session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"

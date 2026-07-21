@@ -204,23 +204,24 @@ def observe_recovery_metadata(
         session_id = _primary_codex_session_id(pid)
         command = safe_codex_recovery_command(argv, session_id=session_id)
         if command is not None:
+            cwd = _process_cwd(pid)
+            if session_id is not None:
+                # Contained Codex deliberately enters a fresh session with
+                # bubblewrap, so the native process has no host-side controlling
+                # TTY. Its open primary rollout (source="cli") is stronger
+                # identity evidence than host TTY ownership and already excludes
+                # structured subagent rollouts.
+                return True, command, cwd
             stat = _parse_stat(pid)
             if not stat:
                 continue
-            # The native Codex process can be a child of its Node launcher but
-            # shares that launcher's foreground process group. Requiring the
-            # candidate's group to own its TTY excludes background agents.
+            # Weaker Node/containment launchers do not own the primary rollout.
+            # Require host foreground-TTY ownership before retaining one as a
+            # fallback so background launchers are never replayed automatically.
             if int(stat.get("tty_nr", 0)) == 0 or int(
                 stat.get("pgrp", -1)
             ) != int(stat.get("tpgid", -2)):
                 continue
-            cwd = _process_cwd(pid)
-            if session_id is not None:
-                return True, command, cwd
-            # Node and containment launchers can be visited before the native
-            # Codex process that owns the rollout file. Retain the weaker
-            # observation only as a fallback after every foreground candidate
-            # has been inspected.
             if weaker_codex is None:
                 weaker_codex = (command, cwd)
     if weaker_codex is not None:

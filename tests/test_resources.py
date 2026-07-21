@@ -127,6 +127,30 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(command, f"codex --yolo resume {session_id}")
         self.assertEqual(cwd, "/8tb/projects/example")
 
+    def test_recovery_observation_accepts_exact_contained_codex_without_host_tty(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        with mock.patch(
+            "termdeck.resources.process_tree",
+            return_value=[100, 101],
+        ), mock.patch(
+            "termdeck.resources._process_argv",
+            side_effect=[("bash",), ("/usr/bin/codex", "--yolo", "resume", session_id)],
+        ), mock.patch(
+            "termdeck.resources._parse_stat",
+            return_value={"tty_nr": 0, "pgrp": 101, "tpgid": -1},
+        ), mock.patch(
+            "termdeck.resources._process_cwd",
+            return_value="/workspace/project",
+        ), mock.patch(
+            "termdeck.resources._primary_codex_session_id",
+            side_effect=lambda pid: session_id if pid == 101 else None,
+        ):
+            observed, command, cwd = observe_recovery_metadata(100)
+
+        self.assertTrue(observed)
+        self.assertEqual(command, f"codex --yolo resume {session_id}")
+        self.assertEqual(cwd, "/workspace/project")
+
     def test_recovery_observation_prefers_native_exact_uuid_over_node_launcher(self):
         session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
         argv_by_pid = {
