@@ -3340,19 +3340,25 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.set_titlebar(header)
         self.set_title(f"TermDeck · {self.window_title}")
 
-        new_window_btn = _icon_button(
-            "New window",
+        # Keep a permanent per-window New tab control in the header. The
+        # browser-style floating + beside the notebook tabs hides when the
+        # scrollable strip is full, so it cannot be the only mouse-accessible
+        # way to create another tab. New-window creation remains available in
+        # the overflow menu without consuming scarce header space.
+        header_new_tab = _icon_button(
+            "New tab",
             "list-add-symbolic",
-            "New window · opens with a shell in the home directory",
-            self.new_window_direct,
+            "New tab · Ctrl+T · opens in the home directory",
+            self.new_tab,
             suggested=False,
             show_label=False,
         )
-        _style(new_window_btn, "td-new-tab", "td-header-icon")
+        _style(header_new_tab, "td-new-tab", "td-header-icon")
         # Keep the button a centred square instead of stretching to the full
         # headerbar height (noticeable at large UI font scales).
-        new_window_btn.set_valign(Gtk.Align.CENTER)
-        header.pack_start(new_window_btn)
+        header_new_tab.set_valign(Gtk.Align.CENTER)
+        self._header_new_tab = header_new_tab
+        header.pack_start(header_new_tab)
 
         overflow_header_actions = [
             ("Rename window", self.rename_window),

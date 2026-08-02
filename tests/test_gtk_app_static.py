@@ -73,6 +73,14 @@ class GtkAppStaticTests(unittest.TestCase):
         self.assertNotIn("open_detected_project", source)
         self.assertNotIn("open_launcher", source)
 
+    def test_every_window_keeps_a_permanent_new_tab_control(self):
+        source = GTK_APP.read_text(encoding="utf-8")
+        self.assertIn('header_new_tab = _icon_button(\n            "New tab"', source)
+        self.assertIn("self.new_tab,", source)
+        self.assertIn("self._header_new_tab = header_new_tab", source)
+        self.assertIn("header.pack_start(header_new_tab)", source)
+        self.assertNotIn("self._header_new_window", source)
+
     def test_window_overview_is_exposed_in_gui(self):
         source = GTK_APP.read_text(encoding="utf-8")
         self.assertIn("WindowOverview", source)

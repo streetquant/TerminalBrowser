@@ -63,11 +63,15 @@ class ModernUiSystemTests(unittest.TestCase):
         self.assertIn("name.set_width_chars(min(20, max(4, len(record.name))))", GTK_APP)
         self.assertIn("name.set_max_width_chars(20)", GTK_APP)
 
-    def test_header_exposes_only_window_name_new_window_and_overflow(self) -> None:
+    def test_header_exposes_window_name_permanent_new_tab_and_overflow(self) -> None:
         self.assertIn('title = Gtk.Label(label=self.window_title', GTK_APP)
         self.assertIn("title.set_max_width_chars(28)", GTK_APP)
-        self.assertIn('new_window_btn = _icon_button(', GTK_APP)
+        self.assertIn('header_new_tab = _icon_button(', GTK_APP)
+        self.assertIn("self._header_new_tab = header_new_tab", GTK_APP)
+        self.assertIn("header.pack_start(header_new_tab)", GTK_APP)
+        self.assertIn("self.new_tab,", GTK_APP)
         self.assertIn("def new_window_direct", GTK_APP)
+        self.assertIn('("New TermDeck window", self.new_window)', GTK_APP)
         self.assertIn("overflow_header_actions", GTK_APP)
         self.assertIn('("Search tabs", self.open_search_window)', GTK_APP)
         self.assertIn('("Command palette", self.open_command_palette)', GTK_APP)
