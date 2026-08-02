@@ -4895,6 +4895,17 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if self.keymap.matches(event, "close_term"):
             self.close_current_tab()
             return True
+        if self.keymap.matches(event, "reopen_closed"):
+            self.reopen_last_closed_tab()
+            return True
+        shortcut_index = index_from_key_name(Gdk.keyval_name(event.keyval) or "")
+        state = KeyMap._clean_state(event.state)
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        alt = bool(state & Gdk.ModifierType.MOD1_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        if shortcut_index is not None and ctrl and not alt and not shift:
+            self.jump_to_tab(shortcut_index)
+            return True
         # Capture zoom / clipboard before VTE treats the chord as input.
         if self.handle_zoom_event(event):
             return True
@@ -5017,14 +5028,17 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             return True
 
         shortcut_index = index_from_key_name(key_name)
-        if shortcut_index is not None and int(event.state & Gdk.ModifierType.MOD1_MASK):
-            if int(event.state & Gdk.ModifierType.CONTROL_MASK):
+        state = KeyMap._clean_state(event.state)
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        alt = bool(state & Gdk.ModifierType.MOD1_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        if shortcut_index is not None:
+            if ctrl and alt:
                 self.toggle_pause_tab(shortcut_index)
-            elif not int(event.state & Gdk.ModifierType.SHIFT_MASK):
+                return True
+            if not shift and (ctrl or alt):
                 self.jump_to_tab(shortcut_index)
-            else:
-                return False
-            return True
+                return True
         return self._route_unhandled_key_to_terminal(event)
 
 
