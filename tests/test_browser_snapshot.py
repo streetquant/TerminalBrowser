@@ -22,13 +22,14 @@ class BrowserSnapshotTests(unittest.TestCase):
                 running = store.create("api", "dev", "python -m http.server", tmp, window_id="win-dev", window_title="Dev", tab_index=1)
                 hidden = store.create("logs", "logs", "tail -f app.log", tmp, window_id="win-dev", window_title="Dev", tab_index=0, visible=False)
                 stopped = store.create("old", "scratch", "bash", tmp, window_id="win-old", window_title="Old", tab_index=0)
-                store.update(running.id, status="running", last_pid=123)
+                store.update(running.id, status="running", last_pid=123, selected_account="work")
                 store.update(stopped.id, status="stopped")
                 payload = json.loads(browser_snapshot_json(store.list(include_archived=True), name="backup"))
             finally:
                 store.close()
 
             self.assertEqual(payload["schema"], "termdeck.browser-snapshot")
+            self.assertEqual(payload["schema_version"], 2)
             self.assertEqual(payload["counts"]["windows"], 2)
             self.assertEqual(payload["counts"]["tabs"], 3)
             self.assertEqual(payload["counts"]["hidden_tabs"], 1)
@@ -36,6 +37,7 @@ class BrowserSnapshotTests(unittest.TestCase):
             tabs = [tab for window in payload["windows"] for tab in window["tabs"]]
             self.assertEqual([tab["name"] for tab in tabs if tab["session_id"] == hidden.id], ["logs"])
             self.assertNotIn("tmux_name", tabs[0])
+            self.assertEqual(next(tab for tab in tabs if tab["session_id"] == running.id)["selected_account"], "work")
 
     def test_parse_rejects_wrong_schema(self):
         with self.assertRaises(BrowserSnapshotError):
@@ -83,7 +85,7 @@ class BrowserSnapshotTests(unittest.TestCase):
                                 "window_id": "win-dev",
                                 "title": "Dev",
                                 "tabs": [
-                                    {"session_id": "td-api", "name": "api", "tag": "dev", "command": "python -m http.server", "cwd": tmp, "status": "running", "visible": True, "tab_index": 0},
+                                    {"session_id": "td-api", "name": "api", "tag": "dev", "command": "python -m http.server", "cwd": tmp, "status": "running", "visible": True, "tab_index": 0, "selected_account": "work"},
                                     {"session_id": "td-old", "name": "old", "tag": "scratch", "command": "bash", "cwd": tmp, "status": "stopped", "visible": True, "tab_index": 1},
                                 ],
                             }
@@ -107,6 +109,9 @@ class BrowserSnapshotTests(unittest.TestCase):
                 self.assertEqual([row.name for row in imported], ["api", "old"])
                 self.assertEqual([row.status for row in imported], ["running", "new"])
                 self.assertTrue(all(row.last_pid is None for row in imported))
+                self.assertIsNone(imported[0].selected_account)
+                self.assertEqual(imported[0].pending_account, "work")
+                self.assertNotEqual(imported[0].codex_home, existing.codex_home)
             finally:
                 store.close()
 

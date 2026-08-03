@@ -8,6 +8,7 @@ from pathlib import Path
 
 from . import __version__
 from .activity import activity_to_dicts, filter_activities, render_activity_table, scan_activities, sort_activities
+from .codex_auth import CodexAuthError, CodexAuthManager
 from .browser_snapshot import BrowserSnapshotError, browser_snapshot_json, import_browser_snapshot, load_snapshot, restore_plan
 from .command_palette import build_palette_items, search_palette, serialise_palette_items
 from .capture_search import render_output_search_table, search_session_output
@@ -24,7 +25,7 @@ from .session_lifecycle import archive_records, hide_records, lifecycle_payload,
 from .session_reconcile import reconcile_store
 from .session_launcher import create_new_session, launch_payload, resolve_launch_fields
 from .session_search import render_search_table, search_sessions
-from .session_store import DEFAULT_DB_PATH, SessionStore
+from .session_store import DEFAULT_DB_PATH, SessionStore, utc_now
 from .settings import sample_settings_json
 from .shutdown_service import (
     ShutdownServiceError,
@@ -1249,6 +1250,101 @@ def cmd_sessions(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_auth(args: argparse.Namespace) -> int:
+    """Inspect or switch the private Codex account for exactly one terminal."""
+
+    store = SessionStore(args.db)
+    try:
+        records = _select_records(store, [args.selector])
+        if len(records) != 1:
+            _print_json(
+                {
+                    "action": "auth",
+                    "ok": False,
+                    "error": "selector must resolve to exactly one remembered terminal",
+                    "count": len(records),
+                }
+            )
+            return 2
+        record = records[0]
+        if record.external:
+            _print_json(
+                {
+                    "action": "auth",
+                    "ok": False,
+                    "id": record.id,
+                    "name": record.name,
+                    "error": (
+                        "adopted external tmux sessions cannot be retroactively isolated; "
+                        "recreate this terminal under TermDeck before switching Codex accounts"
+                    ),
+                }
+            )
+            return 2
+        manager = CodexAuthManager(account_source=store.account_source)
+        requested = (getattr(args, "switch_account", None) or "").strip()
+        if requested:
+            record = store.update(record.id, pending_account=requested)
+            result = manager.switch(record, requested)
+            if not result.ok:
+                record = store.update(record.id, pending_account=None)
+                payload = result.state.to_dict()
+                payload.update(
+                    {
+                        "action": "auth-switch",
+                        "ok": False,
+                        "id": record.id,
+                        "name": record.name,
+                        "auth_scope_id": record.auth_scope_id,
+                        "pending_account": None,
+                        "auth_restart_required": record.auth_restart_required,
+                        "error": result.error,
+                    }
+                )
+                _print_json(payload)
+                return 1
+            record = store.update(
+                record.id,
+                selected_account=result.state.selected_account,
+                pending_account=None,
+                auth_restart_required=True,
+                auth_changed_at=utc_now(),
+            )
+            state = result.state
+            action = "auth-switch"
+        else:
+            state = manager.state(record)
+            if state.selected_account != record.selected_account:
+                record = store.update(
+                    record.id,
+                    selected_account=state.selected_account,
+                    pending_account=None if (state.selected_account or record.selected_account) else record.pending_account,
+                    auth_restart_required=bool(record.auth_restart_required or state.selected_account != record.selected_account),
+                    auth_changed_at=utc_now(),
+                )
+            action = "auth"
+        payload = state.to_dict()
+        payload.update(
+            {
+                "action": action,
+                "ok": True,
+                "id": record.id,
+                "name": record.name,
+                "auth_scope_id": record.auth_scope_id,
+                "pending_account": record.pending_account,
+                "auth_restart_required": record.auth_restart_required,
+                "auth_changed_at": record.auth_changed_at,
+            }
+        )
+        _print_json(payload)
+        return 0
+    except CodexAuthError as exc:
+        _print_json({"action": "auth", "ok": False, "error": str(exc)})
+        return 1
+    finally:
+        store.close()
+
+
 def cmd_gui(args: argparse.Namespace) -> int:
     from .gtk_app import run
     return run(db_path=args.db, workspace_path=getattr(args, "workspace", None))
@@ -1380,6 +1476,12 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("--no-start", action="store_true", help="remember the tab without starting its hidden process")
     new.add_argument("--db", type=Path, default=None)
     new.set_defaults(func=cmd_new)
+
+    auth = sub.add_parser("auth", help="inspect or switch one terminal's isolated Codex account")
+    auth.add_argument("selector", help="session id/prefix, exact name, or tmux name")
+    auth.add_argument("--switch", dest="switch_account", default=None, help="saved account alias, email, or key")
+    auth.add_argument("--db", type=Path, default=None)
+    auth.set_defaults(func=cmd_auth)
 
     windows = sub.add_parser("windows", help="show aggregate browser-window resource usage without launching GTK")
     windows.add_argument("query", nargs="?", default="", help="filter by window id, title, health, or state summary")

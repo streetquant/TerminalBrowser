@@ -11,6 +11,7 @@ import subprocess
 import sys
 import termios
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from .capacity import (
     bounded_registry_records,
 )
 from .codex_archive import LegacyRecoveryResult, repair_legacy_recovery
+from .codex_auth import CodexAuthError, CodexAuthManager, CodexAuthState, CodexSwitchResult
 from .command_palette import PaletteItem, build_palette_items, search_palette
 from .control_plan import ControlPlan, build_control_plan, render_control_plan_text
 from .health import HealthPolicy, classify_session, health_badge, should_pause_for_attention
@@ -3306,6 +3308,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self._tab_directory_refresh_alive = True
         self._terminal_layout_sync_source_id = 0
         self._side_pane_layout_source_id = 0
+        self._auth_combo_updating = False
+        self._auth_switch_generation = 0
+        self._auth_switch_inflight: set[str] = set()
+        self._auth_fingerprints: dict[str, str] = {}
         # Relative point delta from the configured theme font (Ctrl++ / Ctrl+-).
         self.font_zoom_delta = 0
 
@@ -3360,6 +3366,16 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self._header_new_tab = header_new_tab
         header.pack_start(header_new_tab)
 
+        auth_combo = Gtk.ComboBoxText()
+        auth_combo.append("__none__", "Codex: no account")
+        auth_combo.set_active_id("__none__")
+        auth_combo.set_tooltip_text("Codex account for the current terminal")
+        auth_combo.set_valign(Gtk.Align.CENTER)
+        auth_combo.connect("changed", self._on_auth_account_changed)
+        _style(auth_combo, "td-auth-account")
+        self._auth_combo = auth_combo
+        header.pack_end(auth_combo)
+
         overflow_header_actions = [
             ("Rename window", self.rename_window),
             ("New TermDeck window", self.new_window),
@@ -3399,6 +3415,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.notebook.set_tab_pos(Gtk.PositionType.TOP)
         self.notebook.set_scrollable(True)
         self.notebook.connect("page-reordered", self._on_page_reordered)
+        self.notebook.connect("switch-page", self._on_notebook_switch_page)
         # Browser-style new-tab button floating just after the last tab
         # (like Chrome/Firefox). It lives in the chrome overlay and is
         # re-anchored on every strip re-layout; the headerbar + still
@@ -3458,6 +3475,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             self._queue_side_pane_layout_repack()
         self.side.refresh()
         self.restore_previous_tabs(records=restore_records)
+        self._refresh_auth_selector()
+        GLib.timeout_add_seconds(2, self._poll_codex_auth_state)
         GLib.timeout_add_seconds(
             int(max(1, round(getattr(app_context.settings, "ui_refresh_interval_seconds", 5.0)))),
             self._refresh_tab_directories_timer,
@@ -4334,6 +4353,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             if not record.window_id or record.window_id == self.window_id:
                 layout_changes["window_id"] = self.window_id
                 layout_changes["window_title"] = self.window_title
+        if not live_session:
+            # A newly launched tmux process will read the currently selected
+            # private auth.json, so any previous restart requirement is now met.
+            layout_changes["auth_restart_required"] = False
         record = self.app_context.store.update(
             record.id,
             last_opened_at=utc_now(),
@@ -4430,6 +4453,204 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     def current_record(self) -> SessionRecord | None:
         session_id = self.current_session_id()
         return self.app_context.store.get(session_id) if session_id else None
+
+    def _on_notebook_switch_page(self, *_args) -> None:
+        GLib.idle_add(self._refresh_auth_selector)
+
+    def _sync_observed_auth_state(
+        self,
+        record: SessionRecord,
+        state: CodexAuthState,
+    ) -> SessionRecord:
+        if state.selected_account == record.selected_account:
+            return record
+        pending = record.pending_account
+        if state.selected_account is not None or record.selected_account is not None:
+            pending = None
+        updated = self.app_context.store.update(
+            record.id,
+            selected_account=state.selected_account,
+            pending_account=pending,
+            auth_restart_required=True,
+            auth_changed_at=utc_now(),
+        )
+        tab = self.tabs.get(record.id)
+        if tab is not None:
+            tab.record = updated
+        return updated
+
+    def _render_auth_selector(
+        self,
+        record: SessionRecord | None,
+        state: CodexAuthState | None,
+        *,
+        error: str = "",
+    ) -> None:
+        combo = self._auth_combo
+        self._auth_combo_updating = True
+        try:
+            combo.remove_all()
+            if record is None:
+                combo.append("__none__", "Codex: no terminal")
+                combo.set_active_id("__none__")
+                combo.set_sensitive(False)
+                combo.set_tooltip_text("Open a terminal tab to select a Codex account")
+                return
+            if record.external:
+                combo.append("__none__", "Codex: external tmux")
+                combo.set_active_id("__none__")
+                combo.set_sensitive(False)
+                combo.set_tooltip_text(
+                    "Recreate this terminal under TermDeck before switching accounts; "
+                    "a running external tmux environment cannot be retroactively isolated."
+                )
+                return
+            if state is None:
+                combo.append("__none__", "Codex: unavailable")
+                combo.set_active_id("__none__")
+                combo.set_sensitive(False)
+                combo.set_tooltip_text(error or "Could not read this terminal's private Codex account state")
+                return
+
+            pending = record.pending_account
+            none_label = f"Codex: {pending} pending" if pending else "Codex: no account"
+            combo.append("__none__", none_label)
+            for account in state.accounts:
+                suffix = " · restart" if account.active and record.auth_restart_required else ""
+                combo.append(account.account_key, f"{account.label}{suffix}")
+            combo.set_active_id(state.selected_account_key or "__none__")
+            switchable = bool(state.accounts) and state.codex_auth_available and record.id not in self._auth_switch_inflight
+            combo.set_sensitive(switchable)
+            if record.auth_restart_required and state.selected_account:
+                tooltip = (
+                    f"Saved account: {state.selected_account}. Restart the running Codex process "
+                    "when its current turn is finished."
+                )
+            elif state.accounts:
+                tooltip = "Switch the saved account only for this terminal's private CODEX_HOME"
+            else:
+                tooltip = "No saved codex-auth accounts were found"
+            combo.set_tooltip_text(tooltip)
+        finally:
+            self._auth_combo_updating = False
+
+    def _refresh_auth_selector(self) -> bool:
+        record = self.current_record()
+        if record is None:
+            self._render_auth_selector(None, None)
+            return False
+        if record.external:
+            self._render_auth_selector(record, None)
+            return False
+        try:
+            state = self.app_context.codex_auth.state(record)
+            record = self._sync_observed_auth_state(record, state)
+            self._auth_fingerprints[record.id] = state.fingerprint
+            self._render_auth_selector(record, state)
+        except (CodexAuthError, OSError, ValueError) as exc:
+            self._render_auth_selector(record, None, error=str(exc))
+        return False
+
+    def _poll_codex_auth_state(self) -> bool:
+        if not self._tab_directory_refresh_alive:
+            return False
+        record = self.current_record()
+        if record is None or record.external or record.id in self._auth_switch_inflight:
+            return True
+        try:
+            state = self.app_context.codex_auth.state(record)
+        except (CodexAuthError, OSError, ValueError):
+            return True
+        if (
+            self._auth_fingerprints.get(record.id) != state.fingerprint
+            or state.selected_account != record.selected_account
+        ):
+            self._refresh_auth_selector()
+        return True
+
+    def _on_auth_account_changed(self, combo: Gtk.ComboBoxText) -> None:
+        if self._auth_combo_updating:
+            return
+        record = self.current_record()
+        account_key = combo.get_active_id()
+        if record is None or record.external or not account_key or account_key == "__none__":
+            return
+        if record.id in self._auth_switch_inflight:
+            return
+        try:
+            state = self.app_context.codex_auth.state(record)
+        except (CodexAuthError, OSError, ValueError) as exc:
+            self.show_toast(str(exc), kind="error")
+            self._refresh_auth_selector()
+            return
+        account = next((row for row in state.accounts if row.account_key == account_key), None)
+        if account is None or state.selected_account_key == account_key:
+            return
+
+        record = self.app_context.store.update(record.id, pending_account=account.label)
+        tab = self.tabs.get(record.id)
+        if tab is not None:
+            tab.record = record
+        self._auth_switch_inflight.add(record.id)
+        self._auth_switch_generation += 1
+        generation = self._auth_switch_generation
+        combo.set_sensitive(False)
+        self.show_toast(f"Switching {record.name} to {account.label}…", kind="info")
+
+        def _worker() -> None:
+            result: CodexSwitchResult | None = None
+            error = ""
+            try:
+                result = self.app_context.codex_auth.switch(record, account_key)
+            except Exception as exc:
+                error = str(exc)
+            GLib.idle_add(
+                self._complete_auth_switch,
+                record.id,
+                generation,
+                result,
+                error,
+            )
+
+        threading.Thread(target=_worker, name=f"termdeck-auth-{record.id}", daemon=True).start()
+
+    def _complete_auth_switch(
+        self,
+        session_id: str,
+        generation: int,
+        result: CodexSwitchResult | None,
+        error: str,
+    ) -> bool:
+        self._auth_switch_inflight.discard(session_id)
+        record = self.app_context.store.get(session_id)
+        if record is None:
+            self._refresh_auth_selector()
+            return False
+        if generation != self._auth_switch_generation:
+            self._refresh_auth_selector()
+            return False
+        if result is not None and result.ok:
+            record = self.app_context.store.update(
+                session_id,
+                selected_account=result.state.selected_account,
+                pending_account=None,
+                auth_restart_required=True,
+                auth_changed_at=utc_now(),
+            )
+            self._auth_fingerprints[session_id] = result.state.fingerprint
+            tab = self.tabs.get(session_id)
+            if tab is not None:
+                tab.record = record
+            self.show_toast(
+                f"{record.name}: {record.selected_account} saved · restart Codex after the current turn",
+                kind="success",
+            )
+        else:
+            self.app_context.store.update(session_id, pending_account=None)
+            detail = error or (result.error if result is not None else "Codex account switch failed")
+            self.show_toast(f"Account unchanged: {detail}", kind="error")
+        self._refresh_auth_selector()
+        return False
 
     def _session_pause_state(self, record: SessionRecord) -> tuple[bool, int | None]:
         pid = self.app_context.backend.pane_pid(record)
@@ -5053,6 +5274,7 @@ class TermDeckApplication(Gtk.Application):
         super().__init__(application_id="dev.termdeck.TermDeck", flags=0)
         self.store = SessionStore(db_path)
         self.backend = TmuxBackend()
+        self.codex_auth = CodexAuthManager(account_source=self.store.account_source)
         self.theme = load_terminator_theme()
         try:
             self.settings = AppSettings.load()

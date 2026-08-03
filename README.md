@@ -182,6 +182,32 @@ t1000 gui --workspace agents.workspace.json
 ```
 One JSON file defines all windows, tabs, commands, and directories. TermDeck restores the window and tab layout; process recovery follows the rules below.
 
+### Per-terminal Codex accounts
+
+Every TermDeck terminal owns a durable private Codex state directory:
+
+```text
+~/.local/share/termdeck/terminal-auth/<auth-scope-id>
+```
+
+TermDeck exports that directory as `CODEX_HOME` only inside the terminal's tmux session. A new terminal copies the saved `codex-auth` account catalogue from `~/.codex/accounts`, but never copies the globally active `~/.codex/auth.json`, so it starts with no selected account.
+
+```bash
+# Inside one TermDeck terminal; affects only this terminal.
+codex-auth switch work
+codex
+
+# Headless inspection or verified switching from outside the terminal.
+t1000 auth codex-api
+t1000 auth codex-api --switch personal
+```
+
+The header account dropdown uses the same transaction: run the private switch, re-read the private registry, and update SQLite only after the requested account verifies. Stable `codex-auth` releases that use `~/.codex` are handled by a per-terminal compatibility wrapper that changes `HOME` only for the `codex-auth` process; the terminal's ordinary `HOME` is unchanged.
+
+A successful switch is shown as **restart required** because an already-running Codex process may still hold the previous credentials. TermDeck does not kill an active turn. Restart Codex after the turn finishes; a newly launched TermDeck/tmux process clears the restart requirement. Existing TermDeck tmux sessions created before this feature also need one manual restart to receive their private environment. Adopted external tmux sessions cannot be retroactively isolated and must be recreated as TermDeck-managed terminals before account switching is enabled.
+
+Account tokens remain in private filesystem state and are never stored in the TermDeck SQLite database or browser snapshots. Snapshots preserve only the desired account label as pending intent and create a fresh auth scope when imported. Set `TERMDECK_CODEX_ACCOUNT_SOURCE` to use a saved-account source other than `~/.codex`.
+
 ### Exact Codex sessions survive reboots
 Foreground Codex tabs persist the primary conversation UUID and reopen directly with `codex resume <UUID>`. The same conversation, working directory, and safe value-free launch flags return in a new operating-system process.
 

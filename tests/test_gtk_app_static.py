@@ -25,7 +25,7 @@ class GtkAppStaticTests(unittest.TestCase):
         for node in tree.body:
             if not isinstance(node, ast.ImportFrom) or not node.module or not node.level:
                 continue
-            if node.module in {"codex_archive", "command_palette", "command_render", "shortcuts", "session_store", "models", "master_tasks", "health", "workspace_recipe", "control_plan", "session_lifecycle", "session_search"}:
+            if node.module in {"codex_archive", "codex_auth", "command_palette", "command_render", "shortcuts", "session_store", "models", "master_tasks", "health", "workspace_recipe", "control_plan", "session_lifecycle", "session_search"}:
                 module = importlib.import_module(f"termdeck.{node.module}")
                 for alias in node.names:
                     if alias.name == "*":
@@ -80,6 +80,20 @@ class GtkAppStaticTests(unittest.TestCase):
         self.assertIn("self._header_new_tab = header_new_tab", source)
         self.assertIn("header.pack_start(header_new_tab)", source)
         self.assertNotIn("self._header_new_window", source)
+
+    def test_gui_exposes_verified_per_terminal_codex_account_switching(self):
+        source = GTK_APP.read_text(encoding="utf-8")
+        self.assertIn("Gtk.ComboBoxText", source)
+        self.assertIn("CodexAuthManager", source)
+        self.assertIn("_poll_codex_auth_state", source)
+        self.assertIn("_complete_auth_switch", source)
+        self.assertIn("threading.Thread", source)
+        self.assertIn("auth_restart_required=True", source)
+        self.assertIn("restart Codex after the current turn", source)
+        self.assertIn('self.notebook.connect("switch-page", self._on_notebook_switch_page)', source)
+        self.assertIn('"Codex: external tmux"', source)
+        self.assertIn("record.external or record.id in self._auth_switch_inflight", source)
+        self.assertIn("a running external tmux environment cannot be retroactively isolated", source)
 
     def test_window_overview_is_exposed_in_gui(self):
         source = GTK_APP.read_text(encoding="utf-8")

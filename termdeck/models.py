@@ -52,6 +52,12 @@ class SessionRecord:
     external: bool = False
     recovery_command: str | None = None
     recovery_cwd: str | None = None
+    auth_scope_id: str | None = None
+    codex_home: str | None = None
+    selected_account: str | None = None
+    pending_account: str | None = None
+    auth_restart_required: bool = False
+    auth_changed_at: str | None = None
 
 
 @dataclass(frozen=True)

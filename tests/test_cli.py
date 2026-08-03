@@ -5,7 +5,7 @@ import json
 import pathlib
 import unittest
 
-from termdeck.cli import _select_records, build_parser, cmd_activity, cmd_archive, cmd_budget_plan, cmd_capture, cmd_checkpoint, cmd_control_plan, cmd_diagnostics, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_reconcile, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
+from termdeck.cli import _select_records, build_parser, cmd_activity, cmd_archive, cmd_auth, cmd_budget_plan, cmd_capture, cmd_checkpoint, cmd_control_plan, cmd_diagnostics, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_reconcile, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
 
 
 class CliTests(unittest.TestCase):
@@ -14,7 +14,7 @@ class CliTests(unittest.TestCase):
         subparsers = [action for action in parser._actions if isinstance(action, argparse._SubParsersAction)]
         self.assertEqual(len(subparsers), 1)
         choices = sorted(subparsers[0].choices)
-        self.assertEqual(choices, ['activity', 'adopt-tmux', 'archive', 'budget-plan', 'capture', 'checkpoint', 'control-plan', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-checkpoint-service', 'install-desktop', 'kill', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'quickstart', 'recently-closed', 'reconcile', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'terminator-workspace', 'uninstall-checkpoint-service', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
+        self.assertEqual(choices, ['activity', 'adopt-tmux', 'archive', 'auth', 'budget-plan', 'capture', 'checkpoint', 'control-plan', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-checkpoint-service', 'install-desktop', 'kill', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'quickstart', 'recently-closed', 'reconcile', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'terminator-workspace', 'uninstall-checkpoint-service', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
 
 
     def test_shortcuts_command_outputs_json_with_terminator_override(self):
@@ -160,6 +160,77 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("tag", tab)
             self.assertNotIn("tmux_name", tab)
 
+
+    def test_auth_status_persists_a_verified_private_account_change(self):
+        import tempfile
+        from unittest import mock
+        from termdeck.codex_auth import CodexAccount, CodexAuthState
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = pathlib.Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                record = store.create("agent", "ai", "bash", tmp)
+            finally:
+                store.close()
+            state = CodexAuthState(
+                codex_home=record.codex_home,
+                accounts=(CodexAccount("key-work", email="work@example.com", alias="work", active=True),),
+                selected_account="work",
+                selected_account_key="key-work",
+                fingerprint="verified",
+                codex_auth_available=True,
+            )
+            manager = mock.Mock()
+            manager.state.return_value = state
+            args = argparse.Namespace(db=db_path, selector=record.id, switch_account=None)
+            buffer = io.StringIO()
+            with mock.patch("termdeck.cli.CodexAuthManager", return_value=manager), contextlib.redirect_stdout(buffer):
+                code = cmd_auth(args)
+
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(payload["selected_account"], "work")
+            self.assertTrue(payload["auth_restart_required"])
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                saved = store.get(record.id)
+                self.assertEqual(saved.selected_account, "work")
+                self.assertTrue(saved.auth_restart_required)
+            finally:
+                store.close()
+
+    def test_auth_rejects_adopted_external_tmux_session(self):
+        import tempfile
+        from unittest import mock
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = pathlib.Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                record = store.create("external", "adopted", "bash", tmp)
+                record = store.update(record.id, external=True)
+            finally:
+                store.close()
+            args = argparse.Namespace(db=db_path, selector=record.id, switch_account="work")
+            buffer = io.StringIO()
+            with mock.patch("termdeck.cli.CodexAuthManager") as manager, contextlib.redirect_stdout(buffer):
+                code = cmd_auth(args)
+
+            self.assertEqual(code, 2)
+            payload = json.loads(buffer.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertIn("cannot be retroactively isolated", payload["error"])
+            manager.assert_not_called()
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                saved = store.get(record.id)
+                self.assertIsNone(saved.pending_account)
+                self.assertIsNone(saved.selected_account)
+            finally:
+                store.close()
 
     def test_windows_command_outputs_aggregate_json(self):
         from pathlib import Path

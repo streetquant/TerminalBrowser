@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from termdeck.models import SessionRecord
 from termdeck.session_store import SessionStore
 
 
@@ -164,6 +165,74 @@ class SessionStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_each_terminal_gets_a_unique_private_codex_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SessionStore(
+                root / "sessions.sqlite3",
+                auth_root=root / "terminal-auth",
+                account_source=root / "empty-source",
+            )
+            try:
+                first = store.create("first", "ai", "bash", tmp)
+                second = store.create("second", "ai", "bash", tmp)
+
+                self.assertNotEqual(first.auth_scope_id, second.auth_scope_id)
+                self.assertNotEqual(first.codex_home, second.codex_home)
+                for record in (first, second):
+                    home = Path(record.codex_home)
+                    self.assertTrue(home.is_dir())
+                    self.assertTrue((home / "bin" / "codex-auth").is_file())
+                    self.assertFalse((home / "auth.json").exists())
+            finally:
+                store.close()
+
+    def test_direct_upsert_assigns_and_preserves_immutable_auth_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SessionStore(
+                root / "sessions.sqlite3",
+                auth_root=root / "terminal-auth",
+                account_source=root / "empty-source",
+            )
+            try:
+                imported = SessionRecord(
+                    id="td-adopted",
+                    name="adopted",
+                    tag="external",
+                    command="bash",
+                    cwd=tmp,
+                    tmux_name="external-shell",
+                    created_at="now",
+                    last_opened_at="now",
+                    external=True,
+                )
+                store.upsert(imported)
+                saved = store.get(imported.id)
+                self.assertIsNotNone(saved)
+                self.assertTrue(saved.auth_scope_id)  # type: ignore[union-attr]
+                self.assertTrue(Path(saved.codex_home).is_dir())  # type: ignore[arg-type,union-attr]
+
+                replacement = SessionRecord(
+                    **(
+                        dict(saved.__dict__)  # type: ignore[union-attr]
+                        | {
+                            "auth_scope_id": "auth-forged",
+                            "codex_home": str(root / "forged-home"),
+                            "name": "updated",
+                        }
+                    )
+                )
+                store.upsert(replacement)
+                preserved = store.get(imported.id)
+                self.assertEqual(preserved.name, "updated")  # type: ignore[union-attr]
+                self.assertEqual(preserved.auth_scope_id, saved.auth_scope_id)  # type: ignore[union-attr]
+                self.assertEqual(preserved.codex_home, saved.codex_home)  # type: ignore[union-attr]
+                with self.assertRaises(ValueError):
+                    store.update(imported.id, codex_home=str(root / "other-home"))
+            finally:
+                store.close()
+
     def test_schema_migrates_database_from_first_mvp(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "sessions.sqlite3"
@@ -206,6 +275,10 @@ class SessionStoreTests(unittest.TestCase):
                 self.assertTrue(record.visible)  # type: ignore[union-attr]
                 self.assertIsNone(record.recovery_command)  # type: ignore[union-attr]
                 self.assertIsNone(record.recovery_cwd)  # type: ignore[union-attr]
+                self.assertTrue(record.auth_scope_id)  # type: ignore[union-attr]
+                self.assertTrue(Path(record.codex_home).is_dir())  # type: ignore[arg-type,union-attr]
+                self.assertIsNone(record.selected_account)  # type: ignore[union-attr]
+                self.assertFalse(record.auth_restart_required)  # type: ignore[union-attr]
             finally:
                 store.close()
 

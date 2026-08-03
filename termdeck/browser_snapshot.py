@@ -10,7 +10,8 @@ from typing import Any
 from .models import SessionRecord
 from .session_store import SessionStore, short_id, tmux_safe_name
 
-SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 2
+SUPPORTED_SNAPSHOT_VERSIONS = {1, 2}
 
 
 class BrowserSnapshotError(ValueError):
@@ -31,6 +32,7 @@ class SnapshotImportRow:
     visible: bool
     pinned: bool
     status: str
+    requested_account: str | None
     created: bool
     planned: bool
 
@@ -48,6 +50,7 @@ class SnapshotImportRow:
             "visible": self.visible,
             "pinned": self.pinned,
             "status": self.status,
+            "requested_account": self.requested_account,
             "created": self.created,
             "planned": self.planned,
         }
@@ -104,6 +107,7 @@ def _record_to_tab(record: SessionRecord) -> dict[str, object]:
         "last_pid": record.last_pid,
         "created_at": record.created_at,
         "last_opened_at": record.last_opened_at,
+        "selected_account": record.selected_account,
     }
 
 
@@ -200,6 +204,15 @@ def _string(value: Any, field: str, *, default: str | None = None) -> str:
     return value or (default or "")
 
 
+def _optional_string(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise BrowserSnapshotError(f"{field} must be a string or null")
+    value = value.strip()
+    return value or None
+
+
 def _bool(value: Any, field: str, *, default: bool = True) -> bool:
     if value is None:
         return default
@@ -236,7 +249,8 @@ def parse_snapshot(data: Any) -> dict[str, Any]:
     root = _expect_dict(data, "snapshot")
     if root.get("schema") != "termdeck.browser-snapshot":
         raise BrowserSnapshotError("snapshot.schema must be 'termdeck.browser-snapshot'")
-    if int(root.get("schema_version", 0)) != SNAPSHOT_SCHEMA_VERSION:
+    source_version = int(root.get("schema_version", 0))
+    if source_version not in SUPPORTED_SNAPSHOT_VERSIONS:
         raise BrowserSnapshotError(f"unsupported browser snapshot schema_version: {root.get('schema_version')!r}")
     windows = _expect_list(root.get("windows"), "windows")
     parsed_windows: list[dict[str, object]] = []
@@ -260,6 +274,7 @@ def parse_snapshot(data: Any) -> dict[str, Any]:
                     "visible": _bool(tab.get("visible"), f"windows[{window_index}].tabs[{tab_index}].visible", default=True),
                     "pinned": _bool(tab.get("pinned"), f"windows[{window_index}].tabs[{tab_index}].pinned", default=False),
                     "tab_index": _int(tab.get("tab_index"), f"windows[{window_index}].tabs[{tab_index}].tab_index", default=tab_index),
+                    "selected_account": _optional_string(tab.get("selected_account"), f"windows[{window_index}].tabs[{tab_index}].selected_account"),
                 }
             )
         parsed_windows.append({"window_id": window_id, "title": title, "tabs": parsed_tabs})
@@ -329,7 +344,15 @@ def import_browser_snapshot(
                     visible=visible,
                     pinned=bool(tab.get("pinned", False)),
                 )
-                record = store.update(record.id, status=status, last_pid=None)
+                requested_account = tab.get("selected_account")
+                record = store.update(
+                    record.id,
+                    status=status,
+                    last_pid=None,
+                    selected_account=None,
+                    pending_account=str(requested_account) if requested_account else None,
+                    auth_restart_required=False,
+                )
                 session_id = record.id
                 created = True
             rows.append(
@@ -346,6 +369,7 @@ def import_browser_snapshot(
                     visible=visible,
                     pinned=bool(tab.get("pinned", False)),
                     status=status,
+                    requested_account=str(tab["selected_account"]) if tab.get("selected_account") else None,
                     created=created,
                     planned=dry_run,
                 )

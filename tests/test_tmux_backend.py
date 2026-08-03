@@ -189,6 +189,31 @@ class TmuxBackendTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[0].args[0][-1], "codex --yolo")
         self.assertEqual(checkpoints.wrapped, [])
 
+    def test_private_codex_home_is_injected_into_new_tmux_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "auth-home"
+            codex_home.mkdir()
+            record = _record(
+                command="/bin/bash",
+                cwd=tmp,
+                auth_scope_id="auth-one",
+                codex_home=str(codex_home),
+            )
+            backend = TmuxBackend(executable="tmux")
+            completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(backend, "session_exists", return_value=False), mock.patch.object(
+                backend, "_run", return_value=completed
+            ) as run:
+                backend.create_or_resume(record)
+
+            launch = run.call_args_list[0].args[0]
+            self.assertIn(f"CODEX_HOME={codex_home.resolve()}", launch)
+            self.assertIn("TERMDECK_AUTH_SCOPE_ID=auth-one", launch)
+            path_entry = next(item for item in launch if item.startswith("PATH="))
+            self.assertTrue(path_entry.split("=", 1)[1].startswith(str(codex_home.resolve() / "bin")))
+            self.assertEqual(launch[-3:], ["-c", tmp, "/bin/bash"])
+
     def test_checkpoint_records_uses_exact_codex_uuid_without_memory_image(self):
         session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
         checkpoints = FakeCheckpointManager()

@@ -88,6 +88,63 @@ flowchart TD
 
 ---
 
+## 2.1 Isolated Codex Accounts Per Tab
+
+The terminal identity and the selected account are different state variables. For terminal `t`, TermDeck fixes a private state directory `H_t`, while the selected account `s_t` remains mutable:
+
+```text
+H_t = ~/.local/share/termdeck/terminal-auth/<auth-scope-id>
+s_t ∈ {saved Codex accounts} ∪ {none}
+```
+
+The isolation invariant is:
+
+```text
+t_i != t_j  =>  H_i != H_j
+```
+
+A switch changes only one terminal:
+
+```text
+switch(t_i, work)  =>  s_i = work
+switch(t_i, work)  does not change s_j for j != i
+```
+
+```mermaid
+flowchart LR
+    G["Saved account source\n~/.codex/accounts"] -->|copy catalogue; never active auth.json| H1["Terminal A private CODEX_HOME"]
+    G -->|copy catalogue; never active auth.json| H2["Terminal B private CODEX_HOME"]
+    H1 --> A1["selected: work"]
+    H2 --> A2["selected: personal"]
+```
+
+A new terminal is anonymous even when the source Codex home currently has an active login. TermDeck prepends `<private-CODEX_HOME>/bin` to that terminal's `PATH`, so the normal command works inside the shell:
+
+```bash
+codex-auth switch work
+codex
+```
+
+The private wrapper sets both `CODEX_HOME=H_t` and a compatibility-only `HOME` whose `.codex` symlink points to `H_t`. This isolates older `codex-auth` releases that ignore `CODEX_HOME` without changing the shell's real `HOME`.
+
+The GUI dropdown and `t1000 auth <tab> --switch <account>` use a verified transaction:
+
+```text
+set pending account
+  -> run private codex-auth switch
+  -> read private accounts/registry.json
+  -> verify requested account is active
+  -> persist selected account and restart-required flag
+```
+
+If execution or verification fails, TermDeck attempts to restore the previous private account and does not update the selected account in SQLite. The GUI performs the command on a worker thread, so the terminal remains responsive.
+
+TermDeck polls only the current tab's private registry metadata. Therefore a manual `codex-auth switch ...` performed inside the terminal is detected and persisted without intercepting the CLI. It never reads tokens into SQLite and never copies `auth.json` into a snapshot.
+
+After a successful switch, restart the Codex process after its current turn. TermDeck deliberately does not kill or restart an active agent. A newly launched tmux process reads the selected private auth and clears the restart-required flag. An adopted external tmux session cannot be retroactively given a private process environment, so its account control remains disabled until the terminal is recreated under TermDeck.
+
+---
+
 ## 3. The Agent Lifecycle
 
 How a single Codex / Claude Code tab moves through states during a session.

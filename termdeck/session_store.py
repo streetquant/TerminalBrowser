@@ -6,14 +6,17 @@ import shlex
 import sqlite3
 import uuid
 from collections.abc import Iterable
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .codex_auth import new_auth_scope_id, prepare_auth_scope
 from .models import SessionRecord
 
 APP_DIR = Path.home() / ".local" / "share" / "termdeck"
 DEFAULT_DB_PATH = APP_DIR / "sessions.sqlite3"
+DEFAULT_AUTH_ROOT = APP_DIR / "terminal-auth"
 
 _SAFE = re.compile(r"[^a-zA-Z0-9_]+")
 
@@ -50,10 +53,24 @@ def tmux_safe_name(name: str) -> str:
 
 
 class SessionStore:
-    def __init__(self, path: str | Path | None = None):
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        auth_root: str | Path | None = None,
+        account_source: str | Path | None = None,
+    ):
         self.path = Path(path).expanduser() if path else DEFAULT_DB_PATH
+        self.auth_root = (
+            Path(auth_root).expanduser()
+            if auth_root is not None
+            else (DEFAULT_AUTH_ROOT if path is None else self.path.parent / "terminal-auth")
+        )
+        self.account_source = Path(account_source).expanduser() if account_source is not None else None
         if self.path != Path(":memory:"):
             self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.auth_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.auth_root.chmod(0o700)
         # Keep the GUI responsive if a second TermDeck/CLI process briefly
         # holds the registry, and avoid a full fsync for every tab-state update.
         self.conn = sqlite3.connect(str(self.path), timeout=1.0)
@@ -102,7 +119,13 @@ class SessionStore:
                 pane_target TEXT,
                 external INTEGER NOT NULL DEFAULT 0,
                 recovery_command TEXT,
-                recovery_cwd TEXT
+                recovery_cwd TEXT,
+                auth_scope_id TEXT,
+                codex_home TEXT,
+                selected_account TEXT,
+                pending_account TEXT,
+                auth_restart_required INTEGER NOT NULL DEFAULT 0,
+                auth_changed_at TEXT
             )
             """
         )
@@ -115,11 +138,26 @@ class SessionStore:
         self._ensure_column("external", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("recovery_command", "TEXT")
         self._ensure_column("recovery_cwd", "TEXT")
+        self._ensure_column("auth_scope_id", "TEXT")
+        self._ensure_column("codex_home", "TEXT")
+        self._ensure_column("selected_account", "TEXT")
+        self._ensure_column("pending_account", "TEXT")
+        self._ensure_column("auth_restart_required", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("auth_changed_at", "TEXT")
+        self._ensure_auth_scopes()
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_tag ON sessions(tag)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_window ON sessions(window_id, tab_index)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_visible ON sessions(visible)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_pinned ON sessions(pinned)")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_auth_scope ON sessions(auth_scope_id) "
+            "WHERE auth_scope_id IS NOT NULL AND auth_scope_id != ''"
+        )
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_codex_home ON sessions(codex_home) "
+            "WHERE codex_home IS NOT NULL AND codex_home != ''"
+        )
         self.conn.commit()
 
     def _ensure_column(self, name: str, ddl: str) -> None:
@@ -127,6 +165,26 @@ class SessionStore:
         existing = {str(row[1]) for row in rows}
         if name not in existing:
             self.conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
+
+    def _new_auth_scope(self) -> tuple[str, str]:
+        scope_id = new_auth_scope_id()
+        codex_home = self.auth_root / scope_id
+        prepare_auth_scope(codex_home, account_source=self.account_source)
+        return scope_id, str(codex_home)
+
+    def _ensure_auth_scopes(self) -> None:
+        rows = self.conn.execute("SELECT id, auth_scope_id, codex_home FROM sessions").fetchall()
+        for row in rows:
+            scope_id = str(row["auth_scope_id"] or "").strip()
+            codex_home = str(row["codex_home"] or "").strip()
+            if not scope_id or not codex_home:
+                scope_id, codex_home = self._new_auth_scope()
+                self.conn.execute(
+                    "UPDATE sessions SET auth_scope_id = ?, codex_home = ? WHERE id = ?",
+                    (scope_id, codex_home, row["id"]),
+                )
+            else:
+                prepare_auth_scope(codex_home, account_source=self.account_source)
 
     def create(
         self,
@@ -142,6 +200,7 @@ class SessionStore:
         pinned: bool = False,
     ) -> SessionRecord:
         sid = short_id("td")
+        auth_scope_id, codex_home = self._new_auth_scope()
         cwd = str(Path(cwd or os.getcwd()).expanduser())
         now = utc_now()
         safe_tag = tmux_safe_name(tag or "default")
@@ -167,26 +226,47 @@ class SessionStore:
             external=False,
             recovery_command=None,
             recovery_cwd=None,
+            auth_scope_id=auth_scope_id,
+            codex_home=codex_home,
+            selected_account=None,
+            pending_account=None,
+            auth_restart_required=False,
+            auth_changed_at=None,
         )
         self.upsert(record)
         return record
 
     def upsert(self, record: SessionRecord) -> None:
+        existing = self.get(record.id)
+        if existing is not None and existing.auth_scope_id and existing.codex_home:
+            record = replace(
+                record,
+                auth_scope_id=existing.auth_scope_id,
+                codex_home=existing.codex_home,
+            )
+        elif not record.auth_scope_id or not record.codex_home:
+            auth_scope_id, codex_home = self._new_auth_scope()
+            record = replace(record, auth_scope_id=auth_scope_id, codex_home=codex_home)
+        else:
+            prepare_auth_scope(record.codex_home, account_source=self.account_source)
         payload = dict(record.__dict__)
         payload["visible"] = 1 if record.visible else 0
         payload["pinned"] = 1 if getattr(record, "pinned", False) else 0
         payload["external"] = 1 if getattr(record, "external", False) else 0
+        payload["auth_restart_required"] = 1 if getattr(record, "auth_restart_required", False) else 0
         self.conn.execute(
             """
             INSERT INTO sessions (
                 id, name, tag, command, cwd, tmux_name, created_at, last_opened_at,
                 status, last_pid, window_id, window_title, tab_index, visible, pane_target, external, pinned,
-                recovery_command, recovery_cwd
+                recovery_command, recovery_cwd, auth_scope_id, codex_home, selected_account,
+                pending_account, auth_restart_required, auth_changed_at
             )
             VALUES (
                 :id, :name, :tag, :command, :cwd, :tmux_name, :created_at, :last_opened_at,
                 :status, :last_pid, :window_id, :window_title, :tab_index, :visible, :pane_target, :external, :pinned,
-                :recovery_command, :recovery_cwd
+                :recovery_command, :recovery_cwd, :auth_scope_id, :codex_home, :selected_account,
+                :pending_account, :auth_restart_required, :auth_changed_at
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -205,7 +285,11 @@ class SessionStore:
                 pane_target = excluded.pane_target,
                 external = excluded.external,
                 recovery_command = excluded.recovery_command,
-                recovery_cwd = excluded.recovery_cwd
+                recovery_cwd = excluded.recovery_cwd,
+                selected_account = excluded.selected_account,
+                pending_account = excluded.pending_account,
+                auth_restart_required = excluded.auth_restart_required,
+                auth_changed_at = excluded.auth_changed_at
             """,
             payload,
         )
@@ -215,6 +299,9 @@ class SessionStore:
         current = self.get(session_id)
         if not current:
             raise KeyError(session_id)
+        for field in ("auth_scope_id", "codex_home"):
+            if field in changes and changes[field] != getattr(current, field):
+                raise ValueError(f"{field} is immutable for terminal {session_id}")
         data: dict[str, Any] = dict(current.__dict__)
         data.update(changes)
         if "last_opened_at" not in changes:
@@ -227,6 +314,8 @@ class SessionStore:
             data["pinned"] = bool(data["pinned"])
         if "external" in data:
             data["external"] = bool(data["external"])
+        if "auth_restart_required" in data:
+            data["auth_restart_required"] = bool(data["auth_restart_required"])
         updated = SessionRecord(**data)
         self.upsert(updated)
         return updated
@@ -476,4 +565,10 @@ class SessionStore:
             external=bool(row["external"]),
             recovery_command=row["recovery_command"],
             recovery_cwd=row["recovery_cwd"],
+            auth_scope_id=row["auth_scope_id"],
+            codex_home=row["codex_home"],
+            selected_account=row["selected_account"],
+            pending_account=row["pending_account"],
+            auth_restart_required=bool(row["auth_restart_required"]),
+            auth_changed_at=row["auth_changed_at"],
         )

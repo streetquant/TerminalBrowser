@@ -239,15 +239,33 @@ class TmuxBackend:
                 )
         # tmux accepts the command as one shell command argument, which preserves
         # normal shell syntax for commands such as "npm run dev" or "codex".
-        self._run([
+        launch_args = [
             "new-session",
             "-d",
             "-s",
             record.tmux_name,
+        ]
+        raw_codex_home = (getattr(record, "codex_home", None) or "").strip()
+        if raw_codex_home:
+            codex_home = Path(raw_codex_home).expanduser().resolve(strict=False)
+            host_path = os.environ.get("PATH", "")
+            isolated_path = f"{codex_home / 'bin'}:{host_path}" if host_path else str(codex_home / "bin")
+            launch_args.extend(
+                [
+                    "-e",
+                    f"CODEX_HOME={codex_home}",
+                    "-e",
+                    f"TERMDECK_AUTH_SCOPE_ID={getattr(record, 'auth_scope_id', '') or ''}",
+                    "-e",
+                    f"PATH={isolated_path}",
+                ]
+            )
+        launch_args.extend([
             "-c",
             str(launch_directory),
             command,
         ])
+        self._run(launch_args)
         # Make the session visually clean when attached.
         self._run(["set-option", "-t", record.tmux_name, "status", "off"], check=False)
         self._run(["set-option", "-t", record.tmux_name, "remain-on-exit", "on"], check=False)
