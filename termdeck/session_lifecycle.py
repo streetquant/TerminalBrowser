@@ -109,6 +109,12 @@ def _protected_result(record: SessionRecord, action: str) -> LifecycleResult:
     )
 
 
+def _clear_captain_for_record(store: SessionStore, record: SessionRecord) -> None:
+    clear = getattr(store, "clear_window_captain", None)
+    if callable(clear):
+        clear(record.window_id, session_id=record.id)
+
+
 def hide_records(store: SessionStore, records: Iterable[SessionRecord], *, include_pinned: bool = False) -> list[LifecycleResult]:
     results: list[LifecycleResult] = []
     touched_windows: set[str] = set()
@@ -116,6 +122,7 @@ def hide_records(store: SessionStore, records: Iterable[SessionRecord], *, inclu
         if record.pinned and not include_pinned:
             results.append(_protected_result(record, "hide"))
             continue
+        _clear_captain_for_record(store, record)
         updated = store.update(record.id, visible=False, last_opened_at=utc_now())
         touched_windows.add(record.window_id)
         results.append(LifecycleResult.from_record(updated, "hide", detail="hidden from browser restore; process state unchanged"))
@@ -238,6 +245,7 @@ def archive_records(store: SessionStore, records: Iterable[SessionRecord], *, in
         if record.pinned and not include_pinned:
             results.append(_protected_result(record, "archive"))
             continue
+        _clear_captain_for_record(store, record)
         updated = store.update(record.id, status="archived", visible=False, last_opened_at=utc_now())
         touched_windows.add(record.window_id)
         results.append(LifecycleResult.from_record(updated, "archive", detail="archived in registry; process state unchanged"))

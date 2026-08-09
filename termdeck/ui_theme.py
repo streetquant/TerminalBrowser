@@ -24,6 +24,13 @@ TERMINAL_PALETTE_NAMES = (
     "solarized-dark",
 )
 
+# Full-screen terminal applications often contain bounded cards, composers, or
+# reading surfaces even when the terminal itself uses every column. Allowing the
+# font to fall to 6pt turns a maximized window into a 200+ column grid where
+# those surfaces look stranded and the text is no longer comfortably readable.
+MIN_TERMINAL_FONT_SIZE = 10.0
+MAX_TERMINAL_FONT_SIZE = 72.0
+
 # Kind cues for notebook tabs / launcher rows (emoji keeps GTK3 dependency-free).
 KIND_GLYPHS = {
     "shell": "$",
@@ -363,8 +370,8 @@ def scale_font_description(
     font: str | None,
     delta_pt: float,
     *,
-    min_size: float = 6.0,
-    max_size: float = 72.0,
+    min_size: float = MIN_TERMINAL_FONT_SIZE,
+    max_size: float = MAX_TERMINAL_FONT_SIZE,
     default: str = "Monospace 12",
 ) -> str:
     """Return a font description with size adjusted by ``delta_pt`` points."""

@@ -312,7 +312,7 @@ class WindowTabModelTests(TestCase):
             finally:
                 store.close()
 
-    def test_tab_metadata_refresh_persists_and_clears_safe_recovery_commands(self) -> None:
+    def test_tab_metadata_refresh_persists_and_preserves_safe_recovery_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")
             try:
@@ -350,11 +350,11 @@ class WindowTabModelTests(TestCase):
 
                 changed = TermDeckWindow.refresh_tab_directories(window)
 
-                self.assertEqual(changed, 2)
+                self.assertEqual(changed, 1)
                 self.assertEqual(store.get(first.id).recovery_command, "codex --yolo")  # type: ignore[union-attr]
                 self.assertEqual(store.get(first.id).recovery_cwd, first_recovery_cwd)  # type: ignore[union-attr]
-                self.assertIsNone(store.get(second.id).recovery_command)  # type: ignore[union-attr]
-                self.assertIsNone(store.get(second.id).recovery_cwd)  # type: ignore[union-attr]
+                self.assertEqual(store.get(second.id).recovery_command, "codex --yolo")  # type: ignore[union-attr]
+                self.assertEqual(store.get(second.id).recovery_cwd, str(Path(tmp) / "old-repo"))  # type: ignore[union-attr]
                 self.assertEqual(side.refresh_count, 1)
             finally:
                 store.close()

@@ -14,6 +14,7 @@ from termdeck.resources import (
     observe_recovery_command,
     observe_recovery_metadata,
     process_tree,
+    process_tree_contains_codex,
     safe_codex_recovery_command,
 )
 
@@ -203,6 +204,9 @@ class ResourceTests(unittest.TestCase):
         ), mock.patch(
             "termdeck.resources._parse_stat",
             return_value={"tty_nr": 86, "pgrp": 101, "tpgid": 100},
+        ), mock.patch(
+            "termdeck.resources._primary_codex_session_id",
+            return_value=None,
         ):
             self.assertEqual(observe_recovery_command(100), (True, None))
 
@@ -247,6 +251,35 @@ class ResourceTests(unittest.TestCase):
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         # Full /proc scans are typically multi-ms each; fast walk should be << 50ms total.
         self.assertLess(elapsed_ms, 250.0, f"process_tree too slow: {elapsed_ms:.1f}ms for 100 calls")
+
+    def test_process_tree_contains_codex_detects_native_and_node_launcher(self):
+        with mock.patch("termdeck.resources.process_tree", return_value=[100, 101]), mock.patch(
+            "termdeck.resources._process_argv",
+            side_effect=[("/bin/bash",), ("/usr/bin/codex", "--yolo")],
+        ):
+            self.assertTrue(process_tree_contains_codex(100))
+
+        with mock.patch("termdeck.resources.process_tree", return_value=[100, 101]), mock.patch(
+            "termdeck.resources._process_argv",
+            side_effect=[("/bin/bash",), ("/usr/bin/node", "/opt/openai/codex")],
+        ):
+            self.assertTrue(process_tree_contains_codex(100))
+
+    def test_process_tree_contains_codex_proves_absence_only_when_fully_readable(self):
+        with mock.patch("termdeck.resources.process_tree", return_value=[100, 101]), mock.patch(
+            "termdeck.resources._process_argv",
+            side_effect=[("/bin/bash",), ("/usr/bin/python", "worker.py")],
+        ):
+            self.assertFalse(process_tree_contains_codex(100))
+
+        with mock.patch("termdeck.resources.process_tree", return_value=[100, 101]), mock.patch(
+            "termdeck.resources._process_argv",
+            side_effect=[("/bin/bash",), None],
+        ):
+            self.assertIsNone(process_tree_contains_codex(100))
+
+        with mock.patch("termdeck.resources.process_tree", return_value=[]):
+            self.assertIsNone(process_tree_contains_codex(100))
 
 
     def test_snapshot_uses_short_lived_cache(self):

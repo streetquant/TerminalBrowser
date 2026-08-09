@@ -129,6 +129,24 @@ class SessionStore:
             )
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS window_captains (
+                window_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL UNIQUE
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS remembered_windows (
+                window_id TEXT PRIMARY KEY,
+                window_title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_opened_at TEXT NOT NULL
+            )
+            """
+        )
         self._ensure_column("window_id", "TEXT NOT NULL DEFAULT 'main'")
         self._ensure_column("window_title", "TEXT NOT NULL DEFAULT 'Main'")
         self._ensure_column("tab_index", "INTEGER NOT NULL DEFAULT 0")
@@ -158,6 +176,8 @@ class SessionStore:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_codex_home ON sessions(codex_home) "
             "WHERE codex_home IS NOT NULL AND codex_home != ''"
         )
+        self._bootstrap_remembered_windows()
+        self._cleanup_stale_window_captains()
         self.conn.commit()
 
     def _ensure_column(self, name: str, ddl: str) -> None:
@@ -165,6 +185,70 @@ class SessionStore:
         existing = {str(row[1]) for row in rows}
         if name not in existing:
             self.conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
+
+    def _bootstrap_remembered_windows(self) -> int:
+        """Add only currently open legacy windows to the independent registry.
+
+        Older databases inferred window existence from visible tab rows.  Do
+        not resurrect every historical all-hidden group during migration; only
+        groups that were still marked open become durable windows.
+        """
+
+        rows = self.conn.execute(
+            """
+            SELECT window_id, window_title, MIN(created_at), MAX(last_opened_at)
+            FROM sessions
+            WHERE visible = 1 AND status != 'archived'
+            GROUP BY window_id, window_title
+            """
+        ).fetchall()
+        before = self.conn.total_changes
+        self.conn.executemany(
+            """
+            INSERT OR IGNORE INTO remembered_windows (
+                window_id, window_title, created_at, last_opened_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            [
+                (
+                    str(row["window_id"]),
+                    str(row["window_title"] or "Window"),
+                    str(row[2] or utc_now()),
+                    str(row[3] or utc_now()),
+                )
+                for row in rows
+            ],
+        )
+        return max(0, self.conn.total_changes - before)
+
+    def remember_window(self, window_id: str, window_title: str) -> None:
+        """Persist a logical window independently of its current tab states."""
+
+        clean_id = (window_id or "main").strip() or "main"
+        clean_title = (window_title or "Window").strip() or "Window"
+        now = utc_now()
+        self.conn.execute(
+            """
+            INSERT INTO remembered_windows (
+                window_id, window_title, created_at, last_opened_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(window_id) DO UPDATE SET
+                window_title = excluded.window_title,
+                last_opened_at = excluded.last_opened_at
+            """,
+            (clean_id, clean_title, now, now),
+        )
+        self.conn.commit()
+
+    def remembered_windows(self) -> list[tuple[str, str]]:
+        rows = self.conn.execute(
+            """
+            SELECT window_id, window_title
+            FROM remembered_windows
+            ORDER BY window_title COLLATE NOCASE, window_id
+            """
+        ).fetchall()
+        return [(str(row["window_id"]), str(row["window_title"])) for row in rows]
 
     def _new_auth_scope(self) -> tuple[str, str]:
         scope_id = new_auth_scope_id()
@@ -293,6 +377,26 @@ class SessionStore:
             """,
             payload,
         )
+        # A tab moved to another window cannot remain captain of its previous
+        # window. Keep this invariant in the store instead of relying on every
+        # lifecycle or UI caller to remember the cleanup.
+        self.conn.execute(
+            "DELETE FROM window_captains WHERE session_id = ? AND window_id != ?",
+            (record.id, record.window_id),
+        )
+        if record.visible and record.status.casefold() != "archived":
+            now = utc_now()
+            self.conn.execute(
+                """
+                INSERT INTO remembered_windows (
+                    window_id, window_title, created_at, last_opened_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(window_id) DO UPDATE SET
+                    window_title = excluded.window_title,
+                    last_opened_at = excluded.last_opened_at
+                """,
+                (record.window_id, record.window_title or "Window", now, now),
+            )
         self.conn.commit()
 
     def update(self, session_id: str, **changes: object) -> SessionRecord:
@@ -414,6 +518,76 @@ class SessionStore:
         row = self.conn.execute("SELECT * FROM sessions WHERE tmux_name = ?", (tmux_name,)).fetchone()
         return self._row_to_record(row) if row else None
 
+    def set_window_captain(self, window_id: str, session_id: str) -> SessionRecord:
+        """Designate one session as the captain of its current window."""
+
+        record = self.get(session_id)
+        if record is None:
+            raise KeyError(session_id)
+        if record.window_id != window_id:
+            raise ValueError(
+                f"session {session_id} belongs to window {record.window_id!r}, not {window_id!r}"
+            )
+        # The UNIQUE session_id constraint prevents one tab from captaining two
+        # windows. Delete any stale prior assignment before the window upsert.
+        self.conn.execute("DELETE FROM window_captains WHERE session_id = ?", (session_id,))
+        self.conn.execute(
+            """
+            INSERT INTO window_captains (window_id, session_id)
+            VALUES (?, ?)
+            ON CONFLICT(window_id) DO UPDATE SET session_id = excluded.session_id
+            """,
+            (window_id, session_id),
+        )
+        self.conn.commit()
+        return record
+
+    def captain_for_window(self, window_id: str) -> SessionRecord | None:
+        """Return a window's captain, removing a missing or moved assignment."""
+
+        row = self.conn.execute(
+            "SELECT session_id FROM window_captains WHERE window_id = ?",
+            (window_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        session_id = str(row["session_id"])
+        record = self.get(session_id)
+        if record is None or record.window_id != window_id:
+            self.clear_window_captain(window_id, session_id=session_id)
+            return None
+        return record
+
+    def clear_window_captain(self, window_id: str, session_id: str | None = None) -> bool:
+        """Clear a captain, optionally only when it still matches ``session_id``."""
+
+        if session_id is None:
+            cursor = self.conn.execute(
+                "DELETE FROM window_captains WHERE window_id = ?",
+                (window_id,),
+            )
+        else:
+            cursor = self.conn.execute(
+                "DELETE FROM window_captains WHERE window_id = ? AND session_id = ?",
+                (window_id, session_id),
+            )
+        self.conn.commit()
+        return int(cursor.rowcount) > 0
+
+    def _cleanup_stale_window_captains(self) -> int:
+        cursor = self.conn.execute(
+            """
+            DELETE FROM window_captains
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM sessions
+                WHERE sessions.id = window_captains.session_id
+                  AND sessions.window_id = window_captains.window_id
+            )
+            """
+        )
+        return max(0, int(cursor.rowcount))
+
     def list(
         self,
         include_archived: bool = False,
@@ -496,6 +670,14 @@ class SessionStore:
             "UPDATE sessions SET window_title = ? WHERE window_id = ?",
             (clean_title, window_id),
         )
+        self.conn.execute(
+            """
+            UPDATE remembered_windows
+            SET window_title = ?, last_opened_at = ?
+            WHERE window_id = ?
+            """,
+            (clean_title, utc_now(), window_id),
+        )
         self.conn.commit()
         return max(0, int(cursor.rowcount))
 
@@ -510,6 +692,36 @@ class SessionStore:
         for window_id in sorted(grouped, key=lambda wid: (titles.get(wid, ""), wid)):
             rows = sorted(grouped[window_id], key=lambda row: (not row.pinned, row.tab_index, row.last_opened_at))
             result.append((window_id, titles.get(window_id, "Window"), rows))
+        return result
+
+    def windows_for_restore(self) -> list[tuple[str, str, list[SessionRecord]]]:
+        """Return every durable window, including windows with no live tabs."""
+
+        records = self.visible_records()
+        grouped: dict[str, list[SessionRecord]] = {}
+        titles: dict[str, str] = {}
+        for record in records:
+            grouped.setdefault(record.window_id, []).append(record)
+            titles.setdefault(record.window_id, record.window_title)
+
+        remembered = self.remembered_windows()
+        known_ids = {window_id for window_id, _title in remembered}
+        # Defensive compatibility for a database written by another process
+        # between schema initialization and this read.
+        remembered.extend(
+            (window_id, titles.get(window_id, "Window"))
+            for window_id in grouped
+            if window_id not in known_ids
+        )
+        remembered.sort(key=lambda item: (item[1].casefold(), item[0]))
+
+        result: list[tuple[str, str, list[SessionRecord]]] = []
+        for window_id, window_title in remembered:
+            rows = sorted(
+                grouped.get(window_id, []),
+                key=lambda row: (not row.pinned, row.tab_index, row.last_opened_at),
+            )
+            result.append((window_id, window_title, rows))
         return result
 
     def find_equivalent(
@@ -540,6 +752,7 @@ class SessionStore:
         return [str(row[0]) for row in rows]
 
     def delete(self, session_id: str) -> None:
+        self.conn.execute("DELETE FROM window_captains WHERE session_id = ?", (session_id,))
         self.conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         self.conn.commit()
 

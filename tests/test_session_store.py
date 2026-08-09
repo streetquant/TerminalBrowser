@@ -40,6 +40,77 @@ class SessionStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_window_captain_mapping_is_persistent_and_guarded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db)
+            try:
+                captain = store.create(
+                    "captain",
+                    "ai",
+                    "codex",
+                    tmp,
+                    window_id="win-a",
+                    window_title="A",
+                )
+                store.set_window_captain("win-a", captain.id)
+                self.assertEqual(store.captain_for_window("win-a").id, captain.id)  # type: ignore[union-attr]
+                self.assertFalse(store.clear_window_captain("win-a", session_id="td-not-captain"))
+                self.assertEqual(store.captain_for_window("win-a").id, captain.id)  # type: ignore[union-attr]
+            finally:
+                store.close()
+
+            reopened = SessionStore(db)
+            try:
+                self.assertEqual(reopened.captain_for_window("win-a").id, captain.id)  # type: ignore[union-attr]
+                self.assertTrue(reopened.clear_window_captain("win-a", session_id=captain.id))
+                self.assertIsNone(reopened.captain_for_window("win-a"))
+            finally:
+                reopened.close()
+
+    def test_window_captain_validates_membership_and_cleans_stale_mappings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                first = store.create("first", "ai", "codex", tmp, window_id="win-a")
+                second = store.create("second", "ai", "codex", tmp, window_id="win-a")
+                foreign = store.create("foreign", "ai", "codex", tmp, window_id="win-b")
+
+                with self.assertRaises(KeyError):
+                    store.set_window_captain("win-a", "td-missing")
+                with self.assertRaises(ValueError):
+                    store.set_window_captain("win-a", foreign.id)
+
+                store.set_window_captain("win-a", first.id)
+                store.update(first.id, window_id="win-b")
+                self.assertIsNone(store.captain_for_window("win-a"))
+                self.assertEqual(
+                    store.conn.execute(
+                        "SELECT COUNT(*) FROM window_captains WHERE session_id = ?",
+                        (first.id,),
+                    ).fetchone()[0],
+                    0,
+                )
+
+                store.set_window_captain("win-a", second.id)
+                store.delete(second.id)
+                self.assertIsNone(store.captain_for_window("win-a"))
+
+                store.conn.execute(
+                    "INSERT INTO window_captains (window_id, session_id) VALUES (?, ?)",
+                    ("win-stale", "td-gone"),
+                )
+                store.conn.commit()
+                self.assertIsNone(store.captain_for_window("win-stale"))
+                self.assertEqual(
+                    store.conn.execute(
+                        "SELECT COUNT(*) FROM window_captains WHERE window_id = 'win-stale'"
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                store.close()
+
     def test_recovery_metadata_updates_are_batched_without_reordering_tabs(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")

@@ -58,8 +58,17 @@ def _print_json(payload: object) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
-def _select_records(store: SessionStore, selectors: list[str] | tuple[str, ...] | None = None, *, tag: str | None = None, all_sessions: bool = False):
-    records = store.list(include_archived=True)
+def _select_records(
+    store: SessionStore,
+    selectors: list[str] | tuple[str, ...] | None = None,
+    *,
+    tag: str | None = None,
+    all_sessions: bool = False,
+    window_id: str | None = None,
+):
+    # Restrict the candidate set first. Otherwise an exact id, duplicate tab
+    # name, shared tag, or --all can escape the requested browser window.
+    records = store.list(include_archived=True, window_id=window_id)
     selected = []
     seen: set[str] = set()
 
@@ -91,7 +100,13 @@ def _print_lifecycle_result(action: str, results) -> None:
 
 
 def _target_records_from_args(store: SessionStore, args: argparse.Namespace):
-    return _select_records(store, getattr(args, "selectors", None), tag=getattr(args, "tag", None), all_sessions=bool(getattr(args, "all", False)))
+    return _select_records(
+        store,
+        getattr(args, "selectors", None),
+        tag=getattr(args, "tag", None),
+        all_sessions=bool(getattr(args, "all", False)),
+        window_id=getattr(args, "target_window_id", None),
+    )
 
 
 def _control_row(record, action: str, ok: bool, *, pid: int | None = None, detail: str = "") -> dict[str, object]:
@@ -567,6 +582,7 @@ def _run_targeted_control(args: argparse.Namespace, action: str) -> int:
                         rows.append(_control_row(record, action, False, pid=record.last_pid, detail="pinned tab protected; pass --include-pinned to stop it"))
                         continue
                     backend.terminate(record)
+                    store.clear_window_captain(record.window_id, session_id=record.id)
                     store.update(
                         record.id,
                         status="stopped",
@@ -1244,7 +1260,15 @@ def cmd_shortcuts(args: argparse.Namespace) -> int:
 def cmd_sessions(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
     try:
-        _print_json([record.__dict__ for record in store.list(include_archived=args.all)])
+        _print_json(
+            [
+                record.__dict__
+                for record in store.list(
+                    include_archived=args.all,
+                    window_id=getattr(args, "window_id", None),
+                )
+            ]
+        )
     finally:
         store.close()
     return 0
@@ -1283,6 +1307,7 @@ def cmd_auth(args: argparse.Namespace) -> int:
             return 2
         manager = CodexAuthManager(account_source=store.account_source)
         requested = (getattr(args, "switch_account", None) or "").strip()
+        activation = None
         if requested:
             record = store.update(record.id, pending_account=requested)
             result = manager.switch(record, requested)
@@ -1303,12 +1328,22 @@ def cmd_auth(args: argparse.Namespace) -> int:
                 )
                 _print_json(payload)
                 return 1
+            activation = TmuxBackend().activate_auth_change(record)
+            updates: dict[str, object] = {
+                "selected_account": result.state.selected_account,
+                "pending_account": None,
+                "auth_restart_required": not activation.ok,
+                "auth_changed_at": utc_now(),
+            }
+            if activation.recovery_command is not None:
+                updates["recovery_command"] = activation.recovery_command
+                updates["recovery_cwd"] = activation.recovery_cwd
+            if activation.status is not None:
+                updates["status"] = activation.status
+                updates["last_pid"] = activation.pid
             record = store.update(
                 record.id,
-                selected_account=result.state.selected_account,
-                pending_account=None,
-                auth_restart_required=True,
-                auth_changed_at=utc_now(),
+                **updates,
             )
             state = result.state
             action = "auth-switch"
@@ -1334,10 +1369,16 @@ def cmd_auth(args: argparse.Namespace) -> int:
                 "pending_account": record.pending_account,
                 "auth_restart_required": record.auth_restart_required,
                 "auth_changed_at": record.auth_changed_at,
+                "auth_activation_ok": activation.ok if activation is not None else None,
+                "auth_activation_restarted": activation.restarted if activation is not None else None,
+                "auth_activation_detail": activation.detail if activation is not None else None,
             }
         )
+        if activation is not None and not activation.ok:
+            payload["ok"] = False
+            payload["error"] = activation.detail
         _print_json(payload)
-        return 0
+        return 0 if activation is None or activation.ok else 1
     except CodexAuthError as exc:
         _print_json({"action": "auth", "ok": False, "error": str(exc)})
         return 1
@@ -1350,10 +1391,21 @@ def cmd_gui(args: argparse.Namespace) -> int:
     return run(db_path=args.db, workspace_path=getattr(args, "workspace", None))
 
 
-def _add_targeting_args(parser: argparse.ArgumentParser) -> None:
+def _add_targeting_args(
+    parser: argparse.ArgumentParser,
+    *,
+    include_window_id: bool = True,
+) -> None:
     parser.add_argument("selectors", nargs="*", help="session id/prefix, exact name, tmux name, or tag")
     parser.add_argument("--tag", default=None, help="target all sessions under this tag")
     parser.add_argument("--all", action="store_true", help="target all remembered sessions")
+    if include_window_id:
+        parser.add_argument(
+            "--window-id",
+            dest="target_window_id",
+            default=None,
+            help="restrict targets to one TermDeck window",
+        )
     parser.add_argument("--db", type=Path, default=None)
 
 
@@ -1564,6 +1616,7 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--to", dest="selectors", action="append", default=[])
     send.add_argument("--tag", default=None)
     send.add_argument("--all", action="store_true")
+    send.add_argument("--window-id", dest="target_window_id", default=None)
     send.add_argument("--no-enter", action="store_true")
     send.add_argument("--dry-run", action="store_true")
     send.add_argument("--yes", action="store_true")
@@ -1590,7 +1643,7 @@ def build_parser() -> argparse.ArgumentParser:
     hide.set_defaults(func=cmd_hide)
 
     show = sub.add_parser("show", help="make selected hidden/remembered sessions visible in a browser window")
-    _add_targeting_args(show)
+    _add_targeting_args(show, include_window_id=False)
     show.add_argument("--window-id", default="main")
     show.add_argument("--window-title", default="Main")
     show.add_argument("--tab-index", type=int, default=None)
@@ -1612,7 +1665,7 @@ def build_parser() -> argparse.ArgumentParser:
     reopen_closed.set_defaults(func=cmd_reopen_closed)
 
     move = sub.add_parser("move", help="move selected remembered tabs to another browser window/tab slot")
-    _add_targeting_args(move)
+    _add_targeting_args(move, include_window_id=False)
     move.add_argument("--window-id", required=True)
     move.add_argument("--window-title", default=None)
     move.add_argument("--tab-index", type=int, default=None)
@@ -1725,6 +1778,7 @@ def build_parser() -> argparse.ArgumentParser:
     sessions = sub.add_parser("sessions", help="list remembered sessions")
     sessions.add_argument("--db", type=Path, default=None)
     sessions.add_argument("--all", action="store_true")
+    sessions.add_argument("--window-id", default=None, help="list sessions from one TermDeck window")
     sessions.set_defaults(func=cmd_sessions)
 
     workspace_open = sub.add_parser("workspace-open", help="materialise a JSON workspace recipe into remembered sessions")

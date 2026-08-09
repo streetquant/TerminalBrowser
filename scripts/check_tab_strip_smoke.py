@@ -29,8 +29,24 @@ def _tab_parts(Gtk, window, page_index: int = 0):
     tab_label = window.notebook.get_tab_label(page)
     if not isinstance(tab_label, Gtk.Box):
         raise AssertionError(f"unexpected tab-label widget: {type(tab_label).__name__}")
-    labels = [child for child in tab_label.get_children() if isinstance(child, Gtk.Label)]
-    buttons = [child for child in tab_label.get_children() if isinstance(child, Gtk.Button)]
+
+    labels = []
+    buttons = []
+
+    def collect(widget) -> None:
+        if isinstance(widget, Gtk.Button):
+            # A Gtk.Button may implement its caption with an internal label;
+            # that is the close control, not a second tab-name label.
+            buttons.append(widget)
+            return
+        if isinstance(widget, Gtk.Label):
+            labels.append(widget)
+            return
+        if isinstance(widget, Gtk.Container):
+            for child in widget.get_children():
+                collect(child)
+
+    collect(tab_label)
     if len(labels) != 1 or len(buttons) != 1:
         raise AssertionError(
             f"tab must contain one label and one close button; got {len(labels)} labels and {len(buttons)} buttons"

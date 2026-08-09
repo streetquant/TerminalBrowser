@@ -14,14 +14,28 @@ class FakeWindow:
     def __init__(self, app, **kwargs) -> None:
         self.app = app
         self.kwargs = kwargs
+        self.window_id = kwargs.get("window_id")
+        self.tabs = {
+            record.id: record
+            for record in (kwargs.get("restore_records") or [])
+        }
         self.calls: list[str] = []
         FakeWindow.created.append(self)
+
+    def get_realized(self) -> bool:
+        return True
 
     def show_all(self) -> None:
         self.calls.append("show")
 
     def present(self) -> None:
         self.calls.append("present")
+
+    def restore_previous_tabs(self, records=None) -> int:
+        rows = list(records or [])
+        self.calls.append(f"restore:{len(rows)}")
+        self.tabs.update({record.id: record for record in rows})
+        return len(rows)
 
     def new_shell_tab(self, cwd) -> None:
         self.calls.append(f"shell:{Path(cwd)}")
@@ -247,6 +261,87 @@ class FirstRunWindowFlowTests(TestCase):
         self.assertEqual(len(present_calls), 1)
         self.assertEqual(present_calls[0], app.windows)
         app.prompt_for_new_window.assert_not_called()
+
+    def test_reactivation_adds_only_missing_remembered_windows(self) -> None:
+        groups = [
+            (
+                f"win-{index}",
+                f"Window {index}",
+                [SimpleNamespace(id=f"tab-{index}")],
+            )
+            for index in range(10)
+        ]
+        existing = [
+            FakeWindow(
+                None,
+                window_id=window_id,
+                window_title=title,
+                restore_records=records,
+            )
+            for window_id, title, records in groups[:8]
+        ]
+        # Prove activation also fills a missing tab in an already-realized
+        # window without duplicating that window.
+        existing[0].tabs.clear()
+        FakeWindow.created = []
+        store = SimpleNamespace(windows_for_restore=lambda: groups)
+        present_calls = []
+        app = SimpleNamespace(
+            backend=SimpleNamespace(available=True),
+            sampler=object(),
+            store=store,
+            windows=existing,
+            workspace_path=None,
+            prompt_for_new_window=Mock(),
+            _present_all_windows=lambda: present_calls.append(list(app.windows)),
+        )
+
+        with patch("termdeck.gtk_app.reconcile_store"), patch(
+            "termdeck.gtk_app.TermDeckWindow", FakeWindow
+        ):
+            TermDeckApplication.do_activate(app)
+            TermDeckApplication.do_activate(app)
+
+        self.assertEqual({window.window_id for window in app.windows}, {row[0] for row in groups})
+        self.assertEqual(len(app.windows), 10)
+        self.assertEqual([window.window_id for window in FakeWindow.created], ["win-8", "win-9"])
+        self.assertIn("restore:1", existing[0].calls)
+        self.assertEqual(len(present_calls), 2)
+
+    def test_one_window_restore_failure_does_not_suppress_later_windows(self) -> None:
+        groups = [
+            ("win-broken", "Broken", [SimpleNamespace(id="bad")]),
+            ("win-good", "Good", [SimpleNamespace(id="good")]),
+        ]
+        store = SimpleNamespace(windows_for_restore=lambda: groups)
+        orphan = SimpleNamespace(tabs={}, destroy=Mock())
+        application_windows = []
+        app = SimpleNamespace(
+            backend=SimpleNamespace(available=True),
+            sampler=object(),
+            store=store,
+            windows=[],
+            workspace_path=None,
+            prompt_for_new_window=Mock(),
+            _present_all_windows=Mock(),
+            get_windows=lambda: list(application_windows),
+        )
+
+        def build(_app, **kwargs):
+            if kwargs["window_id"] == "win-broken":
+                application_windows.append(orphan)
+                raise RuntimeError("broken fixture")
+            return FakeWindow(_app, **kwargs)
+
+        with patch("termdeck.gtk_app.reconcile_store"), patch(
+            "termdeck.gtk_app.TermDeckWindow", side_effect=build
+        ):
+            TermDeckApplication.do_activate(app)
+
+        self.assertEqual([window.window_id for window in app.windows], ["win-good"])
+        self.assertEqual(app._last_window_restore_errors[0][:2], ("win-broken", "Broken"))
+        orphan.destroy.assert_called_once_with()
+        app._present_all_windows.assert_called_once_with()
 
     def test_present_all_windows_raises_each_restored_window(self) -> None:
         first = FakeWindow(None)

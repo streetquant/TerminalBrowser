@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Literal
 
 from .health import HealthPolicy, SessionHealth, evaluate_health, health_badge
+from .liveness import merge_confirmed_pane_snapshot
 from .master_tasks import MasterTaskRow, filter_rows, row_from_record
 from .models import ResourceSnapshot, SessionRecord
 from .resources import ResourceSampler
@@ -29,16 +30,18 @@ class TaskSnapshotItem:
         return (-self.health.severity, not self.record.pinned, self.record.window_title.casefold(), self.record.name.casefold())
 
 
-def _live_pid(record: SessionRecord, backend: TmuxBackend) -> int | None:
-    """Prefer the live tmux pane pid, but degrade to the remembered pid."""
+def _live_pid(record: SessionRecord, backend: TmuxBackend) -> tuple[int | None, bool]:
+    """Return the best PID plus whether a fresh tmux pane confirmed it."""
 
     if not backend.available:
-        return record.last_pid
+        return record.last_pid, False
     try:
         pid = backend.pane_pid(record)
     except TmuxError:
-        return record.last_pid
-    return pid if pid is not None else record.last_pid
+        return record.last_pid, False
+    if getattr(backend, "pane_snapshot_stale", False):
+        return (pid if pid is not None else record.last_pid), False
+    return pid, pid is not None
 
 
 def build_task_snapshot(
@@ -64,18 +67,27 @@ def build_task_snapshot(
     if backend.available and hasattr(backend, "pane_pids"):
         batch_pids = backend.pane_pids(record_list)
 
+    pane_snapshot_stale = bool(getattr(backend, "pane_snapshot_stale", False))
     resolved_pids: list[int | None] = []
+    confirmed_panes: list[bool] = []
     for record in record_list:
         if record.id in batch_pids:
-            pid = batch_pids[record.id]
-            if pid is None:
-                pid = record.last_pid
+            pane_pid = batch_pids[record.id]
+            if pane_snapshot_stale:
+                pid = pane_pid if pane_pid is not None else record.last_pid
+                confirmed = False
+            else:
+                # A successful all-pane snapshot is authoritative. Do not let a
+                # remembered/reused PID revive an absent or dead tmux pane.
+                pid = pane_pid
+                confirmed = pane_pid is not None
         else:
-            pid = _live_pid(record, backend)
+            pid, confirmed = _live_pid(record, backend)
         resolved_pids.append(pid)
+        confirmed_panes.append(confirmed)
 
     sample_many = getattr(sampler, "snapshots", None)
-    if getattr(backend, "pane_snapshot_stale", False):
+    if pane_snapshot_stale:
         snapshots = [
             ResourceSnapshot(
                 pid=pid,
@@ -94,6 +106,16 @@ def build_task_snapshot(
                 snapshots = [sampler.snapshot(pid) for pid in resolved_pids]
     else:
         snapshots = [sampler.snapshot(pid) for pid in resolved_pids]
+
+    if not pane_snapshot_stale:
+        snapshots = [
+            merge_confirmed_pane_snapshot(
+                snapshot,
+                pane_pid=pid,
+                pane_confirmed=confirmed,
+            )
+            for snapshot, pid, confirmed in zip(snapshots, resolved_pids, confirmed_panes)
+        ]
 
     items: list[TaskSnapshotItem] = []
     for record, pid, snapshot in zip(record_list, resolved_pids, snapshots):

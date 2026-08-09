@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Protocol
 
+from .liveness import merge_confirmed_pane_snapshot
 from .models import ResourceSnapshot, SessionRecord
 from .resources import ResourceSampler
 from .session_store import SessionStore, utc_now
@@ -89,7 +90,13 @@ def _observe_record(record: SessionRecord, backend: BackendLike, sampler: Sample
         pid = backend.pane_pid(record)
     except TmuxError:
         pid = None
-    return True, pid, sampler.snapshot(pid)
+    snapshot = sampler.snapshot(pid)
+    snapshot = merge_confirmed_pane_snapshot(
+        snapshot,
+        pane_pid=pid,
+        pane_confirmed=pid is not None and not getattr(backend, "pane_snapshot_stale", False),
+    )
+    return True, pid, snapshot
 
 
 def _sample_many(
@@ -236,6 +243,14 @@ def reconcile_records(
                 [pid if live_session else None for _record, live_session, pid in resolved],
                 refresh_limit=resource_sample_limit,
             )
+            snapshots = [
+                merge_confirmed_pane_snapshot(
+                    snapshot,
+                    pane_pid=pid,
+                    pane_confirmed=live_session and pid is not None,
+                )
+                for (_record, live_session, pid), snapshot in zip(resolved, snapshots)
+            ]
         observations = [
             (record, live_session, pid, snapshot)
             for (record, live_session, pid), snapshot in zip(resolved, snapshots)

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from termdeck.codex_auth import CodexAuthManager, prepare_auth_scope, read_auth_state
+from termdeck.codex_auth import CodexAuthError, CodexAuthManager, prepare_auth_scope, read_auth_state
 from termdeck.models import SessionRecord
 
 
@@ -45,7 +45,142 @@ def _write_source(source: Path) -> None:
     (source / "auth.json").write_text('{"token":"global-active"}', encoding="utf-8")
 
 
+def _write_native_source(source: Path) -> None:
+    accounts = source / "accounts"
+    accounts.mkdir(parents=True)
+    for name in ("alpha", "beta", "gamma"):
+        (accounts / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "last_refresh": "2026-01-01T00:00:00Z",
+                    "tokens": {"refresh_token": f"{name}-refresh"},
+                }
+            ),
+            encoding="utf-8",
+        )
+    (source / "auth.json").write_text('{"source":"must-not-copy"}', encoding="utf-8")
+    (source / "current").write_text("alpha\n", encoding="utf-8")
+
+
+def _write_native_codex_auth(executable: Path) -> None:
+    executable.write_text(
+        r"""#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+home = Path.home() / '.codex'
+if len(sys.argv) != 3 or sys.argv[1] != 'use':
+    raise SystemExit(64)
+name = sys.argv[2]
+account = home / 'accounts' / f'{name}.json'
+if not account.is_file():
+    raise SystemExit(2)
+auth = home / 'auth.json'
+try:
+    auth.unlink()
+except FileNotFoundError:
+    pass
+auth.symlink_to(account.resolve())
+(home / 'current').write_text(name + '\n', encoding='utf-8')
+(home / 'last-command').write_text(' '.join(sys.argv[1:]) + '\n', encoding='utf-8')
+if os.environ.get('FAKE_FAIL_ACCOUNT') == name:
+    raise SystemExit(1)
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+
+
 class CodexAuthTests(unittest.TestCase):
+    def test_prepare_scope_shares_canonical_sessions_without_sharing_auth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            private = root / "private"
+            _write_source(source)
+            rollout = source / "sessions" / "2026" / "07" / "26" / "rollout-test.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+            archived = source / "archived_sessions"
+            archived.mkdir()
+
+            prepare_auth_scope(private, account_source=source)
+
+            self.assertTrue((private / "sessions").is_symlink())
+            self.assertEqual((private / "sessions").resolve(), (source / "sessions").resolve())
+            self.assertEqual(
+                (private / "sessions" / "2026" / "07" / "26" / "rollout-test.jsonl").read_text(encoding="utf-8"),
+                '{"type":"session_meta"}\n',
+            )
+            self.assertTrue((private / "archived_sessions").is_symlink())
+            self.assertEqual((private / "archived_sessions").resolve(), archived.resolve())
+            self.assertFalse((private / "auth.json").exists())
+
+    def test_prepare_scope_replaces_empty_private_sessions_with_shared_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            private = root / "private"
+            _write_source(source)
+            (source / "sessions").mkdir()
+            (private / "sessions").mkdir(parents=True)
+
+            prepare_auth_scope(private, account_source=source)
+
+            self.assertTrue((private / "sessions").is_symlink())
+            self.assertEqual((private / "sessions").resolve(), (source / "sessions").resolve())
+
+    def test_prepare_scope_preserves_nonempty_legacy_private_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            private = root / "private"
+            _write_source(source)
+            (source / "sessions").mkdir()
+            local_rollout = private / "sessions" / "2026" / "08" / "09" / "rollout-local.jsonl"
+            local_rollout.parent.mkdir(parents=True)
+            local_rollout.write_text('{"local":"must-survive"}\n', encoding="utf-8")
+
+            prepare_auth_scope(private, account_source=source)
+
+            self.assertTrue((private / "sessions").is_dir())
+            self.assertFalse((private / "sessions").is_symlink())
+            self.assertEqual(local_rollout.read_text(encoding="utf-8"), '{"local":"must-survive"}\n')
+            self.assertEqual(list((source / "sessions").rglob("*.jsonl")), [])
+
+    def test_prepare_scope_never_self_links_canonical_session_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            _write_source(home)
+            rollout = home / "sessions" / "2026" / "08" / "09" / "rollout-source.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text('{"source":"keep"}\n', encoding="utf-8")
+
+            prepare_auth_scope(home, account_source=home)
+
+            self.assertTrue((home / "sessions").is_dir())
+            self.assertFalse((home / "sessions").is_symlink())
+            self.assertEqual(rollout.read_text(encoding="utf-8"), '{"source":"keep"}\n')
+
+    def test_prepare_scope_rejects_unexpected_session_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            private = root / "private"
+            unexpected = root / "unexpected"
+            _write_source(source)
+            (source / "sessions").mkdir()
+            unexpected.mkdir()
+            private.mkdir()
+            (private / "sessions").symlink_to(unexpected, target_is_directory=True)
+
+            with self.assertRaises(CodexAuthError):
+                prepare_auth_scope(private, account_source=source)
+
+            self.assertTrue((private / "sessions").is_symlink())
+            self.assertEqual((private / "sessions").resolve(), unexpected.resolve())
+
     def test_prepare_scope_copies_saved_accounts_but_starts_anonymous(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -111,6 +246,150 @@ shutil.copyfile(home / 'accounts' / f"{account['account_key']}.json", home / 'au
             global_registry = json.loads((source / "accounts" / "registry.json").read_text(encoding="utf-8"))
             self.assertEqual(global_registry["active_account_key"], "key-work")
             self.assertEqual((source / "auth.json").read_text(), '{"token":"global-active"}')
+
+
+    def test_native_01x_layout_uses_use_current_and_private_auth_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            private = root / "private"
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            _write_native_source(source)
+            executable = fake_bin / "codex-auth"
+            _write_native_codex_auth(executable)
+
+            host_path = f"{fake_bin}:{os.environ.get('PATH', '')}"
+            with mock.patch.dict(os.environ, {"PATH": host_path}):
+                prepare_auth_scope(private, account_source=source)
+                initial = read_auth_state(private)
+                result = CodexAuthManager(account_source=source).switch(
+                    _record(private, root),
+                    "beta",
+                )
+
+            self.assertIsNone(initial.selected_account)
+            self.assertEqual([account.label for account in initial.accounts], ["alpha", "beta", "gamma"])
+            self.assertTrue(result.ok, result.error)
+            self.assertEqual(result.state.selected_account, "beta")
+            self.assertEqual((private / "current").read_text(encoding="utf-8").strip(), "beta")
+            self.assertEqual((private / "last-command").read_text(encoding="utf-8").strip(), "use beta")
+            self.assertTrue((private / "auth.json").is_symlink())
+            self.assertEqual((private / "auth.json").resolve(), (private / "accounts" / "beta.json").resolve())
+            self.assertEqual((source / "current").read_text(encoding="utf-8").strip(), "alpha")
+            self.assertEqual((source / "auth.json").read_text(encoding="utf-8"), '{"source":"must-not-copy"}')
+
+            (private / "current").unlink()
+            self.assertEqual(read_auth_state(private).selected_account, "beta")
+
+    def test_native_01x_auth_symlink_wins_over_stale_current_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            private = root / "private"
+            _write_native_source(source)
+            prepare_auth_scope(private, account_source=source)
+
+            (private / "current").write_text("alpha\n", encoding="utf-8")
+            (private / "auth.json").symlink_to((private / "accounts" / "beta.json").resolve())
+
+            state = read_auth_state(private)
+            self.assertEqual(state.selected_account, "beta")
+            self.assertEqual(state.selected_account_key, "beta")
+
+    def test_native_01x_switches_two_tabs_without_cross_tab_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            first = root / "first"
+            second = root / "second"
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            _write_native_source(source)
+            executable = fake_bin / "codex-auth"
+            _write_native_codex_auth(executable)
+            host_path = f"{fake_bin}:{os.environ.get('PATH', '')}"
+
+            with mock.patch.dict(os.environ, {"PATH": host_path}):
+                prepare_auth_scope(first, account_source=source)
+                prepare_auth_scope(second, account_source=source)
+                manager = CodexAuthManager(account_source=source)
+                first_result = manager.switch(_record(first, root), "alpha")
+                second_result = manager.switch(_record(second, root), "beta")
+                second_changed = manager.switch(_record(second, root), "gamma")
+
+            self.assertTrue(first_result.ok, first_result.error)
+            self.assertTrue(second_result.ok, second_result.error)
+            self.assertTrue(second_changed.ok, second_changed.error)
+            self.assertEqual(read_auth_state(first).selected_account, "alpha")
+            self.assertEqual(read_auth_state(second).selected_account, "gamma")
+            self.assertEqual((first / "auth.json").resolve(), (first / "accounts" / "alpha.json").resolve())
+            self.assertEqual((second / "auth.json").resolve(), (second / "accounts" / "gamma.json").resolve())
+            self.assertNotEqual((first / "accounts" / "alpha.json").resolve(), (second / "accounts" / "alpha.json").resolve())
+            self.assertEqual((source / "current").read_text(encoding="utf-8").strip(), "alpha")
+
+    def test_native_existing_scope_refreshes_newer_non_active_saved_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            private = root / "private"
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            _write_native_source(source)
+            executable = fake_bin / "codex-auth"
+            _write_native_codex_auth(executable)
+            host_path = f"{fake_bin}:{os.environ.get('PATH', '')}"
+
+            with mock.patch.dict(os.environ, {"PATH": host_path}):
+                prepare_auth_scope(private, account_source=source)
+                manager = CodexAuthManager(account_source=source)
+                selected = manager.switch(_record(private, root), "alpha")
+                self.assertTrue(selected.ok, selected.error)
+
+                for name in ("alpha", "beta"):
+                    (source / "accounts" / f"{name}.json").write_text(
+                        json.dumps(
+                            {
+                                "auth_mode": "chatgpt",
+                                "last_refresh": "2026-02-01T00:00:00Z",
+                                "tokens": {"refresh_token": f"{name}-new"},
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                prepare_auth_scope(private, account_source=source)
+
+            alpha = json.loads((private / "accounts" / "alpha.json").read_text(encoding="utf-8"))
+            beta = json.loads((private / "accounts" / "beta.json").read_text(encoding="utf-8"))
+            self.assertEqual(alpha["tokens"]["refresh_token"], "alpha-refresh")
+            self.assertEqual(beta["tokens"]["refresh_token"], "beta-new")
+            self.assertEqual(read_auth_state(private).selected_account, "alpha")
+
+    def test_native_01x_failed_use_rolls_back_previous_private_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            private = root / "private"
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            _write_native_source(source)
+            executable = fake_bin / "codex-auth"
+            _write_native_codex_auth(executable)
+            host_path = f"{fake_bin}:{os.environ.get('PATH', '')}"
+
+            with mock.patch.dict(os.environ, {"PATH": host_path}):
+                prepare_auth_scope(private, account_source=source)
+                manager = CodexAuthManager(account_source=source)
+                record = _record(private, root)
+                first = manager.switch(record, "alpha")
+                with mock.patch.dict(os.environ, {"FAKE_FAIL_ACCOUNT": "gamma"}):
+                    failed = manager.switch(record, "gamma")
+
+            self.assertTrue(first.ok, first.error)
+            self.assertFalse(failed.ok)
+            self.assertEqual(failed.state.selected_account, "alpha")
+            self.assertEqual((private / "current").read_text(encoding="utf-8").strip(), "alpha")
+            self.assertEqual((private / "auth.json").resolve(), (private / "accounts" / "alpha.json").resolve())
 
 
     def test_failed_switch_rolls_back_to_the_previous_private_account(self):

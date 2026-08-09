@@ -3,11 +3,57 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest import mock
 
-from termdeck.gtk_app import AttachTerminal, Gdk, Gtk
+from termdeck.gtk_app import AttachTerminal, Gdk, Gtk, TermDeckWindow
 from termdeck.models import TerminalTheme
+from termdeck.tmux_backend import ScrollDisposition
 
 
 class TerminalMouseBehaviourTest(TestCase):
+    def test_font_zoom_clamps_readably_and_synchronizes_every_tab(self) -> None:
+        widgets = [
+            SimpleNamespace(
+                terminal=object(),
+                theme=None,
+                request_geometry_sync=mock.Mock(),
+            )
+            for _ in range(2)
+        ]
+        window = SimpleNamespace(
+            app_context=SimpleNamespace(
+                theme=TerminalTheme(font="Monospace 24", use_system_font=False)
+            ),
+            tabs={
+                "visible": SimpleNamespace(widget=widgets[0]),
+                "hidden": SimpleNamespace(widget=widgets[1]),
+            },
+            font_zoom_delta=0,
+            show_toast=mock.Mock(),
+        )
+        window.base_font = lambda: TermDeckWindow.base_font(window)
+        window.zoomed_font = lambda: TermDeckWindow.zoomed_font(window)
+        window.apply_font_zoom = lambda: TermDeckWindow.apply_font_zoom(window)
+
+        with mock.patch("termdeck.gtk_app.apply_theme") as apply_theme:
+            TermDeckWindow.zoom_font(window, -100)
+
+            self.assertEqual(window.zoomed_font(), "Monospace 10")
+            self.assertEqual(window.font_zoom_delta, -14)
+            self.assertEqual(apply_theme.call_count, 2)
+            for widget in widgets:
+                widget.request_geometry_sync.assert_called_once_with(delay_ms=80)
+
+            apply_theme.reset_mock()
+            for widget in widgets:
+                widget.request_geometry_sync.reset_mock()
+
+            TermDeckWindow.zoom_font(window, 1)
+
+            self.assertEqual(window.zoomed_font(), "Monospace 11")
+            self.assertEqual(window.font_zoom_delta, -13)
+            self.assertEqual(apply_theme.call_count, 2)
+            for widget in widgets:
+                widget.request_geometry_sync.assert_called_once_with(delay_ms=80)
+
     def test_terminal_has_terminator_style_scrollbar_without_arrow_key_fallback(self) -> None:
         ready, _argv = Gtk.init_check([])
         if not ready:
@@ -133,6 +179,44 @@ class TerminalMouseBehaviourTest(TestCase):
         self.assertTrue(handled)
         self.assertEqual(calls, [-3, ("cursor-hidden", True)])
         adjustment.get_value.assert_not_called()
+
+    def test_alternate_screen_wheel_is_passed_through_to_the_tui(self) -> None:
+        calls = []
+        terminal = SimpleNamespace()
+        attach = SimpleNamespace(
+            terminal=terminal,
+            _scroll_handler=lambda lines: calls.append(lines) or ScrollDisposition.PASSTHROUGH,
+            _history_cursor_hidden=True,
+            reset_scrollbar=lambda: calls.append("scrollbar-bottom"),
+            _set_history_cursor_hidden=lambda hidden: calls.append(("cursor-hidden", hidden)),
+        )
+        event = SimpleNamespace(direction=Gdk.ScrollDirection.UP, delta_y=0.0)
+
+        handled = AttachTerminal._on_terminal_scroll(attach, terminal, event)
+
+        self.assertFalse(handled)
+        self.assertEqual(calls, [-3, "scrollbar-bottom", ("cursor-hidden", False)])
+
+    def test_proxy_scrollbar_does_not_move_for_application_owned_history(self) -> None:
+        calls = []
+        adjustment = mock.Mock()
+        adjustment.get_value.return_value = 70.0
+        attach = SimpleNamespace(
+            _scrollbar_syncing=False,
+            _last_scrollbar_value=90.0,
+            _scroll_handler=lambda lines: calls.append(lines) or ScrollDisposition.PASSTHROUGH,
+            _history_cursor_hidden=True,
+            _set_history_cursor_hidden=lambda hidden: calls.append(("cursor-hidden", hidden)),
+            _set_scrollbar_value=lambda value: calls.append(("scrollbar", value)),
+        )
+
+        AttachTerminal._on_scrollbar_value_changed(attach, adjustment)
+
+        self.assertEqual(
+            calls,
+            [-20, ("scrollbar", 90.0), ("cursor-hidden", False)],
+        )
+        self.assertEqual(attach._last_scrollbar_value, 90.0)
 
     def test_smooth_wheel_delta_is_clamped_to_scrollback_bounds(self) -> None:
         adjustment = mock.Mock()
@@ -266,6 +350,30 @@ class TerminalMouseBehaviourTest(TestCase):
                 ("geometry", {"delay_ms": 0}),
             ],
         )
+
+    def test_notebook_switch_restores_live_view_and_syncs_selected_page(self) -> None:
+        calls = []
+        page = SimpleNamespace(prepare_for_live_input=lambda: calls.append("prepare"))
+        notebook = SimpleNamespace(
+            get_current_page=lambda: 1,
+            get_nth_page=lambda index: page if index == 1 else None,
+        )
+        window = SimpleNamespace(
+            notebook=notebook,
+            _refresh_auth_selector=lambda: calls.append("auth"),
+            _prepare_switched_terminal=lambda selected: TermDeckWindow._prepare_switched_terminal(
+                window, selected
+            ),
+        )
+
+        with mock.patch(
+            "termdeck.gtk_app.GLib.idle_add",
+            side_effect=lambda callback, *args: callback(*args),
+        ) as idle_add:
+            TermDeckWindow._on_notebook_switch_page(window, notebook, page, 1)
+
+        self.assertEqual(calls, ["auth", "prepare"])
+        self.assertEqual(idle_add.call_count, 2)
 
     def test_forced_geometry_sync_resizes_pty_and_signals_tmux_client(self) -> None:
         pty_obj = mock.Mock()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify real TermDeck/tmux wheel scrolling, including Codex transcript routing."""
+"""Verify shell history, Codex transcript, and native alternate-screen scrolling."""
 
 from __future__ import annotations
 
@@ -129,14 +129,48 @@ sys.stdout.flush()
 """,
             encoding="utf-8",
         )
+
+        native_ready = root / "native-ready"
+        native_input = root / "native-input.bin"
+        native_simulator = root / "native_simulator.py"
+        native_simulator.write_text(
+            """import os, pathlib, sys, termios, time
+ready, captured = map(pathlib.Path, sys.argv[1:])
+fd = sys.stdin.fileno()
+old = termios.tcgetattr(fd)
+raw = termios.tcgetattr(fd)
+raw[3] &= ~(termios.ICANON | termios.ECHO)
+raw[6][termios.VMIN] = 0
+raw[6][termios.VTIME] = 1
+termios.tcsetattr(fd, termios.TCSANOW, raw)
+sys.stdout.write("\\x1b[?1049h\\x1b[?1000h\\x1b[?1006hNative alternate-screen TUI\\r\\n")
+sys.stdout.flush()
+captured.write_bytes(b"")
+ready.touch()
+data = b""
+deadline = time.monotonic() + 20.0
+while time.monotonic() < deadline:
+    data += os.read(fd, 1024)
+    captured.write_bytes(data)
+termios.tcsetattr(fd, termios.TCSANOW, old)
+sys.stdout.write("\\x1b[?1006l\\x1b[?1000l\\x1b[?1049l")
+sys.stdout.flush()
+""",
+            encoding="utf-8",
+        )
         codex_executable = root / "codex"
         codex_executable.symlink_to(sys.executable)
+        native_executable = root / "2.1.226"
+        native_executable.symlink_to(sys.executable)
 
         shell_command = shlex.join(
             [sys.executable, str(shell_worker), str(shell_ready), str(shell_input)]
         )
         codex_command = shlex.join(
             [str(codex_executable), str(codex_simulator), str(codex_ready), str(codex_events)]
+        )
+        native_command = shlex.join(
+            [str(native_executable), str(native_simulator), str(native_ready), str(native_input)]
         )
         workspace = root / "workspace.json"
         workspace.write_text(
@@ -149,6 +183,7 @@ sys.stdout.flush()
                             "tabs": [
                                 {"name": "shell-history", "command": shell_command, "cwd": str(root)},
                                 {"name": "codex-transcript", "command": codex_command, "cwd": str(root)},
+                                {"name": "native-alternate", "command": native_command, "cwd": str(root)},
                             ],
                         }
                     ],
@@ -170,7 +205,7 @@ sys.stdout.flush()
             try:
                 _drain(
                     Gtk,
-                    until=lambda: bool(app.windows and len(app.windows[0].tabs) == 2),
+                    until=lambda: bool(app.windows and len(app.windows[0].tabs) == 3),
                 )
             except RuntimeError as exc:
                 state = {
@@ -186,11 +221,19 @@ sys.stdout.flush()
             records = {record.name: record for record in app.store.list()}
             shell_record = records["shell-history"]
             codex_record = records["codex-transcript"]
+            native_record = records["native-alternate"]
 
             _drain(Gtk, until=shell_ready.exists)
             window._focus_session(shell_record.id)
             shell_attach = window.tabs[shell_record.id].widget
             shell_terminal = shell_attach.terminal
+            _drain(
+                Gtk,
+                until=lambda: (
+                    window.current_session_id() == shell_record.id
+                    and shell_terminal.get_mapped()
+                ),
+            )
             _wheel_up(shell_terminal)
 
             def shell_scroll_state() -> tuple[int, int]:
@@ -207,7 +250,23 @@ sys.stdout.flush()
                 fields = result.stdout.strip().split()
                 return (int(fields[0]), int(fields[1])) if len(fields) == 2 else (0, 0)
 
-            _drain(Gtk, until=lambda: shell_scroll_state()[1] >= 3)
+            try:
+                _drain(Gtk, until=lambda: shell_scroll_state()[1] >= 3)
+            except RuntimeError as exc:
+                pane_state = app.backend._run(
+                    [
+                        "display-message",
+                        "-p",
+                        "-t",
+                        app.backend.pane_target(shell_record),
+                        "#{alternate_on}|#{pane_in_mode}|#{history_size}|#{pane_current_command}",
+                    ],
+                    check=False,
+                ).stdout.strip()
+                raise RuntimeError(
+                    "shell wheel did not enter tmux history: "
+                    f"pane={pane_state!r}, tracked={app.backend._scroll_views!r}"
+                ) from exc
             shell_mode, shell_position = shell_scroll_state()
             shell_cursor_hidden_during_history = shell_attach._history_cursor_hidden
             if not shell_cursor_hidden_during_history:
@@ -227,6 +286,13 @@ sys.stdout.flush()
             window._focus_session(codex_record.id)
             codex_attach = window.tabs[codex_record.id].widget
             codex_terminal = codex_attach.terminal
+            _drain(
+                Gtk,
+                until=lambda: (
+                    window.current_session_id() == codex_record.id
+                    and codex_terminal.get_mapped()
+                ),
+            )
             _wheel_up(codex_terminal)
             _drain(
                 Gtk,
@@ -250,6 +316,46 @@ sys.stdout.flush()
             if codex_attach._history_cursor_hidden:
                 raise AssertionError("Codex composer cursor stayed hidden after live input")
 
+            _drain(Gtk, until=native_ready.exists)
+            window._focus_session(native_record.id)
+            native_attach = window.tabs[native_record.id].widget
+            native_terminal = native_attach.terminal
+            _drain(
+                Gtk,
+                until=lambda: (
+                    window.current_session_id() == native_record.id
+                    and native_terminal.get_mapped()
+                ),
+            )
+
+            def native_state() -> tuple[int, int]:
+                result = app.backend._run(
+                    [
+                        "display-message",
+                        "-p",
+                        "-t",
+                        app.backend.pane_target(native_record),
+                        "#{alternate_on} #{pane_in_mode}",
+                    ],
+                    check=False,
+                )
+                fields = result.stdout.strip().split()
+                return (int(fields[0]), int(fields[1])) if len(fields) == 2 else (0, 0)
+
+            _drain(Gtk, until=lambda: native_state()[0] == 1)
+            _wheel_up(native_terminal)
+            _drain(
+                Gtk,
+                until=lambda: (
+                    native_input.exists()
+                    and b"\x1b[<64;" in native_input.read_bytes()
+                    and native_state() == (1, 0)
+                ),
+            )
+            subprocess.run(["xdotool", "key", "x"], check=True, timeout=5)
+            _drain(Gtk, until=lambda: b"x" in native_input.read_bytes())
+            native_alt, native_mode = native_state()
+
             print(
                 json.dumps(
                     {
@@ -267,6 +373,9 @@ sys.stdout.flush()
                         "codex_events": final_events,
                         "codex_cursor_hidden_during_history": codex_cursor_hidden_during_history,
                         "composer_history_was_not_touched": "composer-up" not in final_events,
+                        "native_alternate_screen": native_alt,
+                        "native_copy_mode": native_mode,
+                        "native_wheel_passthrough": b"\x1b[<64;" in native_input.read_bytes(),
                     },
                     indent=2,
                     sort_keys=True,

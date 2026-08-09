@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import pty
 import re
@@ -30,11 +31,13 @@ from .capacity import (
     UI_RESOURCE_REFRESH_BUDGET,
     bounded_registry_records,
 )
+from .captain import build_captain_envelope
 from .codex_archive import LegacyRecoveryResult, repair_legacy_recovery
 from .codex_auth import CodexAuthError, CodexAuthManager, CodexAuthState, CodexSwitchResult
 from .command_palette import PaletteItem, build_palette_items, search_palette
 from .control_plan import ControlPlan, build_control_plan, render_control_plan_text
 from .health import HealthPolicy, classify_session, health_badge, should_pause_for_attention
+from .liveness import merge_confirmed_pane_snapshot
 from .master_tasks import filter_rows
 from .models import SessionRecord, TerminalTheme
 from .persistence import PersistenceResult, persist_live_sessions
@@ -43,14 +46,14 @@ from .resources import ResourceSampler
 from .session_lifecycle import archive_records, hide_records, move_records, pin_records, recently_closed_records, rename_record, reopen_closed_records, unpin_records
 from .session_reconcile import reconcile_store
 from .session_search import search_sessions
-from .session_store import SessionStore, short_id, utc_now
+from .session_store import DEFAULT_DB_PATH, SessionStore, short_id, utc_now
 from .settings import AppSettings, SettingsError, save_terminal_options
 from .shortcuts import build_shortcut_map, index_from_key_name, shortcut_entries
 from .task_snapshot import build_task_snapshot
 from .command_render import default_shell, directory_tab_name, normalise_directory, render_command
 from .window_snapshot import build_window_snapshots
 from .terminator_config import load_terminator_theme
-from .tmux_backend import TmuxBackend, TmuxError
+from .tmux_backend import AuthActivationResult, ScrollDisposition, TmuxBackend, TmuxError
 from .ui_theme import (
     apply_terminal_palette,
     build_chrome_css,
@@ -346,6 +349,9 @@ class AttachTerminal(Gtk.Box):
         self._detached = False
         self._spawn_source_id = 0
         self._spawn_fallback_source_id = 0
+        self._attach_restart_source_id = 0
+        self._attach_stable_source_id = 0
+        self._attach_restart_attempts = 0
         self._resize_sync_source_id = 0
         self._cursor_hide_source_id = 0
         self._last_allocated_grid = (0, 0)
@@ -417,6 +423,7 @@ class AttachTerminal(Gtk.Box):
         self.terminal.connect("button-press-event", self._on_button_press)
         self.terminal.connect("scroll-event", self._on_terminal_scroll)
         self.terminal.connect("size-allocate", self._on_terminal_size_allocate)
+        self.terminal.connect("child-exited", self._on_attach_child_exited)
         self.connect("destroy", lambda *_: self._cancel_pending_spawn())
         self._selection_pending = False
         self._selection_autocopy_source_id = 0
@@ -508,11 +515,15 @@ class AttachTerminal(Gtk.Box):
     def _cancel_pending_spawn(self) -> None:
         self._remove_glib_source(self._spawn_source_id)
         self._remove_glib_source(self._spawn_fallback_source_id)
+        self._remove_glib_source(self._attach_restart_source_id)
+        self._remove_glib_source(self._attach_stable_source_id)
         self._remove_glib_source(self._resize_sync_source_id)
         self._remove_glib_source(self._cursor_hide_source_id)
         self._remove_glib_source(self._scroll_idle_source_id)
         self._spawn_source_id = 0
         self._spawn_fallback_source_id = 0
+        self._attach_restart_source_id = 0
+        self._attach_stable_source_id = 0
         self._resize_sync_source_id = 0
         self._cursor_hide_source_id = 0
         self._scroll_idle_source_id = 0
@@ -621,6 +632,8 @@ class AttachTerminal(Gtk.Box):
             )
             try:
                 self.terminal.watch_child(self.process.pid)
+                self._remove_glib_source(self._attach_stable_source_id)
+                self._attach_stable_source_id = GLib.timeout_add(2000, self._mark_attach_stable)
             except Exception:
                 pass
         finally:
@@ -628,6 +641,44 @@ class AttachTerminal(Gtk.Box):
                 os.close(slave_fd)
             except OSError:
                 pass
+
+    def _on_attach_child_exited(self, _terminal, _status) -> None:
+        if self._detached:
+            return
+        self.process = None
+        self._remove_glib_source(self._attach_stable_source_id)
+        self._attach_stable_source_id = 0
+        self._schedule_attach_restart()
+
+    def _schedule_attach_restart(self) -> None:
+        if self._detached or self._attach_restart_source_id:
+            return
+        exponent = min(self._attach_restart_attempts, 5)
+        delay_ms = min(5000, 150 * (2 ** exponent))
+        self._attach_restart_attempts += 1
+        self._attach_restart_source_id = GLib.timeout_add(delay_ms, self._restart_attach_client)
+
+    def _restart_attach_client(self) -> bool:
+        self._attach_restart_source_id = 0
+        if self._detached:
+            return False
+        if self.process is not None and self.process.poll() is None:
+            return False
+        self.process = None
+        columns = max(2, int(self.terminal.get_column_count() or 80))
+        rows = max(2, int(self.terminal.get_row_count() or 24))
+        try:
+            self._spawn(columns=columns, rows=rows)
+        except OSError:
+            self.process = None
+            self._schedule_attach_restart()
+        return False
+
+    def _mark_attach_stable(self) -> bool:
+        self._attach_stable_source_id = 0
+        if not self._detached and self.process is not None and self.process.poll() is None:
+            self._attach_restart_attempts = 0
+        return False
 
     def detach(self) -> None:
         self._detached = True
@@ -710,7 +761,16 @@ class AttachTerminal(Gtk.Box):
             return
         handler = self._scroll_handler
         try:
-            if callable(handler) and handler(delta):
+            result = handler(delta) if callable(handler) else ScrollDisposition.UNHANDLED
+            if result is ScrollDisposition.PASSTHROUGH:
+                # The proxy bar represents tmux history, not application-owned
+                # alternate-screen history. Keep it at its previous position;
+                # wheel events on the terminal itself are passed to the TUI.
+                self._set_scrollbar_value(previous)
+                if self._history_cursor_hidden:
+                    self._set_history_cursor_hidden(False)
+                return
+            if result:
                 self._last_scrollbar_value = requested
                 if delta > 0 and self._scrollbar_at_live_edge():
                     # Dragged back to the live edge — leave the history view.
@@ -1205,7 +1265,16 @@ class AttachTerminal(Gtk.Box):
             if not line_delta and delta:
                 line_delta = -1 if delta < 0 else 1
             try:
-                if line_delta and handler(line_delta):
+                result = handler(line_delta) if line_delta else ScrollDisposition.UNHANDLED
+                if result is ScrollDisposition.PASSTHROUGH:
+                    # VTE translates the original event using the mouse mode
+                    # negotiated by the active TUI. Consuming it here would make
+                    # Claude Code, Grok, and every other full-screen app inert.
+                    self.reset_scrollbar()
+                    if self._history_cursor_hidden:
+                        self._set_history_cursor_hidden(False)
+                    return False
+                if result:
                     mover = getattr(self, "_move_scrollbar", None)
                     if callable(mover):
                         mover(line_delta)
@@ -1809,7 +1878,9 @@ class SessionSearchWindow(Gtk.Window):
         record = self.app_context.store.get(match.session_id)
         if not record or not self.app_context.windows:
             return
-        self.app_context.windows[-1].open_session(record)
+        owner_lookup = getattr(self.app_context, "window_for_window_id", None)
+        owner = owner_lookup(record.window_id) if callable(owner_lookup) else None
+        (owner or self.app_context.windows[-1]).open_session(record)
 
 class TerminalTab:
     def __init__(self, record: SessionRecord, widget: AttachTerminal):
@@ -2143,10 +2214,10 @@ class SidePane(Gtk.Box):
         header_row.pack_end(pane_more, False, False, 0)
         self.pack_start(header_row, False, False, 0)
 
-        hint = Gtk.Label(label="Ctrl+left-click any tab card to select multiple tabs", xalign=0)
-        hint.set_line_wrap(True)
-        _style(hint, "td-muted")
-        self.pack_start(hint, False, False, 0)
+        self.hint = Gtk.Label(label="Ctrl+left-click any tab card to select multiple tabs", xalign=0)
+        self.hint.set_line_wrap(True)
+        _style(self.hint, "td-muted")
+        self.pack_start(self.hint, False, False, 0)
 
         self.filter_entry = Gtk.SearchEntry(placeholder_text="Search tabs, directories, or commands")
         _style(self.filter_entry, "td-search-entry")
@@ -2162,7 +2233,11 @@ class SidePane(Gtk.Box):
         scroller.add(self.session_box)
         self.pack_start(scroller, True, True, 0)
 
-        self.prompt = Gtk.Entry(placeholder_text="Send a command or prompt to selected tabs")
+        self.prompt = Gtk.Entry(placeholder_text="Ask this window's Codex captain")
+        self.prompt.set_tooltip_text(
+            "Send one task to this window's Codex captain; Pause, Resume, and Kill still use selected tabs"
+        )
+        self.prompt.connect("activate", lambda *_: self.send_prompt())
         _style(self.prompt, "td-search-entry")
         self.pack_start(self.prompt, False, False, 0)
 
@@ -2186,6 +2261,8 @@ class SidePane(Gtk.Box):
         _style(more, "td-more-actions")
         menu = Gtk.Menu()
         secondary = [
+            ("Make current tab captain", self.make_current_captain),
+            ("Clear captain", self.clear_captain),
             ("New tab", self.window.new_tab),
             ("Rename window", self.window.rename_window),
             ("Palette", self.window.open_command_palette),
@@ -2334,6 +2411,11 @@ class SidePane(Gtk.Box):
         menu.append(self._menu_item("Open", lambda: self.window.open_session(record)))
         menu.append(self._menu_item(selected_label, lambda: self._toggle_record_selection(record, check)))
         menu.append(self._menu_item("Rename", lambda: self.window.rename_session(record)))
+        captain = self._stored_captain()
+        if captain is not None and captain.id == record.id:
+            menu.append(self._menu_item("Clear Codex captain", self.clear_captain))
+        else:
+            menu.append(self._menu_item("Make Codex captain", lambda: self.make_captain(record)))
         menu.append(self._menu_item(self._context_label("Pin", records), lambda: self._pin_records(records)))
         menu.append(self._menu_item(self._context_label("Unpin", records), lambda: self._unpin_records(records)))
         menu.append(self._menu_item(self._context_label("Hide", records), lambda: self._hide_records(records)))
@@ -2371,6 +2453,103 @@ class SidePane(Gtk.Box):
             display = f"{selected_count} selected · {display}"
         self.count_label.set_text(display)
 
+    def _stored_captain(self) -> SessionRecord | None:
+        resolver = getattr(self.window.app_context.store, "captain_for_window", None)
+        if not callable(resolver):
+            return None
+        try:
+            return resolver(self.window.window_id)
+        except Exception:
+            return None
+
+    def _update_captain_hint(self, captain: SessionRecord | None) -> None:
+        if captain is None:
+            text = "Captain: none · Open a Codex tab, then Send or choose Make current tab captain"
+        else:
+            text = f"Captain: {captain.name} · Send asks it to coordinate this window"
+        text += " · Ctrl+left-click tab cards for Pause, Resume, or Kill"
+        self.hint.set_text(text)
+
+    def _captain_error(self, record: SessionRecord) -> str | None:
+        if record.window_id != self.window.window_id:
+            return "That tab belongs to a different TermDeck window"
+        if not record.visible or record.id not in self.window.tabs:
+            return "The Codex captain must be an open tab in this window"
+        status = record.status.casefold()
+        if status == "paused":
+            return f"Captain {record.name} is paused; resume it before sending"
+        if status in {"archived", "stopped", "killed", "terminated", "start-error"}:
+            return f"Captain {record.name} is not running"
+        probe = getattr(self.window.app_context.backend, "is_codex_running", None)
+        if not callable(probe):
+            return "The terminal backend cannot verify a live Codex captain"
+        try:
+            is_codex = bool(probe(record))
+        except Exception:
+            is_codex = False
+        if not is_codex:
+            return f"{record.name} is not currently running Codex"
+        return None
+
+    def _set_captain(self, record: SessionRecord) -> SessionRecord | None:
+        setter = getattr(self.window.app_context.store, "set_window_captain", None)
+        if not callable(setter):
+            return None
+        try:
+            return setter(self.window.window_id, record.id)
+        except Exception:
+            return None
+
+    def resolve_captain(self, *, auto_adopt_current: bool = True) -> tuple[SessionRecord | None, str | None]:
+        captain = self._stored_captain()
+        if captain is not None:
+            error = self._captain_error(captain)
+            return (captain, None) if error is None else (None, error)
+        if not auto_adopt_current:
+            return None, "This window has no Codex captain"
+        current = self.window.current_record()
+        if current is None:
+            return None, "Open a Codex tab in this window, then make it captain"
+        error = self._captain_error(current)
+        if error is not None:
+            return None, error + "; open a Codex tab or choose Make Codex captain"
+        captain = self._set_captain(current)
+        if captain is None:
+            return None, "Could not save this window's Codex captain"
+        self.window.refresh_captain_chrome()
+        return captain, None
+
+    def make_captain(self, record: SessionRecord) -> None:
+        refreshed = self.window.app_context.store.get(record.id) or record
+        error = self._captain_error(refreshed)
+        if error is not None:
+            self.window.show_toast(error, kind="warn")
+            return
+        captain = self._set_captain(refreshed)
+        if captain is None:
+            self.window.show_toast("Could not save this window's Codex captain", kind="danger")
+            return
+        self.window.refresh_captain_chrome()
+        self.window.show_toast(f"{captain.name} is now this window's Codex captain", kind="success")
+
+    def make_current_captain(self) -> None:
+        current = self.window.current_record()
+        if current is None:
+            self.window.show_toast("Open a Codex tab before choosing a captain", kind="warn")
+            return
+        self.make_captain(current)
+
+    def clear_captain(self) -> None:
+        clear = getattr(self.window.app_context.store, "clear_window_captain", None)
+        changed = False
+        if callable(clear):
+            try:
+                changed = bool(clear(self.window.window_id))
+            except Exception:
+                changed = False
+        self.window.refresh_captain_chrome()
+        self.window.show_toast("Codex captain cleared" if changed else "This window has no captain", kind="info")
+
     def refresh(self) -> None:
         # The pane is optional and hidden by default. Direct refresh requests
         # still arrive as tabs change; do no tmux, /proc, or widget work until
@@ -2384,6 +2563,8 @@ class SidePane(Gtk.Box):
             self.window.window_id,
             query,
         )
+        captain = self._stored_captain()
+        self._update_captain_hint(captain)
         live_ids = {record.id for record in matching_records}
         self._visible_record_count = len(matching_records)
         self.selected_ids.intersection_update(live_ids)
@@ -2400,6 +2581,7 @@ class SidePane(Gtk.Box):
             resource_bucket,
             tuple((record.id, record.name, record.tag, record.status, record.visible, record.pinned, record.last_pid) for record in records),
             tuple(sorted(self.selected_ids)),
+            captain.id if captain is not None else None,
         )
         if signature == self._last_refresh_signature:
             return
@@ -2473,7 +2655,8 @@ class SidePane(Gtk.Box):
             check.connect("button-press-event", self._on_session_button_press, record, check)
             top.pack_start(check, False, False, 0)
             pin = "📌 " if record.pinned else ""
-            title = Gtk.Label(label=f"{kind_glyph(kind)} {pin}{record.name}", xalign=0)
+            captain_mark = "♛ " if captain is not None and captain.id == record.id else ""
+            title = Gtk.Label(label=f"{kind_glyph(kind)} {captain_mark}{pin}{record.name}", xalign=0)
             title.set_ellipsize(Pango.EllipsizeMode.END)
             _style(title, "td-title")
             top.pack_start(title, True, True, 0)
@@ -2590,7 +2773,7 @@ class SidePane(Gtk.Box):
         records = []
         for session_id in sorted(self.selected_ids):
             record = self.window.app_context.store.get(session_id)
-            if record:
+            if record and record.window_id == self.window.window_id:
                 records.append(record)
         return records
 
@@ -2598,19 +2781,38 @@ class SidePane(Gtk.Box):
         text = self.prompt.get_text()
         if not text.strip():
             return
-        records = self.selected_records()
+        captain, error = self.resolve_captain()
+        if captain is None:
+            self.window.show_toast(error or "This window has no live Codex captain", kind="warn")
+            return
+        records = self.window.app_context.store.list(
+            include_archived=False,
+            window_id=self.window.window_id,
+        )
+        envelope = build_captain_envelope(
+            window_id=self.window.window_id,
+            window_title=self.window.window_title,
+            captain=captain,
+            records=records,
+            user_request=text,
+            database_path=self.window.app_context.store.path,
+        )
         if not self.window.app_context.confirm_control_plan(
             self.window,
-            records,
+            [captain],
             "send",
-            text=text,
+            text=envelope,
             enter=True,
-            selection="side pane selection",
+            selection="window Codex captain",
         ):
             return
-        for record in records:
-            self.window.app_context.backend.send_text(record, text, enter=True)
+        try:
+            self.window.app_context.backend.send_text(captain, envelope, enter=True)
+        except (OSError, TmuxError) as exc:
+            self.window.show_toast(f"Could not send to captain: {exc}", kind="danger")
+            return
         self.prompt.set_text("")
+        self.window.show_toast(f"Sent to captain {captain.name}", kind="success")
 
     def send_status(self) -> None:
         text = "Pause and summarise your current state in five concise lines. Do not modify files."
@@ -3295,6 +3497,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         )
         self.window_id = window_id or short_id("win")
         self.window_title = window_title or "Main"
+        remember_window = getattr(app_context.store, "remember_window", None)
+        if callable(remember_window):
+            remember_window(self.window_id, self.window_title)
         self._restore_records = restore_records
         self.tabs: dict[str, TerminalTab] = {}
         self.master_window: MasterWindow | None = None
@@ -3865,6 +4070,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             return
         self.notebook.set_tab_label(tab.widget, self._build_tab_label(record))
 
+    def refresh_captain_chrome(self) -> None:
+        """Refresh only the existing side-pane captain indicator."""
+
+        self.side.refresh()
+
     @staticmethod
     def _directory_tracking_changes(record: SessionRecord, live_directory: str) -> dict[str, str]:
         old_directory = normalise_directory(record.cwd)
@@ -3877,6 +4087,18 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if record.name == directory_tab_name(old_directory):
             changes["name"] = directory_tab_name(new_directory)
         return changes
+
+    @staticmethod
+    def _should_update_recovery_metadata(
+        record: SessionRecord,
+        command: str | None,
+        recovery_cwd: str | None,
+    ) -> bool:
+        existing_command = getattr(record, "recovery_command", None)
+        existing_cwd = getattr(record, "recovery_cwd", None)
+        if not command and existing_command:
+            return False
+        return existing_command != command or existing_cwd != recovery_cwd
 
     def refresh_tab_directories(self) -> int:
         records = [tab.record for tab in self.tabs.values()]
@@ -3921,10 +4143,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             if tab is None:
                 continue
             record = self.app_context.store.get(session_id) or tab.record
-            if (
-                getattr(record, "recovery_command", None) == command
-                and getattr(record, "recovery_cwd", None) == recovery_cwd
-            ):
+            if not TermDeckWindow._should_update_recovery_metadata(record, command, recovery_cwd):
                 continue
             recovery_updates.append((session_id, command, recovery_cwd))
         if recovery_updates:
@@ -4171,7 +4390,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if item.kind == "session":
             record = self.app_context.store.get(item.payload)
             if record:
-                self.open_session(record)
+                owner_lookup = getattr(self.app_context, "window_for_window_id", None)
+                owner = owner_lookup(record.window_id) if callable(owner_lookup) else None
+                (owner or self).open_session(record)
 
     def create_session(self, name: str, tag: str, command: str, cwd: str) -> None:
         directory = normalise_directory(cwd)
@@ -4291,8 +4512,14 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             if record.status in {"running", "missing"}:
                 return "running"
         snap = self.app_context.sampler.snapshot(pid)
+        snap = merge_confirmed_pane_snapshot(
+            snap,
+            pane_pid=pid,
+            pane_confirmed=pid is not None
+            and not getattr(self.app_context.backend, "pane_snapshot_stale", False),
+        )
         if snap.exists:
-            return "paused" if snap.state == "T" else "running"
+            return "paused" if snap.state == "T" or (snap.state == "unknown" and record.status == "paused") else "running"
         if record.status == "paused":
             return "paused"
         return record.status if record.status in {"new", "recovery-pending", "stopped"} else "stopped"
@@ -4419,9 +4646,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if callable(restore):
             restore(record)
 
-    def _scroll_terminal(self, record: SessionRecord, lines: int) -> bool:
+    def _scroll_terminal(self, record: SessionRecord, lines: int) -> ScrollDisposition:
         scroll = getattr(self.app_context.backend, "scroll_session", None)
-        return bool(scroll(record, lines)) if callable(scroll) else False
+        return scroll(record, lines) if callable(scroll) else ScrollDisposition.UNHANDLED
 
     def _sync_current_terminal_geometry(self) -> bool:
         self._terminal_layout_sync_source_id = 0
@@ -4454,8 +4681,20 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         session_id = self.current_session_id()
         return self.app_context.store.get(session_id) if session_id else None
 
-    def _on_notebook_switch_page(self, *_args) -> None:
+    def _prepare_switched_terminal(self, page) -> bool:
+        current_page = self.notebook.get_current_page()
+        if self.notebook.get_nth_page(current_page) is not page:
+            return False
+        prepare = getattr(page, "prepare_for_live_input", None)
+        if callable(prepare):
+            # This clears stale/untracked tmux copy mode and synchronizes the
+            # newly mapped VTE grid after GTK has allocated the selected page.
+            prepare()
+        return False
+
+    def _on_notebook_switch_page(self, _notebook, page, _page_num) -> None:
         GLib.idle_add(self._refresh_auth_selector)
+        GLib.idle_add(self._prepare_switched_terminal, page)
 
     def _sync_observed_auth_state(
         self,
@@ -4485,6 +4724,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         state: CodexAuthState | None,
         *,
         error: str = "",
+        environment_ready: bool = True,
     ) -> None:
         combo = self._auth_combo
         self._auth_combo_updating = True
@@ -4503,6 +4743,15 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 combo.set_tooltip_text(
                     "Recreate this terminal under TermDeck before switching accounts; "
                     "a running external tmux environment cannot be retroactively isolated."
+                )
+                return
+            if not environment_ready:
+                combo.append("__none__", "Codex: restart terminal")
+                combo.set_active_id("__none__")
+                combo.set_sensitive(False)
+                combo.set_tooltip_text(
+                    "This live terminal predates per-tab Codex isolation or lost its private auth environment. "
+                    "Restart this terminal once before using codex-auth so another tab cannot be changed."
                 )
                 return
             if state is None:
@@ -4542,13 +4791,25 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if record.external:
             self._render_auth_selector(record, None)
             return False
+        environment_ready = True
+        check_environment = getattr(self.app_context.backend, "private_auth_environment_ready", None)
+        if callable(check_environment):
+            try:
+                environment_ready = bool(check_environment(record))
+            except (OSError, TmuxError):
+                environment_ready = False
         try:
             state = self.app_context.codex_auth.state(record)
             record = self._sync_observed_auth_state(record, state)
             self._auth_fingerprints[record.id] = state.fingerprint
-            self._render_auth_selector(record, state)
+            self._render_auth_selector(record, state, environment_ready=environment_ready)
         except (CodexAuthError, OSError, ValueError) as exc:
-            self._render_auth_selector(record, None, error=str(exc))
+            self._render_auth_selector(
+                record,
+                None,
+                error=str(exc),
+                environment_ready=environment_ready,
+            )
         return False
 
     def _poll_codex_auth_state(self) -> bool:
@@ -4577,6 +4838,19 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             return
         if record.id in self._auth_switch_inflight:
             return
+        check_environment = getattr(self.app_context.backend, "private_auth_environment_ready", None)
+        if callable(check_environment):
+            try:
+                environment_ready = bool(check_environment(record))
+            except (OSError, TmuxError):
+                environment_ready = False
+            if not environment_ready:
+                self.show_toast(
+                    "Restart this terminal once before switching Codex accounts; its live shell is not privately isolated.",
+                    kind="error",
+                )
+                self._refresh_auth_selector()
+                return
         try:
             state = self.app_context.codex_auth.state(record)
         except (CodexAuthError, OSError, ValueError) as exc:
@@ -4599,9 +4873,12 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
         def _worker() -> None:
             result: CodexSwitchResult | None = None
+            activation: AuthActivationResult | None = None
             error = ""
             try:
                 result = self.app_context.codex_auth.switch(record, account_key)
+                if result.ok:
+                    activation = self.app_context.backend.activate_auth_change(record)
             except Exception as exc:
                 error = str(exc)
             GLib.idle_add(
@@ -4609,6 +4886,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 record.id,
                 generation,
                 result,
+                activation,
                 error,
             )
 
@@ -4619,6 +4897,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         session_id: str,
         generation: int,
         result: CodexSwitchResult | None,
+        activation: AuthActivationResult | None,
         error: str,
     ) -> bool:
         self._auth_switch_inflight.discard(session_id)
@@ -4630,21 +4909,39 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             self._refresh_auth_selector()
             return False
         if result is not None and result.ok:
+            activation_ok = activation is not None and activation.ok
+            updates: dict[str, object] = {
+                "selected_account": result.state.selected_account,
+                "pending_account": None,
+                "auth_restart_required": not activation_ok,
+                "auth_changed_at": utc_now(),
+            }
+            if activation is not None:
+                if activation.recovery_command is not None:
+                    updates["recovery_command"] = activation.recovery_command
+                    updates["recovery_cwd"] = activation.recovery_cwd
+                if activation.status is not None:
+                    updates["status"] = activation.status
+                    updates["last_pid"] = activation.pid
             record = self.app_context.store.update(
                 session_id,
-                selected_account=result.state.selected_account,
-                pending_account=None,
-                auth_restart_required=True,
-                auth_changed_at=utc_now(),
+                **updates,
             )
             self._auth_fingerprints[session_id] = result.state.fingerprint
             tab = self.tabs.get(session_id)
             if tab is not None:
                 tab.record = record
-            self.show_toast(
-                f"{record.name}: {record.selected_account} saved · restart Codex after the current turn",
-                kind="success",
-            )
+            if activation_ok and activation is not None and activation.restarted:
+                message = f"{record.name}: {record.selected_account} active · Codex restarted in this tab"
+                kind = "success"
+            elif activation_ok:
+                message = f"{record.name}: {record.selected_account} active for the next Codex launch"
+                kind = "success"
+            else:
+                detail = activation.detail if activation is not None else (error or "Codex restart did not complete")
+                message = f"{record.name}: account saved, but not active in running Codex · {detail}"
+                kind = "error"
+            self.show_toast(message, kind=kind)
         else:
             self.app_context.store.update(session_id, pending_account=None)
             detail = error or (result.error if result is not None else "Codex account switch failed")
@@ -4750,6 +5047,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if not self._remove_tab_widget(session_id):
             return
         try:
+            if record is not None:
+                clear_captain = getattr(self.app_context.store, "clear_window_captain", None)
+                if callable(clear_captain):
+                    clear_captain(record.window_id, session_id=record.id)
             self.app_context.store.update(session_id, visible=False)
         except KeyError:
             pass
@@ -4998,11 +5299,24 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 else:
                     apply_theme(tab.widget.terminal, self.app_context.theme, font_override=font)
                 tab.widget.theme = self.app_context.theme
+                # Font metrics change the VTE grid even for notebook pages that
+                # are not currently mapped. Synchronize the terminal whose font
+                # changed; a window-level delayed callback can otherwise follow
+                # a tab switch and resize only the newly selected page.
+                tab.widget.request_geometry_sync(delay_ms=80)
             except Exception:
                 continue
 
     def zoom_font(self, delta: int) -> None:
-        self.font_zoom_delta = max(-24, min(48, int(self.font_zoom_delta) + int(delta)))
+        _, base_size = parse_font_description(self.base_font())
+        requested_delta = float(self.font_zoom_delta) + int(delta)
+        _, actual_size = parse_font_description(
+            scale_font_description(self.base_font(), requested_delta)
+        )
+        # Store the effective delta, not an out-of-range request. Otherwise a
+        # user who reaches the zoom floor must press Ctrl++ many times before
+        # the font starts growing again.
+        self.font_zoom_delta = actual_size - base_size
         self.apply_font_zoom()
         _, size = parse_font_description(self.zoomed_font())
         self.show_toast(f"Font {size:g}pt", kind="info", seconds=1.2)
@@ -5269,10 +5583,46 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         return self._route_unhandled_key_to_terminal(event)
 
 
+def canonical_database_path(db_path: str | Path | None = None) -> Path:
+    """Resolve the exact file a GUI instance will open and identify."""
+
+    raw_path = Path(db_path).expanduser() if db_path is not None else DEFAULT_DB_PATH
+    if raw_path == Path(":memory:"):
+        raise ValueError("the TermDeck GUI requires a file-backed session database")
+    canonical = raw_path.resolve(strict=False)
+    if canonical.exists() and not canonical.is_file():
+        raise ValueError(f"TermDeck database path is not a regular file: {canonical}")
+    return canonical
+
+
+def _application_id_for_canonical_database(db_path: Path) -> str:
+    default_path = DEFAULT_DB_PATH.expanduser().resolve(strict=False)
+    if db_path == default_path:
+        return "dev.termdeck.TermDeck"
+    digest = hashlib.sha256(os.fsencode(str(db_path))).hexdigest()[:32]
+    return f"dev.termdeck.TermDeck.db_{digest}"
+
+
+def application_id_for_database(db_path: str | Path | None = None) -> str:
+    """Return one stable GApplication identity per canonical registry file.
+
+    GTK forwards a second launch to an existing application with the same ID.
+    A global ID therefore makes ``termdeck gui --db other.sqlite3`` disappear
+    into an already-running default-registry process.  File-backed registries
+    get distinct stable IDs while the historical default keeps its original ID.
+    """
+
+    return _application_id_for_canonical_database(canonical_database_path(db_path))
+
+
 class TermDeckApplication(Gtk.Application):
     def __init__(self, db_path: str | Path | None = None, workspace_path: str | Path | None = None):
-        super().__init__(application_id="dev.termdeck.TermDeck", flags=0)
-        self.store = SessionStore(db_path)
+        canonical_db_path = canonical_database_path(db_path)
+        super().__init__(
+            application_id=_application_id_for_canonical_database(canonical_db_path),
+            flags=0,
+        )
+        self.store = SessionStore(canonical_db_path)
         self.backend = TmuxBackend()
         self.codex_auth = CodexAuthManager(account_source=self.store.account_source)
         self.theme = load_terminator_theme()
@@ -5428,6 +5778,14 @@ class TermDeckApplication(Gtk.Application):
                 return window
         return None
 
+    def window_for_window_id(self, window_id: str) -> TermDeckWindow | None:
+        """Return the open GTK window that owns one logical window id."""
+
+        return next(
+            (window for window in self.windows if window.window_id == window_id),
+            None,
+        )
+
     def available_move_windows(self, record: SessionRecord) -> list[TermDeckWindow]:
         """List open destination windows, excluding the tab's current owner."""
 
@@ -5550,6 +5908,9 @@ class TermDeckApplication(Gtk.Application):
             return 0
         for record in unique.values():
             self.backend.terminate(record)
+            clear_captain = getattr(self.store, "clear_window_captain", None)
+            if callable(clear_captain):
+                clear_captain(record.window_id, session_id=record.id)
             self.store.update(
                 record.id,
                 status="stopped",
@@ -5799,21 +6160,91 @@ class TermDeckApplication(Gtk.Application):
                 self._present_all_windows()
                 return
 
+        restore_groups = getattr(self.store, "windows_for_restore", None)
+        groups = (
+            restore_groups()
+            if callable(restore_groups)
+            else self.store.windows_with_visible_sessions()
+        )
+        windows_by_id = {
+            getattr(window, "window_id", None): window
+            for window in self.windows
+            if getattr(window, "window_id", None)
+        }
+        restore_errors: list[tuple[str, str, str]] = []
+        for window_id, window_title, records in groups:
+            existing = windows_by_id.get(window_id)
+            if existing is not None:
+                open_tabs = getattr(existing, "tabs", {})
+                missing = [record for record in records if record.id not in open_tabs]
+                restore = getattr(existing, "restore_previous_tabs", None)
+                if missing and callable(restore):
+                    try:
+                        restore(records=missing)
+                    except Exception as exc:
+                        restore_errors.append((window_id, window_title, str(exc)))
+                continue
+            get_application_windows = getattr(self, "get_windows", None)
+            windows_before = {
+                id(window)
+                for window in (
+                    get_application_windows()
+                    if callable(get_application_windows)
+                    else ()
+                )
+            }
+            try:
+                win = TermDeckWindow(
+                    self,
+                    window_id=window_id,
+                    window_title=window_title,
+                    restore_records=records,
+                )
+            except Exception as exc:
+                # One malformed window or unavailable terminal must not prevent
+                # every later remembered window from being reconstructed.
+                # Gtk.ApplicationWindow registers with the application early in
+                # construction, so explicitly destroy any new partial window
+                # before a later activation retries the same catalog ID.
+                if callable(get_application_windows):
+                    for partial in get_application_windows():
+                        if id(partial) in windows_before or partial in self.windows:
+                            continue
+                        for tab in list(getattr(partial, "tabs", {}).values()):
+                            try:
+                                tab.widget.detach()
+                            except Exception:
+                                pass
+                        try:
+                            partial.destroy()
+                        except Exception:
+                            pass
+                restore_errors.append((window_id, window_title, str(exc)))
+                continue
+            self.windows.append(win)
+            windows_by_id[window_id] = win
+
+        self._last_window_restore_errors = tuple(restore_errors)
         if not self.windows:
-            groups = self.store.windows_with_visible_sessions()
             if groups:
-                for window_id, window_title, records in groups:
-                    win = TermDeckWindow(
-                        self,
-                        window_id=window_id,
-                        window_title=window_title,
-                        restore_records=records,
+                show_error = getattr(self, "_show_error", None)
+                if callable(show_error):
+                    detail = "\n".join(
+                        f"{title} ({window_id}): {error}"
+                        for window_id, title, error in restore_errors
                     )
-                    self.windows.append(win)
-            else:
-                self.prompt_for_new_window(first_run=True)
+                    show_error("Could not restore saved TermDeck windows", detail)
                 return
+            self.prompt_for_new_window(first_run=True)
+            return
         self._present_all_windows()
+        if restore_errors:
+            show_toast = getattr(self.windows[0], "show_toast", None)
+            if callable(show_toast):
+                show_toast(
+                    f"Could not restore {len(restore_errors)} saved window(s); activate TermDeck to retry",
+                    kind="danger",
+                )
 
     def _present_all_windows(self) -> None:
         """Raise every restored named window, not only the last one created."""

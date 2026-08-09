@@ -214,6 +214,66 @@ def main() -> int:
                     f"window={second.get_allocated_width()}"
                 )
 
+            # The composer is captain-driven: an empty checkbox selection must
+            # still submit to exactly one verified Codex tab in this window,
+            # never broadcast to workers or cross into another window. Stub
+            # only the provider probe/send edge; all GTK widgets, persistence,
+            # envelope construction, and button/signal wiring remain real.
+            second.new_shell_tab(root)
+            _drain_gtk(Gtk, until=lambda: bool(second.tabs))
+            foreign_id = next(iter(second.tabs))
+            captain_id = first.current_session_id()
+            if captain_id is None:
+                raise AssertionError("Tabs pane smoke has no active captain candidate")
+            local_ids = [session_id for session_id in first.tabs if session_id != captain_id]
+            if not local_ids:
+                raise AssertionError("Tabs pane smoke needs one same-window crew tab")
+            first.side.selected_ids = {local_ids[0], foreign_id}
+            original_probe = app.backend.is_codex_running
+            original_send = app.backend.send_text
+            captain_sends = []
+            app.backend.is_codex_running = lambda record: record.id == captain_id
+            app.backend.send_text = lambda record, text, enter=True: captain_sends.append(
+                (record.id, text, bool(enter))
+            )
+            try:
+                primary = next(
+                    child
+                    for child in first.side.get_children()
+                    if isinstance(child, Gtk.Box)
+                    and [item.get_label() for item in child.get_children() if isinstance(item, Gtk.Button)]
+                    == ["Send", "Pause", "Resume", "Kill"]
+                )
+                buttons = {
+                    item.get_label(): item
+                    for item in primary.get_children()
+                    if isinstance(item, Gtk.Button)
+                }
+                first.side.prompt.set_text("captain button smoke")
+                buttons["Send"].clicked()
+                _drain_gtk(Gtk, until=lambda: len(captain_sends) == 1)
+                if captain_sends[0][0] != captain_id or not captain_sends[0][2]:
+                    raise AssertionError(f"Send targeted the wrong tab/mode: {captain_sends[0][:1]}")
+                envelope = captain_sends[0][1]
+                if local_ids[0] not in envelope or foreign_id in envelope:
+                    raise AssertionError("captain envelope escaped its logical window")
+                if "captain button smoke" not in envelope:
+                    raise AssertionError("captain envelope lost the user request")
+                if first.side.prompt.get_text():
+                    raise AssertionError("successful captain Send did not clear the composer")
+                captain = app.store.captain_for_window(first.window_id)
+                if captain is None or captain.id != captain_id:
+                    raise AssertionError("captain assignment was not persisted")
+
+                first.side.prompt.set_text("captain enter smoke")
+                first.side.prompt.emit("activate")
+                _drain_gtk(Gtk, until=lambda: len(captain_sends) == 2)
+                if captain_sends[1][0] != captain_id or "captain enter smoke" not in captain_sends[1][1]:
+                    raise AssertionError("Entry activation did not use the captain Send path")
+            finally:
+                app.backend.is_codex_running = original_probe
+                app.backend.send_text = original_send
+
             if not first.on_key_press(first, f9):
                 raise AssertionError("second F9 toggle was not handled")
             _drain_gtk(Gtk)
@@ -236,6 +296,10 @@ def main() -> int:
                         "persisted": True,
                         "new_window_inherits": True,
                         "row_click_navigation": True,
+                        "captain_send_button": True,
+                        "captain_entry_activate": True,
+                        "captain_window_isolation": True,
+                        "captain_does_not_broadcast": True,
                         "high_scale_edges_visible": True,
                         "sidebar_content_x": content_x,
                         "sidebar_min_width": side_min_width,

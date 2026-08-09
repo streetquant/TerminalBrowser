@@ -413,6 +413,34 @@ def process_tree(root_pid: int) -> list[int]:
     return order
 
 
+def process_tree_contains_codex(root_pid: int) -> bool | None:
+    """Return whether a readable process tree contains a Codex CLI process.
+
+    ``None`` means the tree could not be inspected completely enough to prove
+    absence. Callers that might destroy or recreate a session should treat
+    that state as unknown and fail closed rather than assuming an idle shell.
+    """
+
+    pids = process_tree(root_pid)
+    if not pids:
+        return None
+    unreadable = False
+    for pid in pids:
+        argv = _process_argv(pid)
+        if argv is None:
+            unreadable = True
+            continue
+        if not argv:
+            continue
+        executable = Path(str(argv[0])).name.casefold()
+        if executable == "codex" or executable.startswith("codex-"):
+            return True
+        if executable in {"node", "nodejs"} and len(argv) > 1:
+            if Path(str(argv[1])).name.casefold() == "codex":
+                return True
+    return None if unreadable else False
+
+
 class ResourceSampler:
     """Linux /proc sampler with no third-party dependency.
 

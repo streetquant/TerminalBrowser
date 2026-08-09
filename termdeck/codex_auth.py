@@ -119,6 +119,65 @@ def _write_private_text(path: Path, content: str, *, executable: bool = False) -
     path.chmod(0o700 if executable else 0o600)
 
 
+def _share_codex_session_roots(home: Path, source: Path) -> None:
+    """Share Codex conversation storage while keeping credentials private.
+
+    ``CODEX_HOME`` controls both authentication and rollout discovery. A
+    terminal-private home therefore hides pre-existing conversations unless
+    its session roots point back at the canonical Codex home. New or empty
+    private roots are linked to the canonical store. Non-empty legacy roots
+    are deliberately preserved in place: moving a live rollout is riskier
+    than leaving that one legacy scope local until it can be migrated safely.
+    """
+
+    for name in ("sessions", "archived_sessions"):
+        source_root = source / name
+        if not source_root.is_dir():
+            continue
+        try:
+            source_root = source_root.resolve(strict=True)
+        except OSError:
+            continue
+
+        private_root = home / name
+        if private_root.resolve(strict=False) == source_root:
+            # The canonical source itself is not an auth-isolation target.
+            # Never replace a source session root with a self-referential link.
+            continue
+        if private_root.is_symlink():
+            try:
+                target = private_root.resolve(strict=False)
+            except OSError as exc:
+                raise CodexAuthError(
+                    f"private Codex {name} link cannot be resolved: {private_root}"
+                ) from exc
+            if target != source_root:
+                raise CodexAuthError(
+                    f"private Codex {name} link points outside the canonical session store: {private_root}"
+                )
+            continue
+
+        if private_root.exists():
+            if not private_root.is_dir():
+                raise CodexAuthError(
+                    f"private Codex {name} path is not a directory: {private_root}"
+                )
+            try:
+                next(private_root.iterdir())
+            except StopIteration:
+                private_root.rmdir()
+            except OSError as exc:
+                raise CodexAuthError(
+                    f"private Codex {name} directory cannot be inspected: {private_root}"
+                ) from exc
+            else:
+                # Preserve non-empty legacy rollout trees exactly. They may
+                # belong to a still-running Codex process.
+                continue
+
+        private_root.symlink_to(source_root, target_is_directory=True)
+
+
 def _clear_registry_active_account(registry_path: Path) -> None:
     try:
         payload = json.loads(registry_path.read_text(encoding="utf-8"))
@@ -208,11 +267,15 @@ def prepare_auth_scope(
     *,
     account_source: str | Path | None = None,
 ) -> Path:
-    """Create one durable, anonymous Codex home and compatibility wrapper.
+    """Create one durable Codex auth scope with shared conversation history.
 
-    The saved account catalogue is copied once, but the source ``auth.json`` is
-    deliberately never copied. Stable codex-auth versions that hard-code
+    The saved account catalogue seeds the private scope, but the source
+    ``auth.json`` is deliberately never copied. Native codex-auth 0.1.x scopes
+    may later import newer snapshots for non-active saved accounts while the
+    tab's selected account remains untouched. Releases that hard-code
     ``~/.codex`` are isolated by running them with a private compatibility HOME.
+    Codex session roots are shared with the canonical source home so per-tab
+    credential isolation never makes an existing conversation disappear.
     """
 
     home = Path(codex_home).expanduser().resolve(strict=False)
@@ -222,10 +285,15 @@ def prepare_auth_scope(
     accounts = home / "accounts"
     source = Path(account_source).expanduser() if account_source else default_account_source()
     source_accounts = source / "accounts"
-    if not accounts.exists() and source_accounts.is_dir():
-        shutil.copytree(source_accounts, accounts, symlinks=False)
-        _secure_permissions(accounts)
-        _clear_registry_active_account(accounts / "registry.json")
+    if source_accounts.is_dir():
+        if not accounts.exists():
+            shutil.copytree(source_accounts, accounts, symlinks=False)
+            _secure_permissions(accounts)
+            _clear_registry_active_account(accounts / "registry.json")
+        else:
+            _sync_native_account_catalog(home, source_accounts)
+
+    _share_codex_session_roots(home, source)
 
     compat_home = home / ".termdeck-compat-home"
     compat_home.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -267,6 +335,173 @@ def _registry_accounts(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], s
     return accounts, None
 
 
+def _native_account_names(accounts_dir: Path) -> list[str]:
+    """Return codex-auth 0.1.x account names without reading credential bodies."""
+
+    try:
+        entries = list(accounts_dir.iterdir())
+    except OSError:
+        return []
+    return sorted(
+        {
+            entry.stem
+            for entry in entries
+            if entry.is_file()
+            and not entry.is_symlink()
+            and entry.suffix.casefold() == ".json"
+            and entry.name.casefold() != "registry.json"
+        },
+        key=str.casefold,
+    )
+
+
+def _native_selected_account(home: Path, account_names: list[str]) -> str | None:
+    """Resolve the active account used by codex-auth 0.1.x.
+
+    codex-auth 0.1.x writes the selected account name to ``~/.codex/current``
+    and, on Unix, points ``auth.json`` at ``accounts/<name>.json``. The private
+    auth symlink is authoritative because Codex consumes it directly; the
+    ``current`` marker is a fallback. A link outside this terminal's private
+    account directory is never accepted.
+    """
+
+    names = set(account_names)
+    auth_path = home / "auth.json"
+    if auth_path.is_symlink():
+        try:
+            raw_target = os.readlink(auth_path)
+            target = (auth_path.parent / raw_target).resolve(strict=False)
+            accounts_root = (home / "accounts").resolve(strict=False)
+            relative = target.relative_to(accounts_root)
+        except (OSError, ValueError):
+            relative = None
+        if (
+            relative is not None
+            and relative.parent == Path(".")
+            and relative.suffix.casefold() == ".json"
+            and relative.stem in names
+        ):
+            # auth.json is the file Codex actually consumes, so it wins if a
+            # partially completed switch leaves the metadata marker stale.
+            return relative.stem
+
+    current_path = home / "current"
+    try:
+        current = current_path.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError, UnicodeError):
+        current = ""
+    return current if current in names else None
+
+
+def _account_revision(path: Path) -> tuple[str, int]:
+    """Compare saved-account freshness without exposing credential values."""
+
+    try:
+        stat = path.stat()
+    except OSError:
+        return "", -1
+    refreshed = ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            value = payload.get("last_refresh")
+            if isinstance(value, str):
+                refreshed = value.strip()
+    except (json.JSONDecodeError, OSError, UnicodeError):
+        pass
+    return refreshed, stat.st_mtime_ns
+
+
+def _sync_native_account_catalog(home: Path, source_accounts: Path) -> None:
+    """Refresh stale non-active codex-auth 0.1.x account snapshots.
+
+    A private selected account may contain tokens refreshed by the Codex process,
+    so it is never overwritten. Non-active accounts can safely take a newer
+    source snapshot, which lets a global re-login/re-save repair stale refresh
+    credentials in already-created TermDeck tabs.
+    """
+
+    accounts = home / "accounts"
+    if (accounts / "registry.json").exists() or (source_accounts / "registry.json").exists():
+        return
+    selected = _native_selected_account(home, _native_account_names(accounts))
+    try:
+        entries = list(source_accounts.iterdir())
+    except OSError:
+        return
+    for source_path in entries:
+        if (
+            not source_path.is_file()
+            or source_path.is_symlink()
+            or source_path.suffix.casefold() != ".json"
+            or source_path.name.casefold() == "registry.json"
+        ):
+            continue
+        destination = accounts / source_path.name
+        if source_path.stem == selected:
+            continue
+        if destination.exists() and _account_revision(source_path) <= _account_revision(destination):
+            continue
+        temporary = destination.with_name(f".{destination.name}.sync-{os.getpid()}-{uuid.uuid4().hex}")
+        try:
+            shutil.copy2(source_path, temporary, follow_symlinks=True)
+            temporary.chmod(0o600)
+            temporary.replace(destination)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _path_fingerprint(path: Path) -> bytes:
+    """Fingerprint filesystem metadata without hashing token file contents."""
+
+    try:
+        stat = path.lstat()
+    except OSError:
+        return b"missing"
+    marker = f"{stat.st_mode}:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ino}".encode()
+    if path.is_symlink():
+        try:
+            return marker + b":symlink:" + os.readlink(path).encode("utf-8", "surrogateescape")
+        except OSError:
+            return marker + b":broken-symlink"
+    return marker
+
+
+def _state_fingerprint(home: Path, registry_bytes: bytes, account_names: list[str]) -> str:
+    digest = hashlib.sha256()
+    digest.update(registry_bytes)
+    digest.update(b"\0current\0")
+    try:
+        digest.update((home / "current").read_bytes())
+    except OSError:
+        digest.update(b"missing")
+    digest.update(b"\0auth\0")
+    digest.update(_path_fingerprint(home / "auth.json"))
+    digest.update(b"\0accounts\0")
+    accounts_dir = home / "accounts"
+    for name in account_names:
+        digest.update(name.encode("utf-8", "surrogateescape"))
+        digest.update(b"=")
+        digest.update(_path_fingerprint(accounts_dir / f"{name}.json"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _uses_registry_switch(home: Path) -> bool:
+    registry_path = home / "accounts" / "registry.json"
+    try:
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    rows, _active = _registry_accounts(payload)
+    return bool(rows)
+
+
 def read_auth_state(codex_home: str | Path) -> CodexAuthState:
     home = Path(codex_home).expanduser().resolve(strict=False)
     registry_path = home / "accounts" / "registry.json"
@@ -282,26 +517,36 @@ def read_auth_state(codex_home: str | Path) -> CodexAuthState:
 
     rows, active_key = _registry_accounts(payload)
     accounts: list[CodexAccount] = []
-    for index, row in enumerate(rows):
-        key = str(row.get("account_key") or row.get("key") or row.get("email") or f"account-{index + 1}").strip()
-        if not key:
-            continue
-        accounts.append(
-            CodexAccount(
-                account_key=key,
-                email=str(row.get("email") or "").strip(),
-                alias=str(row.get("alias") or "").strip(),
-                account_name=str(row.get("account_name") or row.get("name") or "").strip(),
-                active=key == active_key,
+    native_names: list[str] = []
+    if rows:
+        for index, row in enumerate(rows):
+            key = str(row.get("account_key") or row.get("key") or row.get("email") or f"account-{index + 1}").strip()
+            if not key:
+                continue
+            accounts.append(
+                CodexAccount(
+                    account_key=key,
+                    email=str(row.get("email") or "").strip(),
+                    alias=str(row.get("alias") or "").strip(),
+                    account_name=str(row.get("account_name") or row.get("name") or "").strip(),
+                    active=key == active_key,
+                )
             )
-        )
+    else:
+        native_names = _native_account_names(home / "accounts")
+        active_key = _native_selected_account(home, native_names)
+        accounts = [
+            CodexAccount(
+                account_key=name,
+                alias=name,
+                account_name=name,
+                active=name == active_key,
+            )
+            for name in native_names
+        ]
     active = next((account for account in accounts if account.active), None)
-    auth_path = home / "auth.json"
-    fingerprint = hashlib.sha256(
-        registry_bytes
-        + b"\0"
-        + (b"auth-present" if auth_path.is_file() else b"auth-absent")
-    ).hexdigest()
+    fingerprint_names = native_names or [account.account_key for account in accounts]
+    fingerprint = _state_fingerprint(home, registry_bytes, fingerprint_names)
     return CodexAuthState(
         codex_home=str(home),
         accounts=tuple(accounts),
@@ -352,9 +597,10 @@ class CodexAuthManager:
         selector: str,
         *,
         cwd: str,
+        verb: str,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(wrapper), "switch", selector],
+            [str(wrapper), verb, selector],
             cwd=cwd,
             env=os.environ.copy(),
             text=True,
@@ -369,18 +615,21 @@ class CodexAuthManager:
         record: SessionRecord,
         wrapper: Path,
         previous: CodexAccount | None,
+        *,
+        verb: str,
     ) -> CodexAuthState:
         if previous is not None:
             try:
-                self._run_switch(wrapper, previous.switch_selector, cwd=record.cwd)
+                self._run_switch(wrapper, previous.switch_selector, cwd=record.cwd, verb=verb)
             except (OSError, subprocess.TimeoutExpired):
                 pass
         else:
             home = Path(record.codex_home or "").expanduser().resolve(strict=False)
-            try:
-                (home / "auth.json").unlink(missing_ok=True)
-            except OSError:
-                pass
+            for marker in ("auth.json", "current"):
+                try:
+                    (home / marker).unlink(missing_ok=True)
+                except OSError:
+                    pass
             _clear_registry_active_account(home / "accounts" / "registry.json")
         return self.state(record)
 
@@ -392,10 +641,11 @@ class CodexAuthManager:
             return CodexSwitchResult(False, state, str(exc))
         previous = next((row for row in state.accounts if row.active), None)
         wrapper = Path(state.codex_home) / "bin" / "codex-auth"
+        verb = "switch" if _uses_registry_switch(Path(state.codex_home)) else "use"
         try:
-            result = self._run_switch(wrapper, account.switch_selector, cwd=record.cwd)
+            result = self._run_switch(wrapper, account.switch_selector, cwd=record.cwd, verb=verb)
         except (OSError, subprocess.TimeoutExpired) as exc:
-            rolled_back = self._rollback(record, wrapper, previous)
+            rolled_back = self._rollback(record, wrapper, previous, verb=verb)
             detail = str(exc)
             if rolled_back.selected_account_key != state.selected_account_key:
                 detail = f"{detail}; rollback could not restore the previous account"
@@ -405,10 +655,10 @@ class CodexAuthManager:
             return CodexSwitchResult(True, verified)
 
         if result.returncode != 0:
-            detail = (result.stderr or "codex-auth switch failed").strip().splitlines()[-1][:500]
+            detail = (result.stderr or f"codex-auth {verb} failed").strip().splitlines()[-1][:500]
         else:
-            detail = "codex-auth returned success but the private registry did not verify the requested account"
-        rolled_back = self._rollback(record, wrapper, previous)
+            detail = "codex-auth returned success but the private account state did not verify the requested account"
+        rolled_back = self._rollback(record, wrapper, previous, verb=verb)
         if rolled_back.selected_account_key != state.selected_account_key:
             detail = f"{detail}; rollback could not restore the previous account"
         return CodexSwitchResult(False, rolled_back, detail)

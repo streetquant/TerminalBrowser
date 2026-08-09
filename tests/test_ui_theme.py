@@ -174,7 +174,7 @@ class UiThemeTests(unittest.TestCase):
         self.assertEqual(scale_font_description("Monospace 12", 1), "Monospace 13")
         self.assertEqual(scale_font_description("Monospace 12", -2), "Monospace 10")
         # Clamp to minimum readable size.
-        self.assertEqual(scale_font_description("Monospace 7", -10), "Monospace 6")
+        self.assertEqual(scale_font_description("Monospace 11", -10), "Monospace 10")
         # Clamp to max.
         self.assertEqual(scale_font_description("Monospace 70", 10), "Monospace 72")
 

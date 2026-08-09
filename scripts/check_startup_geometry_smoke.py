@@ -40,7 +40,14 @@ def _wait_for_matching_grid(
     while time.monotonic() < deadline:
         _drain_gtk(Gtk)
         clients = subprocess.run(
-            ["tmux", "list-clients", "-F", "#{client_width}x#{client_height}"],
+            [
+                "tmux",
+                "list-clients",
+                "-t",
+                record.tmux_name,
+                "-F",
+                "#{client_width}x#{client_height}",
+            ],
             text=True,
             capture_output=True,
             check=False,
@@ -94,7 +101,13 @@ def main() -> int:
                             "title": "Geometry",
                             "tabs": [
                                 {
-                                    "name": "shell",
+                                    "name": "shell-hidden",
+                                    "tag": "terminal",
+                                    "command": "{shell}",
+                                    "cwd": str(root),
+                                },
+                                {
+                                    "name": "shell-current",
                                     "tag": "terminal",
                                     "command": "{shell}",
                                     "cwd": str(root),
@@ -125,8 +138,11 @@ def main() -> int:
 
             window = app.windows[0]
             window.maximize()
-            record = app.store.list()[0]
+            records = {record.name: record for record in app.store.list()}
+            record = records["shell-current"]
+            hidden_record = records["shell-hidden"]
             tab = window.tabs[record.id]
+            hidden_tab = window.tabs[hidden_record.id]
 
             started = time.monotonic()
             first_client_size: tuple[int, int] | None = None
@@ -137,7 +153,14 @@ def main() -> int:
             while time.monotonic() < deadline:
                 _drain_gtk(Gtk)
                 clients = subprocess.run(
-                    ["tmux", "list-clients", "-F", "#{client_width}x#{client_height}"],
+                    [
+                        "tmux",
+                        "list-clients",
+                        "-t",
+                        record.tmux_name,
+                        "-F",
+                        "#{client_width}x#{client_height}",
+                    ],
                     text=True,
                     capture_output=True,
                     check=False,
@@ -194,6 +217,62 @@ def main() -> int:
                 expected=first_vte_size,
             )
 
+            # The first tab was hidden while the window maximized. Switching
+            # through Gtk.Notebook (the real tab-click path) must clear stale
+            # tmux mode and synchronize that newly mapped page's VTE grid.
+            hidden_page = window.notebook.page_num(hidden_tab.widget)
+            window.notebook.set_current_page(hidden_page)
+            switched_hidden_sizes = _wait_for_matching_grid(
+                Gtk,
+                window,
+                hidden_record,
+                hidden_tab,
+                expected=first_vte_size,
+            )
+            current_page = window.notebook.page_num(tab.widget)
+            window.notebook.set_current_page(current_page)
+            switched_current_sizes = _wait_for_matching_grid(
+                Gtk,
+                window,
+                record,
+                tab,
+                expected=first_vte_size,
+            )
+
+            # Font zoom changes character metrics for both visible and hidden
+            # notebook pages. Every attach client must converge to its own VTE
+            # grid without relying on a later tab switch to repair it.
+            window.zoom_font(-2)
+            zoomed_current_sizes = _wait_for_matching_grid(
+                Gtk,
+                window,
+                record,
+                tab,
+                different_from=first_vte_size,
+            )
+            zoomed_hidden_sizes = _wait_for_matching_grid(
+                Gtk,
+                window,
+                hidden_record,
+                hidden_tab,
+                different_from=first_vte_size,
+            )
+            window.zoom_font_reset()
+            reset_current_sizes = _wait_for_matching_grid(
+                Gtk,
+                window,
+                record,
+                tab,
+                expected=first_vte_size,
+            )
+            reset_hidden_sizes = _wait_for_matching_grid(
+                Gtk,
+                window,
+                hidden_record,
+                hidden_tab,
+                expected=first_vte_size,
+            )
+
             _drain_gtk(Gtk)
             root_widget = window.get_child()
             root_alloc = root_widget.get_allocation()
@@ -216,6 +295,12 @@ def main() -> int:
                         "client_surface_filled": True,
                         "pane_visible_grid": f"{pane_visible_sizes[2][0]}x{pane_visible_sizes[2][1]}",
                         "pane_hidden_grid": f"{pane_hidden_sizes[2][0]}x{pane_hidden_sizes[2][1]}",
+                        "switched_hidden_grid": f"{switched_hidden_sizes[2][0]}x{switched_hidden_sizes[2][1]}",
+                        "switched_current_grid": f"{switched_current_sizes[2][0]}x{switched_current_sizes[2][1]}",
+                        "zoomed_current_grid": f"{zoomed_current_sizes[2][0]}x{zoomed_current_sizes[2][1]}",
+                        "zoomed_hidden_grid": f"{zoomed_hidden_sizes[2][0]}x{zoomed_hidden_sizes[2][1]}",
+                        "reset_current_grid": f"{reset_current_sizes[2][0]}x{reset_current_sizes[2][1]}",
+                        "reset_hidden_grid": f"{reset_hidden_sizes[2][0]}x{reset_hidden_sizes[2][1]}",
                     },
                     indent=2,
                     sort_keys=True,

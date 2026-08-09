@@ -47,6 +47,87 @@ class SessionStoreLayoutTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_remembered_window_survives_when_all_tabs_are_stopped_and_hidden(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db)
+            try:
+                record = store.create(
+                    "worker",
+                    "dev",
+                    "bash",
+                    tmp,
+                    window_id="win-durable",
+                    window_title="Durable",
+                )
+                store.update(record.id, status="stopped", visible=False)
+            finally:
+                store.close()
+
+            reopened = SessionStore(db)
+            try:
+                self.assertEqual(
+                    reopened.windows_for_restore(),
+                    [("win-durable", "Durable", [])],
+                )
+            finally:
+                reopened.close()
+
+    def test_legacy_window_backfill_ignores_all_hidden_historical_groups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db)
+            try:
+                visible = store.create(
+                    "visible",
+                    "dev",
+                    "bash",
+                    tmp,
+                    window_id="win-open",
+                    window_title="Open",
+                )
+                hidden = store.create(
+                    "hidden",
+                    "dev",
+                    "bash",
+                    tmp,
+                    window_id="win-history",
+                    window_title="History",
+                    visible=False,
+                )
+                store.update(visible.id, status="running")
+                store.update(hidden.id, status="stopped", visible=False)
+                store.conn.execute("DROP TABLE remembered_windows")
+                store.conn.commit()
+            finally:
+                store.close()
+
+            migrated = SessionStore(db)
+            try:
+                self.assertEqual(migrated.remembered_windows(), [("win-open", "Open")])
+            finally:
+                migrated.close()
+
+    def test_window_rename_updates_sessions_and_independent_registry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                record = store.create(
+                    "worker",
+                    "dev",
+                    "bash",
+                    tmp,
+                    window_id="win-a",
+                    window_title="Before",
+                )
+
+                self.assertEqual(store.rename_window("win-a", "After"), 1)
+
+                self.assertEqual(store.get(record.id).window_title, "After")
+                self.assertEqual(store.remembered_windows(), [("win-a", "After")])
+            finally:
+                store.close()
+
     def test_old_database_migrates_layout_columns(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "sessions.sqlite3"

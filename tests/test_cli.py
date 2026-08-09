@@ -5,7 +5,7 @@ import json
 import pathlib
 import unittest
 
-from termdeck.cli import _select_records, build_parser, cmd_activity, cmd_archive, cmd_auth, cmd_budget_plan, cmd_capture, cmd_checkpoint, cmd_control_plan, cmd_diagnostics, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_reconcile, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
+from termdeck.cli import _select_records, build_parser, cmd_activity, cmd_archive, cmd_auth, cmd_budget_plan, cmd_capture, cmd_checkpoint, cmd_control_plan, cmd_diagnostics, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_reconcile, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_sessions, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
 
 
 class CliTests(unittest.TestCase):
@@ -193,6 +193,121 @@ class CliTests(unittest.TestCase):
             payload = json.loads(buffer.getvalue())
             self.assertEqual(payload["selected_account"], "work")
             self.assertTrue(payload["auth_restart_required"])
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                saved = store.get(record.id)
+                self.assertEqual(saved.selected_account, "work")
+                self.assertTrue(saved.auth_restart_required)
+            finally:
+                store.close()
+
+    def test_auth_switch_activates_selected_account_in_live_tab(self):
+        import tempfile
+        from unittest import mock
+        from termdeck.codex_auth import CodexAccount, CodexAuthState, CodexSwitchResult
+        from termdeck.session_store import SessionStore
+        from termdeck.tmux_backend import AuthActivationResult
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = pathlib.Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                record = store.create("agent", "ai", "bash", tmp)
+                record = store.update(record.id, status="running")
+            finally:
+                store.close()
+            state = CodexAuthState(
+                codex_home=record.codex_home,
+                accounts=(CodexAccount("work", alias="work", active=True),),
+                selected_account="work",
+                selected_account_key="work",
+                fingerprint="verified",
+                codex_auth_available=True,
+            )
+            manager = mock.Mock()
+            manager.switch.return_value = CodexSwitchResult(True, state)
+            backend = mock.Mock()
+            recovery = "codex --yolo resume 019f71b3-fa32-7251-bac3-c628f34dd154"
+            backend.activate_auth_change.return_value = AuthActivationResult(
+                True,
+                True,
+                recovery_command=recovery,
+                recovery_cwd=tmp,
+                pid=4242,
+                status="running",
+                detail="Codex restarted in this tab with the selected account",
+            )
+            args = argparse.Namespace(db=db_path, selector=record.id, switch_account="work")
+            buffer = io.StringIO()
+            with mock.patch("termdeck.cli.CodexAuthManager", return_value=manager), mock.patch(
+                "termdeck.cli.TmuxBackend", return_value=backend
+            ), contextlib.redirect_stdout(buffer):
+                code = cmd_auth(args)
+
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["selected_account"], "work")
+            self.assertTrue(payload["auth_activation_ok"])
+            self.assertTrue(payload["auth_activation_restarted"])
+            self.assertFalse(payload["auth_restart_required"])
+            backend.activate_auth_change.assert_called_once()
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                saved = store.get(record.id)
+                self.assertEqual(saved.selected_account, "work")
+                self.assertFalse(saved.auth_restart_required)
+                self.assertEqual(saved.recovery_command, recovery)
+                self.assertEqual(saved.recovery_cwd, tmp)
+                self.assertEqual(saved.last_pid, 4242)
+                self.assertEqual(saved.status, "running")
+            finally:
+                store.close()
+
+    def test_auth_switch_reports_activation_failure_without_losing_selected_account(self):
+        import tempfile
+        from unittest import mock
+        from termdeck.codex_auth import CodexAccount, CodexAuthState, CodexSwitchResult
+        from termdeck.session_store import SessionStore
+        from termdeck.tmux_backend import AuthActivationResult
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = pathlib.Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                record = store.create("agent", "ai", "bash", tmp)
+                record = store.update(record.id, status="running")
+            finally:
+                store.close()
+            state = CodexAuthState(
+                codex_home=record.codex_home,
+                accounts=(CodexAccount("work", alias="work", active=True),),
+                selected_account="work",
+                selected_account_key="work",
+                fingerprint="verified",
+                codex_auth_available=True,
+            )
+            manager = mock.Mock()
+            manager.switch.return_value = CodexSwitchResult(True, state)
+            backend = mock.Mock()
+            backend.activate_auth_change.return_value = AuthActivationResult(
+                False,
+                False,
+                detail="running Codex session could not be captured exactly",
+            )
+            args = argparse.Namespace(db=db_path, selector=record.id, switch_account="work")
+            buffer = io.StringIO()
+            with mock.patch("termdeck.cli.CodexAuthManager", return_value=manager), mock.patch(
+                "termdeck.cli.TmuxBackend", return_value=backend
+            ), contextlib.redirect_stdout(buffer):
+                code = cmd_auth(args)
+
+            self.assertEqual(code, 1)
+            payload = json.loads(buffer.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["selected_account"], "work")
+            self.assertTrue(payload["auth_restart_required"])
+            self.assertIn("could not be captured exactly", payload["error"])
             store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
             try:
                 saved = store.get(record.id)
@@ -469,6 +584,63 @@ class CliTests(unittest.TestCase):
                 self.assertEqual({record.id for record in selected}, {first.id, second.id})
             finally:
                 store.close()
+
+    def test_window_targeting_filters_before_ids_names_tags_and_all(self):
+        from pathlib import Path
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                first_a = store.create("duplicate", "shared", "codex", tmp, window_id="win-a")
+                second_a = store.create("a-only", "shared", "bash", tmp, window_id="win-a")
+                first_b = store.create("duplicate", "shared", "codex", tmp, window_id="win-b")
+                store.create("b-only", "other", "bash", tmp, window_id="win-b")
+
+                by_name = _select_records(store, ["duplicate"], window_id="win-a")
+                self.assertEqual([record.id for record in by_name], [first_a.id])
+
+                foreign_exact_id = _select_records(store, [first_b.id], window_id="win-a")
+                self.assertEqual(foreign_exact_id, [])
+
+                by_tag = _select_records(store, tag="shared", window_id="win-a")
+                self.assertEqual({record.id for record in by_tag}, {first_a.id, second_a.id})
+
+                all_in_window = _select_records(store, all_sessions=True, window_id="win-a")
+                self.assertEqual({record.id for record in all_in_window}, {first_a.id, second_a.id})
+            finally:
+                store.close()
+
+    def test_window_id_parser_and_sessions_listing_are_scoped_without_move_regression(self):
+        from pathlib import Path
+        import tempfile
+        from termdeck.session_store import SessionStore
+
+        parser = build_parser()
+        send_args = parser.parse_args(["send", "status", "--window-id", "win-a", "--all"])
+        self.assertEqual(send_args.target_window_id, "win-a")
+        pause_args = parser.parse_args(["pause", "--window-id", "win-a", "--all"])
+        self.assertEqual(pause_args.target_window_id, "win-a")
+        move_args = parser.parse_args(["move", "tab", "--window-id", "win-b"])
+        self.assertEqual(move_args.window_id, "win-b")
+        self.assertFalse(hasattr(move_args, "target_window_id"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path)
+            try:
+                expected = store.create("a", "ai", "codex", tmp, window_id="win-a")
+                store.create("b", "ai", "codex", tmp, window_id="win-b")
+            finally:
+                store.close()
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cmd_sessions(argparse.Namespace(db=db_path, all=True, window_id="win-a"))
+            self.assertEqual(code, 0)
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual([row["id"] for row in payload], [expected.id])
 
     def test_control_plan_command_outputs_safety_json(self):
         from pathlib import Path

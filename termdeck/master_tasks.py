@@ -73,7 +73,7 @@ class MasterTaskRow:
 
 def state_from_snapshot(record: SessionRecord, snap: ResourceSnapshot) -> str:
     if snap.exists:
-        return "paused" if snap.state == "T" else "running"
+        return "paused" if snap.state == "T" or (snap.state == "unknown" and record.status == "paused") else "running"
     if record.status == "paused":
         return "paused"
     return record.status if record.status in {"new", "recovery-pending", "stopped", "archived"} else "stopped"
