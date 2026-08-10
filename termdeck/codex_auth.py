@@ -236,8 +236,29 @@ def _real_codex_auth(codex_home: Path) -> Path | None:
         candidate = Path(configured).expanduser().resolve(strict=False)
         if candidate.is_file() and os.access(candidate, os.X_OK) and not _is_termdeck_wrapper(candidate):
             return candidate
-    for entry in _sanitized_host_path(codex_home).split(os.pathsep):
-        candidate = Path(entry) / "codex-auth"
+
+    search_dirs = [Path(entry) for entry in _sanitized_host_path(codex_home).split(os.pathsep)]
+    # Desktop launchers commonly inherit a deliberately small systemd user
+    # PATH (for example /usr/local/bin:/usr/bin) even though interactive
+    # shells add user package-manager bins. codex-auth is commonly installed
+    # by npm under ~/.npm-global/bin, so relying on the GUI's PATH makes the
+    # account selector look unavailable while the command works in a shell.
+    user_home = Path.home().expanduser()
+    search_dirs.extend(
+        [
+            user_home / ".local" / "bin",
+            user_home / ".npm-global" / "bin",
+            user_home / ".bun" / "bin",
+            user_home / ".local" / "share" / "pnpm",
+        ]
+    )
+    seen: set[Path] = set()
+    for entry in search_dirs:
+        entry = entry.expanduser().resolve(strict=False)
+        if entry in seen:
+            continue
+        seen.add(entry)
+        candidate = entry / "codex-auth"
         if candidate.is_file() and os.access(candidate, os.X_OK) and not _is_termdeck_wrapper(candidate):
             return candidate.resolve(strict=False)
     return None

@@ -203,6 +203,37 @@ class CodexAuthTests(unittest.TestCase):
             self.assertIsNone(state.selected_account)
             self.assertEqual([account.label for account in state.accounts], ["work", "personal"])
 
+    def test_prepare_scope_finds_user_npm_codex_auth_when_desktop_path_is_minimal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host_home = root / "host-home"
+            source = root / "source"
+            private = root / "private"
+            executable = host_home / ".npm-global" / "bin" / "codex-auth"
+            executable.parent.mkdir(parents=True)
+            _write_native_codex_auth(executable)
+            _write_native_source(source)
+
+            with mock.patch("termdeck.codex_auth.Path.home", return_value=host_home), mock.patch.dict(
+                os.environ,
+                {"PATH": "/usr/local/bin:/usr/bin"},
+                clear=False,
+            ):
+                prepare_auth_scope(private, account_source=source)
+                state = read_auth_state(private)
+                result = CodexAuthManager(account_source=source).switch(
+                    _record(private, root),
+                    "beta",
+                )
+
+            wrapper = (private / "bin" / "codex-auth").read_text(encoding="utf-8")
+            self.assertTrue(state.codex_auth_available)
+            self.assertTrue(result.ok, result.error)
+            self.assertEqual(result.state.selected_account, "beta")
+            self.assertEqual((private / "auth.json").resolve(), (private / "accounts" / "beta.json").resolve())
+            self.assertIn(f"exec {executable.resolve()} \"$@\"", wrapper)
+            self.assertIn("export PATH=/usr/local/bin:/usr/bin", wrapper)
+
     def test_switch_changes_only_the_terminal_private_home(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
