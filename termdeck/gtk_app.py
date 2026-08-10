@@ -5419,6 +5419,16 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         return ctrl and not shift and (keyval in {Gdk.KEY_c, Gdk.KEY_C} or name == "c")
 
     @staticmethod
+    def _is_plain_ctrl_l_event(event: Gdk.EventKey) -> bool:
+        """Reserve plain Ctrl+L as a no-op so shell redraws cannot hide terminal contents."""
+        state = KeyMap._clean_state(event.state)
+        keyval = Gdk.keyval_to_lower(event.keyval)
+        name = (Gdk.keyval_name(keyval) or "").lower()
+        return state == int(Gdk.ModifierType.CONTROL_MASK) and (
+            keyval in {Gdk.KEY_l, Gdk.KEY_L} or name == "l"
+        )
+
+    @staticmethod
     def _terminal_has_selection(attach) -> bool:
         try:
             return bool(attach.terminal.get_has_selection())
@@ -5449,6 +5459,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             return True
         # Capture zoom / clipboard before VTE treats the chord as input.
         if self.handle_zoom_event(event):
+            return True
+        # Plain Ctrl+L is normally forwarded as form-feed (0x0c), which shells
+        # interpret as clear/redraw. Keep the current terminal contents visible
+        # by consuming only that exact chord; modified Ctrl+L bindings still work.
+        if TermDeckWindow._is_plain_ctrl_l_event(event):
             return True
         attach = self._current_attach_terminal()
         if attach is None:

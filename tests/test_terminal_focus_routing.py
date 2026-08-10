@@ -169,6 +169,47 @@ class TerminalFocusRoutingTest(TestCase):
         self.assertTrue(handled)
         self.assertEqual(routed, [event])
 
+    def test_plain_ctrl_l_is_content_preserving_noop(self) -> None:
+        event = SimpleNamespace(
+            keyval=gtk_app.Gdk.KEY_l,
+            state=gtk_app.Gdk.ModifierType.CONTROL_MASK,
+        )
+
+        self.assertTrue(TermDeckWindow._is_plain_ctrl_l_event(event))
+        self.assertFalse(
+            TermDeckWindow._is_plain_ctrl_l_event(
+                SimpleNamespace(
+                    keyval=gtk_app.Gdk.KEY_l,
+                    state=gtk_app.Gdk.ModifierType.CONTROL_MASK
+                    | gtk_app.Gdk.ModifierType.SHIFT_MASK,
+                )
+            )
+        )
+        self.assertFalse(
+            TermDeckWindow._is_plain_ctrl_l_event(
+                SimpleNamespace(
+                    keyval=gtk_app.Gdk.KEY_l,
+                    state=gtk_app.Gdk.ModifierType.CONTROL_MASK
+                    | gtk_app.Gdk.ModifierType.MOD1_MASK,
+                )
+            )
+        )
+
+    def test_terminal_handler_consumes_plain_ctrl_l_before_vte(self) -> None:
+        window = SimpleNamespace(
+            keymap=KeyMapStub(),
+            handle_zoom_event=lambda _event: False,
+            _current_attach_terminal=lambda: self.fail("Ctrl+L must be consumed before VTE routing"),
+        )
+        event = SimpleNamespace(
+            keyval=gtk_app.Gdk.KEY_l,
+            state=gtk_app.Gdk.ModifierType.CONTROL_MASK,
+        )
+
+        handled = TermDeckWindow.on_terminal_key_press(window, None, event)
+
+        self.assertTrue(handled)
+
     def test_first_key_encoder_handles_text_control_and_navigation_keys(self) -> None:
         cases = [
             (gtk_app.Gdk.KEY_x, 0, b"x"),
