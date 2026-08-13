@@ -14,6 +14,7 @@ import termios
 import tempfile
 import threading
 import time
+import tty
 from pathlib import Path
 
 import gi  # type: ignore
@@ -616,10 +617,11 @@ class AttachTerminal(Gtk.Box):
             except OSError:
                 pass
         try:
-            self.pty_obj = Vte.Pty.new_foreign_sync(master_fd, None)
-            self._last_synced_grid = (0, 0)
-            self._sync_pty_geometry(columns=columns, rows=rows)
-            self.terminal.set_pty(self.pty_obj)
+            # VTE answers terminal identity probes as soon as a PTY is
+            # assigned. Remove the slave's canonical/echo window first, then
+            # start the attach client so those replies are consumed as input
+            # instead of being echoed back as visible ``^[...`` shell text.
+            tty.setraw(slave_fd, when=termios.TCSANOW)
             self.process = subprocess.Popen(
                 self.argv,
                 cwd=self.cwd,
@@ -630,6 +632,10 @@ class AttachTerminal(Gtk.Box):
                 close_fds=True,
                 start_new_session=True,
             )
+            self.pty_obj = Vte.Pty.new_foreign_sync(master_fd, None)
+            self._last_synced_grid = (0, 0)
+            self._sync_pty_geometry(columns=columns, rows=rows)
+            self.terminal.set_pty(self.pty_obj)
             try:
                 self.terminal.watch_child(self.process.pid)
                 self._remove_glib_source(self._attach_stable_source_id)
