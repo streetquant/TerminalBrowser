@@ -12,7 +12,7 @@ from typing import Mapping
 from .chrome_css import build_modern_chrome_css
 from .models import DEFAULT_PALETTE, TerminalTheme
 
-CHROME_THEME_NAMES = ("dark", "noir", "system")
+CHROME_THEME_NAMES = ("dark", "noir", "light", "system")
 DENSITY_NAMES = ("comfortable", "compact")
 CURSOR_SHAPE_NAMES = ("block", "underline", "ibeam")
 TERMINAL_PALETTE_NAMES = (
@@ -106,10 +106,30 @@ CHROME_TOKENS: Mapping[str, ChromeTokens] = {
         success="#3ddc97",
         card_radius=8,
     ),
+    "light": ChromeTokens(
+        name="light",
+        # Explicit paper-light shell: neutral cool greys with an ink foreground
+        # and a saturated cobalt accent. Every text pair clears WCAG AA 4.5:1
+        # (guarded by contrast_violations tests) so the light chrome stays
+        # readable on uncalibrated panels.
+        bg="#f6f7f9",
+        bg_raised="#ffffff",
+        bg_sunken="#eceef2",
+        fg="#1c2128",
+        fg_muted="#59626e",
+        border="#d7dbe1",
+        accent="#2f6fed",
+        accent_fg="#ffffff",
+        danger="#c62b41",
+        warning="#8a5a00",
+        success="#0a6e4a",
+        card_radius=8,
+    ),
     "system": ChromeTokens(
         name="system",
         # Clean neutral light shell — follows desktop when system prefers light.
-        # When system prefers dark, effective_chrome_theme() maps to "dark".
+        # When system prefers dark, effective_chrome_theme() maps to "dark";
+        # values mirror the explicit "light" pack.
         bg="#f6f7f9",
         bg_raised="#ffffff",
         bg_sunken="#eceef2",
@@ -274,6 +294,8 @@ def normalise_chrome_theme(name: str | None) -> str:
     cleaned = str(name or "dark").strip().lower()
     if cleaned in {"default", "modern"}:
         return "dark"
+    if cleaned in {"day", "paper"}:
+        return "light"
     if cleaned not in CHROME_THEME_NAMES:
         return "dark"
     return cleaned
@@ -424,6 +446,80 @@ def resolve_chrome_tokens(name: str | None) -> ChromeTokens:
     return CHROME_TOKENS[normalise_chrome_theme(name)]
 
 
+# WCAG 2.1 AA thresholds: 4.5:1 for normal text, 3:1 for non-text UI marks.
+MIN_TEXT_CONTRAST = 4.5
+MIN_UI_CONTRAST = 3.0
+
+
+def relative_luminance(color: str) -> float:
+    """WCAG 2.1 relative luminance of a ``#rrggbb`` hex color."""
+
+    text = str(color).strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(ch * 2 for ch in text)
+    if len(text) != 6:
+        raise ValueError(f"expected #rrggbb color, got {color!r}")
+    channels = [int(text[index : index + 2], 16) / 255.0 for index in (0, 2, 4)]
+
+    def linearise(channel: float) -> float:
+        if channel <= 0.03928:
+            return channel / 12.92
+        return ((channel + 0.055) / 1.055) ** 2.4
+
+    red, green, blue = (linearise(channel) for channel in channels)
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def contrast_ratio(first: str, second: str) -> float:
+    """WCAG 2.1 contrast ratio between two hex colors (1.0 .. 21.0)."""
+
+    lighter, darker = sorted(
+        (relative_luminance(first), relative_luminance(second)), reverse=True
+    )
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def contrast_violations(tokens: ChromeTokens) -> list[str]:
+    """Human-readable WCAG AA failures for a chrome token pack.
+
+    Text-bearing pairs must clear ``MIN_TEXT_CONTRAST`` (4.5:1); semantic
+    non-text hues must clear ``MIN_UI_CONTRAST`` (3:1) against both working
+    surfaces. An empty list means the pack is AA-clean.
+    """
+
+    text_pairs = (
+        ("fg", tokens.fg, "bg", tokens.bg),
+        ("fg", tokens.fg, "bg_raised", tokens.bg_raised),
+        ("fg", tokens.fg, "bg_sunken", tokens.bg_sunken),
+        ("fg_muted", tokens.fg_muted, "bg", tokens.bg),
+        ("fg_muted", tokens.fg_muted, "bg_raised", tokens.bg_raised),
+        ("accent_fg", tokens.accent_fg, "accent", tokens.accent),
+    )
+    ui_pairs = (
+        ("accent", tokens.accent, "bg", tokens.bg),
+        ("accent", tokens.accent, "bg_raised", tokens.bg_raised),
+        ("danger", tokens.danger, "bg", tokens.bg),
+        ("warning", tokens.warning, "bg", tokens.bg),
+        ("success", tokens.success, "bg", tokens.bg),
+    )
+    failures: list[str] = []
+    for fg_name, fg_value, bg_name, bg_value in text_pairs:
+        ratio = contrast_ratio(fg_value, bg_value)
+        if ratio < MIN_TEXT_CONTRAST:
+            failures.append(
+                f"{tokens.name}: {fg_name} on {bg_name} is {ratio:.2f}:1 "
+                f"(needs {MIN_TEXT_CONTRAST}:1)"
+            )
+    for hue_name, hue_value, bg_name, bg_value in ui_pairs:
+        ratio = contrast_ratio(hue_value, bg_value)
+        if ratio < MIN_UI_CONTRAST:
+            failures.append(
+                f"{tokens.name}: {hue_name} on {bg_name} is {ratio:.2f}:1 "
+                f"(needs {MIN_UI_CONTRAST}:1)"
+            )
+    return failures
+
+
 def detect_system_prefers_dark() -> bool:
     """Best-effort dark preference for the system chrome theme.
 
@@ -464,7 +560,8 @@ def effective_chrome_theme(name: str | None) -> str:
     """Resolve the concrete token pack for a chrome theme setting.
 
     ``system`` follows the desktop: dark pack when dark is preferred, otherwise
-    the light ``system`` token pack. Explicit dark/noir are unchanged.
+    the light ``system`` token pack (which mirrors the explicit ``light``
+    theme). Explicit dark/noir/light are unchanged.
     """
 
     chosen = normalise_chrome_theme(name)
