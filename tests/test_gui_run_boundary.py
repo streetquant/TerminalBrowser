@@ -23,7 +23,7 @@ class GuiRunBoundaryTest(TestCase):
 
             self.assertEqual(first_id, gtk_app.application_id_for_database(alias))
             self.assertNotEqual(first_id, gtk_app.application_id_for_database(second))
-            self.assertRegex(first_id, r"^dev\.termdeck\.TermDeck\.db_[0-9a-f]{32}$")
+            self.assertRegex(first_id, r"^dev\.t1000\.T1000\.db_[0-9a-f]{32}$")
             self.assertTrue(Gio.Application.id_is_valid(first_id))
             self.assertEqual(gtk_app.canonical_database_path(alias), first.resolve())
             with self.assertRaisesRegex(ValueError, "not a regular file"):
@@ -33,7 +33,7 @@ class GuiRunBoundaryTest(TestCase):
             gtk_app.application_id_for_database(None),
             gtk_app.application_id_for_database(DEFAULT_DB_PATH),
         )
-        self.assertEqual(gtk_app.application_id_for_database(None), "dev.termdeck.TermDeck")
+        self.assertEqual(gtk_app.application_id_for_database(None), "dev.t1000.T1000")
         with self.assertRaisesRegex(ValueError, "file-backed"):
             gtk_app.application_id_for_database(":memory:")
 

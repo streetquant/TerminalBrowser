@@ -203,7 +203,7 @@ class UiSurfaceStaticTests(unittest.TestCase):
         self.assertIn("self._header_new_tab = header_new_tab", self.gtk)
         self.assertIn("header.pack_start(header_new_tab)", self.gtk)
         self.assertIn("overflow_header_actions", self.gtk)
-        self.assertIn('("New TermDeck window", self.new_window)', self.gtk)
+        self.assertIn('("New T1000 window", self.new_window)', self.gtk)
         self.assertIn("list-add-symbolic", self.gtk)
         self.assertIn('Gtk.MenuButton(label="⋯")', self.gtk)
         self.assertIn("show_label=False", self.gtk)

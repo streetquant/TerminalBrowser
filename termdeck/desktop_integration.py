@@ -8,9 +8,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-APP_ID = "io.github.termdeck.TermDeck"
+APP_ID = "io.github.t1000.T1000"
 DESKTOP_FILENAME = f"{APP_ID}.desktop"
-ICON_NAME = "termdeck"
+ICON_NAME = "t1000"
 
 TERMDECK_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
   <rect width="128" height="128" rx="24" fill="#1e1e1e"/>
@@ -83,7 +83,7 @@ def resolve_launch_command(command: str | None = None) -> str:
     if command and command.strip():
         base = command.strip()
     else:
-        found = shutil.which("termdeck")
+        found = shutil.which("t1000")
         base = shlex.quote(found) if found else shlex.join([sys.executable, "-m", "termdeck"])
     if " gui" in base or base.endswith(" gui"):
         return base
@@ -95,7 +95,7 @@ def build_desktop_entry(exec_command: str) -> str:
         "[Desktop Entry]",
         "Type=Application",
         "Version=1.0",
-        "Name=TermDeck",
+        "Name=T1000",
         "GenericName=Terminal Task Manager",
         "Comment=Named terminal windows with directory-backed tabs",
         f"Exec={exec_command}",

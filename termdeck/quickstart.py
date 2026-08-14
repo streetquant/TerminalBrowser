@@ -108,7 +108,7 @@ def _recommended_actions(payload: dict[str, Any], *, path: Path) -> list[dict[st
             "install-dependencies",
             "Install lightweight runtime dependencies",
             INSTALL_HINT,
-            "TermDeck needs tmux for persistence and GTK/VTE for the native interface.",
+            "T1000 needs tmux for persistence and GTK/VTE for the native interface.",
         ))
 
     actions.append(_action(
@@ -124,7 +124,7 @@ def _recommended_actions(payload: dict[str, Any], *, path: Path) -> list[dict[st
             "inspect-terminator-theme",
             "Inspect imported Terminator appearance and shortcuts",
             "python3 -m termdeck parse-terminator",
-            "Confirms the font, colours, scrollback, and keybindings TermDeck will reuse.",
+            "Confirms the font, colours, scrollback, and keybindings T1000 will reuse.",
         ))
         if terminator["layouts"]:
             actions.append(_action(
@@ -140,12 +140,12 @@ def _recommended_actions(payload: dict[str, Any], *, path: Path) -> list[dict[st
             "install-app-launcher",
             "Install desktop app launcher",
             "python3 -m termdeck install-desktop",
-            "Lets users start TermDeck from the desktop or app menu.",
+            "Lets users start T1000 from the desktop or app menu.",
         ))
 
     actions.append(_action(
         "launch-gui",
-        "Launch TermDeck",
+        "Launch T1000",
         "python3 -m termdeck gui",
         "Opens the named-window and directory-tab interface.",
     ))

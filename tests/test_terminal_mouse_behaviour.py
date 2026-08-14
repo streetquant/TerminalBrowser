@@ -436,16 +436,17 @@ time.sleep(2)
         self.assertEqual(attach._cursor_hide_source_id, 0)
         terminal.feed.assert_called_once_with(b"\x1b[?25l")
 
-    def test_normal_wheel_never_uses_native_vte_scrollback_when_application_history_exists(self) -> None:
+    def test_normal_wheel_prefers_native_vte_scrollback_over_backend_round_trips(self) -> None:
         calls = []
         terminal = SimpleNamespace(get_has_selection=lambda: False)
         attach = SimpleNamespace(
             terminal=terminal,
             _bind_scrollbar_for_selection=lambda active: calls.append(("bind-native", active)),
-            _scroll_handler=lambda lines: calls.append(("scroll", lines)) or _handled_outcome(lines, depth=3),
-            _sync_history_from_outcome=lambda outcome: calls.append(("sync", outcome.depth)),
+            _native_scrollback_available=lambda: True,
+            _move_native_history=lambda lines: calls.append(("native", lines)),
+            _at_native_live_edge=lambda: False,
             _set_history_cursor_hidden=lambda hidden: calls.append(("cursor", hidden)),
-            _arm_scroll_idle_resume=lambda: calls.append("idle"),
+            _scroll_handler=lambda lines: calls.append(("scroll", lines)) or _handled_outcome(lines, depth=3),
         )
 
         handled = AttachTerminal._on_terminal_scroll(
@@ -457,8 +458,52 @@ time.sleep(2)
         self.assertTrue(handled)
         self.assertEqual(
             calls,
-            [("bind-native", False), ("scroll", -3), ("sync", 3), ("cursor", True), "idle"],
+            [("bind-native", True), ("native", -3), ("cursor", True)],
         )
+
+    def test_native_wheel_returning_to_live_edge_unhides_cursor(self) -> None:
+        calls = []
+        terminal = SimpleNamespace(get_has_selection=lambda: False)
+        attach = SimpleNamespace(
+            terminal=terminal,
+            _bind_scrollbar_for_selection=lambda active: calls.append(("bind-native", active)),
+            _native_scrollback_available=lambda: True,
+            _move_native_history=lambda lines: calls.append(("native", lines)),
+            _at_native_live_edge=lambda: True,
+            _history_cursor_hidden=True,
+            _set_history_cursor_hidden=lambda hidden: calls.append(("cursor", hidden)),
+        )
+
+        handled = AttachTerminal._on_terminal_scroll(
+            attach,
+            terminal,
+            SimpleNamespace(direction=Gdk.ScrollDirection.DOWN, delta_y=0.0),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            calls,
+            [("bind-native", True), ("native", 3), ("cursor", False)],
+        )
+
+    def test_at_native_live_edge_reads_real_adjustment_geometry(self) -> None:
+        at_bottom = SimpleNamespace(
+            native_adjustment=SimpleNamespace(
+                get_value=lambda: 76.0,
+                get_upper=lambda: 100.0,
+                get_page_size=lambda: 24.0,
+            )
+        )
+        scrolled_back = SimpleNamespace(
+            native_adjustment=SimpleNamespace(
+                get_value=lambda: 40.0,
+                get_upper=lambda: 100.0,
+                get_page_size=lambda: 24.0,
+            )
+        )
+
+        self.assertTrue(AttachTerminal._at_native_live_edge(at_bottom))
+        self.assertFalse(AttachTerminal._at_native_live_edge(scrolled_back))
 
     def test_single_scroll_down_from_deep_history_is_incremental_and_does_not_return_live(self) -> None:
         calls = []
@@ -818,7 +863,7 @@ time.sleep(2)
         handled = AttachTerminal._on_terminal_scroll(attach, terminal, event)
 
         self.assertTrue(handled)
-        self.assertEqual(calls, [("scroll", -5), ("sync", 5), ("cursor", True)])
+        self.assertEqual(calls, [("scroll", -15), ("sync", 5), ("cursor", True)])
 
     def test_async_unhandled_unknown_edge_reverts_proxy_without_returning_live(self) -> None:
         calls = []

@@ -1785,6 +1785,17 @@ class AttachTerminal(Gtk.Box):
         self._selection_pending = False
         return copied
 
+    def _at_native_live_edge(self) -> bool:
+        """Return whether VTE's native viewport rests at the live bottom row."""
+
+        try:
+            adjustment = self.native_adjustment
+            value = float(adjustment.get_value())
+            upper = float(adjustment.get_upper()) - float(adjustment.get_page_size())
+        except Exception:
+            return True
+        return value >= upper - 0.5
+
     def _native_scrollback_available(self) -> bool:
         """Return whether this VTE has one normal-screen history buffer."""
 
@@ -1948,7 +1959,7 @@ class AttachTerminal(Gtk.Box):
         elif direction == Gdk.ScrollDirection.DOWN:
             delta = 3.0
         else:
-            delta = float(getattr(event, "delta_y", 0.0) or 0.0)
+            delta = 3.0 * float(getattr(event, "delta_y", 0.0) or 0.0)
         line_delta = int(round(delta))
         if not line_delta and delta:
             line_delta = -1 if delta < 0 else 1
@@ -1983,6 +1994,26 @@ class AttachTerminal(Gtk.Box):
             return True
 
         bind_scrollbar = getattr(self, "_bind_scrollbar_for_selection", None)
+        # Native-first wheel: once VTE's normal-screen buffer holds history
+        # (seeded on attach and fed continuously because the attach client
+        # never enters the alternate screen), the wheel moves that buffer
+        # directly on the main thread with zero backend round trips. The tmux
+        # history controller keeps ownership only while no native history
+        # exists yet.
+        native_available = getattr(self, "_native_scrollback_available", None)
+        prime_native = getattr(self, "_prime_native_scrollback", None)
+        if (callable(native_available) and native_available()) or (
+            callable(prime_native) and prime_native()
+        ):
+            if callable(bind_scrollbar):
+                bind_scrollbar(True)
+            self._move_native_history(line_delta)
+            if self._at_native_live_edge():
+                if getattr(self, "_history_cursor_hidden", False):
+                    self._set_history_cursor_hidden(False)
+            else:
+                self._set_history_cursor_hidden(True)
+            return True
         if callable(bind_scrollbar):
             bind_scrollbar(False)
         handler = getattr(self, "_scroll_handler", None)
@@ -2230,7 +2261,7 @@ class WindowOverview(Gtk.Window):
     ]
 
     def __init__(self, app_context: "TermDeckApplication"):
-        super().__init__(title="TermDeck Window Overview")
+        super().__init__(title="T1000 Window Overview")
         self.app_context = app_context
         self._refresh_alive = True
         self.connect("destroy", lambda *_: setattr(self, "_refresh_alive", False))
@@ -2329,7 +2360,7 @@ class ShortcutWindow(Gtk.Window):
     }
 
     def __init__(self, app_context: "TermDeckApplication", parent: Gtk.Window | None = None):
-        super().__init__(title="TermDeck Keyboard Shortcuts")
+        super().__init__(title="T1000 Keyboard Shortcuts")
         self.app_context = app_context
         _style(self, "td-table-window")
         self.set_resizable(True)
@@ -2569,7 +2600,7 @@ class SessionSearchWindow(Gtk.Window):
     COLUMNS = ["ID", "Window", "Name", "Status", "Fields", "Output", "Command"]
 
     def __init__(self, app_context: "TermDeckApplication"):
-        super().__init__(title="TermDeck Search Tabs")
+        super().__init__(title="T1000 Search Tabs")
         self.app_context = app_context
         _style(self, "td-table-window")
         self.set_default_size(1040, 620)
@@ -3329,7 +3360,7 @@ class SidePane(Gtk.Box):
 
     def _captain_error(self, record: SessionRecord) -> str | None:
         if record.window_id != self.window.window_id:
-            return "That tab belongs to a different TermDeck window"
+            return "That tab belongs to a different T1000 window"
         if not record.visible or record.id not in self.window.tabs:
             return "The Codex captain must be an open tab in this window"
         status = record.status.casefold()
@@ -3843,7 +3874,7 @@ class MasterWindow(Gtk.Window):
         return tree
 
     def __init__(self, app_context: "TermDeckApplication"):
-        super().__init__(title="TermDeck Tab Manager")
+        super().__init__(title="T1000 Tab Manager")
         self.app_context = app_context
         self._refresh_alive = True
         self._capture_preview_cache: dict[tuple[str, str, int | None, int], str] = {}
@@ -4112,7 +4143,7 @@ class MasterWindow(Gtk.Window):
             capture = redacted.text
             if redacted.replacements:
                 labels = ", ".join(redacted.labels)
-                capture = f"[TermDeck redacted {redacted.replacements} secret-like value(s): {labels}]\n\n{capture}"
+                capture = f"[T1000 redacted {redacted.replacements} secret-like value(s): {labels}]\n\n{capture}"
         if not capture:
             capture = "No captured output yet, or the hidden tab process is not currently available."
         self._capture_preview_cache = {key: capture}
@@ -4362,7 +4393,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         window_title: str | None = None,
         restore_records: list[SessionRecord] | None = None,
     ):
-        super().__init__(application=app_context, title="TermDeck")
+        super().__init__(application=app_context, title="T1000")
         self.app_context = app_context
         self.keymap = KeyMap(
             app_context.theme,
@@ -4443,7 +4474,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         title_event.connect("button-press-event", self._on_window_title_press)
         header.set_custom_title(title_event)
         self.set_titlebar(header)
-        self.set_title(f"TermDeck · {self.window_title}")
+        self.set_title(f"T1000 · {self.window_title}")
 
         # Keep a permanent per-window New tab control in the header. The
         # browser-style floating + beside the notebook tabs hides when the
@@ -4477,7 +4508,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
         overflow_header_actions = [
             ("Rename window", self.rename_window),
-            ("New TermDeck window", self.new_window),
+            ("New T1000 window", self.new_window),
             ("Search tabs", self.open_search_window),
             ("Command palette", self.open_command_palette),
             ("Reopen closed tab", self.reopen_last_closed_tab),
@@ -4487,7 +4518,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             ("Keyboard shortcuts", self.open_shortcut_window),
             ("Terminal appearance", self.open_terminal_options),
             ("Kill Window Permanently…", self.kill_window),
-            ("Quit TermDeck", self.quit_termdeck),
+            ("Quit T1000", self.quit_termdeck),
         ]
         overflow_menu = Gtk.Menu()
         for label, handler in overflow_header_actions:
@@ -5275,7 +5306,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     def set_window_name(self, title: str) -> None:
         clean_title = title.strip() or "Window"
         self.window_title = clean_title
-        self.set_title(f"TermDeck · {clean_title}")
+        self.set_title(f"T1000 · {clean_title}")
         self.window_title_label.set_text(clean_title)
         self.app_context.store.rename_window(self.window_id, clean_title)
         for session_id, tab in self.tabs.items():
@@ -5286,7 +5317,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.show_toast(f"Window renamed to {clean_title}", kind="success")
 
     def rename_window(self) -> None:
-        title = self._prompt_window_name(title="Rename TermDeck window", initial=self.window_title)
+        title = self._prompt_window_name(title="Rename T1000 window", initial=self.window_title)
         if title is not None:
             self.set_window_name(title)
 
@@ -6083,7 +6114,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 combo.set_active_id("__none__")
                 combo.set_sensitive(False)
                 combo.set_tooltip_text(
-                    "Recreate this terminal under TermDeck before switching accounts; "
+                    "Recreate this terminal under T1000 before switching accounts; "
                     "a running external tmux environment cannot be retroactively isolated."
                 )
                 return
@@ -6130,7 +6161,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             elif not environment_ready and state.accounts:
                 tooltip = (
                     "Choose an account to upgrade this managed terminal to a private Codex environment. "
-                    "TermDeck will preserve an exact Codex resume or a verified idle shell."
+                    "T1000 will preserve an exact Codex resume or a verified idle shell."
                 )
             elif record.auth_restart_required and state.selected_account:
                 tooltip = (
@@ -6179,7 +6210,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             except Exception as exc:
                 # One malformed/stale callback must never drop the remaining
                 # recovery payloads (some may still own scope locks).
-                print(f"TermDeck: auth completion recovery failed: {exc}", file=sys.stderr)
+                print(f"T1000: auth completion recovery failed: {exc}", file=sys.stderr)
 
     def _finish_auth_switch_ui(self, session_id: str, *, protect_attach: bool = False) -> None:
         """Release one committed generation's guard and repair its attach/UI."""
@@ -6197,13 +6228,13 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         try:
             TermDeckWindow._resolve_auth_attach_gap(self, session_id)
         except Exception as exc:
-            print(f"TermDeck: could not resolve auth attach for {session_id}: {exc}", file=sys.stderr)
+            print(f"T1000: could not resolve auth attach for {session_id}: {exc}", file=sys.stderr)
         try:
             self._refresh_auth_selector()
         except Exception as exc:
             # Durable auth/process state is already committed at this point;
             # a later poll or tab switch can repaint the selector.
-            print(f"TermDeck: could not refresh auth selector for {session_id}: {exc}", file=sys.stderr)
+            print(f"T1000: could not refresh auth selector for {session_id}: {exc}", file=sys.stderr)
 
     def _refresh_auth_selector(self) -> bool:
         record = self.current_record()
@@ -6368,7 +6399,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 transaction_lock,
             )
             print(
-                f"TermDeck: {record.name} account completion remains protected and will "
+                f"T1000: {record.name} account completion remains protected and will "
                 f"retry on the auth poll: "
                 f"{scheduling_error}",
                 file=sys.stderr,
@@ -6456,7 +6487,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                     transaction_lock.__exit__(None, None, None)
                 except Exception as exc:
                     print(
-                        f"TermDeck: could not release auth transaction lock for {session_id}: {exc}",
+                        f"T1000: could not release auth transaction lock for {session_id}: {exc}",
                         file=sys.stderr,
                     )
 
@@ -6472,7 +6503,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                     # Status rendering must never prevent registration of the
                     # durable-state retry that owns this lock and guard.
                     print(
-                        f"TermDeck: could not show auth persistence retry status "
+                        f"T1000: could not show auth persistence retry status "
                         f"for {session_id}: {toast_exc}",
                         file=sys.stderr,
                     )
@@ -6513,7 +6544,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                         )
                     except Exception as toast_exc:
                         print(
-                            f"TermDeck: could not show auth poll recovery status "
+                            f"T1000: could not show auth poll recovery status "
                             f"for {session_id}: {toast_exc}",
                             file=sys.stderr,
                         )
@@ -7297,9 +7328,9 @@ def canonical_database_path(db_path: str | Path | None = None) -> Path:
 def _application_id_for_canonical_database(db_path: Path) -> str:
     default_path = DEFAULT_DB_PATH.expanduser().resolve(strict=False)
     if db_path == default_path:
-        return "dev.termdeck.TermDeck"
+        return "dev.t1000.T1000"
     digest = hashlib.sha256(os.fsencode(str(db_path))).hexdigest()[:32]
-    return f"dev.termdeck.TermDeck.db_{digest}"
+    return f"dev.t1000.T1000.db_{digest}"
 
 
 def application_id_for_database(db_path: str | Path | None = None) -> str:
@@ -7846,7 +7877,7 @@ class TermDeckApplication(Gtk.Application):
         ]
         if managed_count:
             details.append(
-                f"{managed_count} TermDeck-managed {managed_word} will be stopped."
+                f"{managed_count} T1000-managed {managed_word} will be stopped."
             )
         if external_count:
             details.append(
@@ -8066,7 +8097,7 @@ class TermDeckApplication(Gtk.Application):
         default_title = f"Window {len(self.windows) + 1}"
         dialog = WindowNameDialog(
             parent,
-            title="Create your first TermDeck window" if first_run else "New TermDeck window",
+            title="Create your first T1000 window" if first_run else "New T1000 window",
             initial=default_title,
             confirm_label="Create window",
             description=(
@@ -8204,7 +8235,7 @@ class TermDeckApplication(Gtk.Application):
         if busy_windows:
             for window in busy_windows:
                 window.show_toast(
-                    "TermDeck will stay open until the Codex account switch finishes",
+                    "T1000 will stay open until the Codex account switch finishes",
                     kind="warning",
                 )
             return False
@@ -8227,7 +8258,7 @@ class TermDeckApplication(Gtk.Application):
                 buttons=Gtk.ButtonsType.CLOSE,
                 text="tmux is required",
             )
-            dialog.format_secondary_text("Install tmux, then run TermDeck again. On Debian/Ubuntu: sudo apt install tmux")
+            dialog.format_secondary_text("Install tmux, then run T1000 again. On Debian/Ubuntu: sudo apt install tmux")
             dialog.run()
             dialog.destroy()
             return
@@ -8360,7 +8391,7 @@ class TermDeckApplication(Gtk.Application):
                         f"{title} ({window_id}): {error}"
                         for window_id, title, error in restore_errors
                     )
-                    show_error("Could not restore saved TermDeck windows", detail)
+                    show_error("Could not restore saved T1000 windows", detail)
                 return
             self.prompt_for_new_window(first_run=True)
             return
@@ -8369,7 +8400,7 @@ class TermDeckApplication(Gtk.Application):
             show_toast = getattr(self.windows[0], "show_toast", None)
             if callable(show_toast):
                 show_toast(
-                    f"Could not restore {len(restore_errors)} saved window(s); activate TermDeck to retry",
+                    f"Could not restore {len(restore_errors)} saved window(s); activate T1000 to retry",
                     kind="danger",
                 )
 

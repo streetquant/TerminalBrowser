@@ -20,7 +20,7 @@ class DesktopIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             paths = desktop_paths(tmp)
             self.assertEqual(paths.desktop_file, Path(tmp) / "applications" / f"{APP_ID}.desktop")
-            self.assertEqual(paths.icon_file, Path(tmp) / "icons" / "hicolor" / "scalable" / "apps" / "termdeck.svg")
+            self.assertEqual(paths.icon_file, Path(tmp) / "icons" / "hicolor" / "scalable" / "apps" / "t1000.svg")
 
     def test_resolve_command_prefers_explicit_override_and_adds_gui(self):
         self.assertEqual(resolve_launch_command("/opt/termdeck/bin/termdeck"), "/opt/termdeck/bin/termdeck gui")
@@ -31,22 +31,22 @@ class DesktopIntegrationTests(unittest.TestCase):
             self.assertEqual(resolve_launch_command(), "/usr/bin/python3 -m termdeck gui")
 
     def test_desktop_entry_contains_browser_like_metadata(self):
-        entry = build_desktop_entry("termdeck gui")
-        self.assertIn("Name=TermDeck", entry)
-        self.assertIn("Exec=termdeck gui", entry)
-        self.assertIn("Icon=termdeck", entry)
+        entry = build_desktop_entry("t1000 gui")
+        self.assertIn("Name=T1000", entry)
+        self.assertIn("Exec=t1000 gui", entry)
+        self.assertIn("Icon=t1000", entry)
         self.assertIn("Terminal=false", entry)
         self.assertIn("Categories=System;TerminalEmulator;Development;Utility;", entry)
         self.assertTrue(entry.endswith("\n"))
 
     def test_install_and_uninstall_write_expected_files(self):
         with tempfile.TemporaryDirectory() as tmp:
-            plan = build_install_plan(command="termdeck", data_home=tmp)
+            plan = build_install_plan(command="t1000", data_home=tmp)
             payload = install_desktop(plan)
             self.assertTrue(payload["ok"])
             self.assertTrue(plan.paths.desktop_file.exists())
             self.assertTrue(plan.paths.icon_file.exists())
-            self.assertIn("Exec=termdeck gui", plan.paths.desktop_file.read_text())
+            self.assertIn("Exec=t1000 gui", plan.paths.desktop_file.read_text())
             self.assertIn("<svg", plan.paths.icon_file.read_text())
             removed = uninstall_desktop(data_home=tmp)
             self.assertEqual(set(removed["removed"]), {str(plan.paths.desktop_file), str(plan.paths.icon_file)})
@@ -55,7 +55,7 @@ class DesktopIntegrationTests(unittest.TestCase):
 
     def test_dry_run_does_not_write(self):
         with tempfile.TemporaryDirectory() as tmp:
-            plan = build_install_plan(command="termdeck", data_home=tmp)
+            plan = build_install_plan(command="t1000", data_home=tmp)
             payload = install_desktop(plan, dry_run=True)
             self.assertTrue(payload["dry_run"])
             self.assertFalse(plan.paths.desktop_file.exists())
