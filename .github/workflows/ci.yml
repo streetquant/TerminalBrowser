@@ -45,7 +45,7 @@ jobs:
         run: |
           python3 -m venv --system-site-packages .venv-gtk
           .venv-gtk/bin/python -m pip install --upgrade pip
-          .venv-gtk/bin/python -m pip install pytest -e .
+          .venv-gtk/bin/python -m pip install pytest pytest-subtests -e .
       - name: Full test suite
         env:
           NO_AT_BRIDGE: '1'
@@ -143,3 +143,23 @@ jobs:
           path: termdeck-ui-smoke-*.png
           if-no-files-found: error
           retention-days: 7
+
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install TermDeck
+        run: pip install -e .
+      - name: Run headless perf probes
+        run: python scripts/perf_probe.py --json-out termdeck-perf-probe.json
+      - name: Upload perf probe results
+        uses: actions/upload-artifact@v4
+        with:
+          name: termdeck-perf-probe
+          path: termdeck-perf-probe.json
+          if-no-files-found: error
+          retention-days: 30
