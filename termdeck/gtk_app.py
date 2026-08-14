@@ -55,6 +55,7 @@ from .session_store import DEFAULT_DB_PATH, SessionStore, short_id, utc_now
 from .settings import AppSettings, SettingsError, save_terminal_options
 from .shortcuts import build_shortcut_map, index_from_key_name, shortcut_entries
 from .task_snapshot import build_task_snapshot
+from .tmux_control import ControlEvent, ControlModeClient
 from .command_render import default_shell, directory_tab_name, normalise_directory, render_command
 from .window_snapshot import build_window_snapshots
 from .terminator_config import load_terminator_theme
@@ -7338,6 +7339,11 @@ class TermDeckApplication(Gtk.Application):
         # overview, tab manager) reuse one tmux/proc sampling pass per tick
         # instead of each running their own identical pass.
         self._task_snapshot_cache = None
+        # Event-driven refresh: one persistent tmux control-mode client turns
+        # session lifecycle changes into a coalesced refresh well before the
+        # next polling tick; the periodic timers stay on as the reconcile net.
+        self._tmux_events_client: ControlModeClient | None = None
+        self._tmux_event_refresh_source: int | None = None
 
     def do_startup(self) -> None:
         Gtk.Application.do_startup(self)
@@ -7359,6 +7365,8 @@ class TermDeckApplication(Gtk.Application):
             self._frame_budget_monitor = FrameBudgetMonitor()
             install_glib_probe(self._frame_budget_monitor)
             GLib.timeout_add_seconds(10, self._log_frame_budget_report)
+        if os.environ.get("T1000_DISABLE_TMUX_EVENTS") != "1":
+            self._start_tmux_event_watcher()
 
     def _log_frame_budget_report(self) -> bool:
         """Emit one-line stall summaries so field reports are copy-pasteable."""
@@ -7373,6 +7381,91 @@ class TermDeckApplication(Gtk.Application):
             file=sys.stderr,
         )
         return True
+
+    # Notification kinds that change what the task tables and panes display.
+    # High-frequency stream kinds (output, pane-offset, focus, resize) are
+    # excluded on purpose; "unknown" is a forward-compatible catch-all and is
+    # safe because refreshes are coalesced.
+    _EVENT_REFRESH_KINDS = frozenset(
+        {
+            "client-detached",
+            "client-session-changed",
+            "exit",
+            "layout-change",
+            "pane-add",
+            "pane-exited",
+            "session-changed",
+            "sessions-changed",
+            "unknown",
+            "unlinked-window-add",
+            "unlinked-window-close",
+            "unlinked-window-renamed",
+            "window-add",
+            "window-close",
+            "window-pane-changed",
+            "window-renamed",
+        }
+    )
+
+    def _start_tmux_event_watcher(self) -> None:
+        """Start push-based refresh from tmux control-mode notifications.
+
+        The polling timers remain as the reconcile fallback; this only makes
+        session create/close/rename visible immediately.  ``attach-session``
+        without a target never creates sessions, so the watcher is free of
+        side effects: while no tmux session exists the client retries with a
+        capped backoff until one appears, then stays attached.
+        """
+
+        if self._tmux_events_client is not None or not self.backend.available:
+            return
+        executable = self.backend.executable
+
+        def spawn_transport() -> "subprocess.Popen[bytes]":
+            return subprocess.Popen(
+                [executable, "-C", "attach-session"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+
+        self._tmux_events_client = ControlModeClient(
+            spawn_transport=spawn_transport,
+            on_event=self._on_tmux_control_event,
+            reconnect_initial_seconds=1.0,
+            reconnect_max_seconds=10.0,
+        )
+        self._tmux_events_client.start()
+
+    def _on_tmux_control_event(self, event: ControlEvent) -> None:
+        """Reader-thread callback: only schedule main-loop work, never touch GTK."""
+
+        if event.kind not in self._EVENT_REFRESH_KINDS:
+            return
+        GLib.idle_add(self._queue_event_refresh)
+
+    def _queue_event_refresh(self) -> bool:
+        """Coalesce notification bursts (one spawn emits several) into one refresh."""
+
+        if self._tmux_event_refresh_source is None:
+            self._tmux_event_refresh_source = GLib.timeout_add(
+                150, self._run_event_refresh
+            )
+        return False
+
+    def _run_event_refresh(self) -> bool:
+        self._tmux_event_refresh_source = None
+        # The world changed outside this app: drop the snapshot memo so the
+        # refresh below (and any imminent timer tick) samples fresh state.
+        self._task_snapshot_cache = None
+        for toplevel in self.get_windows():
+            if isinstance(toplevel, (WindowOverview, MasterWindow)) and toplevel.get_visible():
+                toplevel.refresh(force=True)
+        for window in self.windows:
+            side = getattr(window, "side", None)
+            if side is not None:
+                side.refresh()
+        return False
 
     def persist_for_shutdown(self) -> PersistenceResult | None:
         """Persist exact recoverable state once before the application exits."""
@@ -7428,6 +7521,15 @@ class TermDeckApplication(Gtk.Application):
         return records, items
 
     def do_shutdown(self) -> None:
+        client = self._tmux_events_client
+        if client is not None:
+            # Stop the reader before persistence so a wedged transport cannot
+            # interleave callbacks with teardown; stop() joins with a bound.
+            self._tmux_events_client = None
+            client.stop()
+        if self._tmux_event_refresh_source is not None:
+            GLib.source_remove(self._tmux_event_refresh_source)
+            self._tmux_event_refresh_source = None
         try:
             self.persist_for_shutdown()
         except Exception:

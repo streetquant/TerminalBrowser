@@ -61,6 +61,23 @@ class UiSmoothnessSourceTest(unittest.TestCase):
         self.assertNotIn("self.store.clear()", master)
         self.assertNotIn("self.history_store.clear()", master)
 
+    def test_tmux_events_drive_coalesced_refresh(self) -> None:
+        # Phase 1 of the SOTA plan: a persistent control-mode client turns
+        # tmux lifecycle notifications into one coalesced refresh instead of
+        # waiting for the next polling tick.  The reader-thread callback must
+        # marshal via idle_add, bursts must coalesce through a single timeout
+        # source, and shutdown must stop the client.
+        self.assertIn("from .tmux_control import ControlEvent, ControlModeClient", self.source)
+        self.assertIn("def _start_tmux_event_watcher(self) -> None:", self.source)
+        self.assertIn("GLib.idle_add(self._queue_event_refresh)", self.source)
+        self.assertIn("if self._tmux_event_refresh_source is None:", self.source)
+        self.assertIn("self._task_snapshot_cache = None\n        for toplevel in self.get_windows():", self.source)
+        shutdown = self.source.split("def do_shutdown", 1)[1].split("def rebuild_theme", 1)[0]
+        self.assertIn("client.stop()", shutdown)
+        # The watcher must never create tmux sessions on the user's server.
+        self.assertIn('[executable, "-C", "attach-session"]', self.source)
+        self.assertNotIn('"-C", "new-session"', self.source)
+
     def test_rename_stacks_crossfade(self) -> None:
         self.assertNotIn("Gtk.StackTransitionType.NONE", self.source)
         self.assertEqual(self.source.count("Gtk.StackTransitionType.CROSSFADE"), 2)
