@@ -48,6 +48,19 @@ class UiSmoothnessSourceTest(unittest.TestCase):
         self.assertIn("selected_titles", overview)
         self.assertIn("selection.select_iter(row_iter)", overview)
 
+    def test_periodic_tables_diff_rows_in_place(self) -> None:
+        # clear()+re-append blanks tables for a frame and drops scroll state;
+        # the keyed reconciler must stay the only periodic refresh path for
+        # the overview and tab manager stores (Phase 3 of the SOTA plan).
+        self.assertIn("def _reconcile_list_store(", self.source)
+        self.assertIn("_reconcile_list_store(self.store, desired_rows)", self.source)
+        self.assertIn("_reconcile_list_store(model, desired_rows)", self.source)
+        overview = self.source.split("class WindowOverview", 1)[1].split("class ShortcutWindow", 1)[0]
+        self.assertNotIn("self.store.clear()", overview)
+        master = self.source.split("class MasterWindow", 1)[1].split("class TermDeckWindow", 1)[0]
+        self.assertNotIn("self.store.clear()", master)
+        self.assertNotIn("self.history_store.clear()", master)
+
     def test_rename_stacks_crossfade(self) -> None:
         self.assertNotIn("Gtk.StackTransitionType.NONE", self.source)
         self.assertEqual(self.source.count("Gtk.StackTransitionType.CROSSFADE"), 2)

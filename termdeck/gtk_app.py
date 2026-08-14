@@ -2125,6 +2125,80 @@ def _refresh_paused(widget: Gtk.Widget) -> bool:
     return bool(getattr(toplevel, "_termdeck_iconified", False))
 
 
+def _store_sort_active(store) -> bool:
+    """Report whether a user-clicked column sort controls the store's order.
+
+    When GTK sorting is active the model reorders rows itself, so positional
+    reconciliation must defer to it instead of fighting for row order.
+    """
+
+    getter = getattr(store, "get_sort_column_id", None)
+    if not callable(getter):
+        return False
+    try:
+        result = getter()
+    except Exception:
+        return False
+    if isinstance(result, tuple) and result:
+        return bool(result[0])
+    return False
+
+
+def _reconcile_list_store(store, desired_rows, *, key_column: int = 0) -> bool:
+    """Diff ``desired_rows`` into ``store`` in place, keyed by ``key_column``.
+
+    clear()+re-append blanks the tree for a frame, drops the scroll position
+    and forces selection restoration on every periodic tick.  Updating only
+    the cells that actually changed keeps the widget visually still.  Returns
+    True when a full rebuild was unavoidable (duplicate keys or a relative
+    reorder) so callers can restore selection state by key.
+    """
+
+    desired_keys = [row[key_column] for row in desired_rows]
+    diffable = len(set(desired_keys)) == len(desired_keys)
+    existing_iters = {}
+    existing_order = []
+    if diffable:
+        tree_iter = store.get_iter_first()
+        while tree_iter is not None:
+            key = store.get_value(tree_iter, key_column)
+            if key in existing_iters:
+                diffable = False
+                break
+            existing_iters[key] = tree_iter
+            existing_order.append(key)
+            tree_iter = store.iter_next(tree_iter)
+    sort_active = _store_sort_active(store)
+    if diffable and not sort_active:
+        desired_set = set(desired_keys)
+        survivors = [key for key in existing_order if key in desired_set]
+        if survivors != [key for key in desired_keys if key in existing_iters]:
+            # Relative order changed underneath us; a rebuild is cheaper and
+            # safer than computing a minimal move sequence for a rare event.
+            diffable = False
+    if not diffable:
+        store.clear()
+        for row in desired_rows:
+            store.append(list(row))
+        return True
+    desired_set = set(desired_keys)
+    for key in existing_order:
+        if key not in desired_set:
+            store.remove(existing_iters.pop(key))
+    for position, row in enumerate(desired_rows):
+        tree_iter = existing_iters.get(row[key_column])
+        if tree_iter is None:
+            if sort_active:
+                store.append(list(row))
+            else:
+                store.insert(position, list(row))
+            continue
+        for column, value in enumerate(row):
+            if store.get_value(tree_iter, column) != value:
+                store.set_value(tree_iter, column, value)
+    return False
+
+
 class WindowOverview(Gtk.Window):
     """Browser-style overview of TermDeck windows and their aggregate load."""
 
@@ -2192,18 +2266,18 @@ class WindowOverview(Gtk.Window):
         return True
 
     def refresh(self, *_args, force: bool = False) -> None:
-        # Keep the user's row selection across periodic rebuilds so the table
-        # never visibly "loses" focus mid-review.
+        # Diff rows in place instead of clear()+rebuild so the table never
+        # blinks, keeps its scroll position, and keeps the user's selection
+        # across periodic refreshes.
         selection = self.tree.get_selection()
         _model, selected_paths = selection.get_selected_rows()
         selected_titles = {
             self.store.get_value(self.store.get_iter(path), 0)
             for path in selected_paths
         }
-        self.store.clear()
         _records, items = self.app_context.shared_task_snapshot(force=force)
-        for row in build_window_snapshots(items):
-            row_iter = self.store.append([
+        desired_rows = [
+            [
                 row.title,
                 str(row.tab_count),
                 str(row.visible_count),
@@ -2215,9 +2289,17 @@ class WindowOverview(Gtk.Window):
                 str(row.process_count),
                 row.runtime,
                 row.top_health,
-            ])
-            if row.title in selected_titles:
-                selection.select_iter(row_iter)
+            ]
+            for row in build_window_snapshots(items)
+        ]
+        if _reconcile_list_store(self.store, desired_rows):
+            # Rare full rebuild (duplicate titles or reorder): restore the
+            # user's selection by key so focus is never visibly lost.
+            row_iter = self.store.get_iter_first()
+            while row_iter is not None:
+                if self.store.get_value(row_iter, 0) in selected_titles:
+                    selection.select_iter(row_iter)
+                row_iter = self.store.iter_next(row_iter)
 
 
 class ShortcutWindow(Gtk.Window):
@@ -3967,8 +4049,6 @@ class MasterWindow(Gtk.Window):
     def refresh(self, *_args, force: bool = False) -> None:
         selected_tabs = set(self._selected_ids_for_tree(self.tree))
         selected_history = set(self._selected_ids_for_tree(self.history_tree))
-        self.store.clear()
-        self.history_store.clear()
         records, items = self.app_context.shared_task_snapshot(force=force)
         matching = filter_rows([item.row for item in items], self.filter_entry.get_text())
         tab_rows, history_rows = _partition_master_rows(records, matching)
@@ -3985,12 +4065,18 @@ class MasterWindow(Gtk.Window):
             (self.store, self.tree, tab_rows, selected_tabs),
             (self.history_store, self.history_tree, history_rows, selected_history),
         ):
+            desired_rows = []
             for row in rows[:MASTER_ROW_LIMIT]:
                 values = row.as_list()
-                iter_ = model.append(values[:3] + values[4:])
-                if row.session_id in selected:
-                    path = model.get_path(iter_)
-                    tree.get_selection().select_path(path)
+                desired_rows.append(values[:3] + values[4:])
+            if _reconcile_list_store(model, desired_rows) and selected:
+                # Rare full rebuild: restore selection by session id (col 0)
+                # so multi-select control workflows survive the refresh.
+                row_iter = model.get_iter_first()
+                while row_iter is not None:
+                    if model.get_value(row_iter, 0) in selected:
+                        tree.get_selection().select_path(model.get_path(row_iter))
+                    row_iter = model.iter_next(row_iter)
         self.update_capture_preview()
         self.update_remove_sensitivity()
 
