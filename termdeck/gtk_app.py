@@ -39,6 +39,7 @@ from .codex_archive import LegacyRecoveryResult, repair_legacy_recovery
 from .codex_auth import CodexAuthError, CodexAuthManager, CodexAuthState, CodexSwitchResult
 from .command_palette import PaletteItem, build_palette_items, search_palette
 from .control_plan import ControlPlan, build_control_plan, render_control_plan_text
+from .frame_budget import FrameBudgetMonitor, hud_enabled, install_glib_probe
 from .health import HealthPolicy, classify_session, health_badge, should_pause_for_attention
 from .history_control import ScrollDisposition, ScrollOutcome, unhandled_scroll
 from .liveness import merge_confirmed_pane_snapshot
@@ -7263,6 +7264,29 @@ class TermDeckApplication(Gtk.Application):
                 ui_font=self.settings.ui_font,
                 ui_font_scale=self.settings.ui_font_scale,
             )
+        self._frame_budget_monitor = None
+        if hud_enabled():
+            # Opt-in (T1000_PERF_HUD=1) stall evidence: a lightweight GLib tick
+            # probe plus a periodic one-line report keeps UI jank measurable in
+            # the field before and after each optimisation, at zero cost when
+            # the HUD is off.
+            self._frame_budget_monitor = FrameBudgetMonitor()
+            install_glib_probe(self._frame_budget_monitor)
+            GLib.timeout_add_seconds(10, self._log_frame_budget_report)
+
+    def _log_frame_budget_report(self) -> bool:
+        """Emit one-line stall summaries so field reports are copy-pasteable."""
+
+        monitor = self._frame_budget_monitor
+        if monitor is None:
+            return False
+        report = monitor.report()
+        print(
+            f"[frame-budget] ticks={report.ticks} stalls={report.stalls} "
+            f"p95={report.p95_ms:.2f}ms worst={report.worst_ms:.2f}ms",
+            file=sys.stderr,
+        )
+        return True
 
     def persist_for_shutdown(self) -> PersistenceResult | None:
         """Persist exact recoverable state once before the application exits."""
