@@ -1,8 +1,33 @@
 # TermDeck UI/UX SOTA Plan
 
-Status: proposed · Scope: UI smoothness, latency, and visual polish · Basis: code audit of
+Status: implemented (Phases 0–5, 7) · Scope: UI smoothness, latency, and visual polish · Basis: code audit of
 `termdeck/gtk_app.py` (8,400 lines), `tmux_backend.py`, `history_control.py`, `chrome_css.py`,
 `ui_theme.py`, `resources.py`, `settings.py`, and the smoke/regression test suite.
+
+## 0. Implementation status (updated 2026-08-15)
+
+| Phase | Status | Landed as |
+|---|---|---|
+| 0 — Instrumentation | Done | Frame-budget monitor, `scripts/perf_probe.py`, baseline at `docs/perf-baselines/2026-08-15-headless-max.json` |
+| 1 — Event-driven control plane | Done | tmux control-mode client (`%output`/layout events) drives refresh instead of timer polling |
+| 2 — Scrollback history mirror | Done (dark launch) | Mirror infrastructure landed behind existing scroll ownership; per-tick round trips removed from the hot path |
+| 3 — Incremental UI updates | Done | Keyed-diff row refresh; no rebuild-the-world, selection/scroll preserved |
+| 4 — Perceived performance polish | Done | `reduce_motion` setting honored by all chrome animations; toast revealer polish |
+| 5 — Visual design system | Done | Design tokens, light chrome theme, enforced WCAG contrast (4.5:1 text, 3:1 UI) with regression tests |
+| 6 — GTK4 + libadwaita migration | Deferred (see below) | Readiness check done; blocked on missing GTK4 VTE bindings on the target host |
+| 7 — Hold the line | Done | CI perf-probe job + AST guards banning blocking calls on the GTK main thread |
+
+### Phase 6 readiness check and deferral rationale (2026-08-15)
+
+Probed on the production host (Arch Linux): GTK 4.22.4 and its GI bindings are available
+(`gi.require_version("Gtk", "4.0")` succeeds), but the GTK4 build of VTE is not — `vte4` is not
+installed and `gi.require_version("Vte", "3.91")` fails; only `vte3` (Vte 2.91, GTK3) is present.
+TermDeck is a VTE-embedding terminal app, so a GTK4 port cannot even be smoke-tested on the target
+machine until `vte4` is installed, and a responsible migration additionally needs side-by-side
+display parity testing (rendering, scroll latency, IME, clipboard) that must not be rushed. With
+Phases 1–4 landed, the polling and rebuild costs that GTK4 would have masked are already gone, so
+the migration is deferred as a deliberate follow-up, not dropped: install `vte4`, port behind the
+widget facade, and validate against the Phase 0 probes before switching defaults.
 
 ## 1. Executive summary
 
