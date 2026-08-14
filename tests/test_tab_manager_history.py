@@ -84,6 +84,8 @@ class TabManagerHistoryTest(TestCase):
             windows=[],
         )
         items = [SimpleNamespace(row=row(record)) for record in records]
+        # MasterWindow consumes the application-level shared snapshot memo.
+        context.shared_task_snapshot = lambda *, force=False: (records, items)
         with mock.patch("termdeck.gtk_app.build_task_snapshot", return_value=items), mock.patch(
             "termdeck.gtk_app.GLib.timeout_add_seconds", return_value=1
         ):

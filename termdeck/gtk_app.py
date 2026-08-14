@@ -2095,6 +2095,35 @@ class AttachTerminal(Gtk.Box):
 
 
 
+def _refresh_paused(widget: Gtk.Widget) -> bool:
+    """True when the widget's toplevel window is minimized.
+
+    Periodic refresh timers skip tmux/proc snapshot work for minimized
+    windows; iconified-state tracking is wired lazily on first use so every
+    caller stays a single line and unmapped/hidden gating stays unchanged.
+    """
+
+    toplevel = widget.get_toplevel()
+    if not isinstance(toplevel, Gtk.Window):
+        return False
+    if not getattr(toplevel, "_termdeck_pause_wired", False):
+        toplevel._termdeck_pause_wired = True
+        toplevel._termdeck_iconified = False
+
+        def _on_window_state(window, event) -> bool:
+            window._termdeck_iconified = bool(
+                getattr(event, "new_window_state", 0) & Gdk.WindowState.ICONIFIED
+            )
+            return False
+
+        try:
+            toplevel.connect("window-state-event", _on_window_state)
+        except Exception:
+            # Tracking is a best-effort optimisation; never break refresh.
+            return False
+    return bool(getattr(toplevel, "_termdeck_iconified", False))
+
+
 class WindowOverview(Gtk.Window):
     """Browser-style overview of TermDeck windows and their aggregate load."""
 
@@ -2138,7 +2167,7 @@ class WindowOverview(Gtk.Window):
         label.set_xalign(0)
         top.pack_start(label, True, True, 0)
         refresh = Gtk.Button(label="Refresh")
-        refresh.connect("clicked", lambda *_: self.refresh())
+        refresh.connect("clicked", lambda *_: self.refresh(force=True))
         top.pack_start(refresh, False, False, 0)
         close = Gtk.Button(label="Close")
         close.connect("clicked", lambda *_: self.destroy())
@@ -2155,22 +2184,25 @@ class WindowOverview(Gtk.Window):
     def _refresh_timer(self) -> bool:
         if not getattr(self, "_refresh_alive", False):
             return False
+        if _refresh_paused(self):
+            return True
         if self.get_visible():
             self.refresh()
         return True
 
-    def refresh(self, *_args) -> None:
+    def refresh(self, *_args, force: bool = False) -> None:
+        # Keep the user's row selection across periodic rebuilds so the table
+        # never visibly "loses" focus mid-review.
+        selection = self.tree.get_selection()
+        _model, selected_paths = selection.get_selected_rows()
+        selected_titles = {
+            self.store.get_value(self.store.get_iter(path), 0)
+            for path in selected_paths
+        }
         self.store.clear()
-        records = self.app_context.store.list()
-        items = build_task_snapshot(
-            records,
-            backend=self.app_context.backend,
-            sampler=self.app_context.sampler,
-            policy=self.app_context.budget,
-            snapshot_refresh_limit=UI_RESOURCE_REFRESH_BUDGET,
-        )
+        _records, items = self.app_context.shared_task_snapshot(force=force)
         for row in build_window_snapshots(items):
-            self.store.append([
+            row_iter = self.store.append([
                 row.title,
                 str(row.tab_count),
                 str(row.visible_count),
@@ -2183,6 +2215,8 @@ class WindowOverview(Gtk.Window):
                 row.runtime,
                 row.top_health,
             ])
+            if row.title in selected_titles:
+                selection.select_iter(row_iter)
 
 
 class ShortcutWindow(Gtk.Window):
@@ -3012,6 +3046,8 @@ class SidePane(Gtk.Box):
     def _refresh_timer(self) -> bool:
         if not getattr(self, "_refresh_alive", False):
             return False
+        if _refresh_paused(self):
+            return True
         if self.get_mapped() and self.get_visible():
             self.refresh()
         return True
@@ -3808,7 +3844,7 @@ class MasterWindow(Gtk.Window):
             ("Kill", self.kill_selected),
             ("Archive", self.archive_selected),
             ("Pause Hot", self.pause_hot),
-            ("Refresh", self.refresh),
+            ("Refresh", lambda *_: self.refresh(force=True)),
         ]:
             button = Gtk.Button(label=label)
             button.connect("clicked", lambda _b, h=handler: h())
@@ -3824,6 +3860,8 @@ class MasterWindow(Gtk.Window):
     def _refresh_timer(self) -> bool:
         if not getattr(self, "_refresh_alive", False):
             return False
+        if _refresh_paused(self):
+            return True
         if self.get_visible():
             self.refresh()
         return True
@@ -3925,19 +3963,12 @@ class MasterWindow(Gtk.Window):
         self._show_row_context_menu(record, event)
         return True
 
-    def refresh(self, *_args) -> None:
+    def refresh(self, *_args, force: bool = False) -> None:
         selected_tabs = set(self._selected_ids_for_tree(self.tree))
         selected_history = set(self._selected_ids_for_tree(self.history_tree))
         self.store.clear()
         self.history_store.clear()
-        records = self.app_context.store.list()
-        items = build_task_snapshot(
-            records,
-            backend=self.app_context.backend,
-            sampler=self.app_context.sampler,
-            policy=self.app_context.budget,
-            snapshot_refresh_limit=UI_RESOURCE_REFRESH_BUDGET,
-        )
+        records, items = self.app_context.shared_task_snapshot(force=force)
         matching = filter_rows([item.row for item in items], self.filter_entry.get_text())
         tab_rows, history_rows = _partition_master_rows(records, matching)
         showing_history = self.view_notebook.get_current_page() == 1
@@ -4297,7 +4328,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         _style(title_entry, "td-title-entry")
         self._window_title_entry = title_entry
         title_stack = Gtk.Stack()
-        title_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        # Crossfade between the title label and its inline rename entry; GTK
+        # globally disables this when gtk-enable-animations is off.
+        title_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        title_stack.set_transition_duration(120)
         title_stack.add_named(title, "label")
         title_stack.add_named(title_entry, "entry")
         title_stack.set_visible_child(title)
@@ -4699,7 +4733,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         name_entry.set_max_width_chars(20)
         _style(name_entry, "td-tab-name-entry")
         name_stack = Gtk.Stack()
-        name_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        # Match the window-title rename crossfade for tab renames.
+        name_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        name_stack.set_transition_duration(120)
         name_stack.add_named(name, "label")
         name_stack.add_named(name_entry, "entry")
         name_stack.set_visible_child(name)
@@ -7211,6 +7247,10 @@ class TermDeckApplication(Gtk.Application):
         self._last_persistence_result: PersistenceResult | None = None
         self._legacy_recovery_checked = False
         self._last_legacy_recovery_result: LegacyRecoveryResult | None = None
+        # Shared snapshot memo: multiple periodic table refreshers (window
+        # overview, tab manager) reuse one tmux/proc sampling pass per tick
+        # instead of each running their own identical pass.
+        self._task_snapshot_cache = None
 
     def do_startup(self) -> None:
         Gtk.Application.do_startup(self)
@@ -7232,6 +7272,50 @@ class TermDeckApplication(Gtk.Application):
         self._shutdown_persistence_started = True
         self._last_persistence_result = persist_live_sessions(self.store, self.backend)
         return self._last_persistence_result
+
+    def shared_task_snapshot(self, *, force: bool = False):
+        """Return (records, task snapshot items), memoized briefly.
+
+        The window overview and the tab manager historically each ran their
+        own tmux list/capture and /proc sampling pass on every refresh tick
+        even though they request identical data.  One short-lived memo keeps
+        a single sampling pass per tick without changing what any consumer
+        renders: the memo key covers record identity and state, so any store
+        change (open/close/rename/visibility) invalidates it immediately,
+        and ``force=True`` (manual Refresh buttons) always rebuilds.
+        """
+
+        records = self.store.list()
+        key = tuple(
+            (
+                record.id,
+                getattr(record, "status", None),
+                getattr(record, "last_pid", None),
+                getattr(record, "name", None),
+                getattr(record, "window_id", None),
+                getattr(record, "visible", None),
+            )
+            for record in records
+        )
+        now = time.monotonic()
+        ttl = min(2.0, max(0.5, float(self.settings.ui_refresh_interval_seconds) / 2.0))
+        cached = self._task_snapshot_cache
+        if (
+            not force
+            and cached is not None
+            and cached[0] == key
+            and (now - cached[1]) < ttl
+        ):
+            return records, cached[2]
+        items = build_task_snapshot(
+            records,
+            backend=self.backend,
+            sampler=self.sampler,
+            policy=self.budget,
+            snapshot_refresh_limit=UI_RESOURCE_REFRESH_BUDGET,
+        )
+        self._task_snapshot_cache = (key, now, items)
+        return records, items
 
     def do_shutdown(self) -> None:
         try:
