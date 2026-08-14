@@ -5,16 +5,33 @@ import json
 import pathlib
 import unittest
 
-from termdeck.cli import _select_records, build_parser, cmd_activity, cmd_archive, cmd_auth, cmd_budget_plan, cmd_capture, cmd_checkpoint, cmd_control_plan, cmd_diagnostics, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_reconcile, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_sessions, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
+from termdeck.cli import _persist_auth_update_with_retry, _select_records, build_parser, cmd_activity, cmd_archive, cmd_auth, cmd_auth_gc, cmd_budget_plan, cmd_capture, cmd_checkpoint, cmd_control_plan, cmd_diagnose_freeze, cmd_diagnostics, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_reconcile, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_sessions, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
 
 
 class CliTests(unittest.TestCase):
+    def test_auth_store_retry_keeps_retrying_until_commit(self):
+        import sqlite3
+        from unittest import mock
+
+        saved = object()
+        store = mock.Mock()
+        store.update.side_effect = [sqlite3.OperationalError("busy"), saved]
+        with mock.patch("termdeck.cli.time.sleep") as sleep, contextlib.redirect_stderr(
+            io.StringIO()
+        ) as errors:
+            result = _persist_auth_update_with_retry(store, "session", {"selected_account": "work"})
+
+        self.assertIs(result, saved)
+        self.assertEqual(store.update.call_count, 2)
+        sleep.assert_called_once_with(0.05)
+        self.assertIn("remains protected", errors.getvalue())
+
     def test_parser_has_single_subcommand_registry_without_templates(self):
         parser = build_parser()
         subparsers = [action for action in parser._actions if isinstance(action, argparse._SubParsersAction)]
         self.assertEqual(len(subparsers), 1)
         choices = sorted(subparsers[0].choices)
-        self.assertEqual(choices, ['activity', 'adopt-tmux', 'archive', 'auth', 'budget-plan', 'capture', 'checkpoint', 'control-plan', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-checkpoint-service', 'install-desktop', 'kill', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'quickstart', 'recently-closed', 'reconcile', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'terminator-workspace', 'uninstall-checkpoint-service', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
+        self.assertEqual(choices, ['activity', 'adopt-tmux', 'archive', 'auth', 'auth-gc', 'budget-plan', 'capture', 'checkpoint', 'control-plan', 'diagnose-freeze', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-checkpoint-service', 'install-desktop', 'kill', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'quickstart', 'recently-closed', 'reconcile', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'terminator-workspace', 'uninstall-checkpoint-service', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
 
 
     def test_shortcuts_command_outputs_json_with_terminator_override(self):
@@ -186,7 +203,10 @@ class CliTests(unittest.TestCase):
             manager.state.return_value = state
             args = argparse.Namespace(db=db_path, selector=record.id, switch_account=None)
             buffer = io.StringIO()
-            with mock.patch("termdeck.cli.CodexAuthManager", return_value=manager), contextlib.redirect_stdout(buffer):
+            with mock.patch.dict(
+                "os.environ",
+                {"TERMDECK_CODEX_ACCOUNT_SOURCE": str(pathlib.Path(tmp) / "empty-source")},
+            ), mock.patch("termdeck.cli.CodexAuthManager", return_value=manager), contextlib.redirect_stdout(buffer):
                 code = cmd_auth(args)
 
             self.assertEqual(code, 0)
@@ -201,12 +221,39 @@ class CliTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_auth_switch_activates_selected_account_in_live_tab(self):
+    def test_auth_switch_selects_account_for_unselected_new_tab_in_safe_order(self):
         import tempfile
         from unittest import mock
         from termdeck.codex_auth import CodexAccount, CodexAuthState, CodexSwitchResult
         from termdeck.session_store import SessionStore
-        from termdeck.tmux_backend import AuthActivationResult
+        from termdeck.tmux_backend import (
+            AuthActivationPlan,
+            AuthActivationResult,
+            AuthQuiesceResult,
+        )
+
+        calls = []
+
+        class TransactionBackend:
+            def plan_auth_change(self, record):
+                calls.append("plan")
+                return AuthActivationPlan(True, live=True, restart=True, detail="ready")
+
+            def quiesce_auth_change(self, record, plan):
+                calls.append("quiesce")
+                return AuthQuiesceResult(True, live=True, terminated=True)
+
+            def apply_auth_change(self, record, plan, quiescence):
+                calls.append("apply")
+                return AuthActivationResult(
+                    True,
+                    True,
+                    recovery_command=recovery,
+                    recovery_cwd=tmp,
+                    pid=4242,
+                    status="running",
+                    detail="Codex restarted in this tab with the selected account",
+                )
 
         with tempfile.TemporaryDirectory() as tmp:
             db_path = pathlib.Path(tmp) / "sessions.sqlite3"
@@ -216,7 +263,15 @@ class CliTests(unittest.TestCase):
                 record = store.update(record.id, status="running")
             finally:
                 store.close()
-            state = CodexAuthState(
+            previous = CodexAuthState(
+                codex_home=record.codex_home,
+                accounts=(CodexAccount("work", alias="work", active=False),),
+                selected_account=None,
+                selected_account_key=None,
+                fingerprint="unselected",
+                codex_auth_available=True,
+            )
+            selected = CodexAuthState(
                 codex_home=record.codex_home,
                 accounts=(CodexAccount("work", alias="work", active=True),),
                 selected_account="work",
@@ -225,33 +280,39 @@ class CliTests(unittest.TestCase):
                 codex_auth_available=True,
             )
             manager = mock.Mock()
-            manager.switch.return_value = CodexSwitchResult(True, state)
-            backend = mock.Mock()
             recovery = "codex --yolo resume 019f71b3-fa32-7251-bac3-c628f34dd154"
-            backend.activate_auth_change.return_value = AuthActivationResult(
-                True,
-                True,
-                recovery_command=recovery,
-                recovery_cwd=tmp,
-                pid=4242,
-                status="running",
-                detail="Codex restarted in this tab with the selected account",
-            )
+
+            def current_state(_record):
+                calls.append("state")
+                return previous
+
+            def switch(_record, account_key):
+                calls.append(("switch", account_key))
+                return CodexSwitchResult(True, selected)
+
+            manager.state.side_effect = current_state
+            manager.switch.side_effect = switch
             args = argparse.Namespace(db=db_path, selector=record.id, switch_account="work")
             buffer = io.StringIO()
-            with mock.patch("termdeck.cli.CodexAuthManager", return_value=manager), mock.patch(
-                "termdeck.cli.TmuxBackend", return_value=backend
+            with mock.patch.dict(
+                "os.environ",
+                {"TERMDECK_CODEX_ACCOUNT_SOURCE": str(pathlib.Path(tmp) / "empty-source")},
+            ), mock.patch("termdeck.cli.CodexAuthManager", return_value=manager), mock.patch(
+                "termdeck.cli.TmuxBackend", return_value=TransactionBackend()
             ), contextlib.redirect_stdout(buffer):
                 code = cmd_auth(args)
 
             self.assertEqual(code, 0)
+            self.assertEqual(
+                calls,
+                ["state", "plan", "quiesce", ("switch", "work"), "apply"],
+            )
             payload = json.loads(buffer.getvalue())
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["selected_account"], "work")
             self.assertTrue(payload["auth_activation_ok"])
             self.assertTrue(payload["auth_activation_restarted"])
             self.assertFalse(payload["auth_restart_required"])
-            backend.activate_auth_change.assert_called_once()
             store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
             try:
                 saved = store.get(record.id)
@@ -269,7 +330,27 @@ class CliTests(unittest.TestCase):
         from unittest import mock
         from termdeck.codex_auth import CodexAccount, CodexAuthState, CodexSwitchResult
         from termdeck.session_store import SessionStore
-        from termdeck.tmux_backend import AuthActivationResult
+        from termdeck.tmux_backend import (
+            AuthActivationPlan,
+            AuthActivationResult,
+            AuthQuiesceResult,
+        )
+
+        class TransactionBackend:
+            def plan_auth_change(self, record):
+                return AuthActivationPlan(True, live=True, restart=True, detail="ready")
+
+            def quiesce_auth_change(self, record, plan):
+                return AuthQuiesceResult(True, live=True, terminated=True)
+
+            def apply_auth_change(self, record, plan, quiescence):
+                return AuthActivationResult(
+                    False,
+                    False,
+                    status="recovery-pending",
+                    detail="running Codex session could not be captured exactly",
+                    preserve_selected_account=True,
+                )
 
         with tempfile.TemporaryDirectory() as tmp:
             db_path = pathlib.Path(tmp) / "sessions.sqlite3"
@@ -279,7 +360,15 @@ class CliTests(unittest.TestCase):
                 record = store.update(record.id, status="running")
             finally:
                 store.close()
-            state = CodexAuthState(
+            previous = CodexAuthState(
+                codex_home=record.codex_home,
+                accounts=(CodexAccount("work", alias="work", active=False),),
+                selected_account=None,
+                selected_account_key=None,
+                fingerprint="unselected",
+                codex_auth_available=True,
+            )
+            selected = CodexAuthState(
                 codex_home=record.codex_home,
                 accounts=(CodexAccount("work", alias="work", active=True),),
                 selected_account="work",
@@ -288,17 +377,15 @@ class CliTests(unittest.TestCase):
                 codex_auth_available=True,
             )
             manager = mock.Mock()
-            manager.switch.return_value = CodexSwitchResult(True, state)
-            backend = mock.Mock()
-            backend.activate_auth_change.return_value = AuthActivationResult(
-                False,
-                False,
-                detail="running Codex session could not be captured exactly",
-            )
+            manager.state.return_value = previous
+            manager.switch.return_value = CodexSwitchResult(True, selected)
             args = argparse.Namespace(db=db_path, selector=record.id, switch_account="work")
             buffer = io.StringIO()
-            with mock.patch("termdeck.cli.CodexAuthManager", return_value=manager), mock.patch(
-                "termdeck.cli.TmuxBackend", return_value=backend
+            with mock.patch.dict(
+                "os.environ",
+                {"TERMDECK_CODEX_ACCOUNT_SOURCE": str(pathlib.Path(tmp) / "empty-source")},
+            ), mock.patch("termdeck.cli.CodexAuthManager", return_value=manager), mock.patch(
+                "termdeck.cli.TmuxBackend", return_value=TransactionBackend()
             ), contextlib.redirect_stdout(buffer):
                 code = cmd_auth(args)
 
@@ -313,6 +400,369 @@ class CliTests(unittest.TestCase):
                 saved = store.get(record.id)
                 self.assertEqual(saved.selected_account, "work")
                 self.assertTrue(saved.auth_restart_required)
+            finally:
+                store.close()
+
+    def test_auth_switch_preflight_failure_does_not_change_private_credentials(self):
+        import tempfile
+        from unittest import mock
+        from termdeck.codex_auth import CodexAccount, CodexAuthState
+        from termdeck.session_store import SessionStore
+        from termdeck.tmux_backend import AuthActivationPlan
+
+        calls = []
+
+        class TwoPhaseBackend:
+            def plan_auth_change(self, record):
+                calls.append(("plan", record.id))
+                return AuthActivationPlan(False, detail="live Codex recovery is not exact")
+
+            def quiesce_auth_change(self, record, plan):
+                raise AssertionError("a rejected plan must never be quiesced")
+
+            def apply_auth_change(self, record, plan, quiescence):
+                raise AssertionError("a rejected plan must never be applied")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = pathlib.Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                record = store.create("agent", "ai", "codex", tmp)
+                record = store.update(
+                    record.id,
+                    selected_account="personal",
+                    pending_account="abandoned",
+                    status="running",
+                )
+            finally:
+                store.close()
+
+            manager = mock.Mock()
+            manager.state.return_value = CodexAuthState(
+                codex_home=record.codex_home,
+                accounts=(
+                    CodexAccount("personal-key", alias="personal", active=True),
+                    CodexAccount("work-key", alias="work", active=False),
+                ),
+                selected_account="personal",
+                selected_account_key="personal-key",
+                fingerprint="before",
+                codex_auth_available=True,
+            )
+            args = argparse.Namespace(db=db_path, selector=record.id, switch_account="work")
+            buffer = io.StringIO()
+            with mock.patch.dict(
+                "os.environ",
+                {"TERMDECK_CODEX_ACCOUNT_SOURCE": str(pathlib.Path(tmp) / "empty-source")},
+            ), mock.patch("termdeck.cli.CodexAuthManager", return_value=manager), mock.patch(
+                "termdeck.cli.TmuxBackend", return_value=TwoPhaseBackend()
+            ), contextlib.redirect_stdout(buffer):
+                code = cmd_auth(args)
+
+            self.assertEqual(code, 1)
+            self.assertEqual(calls, [("plan", record.id)])
+            manager.state.assert_called_once()
+            manager.switch.assert_not_called()
+            manager.restore.assert_not_called()
+            payload = json.loads(buffer.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["selected_account"], "personal")
+            self.assertIn("not exact", payload["error"])
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                saved = store.get(record.id)
+                self.assertEqual(saved.selected_account, "personal")
+                self.assertEqual(saved.pending_account, "abandoned")
+                self.assertFalse(saved.auth_restart_required)
+            finally:
+                store.close()
+
+    def test_auth_switch_restores_previous_account_before_recreating_after_switch_failure(self):
+        import tempfile
+        from unittest import mock
+        from termdeck.codex_auth import CodexAccount, CodexAuthState, CodexSwitchResult
+        from termdeck.session_store import SessionStore
+        from termdeck.tmux_backend import (
+            AuthActivationPlan,
+            AuthActivationResult,
+            AuthQuiesceResult,
+        )
+
+        calls = []
+
+        class TwoPhaseBackend:
+            def plan_auth_change(self, record):
+                calls.append("plan")
+                return AuthActivationPlan(True, live=True, restart=True, detail="ready")
+
+            def quiesce_auth_change(self, record, plan):
+                calls.append("quiesce")
+                return AuthQuiesceResult(True, live=True, terminated=True)
+
+            def apply_auth_change(self, record, plan, quiescence):
+                calls.append("apply")
+                return AuthActivationResult(
+                    True,
+                    True,
+                    pid=4242,
+                    status="running",
+                    detail="previous account restored and terminal recreated",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = pathlib.Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                record = store.create("agent", "ai", "codex", tmp)
+                record = store.update(record.id, selected_account="personal", status="running")
+            finally:
+                store.close()
+            previous = CodexAuthState(
+                codex_home=record.codex_home,
+                accounts=(
+                    CodexAccount("personal-key", alias="personal", active=True),
+                    CodexAccount("work-key", alias="work", active=False),
+                ),
+                selected_account="personal",
+                selected_account_key="personal-key",
+                fingerprint="before",
+                codex_auth_available=True,
+            )
+            manager = mock.Mock()
+
+            def current_state(_record):
+                calls.append("state")
+                return previous
+
+            def switch(_record, _account):
+                calls.append("switch")
+                return CodexSwitchResult(False, previous, "pointer replace failed")
+
+            def restore(_record, account_key):
+                calls.append(("restore", account_key))
+                return CodexSwitchResult(True, previous)
+
+            manager.state.side_effect = current_state
+            manager.switch.side_effect = switch
+            manager.restore.side_effect = restore
+            args = argparse.Namespace(db=db_path, selector=record.id, switch_account="work")
+            buffer = io.StringIO()
+            with mock.patch.dict(
+                "os.environ",
+                {"TERMDECK_CODEX_ACCOUNT_SOURCE": str(pathlib.Path(tmp) / "empty-source")},
+            ), mock.patch("termdeck.cli.CodexAuthManager", return_value=manager), mock.patch(
+                "termdeck.cli.TmuxBackend", return_value=TwoPhaseBackend()
+            ), contextlib.redirect_stdout(buffer):
+                code = cmd_auth(args)
+
+            self.assertEqual(code, 1)
+            self.assertEqual(
+                calls,
+                [
+                    "state",
+                    "plan",
+                    "quiesce",
+                    "switch",
+                    ("restore", "personal-key"),
+                    "apply",
+                ],
+            )
+            payload = json.loads(buffer.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["selected_account"], "personal")
+            self.assertFalse(payload["auth_restart_required"])
+            self.assertIn("pointer replace failed", payload["error"])
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                saved = store.get(record.id)
+                self.assertEqual(saved.selected_account, "personal")
+                self.assertIsNone(saved.pending_account)
+                self.assertFalse(saved.auth_restart_required)
+            finally:
+                store.close()
+
+    def test_auth_switch_persists_destructive_legacy_failure_and_clears_stale_recovery(self):
+        import tempfile
+        from unittest import mock
+        from termdeck.codex_auth import CodexAccount, CodexAuthState, CodexSwitchResult
+        from termdeck.session_store import SessionStore
+        from termdeck.tmux_backend import (
+            AuthActivationPlan,
+            AuthActivationResult,
+            AuthQuiesceResult,
+        )
+
+        class TwoPhaseBackend:
+            def plan_auth_change(self, record):
+                return AuthActivationPlan(True, live=True, restart=True, detail="ready")
+
+            def quiesce_auth_change(self, record, plan):
+                return AuthQuiesceResult(True, live=True, terminated=True)
+
+            def apply_auth_change(self, record, plan, quiescence):
+                return AuthActivationResult(
+                    False,
+                    False,
+                    status="stopped",
+                    detail="could not recreate the idle shell",
+                    preserve_selected_account=True,
+                    command="/bin/bash",
+                    cwd=new_cwd,
+                    clear_recovery=True,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            new_cwd = str(pathlib.Path(tmp) / "live-directory")
+            pathlib.Path(new_cwd).mkdir()
+            db_path = pathlib.Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                record = store.create("agent", "ai", "codex", tmp)
+                record = store.update(
+                    record.id,
+                    selected_account="personal",
+                    recovery_command="codex resume 019f71b3-fa32-7251-bac3-c628f34dd154",
+                    recovery_cwd=tmp,
+                    status="running",
+                    last_pid=31337,
+                )
+            finally:
+                store.close()
+            previous = CodexAuthState(
+                codex_home=record.codex_home,
+                accounts=(
+                    CodexAccount("personal-key", alias="personal", active=True),
+                    CodexAccount("work-key", alias="work", active=False),
+                ),
+                selected_account="personal",
+                selected_account_key="personal-key",
+                fingerprint="before",
+                codex_auth_available=True,
+            )
+            selected = CodexAuthState(
+                codex_home=record.codex_home,
+                accounts=(CodexAccount("work-key", alias="work", active=True),),
+                selected_account="work",
+                selected_account_key="work-key",
+                fingerprint="selected",
+                codex_auth_available=True,
+            )
+            manager = mock.Mock()
+            manager.state.return_value = previous
+            manager.switch.return_value = CodexSwitchResult(True, selected)
+            args = argparse.Namespace(db=db_path, selector=record.id, switch_account="work")
+            buffer = io.StringIO()
+            with mock.patch.dict(
+                "os.environ",
+                {"TERMDECK_CODEX_ACCOUNT_SOURCE": str(pathlib.Path(tmp) / "empty-source")},
+            ), mock.patch("termdeck.cli.CodexAuthManager", return_value=manager), mock.patch(
+                "termdeck.cli.TmuxBackend", return_value=TwoPhaseBackend()
+            ), contextlib.redirect_stdout(buffer):
+                code = cmd_auth(args)
+
+            self.assertEqual(code, 1)
+            manager.restore.assert_not_called()
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                saved = store.get(record.id)
+                self.assertEqual(saved.selected_account, "work")
+                self.assertTrue(saved.auth_restart_required)
+                self.assertEqual(saved.command, "/bin/bash")
+                self.assertEqual(saved.cwd, new_cwd)
+                self.assertIsNone(saved.recovery_command)
+                self.assertIsNone(saved.recovery_cwd)
+                self.assertEqual(saved.status, "stopped")
+                self.assertIsNone(saved.last_pid)
+            finally:
+                store.close()
+
+    def test_auth_switch_persists_exact_recovery_after_destructive_failure(self):
+        import tempfile
+        from unittest import mock
+        from termdeck.codex_auth import CodexAccount, CodexAuthState, CodexSwitchResult
+        from termdeck.session_store import SessionStore
+        from termdeck.tmux_backend import (
+            AuthActivationPlan,
+            AuthActivationResult,
+            AuthQuiesceResult,
+        )
+
+        recovery = "codex resume 019f71b3-fa32-7251-bac3-c628f34dd154"
+
+        class TwoPhaseBackend:
+            def plan_auth_change(self, record):
+                return AuthActivationPlan(True, live=True, restart=True, detail="ready")
+
+            def quiesce_auth_change(self, record, plan):
+                return AuthQuiesceResult(True, live=True, terminated=True)
+
+            def apply_auth_change(self, record, plan, quiescence):
+                return AuthActivationResult(
+                    False,
+                    False,
+                    recovery_command=recovery,
+                    recovery_cwd=tmp,
+                    status="recovery-pending",
+                    detail="resume failed after the old pane stopped",
+                    preserve_selected_account=True,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = pathlib.Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                record = store.create("agent", "ai", "codex", tmp)
+                record = store.update(
+                    record.id,
+                    selected_account="personal",
+                    status="running",
+                    last_pid=31337,
+                )
+            finally:
+                store.close()
+            previous = CodexAuthState(
+                codex_home=record.codex_home,
+                accounts=(
+                    CodexAccount("personal-key", alias="personal", active=True),
+                    CodexAccount("work-key", alias="work", active=False),
+                ),
+                selected_account="personal",
+                selected_account_key="personal-key",
+                fingerprint="before",
+                codex_auth_available=True,
+            )
+            selected = CodexAuthState(
+                codex_home=record.codex_home,
+                accounts=(CodexAccount("work-key", alias="work", active=True),),
+                selected_account="work",
+                selected_account_key="work-key",
+                fingerprint="selected",
+                codex_auth_available=True,
+            )
+            manager = mock.Mock()
+            manager.state.return_value = previous
+            manager.switch.return_value = CodexSwitchResult(True, selected)
+            args = argparse.Namespace(db=db_path, selector=record.id, switch_account="work")
+            with mock.patch.dict(
+                "os.environ",
+                {"TERMDECK_CODEX_ACCOUNT_SOURCE": str(pathlib.Path(tmp) / "empty-source")},
+            ), mock.patch("termdeck.cli.CodexAuthManager", return_value=manager), mock.patch(
+                "termdeck.cli.TmuxBackend", return_value=TwoPhaseBackend()
+            ), contextlib.redirect_stdout(io.StringIO()):
+                code = cmd_auth(args)
+
+            self.assertEqual(code, 1)
+            manager.restore.assert_not_called()
+            store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
+            try:
+                saved = store.get(record.id)
+                self.assertEqual(saved.selected_account, "work")
+                self.assertEqual(saved.command, "codex")
+                self.assertEqual(saved.cwd, tmp)
+                self.assertEqual(saved.recovery_command, recovery)
+                self.assertEqual(saved.recovery_cwd, tmp)
+                self.assertEqual(saved.status, "recovery-pending")
+                self.assertIsNone(saved.last_pid)
             finally:
                 store.close()
 
@@ -331,7 +781,10 @@ class CliTests(unittest.TestCase):
                 store.close()
             args = argparse.Namespace(db=db_path, selector=record.id, switch_account="work")
             buffer = io.StringIO()
-            with mock.patch("termdeck.cli.CodexAuthManager") as manager, contextlib.redirect_stdout(buffer):
+            with mock.patch.dict(
+                "os.environ",
+                {"TERMDECK_CODEX_ACCOUNT_SOURCE": str(pathlib.Path(tmp) / "empty-source")},
+            ), mock.patch("termdeck.cli.CodexAuthManager") as manager, contextlib.redirect_stdout(buffer):
                 code = cmd_auth(args)
 
             self.assertEqual(code, 2)
@@ -412,6 +865,49 @@ class CliTests(unittest.TestCase):
                 self.assertIn("diagnostics.json", archive.namelist())
                 self.assertIn("tasks.json", archive.namelist())
 
+    def test_diagnose_freeze_command_emits_bounded_payload(self):
+        from unittest import mock
+
+        args = argparse.Namespace(db=pathlib.Path("/tmp/fake-db"), auth_root=pathlib.Path("/tmp/fake-auth"))
+        expected = {"schema": "termdeck.freeze-diagnostics.v1"}
+        buffer = io.StringIO()
+        with mock.patch(
+            "termdeck.cli.build_freeze_diagnostic_payload", return_value=dict(expected)
+        ) as build, contextlib.redirect_stdout(buffer):
+            code = cmd_diagnose_freeze(args)
+
+        self.assertEqual(code, 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["action"], "diagnose-freeze")
+        build.assert_called_once_with(db_path=args.db, auth_root=args.auth_root)
+
+    def test_auth_gc_is_dry_run_only_in_this_release(self):
+        from unittest import mock
+
+        args = argparse.Namespace(
+            db=pathlib.Path("/tmp/fake-db"),
+            auth_root=pathlib.Path("/tmp/fake-auth"),
+            min_age_hours=24.0,
+        )
+        buffer = io.StringIO()
+        with mock.patch(
+            "termdeck.cli.plan_auth_scope_gc",
+            return_value={"ok": True, "action": "auth-gc-plan", "dry_run": True},
+        ) as plan, contextlib.redirect_stdout(buffer):
+            code = cmd_auth_gc(args)
+
+        self.assertEqual(code, 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertTrue(payload["dry_run"])
+        self.assertFalse(payload["mutation_available"])
+        self.assertIn("dry-run only", payload["detail"])
+        plan.assert_called_once_with(
+            db_path=args.db,
+            auth_root=args.auth_root,
+            min_age_seconds=24.0 * 3600.0,
+        )
+
     def test_settings_sample_outputs_loadable_json(self):
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
@@ -425,6 +921,7 @@ class CliTests(unittest.TestCase):
     def test_reconcile_command_repairs_stale_running_session_json(self):
         from pathlib import Path
         import tempfile
+        from unittest import mock
         from termdeck.session_store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -438,7 +935,14 @@ class CliTests(unittest.TestCase):
 
             args = argparse.Namespace(db=db_path, tag=None, all=False, dry_run=False, keep_visible=False)
             buffer = io.StringIO()
-            with contextlib.redirect_stdout(buffer):
+            # This CLI test must not inherit the host's potentially saturated
+            # tmux control plane. A bounded query failure deliberately keeps a
+            # prior running state, so prove the intended missing-session branch
+            # with a deterministic backend observation instead.
+            with mock.patch(
+                "termdeck.tmux_backend.TmuxBackend.session_exists_many",
+                return_value={record.id: False},
+            ), contextlib.redirect_stdout(buffer):
                 code = cmd_reconcile(args)
             self.assertEqual(code, 0)
             payload = json.loads(buffer.getvalue())

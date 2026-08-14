@@ -120,11 +120,17 @@ flowchart LR
     H2 --> A2["selected: personal"]
 ```
 
-A new terminal is anonymous even when the source Codex home currently has an active login. Credential state and mutable SQLite runtime state stay private, while conversation content is shared: new or empty private scopes link the canonical `sessions/` and `archived_sessions/` roots. Before TermDeck executes an exact `codex resume <UUID>`, it checks the private `state_5.sqlite`; if that UUID is absent, TermDeck transactionally hydrates only the matching thread row plus direct section/dynamic-tool metadata from a canonical state DB. This preserves exact recovery without making multiple terminals contend on one SQLite database. Non-empty legacy private session trees are preserved instead of being moved underneath a possibly live process. TermDeck prepends `<private-CODEX_HOME>/bin` to that terminal's `PATH`, so the normal command works inside the shell:
+A new terminal is anonymous even when the source Codex home currently has an active login. Credential state and mutable SQLite runtime state stay private, while conversation content is shared: new or empty private scopes link the canonical `sessions/` and `archived_sessions/` roots. Before that shared tree becomes visible to a cold scope, TermDeck builds a sparse private `state_5.sqlite` from the currently audited canonical schema and migration ledger. It preserves Codex's incremental-vacuum setting, writes the natural empty complete-backfill marker and built-in Pinned section, and deliberately starts with no conversation rows; Codex therefore does not independently rescan the whole shared rollout archive for every terminal. Before TermDeck executes an exact `codex resume <UUID>`, it transactionally hydrates only the matching thread row plus direct section/dynamic-tool metadata from a canonical state DB with the identical migration identity. Existing private databases remain untouched during scope preparation. An incomplete or running native backfill is neither relabeled nor newly exposed to the shared roots, and a subsequent launch or exact hydration fails closed. This preserves exact recovery without making multiple terminals contend on one SQLite database or falsely completing an active native scan. Non-empty legacy private session trees are preserved instead of being moved underneath a possibly live process. TermDeck prepends `<private-CODEX_HOME>/bin` to that terminal's `PATH`, so the normal command works inside the shell:
 
 ```bash
 # codex-auth 0.1.x calls account selection `use`.
+# Interactive picker: choose with the arrow keys + Enter.
+codex-auth use
+
+# Direct selection by saved account name.
 codex-auth use work
+
+# The next Codex process in this terminal uses the selected account.
 codex
 ```
 
@@ -134,21 +140,22 @@ The GUI dropdown and `t1000 auth <tab> --switch <account>` use a verified transa
 
 ```text
 set pending account
+  -> capture and bind an exact resume UUID or a verified idle shell
+  -> fail unchanged if the live process cannot be preserved safely
   -> run the private codex-auth account-selection command
-  -> re-read the private active-account metadata
-  -> verify requested account is active
-  -> if Codex is running, capture exact resume UUID
+  -> re-read and verify the private active-account metadata
+  -> revalidate the bound tmux identity
   -> recreate only that tmux tab under the selected private auth
   -> verify private CODEX_HOME / scope / PATH
   -> resume the same Codex UUID
   -> persist selected account as active
 ```
 
-If execution or verification fails, TermDeck attempts to restore the previous private account and does not update the selected account in SQLite. The GUI performs the command on a worker thread, so the terminal remains responsive.
+If preflight, execution, or pre-destructive verification fails, TermDeck restores the previous private account and does not update the selected account in SQLite. Once a verified recreation has begun, the old terminal may already be gone; a later recreation failure keeps the selected private account and persists an explicit stopped or recovery-pending state for a safe retry. The GUI performs the command on a worker thread, so the terminal remains responsive.
 
-TermDeck polls only the current tab's private account metadata. Therefore a manual `codex-auth use ...` performed inside an isolated terminal is detected and persisted without intercepting the CLI. It never writes tokens to SQLite and never copies `auth.json` into a snapshot. Existing native 0.1.x scopes also import newer source snapshots for non-active accounts; the selected account file is never overwritten, so a tab's refreshed live credentials win while a later global re-login/re-save can repair another stale saved account.
+TermDeck polls only the current tab's private account metadata. Therefore a manual `codex-auth use` picker selection or `codex-auth use <account>` performed inside an isolated terminal is detected and persisted without intercepting the CLI. The picker command is used without an empty-string placeholder. It never writes tokens to SQLite and never copies `auth.json` into a snapshot. Existing native 0.1.x scopes also import newer source snapshots for non-active accounts; the selected account file is never overwritten, so a tab's refreshed live credentials win while a later global re-login/re-save can repair another stale saved account. A subsequently launched Codex process reads the selection; an already-running process keeps the credentials it loaded at startup.
 
-After a successful GUI switch, a running Codex is automatically resumed in the same tab under the selected account, but only when TermDeck can prove an exact session UUID first. If exact recovery is unavailable, TermDeck fails closed rather than killing the conversation. A live TermDeck tmux session created before per-tab auth isolation cannot be retroactively fixed by changing SQLite, so TermDeck verifies its `CODEX_HOME`, auth-scope ID, and private-wrapper `PATH` before enabling account controls; legacy sessions show **Codex: restart terminal** until recreated. An adopted external tmux session likewise remains disabled until recreated under TermDeck.
+After a successful GUI switch, a running Codex is automatically resumed in the same tab under the selected account, but only when TermDeck can prove an exact session UUID first. If exact recovery is unavailable, TermDeck fails closed before changing credentials or killing the conversation. For a managed tmux session created before per-tab auth isolation, the dropdown remains usable and labels the choice as an **upgrades terminal** action. Selection is allowed only when the process tree proves the pane is at a supported idle shell; TermDeck binds its identity and live directory, switches the private account, recreates the shell once with its private environment, and verifies `CODEX_HOME`, auth-scope ID, and private-wrapper `PATH`. An unknown or non-shell foreground process is left untouched. An adopted external tmux session remains disabled until replaced by a TermDeck-managed terminal.
 
 ---
 

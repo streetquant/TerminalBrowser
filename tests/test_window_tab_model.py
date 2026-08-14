@@ -5,6 +5,7 @@ from unittest import TestCase
 
 from termdeck.command_render import directory_tab_name, normalise_directory
 from termdeck.gtk_app import TermDeckWindow
+from termdeck.session_lifecycle import recently_closed_records
 from termdeck.session_store import SessionStore
 from termdeck.tmux_backend import TmuxError
 
@@ -84,6 +85,50 @@ class WindowTabModelTests(TestCase):
         self.assertTrue(all(not call[2]["refresh_side"] for call in calls[2:]))
         self.assertEqual(side.refresh_count, 1)
 
+    def test_one_attach_exception_does_not_hide_later_tabs(self) -> None:
+        """A VTE/attach failure is isolated and retried, not window-fatal."""
+
+        records = [
+            SimpleNamespace(id="first", tab_index=0, visible=True, status="running"),
+            SimpleNamespace(id="second", tab_index=1, visible=True, status="running"),
+        ]
+        updates = []
+
+        class Backend:
+            def session_exists_many(self, candidates):
+                return {candidate.id: True for candidate in candidates}
+
+            def pane_pids(self, candidates):
+                return {candidate.id: index for index, candidate in enumerate(candidates, start=101)}
+
+        side = SideStub()
+        window = SimpleNamespace(
+            app_context=SimpleNamespace(
+                backend=Backend(),
+                store=SimpleNamespace(
+                    update=lambda session_id, **changes: updates.append((session_id, changes)),
+                ),
+            ),
+            tabs={},
+            side=side,
+        )
+
+        def open_session(record, **_kwargs):
+            if record.id == "first":
+                raise RuntimeError("VTE allocation failed")
+            window.tabs[record.id] = object()
+
+        window.open_session = open_session
+
+        restored = TermDeckWindow.restore_previous_tabs(window, records=records)
+
+        self.assertEqual(restored, 1)
+        self.assertEqual(set(window.tabs), {"second"})
+        self.assertEqual(window._restore_retry_ids, {"first"})
+        self.assertEqual(updates[0][0], "first")
+        self.assertEqual(updates[0][1]["visible"], True)
+        self.assertEqual(side.refresh_count, 1)
+
     def test_restore_restarts_selected_tabs_when_the_backend_was_lost(self) -> None:
         record = SimpleNamespace(id="crashed", tab_index=0)
         calls = []
@@ -150,6 +195,54 @@ class WindowTabModelTests(TestCase):
             [("crashed", {"status": "start-error", "last_pid": None, "visible": True})],
         )
         self.assertEqual(side.refresh_count, 1)
+
+    def test_failed_exact_restore_keeps_recovery_pending_status(self) -> None:
+        record = SimpleNamespace(
+            id="recover-me",
+            tab_index=0,
+            visible=True,
+            status="recovery-pending",
+        )
+        updates = []
+
+        class Backend:
+            def session_exists_many(self, candidates):
+                return {candidate.id: False for candidate in candidates}
+
+            def pane_pids(self, _candidates):
+                return {}
+
+        side = SideStub()
+        window = SimpleNamespace(
+            app_context=SimpleNamespace(
+                backend=Backend(),
+                store=SimpleNamespace(
+                    update=lambda session_id, **changes: updates.append((session_id, changes))
+                ),
+            ),
+            tabs={},
+            side=side,
+            open_session=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                TmuxError("exact recovery unavailable")
+            ),
+        )
+
+        restored = TermDeckWindow.restore_previous_tabs(window, records=[record])
+
+        self.assertEqual(restored, 0)
+        self.assertEqual(
+            updates,
+            [
+                (
+                    "recover-me",
+                    {
+                        "status": "recovery-pending",
+                        "last_pid": None,
+                        "visible": True,
+                    },
+                )
+            ],
+        )
 
     def test_directory_tab_name_uses_only_final_component(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -311,6 +404,371 @@ class WindowTabModelTests(TestCase):
                 self.assertEqual(side.refresh_count, 1)
             finally:
                 store.close()
+
+    def test_close_snapshots_live_directory_before_detaching_tab(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_directory = root / "old-project"
+            new_directory = root / "new-project"
+            old_directory.mkdir()
+            new_directory.mkdir()
+            store = SessionStore(root / "sessions.sqlite3")
+            try:
+                record = store.create("old-project", "terminal", "bash", old_directory)
+                order = []
+
+                class Backend:
+                    def current_directory(self, candidate):
+                        order.append(("resolve", candidate.id))
+                        return str(new_directory)
+
+                def remove(session_id):
+                    updated = store.get(session_id)
+                    order.append(("detach", updated.cwd, updated.name))
+                    return True
+
+                window = SimpleNamespace(
+                    tabs={record.id: SimpleNamespace(record=record)},
+                    app_context=SimpleNamespace(store=store, backend=Backend()),
+                    _remove_tab_widget=remove,
+                    _renumber_visible_tabs=lambda: None,
+                    _persist_live_directory_before_detach=lambda candidate: TermDeckWindow._persist_live_directory_before_detach(
+                        window, candidate
+                    ),
+                    _directory_tracking_changes=lambda candidate, live: TermDeckWindow._directory_tracking_changes(
+                        candidate, live
+                    ),
+                    refresh_tab_label=lambda updated: order.append(("label", updated.cwd)),
+                    side=SideStub(),
+                )
+
+                TermDeckWindow.hide_tab(window, record.id, include_pinned=True)
+
+                updated = store.get(record.id)
+                self.assertEqual(updated.cwd, str(new_directory.resolve()))  # type: ignore[union-attr]
+                self.assertEqual(updated.name, "new-project")  # type: ignore[union-attr]
+                self.assertFalse(updated.visible)  # type: ignore[union-attr]
+                self.assertEqual(order[0], ("resolve", record.id))
+                self.assertEqual(
+                    order[2],
+                    ("detach", str(new_directory.resolve()), "new-project"),
+                )
+            finally:
+                store.close()
+
+    def test_user_open_replaces_missing_session_with_one_shell_at_saved_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "saved-project"
+            directory.mkdir()
+            store = SessionStore(root / "sessions.sqlite3")
+            try:
+                record = store.create(
+                    "ended external",
+                    "terminal",
+                    "sentinel-command-must-not-run",
+                    directory,
+                )
+                record = store.update(
+                    record.id,
+                    status="running",
+                    visible=True,
+                    external=True,
+                )
+                opened = []
+                toasts = []
+                window = SimpleNamespace(
+                    app_context=SimpleNamespace(
+                        store=store,
+                        backend=SimpleNamespace(session_exists=lambda candidate: False),
+                    ),
+                    tabs={},
+                    new_shell_tab=lambda cwd: opened.append(cwd),
+                    show_toast=lambda message, **kwargs: toasts.append((message, kwargs)),
+                    side=SideStub(),
+                    master_window=None,
+                    _remove_tab_widget=lambda _session_id: False,
+                )
+
+                result = TermDeckWindow.open_user_session(window, record)
+
+                ended = store.get(record.id)
+                self.assertTrue(result)
+                self.assertEqual(opened, [str(directory.resolve())])
+                self.assertEqual(ended.status, "stopped")  # type: ignore[union-attr]
+                self.assertFalse(ended.visible)  # type: ignore[union-attr]
+                self.assertIsNone(ended.last_pid)  # type: ignore[union-attr]
+                self.assertEqual(len(toasts), 1)
+                self.assertIn("opened a new shell", toasts[0][0])
+            finally:
+                store.close()
+
+    def test_missing_attach_can_be_reopened_once_at_saved_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "saved-project"
+            directory.mkdir()
+            store = SessionStore(root / "sessions.sqlite3")
+            try:
+                record = store.create(
+                    "ended shell",
+                    "terminal",
+                    "sentinel-command-must-not-run",
+                    directory,
+                )
+                record = store.update(
+                    record.id,
+                    status="running",
+                    visible=True,
+                    external=True,
+                )
+                opened: list[str] = []
+                removed: list[str] = []
+                side = SideStub()
+                window = SimpleNamespace(
+                    app_context=SimpleNamespace(
+                        store=store,
+                        backend=SimpleNamespace(session_exists=lambda _record: False),
+                    ),
+                    tabs={},
+                    _missing_session_replacements=set(),
+                    new_shell_tab=lambda cwd: opened.append(cwd),
+                    show_toast=lambda *_args, **_kwargs: None,
+                    side=side,
+                    master_window=None,
+                    _remove_tab_widget=lambda session_id: removed.append(session_id),
+                    _renumber_visible_tabs=lambda: None,
+                )
+                window.open_user_session = lambda candidate: TermDeckWindow.open_user_session(
+                    window, candidate
+                )
+
+                self.assertFalse(
+                    TermDeckWindow._finalize_missing_attach_target(window, record.id)
+                )
+                missing = store.get(record.id)
+                self.assertEqual(missing.status, "missing")  # type: ignore[union-attr]
+                self.assertFalse(missing.visible)  # type: ignore[union-attr]
+                self.assertEqual(
+                    [candidate.id for candidate in recently_closed_records(store)],
+                    [record.id],
+                )
+
+                self.assertEqual(TermDeckWindow.reopen_last_closed_tab(window), 1)
+
+                ended = store.get(record.id)
+                self.assertEqual(opened, [str(directory.resolve())])
+                self.assertEqual(ended.status, "stopped")  # type: ignore[union-attr]
+                self.assertFalse(ended.visible)  # type: ignore[union-attr]
+                self.assertEqual(recently_closed_records(store), [])
+
+                killed = store.create("killed", "terminal", "bash", directory, visible=False)
+                store.update(killed.id, status="stopped", visible=False)
+                self.assertEqual(recently_closed_records(store), [])
+            finally:
+                store.close()
+
+    def test_user_open_replacement_failure_preserves_original_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                record = store.create("ended", "terminal", "do-not-replay", tmp)
+                record = store.update(
+                    record.id,
+                    status="running",
+                    visible=True,
+                    external=True,
+                    last_pid=919,
+                )
+                removed = []
+                toasts = []
+                window = SimpleNamespace(
+                    app_context=SimpleNamespace(
+                        store=store,
+                        backend=SimpleNamespace(session_exists=lambda _record: False),
+                    ),
+                    _missing_session_replacements=set(),
+                    new_shell_tab=lambda _cwd: (_ for _ in ()).throw(TmuxError("tmux offline")),
+                    show_toast=lambda message, **kwargs: toasts.append((message, kwargs)),
+                    side=SideStub(),
+                    _remove_tab_widget=removed.append,
+                )
+
+                result = TermDeckWindow.open_user_session(window, record)
+
+                unchanged = store.get(record.id)
+                self.assertFalse(result)
+                self.assertEqual(unchanged.status, "running")  # type: ignore[union-attr]
+                self.assertTrue(unchanged.visible)  # type: ignore[union-attr]
+                self.assertEqual(unchanged.last_pid, 919)  # type: ignore[union-attr]
+                self.assertEqual(removed, [])
+                self.assertEqual(window._missing_session_replacements, set())
+                self.assertIn("tmux offline", toasts[0][0])
+            finally:
+                store.close()
+
+    def test_repeated_stale_open_creates_only_one_replacement_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                stale = store.create("ended", "terminal", "do-not-replay", tmp)
+                stale = store.update(stale.id, status="running", external=True)
+                opened = []
+                removed = []
+                window = SimpleNamespace(
+                    app_context=SimpleNamespace(
+                        store=store,
+                        backend=SimpleNamespace(session_exists=lambda _record: False),
+                    ),
+                    _missing_session_replacements=set(),
+                    new_shell_tab=lambda cwd: opened.append(cwd),
+                    show_toast=lambda *_args, **_kwargs: None,
+                    side=SideStub(),
+                    _remove_tab_widget=removed.append,
+                )
+
+                self.assertTrue(TermDeckWindow.open_user_session(window, stale))
+                self.assertTrue(TermDeckWindow.open_user_session(window, stale))
+
+                self.assertEqual(opened, [str(Path(tmp).resolve())])
+                self.assertEqual(removed, [stale.id])
+                self.assertEqual(store.get(stale.id).status, "stopped")  # type: ignore[union-attr]
+            finally:
+                store.close()
+
+    def test_missing_managed_recovery_uses_exact_resume_path_not_blank_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                record = store.create("recover", "ai", "codex", tmp)
+                record = store.update(
+                    record.id,
+                    status="recovery-pending",
+                    recovery_command="codex --yolo resume 019f9cd7-5cbb-7600-80c4-8cacdf88deb7",
+                    recovery_cwd=tmp,
+                )
+                created = []
+                opened = []
+                removed = []
+
+                class Backend:
+                    def session_exists(self, _record):
+                        return False
+
+                    def create_or_resume(self, candidate):
+                        created.append(candidate)
+
+                window = SimpleNamespace(
+                    app_context=SimpleNamespace(store=store, backend=Backend()),
+                    open_session=lambda candidate, **kwargs: opened.append((candidate, kwargs)),
+                    new_shell_tab=lambda _cwd: self.fail("exact recovery must not become a blank shell"),
+                    _remove_tab_widget=removed.append,
+                    show_toast=lambda *_args, **_kwargs: None,
+                    side=SideStub(),
+                )
+
+                result = TermDeckWindow.open_user_session(window, record)
+
+                self.assertTrue(result)
+                self.assertEqual([candidate.id for candidate in created], [record.id])
+                self.assertEqual(created[0].status, "recovery-pending")
+                self.assertEqual(opened[0][1]["known_live"], True)
+                self.assertEqual(removed, [record.id])
+            finally:
+                store.close()
+
+    def test_failed_managed_exact_recovery_preserves_record_and_surfaces_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                record = store.create("recover", "ai", "codex", tmp)
+                record = store.update(
+                    record.id,
+                    status="stopped",
+                    visible=True,
+                    recovery_command="codex --yolo resume 019f9cd7-5cbb-7600-80c4-8cacdf88deb7",
+                    recovery_cwd=tmp,
+                )
+                toasts = []
+                window = SimpleNamespace(
+                    app_context=SimpleNamespace(
+                        store=store,
+                        backend=SimpleNamespace(
+                            session_exists=lambda _record: False,
+                            create_or_resume=lambda _record: (_ for _ in ()).throw(
+                                TmuxError("archive missing")
+                            ),
+                        ),
+                    ),
+                    open_session=lambda *_args, **_kwargs: self.fail("failed recovery must not open"),
+                    new_shell_tab=lambda _cwd: self.fail("failed recovery must not become a shell"),
+                    _remove_tab_widget=lambda _session_id: self.fail("failed recovery stays actionable"),
+                    show_toast=lambda message, **kwargs: toasts.append((message, kwargs)),
+                    side=SideStub(),
+                )
+
+                result = TermDeckWindow.open_user_session(window, record)
+
+                unchanged = store.get(record.id)
+                self.assertFalse(result)
+                self.assertEqual(unchanged.status, "stopped")  # type: ignore[union-attr]
+                self.assertTrue(unchanged.visible)  # type: ignore[union-attr]
+                self.assertEqual(unchanged.recovery_command, record.recovery_command)  # type: ignore[union-attr]
+                self.assertIn("archive missing", toasts[0][0])
+            finally:
+                store.close()
+
+    def test_failed_new_session_rolls_back_its_row_and_partial_tmux_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            terminated = []
+
+            class Backend:
+                def create_or_resume(self, _record):
+                    return None
+
+                def pane_pid(self, _record):
+                    raise TmuxError("pane unavailable")
+
+                def terminate(self, candidate):
+                    terminated.append(candidate.id)
+
+            window = SimpleNamespace(
+                app_context=SimpleNamespace(store=store, backend=Backend()),
+                window_id="win",
+                window_title="Win",
+                notebook=SimpleNamespace(get_n_pages=lambda: 0),
+                _remove_tab_widget=lambda _session_id: False,
+            )
+
+            try:
+                with self.assertRaisesRegex(TmuxError, "pane unavailable"):
+                    TermDeckWindow.create_session(window, "replacement", "terminal", "bash", tmp)
+                self.assertEqual(store.list(), [])
+                self.assertEqual(len(terminated), 1)
+            finally:
+                store.close()
+
+    def test_user_open_reattaches_live_session_without_replacement(self) -> None:
+        record = SimpleNamespace(id="live", cwd="/tmp")
+        opened = []
+        replacements = []
+        window = SimpleNamespace(
+            app_context=SimpleNamespace(
+                store=SimpleNamespace(get=lambda _session_id: record),
+                backend=SimpleNamespace(session_exists=lambda candidate: True),
+            ),
+            tabs={},
+            open_session=lambda candidate, **kwargs: opened.append((candidate, kwargs)),
+            new_shell_tab=lambda cwd: replacements.append(cwd),
+        )
+
+        result = TermDeckWindow.open_user_session(window, record)
+
+        self.assertTrue(result)
+        self.assertEqual(replacements, [])
+        self.assertEqual(opened[0][0], record)
+        self.assertEqual(opened[0][1]["known_live"], True)
 
     def test_tab_metadata_refresh_persists_and_preserves_safe_recovery_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

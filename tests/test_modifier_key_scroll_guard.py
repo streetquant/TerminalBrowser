@@ -72,8 +72,7 @@ def _make_scroll_view_window(calls, *, scroll_active: bool = True):
     record = SimpleNamespace(id="sess-1")
     attach = SimpleNamespace(
         terminal=object(),
-        _set_history_cursor_hidden=lambda hidden: calls.append(("cursor", hidden)),
-        reset_scrollbar=lambda: calls.append("reset_scrollbar"),
+        prepare_for_live_input=lambda: calls.append(("restore", "sess-1")) or True,
     )
     backend = SimpleNamespace(
         scroll_view_active=lambda r: scroll_active,
@@ -90,12 +89,11 @@ def _make_scroll_view_window(calls, *, scroll_active: bool = True):
         _is_paste_event=lambda event: False,
         current_record=lambda: record,
         app_context=SimpleNamespace(backend=backend),
-        _restore_live_terminal=lambda r: calls.append(("restore", r.id)),
     )
 
 
 class ModifierKeyScrollGuardTest(TestCase):
-    """Pressing modifier-only keys while in scroll view must not call _restore_live_terminal."""
+    """Modifier-only keys must not cross the live-input restoration boundary."""
 
     def _press(self, keyval: int, *, scroll_active: bool = True):
         calls = []

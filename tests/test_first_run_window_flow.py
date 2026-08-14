@@ -308,6 +308,38 @@ class FirstRunWindowFlowTests(TestCase):
         self.assertIn("restore:1", existing[0].calls)
         self.assertEqual(len(present_calls), 2)
 
+    def test_reactivation_detaches_unrealized_window_before_rebuilding_it(self) -> None:
+        record = SimpleNamespace(id="tab-a")
+        groups = [("win-a", "Cash", [record])]
+        terminal = SimpleNamespace(detach=Mock())
+        stale = SimpleNamespace(
+            window_id="win-a",
+            tabs={record.id: SimpleNamespace(widget=terminal)},
+            get_realized=lambda: False,
+            destroy=Mock(),
+        )
+        store = SimpleNamespace(windows_for_restore=lambda: groups)
+        app = SimpleNamespace(
+            backend=SimpleNamespace(available=True),
+            sampler=object(),
+            store=store,
+            windows=[stale],
+            workspace_path=None,
+            prompt_for_new_window=Mock(),
+            _present_all_windows=Mock(),
+        )
+
+        with patch("termdeck.gtk_app.reconcile_store"), patch(
+            "termdeck.gtk_app.TermDeckWindow", FakeWindow
+        ):
+            TermDeckApplication.do_activate(app)
+
+        terminal.detach.assert_called_once_with()
+        stale.destroy.assert_called_once_with()
+        self.assertEqual(len(app.windows), 1)
+        self.assertIsNot(app.windows[0], stale)
+        self.assertEqual(app.windows[0].window_id, "win-a")
+
     def test_one_window_restore_failure_does_not_suppress_later_windows(self) -> None:
         groups = [
             ("win-broken", "Broken", [SimpleNamespace(id="bad")]),

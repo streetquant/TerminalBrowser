@@ -76,7 +76,7 @@ class SessionCardPointerTest(TestCase):
     def test_single_click_row_activation_opens_that_session(self) -> None:
         opened = []
         record = SimpleNamespace(id="target")
-        pane = SimpleNamespace(window=SimpleNamespace(open_session=opened.append))
+        pane = SimpleNamespace(window=SimpleNamespace(open_user_session=opened.append))
         row = SimpleNamespace(_termdeck_session_record=record)
 
         SidePane._on_session_row_activated(pane, None, row)
@@ -91,11 +91,11 @@ class SessionCardPointerTest(TestCase):
 
         self.assertEqual(opened, [])
 
-    def test_plain_left_click_on_card_opens_that_session(self) -> None:
+    def test_plain_left_click_on_card_defers_to_single_row_activation(self) -> None:
         opened = []
         record = SimpleNamespace(id="target")
         pane = SimpleNamespace(
-            window=SimpleNamespace(open_session=opened.append),
+            window=SimpleNamespace(open_user_session=opened.append),
             _on_session_button_press=lambda *_args: False,
         )
         event = SimpleNamespace(button=1)
@@ -108,15 +108,15 @@ class SessionCardPointerTest(TestCase):
             CheckStub(),
         )
 
-        self.assertTrue(handled)
-        self.assertEqual(opened, [record])
+        self.assertFalse(handled)
+        self.assertEqual(opened, [])
 
     def test_ctrl_click_card_remains_bulk_selection(self) -> None:
         opened = []
         delegated = []
         record = SimpleNamespace(id="target")
         pane = SimpleNamespace(
-            window=SimpleNamespace(open_session=opened.append),
+            window=SimpleNamespace(open_user_session=opened.append),
             _on_session_button_press=lambda *args: delegated.append(args) or True,
         )
         event = SimpleNamespace(

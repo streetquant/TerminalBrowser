@@ -116,6 +116,29 @@ class TerminalCopyPipelineTest(TestCase):
         self.assertEqual(clipboards[gtk_app.Gdk.SELECTION_CLIPBOARD].text, 'clip')
         self.assertEqual(attach._last_copied_text, 'clip')
 
+    def test_history_redraw_keeps_snapshot_in_last_copy_and_clipboard(self) -> None:
+        terminal = TerminalStub(selected_text='selected before redraw')
+        clipboard = ClipboardStub()
+        attach = make_attach(
+            terminal,
+            {gtk_app.Gdk.SELECTION_CLIPBOARD: clipboard},
+        )
+        attach._selection_autocopy_source_id = 0
+        attach._selection_pending = True
+        attach._copy_selection_to_clipboards = lambda: (
+            AttachTerminal._copy_selection_to_clipboards(attach)
+        )
+
+        copied = AttachTerminal._snapshot_selection_before_history_scroll(attach)
+        terminal.has_selection = False
+        terminal.selected_text = ''
+
+        self.assertTrue(copied)
+        self.assertEqual(attach._last_copied_text, 'selected before redraw')
+        self.assertEqual(clipboard.text, 'selected before redraw')
+        self.assertTrue(clipboard.stored)
+        self.assertFalse(attach._selection_pending)
+
 
 if __name__ == '__main__':
     import unittest

@@ -1,7 +1,10 @@
+import json
+import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from termdeck.models import SessionRecord
 from termdeck.session_store import SessionStore
@@ -258,6 +261,90 @@ class SessionStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_create_persists_proven_canonical_default_without_restart_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            accounts = source / "accounts"
+            accounts.mkdir(parents=True)
+            for name in ("alpha", "beta"):
+                (accounts / f"{name}.json").write_text(
+                    json.dumps(
+                        {
+                            "auth_mode": "chatgpt",
+                            "tokens": {"refresh_token": f"{name}-refresh"},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            (source / "current").write_text("beta\n", encoding="utf-8")
+            (source / "auth.json").symlink_to(Path("accounts") / "beta.json")
+            store = SessionStore(
+                root / "sessions.sqlite3",
+                auth_root=root / "terminal-auth",
+                account_source=source,
+            )
+            try:
+                created = store.create("agent", "ai", "bash", tmp)
+                persisted = store.get(created.id)
+
+                self.assertEqual(created.selected_account, "beta")
+                self.assertFalse(created.auth_restart_required)
+                self.assertIsNotNone(persisted)
+                self.assertEqual(persisted.selected_account, "beta")  # type: ignore[union-attr]
+                self.assertFalse(persisted.auth_restart_required)  # type: ignore[union-attr]
+                home = Path(created.codex_home)
+                self.assertTrue((home / "accounts").is_symlink())
+                self.assertTrue((home / "auth.json").is_symlink())
+                self.assertEqual(
+                    (home / "auth.json").resolve(),
+                    accounts / "beta.json",
+                )
+            finally:
+                store.close()
+
+    def test_create_uses_default_account_source_for_inherited_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host_home = root / "host-home"
+            source = host_home / ".codex"
+            accounts = source / "accounts"
+            accounts.mkdir(parents=True)
+            for name in ("alpha", "beta"):
+                (accounts / f"{name}.json").write_text(
+                    json.dumps(
+                        {
+                            "auth_mode": "chatgpt",
+                            "tokens": {"refresh_token": f"{name}-refresh"},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            (source / "current").write_text("beta\n", encoding="utf-8")
+            (source / "auth.json").symlink_to(Path("accounts") / "beta.json")
+
+            with mock.patch.dict(os.environ, {}, clear=False), mock.patch(
+                "termdeck.codex_auth.Path.home",
+                return_value=host_home,
+            ):
+                os.environ.pop("TERMDECK_CODEX_ACCOUNT_SOURCE", None)
+                store = SessionStore(
+                    root / "sessions.sqlite3",
+                    auth_root=root / "terminal-auth",
+                )
+                try:
+                    created = store.create("agent", "ai", "bash", tmp)
+                    persisted = store.get(created.id)
+
+                    self.assertEqual(store.account_source, source)
+                    self.assertEqual(created.selected_account, "beta")
+                    self.assertFalse(created.auth_restart_required)
+                    self.assertIsNotNone(persisted)
+                    self.assertEqual(persisted.selected_account, "beta")  # type: ignore[union-attr]
+                    self.assertFalse(persisted.auth_restart_required)  # type: ignore[union-attr]
+                finally:
+                    store.close()
+
     def test_direct_upsert_assigns_and_preserves_immutable_auth_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -336,7 +423,10 @@ class SessionStoreTests(unittest.TestCase):
             conn.commit()
             conn.close()
 
-            store = SessionStore(db)
+            store = SessionStore(
+                db,
+                account_source=Path(tmp) / "empty-source",
+            )
             try:
                 record = store.get("td-old")
                 self.assertIsNotNone(record)

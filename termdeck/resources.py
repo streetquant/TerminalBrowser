@@ -64,6 +64,54 @@ def _process_argv(pid: int) -> tuple[str, ...] | None:
     )
 
 
+def _managed_codex_observation_argv(
+    pid: int,
+    argv: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Remove only TermDeck's verified private-state launch decoration.
+
+    The private wrapper prepends ``-c sqlite_home=...`` and unattended exact
+    recovery adds the hook-trust flag.  Neither belongs in durable user launch
+    metadata.  Arbitrary config values still fail closed: the override is
+    removed only when it points exactly at this process's absolute CODEX_HOME.
+    """
+
+    if len(argv) < 3 or argv[1] not in {"-c", "--config"}:
+        return argv
+    try:
+        with open(f"{_PROC}/{pid}/environ", "rb") as handle:
+            raw_environment = handle.read(1024 * 1024 + 1)
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return argv
+    if len(raw_environment) > 1024 * 1024:
+        return argv
+    codex_home = ""
+    for entry in raw_environment.split(b"\0"):
+        if entry.startswith(b"CODEX_HOME="):
+            codex_home = os.fsdecode(entry.split(b"=", 1)[1])
+            break
+    if not codex_home or not Path(codex_home).is_absolute():
+        return argv
+    raw_value = argv[2]
+    if not raw_value.startswith("sqlite_home="):
+        return argv
+    configured = raw_value.split("=", 1)[1]
+    if (
+        len(configured) >= 2
+        and configured[0] == configured[-1]
+        and configured[0] in {"'", '"'}
+    ):
+        configured = configured[1:-1]
+    if os.path.normpath(configured) != os.path.normpath(codex_home):
+        return argv
+    cleaned = [argv[0], *argv[3:]]
+    try:
+        cleaned.remove("--dangerously-bypass-hook-trust")
+    except ValueError:
+        pass
+    return tuple(cleaned)
+
+
 def _process_cwd(pid: int) -> str | None:
     """Read one process cwd while it is still live and resolvable."""
 
@@ -180,6 +228,96 @@ def safe_codex_recovery_command(
     return shlex.join(command)
 
 
+def safe_claude_recovery_command(argv: Sequence[str]) -> str | None:
+    """Return one canonical exact Claude recovery command, or reject it.
+
+    ``cc-go-ulw`` supplies credentials, model routing, and settings before it
+    execs Claude Code.  Recovery must therefore retain that launcher while
+    discarding path aliases and every option other than one exact session UUID.
+    A bare launcher is a new conversation, not recovery state.
+    """
+
+    if not argv or str(argv[0]) != "cc-go-ulw":
+        return None
+    args = [str(part) for part in argv[1:]]
+    if len(args) != 2 or args[0] != "--resume":
+        return None
+    raw_session_id = args[1]
+    session_id = _canonical_codex_session_id(raw_session_id)
+    if session_id is None or raw_session_id != session_id:
+        return None
+    return shlex.join(["cc-go-ulw", "--resume", session_id])
+
+
+def _claude_process(argv: Sequence[str]) -> bool:
+    """Recognize the configured wrapper or Claude's exec-replaced binary."""
+
+    if not argv:
+        return False
+    executable = Path(str(argv[0]))
+    if executable.name in {"cc-go-ulw", "claude", "claude-code"}:
+        return True
+    parts = executable.parts
+    return len(parts) >= 3 and parts[-2] == "versions" and parts[-3] == "claude"
+
+
+def _primary_claude_session_id(pid: int) -> str | None:
+    """Read the primary Claude project JSONL held open by one live process.
+
+    Primary conversations are root ``projects/<encoded-cwd>/<uuid>.jsonl``
+    files.  Nested subagent/tool-result JSONLs are deliberately excluded.  The
+    first bounded record must identify the same UUID as the filename; no prompt
+    or transcript content is inspected.
+    """
+
+    proc_cwd = _process_cwd(pid)
+    candidates: list[tuple[int, int, str]] = []
+    try:
+        fd_names = os.listdir(f"{_PROC}/{pid}/fd")
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+
+    for fd_name in fd_names:
+        try:
+            target = os.readlink(f"{_PROC}/{pid}/fd/{fd_name}")
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+            continue
+        path = Path(target)
+        if (
+            path.suffix != ".jsonl"
+            or path.parent.parent.name != "projects"
+        ):
+            continue
+        session_id = _canonical_codex_session_id(path.stem)
+        if session_id is None or path.stem != session_id:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                first_line = handle.readline(65537)
+            if not first_line or len(first_line) > 65536:
+                continue
+            payload = json.loads(first_line)
+            if not isinstance(payload, dict):
+                continue
+            observed_id = _canonical_codex_session_id(payload.get("sessionId"))
+            if observed_id != session_id:
+                continue
+            metadata_cwd = payload.get("cwd")
+            rank = 0 if proc_cwd and metadata_cwd == proc_cwd else 1
+            try:
+                modified_ns = os.stat(path).st_mtime_ns
+            except OSError:
+                modified_ns = 0
+            candidates.append((rank, -modified_ns, session_id))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][2]
+
+
 def observe_recovery_metadata(
     root_pid: int,
 ) -> tuple[bool, str | None, str | None]:
@@ -202,7 +340,10 @@ def observe_recovery_metadata(
             continue
         observed = True
         session_id = _primary_codex_session_id(pid)
-        command = safe_codex_recovery_command(argv, session_id=session_id)
+        command = safe_codex_recovery_command(
+            _managed_codex_observation_argv(pid, argv),
+            session_id=session_id,
+        )
         if command is not None:
             cwd = _process_cwd(pid)
             if session_id is not None:
@@ -224,6 +365,28 @@ def observe_recovery_metadata(
                 continue
             if weaker_codex is None:
                 weaker_codex = (command, cwd)
+            continue
+
+        claude_session_id = _primary_claude_session_id(pid) if _claude_process(argv) else None
+        if claude_session_id is not None:
+            command = safe_claude_recovery_command(
+                ("cc-go-ulw", "--resume", claude_session_id)
+            )
+        else:
+            command = safe_claude_recovery_command(argv)
+        if command is None:
+            continue
+        stat = _parse_stat(pid)
+        if not stat:
+            continue
+        # cc-go-ulw is a direct terminal launcher, so exact Claude recovery is
+        # retained only for the foreground TTY process.  This excludes detached
+        # helpers which may briefly share the primary transcript descriptor.
+        if int(stat.get("tty_nr", 0)) == 0 or int(stat.get("pgrp", -1)) != int(
+            stat.get("tpgid", -2)
+        ):
+            continue
+        return True, command, _process_cwd(pid)
     if weaker_codex is not None:
         return True, weaker_codex[0], weaker_codex[1]
     return observed, None, None

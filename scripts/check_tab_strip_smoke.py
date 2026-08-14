@@ -62,11 +62,13 @@ def main() -> int:
         workdir = root / "client-api"
         live_workdir = root / "live-cwd"
         renamed_workdir = root / "renamed-cwd"
+        reopened_workdir = root / "reopened-cwd"
         home.mkdir()
         tmux_tmp.mkdir(mode=0o700)
         workdir.mkdir()
         live_workdir.mkdir()
         renamed_workdir.mkdir()
+        reopened_workdir.mkdir()
         os.environ["HOME"] = str(home)
         os.environ["TMUX_TMPDIR"] = str(tmux_tmp)
         os.environ["NO_AT_BRIDGE"] = "1"
@@ -160,6 +162,37 @@ def main() -> int:
             if renamed_close.get_label() != "×":
                 raise AssertionError("rename changed the close control")
 
+            # Reproduce a rapid ``cd`` followed immediately by closing the tab.
+            # The close path must snapshot tmux's live cwd before detaching so
+            # Ctrl+Shift+T can reattach the same session in the right directory.
+            app.backend.send_text(renamed, f"cd {shlex.quote(str(reopened_workdir))}")
+            _drain_gtk(
+                Gtk,
+                until=lambda: app.backend.current_directory(renamed)
+                == str(reopened_workdir.resolve()),
+            )
+            if not window.hide_tab(renamed.id, include_pinned=True):
+                raise AssertionError("close path did not hide the live tab")
+            closed = app.store.get(renamed.id)
+            if closed is None or closed.visible:
+                raise AssertionError("closed tab was not retained as hidden")
+            if closed.cwd != str(reopened_workdir.resolve()):
+                raise AssertionError(
+                    f"close snapshot stored {closed.cwd!r}, expected {str(reopened_workdir.resolve())!r}"
+                )
+            if window.reopen_last_closed_tab() != 1:
+                raise AssertionError("reopen-last-closed did not restore the hidden tab")
+            _drain_gtk(
+                Gtk,
+                until=lambda: renamed.id in window.tabs
+                and window.tabs[renamed.id].widget.process is not None,
+            )
+            reopened = app.store.get(renamed.id)
+            if reopened is None or not reopened.visible:
+                raise AssertionError("reopened tab was not marked visible")
+            if app.backend.current_directory(reopened) != str(reopened_workdir.resolve()):
+                raise AssertionError("reopened tab did not retain its live directory")
+
             print(
                 json.dumps(
                     {
@@ -167,6 +200,8 @@ def main() -> int:
                         "initial_label": "client-api",
                         "tracked_cwd_label": "live-cwd",
                         "renamed_label": "api-renamed",
+                        "reopened_directory": str(reopened_workdir.resolve()),
+                        "reopened_same_session": True,
                         "visible_decoration": False,
                         "close_control": "×",
                     },

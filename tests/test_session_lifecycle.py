@@ -1,12 +1,16 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from termdeck.session_lifecycle import archive_records, compact_window, hide_records, move_records, pin_records, recently_closed_records, rename_record, reopen_closed_records, retag_records, show_records, unpin_records
-from termdeck.session_store import SessionStore
+from termdeck.session_store import SessionStore, utc_now
 
 
 class SessionLifecycleTests(unittest.TestCase):
+    def test_session_timestamps_have_fractional_precision_for_close_ordering(self):
+        self.assertRegex(utc_now(), r"\.\d{6}\+00:00$")
+
     def test_hide_compacts_visible_tab_order_without_killing_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")
@@ -141,7 +145,50 @@ class SessionLifecycleTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_runtime_reconciliation_preserves_recently_closed_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                first = store.create("first", "dev", "bash", tmp)
+                second = store.create("second", "dev", "bash", tmp)
+                second_closed_at = "2026-08-12T19:00:00.000001+00:00"
+                first_closed_at = "2026-08-12T19:00:00.000002+00:00"
+                with patch(
+                    "termdeck.session_lifecycle.utc_now",
+                    return_value=second_closed_at,
+                ):
+                    hide_records(store, [second])
+                with patch(
+                    "termdeck.session_lifecycle.utc_now",
+                    return_value=first_closed_at,
+                ):
+                    hide_records(store, [first])
 
+                store.update_runtime_states(
+                    [
+                        (first.id, "running", False, 101),
+                        (second.id, "running", False, 202),
+                    ]
+                )
+
+                self.assertEqual(
+                    [record.id for record in store.hidden_records()],
+                    [first.id, second.id],
+                )
+                self.assertEqual(
+                    [record.id for record in recently_closed_records(store)],
+                    [first.id, second.id],
+                )
+                self.assertEqual(
+                    store.get(first.id).last_opened_at,  # type: ignore[union-attr]
+                    first_closed_at,
+                )
+                self.assertEqual(
+                    store.get(second.id).last_opened_at,  # type: ignore[union-attr]
+                    second_closed_at,
+                )
+            finally:
+                store.close()
 
     def test_pinned_tabs_are_front_loaded_and_protected_until_unpinned(self):
         import tempfile

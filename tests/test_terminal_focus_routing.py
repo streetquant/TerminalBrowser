@@ -28,7 +28,7 @@ class TerminalFocusRoutingTest(TestCase):
             terminal=SimpleNamespace(get_has_selection=lambda: False),
             copy_clipboard=lambda: calls.append("copy"),
             paste_clipboard=lambda: calls.append("paste"),
-            _set_history_cursor_hidden=lambda hidden: calls.append(("cursor-hidden", hidden)),
+            prepare_for_live_input=lambda: calls.append(("restore", "scrolling")) or True,
         )
         backend = SimpleNamespace(scroll_view_active=lambda candidate: candidate is record)
         window = SimpleNamespace(
@@ -41,7 +41,6 @@ class TerminalFocusRoutingTest(TestCase):
             _terminal_has_selection=lambda _attach: False,
             _is_paste_event=lambda _event: False,
             current_record=lambda: record,
-            _restore_live_terminal=lambda candidate: calls.append(("restore", candidate.id)),
         )
         event = SimpleNamespace(keyval=gtk_app.Gdk.KEY_x, state=0)
 
@@ -50,7 +49,7 @@ class TerminalFocusRoutingTest(TestCase):
         self.assertFalse(handled)
         self.assertEqual(
             calls,
-            [("restore", "scrolling"), ("cursor-hidden", False)],
+            [("restore", "scrolling")],
         )
 
     def test_paste_restores_live_view_before_clipboard_delivery(self) -> None:
@@ -60,7 +59,7 @@ class TerminalFocusRoutingTest(TestCase):
             terminal=SimpleNamespace(get_has_selection=lambda: False),
             copy_clipboard=lambda: calls.append("copy"),
             paste_clipboard=lambda: calls.append("paste"),
-            _set_history_cursor_hidden=lambda hidden: calls.append(("cursor-hidden", hidden)),
+            prepare_for_live_input=lambda: calls.append(("restore", "scrolling")) or True,
         )
         backend = SimpleNamespace(scroll_view_active=lambda candidate: candidate is record)
         window = SimpleNamespace(
@@ -73,7 +72,6 @@ class TerminalFocusRoutingTest(TestCase):
             _terminal_has_selection=lambda _attach: False,
             _is_paste_event=lambda _event: True,
             current_record=lambda: record,
-            _restore_live_terminal=lambda candidate: calls.append(("restore", candidate.id)),
         )
         event = SimpleNamespace(keyval=gtk_app.Gdk.KEY_v, state=0)
 
@@ -82,18 +80,15 @@ class TerminalFocusRoutingTest(TestCase):
         self.assertTrue(handled)
         self.assertEqual(
             calls,
-            [("restore", "scrolling"), ("cursor-hidden", False), "paste"],
+            [("restore", "scrolling"), "paste"],
         )
 
     def test_unhandled_window_key_focuses_terminal_and_delivers_first_event(self) -> None:
         terminal = TerminalStub()
         attach = SimpleNamespace(
             terminal=terminal,
-            prepare_for_live_input=lambda: None,
-            scroll_to_bottom=lambda: setattr(
-                terminal,
-                "bottom_count",
-                terminal.bottom_count + 1,
+            prepare_for_live_input=lambda: (
+                setattr(terminal, "bottom_count", terminal.bottom_count + 1) or True
             ),
         )
         chrome = object()
@@ -119,8 +114,7 @@ class TerminalFocusRoutingTest(TestCase):
         delivered = []
         attach = SimpleNamespace(
             terminal=terminal,
-            prepare_for_live_input=lambda: None,
-            scroll_to_bottom=lambda: None,
+            prepare_for_live_input=lambda: True,
             feed_key_event=delivered.append,
         )
         window = SimpleNamespace(

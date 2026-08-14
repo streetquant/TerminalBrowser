@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from . import __version__
@@ -15,6 +17,8 @@ from .capture_search import render_output_search_table, search_session_output
 from .control_plan import build_control_plan
 from .desktop_integration import build_install_plan, install_desktop, uninstall_desktop
 from .diagnostics import build_diagnostic_payload, write_diagnostic_bundle
+from .freeze_diagnostics import build_freeze_diagnostic_payload
+from .auth_scope_gc import plan_auth_scope_gc
 from .health import classify_session, health_badge, should_pause_for_attention
 from .persistence import persist_live_sessions, persistence_candidates
 from .quickstart import build_quickstart
@@ -37,7 +41,13 @@ from .shutdown_service import (
 from .shortcuts import build_shortcut_report, render_shortcut_table, shortcut_entries, shortcut_entries_to_dicts, shortcut_profile_names
 from .task_snapshot import build_task_snapshot, filter_task_snapshot, render_task_table, sort_task_snapshot, task_snapshot_to_dicts
 from .terminator_config import TerminatorConfig, load_terminator_theme
-from .tmux_backend import TmuxBackend, TmuxError
+from .tmux_backend import (
+    AuthTransactionBusy,
+    TmuxBackend,
+    TmuxError,
+    auth_transaction_lock,
+    execute_auth_change,
+)
 from .tmux_discovery import adopt_tmux_sessions, discover_tmux_sessions
 from .window_snapshot import build_window_snapshots, filter_window_snapshots, render_window_table, sort_window_snapshots, window_snapshots_to_dicts
 from .workspace_launcher import WorkspaceLaunchError, open_workspace_file
@@ -275,6 +285,45 @@ def cmd_diagnostics(args: argparse.Namespace) -> int:
     if isinstance(payload, dict):
         payload.setdefault("ok", True)
         payload.setdefault("action", "diagnostics")
+    _print_json(payload)
+    return 0
+
+
+def cmd_diagnose_freeze(args: argparse.Namespace) -> int:
+    """Emit one bounded, capture-free snapshot for terminal/Codex stalls."""
+
+    try:
+        payload = build_freeze_diagnostic_payload(
+            db_path=args.db,
+            auth_root=getattr(args, "auth_root", None),
+        )
+    except Exception as exc:
+        _print_json({"ok": False, "action": "diagnose-freeze", "error": str(exc)})
+        return 1
+    payload.setdefault("ok", True)
+    payload.setdefault("action", "diagnose-freeze")
+    _print_json(payload)
+    return 0
+
+
+def cmd_auth_gc(args: argparse.Namespace) -> int:
+    """Report orphan private Codex scopes without mutating their contents."""
+
+    min_age_seconds = max(0.0, float(getattr(args, "min_age_hours", 24.0))) * 3600.0
+    try:
+        payload = plan_auth_scope_gc(
+            db_path=args.db,
+            auth_root=getattr(args, "auth_root", None),
+            min_age_seconds=min_age_seconds,
+        )
+    except Exception as exc:
+        _print_json({"ok": False, "action": "auth-gc", "error": str(exc)})
+        return 1
+    payload["mutation_available"] = False
+    payload["detail"] = (
+        "dry-run only: quarantine remains disabled until its isolated mutation "
+        "and rollback path can be exercised end-to-end"
+    )
     _print_json(payload)
     return 0
 
@@ -1274,6 +1323,62 @@ def cmd_sessions(args: argparse.Namespace) -> int:
     return 0
 
 
+def _auth_activation_updates(activation) -> dict[str, object]:
+    """Translate an activation receipt into durable session metadata."""
+
+    updates: dict[str, object] = {}
+    command = getattr(activation, "command", None)
+    cwd = getattr(activation, "cwd", None)
+    if command is not None:
+        updates["command"] = command
+    if cwd is not None:
+        updates["cwd"] = cwd
+    if bool(getattr(activation, "clear_recovery", False)):
+        updates["recovery_command"] = None
+        updates["recovery_cwd"] = None
+    else:
+        recovery_command = getattr(activation, "recovery_command", None)
+        if recovery_command is not None:
+            updates["recovery_command"] = recovery_command
+            updates["recovery_cwd"] = getattr(activation, "recovery_cwd", None)
+    status = getattr(activation, "status", None)
+    if status is not None:
+        updates["status"] = status
+        updates["last_pid"] = getattr(activation, "pid", None)
+    return updates
+
+
+def _persist_auth_update_with_retry(
+    store: SessionStore,
+    session_id: str,
+    updates: dict[str, object],
+):
+    """Keep the scope lock until a transient durable-store failure clears.
+
+    A successful credential/process transaction must not become visible to a
+    second picker while SessionStore still describes the previous account.
+    CLI callers therefore retain the flock and retry the small SQLite commit;
+    Ctrl-C remains the explicit escape for a genuinely permanent storage
+    failure.
+    """
+
+    delay = 0.05
+    warned = False
+    while True:
+        try:
+            return store.update(session_id, **updates)
+        except (OSError, sqlite3.Error) as exc:
+            if not warned:
+                print(
+                    "termdeck: could not save Codex account state; retrying while "
+                    f"this terminal remains protected: {exc}",
+                    file=sys.stderr,
+                )
+                warned = True
+            time.sleep(delay)
+            delay = min(1.0, delay * 2)
+
+
 def cmd_auth(args: argparse.Namespace) -> int:
     """Inspect or switch the private Codex account for exactly one terminal."""
 
@@ -1308,44 +1413,45 @@ def cmd_auth(args: argparse.Namespace) -> int:
         manager = CodexAuthManager(account_source=store.account_source)
         requested = (getattr(args, "switch_account", None) or "").strip()
         activation = None
+        transaction_ok = True
+        transaction_error = ""
         if requested:
-            record = store.update(record.id, pending_account=requested)
-            result = manager.switch(record, requested)
-            if not result.ok:
-                record = store.update(record.id, pending_account=None)
-                payload = result.state.to_dict()
-                payload.update(
-                    {
-                        "action": "auth-switch",
-                        "ok": False,
-                        "id": record.id,
-                        "name": record.name,
-                        "auth_scope_id": record.auth_scope_id,
-                        "pending_account": None,
-                        "auth_restart_required": record.auth_restart_required,
-                        "error": result.error,
-                    }
-                )
-                _print_json(payload)
-                return 1
-            activation = TmuxBackend().activate_auth_change(record)
-            updates: dict[str, object] = {
-                "selected_account": result.state.selected_account,
-                "pending_account": None,
-                "auth_restart_required": not activation.ok,
-                "auth_changed_at": utc_now(),
-            }
-            if activation.recovery_command is not None:
-                updates["recovery_command"] = activation.recovery_command
-                updates["recovery_cwd"] = activation.recovery_cwd
-            if activation.status is not None:
-                updates["status"] = activation.status
-                updates["last_pid"] = activation.pid
-            record = store.update(
-                record.id,
-                **updates,
-            )
-            state = result.state
+            backend = TmuxBackend()
+            try:
+                with auth_transaction_lock(record):
+                    previous_state = manager.state(record)
+                    transaction = execute_auth_change(
+                        backend,
+                        manager,
+                        record,
+                        previous_state,
+                        requested,
+                    )
+                    transaction_ok = transaction.ok
+                    transaction_error = transaction.error
+                    activation = transaction.activation
+                    if transaction.switch_result is None:
+                        # Planning/quiescence failed before credentials or
+                        # durable session metadata changed. Preserve the whole
+                        # prior record, including any pre-existing marker.
+                        state = previous_state
+                    else:
+                        state = transaction.switch_result.state
+                        updates: dict[str, object] = {
+                            "selected_account": state.selected_account,
+                            "pending_account": None,
+                            "auth_restart_required": not (
+                                activation is not None and activation.ok
+                            ),
+                            "auth_changed_at": utc_now(),
+                        }
+                        if activation is not None:
+                            updates.update(_auth_activation_updates(activation))
+                        record = _persist_auth_update_with_retry(store, record.id, updates)
+            except AuthTransactionBusy as exc:
+                state = manager.state(record)
+                transaction_ok = False
+                transaction_error = str(exc)
             action = "auth-switch"
         else:
             state = manager.state(record)
@@ -1362,7 +1468,7 @@ def cmd_auth(args: argparse.Namespace) -> int:
         payload.update(
             {
                 "action": action,
-                "ok": True,
+                "ok": transaction_ok,
                 "id": record.id,
                 "name": record.name,
                 "auth_scope_id": record.auth_scope_id,
@@ -1374,11 +1480,14 @@ def cmd_auth(args: argparse.Namespace) -> int:
                 "auth_activation_detail": activation.detail if activation is not None else None,
             }
         )
-        if activation is not None and not activation.ok:
-            payload["ok"] = False
-            payload["error"] = activation.detail
+        if not transaction_ok:
+            payload["error"] = transaction_error or (
+                str(getattr(activation, "detail", ""))
+                if activation is not None
+                else "Codex account transaction failed"
+            )
         _print_json(payload)
-        return 0 if activation is None or activation.ok else 1
+        return 0 if transaction_ok else 1
     except CodexAuthError as exc:
         _print_json({"action": "auth", "ok": False, "error": str(exc)})
         return 1
@@ -1426,6 +1535,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_arg(diagnostics)
     diagnostics.add_argument("--output", type=Path, default=None, help="write a ZIP diagnostic bundle instead of printing the full JSON report")
     diagnostics.set_defaults(func=cmd_diagnostics)
+
+    diagnose_freeze = sub.add_parser(
+        "diagnose-freeze",
+        help="report bounded I/O pressure, blocked tasks, and Codex state footprint",
+    )
+    diagnose_freeze.add_argument("--db", type=Path, default=None)
+    diagnose_freeze.add_argument("--auth-root", type=Path, default=None)
+    diagnose_freeze.set_defaults(func=cmd_diagnose_freeze)
+
+    auth_gc = sub.add_parser(
+        "auth-gc",
+        help="dry-run orphan private Codex scope analysis without modifying state",
+    )
+    auth_gc.add_argument("--db", type=Path, default=None)
+    auth_gc.add_argument("--auth-root", type=Path, default=None)
+    auth_gc.add_argument("--min-age-hours", type=float, default=24.0)
+    auth_gc.set_defaults(func=cmd_auth_gc)
 
     settings_sample = sub.add_parser("settings-sample", help="print a sample TermDeck settings JSON file")
     settings_sample.set_defaults(func=cmd_settings_sample)

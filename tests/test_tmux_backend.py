@@ -1,13 +1,38 @@
+import os
+import fcntl
+import signal
 import sqlite3
 import subprocess
 import tempfile
-from pathlib import Path
+import threading
+import time
 import unittest
+from contextlib import contextmanager
+from pathlib import Path
 from unittest import mock
 
 from termdeck.checkpointing import CheckpointResult
+from termdeck.codex_auth import prepare_auth_scope
+from termdeck.codex_config_scope import CodexConfigScopeError
+from termdeck.history_control import (
+    BackendHistoryState,
+    EdgeKnowledge,
+    HistoryOwner,
+    ScrollDisposition,
+)
 from termdeck.models import SessionRecord
-from termdeck.tmux_backend import ScrollDisposition, TmuxBackend, TmuxError
+from termdeck.resources import process_tree
+from termdeck.tmux_backend import (
+    AuthTransactionBusy,
+    TmuxBackend,
+    TmuxError,
+    _AuthLifetimeLease,
+    _AuthPaneIdentity,
+    _acquire_auth_lifetime_lease,
+    _auth_legacy_lifetime_lock_path,
+    _auth_lifetime_lock_path,
+    auth_transaction_lock,
+)
 
 
 def _record(**kwargs) -> SessionRecord:
@@ -23,6 +48,190 @@ def _record(**kwargs) -> SessionRecord:
     )
     base.update(kwargs)
     return SessionRecord(**base)
+
+
+def _auth_record(**kwargs) -> SessionRecord:
+    return _record(
+        auth_scope_id="auth-test",
+        codex_home="/tmp/auth-test",
+        **kwargs,
+    )
+
+
+def _auth_identity(
+    *,
+    command: str = "bash",
+    cwd: str = "/tmp",
+    session_created: str = "1700000000",
+    pane_id: str = "%1",
+    pane_pid: int = 100,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        args=["tmux"],
+        returncode=0,
+        stdout=(
+            f"{session_created}\t{pane_id}\t{pane_pid}\t{command}\t{cwd}\t0\n"
+        ),
+        stderr="",
+    )
+
+
+def _auth_pane_identity(
+    *,
+    command: str = "bash",
+    cwd: str = "/tmp",
+    session_created: str = "1700000000",
+    pane_id: str = "%1",
+    pane_pid: int = 100,
+) -> _AuthPaneIdentity:
+    return _AuthPaneIdentity(
+        session_created=session_created,
+        pane_id=pane_id,
+        pane_pid=pane_pid,
+        current_command=command,
+        current_path=cwd,
+    )
+
+
+@contextmanager
+def _stable_auth_process(
+    backend: TmuxBackend,
+    *,
+    environment_ready: bool,
+):
+    """Provide PID-reuse-safe process evidence without depending on host PIDs."""
+
+    lease = mock.Mock(name="auth_lifetime_lease")
+    with mock.patch.object(
+        TmuxBackend,
+        "_auth_process_identity",
+        return_value=("S", 1),
+    ), mock.patch.object(
+        TmuxBackend,
+        "_private_auth_process_environment_ready",
+        return_value=environment_ready,
+    ), mock.patch(
+        "termdeck.tmux_backend._acquire_auth_lifetime_lease",
+        return_value=lease,
+    ), mock.patch(
+        "termdeck.tmux_backend._auth_transaction_is_held",
+        return_value=True,
+    ):
+        yield lease
+
+
+@contextmanager
+def _auth_input_gate(backend: TmuxBackend):
+    """Model a verified tmux input gate without invoking a real server."""
+
+    with mock.patch.object(
+        backend,
+        "_disable_auth_pane_input",
+        return_value=False,
+    ) as disable, mock.patch.object(
+        backend,
+        "_restore_auth_pane_input",
+    ) as restore:
+        yield disable, restore
+
+
+@contextmanager
+def _private_launch_receipts(backend: TmuxBackend):
+    """Isolate private-state tests from tmux/config and gate side effects."""
+
+    lease = mock.Mock(name="private_launch_lease", held=True)
+    with mock.patch.object(
+        backend,
+        "_auth_session_exists",
+        return_value=False,
+    ) as exists, mock.patch(
+        "termdeck.tmux_backend._acquire_auth_lifetime_lease",
+        return_value=lease,
+    ) as acquire, mock.patch(
+        "termdeck.tmux_backend.migrate_quiescent_codex_configuration",
+    ) as migrate:
+        yield exists, acquire, migrate, lease
+
+
+def _write_state_db(
+    path: Path,
+    *,
+    status: str = "complete",
+    threads: list[tuple[str, str, str]] | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
+    connection.executescript(
+        """
+        CREATE TABLE _sqlx_migrations (
+            version BIGINT PRIMARY KEY,
+            description TEXT NOT NULL,
+            installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            success BOOLEAN NOT NULL,
+            checksum BLOB NOT NULL,
+            execution_time BIGINT NOT NULL
+        );
+        CREATE TABLE backfill_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            status TEXT NOT NULL,
+            last_watermark TEXT,
+            last_success_at INTEGER,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE thread_sections (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            rollout_path TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0,
+            thread_section_id TEXT REFERENCES thread_sections(id) ON DELETE SET NULL
+        );
+        CREATE TABLE thread_dynamic_tools (
+            thread_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            input_schema TEXT NOT NULL,
+            defer_loading INTEGER NOT NULL,
+            namespace TEXT,
+            PRIMARY KEY(thread_id, position),
+            FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+        );
+        CREATE TABLE thread_spawn_edges (id TEXT PRIMARY KEY);
+        CREATE TABLE remote_control_enrollments (id TEXT PRIMARY KEY);
+        CREATE TABLE external_agent_config_imports (id TEXT PRIMARY KEY);
+        """
+    )
+    connection.executemany(
+        """
+        INSERT INTO _sqlx_migrations(
+            version, description, success, checksum, execution_time
+        ) VALUES (?, ?, 1, ?, ?)
+        """,
+        [
+            (version, f"migration {version}", bytes([version]) * 48, version * 10)
+            for version in range(1, 47)
+        ],
+    )
+    connection.execute(
+        """
+        INSERT INTO backfill_state(
+            id, status, last_watermark, last_success_at, updated_at
+        ) VALUES (1, ?, 'sessions/last.jsonl', 1234, 1234)
+        """,
+        (status,),
+    )
+    connection.execute(
+        "INSERT INTO thread_sections(id, name) VALUES (?, 'Pinned')",
+        ("01984de2-8f74-7c91-a3b2-5c5e937cf318",),
+    )
+    connection.executemany(
+        "INSERT INTO threads(id, rollout_path, cwd) VALUES (?, ?, ?)",
+        threads or [],
+    )
+    connection.commit()
+    connection.close()
 
 
 class FakeCheckpointManager:
@@ -51,6 +260,47 @@ class FakeCheckpointManager:
 
 
 class TmuxBackendTests(unittest.TestCase):
+    def test_recovery_pending_relaunches_exact_claude_session_without_dmtcp(self):
+        session_id = "d2a7ed1b-d6fd-45de-8342-5f10cfed3c07"
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_cwd = Path(tmp) / "saved"
+            recovery_cwd = Path(tmp) / "recovery"
+            saved_cwd.mkdir()
+            recovery_cwd.mkdir()
+            record = _record(
+                command="cc-go-ulw",
+                cwd=str(saved_cwd),
+                recovery_command=f"cc-go-ulw --resume {session_id}",
+                recovery_cwd=str(recovery_cwd),
+                status="recovery-pending",
+            )
+            checkpoints = FakeCheckpointManager()
+            backend = TmuxBackend(executable="tmux", checkpoint_manager=checkpoints)
+            completed = subprocess.CompletedProcess(
+                args=["tmux"], returncode=0, stdout="", stderr=""
+            )
+
+            with mock.patch.object(
+                backend, "session_exists", return_value=False
+            ), mock.patch.object(backend, "_run", return_value=completed) as run:
+                backend.create_or_resume(record)
+
+            self.assertEqual(
+                run.call_args_list[0],
+                mock.call(
+                    [
+                        "new-session",
+                        "-d",
+                        "-s",
+                        record.tmux_name,
+                        "-c",
+                        str(recovery_cwd.resolve()),
+                        f"cc-go-ulw --resume {session_id}",
+                    ]
+                ),
+            )
+            self.assertEqual(checkpoints.wrapped, [])
+
     def test_crash_restart_relaunches_exact_codex_session_then_returns_to_the_shell(self):
         session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
         with tempfile.TemporaryDirectory() as tmp:
@@ -94,37 +344,53 @@ class TmuxBackendTests(unittest.TestCase):
         session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            source_db = root / "source-state.sqlite"
-            private_home = root / "private"
+            source_db = root / "source?#%-state.sqlite"
+            private_home = root / "auth-one"
             private_home.mkdir()
+            private_bin = private_home / "bin"
+            private_bin.mkdir()
+            private_codex = private_bin / "codex"
+            private_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            private_codex.chmod(0o700)
             private_db = private_home / "state_5.sqlite"
-            schema = """
-                CREATE TABLE threads (
-                    id TEXT PRIMARY KEY,
-                    rollout_path TEXT NOT NULL,
-                    cwd TEXT,
-                    archived INTEGER NOT NULL DEFAULT 0
-                );
-            """
-            for path in (source_db, private_db):
-                con = sqlite3.connect(path)
-                con.executescript(schema)
-                con.commit()
-                con.close()
+            sessions = root / "sessions"
+            sessions.mkdir()
+            rollout = sessions / "canonical-rollout.jsonl"
+            rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+            (private_home / "sessions").symlink_to(sessions, target_is_directory=True)
+            _write_state_db(
+                source_db,
+                threads=[(session_id, str(rollout), str(root))],
+            )
+            _write_state_db(
+                private_db,
+                threads=[
+                    (
+                        "019f0000-0000-7000-8000-000000000001",
+                        str(root / "local.jsonl"),
+                        str(root),
+                    )
+                ],
+            )
             source = sqlite3.connect(source_db)
             source.execute(
-                "INSERT INTO threads(id, rollout_path, cwd, archived) VALUES (?, ?, ?, 0)",
-                (session_id, str(root / "canonical-rollout.jsonl"), str(root)),
+                "INSERT INTO thread_sections(id, name) VALUES ('custom-section', 'Recovered')"
+            )
+            source.execute(
+                "UPDATE threads SET thread_section_id='custom-section' WHERE id=?",
+                (session_id,),
+            )
+            source.execute(
+                """
+                INSERT INTO thread_dynamic_tools(
+                    thread_id, position, name, description, input_schema,
+                    defer_loading, namespace
+                ) VALUES (?, 0, 'lookup', 'Exact tool', '{"type":"object"}', 1, 'recovery')
+                """,
+                (session_id,),
             )
             source.commit()
             source.close()
-            private = sqlite3.connect(private_db)
-            private.execute(
-                "INSERT INTO threads(id, rollout_path, cwd, archived) VALUES (?, ?, ?, 0)",
-                ("019f0000-0000-7000-8000-000000000001", str(root / "local.jsonl"), str(root)),
-            )
-            private.commit()
-            private.close()
 
             record = _record(
                 command="/bin/bash",
@@ -139,7 +405,7 @@ class TmuxBackendTests(unittest.TestCase):
             completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
             with mock.patch.dict(
                 "os.environ", {"TERMDECK_CODEX_STATE_SOURCE": str(source_db)}, clear=False
-            ), mock.patch.object(backend, "session_exists", return_value=False), mock.patch.object(
+            ), _private_launch_receipts(backend), mock.patch.object(
                 backend, "_run", return_value=completed
             ):
                 backend.create_or_resume(record)
@@ -147,26 +413,38 @@ class TmuxBackendTests(unittest.TestCase):
             private = sqlite3.connect(private_db)
             try:
                 rows = dict(private.execute("SELECT id, rollout_path FROM threads"))
+                section = private.execute(
+                    "SELECT id, name FROM thread_sections WHERE id='custom-section'"
+                ).fetchone()
+                tool = private.execute(
+                    """
+                    SELECT position, name, description, input_schema,
+                           defer_loading, namespace
+                    FROM thread_dynamic_tools WHERE thread_id=?
+                    """,
+                    (session_id,),
+                ).fetchone()
             finally:
                 private.close()
             self.assertEqual(len(rows), 2)
-            self.assertEqual(rows[session_id], str(root / "canonical-rollout.jsonl"))
+            self.assertEqual(rows[session_id], str(rollout))
             self.assertIn("019f0000-0000-7000-8000-000000000001", rows)
+            self.assertEqual(section, ("custom-section", "Recovered"))
+            self.assertEqual(
+                tool,
+                (0, "lookup", "Exact tool", '{"type":"object"}', 1, "recovery"),
+            )
 
     def test_exact_recovery_fails_closed_when_thread_metadata_cannot_be_hydrated(self):
         session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source_db = root / "source-state.sqlite"
-            private_home = root / "private"
+            private_home = root / "auth-one"
             private_home.mkdir()
             private_db = private_home / "state_5.sqlite"
-            schema = "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, cwd TEXT, archived INTEGER NOT NULL DEFAULT 0);"
-            for path in (source_db, private_db):
-                con = sqlite3.connect(path)
-                con.execute(schema)
-                con.commit()
-                con.close()
+            _write_state_db(source_db)
+            _write_state_db(private_db)
 
             record = _record(
                 command="/bin/bash",
@@ -180,12 +458,273 @@ class TmuxBackendTests(unittest.TestCase):
             backend = TmuxBackend(executable="tmux")
             with mock.patch.dict(
                 "os.environ", {"TERMDECK_CODEX_STATE_SOURCE": str(source_db)}, clear=False
-            ), mock.patch.object(backend, "session_exists", return_value=False), mock.patch.object(
+            ), _private_launch_receipts(backend), mock.patch.object(
                 backend, "_run"
             ) as run, self.assertRaisesRegex(TmuxError, "metadata is absent"):
                 backend.create_or_resume(record)
 
             run.assert_not_called()
+
+    def test_exact_recovery_rolls_back_on_dynamic_tool_schema_mismatch(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_db = root / "source-state.sqlite"
+            private_home = root / "auth-one"
+            private_home.mkdir()
+            private_db = private_home / "state_5.sqlite"
+            sessions = root / "sessions"
+            sessions.mkdir()
+            rollout = sessions / "canonical-rollout.jsonl"
+            rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+            (private_home / "sessions").symlink_to(sessions, target_is_directory=True)
+            _write_state_db(
+                source_db,
+                threads=[(session_id, str(rollout), str(root))],
+            )
+            _write_state_db(private_db)
+            private = sqlite3.connect(private_db)
+            private.execute("ALTER TABLE thread_dynamic_tools ADD COLUMN corrupt TEXT")
+            private.commit()
+            private.close()
+            record = _record(
+                command="/bin/bash",
+                cwd=str(root),
+                recovery_command=f"codex --yolo resume {session_id}",
+                recovery_cwd=str(root),
+                status="new",
+                auth_scope_id="auth-one",
+                codex_home=str(private_home),
+            )
+            backend = TmuxBackend(executable="tmux")
+
+            with mock.patch.dict(
+                "os.environ", {"TERMDECK_CODEX_STATE_SOURCE": str(source_db)}, clear=False
+            ), _private_launch_receipts(backend), mock.patch.object(
+                backend, "_run"
+            ) as run, self.assertRaisesRegex(TmuxError, "dynamic_tools schema mismatch"):
+                backend.create_or_resume(record)
+
+            run.assert_not_called()
+            private = sqlite3.connect(private_db)
+            try:
+                self.assertEqual(
+                    private.execute("SELECT count(*) FROM threads WHERE id=?", (session_id,)).fetchone(),
+                    (0,),
+                )
+            finally:
+                private.close()
+
+    def test_exact_recovery_rejects_rollout_outside_shared_history(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_db = root / "source-state.sqlite"
+            private_home = root / "auth-one"
+            private_home.mkdir()
+            private_db = private_home / "state_5.sqlite"
+            sessions = root / "sessions"
+            sessions.mkdir()
+            (private_home / "sessions").symlink_to(sessions, target_is_directory=True)
+            outside = root / "outside.jsonl"
+            outside.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+            _write_state_db(
+                source_db,
+                threads=[(session_id, str(outside), str(root))],
+            )
+            _write_state_db(private_db)
+            record = _record(
+                command="/bin/bash",
+                cwd=str(root),
+                recovery_command=f"codex --yolo resume {session_id}",
+                recovery_cwd=str(root),
+                status="new",
+                auth_scope_id="auth-one",
+                codex_home=str(private_home),
+            )
+            backend = TmuxBackend(executable="tmux")
+
+            with mock.patch.dict(
+                "os.environ", {"TERMDECK_CODEX_STATE_SOURCE": str(source_db)}, clear=False
+            ), _private_launch_receipts(backend), mock.patch.object(
+                backend, "_run"
+            ) as run, self.assertRaisesRegex(TmuxError, "outside the private shared-history root"):
+                backend.create_or_resume(record)
+
+            run.assert_not_called()
+
+    def test_exact_recovery_does_not_write_into_a_running_private_backfill(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_db = root / "source-state.sqlite"
+            private_home = root / "auth-one"
+            private_db = private_home / "state_5.sqlite"
+            _write_state_db(
+                source_db,
+                threads=[(session_id, str(root / "canonical-rollout.jsonl"), str(root))],
+            )
+            _write_state_db(private_db, status="running")
+            before = private_db.read_bytes()
+            record = _record(
+                command="/bin/bash",
+                cwd=str(root),
+                recovery_command=f"codex --yolo resume {session_id}",
+                recovery_cwd=str(root),
+                status="new",
+                auth_scope_id="auth-one",
+                codex_home=str(private_home),
+            )
+            backend = TmuxBackend(executable="tmux")
+
+            with mock.patch.dict(
+                "os.environ", {"TERMDECK_CODEX_STATE_SOURCE": str(source_db)}, clear=False
+            ), _private_launch_receipts(backend), mock.patch.object(
+                backend, "_run"
+            ) as run, self.assertRaisesRegex(TmuxError, "backfill is not complete"):
+                backend.create_or_resume(record)
+
+            run.assert_not_called()
+            self.assertEqual(private_db.read_bytes(), before)
+
+    def test_ordinary_codex_launch_does_not_start_on_incomplete_private_backfill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            private_home = root / "auth-one"
+            private_db = private_home / "state_5.sqlite"
+            _write_state_db(private_db, status="pending")
+            before = private_db.read_bytes()
+            record = _record(
+                command="codex",
+                cwd=str(root),
+                status="new",
+                auth_scope_id="auth-one",
+                codex_home=str(private_home),
+            )
+            backend = TmuxBackend(executable="tmux")
+
+            with _private_launch_receipts(backend), mock.patch.object(
+                backend, "_run"
+            ) as run, self.assertRaisesRegex(
+                TmuxError, "backfill is not complete"
+            ):
+                backend.create_or_resume(record)
+
+            run.assert_not_called()
+            self.assertEqual(private_db.read_bytes(), before)
+
+    def test_exact_recovery_rejects_a_different_migration_identity(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_db = root / "source-state.sqlite"
+            private_home = root / "auth-one"
+            private_db = private_home / "state_5.sqlite"
+            _write_state_db(
+                source_db,
+                threads=[(session_id, str(root / "canonical-rollout.jsonl"), str(root))],
+            )
+            _write_state_db(private_db)
+            private = sqlite3.connect(private_db)
+            private.execute(
+                "UPDATE _sqlx_migrations SET checksum=? WHERE version=1",
+                (b"d" * 48,),
+            )
+            private.commit()
+            private.close()
+            before = private_db.read_bytes()
+            record = _record(
+                command="/bin/bash",
+                cwd=str(root),
+                recovery_command=f"codex --yolo resume {session_id}",
+                recovery_cwd=str(root),
+                status="new",
+                auth_scope_id="auth-one",
+                codex_home=str(private_home),
+            )
+            backend = TmuxBackend(executable="tmux")
+
+            with mock.patch.dict(
+                "os.environ", {"TERMDECK_CODEX_STATE_SOURCE": str(source_db)}, clear=False
+            ), _private_launch_receipts(backend), mock.patch.object(
+                backend, "_run"
+            ) as run, self.assertRaisesRegex(TmuxError, "metadata is absent"):
+                backend.create_or_resume(record)
+
+            run.assert_not_called()
+            self.assertEqual(private_db.read_bytes(), before)
+
+    def test_cold_shared_scope_starts_sparse_then_hydrates_only_exact_recovery(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        unrelated_id = "019f0000-0000-7000-8000-000000000099"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_home = root / "source"
+            private_home = root / "auth-one"
+            source_db = source_home / "state_5.sqlite"
+            rollout = source_home / "sessions" / "2026" / "08" / "12" / "rollout.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+            _write_state_db(
+                source_db,
+                threads=[
+                    (session_id, str(rollout), str(root)),
+                    (unrelated_id, str(root / "unrelated.jsonl"), str(root)),
+                ],
+            )
+            # Exact recovery requires the private scope's executable wrapper.
+            # Make that prerequisite deterministic instead of depending on a
+            # host-level `codex` binary being discoverable in the test runner.
+            host_codex = root / "host-codex"
+            host_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            host_codex.chmod(0o700)
+            with mock.patch.dict(
+                "os.environ",
+                {"TERMDECK_CODEX_BINARY": str(host_codex)},
+                clear=False,
+            ):
+                prepare_auth_scope(private_home, account_source=source_home)
+            self.assertTrue((private_home / "bin" / "codex").is_file())
+            self.assertTrue(os.access(private_home / "bin" / "codex", os.X_OK))
+            private_db = private_home / "state_5.sqlite"
+            state = sqlite3.connect(private_db)
+            try:
+                self.assertEqual(
+                    state.execute("SELECT status FROM backfill_state WHERE id=1").fetchone(),
+                    ("complete",),
+                )
+                self.assertEqual(state.execute("SELECT count(*) FROM threads").fetchone(), (0,))
+            finally:
+                state.close()
+
+            record = _record(
+                command="/bin/bash",
+                cwd=str(root),
+                recovery_command=f"codex --yolo resume {session_id}",
+                recovery_cwd=str(root),
+                status="new",
+                auth_scope_id="auth-one",
+                codex_home=str(private_home),
+            )
+            backend = TmuxBackend(executable="tmux")
+            completed = subprocess.CompletedProcess(
+                args=["tmux"], returncode=0, stdout="", stderr=""
+            )
+            with mock.patch.dict(
+                "os.environ", {"TERMDECK_CODEX_STATE_SOURCE": ""}, clear=False
+            ), _private_launch_receipts(backend), mock.patch.object(
+                backend, "_run", return_value=completed
+            ):
+                backend.create_or_resume(record)
+
+            state = sqlite3.connect(private_db)
+            try:
+                self.assertEqual(
+                    state.execute("SELECT id FROM threads ORDER BY id").fetchall(),
+                    [(session_id,)],
+                )
+            finally:
+                state.close()
 
     def test_missing_recovery_directory_falls_back_to_the_saved_tab_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -198,7 +737,9 @@ class TmuxBackendTests(unittest.TestCase):
             backend = TmuxBackend(executable="tmux")
             completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
 
-            with mock.patch.object(backend, "session_exists", return_value=False), mock.patch.object(
+            with mock.patch.object(
+                backend, "session_exists", return_value=False
+            ), mock.patch.object(
                 backend, "_run", return_value=completed
             ) as run:
                 backend.create_or_resume(record)
@@ -271,6 +812,42 @@ class TmuxBackendTests(unittest.TestCase):
         run.assert_not_called()
         self.assertEqual(checkpoints.wrapped, [])
 
+    def test_recovery_pending_bare_claude_launcher_fails_closed(self):
+        checkpoints = FakeCheckpointManager()
+        record = _record(
+            command="cc-go-ulw",
+            recovery_command="cc-go-ulw",
+            status="recovery-pending",
+        )
+        backend = TmuxBackend(executable="tmux", checkpoint_manager=checkpoints)
+
+        with mock.patch.object(
+            backend, "session_exists", return_value=False
+        ), self.assertRaisesRegex(
+            TmuxError,
+            "exact process recovery is unavailable",
+        ), mock.patch.object(backend, "_run") as run:
+            backend.create_or_resume(record)
+
+        run.assert_not_called()
+        self.assertEqual(checkpoints.wrapped, [])
+
+    def test_reclassified_new_claude_launcher_may_start_fresh(self):
+        checkpoints = FakeCheckpointManager()
+        record = _record(command="cc-go-ulw", status="new")
+        backend = TmuxBackend(executable="tmux", checkpoint_manager=checkpoints)
+        completed = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="", stderr=""
+        )
+
+        with mock.patch.object(
+            backend, "session_exists", return_value=False
+        ), mock.patch.object(backend, "_run", return_value=completed) as run:
+            backend.create_or_resume(record)
+
+        self.assertEqual(run.call_args_list[0].args[0][-1], "wrapped(cc-go-ulw)")
+        self.assertEqual(checkpoints.wrapped, [(record.id, "cc-go-ulw")])
+
     def test_deliberately_new_codex_tab_may_start_a_new_session(self):
         checkpoints = FakeCheckpointManager()
         record = _record(command="codex --yolo", status="new")
@@ -289,7 +866,7 @@ class TmuxBackendTests(unittest.TestCase):
 
     def test_private_codex_home_is_injected_into_new_tmux_session(self):
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = Path(tmp) / "auth-home"
+            codex_home = Path(tmp) / "auth-one"
             codex_home.mkdir()
             record = _record(
                 command="/bin/bash",
@@ -300,7 +877,7 @@ class TmuxBackendTests(unittest.TestCase):
             backend = TmuxBackend(executable="tmux")
             completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
 
-            with mock.patch.object(backend, "session_exists", return_value=False), mock.patch.object(
+            with _private_launch_receipts(backend), mock.patch.object(
                 backend, "_run", return_value=completed
             ) as run:
                 backend.create_or_resume(record)
@@ -310,91 +887,927 @@ class TmuxBackendTests(unittest.TestCase):
             self.assertIn("TERMDECK_AUTH_SCOPE_ID=auth-one", launch)
             path_entry = next(item for item in launch if item.startswith("PATH="))
             self.assertTrue(path_entry.split("=", 1)[1].startswith(str(codex_home.resolve() / "bin")))
-            self.assertEqual(launch[-3:], ["-c", tmp, "/bin/bash"])
+            self.assertEqual(launch[-3:-1], ["-c", tmp])
+            self.assertIn("bash --noprofile --rcfile", launch[-1])
+            self.assertIn(str(codex_home / "bin" / ".termdeck-bashrc"), launch[-1])
+            self.assertTrue(launch[-1].endswith(" -i"))
+
+    def test_live_private_session_skips_config_migration_and_new_spawn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "auth-one"
+            codex_home.mkdir()
+            record = _record(
+                cwd=tmp,
+                auth_scope_id="auth-one",
+                codex_home=str(codex_home),
+            )
+            backend = TmuxBackend(executable="tmux")
+
+            with mock.patch.object(
+                backend, "_auth_session_exists", return_value=True
+            ) as exists, mock.patch(
+                "termdeck.tmux_backend._acquire_auth_lifetime_lease"
+            ) as acquire, mock.patch(
+                "termdeck.tmux_backend.migrate_quiescent_codex_configuration"
+            ) as migrate, mock.patch(
+                "termdeck.tmux_backend.ensure_private_codex_state"
+            ) as ensure, mock.patch.object(backend, "_run") as run:
+                backend.create_or_resume(record)
+
+            exists.assert_called_once_with(record)
+            acquire.assert_not_called()
+            migrate.assert_not_called()
+            ensure.assert_not_called()
+            run.assert_not_called()
+
+    def test_absent_private_session_migrates_config_before_state_and_spawn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "auth-one"
+            codex_home.mkdir()
+            record = _record(
+                command="/bin/bash",
+                cwd=tmp,
+                auth_scope_id="auth-one",
+                codex_home=str(codex_home),
+            )
+            backend = TmuxBackend(executable="tmux")
+            events = []
+            lease = mock.Mock(name="lifetime_lease", held=True)
+            lease.release.side_effect = lambda: events.append("lease-release")
+            completed = subprocess.CompletedProcess(
+                args=["tmux"], returncode=0, stdout="", stderr=""
+            )
+
+            with mock.patch.object(
+                backend, "_auth_session_exists", return_value=False
+            ) as exists, mock.patch(
+                "termdeck.tmux_backend._acquire_auth_lifetime_lease",
+                return_value=lease,
+            ), mock.patch(
+                "termdeck.tmux_backend.migrate_quiescent_codex_configuration",
+                side_effect=lambda _home: events.append("migrate"),
+            ) as migrate, mock.patch(
+                "termdeck.tmux_backend.ensure_private_codex_state",
+                side_effect=lambda _home, **_kwargs: events.append("ensure"),
+            ) as ensure, mock.patch.object(
+                backend,
+                "_run",
+                side_effect=lambda args, **_kwargs: (
+                    events.append(args[0]) or completed
+                ),
+            ) as run:
+                backend.create_or_resume(record)
+
+            self.assertEqual(exists.call_args_list, [mock.call(record), mock.call(record)])
+            migrate.assert_called_once_with(str(codex_home))
+            ensure.assert_called_once_with(str(codex_home), require_complete=True)
+            self.assertEqual(run.call_args_list[0].args[0][0], "new-session")
+            self.assertEqual(events[:3], ["migrate", "ensure", "new-session"])
+            self.assertEqual(events[-1], "lease-release")
+            lease.release.assert_called_once_with()
+
+    def test_indeterminate_private_liveness_fails_before_config_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "auth-one"
+            codex_home.mkdir()
+            record = _record(
+                cwd=tmp,
+                auth_scope_id="auth-one",
+                codex_home=str(codex_home),
+            )
+            backend = TmuxBackend(executable="tmux")
+
+            with mock.patch.object(
+                backend,
+                "_auth_session_exists",
+                side_effect=TmuxError("tmux liveness is indeterminate"),
+            ), mock.patch(
+                "termdeck.tmux_backend._acquire_auth_lifetime_lease"
+            ) as acquire, mock.patch(
+                "termdeck.tmux_backend.migrate_quiescent_codex_configuration"
+            ) as migrate, mock.patch(
+                "termdeck.tmux_backend.ensure_private_codex_state"
+            ) as ensure, mock.patch.object(
+                backend, "_run"
+            ) as run, self.assertRaisesRegex(TmuxError, "liveness is indeterminate"):
+                backend.create_or_resume(record)
+
+            acquire.assert_not_called()
+            migrate.assert_not_called()
+            ensure.assert_not_called()
+            run.assert_not_called()
+
+    def test_config_migration_failure_prevents_private_state_and_spawn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "auth-one"
+            codex_home.mkdir()
+            record = _record(
+                cwd=tmp,
+                auth_scope_id="auth-one",
+                codex_home=str(codex_home),
+            )
+            backend = TmuxBackend(executable="tmux")
+            lease = mock.Mock(name="lifetime_lease", held=True)
+
+            with mock.patch.object(
+                backend, "_auth_session_exists", return_value=False
+            ) as exists, mock.patch(
+                "termdeck.tmux_backend._acquire_auth_lifetime_lease",
+                return_value=lease,
+            ), mock.patch(
+                "termdeck.tmux_backend.migrate_quiescent_codex_configuration",
+                side_effect=CodexConfigScopeError("legacy config rollback complete"),
+            ) as migrate, mock.patch(
+                "termdeck.tmux_backend.ensure_private_codex_state"
+            ) as ensure, mock.patch.object(
+                backend, "_run"
+            ) as run, self.assertRaisesRegex(
+                TmuxError, "could not migrate stopped private Codex configuration"
+            ):
+                backend.create_or_resume(record)
+
+            self.assertEqual(exists.call_args_list, [mock.call(record), mock.call(record)])
+            migrate.assert_called_once_with(str(codex_home))
+            ensure.assert_not_called()
+            run.assert_not_called()
+            lease.release.assert_called_once_with()
+
+    def test_prelaunch_migration_failure_releases_both_real_lifetime_locks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_home = root / "cache"
+            codex_home = root / "auth-one"
+            codex_home.mkdir()
+            record = _record(
+                cwd=tmp,
+                auth_scope_id="auth-one",
+                codex_home=str(codex_home),
+            )
+            backend = TmuxBackend(executable="tmux")
+
+            with mock.patch.dict(
+                os.environ, {"XDG_CACHE_HOME": str(cache_home)}, clear=False
+            ), mock.patch.object(
+                backend, "_auth_session_exists", return_value=False
+            ), mock.patch(
+                "termdeck.tmux_backend.migrate_quiescent_codex_configuration",
+                side_effect=CodexConfigScopeError("rollback complete"),
+            ), mock.patch(
+                "termdeck.tmux_backend.ensure_private_codex_state"
+            ) as ensure, mock.patch.object(
+                backend, "_run"
+            ) as run, self.assertRaisesRegex(
+                TmuxError, "could not migrate stopped private Codex configuration"
+            ):
+                backend.create_or_resume(record)
+
+            ensure.assert_not_called()
+            run.assert_not_called()
+            with mock.patch.dict(
+                os.environ, {"XDG_CACHE_HOME": str(cache_home)}, clear=False
+            ):
+                for path in (
+                    _auth_legacy_lifetime_lock_path(record),
+                    _auth_lifetime_lock_path(record),
+                ):
+                    fd = os.open(path, os.O_RDWR | os.O_APPEND)
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        os.close(fd)
+
+    def test_private_scope_identity_is_rejected_before_lock_or_spawn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "auth-one"
+            codex_home.mkdir()
+            backend = TmuxBackend(executable="tmux")
+            invalid_records = (
+                _record(auth_scope_id="auth-one!", codex_home=str(codex_home)),
+                _record(auth_scope_id="auth-two", codex_home=str(codex_home)),
+            )
+
+            for record in invalid_records:
+                with self.subTest(scope=record.auth_scope_id), mock.patch.object(
+                    backend, "_auth_session_exists"
+                ) as exists, mock.patch(
+                    "termdeck.tmux_backend._acquire_auth_lifetime_lease"
+                ) as acquire, mock.patch.object(backend, "_run") as run, self.assertRaisesRegex(
+                    TmuxError, "must match its CODEX_HOME basename"
+                ):
+                    backend.create_or_resume(record)
+
+                exists.assert_not_called()
+                acquire.assert_not_called()
+                run.assert_not_called()
+                self.assertFalse((codex_home / ".termdeck-auth-transaction.lock").exists())
+
+    def test_relative_private_codex_home_is_rejected_before_lock_or_spawn(self):
+        record = _record(auth_scope_id="auth-one", codex_home="relative/auth-one")
+        backend = TmuxBackend(executable="tmux")
+
+        with mock.patch.object(
+            backend, "_auth_session_exists"
+        ) as exists, mock.patch(
+            "termdeck.tmux_backend._acquire_auth_lifetime_lease"
+        ) as acquire, mock.patch.object(backend, "_run") as run, self.assertRaisesRegex(
+            TmuxError, "CODEX_HOME must be absolute"
+        ):
+            backend.create_or_resume(record)
+
+        exists.assert_not_called()
+        acquire.assert_not_called()
+        run.assert_not_called()
+
+    def test_relative_xdg_cache_home_fails_before_lifetime_lock_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "auth-one"
+            codex_home.mkdir()
+            record = _record(auth_scope_id="auth-one", codex_home=str(codex_home))
+
+            with mock.patch.dict(
+                os.environ, {"XDG_CACHE_HOME": "relative-cache"}, clear=False
+            ), self.assertRaisesRegex(TmuxError, "XDG_CACHE_HOME must be absolute"):
+                _acquire_auth_lifetime_lease(record)
+
+            self.assertFalse((codex_home / ".termdeck-codex-lifetime").exists())
+
+    def test_dual_lifetime_lease_acquires_legacy_then_canonical_and_releases_reverse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_home = root / "cache"
+            codex_home = root / "auth-one"
+            codex_home.mkdir()
+            record = _record(auth_scope_id="auth-one", codex_home=str(codex_home))
+            events = []
+            real_open = os.open
+            real_close = os.close
+
+            def open_lock(path, flags, mode=0o777):
+                events.append(("open", Path(path)))
+                return real_open(path, flags, mode)
+
+            def close_lock(fd):
+                events.append(("close", fd))
+                real_close(fd)
+
+            with mock.patch.dict(
+                os.environ, {"XDG_CACHE_HOME": str(cache_home)}, clear=False
+            ), mock.patch("termdeck.tmux_backend.os.open", side_effect=open_lock), mock.patch(
+                "termdeck.tmux_backend.os.close", side_effect=close_lock
+            ):
+                legacy_path = _auth_legacy_lifetime_lock_path(record)
+                canonical_path = _auth_lifetime_lock_path(record)
+                lease = _acquire_auth_lifetime_lease(record)
+                self.assertTrue(lease.matches(legacy_path, canonical_path))
+                opened = [item for item in events if item[0] == "open"]
+                self.assertEqual(opened, [("open", legacy_path), ("open", canonical_path)])
+                opened_fds = [fd for fd, _path in lease._locks]
+                lease.release()
+                lease.release()
+
+            closed = [item[1] for item in events if item[0] == "close"]
+            self.assertEqual(closed, list(reversed(opened_fds)))
+
+    def test_legacy_lifetime_holder_blocks_backend_before_canonical_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_home = root / "cache"
+            codex_home = root / "auth-one"
+            codex_home.mkdir()
+            record = _record(auth_scope_id="auth-one", codex_home=str(codex_home))
+
+            with mock.patch.dict(
+                os.environ, {"XDG_CACHE_HOME": str(cache_home)}, clear=False
+            ):
+                legacy_path = _auth_legacy_lifetime_lock_path(record)
+                legacy_path.parent.mkdir(parents=True, mode=0o700)
+                holder_fd = os.open(legacy_path, os.O_RDWR | os.O_CREAT, 0o600)
+                fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    with self.assertRaisesRegex(TmuxError, "still owns"):
+                        _acquire_auth_lifetime_lease(record)
+                    self.assertFalse(_auth_lifetime_lock_path(record).exists())
+                finally:
+                    fcntl.flock(holder_fd, fcntl.LOCK_UN)
+                    os.close(holder_fd)
+
+    def test_canonical_lifetime_holder_releases_legacy_on_backend_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_home = root / "cache"
+            codex_home = root / "auth-one"
+            codex_home.mkdir()
+            record = _record(auth_scope_id="auth-one", codex_home=str(codex_home))
+
+            with mock.patch.dict(
+                os.environ, {"XDG_CACHE_HOME": str(cache_home)}, clear=False
+            ):
+                canonical_path = _auth_lifetime_lock_path(record)
+                canonical_path.parent.mkdir(parents=True, mode=0o700)
+                holder_fd = os.open(canonical_path, os.O_RDWR | os.O_CREAT, 0o600)
+                fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    with self.assertRaisesRegex(TmuxError, "still owns"):
+                        _acquire_auth_lifetime_lease(record)
+                    legacy_path = _auth_legacy_lifetime_lock_path(record)
+                    probe_fd = os.open(legacy_path, os.O_RDWR | os.O_APPEND)
+                    try:
+                        fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        fcntl.flock(probe_fd, fcntl.LOCK_UN)
+                        os.close(probe_fd)
+                finally:
+                    fcntl.flock(holder_fd, fcntl.LOCK_UN)
+                    os.close(holder_fd)
+
+    def test_auth_transaction_lock_is_reentrant_in_the_same_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "auth-one"
+            codex_home.mkdir()
+            record = _record(
+                auth_scope_id="auth-one",
+                codex_home=str(codex_home),
+            )
+            events = []
+
+            with auth_transaction_lock(record):
+                events.append("outer")
+                with auth_transaction_lock(record):
+                    events.append("inner")
+            with auth_transaction_lock(record):
+                events.append("reacquired")
+
+            self.assertEqual(events, ["outer", "inner", "reacquired"])
+
+    def test_auth_transaction_lock_rejects_concurrent_thread_without_waiting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "auth-one"
+            codex_home.mkdir()
+            record = _record(
+                auth_scope_id="auth-one",
+                codex_home=str(codex_home),
+            )
+            outcomes = []
+
+            def contend():
+                try:
+                    with auth_transaction_lock(record):
+                        outcomes.append("acquired")
+                except AuthTransactionBusy as exc:
+                    outcomes.append(str(exc))
+
+            with auth_transaction_lock(record):
+                thread = threading.Thread(target=contend, daemon=True)
+                thread.start()
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+
+            self.assertEqual(len(outcomes), 1)
+            self.assertIn("already running", outcomes[0])
+
+    def test_launcher_lifetime_holder_blocks_pointer_mutation_with_matching_path(self):
+        from termdeck.codex_auth import CodexAccount, CodexAuthState
+        from termdeck.tmux_backend import (
+            _auth_lifetime_lock_path,
+            execute_auth_change,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "auth-alpha_beta_one"
+            codex_home.mkdir()
+            root = codex_home / ".termdeck-codex-lifetime"
+            scope_id = "auth-alpha_beta_one"
+            record = _record(
+                status="stopped",
+                auth_scope_id=scope_id,
+                codex_home=str(codex_home),
+            )
+            helper = (
+                Path(__file__).resolve().parents[1]
+                / "terminal-auth"
+                / "codex-contained-gates.sh"
+            )
+            environment = {
+                **os.environ,
+                "CODEX_TERMDECK_GATE_ROOT": str(root),
+                "CODEX_HOME": str(codex_home),
+                "TERMDECK_AUTH_SCOPE_ID": scope_id,
+                "XDG_CACHE_HOME": str(Path(tmp) / "cache"),
+            }
+            path_result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'set -e; source "$1"; '
+                    'gate_root="$(codex_contained_gate_root "$(id -u)")"; '
+                    'scope_key="$(codex_contained_scope_key "$2")"; '
+                    'printf "%s/scope.%s.lock\\n" "$gate_root" "$scope_key"',
+                    "gate-path-test",
+                    str(helper),
+                    scope_id,
+                ],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                env=environment,
+                check=True,
+            )
+            with mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(
+                    _auth_lifetime_lock_path(record),
+                    Path(path_result.stdout.strip()),
+                )
+
+            holder = subprocess.Popen(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; '
+                    'codex_contained_acquire_termdeck_lifetime_lock '
+                    '"$(id -u)" "$2" "$3"; '
+                    'printf "READY\\n"; sleep 30',
+                    "gate-holder-test",
+                    str(helper),
+                    scope_id,
+                    str(Path(tmp)),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                start_new_session=True,
+            )
+            try:
+                assert holder.stdout is not None
+                self.assertEqual(holder.stdout.readline().strip(), "READY")
+                previous = CodexAuthState(
+                    codex_home=str(codex_home),
+                    accounts=(CodexAccount("alpha", alias="alpha"),),
+                    selected_account=None,
+                    selected_account_key=None,
+                    fingerprint="unselected",
+                    codex_auth_available=True,
+                )
+                manager = mock.Mock()
+                backend = TmuxBackend(executable="tmux")
+                with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+                    backend, "_auth_session_exists", return_value=False
+                ):
+                    with auth_transaction_lock(record):
+                        result = execute_auth_change(
+                            backend,
+                            manager,
+                            record,
+                            previous,
+                            "alpha",
+                        )
+
+                self.assertFalse(result.ok)
+                self.assertIn("live owner", result.error)
+                manager.switch.assert_not_called()
+            finally:
+                try:
+                    os.killpg(holder.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                holder.wait(timeout=5)
+
+    def test_private_create_or_resume_runs_inside_auth_transaction_lock(self):
+        record = _record(
+            auth_scope_id="auth-one",
+            codex_home="/private/auth-one",
+        )
+        backend = TmuxBackend(executable="tmux")
+        events = []
+        lease = mock.Mock(name="lifetime_lease", held=True)
+        lease.release.side_effect = lambda: events.append("lease-release")
+
+        @contextmanager
+        def transaction(candidate):
+            self.assertIs(candidate, record)
+            events.append("lock-enter")
+            try:
+                yield
+            finally:
+                events.append("lock-exit")
+
+        with mock.patch(
+            "termdeck.tmux_backend.auth_transaction_lock",
+            side_effect=transaction,
+        ) as lock, mock.patch.object(
+            backend,
+            "_auth_session_exists",
+            return_value=False,
+        ) as exists, mock.patch(
+            "termdeck.tmux_backend._acquire_auth_lifetime_lease",
+            side_effect=lambda candidate: (
+                events.append(("lease-acquire", candidate)) or lease
+            ),
+        ) as acquire, mock.patch.object(
+            backend,
+            "_create_or_resume_unlocked",
+            side_effect=lambda candidate, **kwargs: events.append(
+                ("create", candidate, kwargs)
+            ),
+        ) as create:
+            backend.create_or_resume(record)
+
+        self.assertEqual(
+            events,
+            [
+                "lock-enter",
+                ("lease-acquire", record),
+                (
+                    "create",
+                    record,
+                    {"require_absent": True, "lifetime_lease": lease},
+                ),
+                "lease-release",
+                "lock-exit",
+            ],
+        )
+        lock.assert_called_once_with(record)
+        exists.assert_called_once_with(record)
+        acquire.assert_called_once_with(record)
+        create.assert_called_once_with(
+            record,
+            require_absent=True,
+            lifetime_lease=lease,
+        )
+
+    def test_private_recovery_pending_live_target_repairs_idle_placeholder(self):
+        recovery = "codex --yolo resume 019f71b3-fa32-7251-bac3-c628f34dd154"
+        record = _auth_record(
+            status="recovery-pending",
+            recovery_command=recovery,
+            recovery_cwd="/tmp",
+        )
+        backend = TmuxBackend(executable="tmux")
+
+        @contextmanager
+        def transaction(candidate):
+            self.assertIs(candidate, record)
+            yield
+
+        with mock.patch(
+            "termdeck.tmux_backend.auth_transaction_lock",
+            side_effect=transaction,
+        ), mock.patch.object(
+            backend, "_auth_session_exists", return_value=True
+        ), mock.patch.object(
+            backend, "_recover_exact_over_idle_placeholder"
+        ) as recover, mock.patch.object(
+            backend, "_create_or_resume_unlocked"
+        ) as create:
+            backend.create_or_resume(record)
+
+        recover.assert_called_once_with(record)
+        create.assert_not_called()
+
+    def test_private_auth_path_drops_another_terminal_scope(self):
+        home = Path("/private/terminal-auth/auth-this")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PATH": (
+                    "/private/terminal-auth/auth-other/bin:"
+                    "/usr/local/bin:/private/terminal-auth/auth-this/bin:/usr/bin"
+                )
+            },
+        ):
+            result = TmuxBackend._private_auth_path(home)
+
+        self.assertEqual(
+            result,
+            "/private/terminal-auth/auth-this/bin:/usr/local/bin:/usr/bin",
+        )
+
+    def test_exact_recovery_respawns_same_idle_pane_without_tmux_gap(self):
+        recovery = "codex --yolo resume 019f71b3-fa32-7251-bac3-c628f34dd154"
+        record = _auth_record(
+            command="/bin/bash",
+            status="recovery-pending",
+            recovery_command=recovery,
+            recovery_cwd="/tmp",
+        )
+        backend = TmuxBackend(executable="tmux")
+        previous = _auth_pane_identity(pane_pid=100)
+        created = _auth_pane_identity(pane_pid=200)
+        suspended = ((100, 1, False),)
+        events = []
+        lease = mock.Mock(name="lifetime_lease")
+        lease.release.side_effect = lambda: events.append("lease-release")
+
+        def run(argv, **_kwargs):
+            events.append(("run", argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.dict(
+            os.environ,
+            {"PATH": "/tmp/other-scope/bin:/usr/bin"},
+        ), mock.patch.object(
+            Path, "is_file", return_value=True
+        ), mock.patch(
+            "termdeck.tmux_backend.os.access", return_value=True
+        ), mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=previous
+        ), mock.patch.object(
+            backend, "_auth_process_identity", return_value=("S", 1)
+        ), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata",
+            return_value=(True, None, None),
+        ), mock.patch.object(
+            backend, "_process_tree_is_idle_shell", return_value=True
+        ), mock.patch.object(
+            backend, "_suspend_auth_process_tree", return_value=suspended
+        ), mock.patch(
+            "termdeck.tmux_backend._acquire_auth_lifetime_lease",
+            return_value=lease,
+        ), mock.patch(
+            "termdeck.tmux_backend.migrate_quiescent_codex_configuration"
+        ), mock.patch(
+            "termdeck.tmux_backend.ensure_private_codex_state"
+        ), mock.patch.object(
+            backend, "_hydrate_private_codex_recovery"
+        ) as hydrate, mock.patch.object(
+            backend, "_run", side_effect=run
+        ), mock.patch.object(
+            backend, "_kill_quiesced_auth_processes"
+        ) as kill_old, mock.patch.object(
+            backend,
+            "_await_exact_pane_respawn_ready",
+            return_value=(created, ""),
+        ) as await_ready, _auth_input_gate(backend):
+            backend._recover_exact_over_idle_placeholder(record)
+
+        self.assertEqual(events[0], "lease-release")
+        respawn = events[1][1]
+        self.assertEqual(respawn[:5], ["respawn-pane", "-k", "-t", "%1", "-e"])
+        self.assertIn("CODEX_HOME=/tmp/auth-test", respawn)
+        self.assertIn("TERMDECK_AUTH_SCOPE_ID=auth-test", respawn)
+        self.assertIn("CODEX_TERMDECK_GATE_ROOT=/tmp/auth-test/.termdeck-codex-lifetime", respawn)
+        self.assertEqual(respawn[-3:-1], ["-c", "/tmp"])
+        self.assertIn("/tmp/auth-test/bin/codex", respawn[-1])
+        self.assertIn("TERMDECK_AUTH_SCOPE_ID=auth-test", respawn[-1])
+        self.assertIn("--dangerously-bypass-hook-trust", respawn[-1])
+        self.assertNotIn("/tmp/other-scope/bin/codex", respawn[-1])
+        self.assertIn("; exec ", respawn[-1])
+        self.assertIn("bash --noprofile --rcfile", respawn[-1])
+        self.assertIn("/tmp/auth-test/bin/.termdeck-bashrc", respawn[-1])
+        self.assertTrue(respawn[-1].endswith(" -i"))
+        hydrate.assert_called_once_with(record, recovery)
+        kill_old.assert_called_once_with(suspended)
+        await_ready.assert_called_once_with(
+            record,
+            previous=previous,
+            expected_recovery_command=recovery,
+            expected_recovery_cwd="/tmp",
+        )
+
+    def test_exact_recovery_leaves_a_different_live_conversation_untouched(self):
+        recovery = "codex --yolo resume 019f71b3-fa32-7251-bac3-c628f34dd154"
+        other = "codex --yolo resume 019f71b3-fa32-7251-bac3-c628f34dd155"
+        record = _auth_record(
+            status="recovery-pending",
+            recovery_command=recovery,
+            recovery_cwd="/tmp",
+        )
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity()
+
+        with mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            backend, "_auth_process_identity", return_value=("S", 1)
+        ), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata",
+            return_value=(True, other, "/tmp"),
+        ), self.assertRaisesRegex(
+            TmuxError, "different exact recovery session"
+        ), mock.patch.object(
+            backend, "_suspend_auth_process_tree"
+        ) as suspend, mock.patch.object(
+            backend, "_run"
+        ) as run:
+            backend._recover_exact_over_idle_placeholder(record)
+
+        suspend.assert_not_called()
+        run.assert_not_called()
+
+    def test_exact_recovery_refuses_placeholder_with_background_job(self):
+        recovery = "codex --yolo resume 019f71b3-fa32-7251-bac3-c628f34dd154"
+        record = _auth_record(
+            status="recovery-pending",
+            recovery_command=recovery,
+            recovery_cwd="/tmp",
+        )
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity()
+
+        with mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            backend, "_auth_process_identity", return_value=("S", 1)
+        ), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata",
+            return_value=(True, None, None),
+        ), mock.patch.object(
+            backend, "_process_tree_is_idle_shell", return_value=False
+        ), self.assertRaisesRegex(
+            TmuxError, "idle placeholder shell with no jobs"
+        ), mock.patch.object(
+            backend, "_suspend_auth_process_tree"
+        ) as suspend, mock.patch.object(
+            backend, "_run"
+        ) as run:
+            backend._recover_exact_over_idle_placeholder(record)
+
+        suspend.assert_not_called()
+        run.assert_not_called()
 
     def test_private_auth_environment_ready_requires_exact_live_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = Path(tmp) / "auth-home"
+            codex_home = Path(tmp) / "auth-one"
+            gate_root = codex_home / ".termdeck-codex-lifetime"
             record = _record(
                 auth_scope_id="auth-one",
                 codex_home=str(codex_home),
             )
             backend = TmuxBackend(executable="tmux")
-            output = "\n".join(
-                [
-                    f"CODEX_HOME={codex_home.resolve()}",
-                    "TERMDECK_AUTH_SCOPE_ID=auth-one",
-                    f"PATH={codex_home.resolve() / 'bin'}:/usr/bin:/bin",
-                ]
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "CODEX_HOME": str(codex_home.resolve()),
+                    "TERMDECK_AUTH_SCOPE_ID": "auth-one",
+                    "CODEX_TERMDECK_GATE_ROOT": str(gate_root),
+                    "PATH": f"{codex_home.resolve() / 'bin'}:{environment.get('PATH', '')}",
+                }
             )
-            completed = subprocess.CompletedProcess(
-                args=["tmux"],
-                returncode=0,
-                stdout=output,
-                stderr="",
-            )
+            process = subprocess.Popen(["/bin/sleep", "30"], env=environment)
+            try:
+                pane = _auth_pane_identity(command="sleep", pane_pid=process.pid)
+                with mock.patch.dict(
+                    os.environ,
+                    {"CODEX_TERMDECK_GATE_ROOT": str(gate_root)},
+                    clear=False,
+                ), mock.patch(
+                    "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+                ), mock.patch.object(
+                    backend, "_inspect_auth_pane", return_value=pane
+                ) as inspect:
+                    self.assertTrue(backend.private_auth_environment_ready(record))
 
-            with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
-                backend, "_run", return_value=completed
-            ) as run:
-                self.assertTrue(backend.private_auth_environment_ready(record))
-
-            run.assert_called_once_with(
-                ["show-environment", "-t", record.tmux_name],
-                check=False,
-                timeout=backend.query_timeout,
-            )
+                inspect.assert_called_once_with(record)
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
 
     def test_private_auth_environment_ready_rejects_pre_isolation_live_session(self):
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = Path(tmp) / "auth-home"
+            codex_home = Path(tmp) / "auth-one"
             record = _record(
                 auth_scope_id="auth-one",
                 codex_home=str(codex_home),
             )
             backend = TmuxBackend(executable="tmux")
-            legacy = subprocess.CompletedProcess(
-                args=["tmux"],
-                returncode=0,
-                stdout="PATH=/usr/local/bin:/usr/bin:/bin\n",
-                stderr="",
+            legacy_environment = os.environ.copy()
+            legacy_environment.pop("CODEX_HOME", None)
+            legacy_environment.pop("TERMDECK_AUTH_SCOPE_ID", None)
+            wrong_environment = os.environ.copy()
+            wrong_environment.update(
+                {
+                    "CODEX_HOME": str(codex_home.resolve()),
+                    "TERMDECK_AUTH_SCOPE_ID": "auth-other",
+                    "PATH": f"{codex_home.resolve() / 'bin'}:{wrong_environment.get('PATH', '')}",
+                }
             )
-            wrong_scope = subprocess.CompletedProcess(
-                args=["tmux"],
-                returncode=0,
-                stdout="\n".join(
-                    [
-                        f"CODEX_HOME={codex_home.resolve()}",
-                        "TERMDECK_AUTH_SCOPE_ID=auth-other",
-                        f"PATH={codex_home.resolve() / 'bin'}:/usr/bin:/bin",
-                    ]
-                ),
-                stderr="",
+            legacy = subprocess.Popen(["/bin/sleep", "30"], env=legacy_environment)
+            wrong = subprocess.Popen(["/bin/sleep", "30"], env=wrong_environment)
+            try:
+                panes = [
+                    _auth_pane_identity(command="sleep", pane_pid=legacy.pid),
+                    _auth_pane_identity(command="sleep", pane_pid=wrong.pid),
+                ]
+                with mock.patch(
+                    "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+                ), mock.patch.object(
+                    backend, "_inspect_auth_pane", side_effect=panes
+                ):
+                    self.assertFalse(backend.private_auth_environment_ready(record))
+                    self.assertFalse(backend.private_auth_environment_ready(record))
+            finally:
+                legacy.terminate()
+                wrong.terminate()
+                legacy.wait(timeout=5)
+                wrong.wait(timeout=5)
+
+    def test_auth_recreation_readiness_accepts_exact_recovery_takeover(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        recovery = f"codex --yolo resume {session_id}"
+        record = _auth_record(status="running")
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity(
+            command="codex",
+            session_created="1700000001",
+            pane_pid=4242,
+        )
+
+        with mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            TmuxBackend, "_auth_process_identity", return_value=("S", 22)
+        ), mock.patch.object(
+            TmuxBackend,
+            "_private_auth_process_tree_environment_ready",
+            return_value=True,
+        ), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata",
+            return_value=(True, recovery, "/workspace/repo"),
+        ) as observe:
+            ready, detail = backend._await_auth_recreation_ready(
+                record,
+                previous_session_created="1700000000",
+                expected_recovery_command=recovery,
+                expected_recovery_cwd="/workspace/repo",
+                timeout=0.05,
             )
 
-            with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
-                backend, "_run", side_effect=[legacy, wrong_scope]
-            ):
-                self.assertFalse(backend.private_auth_environment_ready(record))
-                self.assertFalse(backend.private_auth_environment_ready(record))
+        self.assertEqual(ready, identity)
+        self.assertEqual(detail, "")
+        observe.assert_called_once_with(4242)
+
+    def test_auth_recreation_readiness_rejects_wrong_recovery_takeover(self):
+        expected_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        wrong_id = "019f71b3-fa32-7251-bac3-c628f34dd155"
+        record = _auth_record(status="running")
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity(
+            command="codex",
+            session_created="1700000001",
+            pane_pid=4242,
+        )
+
+        with mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            TmuxBackend, "_auth_process_identity", return_value=("S", 22)
+        ), mock.patch.object(
+            TmuxBackend,
+            "_private_auth_process_tree_environment_ready",
+            return_value=True,
+        ), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata",
+            return_value=(
+                True,
+                f"codex --yolo resume {wrong_id}",
+                "/workspace/repo",
+            ),
+        ), mock.patch(
+            "termdeck.tmux_backend.time.monotonic", side_effect=[100.0, 101.0]
+        ), mock.patch("termdeck.tmux_backend.time.sleep") as sleep:
+            ready, detail = backend._await_auth_recreation_ready(
+                record,
+                previous_session_created="1700000000",
+                expected_recovery_command=f"codex --yolo resume {expected_id}",
+                expected_recovery_cwd="/workspace/repo",
+                timeout=0.05,
+            )
+
+        self.assertEqual(ready, identity)
+        self.assertIn("exact Codex recovery UUID", detail)
+        sleep.assert_not_called()
 
     def test_auth_change_restarts_exact_live_codex_and_preserves_resume_identity(self):
         session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
-        record = _record(command="/bin/bash", status="running")
+        record = _auth_record(command="/bin/bash", status="running")
         backend = TmuxBackend(executable="tmux")
         recovery = f"codex --yolo resume {session_id}"
 
-        with mock.patch.object(backend, "session_exists", return_value=True), mock.patch.object(
-            backend,
-            "recovery_metadata",
-            return_value={record.id: (recovery, "/workspace/repo")},
-        ), mock.patch.object(backend, "terminate") as terminate, mock.patch.object(
-            backend, "create_or_resume"
+        identity = _auth_pane_identity(command="codex")
+        created_identity = _auth_pane_identity(
+            command="codex", session_created="1700000001", pane_pid=4242
+        )
+        with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata",
+            side_effect=[
+                (True, recovery, "/workspace/repo"),
+                (True, recovery, "/workspace/repo"),
+                (True, recovery, "/workspace/repo"),
+            ],
+        ), mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            backend, "_suspend_auth_process_tree", return_value=((100, 1, False),)
+        ), mock.patch.object(
+            backend, "_kill_quiesced_auth_processes"
+        ), mock.patch.object(backend, "_terminate_auth_session") as terminate, mock.patch.object(
+            backend, "_create_or_resume_unlocked"
         ) as create, mock.patch.object(
-            backend, "private_auth_environment_ready", return_value=True
-        ) as ready, mock.patch.object(
-            backend, "pane_pid", return_value=4242
-        ):
+            backend,
+            "_await_auth_recreation_ready",
+            return_value=(created_identity, ""),
+        ), _stable_auth_process(backend, environment_ready=True), _auth_input_gate(backend):
             result = backend.activate_auth_change(record)
 
         self.assertTrue(result.ok)
@@ -403,49 +1816,428 @@ class TmuxBackendTests(unittest.TestCase):
         self.assertEqual(result.recovery_cwd, "/workspace/repo")
         self.assertEqual(result.pid, 4242)
         self.assertEqual(result.status, "running")
+        self.assertFalse(result.clear_recovery)
+        self.assertIsNone(result.command)
+        self.assertIsNone(result.cwd)
         terminate.assert_called_once_with(record)
         resumed = create.call_args.args[0]
+        self.assertTrue(create.call_args.kwargs["require_absent"])
         self.assertEqual(resumed.recovery_command, recovery)
         self.assertEqual(resumed.recovery_cwd, "/workspace/repo")
         self.assertEqual(resumed.status, "running")
-        ready.assert_called_once_with(resumed)
 
     def test_auth_change_idle_shell_needs_no_restart(self):
-        record = _record(command="/bin/bash", status="running")
+        record = _auth_record(command="/bin/bash", status="running")
         backend = TmuxBackend(executable="tmux")
-        current = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="bash\n", stderr=""
-        )
 
-        with mock.patch.object(backend, "session_exists", return_value=True), mock.patch.object(
-            backend, "recovery_metadata", return_value={record.id: (None, None)}
-        ), mock.patch.object(backend, "pane_pid", return_value=100), mock.patch(
+        identity = _auth_pane_identity()
+        with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata", return_value=(True, None, None)
+        ), mock.patch.object(
+            backend, "private_auth_environment_ready", return_value=True
+        ), mock.patch(
             "termdeck.tmux_backend.process_tree_contains_codex", return_value=False
-        ), mock.patch.object(backend, "_run", return_value=current), mock.patch.object(
-            backend, "terminate"
-        ) as terminate, mock.patch.object(backend, "create_or_resume") as create:
+        ), mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            backend, "_suspend_auth_process_tree", return_value=((100, 1, False),)
+        ) as suspend, mock.patch.object(
+            backend, "_resume_auth_processes"
+        ) as resume, mock.patch.object(
+            backend, "create_or_resume"
+        ) as create, _stable_auth_process(backend, environment_ready=True), _auth_input_gate(
+            backend
+        ) as input_gate:
             result = backend.activate_auth_change(record)
 
         self.assertTrue(result.ok)
         self.assertFalse(result.restarted)
         self.assertIn("next Codex launch", result.detail)
+        suspend.assert_called_once_with(100, allow_running_root=True)
+        input_gate[0].assert_called_once_with("%1")
+        input_gate[1].assert_called_once_with("%1", False)
+        resume.assert_called_once_with(((100, 1, False),))
+        create.assert_not_called()
+
+    def test_auth_change_records_paused_state_when_post_suspend_rollback_fails(self):
+        record = _auth_record(command="/bin/bash", status="running")
+        backend = TmuxBackend(executable="tmux")
+
+        identity = _auth_pane_identity()
+        with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata", return_value=(True, None, None)
+        ), mock.patch.object(
+            backend, "private_auth_environment_ready", return_value=True
+        ), mock.patch(
+            "termdeck.tmux_backend.process_tree_contains_codex", return_value=False
+        ), mock.patch.object(
+            backend,
+            "_inspect_auth_pane",
+            side_effect=[identity, identity, TmuxError("tmux inspection failed")],
+        ), mock.patch.object(
+            backend, "_suspend_auth_process_tree", return_value=((100, 1, False),)
+        ), mock.patch.object(
+            backend, "_resume_auth_processes", side_effect=TmuxError("resume denied")
+        ), _stable_auth_process(backend, environment_ready=True), _auth_input_gate(backend):
+            result = backend.activate_auth_change(record)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "paused")
+        self.assertEqual(result.pid, 100)
+        self.assertIn("could not be fully resumed", result.detail)
+
+    def test_partial_auth_resume_failure_re_stops_already_resumed_processes(self):
+        processes = ((100, 10, False), (101, 11, False))
+        states = {100: "T", 101: "T"}
+
+        def identity(pid):
+            return states[pid], 10 if pid == 100 else 11
+
+        def send_signal(pid, requested_signal):
+            if (pid, requested_signal) == (100, signal.SIGCONT):
+                raise PermissionError("resume denied")
+            if requested_signal == signal.SIGCONT:
+                states[pid] = "R"
+            elif requested_signal == signal.SIGSTOP:
+                states[pid] = "T"
+
+        with mock.patch.object(
+            TmuxBackend, "_auth_process_identity", side_effect=identity
+        ), mock.patch(
+            "termdeck.tmux_backend.os.kill", side_effect=send_signal
+        ) as kill, self.assertRaisesRegex(TmuxError, "permission denied"):
+            TmuxBackend._resume_auth_processes(processes)
+
+        self.assertEqual(states[101], "T")
+        self.assertEqual(
+            kill.call_args_list,
+            [
+                mock.call(101, signal.SIGCONT),
+                mock.call(100, signal.SIGCONT),
+                mock.call(101, signal.SIGSTOP),
+            ],
+        )
+
+    def test_auth_change_migrates_legacy_idle_shell_using_live_directory(self):
+        record = _auth_record(
+            command="python old-task.py",
+            cwd="/saved",
+            status="running",
+            recovery_command=(
+                "codex --yolo resume 019f71b3-fa32-7251-bac3-c628f34dd154"
+            ),
+            recovery_cwd="/stale-codex-cwd",
+        )
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity(cwd="/tmp")
+        created_identity = _auth_pane_identity(
+            cwd="/tmp", session_created="1700000001", pane_pid=4243
+        )
+
+        with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata", return_value=(True, None, None)
+        ), mock.patch.object(
+            backend, "private_auth_environment_ready", return_value=True
+        ), mock.patch(
+            "termdeck.tmux_backend.process_tree_contains_codex", return_value=False
+        ), mock.patch.object(
+            backend, "_idle_shell_executable", return_value="/bin/bash"
+        ), mock.patch.object(
+            backend, "_process_tree_is_idle_shell", return_value=True
+        ), mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            backend, "_suspend_auth_process_tree", return_value=((100, 1, False),)
+        ), mock.patch.object(
+            backend, "_kill_quiesced_auth_processes"
+        ), mock.patch.object(
+            backend, "_terminate_auth_session"
+        ) as terminate, mock.patch.object(
+            backend, "_create_or_resume_unlocked"
+        ) as create, mock.patch.object(
+            backend,
+            "_await_auth_recreation_ready",
+            return_value=(created_identity, ""),
+        ), _stable_auth_process(backend, environment_ready=False), _auth_input_gate(backend):
+            plan = backend.plan_auth_change(record)
+            quiescence = backend.quiesce_auth_change(record, plan)
+            result = backend.apply_auth_change(record, plan, quiescence)
+
+        self.assertTrue(plan.ok)
+        self.assertTrue(plan.restart)
+        self.assertFalse(plan.environment_ready)
+        self.assertEqual(plan.replacement_command, "/bin/bash")
+        self.assertEqual(plan.replacement_cwd, "/tmp")
+        self.assertTrue(result.ok)
+        self.assertTrue(result.restarted)
+        self.assertTrue(result.preserve_selected_account)
+        self.assertEqual(result.command, "/bin/bash")
+        self.assertEqual(result.cwd, "/tmp")
+        self.assertTrue(result.clear_recovery)
+        self.assertIsNone(result.recovery_command)
+        self.assertIsNone(result.recovery_cwd)
+        terminate.assert_called_once_with(record)
+        migrated = create.call_args.args[0]
+        self.assertTrue(create.call_args.kwargs["require_absent"])
+        self.assertEqual(migrated.command, "/bin/bash")
+        self.assertEqual(migrated.cwd, "/tmp")
+        self.assertIsNone(migrated.recovery_command)
+        self.assertIsNone(migrated.recovery_cwd)
+
+    def test_failed_legacy_recreation_returns_durable_shell_replacement_metadata(self):
+        record = _auth_record(
+            command="python stale-task.py",
+            cwd="/saved",
+            status="running",
+            recovery_command=(
+                "codex --yolo resume 019f71b3-fa32-7251-bac3-c628f34dd154"
+            ),
+            recovery_cwd="/stale-codex-cwd",
+        )
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity(cwd="/tmp")
+
+        with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata", return_value=(True, None, None)
+        ), mock.patch.object(
+            backend, "private_auth_environment_ready", return_value=False
+        ), mock.patch(
+            "termdeck.tmux_backend.process_tree_contains_codex", return_value=False
+        ), mock.patch.object(
+            backend, "_idle_shell_executable", return_value="/bin/bash"
+        ), mock.patch.object(
+            backend, "_process_tree_is_idle_shell", return_value=True
+        ), mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            backend, "_suspend_auth_process_tree", return_value=((100, 1, False),)
+        ), mock.patch.object(
+            backend, "_kill_quiesced_auth_processes"
+        ), mock.patch.object(
+            backend, "_terminate_auth_session"
+        ), mock.patch.object(
+            backend,
+            "_create_or_resume_unlocked",
+            side_effect=TmuxError("recreate failed"),
+        ), _stable_auth_process(backend, environment_ready=False), _auth_input_gate(backend):
+            result = backend.activate_auth_change(record)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "stopped")
+        self.assertTrue(result.preserve_selected_account)
+        self.assertEqual(result.command, "/bin/bash")
+        self.assertEqual(result.cwd, "/tmp")
+        self.assertTrue(result.clear_recovery)
+        self.assertIsNone(result.recovery_command)
+        self.assertIsNone(result.recovery_cwd)
+        self.assertIn("idle shell", result.detail)
+
+    def test_auth_change_rejects_legacy_shell_with_background_job_at_preflight(self):
+        record = _auth_record(command="/bin/bash", status="running")
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity()
+
+        with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata", return_value=(True, None, None)
+        ), mock.patch.object(
+            backend, "private_auth_environment_ready", return_value=False
+        ), mock.patch(
+            "termdeck.tmux_backend.process_tree_contains_codex", return_value=False
+        ), mock.patch.object(
+            backend, "_idle_shell_executable", return_value="/bin/bash"
+        ), mock.patch.object(
+            backend, "_process_tree_is_idle_shell", return_value=False
+        ), mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            backend, "terminate"
+        ) as terminate, _stable_auth_process(backend, environment_ready=False), _auth_input_gate(backend):
+            plan = backend.plan_auth_change(record)
+
+        self.assertFalse(plan.ok)
+        self.assertIn("background job", plan.detail)
+        terminate.assert_not_called()
+
+    def test_legacy_bash_with_background_sleep_is_rejected_and_left_running(self):
+        record = _auth_record(command="/bin/bash", status="running")
+        backend = TmuxBackend(executable="tmux")
+        shell = subprocess.Popen(
+            ["bash", "-c", "sleep 30 & wait"],
+            start_new_session=True,
+        )
+        try:
+            tree = []
+            for _ in range(100):
+                tree = process_tree(shell.pid)
+                if len(tree) > 1:
+                    break
+                time.sleep(0.01)
+            self.assertGreater(len(tree), 1)
+            identity = _auth_pane_identity(pane_pid=shell.pid)
+            with mock.patch.object(
+                backend, "_auth_session_exists", return_value=True
+            ), mock.patch.object(
+                backend, "_private_auth_process_environment_ready", return_value=False
+            ), mock.patch.object(
+                backend, "_inspect_auth_pane", return_value=identity
+            ), mock.patch.object(
+                backend, "terminate"
+            ) as terminate:
+                plan = backend.plan_auth_change(record)
+
+            self.assertFalse(plan.ok)
+            self.assertIn("background job", plan.detail)
+            self.assertIsNone(shell.poll())
+            terminate.assert_not_called()
+        finally:
+            try:
+                os.killpg(shell.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            shell.wait(timeout=5)
+
+    def test_auth_change_rejects_background_job_started_after_preflight(self):
+        record = _auth_record(command="/bin/bash", status="running")
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity()
+
+        with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata", return_value=(True, None, None)
+        ), mock.patch.object(
+            backend, "private_auth_environment_ready", return_value=False
+        ), mock.patch(
+            "termdeck.tmux_backend.process_tree_contains_codex", return_value=False
+        ), mock.patch.object(
+            backend, "_idle_shell_executable", return_value="/bin/bash"
+        ), mock.patch.object(
+            backend, "_process_tree_is_idle_shell", side_effect=[True, False]
+        ), mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            backend, "_terminate_auth_session"
+        ) as terminate, _stable_auth_process(backend, environment_ready=False), _auth_input_gate(backend):
+            plan = backend.plan_auth_change(record)
+            quiescence = backend.quiesce_auth_change(record, plan)
+
+        self.assertTrue(plan.ok)
+        self.assertFalse(quiescence.ok)
+        self.assertIn("background job after auth preflight", quiescence.detail)
+        terminate.assert_not_called()
+
+    def test_auth_change_revalidates_identity_before_legacy_termination(self):
+        record = _auth_record(command="/bin/bash", status="running")
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity()
+        changed_identity = _auth_pane_identity(pane_pid=101)
+
+        with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata", return_value=(True, None, None)
+        ), mock.patch.object(
+            backend, "private_auth_environment_ready", return_value=False
+        ), mock.patch(
+            "termdeck.tmux_backend.process_tree_contains_codex", return_value=False
+        ), mock.patch.object(
+            backend, "_idle_shell_executable", return_value="/bin/bash"
+        ), mock.patch.object(
+            backend, "_process_tree_is_idle_shell", return_value=True
+        ), mock.patch.object(
+            backend,
+            "_inspect_auth_pane",
+            side_effect=[identity, changed_identity],
+        ), mock.patch.object(
+            backend, "_terminate_auth_session"
+        ) as terminate, _stable_auth_process(backend, environment_ready=False), _auth_input_gate(backend):
+            plan = backend.plan_auth_change(record)
+            quiescence = backend.quiesce_auth_change(record, plan)
+
+        self.assertTrue(plan.ok)
+        self.assertFalse(quiescence.ok)
+        self.assertIn("changed after auth preflight", quiescence.detail)
+        terminate.assert_not_called()
+
+    def test_auth_change_reobserves_exact_recovery_before_termination(self):
+        first_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        second_id = "019f71b3-fa32-7251-bac3-c628f34dd155"
+        first = f"codex --yolo resume {first_id}"
+        second = f"codex --yolo resume {second_id}"
+        record = _auth_record(command="/bin/bash", status="running")
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity(command="codex")
+
+        with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata",
+            side_effect=[
+                (True, first, "/workspace/repo"),
+                (True, second, "/workspace/repo"),
+            ],
+        ), mock.patch.object(
+            backend, "private_auth_environment_ready", return_value=True
+        ), mock.patch.object(
+            backend,
+            "_inspect_auth_pane",
+            return_value=identity,
+        ), mock.patch.object(
+            backend, "_terminate_auth_session"
+        ) as terminate, _stable_auth_process(backend, environment_ready=True), _auth_input_gate(backend):
+            plan = backend.plan_auth_change(record)
+            quiescence = backend.quiesce_auth_change(record, plan)
+
+        self.assertTrue(plan.ok)
+        self.assertEqual(plan.recovery_command, first)
+        self.assertFalse(quiescence.ok)
+        self.assertIn("recovery identity changed", quiescence.detail)
+        terminate.assert_not_called()
+
+    def test_auth_change_rejects_external_session_without_inspection(self):
+        record = _auth_record(external=True, pane_target="%9")
+        backend = TmuxBackend(executable="tmux")
+
+        with mock.patch.object(backend, "session_exists") as exists, mock.patch.object(
+            backend, "_run"
+        ) as run:
+            plan = backend.plan_auth_change(record)
+
+        self.assertFalse(plan.ok)
+        self.assertIn("external", plan.detail)
+        exists.assert_not_called()
+        run.assert_not_called()
+
+    def test_auth_change_allows_stopped_managed_terminal_without_recreation(self):
+        record = _auth_record(status="stopped")
+        backend = TmuxBackend(executable="tmux")
+
+        with mock.patch.object(backend, "_auth_session_exists", return_value=False), mock.patch.object(
+            backend, "terminate"
+        ) as terminate, mock.patch.object(
+            backend, "create_or_resume"
+        ) as create, _stable_auth_process(backend, environment_ready=False), _auth_input_gate(backend):
+            plan = backend.plan_auth_change(record)
+            quiescence = backend.quiesce_auth_change(record, plan)
+            result = backend.apply_auth_change(record, plan, quiescence)
+
+        self.assertTrue(plan.ok)
+        self.assertFalse(plan.live)
+        self.assertTrue(result.ok)
+        self.assertFalse(result.restarted)
         terminate.assert_not_called()
         create.assert_not_called()
 
     def test_auth_change_fails_closed_when_live_codex_has_no_exact_resume_identity(self):
-        record = _record(command="/bin/bash", status="running")
+        record = _auth_record(command="/bin/bash", status="running")
         backend = TmuxBackend(executable="tmux")
-        current = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="codex\n", stderr=""
-        )
+        identity = _auth_pane_identity(command="codex")
 
-        with mock.patch.object(backend, "session_exists", return_value=True), mock.patch.object(
-            backend, "recovery_metadata", return_value={record.id: (None, None)}
-        ), mock.patch.object(backend, "pane_pid", return_value=100), mock.patch(
+        with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata", return_value=(True, None, None)
+        ), mock.patch.object(
+            backend, "private_auth_environment_ready", return_value=True
+        ), mock.patch(
             "termdeck.tmux_backend.process_tree_contains_codex", return_value=True
-        ), mock.patch.object(backend, "_run", return_value=current), mock.patch.object(
+        ), mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
             backend, "terminate"
-        ) as terminate:
+        ) as terminate, _stable_auth_process(backend, environment_ready=True), _auth_input_gate(backend):
             result = backend.activate_auth_change(record)
 
         self.assertFalse(result.ok)
@@ -454,21 +2246,24 @@ class TmuxBackendTests(unittest.TestCase):
         terminate.assert_not_called()
 
     def test_auth_change_rejects_non_exact_codex_recovery_before_killing_tab(self):
-        record = _record(command="/bin/bash", status="running")
+        record = _auth_record(command="/bin/bash", status="running")
         backend = TmuxBackend(executable="tmux")
-        current = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="codex\n", stderr=""
-        )
+        identity = _auth_pane_identity(command="codex")
 
-        with mock.patch.object(backend, "session_exists", return_value=True), mock.patch.object(
-            backend,
-            "recovery_metadata",
-            return_value={record.id: ("codex --yolo", "/workspace/repo")},
-        ), mock.patch.object(backend, "pane_pid", return_value=100), mock.patch(
+        with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata",
+            return_value=(True, "codex --yolo", "/workspace/repo"),
+        ), mock.patch.object(
+            backend, "private_auth_environment_ready", return_value=True
+        ), mock.patch(
             "termdeck.tmux_backend.process_tree_contains_codex", return_value=True
-        ), mock.patch.object(backend, "_run", return_value=current), mock.patch.object(
+        ), mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
             backend, "terminate"
-        ) as terminate, mock.patch.object(backend, "create_or_resume") as create:
+        ) as terminate, mock.patch.object(
+            backend, "create_or_resume"
+        ) as create, _stable_auth_process(backend, environment_ready=True), _auth_input_gate(backend):
             result = backend.activate_auth_change(record)
 
         self.assertFalse(result.ok)
@@ -478,19 +2273,21 @@ class TmuxBackendTests(unittest.TestCase):
         create.assert_not_called()
 
     def test_auth_change_unknown_process_tree_fails_closed(self):
-        record = _record(command="/bin/bash", status="running")
+        record = _auth_record(command="/bin/bash", status="running")
         backend = TmuxBackend(executable="tmux")
-        current = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="bash\n", stderr=""
-        )
+        identity = _auth_pane_identity()
 
-        with mock.patch.object(backend, "session_exists", return_value=True), mock.patch.object(
-            backend, "recovery_metadata", return_value={record.id: (None, None)}
-        ), mock.patch.object(backend, "pane_pid", return_value=100), mock.patch(
+        with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata", return_value=(True, None, None)
+        ), mock.patch.object(
+            backend, "private_auth_environment_ready", return_value=False
+        ), mock.patch(
             "termdeck.tmux_backend.process_tree_contains_codex", return_value=None
-        ), mock.patch.object(backend, "_run", return_value=current), mock.patch.object(
+        ), mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
             backend, "terminate"
-        ) as terminate:
+        ) as terminate, _stable_auth_process(backend, environment_ready=False), _auth_input_gate(backend):
             result = backend.activate_auth_change(record)
 
         self.assertFalse(result.ok)
@@ -500,17 +2297,31 @@ class TmuxBackendTests(unittest.TestCase):
 
     def test_auth_change_persists_recovery_state_when_recreate_fails(self):
         session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
-        record = _record(command="/bin/bash", status="running")
+        record = _auth_record(command="/bin/bash", status="running")
         backend = TmuxBackend(executable="tmux")
         recovery = f"codex --yolo resume {session_id}"
+        identity = _auth_pane_identity(command="codex")
 
-        with mock.patch.object(backend, "session_exists", return_value=True), mock.patch.object(
+        with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
+            "termdeck.tmux_backend.observe_recovery_metadata",
+            side_effect=[
+                (True, recovery, "/workspace/repo"),
+                (True, recovery, "/workspace/repo"),
+                (True, recovery, "/workspace/repo"),
+            ],
+        ), mock.patch.object(
+            backend, "private_auth_environment_ready", return_value=True
+        ), mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            backend, "_suspend_auth_process_tree", return_value=((100, 1, False),)
+        ), mock.patch.object(
+            backend, "_kill_quiesced_auth_processes"
+        ), mock.patch.object(backend, "_terminate_auth_session"), mock.patch.object(
             backend,
-            "recovery_metadata",
-            return_value={record.id: (recovery, "/workspace/repo")},
-        ), mock.patch.object(backend, "terminate"), mock.patch.object(
-            backend, "create_or_resume", side_effect=TmuxError("recreate failed")
-        ):
+            "_create_or_resume_unlocked",
+            side_effect=TmuxError("recreate failed"),
+        ), _stable_auth_process(backend, environment_ready=True), _auth_input_gate(backend):
             result = backend.activate_auth_change(record)
 
         self.assertFalse(result.ok)
@@ -518,7 +2329,362 @@ class TmuxBackendTests(unittest.TestCase):
         self.assertEqual(result.status, "recovery-pending")
         self.assertEqual(result.recovery_command, recovery)
         self.assertEqual(result.recovery_cwd, "/workspace/repo")
+        self.assertTrue(result.preserve_selected_account)
+        self.assertFalse(result.clear_recovery)
+        self.assertIsNone(result.command)
+        self.assertIsNone(result.cwd)
         self.assertIn("recreate failed", result.detail)
+
+    def test_auth_change_marks_failed_recreation_uncertain_when_cleanup_cannot_bind(self):
+        from termdeck.tmux_backend import AuthActivationPlan, AuthQuiesceResult
+
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        recovery = f"codex --yolo resume {session_id}"
+        record = _auth_record(command="/bin/bash", status="running")
+        backend = TmuxBackend(executable="tmux")
+        plan = AuthActivationPlan(
+            True,
+            live=True,
+            restart=True,
+            environment_ready=True,
+            session_created="1700000000",
+            pane_id="%1",
+            pane_pid=100,
+            pane_start_time=1,
+            pane_current_command="codex",
+            pane_current_path="/workspace/repo",
+            recovery_command=recovery,
+            recovery_cwd="/workspace/repo",
+        )
+        lease = mock.Mock(name="auth_lifetime_lease")
+        quiescence = AuthQuiesceResult(
+            True,
+            live=True,
+            terminated=True,
+            plan_token=backend._auth_plan_token(plan),
+            lifetime_lease=lease,
+        )
+        created = _auth_pane_identity(
+            command="codex",
+            cwd="/workspace/repo",
+            session_created="1700000001",
+            pane_pid=4242,
+        )
+
+        with mock.patch.object(
+            backend, "_create_or_resume_unlocked"
+        ) as create, mock.patch.object(
+            backend,
+            "_await_auth_recreation_ready",
+            return_value=(created, "fresh pane has not taken over the exact Codex recovery UUID"),
+        ), mock.patch.object(
+            backend,
+            "_cleanup_failed_auth_recreation",
+            return_value=(False, "terminal identity changed before failed-restart cleanup"),
+        ):
+            result = backend.apply_auth_change(record, plan, quiescence)
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.restarted)
+        self.assertEqual(result.status, "recovery-pending")
+        self.assertEqual(result.pid, 4242)
+        self.assertEqual(result.recovery_command, recovery)
+        self.assertIn("exact Codex recovery UUID", result.detail)
+        self.assertIn("identity changed", result.detail)
+        self.assertEqual(lease.release.call_args_list, [mock.call(), mock.call()])
+        create.assert_called_once()
+        self.assertTrue(create.call_args.kwargs["require_absent"])
+
+    def test_auth_change_apply_requires_the_matching_quiescence_receipt(self):
+        from termdeck.tmux_backend import AuthActivationPlan, AuthQuiesceResult
+
+        backend = TmuxBackend(executable="tmux")
+        record = _auth_record(status="stopped")
+        plan = AuthActivationPlan(True, detail="stopped")
+
+        result = backend.apply_auth_change(
+            record,
+            plan,
+            AuthQuiesceResult(True, detail="not bound to this plan"),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("matching successful quiescence receipt", result.detail)
+
+    def test_same_account_reselect_repairs_legacy_binding_after_quiescence(self):
+        from termdeck.codex_auth import CodexAccount, CodexAuthState, CodexSwitchResult
+        from termdeck.tmux_backend import (
+            AuthActivationPlan,
+            AuthActivationResult,
+            AuthQuiesceResult,
+            execute_auth_change,
+        )
+
+        calls = []
+        record = _auth_record(status="stopped", selected_account="alpha")
+        stale = CodexAuthState(
+            codex_home=record.codex_home or "",
+            accounts=(CodexAccount("alpha", alias="alpha", active=True),),
+            selected_account="alpha",
+            selected_account_key="alpha",
+            fingerprint="stale",
+            codex_auth_available=True,
+            catalog_shared=False,
+            canonical_binding_ready=False,
+        )
+        repaired = CodexAuthState(
+            codex_home=record.codex_home or "",
+            accounts=(CodexAccount("alpha", alias="alpha", active=True),),
+            selected_account="alpha",
+            selected_account_key="alpha",
+            fingerprint="repaired",
+            codex_auth_available=True,
+            canonical_binding_ready=True,
+        )
+
+        class Backend:
+            def plan_auth_change(self, _record):
+                calls.append("plan")
+                return AuthActivationPlan(True, detail="stopped")
+
+            def quiesce_auth_change(self, _record, _plan):
+                calls.append("quiesce")
+                return AuthQuiesceResult(True)
+
+            def apply_auth_change(self, _record, _plan, _quiescence):
+                calls.append("apply")
+                return AuthActivationResult(True, False)
+
+        class Manager:
+            def switch(self, _record, account_key):
+                calls.append(("switch", account_key))
+                return CodexSwitchResult(True, repaired)
+
+            def restore(self, *_args):
+                raise AssertionError("successful repair must not roll back")
+
+        result = execute_auth_change(Backend(), Manager(), record, stale, "alpha")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(calls, ["plan", "quiesce", ("switch", "alpha"), "apply"])
+        self.assertEqual(result.switch_result.state.fingerprint, "repaired")
+
+    def test_explicit_same_canonical_account_still_activates_a_legacy_terminal(self):
+        from termdeck.codex_auth import CodexAccount, CodexAuthState, CodexSwitchResult
+        from termdeck.tmux_backend import (
+            AuthActivationPlan,
+            AuthActivationResult,
+            AuthQuiesceResult,
+            execute_auth_change,
+        )
+
+        calls = []
+        record = _auth_record(status="running", selected_account="alpha")
+        selected = CodexAuthState(
+            codex_home=record.codex_home or "",
+            accounts=(CodexAccount("alpha", alias="alpha", active=True),),
+            selected_account="alpha",
+            selected_account_key="alpha",
+            fingerprint="canonical",
+            codex_auth_available=True,
+            canonical_binding_ready=True,
+        )
+
+        class Backend:
+            def plan_auth_change(self, _record):
+                calls.append("plan")
+                return AuthActivationPlan(True, live=True, restart=True)
+
+            def quiesce_auth_change(self, _record, _plan):
+                calls.append("quiesce")
+                return AuthQuiesceResult(True, live=True, terminated=True)
+
+            def apply_auth_change(self, _record, _plan, _quiescence):
+                calls.append("apply")
+                return AuthActivationResult(True, True)
+
+        class Manager:
+            def switch(self, _record, account_key):
+                calls.append(("switch", account_key))
+                return CodexSwitchResult(True, selected)
+
+        result = execute_auth_change(Backend(), Manager(), record, selected, "alpha")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(calls, ["plan", "quiesce", ("switch", "alpha"), "apply"])
+
+    def test_switch_failure_restores_unselected_pointer_before_reactivation(self):
+        from termdeck.codex_auth import CodexAccount, CodexAuthState, CodexSwitchResult
+        from termdeck.tmux_backend import (
+            AuthActivationPlan,
+            AuthActivationResult,
+            AuthQuiesceResult,
+            execute_auth_change,
+        )
+
+        calls = []
+        record = _auth_record(status="stopped", selected_account=None)
+        previous = CodexAuthState(
+            codex_home=record.codex_home or "",
+            accounts=(CodexAccount("alpha", alias="alpha", active=False),),
+            selected_account=None,
+            selected_account_key=None,
+            fingerprint="unselected",
+            codex_auth_available=True,
+        )
+
+        class Backend:
+            def plan_auth_change(self, _record):
+                calls.append("plan")
+                return AuthActivationPlan(True, detail="stopped")
+
+            def quiesce_auth_change(self, _record, _plan):
+                calls.append("quiesce")
+                return AuthQuiesceResult(True)
+
+            def apply_auth_change(self, _record, _plan, _quiescence):
+                calls.append("apply")
+                return AuthActivationResult(True, False)
+
+        class Manager:
+            def switch(self, _record, account_key):
+                calls.append(("switch", account_key))
+                return CodexSwitchResult(False, previous, "replace failed")
+
+            def restore(self, _record, account_key):
+                calls.append(("restore", account_key))
+                return CodexSwitchResult(True, previous)
+
+        result = execute_auth_change(Backend(), Manager(), record, previous, "alpha")
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.rolled_back)
+        self.assertTrue(result.activation.ok)
+        self.assertEqual(
+            calls,
+            [
+                "plan",
+                "quiesce",
+                ("switch", "alpha"),
+                ("restore", None),
+                "apply",
+            ],
+        )
+
+    def test_failed_restore_leaves_terminated_terminal_stopped(self):
+        from termdeck.codex_auth import CodexAccount, CodexAuthState, CodexSwitchResult
+        from termdeck.tmux_backend import (
+            AuthActivationPlan,
+            AuthQuiesceResult,
+            execute_auth_change,
+        )
+
+        calls = []
+        record = _auth_record(status="running", selected_account="alpha")
+        previous = CodexAuthState(
+            codex_home=record.codex_home or "",
+            accounts=(
+                CodexAccount("alpha", alias="alpha", active=True),
+                CodexAccount("beta", alias="beta", active=False),
+            ),
+            selected_account="alpha",
+            selected_account_key="alpha",
+            fingerprint="before",
+            codex_auth_available=True,
+        )
+
+        class Backend:
+            def plan_auth_change(self, _record):
+                calls.append("plan")
+                return AuthActivationPlan(
+                    True,
+                    live=True,
+                    restart=True,
+                    replacement_command="/bin/bash",
+                    replacement_cwd="/tmp",
+                )
+
+            def quiesce_auth_change(self, _record, _plan):
+                calls.append("quiesce")
+                return AuthQuiesceResult(True, live=True, terminated=True)
+
+            def apply_auth_change(self, *_args):
+                calls.append("apply")
+                raise AssertionError("uncertain credentials must never be reactivated")
+
+        class Manager:
+            def switch(self, _record, account_key):
+                calls.append(("switch", account_key))
+                return CodexSwitchResult(False, previous, "replace failed")
+
+            def restore(self, _record, account_key):
+                calls.append(("restore", account_key))
+                return CodexSwitchResult(False, previous, "restore not verified")
+
+        result = execute_auth_change(Backend(), Manager(), record, previous, "beta")
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.rolled_back)
+        self.assertFalse(result.activation.ok)
+        self.assertEqual(result.activation.status, "stopped")
+        self.assertNotIn("apply", calls)
+        self.assertIn("restore failed", result.error)
+
+    def test_restore_exception_and_unreadable_state_is_persisted_as_unverified(self):
+        from termdeck.codex_auth import CodexAccount, CodexAuthState
+        from termdeck.tmux_backend import (
+            AuthActivationPlan,
+            AuthQuiesceResult,
+            execute_auth_change,
+        )
+
+        record = _auth_record(status="running", selected_account="alpha")
+        previous = CodexAuthState(
+            codex_home=record.codex_home or "",
+            accounts=(
+                CodexAccount("alpha", alias="alpha", active=True),
+                CodexAccount("beta", alias="beta", active=False),
+            ),
+            selected_account="alpha",
+            selected_account_key="alpha",
+            fingerprint="before",
+            codex_auth_available=True,
+        )
+
+        class Backend:
+            def plan_auth_change(self, _record):
+                return AuthActivationPlan(
+                    True,
+                    live=True,
+                    restart=True,
+                    replacement_command="/bin/bash",
+                    replacement_cwd="/tmp",
+                )
+
+            def quiesce_auth_change(self, _record, _plan):
+                return AuthQuiesceResult(True, live=True, terminated=True)
+
+            def apply_auth_change(self, *_args):
+                raise AssertionError("an unverified pointer must remain stopped")
+
+        class Manager:
+            def switch(self, *_args):
+                raise OSError("partial pointer replace")
+
+            def restore(self, *_args):
+                raise OSError("restore failed")
+
+            def state(self, *_args):
+                raise OSError("state unreadable")
+
+        result = execute_auth_change(Backend(), Manager(), record, previous, "beta")
+
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.switch_result.state.selected_account)
+        self.assertIsNone(result.switch_result.state.selected_account_key)
+        self.assertFalse(result.switch_result.state.canonical_binding_ready)
+        self.assertEqual(result.activation.status, "stopped")
+        self.assertIn("could not be inspected", result.error)
 
     def test_checkpoint_records_uses_exact_codex_uuid_without_memory_image(self):
         session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
@@ -615,9 +2781,11 @@ class TmuxBackendTests(unittest.TestCase):
         with mock.patch(
             "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
         ), mock.patch.object(backend, "_run") as run:
-            handled = backend.scroll_session(record, 3)
+            outcome = backend.scroll_session(record, 3)
 
-        self.assertFalse(handled)
+        self.assertIs(outcome.disposition, ScrollDisposition.UNHANDLED)
+        self.assertIs(outcome.edge, EdgeKnowledge.LIVE_EXACT)
+        self.assertEqual(outcome.depth, 0)
         self.assertFalse(backend.scroll_view_active(record))
         run.assert_not_called()
 
@@ -627,86 +2795,275 @@ class TmuxBackendTests(unittest.TestCase):
         command = subprocess.CompletedProcess(
             args=["tmux"], returncode=0, stdout="1\t0\tcodex\n", stderr=""
         )
-        scrolled = subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             args=["tmux"], returncode=0, stdout="", stderr=""
         )
-        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
-            backend, "_run", side_effect=[command, scrolled]
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+        ), mock.patch.object(
+            backend, "_run", side_effect=[command, completed, completed]
         ) as run:
-            handled = backend.scroll_session(record, -3)
+            outcome = backend.scroll_session(record, -3)
 
-        self.assertTrue(handled)
-        self.assertTrue(backend.scroll_view_active(record))
+        self.assertIs(outcome.disposition, ScrollDisposition.HANDLED)
+        self.assertIs(outcome.owner, HistoryOwner.CODEX)
+        self.assertIs(outcome.edge, EdgeKnowledge.HISTORY_EXACT)
+        self.assertEqual(outcome.depth, 3)
+        self.assertTrue(outcome.managed_open)
+        state = backend.scroll_state(record)
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertTrue(state.managed_open)
+        self.assertEqual(state.depth, 3)
         self.assertEqual(
-            run.call_args_list,
-            [
-                mock.call(
-                    [
-                        "display-message",
-                        "-p",
-                        "-t",
-                        backend.pane_target(record),
-                        "#{alternate_on}\t#{pane_in_mode}\t#{pane_current_command}",
-                    ],
-                    check=False,
-                    timeout=backend.query_timeout,
-                ),
-                mock.call(
-                    [
-                        "send-keys",
-                        "-t",
-                        backend.pane_target(record),
-                        "C-t",
-                        ";",
-                        "send-keys",
-                        "-t",
-                        backend.pane_target(record),
-                        "-N",
-                        "3",
-                        "Up",
-                    ],
-                    check=False,
-                    timeout=backend.query_timeout,
-                ),
-            ],
+            run.call_args_list[1],
+            mock.call(
+                ["send-keys", "-t", backend.pane_target(record), "C-t"],
+                check=False,
+                timeout=backend.query_timeout,
+            ),
+        )
+        self.assertEqual(
+            run.call_args_list[2],
+            mock.call(
+                [
+                    "send-keys",
+                    "-t",
+                    backend.pane_target(record),
+                    "-N",
+                    "3",
+                    "Up",
+                ],
+                check=False,
+                timeout=backend.query_timeout,
+            ),
         )
 
-    def test_scroll_shell_uses_tmux_copy_mode_not_child_arrow_keys(self):
+    def test_scroll_shell_uses_tmux_copy_mode_and_reports_exact_position(self):
         record = _record()
         backend = TmuxBackend(executable="tmux")
         command = subprocess.CompletedProcess(
             args=["tmux"], returncode=0, stdout="0\t0\tbash\n", stderr=""
         )
         scrolled = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="1\t3\t120\n", stderr=""
+        )
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+        ), mock.patch.object(backend, "_run", side_effect=[command, scrolled]) as run:
+            outcome = backend.scroll_session(record, -3)
+
+        self.assertIs(outcome.disposition, ScrollDisposition.HANDLED)
+        self.assertIs(outcome.owner, HistoryOwner.TMUX)
+        self.assertIs(outcome.edge, EdgeKnowledge.HISTORY_EXACT)
+        self.assertEqual(outcome.depth, 3)
+        self.assertEqual(outcome.extent, 120)
+        self.assertTrue(backend.scroll_view_active(record))
+        self.assertIn("copy-mode", run.call_args_list[-1].args[0])
+        self.assertIn("scroll-up", run.call_args_list[-1].args[0])
+        self.assertIn("#{pane_in_mode}\t#{scroll_position}\t#{history_size}", run.call_args_list[-1].args[0])
+
+    def test_single_scroll_down_from_deep_tmux_history_is_incremental(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        backend._scroll_views[record.id] = BackendHistoryState(
+            owner=HistoryOwner.TMUX,
+            depth=30,
+            extent=120,
+            command="bash",
+            validated_at=time.monotonic(),
+        )
+        scrolled = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="1\t27\t120\n", stderr=""
+        )
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+        ), mock.patch.object(backend, "_run", return_value=scrolled) as run:
+            outcome = backend.scroll_session(record, 3)
+
+        self.assertIs(outcome.edge, EdgeKnowledge.HISTORY_EXACT)
+        self.assertEqual(outcome.depth, 27)
+        self.assertTrue(backend.scroll_view_active(record))
+        self.assertIn("scroll-down", run.call_args.args[0])
+        self.assertNotIn("copy-mode", run.call_args.args[0])
+
+    def test_single_scroll_down_from_deep_codex_history_does_not_close_transcript(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        backend._scroll_views[record.id] = BackendHistoryState(
+            owner=HistoryOwner.CODEX,
+            depth=30,
+            managed_open=True,
+            command="codex",
+            validated_at=time.monotonic(),
+        )
+        context = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="1\t0\tcodex\n", stderr=""
+        )
+        completed = subprocess.CompletedProcess(
             args=["tmux"], returncode=0, stdout="", stderr=""
         )
-        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
-            backend, "_run", side_effect=[command, scrolled]
-        ) as run:
-            handled = backend.scroll_session(record, -3)
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+        ), mock.patch.object(backend, "_run", side_effect=[context, completed]) as run:
+            outcome = backend.scroll_session(record, 3)
 
-        self.assertTrue(handled)
+        self.assertIs(outcome.edge, EdgeKnowledge.HISTORY_EXACT)
+        self.assertEqual(outcome.depth, 27)
         self.assertTrue(backend.scroll_view_active(record))
         self.assertEqual(
-            run.call_args_list[-1],
-            mock.call(
-                [
-                    "copy-mode",
-                    "-t",
-                    backend.pane_target(record),
-                    ";",
-                    "send-keys",
-                    "-X",
-                    "-t",
-                    backend.pane_target(record),
-                    "-N",
-                    "3",
-                    "scroll-up",
-                ],
-                check=False,
-                timeout=backend.query_timeout,
-            ),
+            run.call_args_list[-1].args[0],
+            [
+                "send-keys",
+                "-t",
+                backend.pane_target(record),
+                "-N",
+                "3",
+                "Down",
+            ],
         )
+        self.assertNotIn("C-t", run.call_args.args[0])
+
+    def test_codex_scroll_down_reports_live_only_when_logical_depth_reaches_zero(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        backend._scroll_views[record.id] = BackendHistoryState(
+            owner=HistoryOwner.CODEX,
+            depth=3,
+            managed_open=True,
+            command="codex",
+            validated_at=time.monotonic(),
+        )
+        context = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="1\t0\tcodex\n", stderr=""
+        )
+        completed = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="", stderr=""
+        )
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+        ), mock.patch.object(backend, "_run", side_effect=[context, completed]):
+            outcome = backend.scroll_session(record, 3)
+
+        self.assertIs(outcome.edge, EdgeKnowledge.LIVE_EXACT)
+        self.assertEqual(outcome.depth, 0)
+        # The transcript remains tracked until restore_live_session closes the
+        # exact managed surface. A live-edge outcome is evidence, not cleanup.
+        self.assertTrue(backend.scroll_view_active(record))
+
+    def test_codex_scroll_revalidates_owner_and_sends_no_key_when_query_fails(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        state = BackendHistoryState(
+            owner=HistoryOwner.CODEX,
+            depth=30,
+            managed_open=True,
+            command="codex",
+            validated_at=time.monotonic(),
+        )
+        backend._scroll_views[record.id] = state
+        failed = subprocess.CompletedProcess(
+            args=["tmux"], returncode=1, stdout="", stderr="query failed"
+        )
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+        ), mock.patch.object(backend, "_run", return_value=failed) as run:
+            outcome = backend.scroll_session(record, 3)
+
+        self.assertIs(outcome.disposition, ScrollDisposition.UNHANDLED)
+        self.assertIs(outcome.edge, EdgeKnowledge.UNKNOWN)
+        self.assertEqual(outcome.depth, 30)
+        self.assertEqual(backend.scroll_state(record), state)
+        self.assertEqual(len(run.call_args_list), 1)
+        self.assertEqual(run.call_args.args[0][0], "display-message")
+
+    def test_codex_scroll_after_process_exit_never_sends_stale_transcript_key_to_shell(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        backend._scroll_views[record.id] = BackendHistoryState(
+            owner=HistoryOwner.CODEX,
+            depth=30,
+            managed_open=True,
+            command="codex",
+            validated_at=time.monotonic(),
+        )
+        shell = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="0\t0\tbash\n", stderr=""
+        )
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+        ), mock.patch.object(backend, "_run", return_value=shell) as run:
+            outcome = backend.scroll_session(record, 3)
+
+        self.assertIs(outcome.disposition, ScrollDisposition.UNHANDLED)
+        self.assertIs(outcome.owner, HistoryOwner.LIVE)
+        self.assertFalse(backend.scroll_view_active(record))
+        self.assertEqual(len(run.call_args_list), 1)
+        self.assertNotIn("send-keys", run.call_args.args[0])
+
+    def test_history_io_is_serialized_per_session_not_globally(self):
+        first = _record(id="td-first", tmux_name="termdeck_first")
+        second = _record(id="td-second", tmux_name="termdeck_second")
+        backend = TmuxBackend(executable="tmux")
+        now = time.monotonic()
+        backend._scroll_views[first.id] = BackendHistoryState(
+            owner=HistoryOwner.TMUX,
+            depth=30,
+            extent=120,
+            command="bash",
+            validated_at=now,
+        )
+        backend._scroll_views[second.id] = BackendHistoryState(
+            owner=HistoryOwner.TMUX,
+            depth=30,
+            extent=120,
+            command="bash",
+            validated_at=now,
+        )
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_finished = threading.Event()
+        outcomes = {}
+
+        def run(args, **_kwargs):
+            joined = " ".join(args)
+            if backend.pane_target(first) in joined:
+                first_entered.set()
+                self.assertTrue(release_first.wait(timeout=2))
+                return subprocess.CompletedProcess(
+                    args=["tmux"], returncode=0, stdout="1\t27\t120\n", stderr=""
+                )
+            if backend.pane_target(second) in joined:
+                second_finished.set()
+                return subprocess.CompletedProcess(
+                    args=["tmux"], returncode=0, stdout="1\t27\t120\n", stderr=""
+                )
+            raise AssertionError(f"unexpected tmux command: {args!r}")
+
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+        ), mock.patch.object(backend, "_run", side_effect=run):
+            first_thread = threading.Thread(
+                target=lambda: outcomes.setdefault("first", backend.scroll_session(first, 3))
+            )
+            second_thread = threading.Thread(
+                target=lambda: outcomes.setdefault("second", backend.scroll_session(second, 3))
+            )
+            first_thread.start()
+            self.assertTrue(first_entered.wait(timeout=1))
+            second_thread.start()
+            self.assertTrue(
+                second_finished.wait(timeout=1),
+                "second terminal was convoyed behind the first terminal's blocked I/O",
+            )
+            second_thread.join(timeout=1)
+            self.assertFalse(second_thread.is_alive())
+            release_first.set()
+            first_thread.join(timeout=1)
+            self.assertFalse(first_thread.is_alive())
+
+        self.assertEqual(outcomes["first"].depth, 27)
+        self.assertEqual(outcomes["second"].depth, 27)
 
     def test_scroll_alternate_screen_is_passed_to_any_tui_without_copy_mode(self):
         record = _record()
@@ -722,21 +3079,13 @@ class TmuxBackendTests(unittest.TestCase):
                 with mock.patch(
                     "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
                 ), mock.patch.object(backend, "_run", return_value=state) as run:
-                    disposition = backend.scroll_session(record, -3)
+                    outcome = backend.scroll_session(record, -3)
 
-                self.assertIs(disposition, ScrollDisposition.PASSTHROUGH)
+                self.assertIs(outcome.disposition, ScrollDisposition.PASSTHROUGH)
+                self.assertIs(outcome.owner, HistoryOwner.CHILD_TUI)
+                self.assertIs(outcome.edge, EdgeKnowledge.UNKNOWN)
                 self.assertFalse(backend.scroll_view_active(record))
-                run.assert_called_once_with(
-                    [
-                        "display-message",
-                        "-p",
-                        "-t",
-                        backend.pane_target(record),
-                        "#{alternate_on}\t#{pane_in_mode}\t#{pane_current_command}",
-                    ],
-                    check=False,
-                    timeout=backend.query_timeout,
-                )
+                run.assert_called_once()
 
     def test_scroll_alternate_screen_repairs_stale_copy_mode_before_passthrough(self):
         record = _record()
@@ -750,9 +3099,9 @@ class TmuxBackendTests(unittest.TestCase):
         with mock.patch(
             "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
         ), mock.patch.object(backend, "_run", side_effect=[state, restored]) as run:
-            disposition = backend.scroll_session(record, -3)
+            outcome = backend.scroll_session(record, -3)
 
-        self.assertIs(disposition, ScrollDisposition.PASSTHROUGH)
+        self.assertIs(outcome.disposition, ScrollDisposition.PASSTHROUGH)
         self.assertFalse(backend.scroll_view_active(record))
         self.assertEqual(
             run.call_args_list[-1],
@@ -763,46 +3112,32 @@ class TmuxBackendTests(unittest.TestCase):
             ),
         )
 
-    def test_subsequent_codex_wheel_does_not_toggle_transcript_closed(self):
-        record = _record()
-        backend = TmuxBackend(executable="tmux")
-        backend._scroll_views[record.id] = "codex-transcript"
-        completed = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="", stderr=""
-        )
-        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
-            backend, "_run", return_value=completed
-        ) as run:
-            handled = backend.scroll_session(record, 4)
-
-        self.assertTrue(handled)
-        run.assert_called_once_with(
-            [
-                "send-keys",
-                "-t",
-                backend.pane_target(record),
-                "-N",
-                "4",
-                "Down",
-            ],
-            check=False,
-            timeout=backend.query_timeout,
-        )
-
     def test_large_codex_scrollbar_jump_uses_page_navigation(self):
         record = _record()
         backend = TmuxBackend(executable="tmux")
-        backend._scroll_views[record.id] = "codex-transcript"
+        backend._scroll_views[record.id] = BackendHistoryState(
+            owner=HistoryOwner.CODEX,
+            depth=24,
+            managed_open=True,
+            command="codex",
+            validated_at=time.monotonic(),
+        )
+        context = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="1\t0\tcodex\n", stderr=""
+        )
         completed = subprocess.CompletedProcess(
             args=["tmux"], returncode=0, stdout="", stderr=""
         )
         with mock.patch(
             "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
-        ), mock.patch.object(backend, "_run", return_value=completed) as run:
-            handled = backend.scroll_session(record, -96)
+        ), mock.patch.object(backend, "_run", side_effect=[context, completed]) as run:
+            outcome = backend.scroll_session(record, -96)
 
-        self.assertTrue(handled)
-        run.assert_called_once_with(
+        self.assertIs(outcome.disposition, ScrollDisposition.HANDLED)
+        self.assertEqual(outcome.depth, 120)
+        self.assertEqual(
+            run.call_args_list[-1],
+            mock.call(
             [
                 "send-keys",
                 "-t",
@@ -813,6 +3148,7 @@ class TmuxBackendTests(unittest.TestCase):
             ],
             check=False,
             timeout=backend.query_timeout,
+            ),
         )
 
     def test_interactive_session_leaves_pointer_with_tui_and_bounds_history(self):
@@ -887,45 +3223,100 @@ class TmuxBackendTests(unittest.TestCase):
             timeout=backend.query_timeout,
         )
 
-    def test_restore_live_codex_transcript_closes_it_before_live_input(self):
+    def test_restore_live_codex_transcript_closes_only_termdeck_managed_transcript(self):
         record = _record()
         backend = TmuxBackend(executable="tmux")
-        backend._scroll_views[record.id] = "codex-transcript"
+        backend._scroll_views[record.id] = BackendHistoryState(
+            owner=HistoryOwner.CODEX,
+            depth=30,
+            managed_open=True,
+            command="codex",
+            validated_at=time.monotonic(),
+        )
+        context = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="1\t0\tcodex\n", stderr=""
+        )
         completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
         with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
-            backend, "_run", return_value=completed
+            backend, "_run", side_effect=[context, completed]
         ) as run:
-            backend.restore_live_session(record)
+            restored = backend.restore_live_session(record)
 
+        self.assertTrue(restored)
         self.assertFalse(backend.scroll_view_active(record))
-        run.assert_called_once_with(
-            [
-                "send-keys",
-                "-t",
-                backend.pane_target(record),
-                "C-t",
-                ";",
-                "set-option",
-                "-t",
-                record.tmux_name,
-                "mouse",
-                "off",
-                ";",
-                "set-option",
-                "-w",
-                "-t",
-                backend.pane_target(record),
-                "window-size",
-                "latest",
-                ";",
-                "copy-mode",
-                "-q",
-                "-t",
-                backend.pane_target(record),
-            ],
-            check=False,
-            timeout=backend.query_timeout,
+        self.assertEqual(run.call_args.args[0][:5], ["send-keys", "-t", backend.pane_target(record), "C-t", ";"])
+
+    def test_restore_live_failure_preserves_tracked_history_state(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        state = BackendHistoryState(
+            owner=HistoryOwner.CODEX,
+            depth=30,
+            managed_open=True,
+            command="codex",
+            validated_at=time.monotonic(),
         )
+        backend._scroll_views[record.id] = state
+        context = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="1\t0\tcodex\n", stderr=""
+        )
+        failed = subprocess.CompletedProcess(args=["tmux"], returncode=1, stdout="", stderr="failed")
+        with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            backend, "_run", side_effect=[context, failed]
+        ):
+            restored = backend.restore_live_session(record)
+
+        self.assertFalse(restored)
+        self.assertEqual(backend.scroll_state(record), state)
+
+    def test_restore_live_codex_owner_query_failure_blocks_input_and_keeps_state(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        state = BackendHistoryState(
+            owner=HistoryOwner.CODEX,
+            depth=30,
+            managed_open=True,
+            command="codex",
+            validated_at=time.monotonic(),
+        )
+        backend._scroll_views[record.id] = state
+        failed = subprocess.CompletedProcess(
+            args=["tmux"], returncode=1, stdout="", stderr="query failed"
+        )
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+        ), mock.patch.object(backend, "_run", return_value=failed) as run:
+            restored = backend.restore_live_session(record, force=True)
+
+        self.assertFalse(restored)
+        self.assertEqual(backend.scroll_state(record), state)
+        self.assertEqual(len(run.call_args_list), 1)
+        self.assertNotIn("C-t", run.call_args.args[0])
+
+    def test_restore_live_after_codex_exit_clears_stale_state_without_sending_ct(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        backend._scroll_views[record.id] = BackendHistoryState(
+            owner=HistoryOwner.CODEX,
+            depth=30,
+            managed_open=True,
+            command="codex",
+            validated_at=time.monotonic(),
+        )
+        shell = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="0\t0\tbash\n", stderr=""
+        )
+        completed = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="", stderr=""
+        )
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+        ), mock.patch.object(backend, "_run", side_effect=[shell, completed]) as run:
+            restored = backend.restore_live_session(record, force=True)
+
+        self.assertTrue(restored)
+        self.assertFalse(backend.scroll_view_active(record))
+        self.assertNotIn("C-t", run.call_args_list[-1].args[0])
 
     def test_send_text_restores_untracked_copy_mode_before_literal_text_and_enter(self):
         record = _record()
@@ -954,10 +3345,27 @@ class TmuxBackendTests(unittest.TestCase):
             ],
         )
 
+    def test_send_text_refuses_to_leak_input_when_live_restore_fails(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        with mock.patch.object(backend, "create_or_resume"), mock.patch.object(
+            backend, "restore_live_session", return_value=False
+        ), mock.patch.object(backend, "_run") as run:
+            with self.assertRaisesRegex(TmuxError, "restored from history"):
+                backend.send_text(record, "must-not-leak", enter=True)
+
+        run.assert_not_called()
+
     def test_terminate_forgets_tracked_scroll_view(self):
         record = _record()
         backend = TmuxBackend(executable="tmux")
-        backend._scroll_views[record.id] = "tmux-history"
+        backend._scroll_views[record.id] = BackendHistoryState(
+            owner=HistoryOwner.TMUX,
+            depth=3,
+            extent=100,
+            command="bash",
+            validated_at=time.monotonic(),
+        )
         with mock.patch.object(backend, "session_exists", return_value=False):
             backend.terminate(record)
 

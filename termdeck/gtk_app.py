@@ -15,6 +15,8 @@ import tempfile
 import threading
 import time
 import tty
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import gi  # type: ignore
@@ -38,6 +40,7 @@ from .codex_auth import CodexAuthError, CodexAuthManager, CodexAuthState, CodexS
 from .command_palette import PaletteItem, build_palette_items, search_palette
 from .control_plan import ControlPlan, build_control_plan, render_control_plan_text
 from .health import HealthPolicy, classify_session, health_badge, should_pause_for_attention
+from .history_control import ScrollDisposition, ScrollOutcome, unhandled_scroll
 from .liveness import merge_confirmed_pane_snapshot
 from .master_tasks import filter_rows
 from .models import SessionRecord, TerminalTheme
@@ -54,7 +57,14 @@ from .task_snapshot import build_task_snapshot
 from .command_render import default_shell, directory_tab_name, normalise_directory, render_command
 from .window_snapshot import build_window_snapshots
 from .terminator_config import load_terminator_theme
-from .tmux_backend import AuthActivationResult, ScrollDisposition, TmuxBackend, TmuxError
+from .tmux_backend import (
+    AuthActivationResult,
+    AuthTransactionBusy,
+    TmuxBackend,
+    TmuxError,
+    auth_transaction_lock,
+    execute_auth_change,
+)
 from .ui_theme import (
     apply_terminal_palette,
     build_chrome_css,
@@ -70,7 +80,95 @@ from .ui_theme import (
     terminal_palette_names,
     toast_message_for_action,
 )
+from .vte_stack import merge_vte_attach_environment
 from .workspace_recipe import RecipeWindow, WorkspaceRecipeError, load_recipe
+
+
+_VTE_VERSION_REPLY = re.compile(r"VTE\(\d{3,6}\)")
+_VTE_CARET_DA_REPLY = re.compile(r"\^\[\[(?:\?|>)[0-9;]+c")
+_VTE_RAW_DA_REPLY = re.compile(r"\x1b\[(?:\?|>)[0-9;]+c")
+
+# Scrollbar drags are high-frequency UI input. Bound backend work globally so
+# a large restored workspace cannot turn one drag per tab into an I/O convoy.
+_HISTORY_SCROLL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="termdeck-history",
+)
+# ThreadPoolExecutor intentionally has an unbounded internal work queue. A
+# non-blocking admission semaphore caps all active+queued history worker chains
+# so storage stalls cannot accumulate one queued future per restored tab.
+_HISTORY_SCROLL_ADMISSION = threading.BoundedSemaphore(value=8)
+
+
+def _without_replayed_vte_probe_echo(history: str) -> str:
+    """Drop only terminal-identity replies leaked by the old attach race.
+
+    Older TermDeck clients could hand a canonical/echoing PTY to VTE before
+    the tmux attach child existed. VTE's automatic DA/XTVERSION replies then
+    became visible shell text and were retained in tmux history. The current
+    child-first/raw attach prevents new contamination; this narrow filter keeps
+    those already-persisted rows from being re-seeded into every new VTE view.
+
+    Ordinary text that merely mentions a VTE version is preserved. A line is
+    discarded only when the version token is paired with a DA reply, a complete
+    XTVERSION DCS reply, or the repeated-version/ST shape from the known leak.
+    """
+
+    kept: list[str] = []
+    for line in history.splitlines(keepends=True):
+        version_hits = len(_VTE_VERSION_REPLY.findall(line))
+        da_hits = len(_VTE_CARET_DA_REPLY.findall(line)) + len(
+            _VTE_RAW_DA_REPLY.findall(line)
+        )
+        complete_xtversion = bool(version_hits) and (
+            ("\x1bP>|VTE(" in line and "\x1b\\" in line)
+            or ("^[P>|VTE(" in line and "^[\\" in line)
+        )
+        repeated_xtversion = version_hits >= 2 and (
+            "^[\\" in line or "\x1b\\" in line
+        )
+        if complete_xtversion or (version_hits and da_hits) or repeated_xtversion:
+            continue
+        kept.append(line)
+    return "".join(kept)
+
+
+def _usable_glib_source_id(source_id) -> bool:
+    return isinstance(source_id, int) and not isinstance(source_id, bool) and source_id > 0
+
+
+def _schedule_glib_callback(callback, *args, delay_ms: int = 0) -> tuple[bool, str]:
+    """Schedule one main-context callback with an independent source fallback."""
+
+    delay_ms = max(0, int(delay_ms))
+    errors: list[str] = []
+    try:
+        if delay_ms:
+            source_id = GLib.timeout_add(delay_ms, callback, *args)
+        else:
+            source_id = GLib.idle_add(callback, *args)
+        if _usable_glib_source_id(source_id):
+            return True, ""
+        errors.append(f"primary scheduler returned unusable source id {source_id!r}")
+    except Exception as exc:
+        errors.append(f"primary scheduler failed: {exc}")
+
+    source = None
+    try:
+        source = GLib.timeout_source_new(delay_ms) if delay_ms else GLib.idle_source_new()
+        source.set_callback(callback, *args)
+        source_id = source.attach(GLib.MainContext.default())
+        if _usable_glib_source_id(source_id):
+            return True, ""
+        errors.append(f"fallback scheduler returned unusable source id {source_id!r}")
+    except Exception as exc:
+        errors.append(f"fallback scheduler failed: {exc}")
+    if source is not None:
+        try:
+            source.destroy()
+        except Exception:
+            pass
+    return False, "; ".join(errors)
 
 
 def _style(widget, *classes):
@@ -338,8 +436,12 @@ class AttachTerminal(Gtk.Box):
         key_press_handler=None,
         live_focus_handler=None,
         scroll_handler=None,
+        selection_history_handler=None,
+        attach_exit_handler=None,
+        attach_stable_handler=None,
         scrollback_extent: int | None = None,
         font_override: str | None = None,
+        child_environment: dict[str, str] | None = None,
     ):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.argv = argv
@@ -348,18 +450,26 @@ class AttachTerminal(Gtk.Box):
         self.process: subprocess.Popen[bytes] | None = None
         self.pty_obj = None
         self._detached = False
+        self._terminally_stopped = False
         self._spawn_source_id = 0
         self._spawn_fallback_source_id = 0
         self._attach_restart_source_id = 0
         self._attach_stable_source_id = 0
         self._attach_restart_attempts = 0
+        self._attach_restart_deferred = False
         self._resize_sync_source_id = 0
         self._cursor_hide_source_id = 0
         self._last_allocated_grid = (0, 0)
         self._last_synced_grid = (0, 0)
         self._live_focus_handler = None
         self._scroll_handler = None
+        self._selection_history_handler = selection_history_handler
+        self._attach_exit_handler = attach_exit_handler
+        self._attach_stable_handler = attach_stable_handler
+        self._child_environment = merge_vte_attach_environment(child_environment)
+        self._native_history_primed = False
         self._key_press_handler_id = 0
+        self._key_press_handler = None
         self._history_cursor_hidden = False
         self._scroll_idle_source_id = 0
         self._clipboard_image_paths: set[str] = set()
@@ -369,29 +479,42 @@ class AttachTerminal(Gtk.Box):
         self.terminal.set_hexpand(True)
         self.terminal.set_vexpand(True)
         apply_theme(self.terminal, theme, font_override=font_override)
-        # Match Terminator's terminal layout: VTE and a persistent scrollbar
-        # share one row, with the bar representing the history behind tmux.
+        # Normal terminal review and VTE text selection have different history
+        # owners.  The persistent scrollbar represents the application-aware
+        # tmux/Codex history controller; VTE's native adjustment is retained
+        # separately and is bound to the bar only while a real VTE selection is
+        # active.  Keeping the two coordinate systems distinct prevents both
+        # deep-drag blanking and false "live edge" detection.
         self.terminal_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         self.terminal_row.set_hexpand(True)
         self.terminal_row.set_vexpand(True)
-        # VTE sees the tmux client in its alternate screen, whose adjustment has
-        # no history range and therefore no drawable thumb. Keep a small proxy
-        # adjustment for the history owner behind tmux instead.
+        self.native_adjustment = self.terminal.get_vadjustment()
         extent = float(max(100, int(scrollback_extent or theme.scrollback_lines)))
-        page_size = min(24.0, extent - 1.0)
-        self.scroll_adjustment = Gtk.Adjustment.new(
-            extent - page_size,
-            0.0,
+        page_size = min(24.0, max(1.0, extent - 1.0))
+        self.history_adjustment = Gtk.Adjustment.new(
             extent,
+            0.0,
+            extent + page_size,
             3.0,
             page_size,
             page_size,
         )
-        self._scrollbar_syncing = False
-        self._last_scrollbar_value = float(self.scroll_adjustment.get_value())
+        self._history_scrollbar_syncing = False
+        self._last_history_scrollbar_value = float(self.history_adjustment.get_value())
+        self._history_drag_last_requested = self._last_history_scrollbar_value
+        self._scrollbar_native_bound = False
+        self._history_request_lock = threading.Lock()
+        self._history_scroll_generation = 0
+        self._history_scroll_sequence = 0
+        self._history_last_applied_sequence = 0
+        self._pending_history_delta = 0
+        self._history_worker_active = False
+        self._history_worker_generation: int | None = None
+        self._pending_history_apply = None
+        self._history_apply_scheduled = False
         self.scrollbar = Gtk.Scrollbar.new(
             Gtk.Orientation.VERTICAL,
-            adjustment=self.scroll_adjustment,
+            adjustment=self.history_adjustment,
         )
         _style(self.scrollbar, "td-terminal-scrollbar")
         self.scrollbar.get_style_context().remove_class("overlay-indicator")
@@ -399,13 +522,13 @@ class AttachTerminal(Gtk.Box):
         self.scrollbar.set_hexpand(False)
         self.scrollbar.set_vexpand(True)
         self.scrollbar.set_opacity(1.0)
-        self.scroll_adjustment.connect(
+        self.history_adjustment.connect(
             "value-changed",
-            self._on_scrollbar_value_changed,
+            self._on_history_scrollbar_value_changed,
         )
-        # Do not let VTE translate wheel motion into Up/Down keypresses for an
-        # alternate-screen application. In Codex that cycles prompt history
-        # instead of moving through terminal content.
+        # Do not let VTE synthesize Up/Down fallback keys for an application
+        # history gesture. Alternate-screen applications that negotiate mouse
+        # reporting still receive their own wheel protocol through VTE.
         try:
             self.terminal.set_enable_fallback_scrolling(False)
         except Exception:
@@ -417,6 +540,9 @@ class AttachTerminal(Gtk.Box):
             key_press_handler=key_press_handler,
             live_focus_handler=live_focus_handler,
             scroll_handler=scroll_handler,
+            selection_history_handler=selection_history_handler,
+            attach_exit_handler=attach_exit_handler,
+            attach_stable_handler=attach_stable_handler,
         )
         # Select-to-copy: run *after* VTE handles the release so the selection exists.
         self.terminal.connect_after("button-release-event", self._on_button_release)
@@ -445,6 +571,9 @@ class AttachTerminal(Gtk.Box):
         key_press_handler,
         live_focus_handler,
         scroll_handler=None,
+        selection_history_handler=None,
+        attach_exit_handler=None,
+        attach_stable_handler=None,
     ) -> None:
         """Retarget window-owned callbacks when this live widget is reparented."""
 
@@ -459,8 +588,12 @@ class AttachTerminal(Gtk.Box):
                 "key-press-event",
                 key_press_handler,
             )
+        self._key_press_handler = key_press_handler
         self._live_focus_handler = live_focus_handler
         self._scroll_handler = scroll_handler
+        self._selection_history_handler = selection_history_handler
+        self._attach_exit_handler = attach_exit_handler
+        self._attach_stable_handler = attach_stable_handler
 
     def apply_window_theme(self, theme: TerminalTheme, *, font_override: str) -> None:
         self.theme = theme
@@ -540,14 +673,25 @@ class AttachTerminal(Gtk.Box):
             # cannot leave tmux at the previous, smaller grid.
             self.request_geometry_sync()
             return
-        if self._detached or columns < 2 or rows < 2:
+        if (
+            self._detached
+            or getattr(self, "_terminally_stopped", False)
+            or getattr(self, "_attach_restart_deferred", False)
+            or columns < 2
+            or rows < 2
+        ):
             return
         self._remove_glib_source(self._spawn_source_id)
         self._spawn_source_id = GLib.timeout_add(60, self._spawn_after_stable_allocation)
 
     def _spawn_after_stable_allocation(self) -> bool:
         self._spawn_source_id = 0
-        if self.process is not None or self._detached:
+        if (
+            self.process is not None
+            or self._detached
+            or getattr(self, "_terminally_stopped", False)
+            or getattr(self, "_attach_restart_deferred", False)
+        ):
             return False
         columns, rows = self._last_allocated_grid
         if columns < 2 or rows < 2:
@@ -574,14 +718,72 @@ class AttachTerminal(Gtk.Box):
         self._sync_pty_geometry(columns=columns, rows=rows, force=True)
         return False
 
+    def apply_canonical_grid(self, *, columns: int, rows: int) -> None:
+        """Apply one settled window grid to this VTE and its tmux client."""
+
+        columns = max(0, int(columns))
+        rows = max(0, int(rows))
+        if self._detached or columns < 2 or rows < 2:
+            return
+        grid = (columns, rows)
+        if grid == self._last_allocated_grid and grid == self._last_synced_grid:
+            return
+        try:
+            self.terminal.set_size(columns, rows)
+        except Exception:
+            pass
+        else:
+            self._last_allocated_grid = grid
+        self._sync_pty_geometry(columns=columns, rows=rows, force=True)
+
     def _spawn_fallback(self) -> bool:
         self._spawn_fallback_source_id = 0
-        if self.process is not None or self._detached:
+        if (
+            self.process is not None
+            or self._detached
+            or getattr(self, "_terminally_stopped", False)
+            or getattr(self, "_attach_restart_deferred", False)
+        ):
             return False
         columns = max(2, int(self.terminal.get_column_count() or 80))
         rows = max(2, int(self.terminal.get_row_count() or 24))
         self._spawn(columns=columns, rows=rows)
         return False
+
+    def _prime_native_scrollback(self) -> bool:
+        """Seed one restored tmux pane into VTE's normal-screen history.
+
+        A newly attached client receives only tmux's current screen. Feeding a
+        bounded plain-text snapshot before the first attach makes already-live
+        sessions immediately scrollable without restarting or modifying the
+        process in the pane. Future terminal output remains in this same VTE
+        buffer because the attach client cannot enter the alternate screen.
+        """
+
+        if self._native_history_primed:
+            return False
+        history_reader = getattr(self, "_selection_history_handler", None)
+        if not callable(history_reader):
+            return False
+        try:
+            history = history_reader()
+        except Exception:
+            return False
+        if not isinstance(history, str) or not history:
+            return False
+        history = history[-2_000_000:].replace("\x00", "")
+        history = _without_replayed_vte_probe_echo(history)
+        payload = history.rstrip("\r\n").replace("\r\n", "\n").replace(
+            "\r", "\n"
+        )
+        if not payload:
+            return False
+        try:
+            self.terminal.feed((payload.replace("\n", "\r\n") + "\r\n").encode())
+        except Exception:
+            return False
+        self._native_history_primed = True
+        return True
 
     def _sync_pty_geometry(self, *, columns: int, rows: int, force: bool = False) -> None:
         if columns < 2 or rows < 2 or self.pty_obj is None:
@@ -604,12 +806,16 @@ class AttachTerminal(Gtk.Box):
                 pass
 
     def _spawn(self, *, columns: int, rows: int) -> None:
-        if self.process is not None or self._detached:
+        if (
+            self.process is not None
+            or self._detached
+            or getattr(self, "_terminally_stopped", False)
+            or getattr(self, "_attach_restart_deferred", False)
+        ):
             return
         self._cancel_pending_spawn()
         master_fd, slave_fd = pty.openpty()
-        env = os.environ.copy()
-        env.setdefault("TERM", "xterm-256color")
+        env = dict(self._child_environment)
         winsize = struct.pack("HHHH", rows, columns, 0, 0)
         for fd in (master_fd, slave_fd):
             try:
@@ -617,11 +823,20 @@ class AttachTerminal(Gtk.Box):
             except OSError:
                 pass
         try:
-            # VTE answers terminal identity probes as soon as a PTY is
-            # assigned. Remove the slave's canonical/echo window first, then
-            # start the attach client so those replies are consumed as input
-            # instead of being echoed back as visible ``^[...`` shell text.
+            # A newly opened slave starts with canonical input echo enabled.
+            # VTE answers DA/XTVERSION probes immediately after set_pty(); if
+            # tmux has not finished applying its own raw mode yet, those binary
+            # replies are echoed back as literal ``^[...VTE(...)`` shell text.
+            # Make the attach transport raw before exec so there is no echo
+            # window at all; tmux subsequently installs its normal client mode.
             tty.setraw(slave_fd, when=termios.TCSANOW)
+            # Start the attach client before handing the PTY to VTE.  VTE
+            # emits DA/XTVERSION probes as soon as a PTY is assigned; if that
+            # happens while the slave has no child, the probe responses can be
+            # queued as input and become literal ``^[...`` text in the shell
+            # on every relaunch.  The child owns the slave first, so responses
+            # are consumed by the terminal stack instead of displayed.
+            self._prime_native_scrollback()
             self.process = subprocess.Popen(
                 self.argv,
                 cwd=self.cwd,
@@ -654,10 +869,69 @@ class AttachTerminal(Gtk.Box):
         self.process = None
         self._remove_glib_source(self._attach_stable_source_id)
         self._attach_stable_source_id = 0
+        should_retry: bool | None = True
+        handler = getattr(self, "_attach_exit_handler", None)
+        if callable(handler):
+            try:
+                decision = handler()
+                should_retry = None if decision is None else bool(decision)
+            except Exception:
+                # A failed liveness check is inconclusive. Preserve the normal
+                # client-only retry path instead of declaring the task dead.
+                should_retry = True
+        if should_retry is None:
+            # Auth activation can intentionally remove the tmux target between
+            # terminating and recreating it. Pause every spawn path until the
+            # completed transaction can classify the replacement exactly once.
+            self._attach_restart_deferred = True
+            for attr in (
+                "_spawn_source_id",
+                "_spawn_fallback_source_id",
+                "_attach_restart_source_id",
+            ):
+                source_id = getattr(self, attr, 0)
+                self._remove_glib_source(source_id)
+                setattr(self, attr, 0)
+            return
+        if not should_retry:
+            self._terminally_stopped = True
+            self._cancel_pending_spawn()
+            return
         self._schedule_attach_restart()
 
+    def resolve_deferred_attach(self) -> bool:
+        """Classify and resume one attach client paused for an auth transition."""
+
+        if (
+            self._detached
+            or getattr(self, "_terminally_stopped", False)
+            or not getattr(self, "_attach_restart_deferred", False)
+        ):
+            return False
+        handler = getattr(self, "_attach_exit_handler", None)
+        try:
+            decision = handler() if callable(handler) else True
+        except Exception:
+            # As on an ordinary client exit, an inconclusive liveness query
+            # keeps the non-destructive retry path available.
+            decision = True
+        if decision is None:
+            return False
+        self._attach_restart_deferred = False
+        if not bool(decision):
+            self._terminally_stopped = True
+            self._cancel_pending_spawn()
+            return False
+        self._schedule_attach_restart()
+        return False
+
     def _schedule_attach_restart(self) -> None:
-        if self._detached or self._attach_restart_source_id:
+        if (
+            self._detached
+            or getattr(self, "_terminally_stopped", False)
+            or getattr(self, "_attach_restart_deferred", False)
+            or self._attach_restart_source_id
+        ):
             return
         exponent = min(self._attach_restart_attempts, 5)
         delay_ms = min(5000, 150 * (2 ** exponent))
@@ -666,7 +940,11 @@ class AttachTerminal(Gtk.Box):
 
     def _restart_attach_client(self) -> bool:
         self._attach_restart_source_id = 0
-        if self._detached:
+        if (
+            self._detached
+            or getattr(self, "_terminally_stopped", False)
+            or getattr(self, "_attach_restart_deferred", False)
+        ):
             return False
         if self.process is not None and self.process.poll() is None:
             return False
@@ -684,10 +962,19 @@ class AttachTerminal(Gtk.Box):
         self._attach_stable_source_id = 0
         if not self._detached and self.process is not None and self.process.poll() is None:
             self._attach_restart_attempts = 0
+            handler = getattr(self, "_attach_stable_handler", None)
+            if callable(handler):
+                try:
+                    handler()
+                except Exception:
+                    # A stable tmux client is already useful; window bookkeeping
+                    # must not turn that success into another reconnect cycle.
+                    pass
         return False
 
     def detach(self) -> None:
         self._detached = True
+        self._cancel_async_history_scroll()
         self._cancel_pending_spawn()
         self._cleanup_clipboard_images()
         if not self.process or self.process.poll() is not None:
@@ -713,83 +1000,314 @@ class AttachTerminal(Gtk.Box):
         """Paste PRIMARY selection into the shell as input (middle-click)."""
         self._paste_from_selection(Gdk.SELECTION_PRIMARY, prefer_last=True)
 
+    def _history_bottom_value(self) -> float:
+        adjustment = self.history_adjustment
+        return max(
+            float(adjustment.get_lower()),
+            float(adjustment.get_upper()) - float(adjustment.get_page_size()),
+        )
+
+    def _native_bottom_value(self) -> float:
+        adjustment = self.native_adjustment
+        return max(
+            float(adjustment.get_lower()),
+            float(adjustment.get_upper()) - float(adjustment.get_page_size()),
+        )
+
+    def _bind_scrollbar_for_selection(self, active: bool) -> None:
+        """Expose VTE's adjustment only while a real VTE selection owns review."""
+
+        active = bool(active)
+        if active == self._scrollbar_native_bound:
+            return
+        try:
+            self.scrollbar.set_adjustment(
+                self.native_adjustment if active else self.history_adjustment
+            )
+        except Exception:
+            return
+        self._scrollbar_native_bound = active
+
+    def _set_history_scrollbar_value(self, value: float) -> None:
+        adjustment = self.history_adjustment
+        lower = float(adjustment.get_lower())
+        upper = self._history_bottom_value()
+        self._history_scrollbar_syncing = True
+        try:
+            adjustment.set_value(min(upper, max(lower, float(value))))
+            self._last_history_scrollbar_value = float(adjustment.get_value())
+            self._history_drag_last_requested = self._last_history_scrollbar_value
+        finally:
+            self._history_scrollbar_syncing = False
+
+    def _set_history_depth(self, depth: int, *, extent: int | None = None) -> None:
+        """Synchronize the proxy from backend/logical history depth evidence."""
+
+        clean_depth = max(0, int(depth))
+        adjustment = self.history_adjustment
+        page = max(1.0, float(adjustment.get_page_size()))
+        current_extent = max(0.0, float(adjustment.get_upper()) - page)
+        target_extent = max(
+            current_extent,
+            float(clean_depth),
+            float(max(0, int(extent))) if extent is not None else 0.0,
+        )
+        self._history_scrollbar_syncing = True
+        try:
+            if abs(target_extent - current_extent) > 0.5:
+                adjustment.set_upper(target_extent + page)
+            bottom = max(
+                float(adjustment.get_lower()),
+                float(adjustment.get_upper()) - float(adjustment.get_page_size()),
+            )
+            adjustment.set_value(
+                min(bottom, max(float(adjustment.get_lower()), bottom - clean_depth))
+            )
+            self._last_history_scrollbar_value = float(adjustment.get_value())
+            self._history_drag_last_requested = self._last_history_scrollbar_value
+        finally:
+            self._history_scrollbar_syncing = False
+
+    def _sync_history_from_outcome(self, outcome: ScrollOutcome) -> None:
+        if outcome.depth is None:
+            return
+        self._set_history_depth(outcome.depth, extent=outcome.extent)
+
+    def _move_native_history(self, lines: int) -> None:
+        """Move only VTE's retained normal-screen buffer for selection review."""
+
+        adjustment = self.native_adjustment
+        try:
+            current = float(adjustment.get_value())
+            lower = float(adjustment.get_lower())
+            upper = max(
+                lower,
+                float(adjustment.get_upper()) - float(adjustment.get_page_size()),
+            )
+            adjustment.set_value(
+                min(upper, max(lower, current + int(lines)))
+            )
+        except Exception:
+            return
+
+    def reset_scrollbar(self) -> None:
+        """Reset the application-aware history proxy to its live endpoint."""
+
+        self._set_history_depth(0)
+
     def scroll_to_bottom(self) -> None:
-        """Return the VTE viewport to the live terminal screen."""
+        """Return both application history and VTE's viewport to live output."""
 
         self.reset_scrollbar()
         try:
-            adjustment = self.terminal.get_vadjustment()
-            bottom = max(
-                adjustment.get_lower(),
-                adjustment.get_upper() - adjustment.get_page_size(),
-            )
-            adjustment.set_value(bottom)
+            self.native_adjustment.set_value(self._native_bottom_value())
         except Exception:
             pass
 
-    def _set_scrollbar_value(self, value: float) -> None:
-        adjustment = self.scroll_adjustment
-        lower = float(adjustment.get_lower())
-        upper = max(
-            lower,
-            float(adjustment.get_upper()) - float(adjustment.get_page_size()),
-        )
-        self._scrollbar_syncing = True
-        try:
-            adjustment.set_value(min(upper, max(lower, float(value))))
-            self._last_scrollbar_value = float(adjustment.get_value())
-        finally:
-            self._scrollbar_syncing = False
+    def _cancel_async_history_scroll(self) -> None:
+        """Invalidate queued/in-flight thumb work without killing backend commands."""
 
-    def _move_scrollbar(self, lines: int) -> None:
-        self._set_scrollbar_value(self._last_scrollbar_value + int(lines))
+        with self._history_request_lock:
+            self._history_scroll_generation += 1
+            self._pending_history_delta = 0
+            self._pending_history_apply = None
+            # An already-running worker remains marked active until it observes
+            # generation drift. This prevents a second worker from racing the
+            # same widget while the old backend call is still returning.
+            self._history_drag_last_requested = self._last_history_scrollbar_value
 
-    def reset_scrollbar(self) -> None:
-        adjustment = self.scroll_adjustment
-        self._set_scrollbar_value(
-            float(adjustment.get_upper()) - float(adjustment.get_page_size())
-        )
+    def _queue_history_scroll_delta(self, delta: int) -> None:
+        """Coalesce one thumb movement and keep tmux I/O off the GTK thread."""
 
-    def _scrollbar_at_live_edge(self) -> bool:
-        """True when the proxy scrollbar sits at the live (bottom) edge."""
-
-        adjustment = self.scroll_adjustment
-        bottom = float(adjustment.get_upper()) - float(adjustment.get_page_size())
-        return float(adjustment.get_value()) >= bottom - 0.5
-
-    def _on_scrollbar_value_changed(self, adjustment) -> None:
-        if self._scrollbar_syncing:
+        clean_delta = int(delta)
+        if not clean_delta or self._detached:
             return
-        previous = float(self._last_scrollbar_value)
+        admitted = False
+        with self._history_request_lock:
+            self._pending_history_delta += clean_delta
+            generation = self._history_scroll_generation
+            if self._history_worker_active:
+                return
+            admitted = _HISTORY_SCROLL_ADMISSION.acquire(blocking=False)
+            if admitted:
+                self._history_worker_active = True
+                self._history_worker_generation = generation
+            else:
+                # Fail fast under global storage pressure. The proxy is restored
+                # to its last applied value on GTK rather than growing an
+                # unbounded executor queue.
+                self._pending_history_delta = 0
+                self._history_drag_last_requested = self._last_history_scrollbar_value
+        if not admitted:
+            _schedule_glib_callback(self._restore_history_proxy_after_failed_drag)
+            return
+        try:
+            _HISTORY_SCROLL_EXECUTOR.submit(
+                self._history_scroll_worker,
+                generation,
+            )
+        except RuntimeError:
+            _HISTORY_SCROLL_ADMISSION.release()
+            with self._history_request_lock:
+                if self._history_worker_generation == generation:
+                    self._history_worker_active = False
+                    self._history_worker_generation = None
+                self._pending_history_delta = 0
+            _schedule_glib_callback(self._restore_history_proxy_after_failed_drag)
+
+    def _restore_history_proxy_after_failed_drag(self) -> bool:
+        self._set_history_scrollbar_value(self._last_history_scrollbar_value)
+        return False
+
+    def _publish_async_history_scroll_outcome(
+        self,
+        generation: int,
+        sequence: int,
+        attempted_delta: int,
+        outcome,
+    ) -> None:
+        """Keep at most one pending GTK completion per terminal widget."""
+
+        schedule = False
+        with self._history_request_lock:
+            if generation != self._history_scroll_generation or self._detached:
+                return
+            self._pending_history_apply = (
+                generation,
+                sequence,
+                attempted_delta,
+                outcome,
+            )
+            if not self._history_apply_scheduled:
+                self._history_apply_scheduled = True
+                schedule = True
+        if schedule:
+            _schedule_glib_callback(self._drain_async_history_scroll_outcome)
+
+    def _drain_async_history_scroll_outcome(self) -> bool:
+        with self._history_request_lock:
+            pending = self._pending_history_apply
+            self._pending_history_apply = None
+            self._history_apply_scheduled = False
+        if pending is None:
+            return False
+        generation, sequence, attempted_delta, outcome = pending
+        return self._apply_async_history_scroll_outcome(
+            generation,
+            sequence,
+            attempted_delta,
+            outcome,
+        )
+
+    def _history_scroll_worker(self, generation: int) -> None:
+        """Serialize one admitted widget's coalesced backend navigation burst."""
+
+        try:
+            while True:
+                with self._history_request_lock:
+                    if self._detached:
+                        self._history_worker_active = False
+                        self._history_worker_generation = None
+                        return
+                    if generation != self._history_scroll_generation:
+                        # Reuse the same admitted worker chain for the newest
+                        # generation instead of queuing a replacement future.
+                        generation = self._history_scroll_generation
+                        self._history_worker_generation = generation
+                    delta = int(self._pending_history_delta)
+                    self._pending_history_delta = 0
+                    if not delta:
+                        self._history_worker_active = False
+                        self._history_worker_generation = None
+                        return
+                    self._history_scroll_sequence += 1
+                    sequence = self._history_scroll_sequence
+
+                handler = getattr(self, "_scroll_handler", None)
+                if not callable(handler):
+                    outcome = None
+                else:
+                    try:
+                        outcome = handler(delta)
+                    except Exception:
+                        outcome = None
+
+                with self._history_request_lock:
+                    stale = generation != self._history_scroll_generation or self._detached
+                    terminal_outcome = (
+                        not isinstance(outcome, ScrollOutcome)
+                        or outcome.disposition is not ScrollDisposition.HANDLED
+                        or outcome.reached_live_edge
+                    )
+                    if stale:
+                        # Do not publish old-generation UI state. Loop once more
+                        # so this same admitted worker can absorb any new delta.
+                        continue
+                    if terminal_outcome:
+                        self._pending_history_delta = 0
+                        self._history_worker_active = False
+                        self._history_worker_generation = None
+
+                self._publish_async_history_scroll_outcome(
+                    generation,
+                    sequence,
+                    delta,
+                    outcome,
+                )
+                if terminal_outcome:
+                    return
+        finally:
+            _HISTORY_SCROLL_ADMISSION.release()
+
+    def _apply_async_history_scroll_outcome(
+        self,
+        generation: int,
+        sequence: int,
+        attempted_delta: int,
+        outcome,
+    ) -> bool:
+        """Apply a worker result only if it still belongs to this live widget."""
+
+        with self._history_request_lock:
+            if generation != self._history_scroll_generation or self._detached:
+                return False
+            if sequence <= self._history_last_applied_sequence:
+                return False
+            self._history_last_applied_sequence = sequence
+        if not isinstance(outcome, ScrollOutcome):
+            self._set_history_scrollbar_value(self._last_history_scrollbar_value)
+            return False
+        if outcome.disposition is ScrollDisposition.PASSTHROUGH:
+            # A physical wheel can be passed to a TUI; a scrollbar thumb cannot.
+            # Revert the proxy without synthesizing child input.
+            self._set_history_scrollbar_value(self._last_history_scrollbar_value)
+            if self._history_cursor_hidden:
+                self._set_history_cursor_hidden(False)
+            return False
+        if outcome.disposition is not ScrollDisposition.HANDLED:
+            if outcome.reached_live_edge:
+                self._set_history_depth(0)
+            else:
+                self._set_history_scrollbar_value(self._last_history_scrollbar_value)
+            return False
+        self._sync_history_from_outcome(outcome)
+        if outcome.reached_live_edge:
+            self.prepare_for_live_input()
+            return False
+        self._set_history_cursor_hidden(True)
+        self._arm_scroll_idle_resume()
+        return False
+
+    def _on_history_scrollbar_value_changed(self, adjustment) -> None:
+        if self._history_scrollbar_syncing or self._scrollbar_native_bound:
+            return
         requested = float(adjustment.get_value())
-        delta = int(round(requested - previous))
+        previous_requested = float(self._history_drag_last_requested)
+        delta = int(round(requested - previous_requested))
+        self._history_drag_last_requested = requested
         if not delta:
             return
-        handler = self._scroll_handler
-        try:
-            result = handler(delta) if callable(handler) else ScrollDisposition.UNHANDLED
-            if result is ScrollDisposition.PASSTHROUGH:
-                # The proxy bar represents tmux history, not application-owned
-                # alternate-screen history. Keep it at its previous position;
-                # wheel events on the terminal itself are passed to the TUI.
-                self._set_scrollbar_value(previous)
-                if self._history_cursor_hidden:
-                    self._set_history_cursor_hidden(False)
-                return
-            if result:
-                self._last_scrollbar_value = requested
-                if delta > 0 and self._scrollbar_at_live_edge():
-                    # Dragged back to the live edge — leave the history view.
-                    self.prepare_for_live_input()
-                else:
-                    self._set_history_cursor_hidden(True)
-                    # Arm the inactivity timer so streaming resumes
-                    # automatically if the user stops dragging the scrollbar.
-                    self._arm_scroll_idle_resume()
-                return
-        except Exception:
-            pass
-        self._set_scrollbar_value(previous)
+        self._queue_history_scroll_delta(delta)
 
     def _feed_text(self, text: str) -> bool:
         """Paste text through VTE so bracketed-paste mode can prevent submit."""
@@ -1196,6 +1714,16 @@ class AttachTerminal(Gtk.Box):
             self._selection_pending = bool(self.terminal.get_has_selection())
         except Exception:
             self._selection_pending = False
+        # While VTE owns a real selection, expose exactly the native VTE
+        # adjustment so wheel/drag extension keeps one continuous selection.
+        # Invalidate queued/in-flight thumb results before rebinding: a backend
+        # command already inside tmux may finish, but no stale completion or
+        # follow-up navigation is allowed to mutate the new selection surface.
+        # Clearing the selection atomically rebinds the persistent bar to the
+        # application-aware tmux/Codex history proxy.
+        if self._selection_pending:
+            self._cancel_async_history_scroll()
+        self._bind_scrollbar_for_selection(self._selection_pending)
         if self._selection_pending:
             self._queue_selection_copy(delay_ms=120)
 
@@ -1213,6 +1741,144 @@ class AttachTerminal(Gtk.Box):
             )
         except Exception:
             self._selection_autocopy_source_id = 0
+
+    def _snapshot_selection_before_history_scroll(self) -> bool:
+        """Copy a live range before any history movement can update it."""
+
+        try:
+            if not self.terminal.get_has_selection():
+                return False
+        except Exception:
+            return False
+
+        # Do not let the normal 120 ms select-to-copy debounce race either a
+        # native held-drag extension or a degraded redraw-based fallback:
+        # capture the current payload before the viewport moves.
+        #
+        # This is deliberately a *read-only* VTE operation. Calling
+        # copy_clipboard/copy_primary from inside scroll-event can make VTE
+        # consume the same wheel event while it is updating its selection,
+        # which makes scrolling appear stuck whenever text is selected. The
+        # normal release/idle copy path still uses those VTE ownership calls;
+        # the wheel path only snapshots text and publishes CLIPBOARD.
+        try:
+            text = self._selected_text()
+            if not text:
+                copied = False
+            else:
+                self._last_copied_text = text
+                self._set_clipboard_text(text, Gdk.SELECTION_CLIPBOARD)
+                copied = True
+        except Exception:
+            # Selection preservation is best effort and must never disable
+            # history scrolling if a clipboard backend is unavailable.
+            copied = False
+        source_id = getattr(self, "_selection_autocopy_source_id", 0)
+        if source_id:
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                pass
+            self._selection_autocopy_source_id = 0
+        self._selection_pending = False
+        return copied
+
+    def _native_scrollback_available(self) -> bool:
+        """Return whether this VTE has one normal-screen history buffer."""
+
+        try:
+            adjustment = self.terminal.get_vadjustment()
+            lower = float(adjustment.get_lower())
+            page = float(adjustment.get_page_size())
+            upper = max(lower, float(adjustment.get_upper()) - page)
+        except Exception:
+            return False
+        return upper > lower + 0.5
+
+    def _dispatch_selection_button_event(
+        self,
+        source_event: Gdk.EventScroll,
+        event_type: Gdk.EventType,
+        state: Gdk.ModifierType,
+    ) -> bool:
+        """Send VTE one synthetic left-button edge at the wheel pointer.
+
+        VTE keeps a completed selection stable while its native adjustment
+        moves, and it can extend that range with Shift+button-1.  It does not,
+        however, retain the original anchor when a wheel event arrives during
+        an unfinished button-1 drag.  The selection-scroll bridge below uses
+        these two native operations; this helper only builds the matching GDK
+        button event and never draws or owns a second selection surface.
+        """
+
+        try:
+            synthetic = Gdk.Event.new(event_type)
+            button_event = synthetic.button
+            button_event.window = (
+                getattr(source_event, "window", None) or self.terminal.get_window()
+            )
+            button_event.send_event = True
+            button_event.time = int(
+                getattr(source_event, "time", Gdk.CURRENT_TIME) or Gdk.CURRENT_TIME
+            )
+            button_event.x = float(getattr(source_event, "x", 0.0) or 0.0)
+            button_event.y = float(getattr(source_event, "y", 0.0) or 0.0)
+            button_event.x_root = float(
+                getattr(source_event, "x_root", button_event.x) or button_event.x
+            )
+            button_event.y_root = float(
+                getattr(source_event, "y_root", button_event.y) or button_event.y
+            )
+            button_event.state = state
+            button_event.button = 1
+            get_device = getattr(source_event, "get_device", None)
+            if callable(get_device):
+                device = get_device()
+                if device is not None:
+                    synthetic.set_device(device)
+            self.terminal.event(synthetic)
+            return True
+        except Exception:
+            return False
+
+    def _continue_selection_through_native_scroll(
+        self,
+        event: Gdk.EventScroll,
+        line_delta: int,
+    ) -> bool:
+        """Preserve and extend a held drag while native history is scrolled."""
+
+        state = Gdk.ModifierType(int(getattr(event, "state", 0) or 0))
+        if not line_delta or not (state & Gdk.ModifierType.BUTTON1_MASK):
+            return False
+        if not self._dispatch_selection_button_event(
+            event,
+            Gdk.EventType.BUTTON_RELEASE,
+            state,
+        ):
+            return False
+
+        # Move only the one VTE adjustment while the range is completed.  A
+        # Shift+button-1 press at the same pointer then asks VTE to extend the
+        # existing absolute range into the newly exposed rows.  The user's
+        # real button release completes this synthetic continuation normally.
+        self._move_native_history(line_delta)
+        button_masks = (
+            Gdk.ModifierType.BUTTON1_MASK
+            | Gdk.ModifierType.BUTTON2_MASK
+            | Gdk.ModifierType.BUTTON3_MASK
+            | Gdk.ModifierType.BUTTON4_MASK
+            | Gdk.ModifierType.BUTTON5_MASK
+        )
+        extend_state = Gdk.ModifierType(
+            (int(state) & ~int(button_masks)) | int(Gdk.ModifierType.SHIFT_MASK)
+        )
+        self._dispatch_selection_button_event(
+            event,
+            Gdk.EventType.BUTTON_PRESS,
+            extend_state,
+        )
+        return True
 
     def _show_terminal_context_menu(self, event: Gdk.EventButton) -> None:
         menu = Gtk.Menu()
@@ -1236,9 +1902,19 @@ class AttachTerminal(Gtk.Box):
     def _on_button_press(self, _terminal, event: Gdk.EventButton) -> bool:
         button = int(getattr(event, "button", 0) or 0)
         if button == 1:
-            # Let VTE see the complete press/drag/release gesture first. Live
-            # viewport restoration happens on release only when no selection
-            # was created, so ordinary drag-to-copy does not get cancelled.
+            # A backend history redraw that is already in flight cannot be
+            # cancelled at the tmux boundary. Do not let VTE establish a new
+            # selection underneath that redraw: invalidate pending UI work and
+            # consume this one press. The next press is accepted after the
+            # worker has observed the generation change and retired.
+            if bool(getattr(self, "_history_worker_active", False)):
+                cancel = getattr(self, "_cancel_async_history_scroll", None)
+                if callable(cancel):
+                    cancel()
+                return True
+            # Otherwise let VTE see the complete press/drag/release gesture.
+            # Live viewport restoration happens on release only when no
+            # selection was created, so ordinary drag-to-copy is preserved.
             return False
         # Middle-click paste from PRIMARY / last selection (classic terminal).
         if button == 2:
@@ -1250,7 +1926,13 @@ class AttachTerminal(Gtk.Box):
         return False
 
     def _on_terminal_scroll(self, terminal, event: Gdk.EventScroll) -> bool:
-        """Scroll the owning session without synthesizing composer key input."""
+        """Route wheel input through exactly one canonical history owner.
+
+        Normal review belongs to tmux/Codex and never consults VTE's viewport
+        for the live-edge decision.  A real VTE text selection is the sole
+        exception: it remains inside the retained VTE buffer so redraws cannot
+        destroy the selected range.
+        """
 
         direction = getattr(event, "direction", None)
         if direction not in {
@@ -1265,47 +1947,66 @@ class AttachTerminal(Gtk.Box):
             delta = 3.0
         else:
             delta = float(getattr(event, "delta_y", 0.0) or 0.0)
-        handler = getattr(self, "_scroll_handler", None)
-        if callable(handler):
-            line_delta = int(round(delta))
-            if not line_delta and delta:
-                line_delta = -1 if delta < 0 else 1
-            try:
-                result = handler(line_delta) if line_delta else ScrollDisposition.UNHANDLED
-                if result is ScrollDisposition.PASSTHROUGH:
-                    # VTE translates the original event using the mouse mode
-                    # negotiated by the active TUI. Consuming it here would make
-                    # Claude Code, Grok, and every other full-screen app inert.
-                    self.reset_scrollbar()
-                    if self._history_cursor_hidden:
-                        self._set_history_cursor_hidden(False)
-                    return False
-                if result:
-                    mover = getattr(self, "_move_scrollbar", None)
-                    if callable(mover):
-                        mover(line_delta)
-                    if line_delta > 0 and self._scrollbar_at_live_edge():
-                        # Scrolled back down to the live edge — return to the
-                        # live screen instead of leaving the history pager
-                        # frozen until the next keypress.
-                        self.prepare_for_live_input()
-                    else:
-                        self._set_history_cursor_hidden(True)
-                        # Arm the inactivity timer so streaming resumes
-                        # automatically if the user stops scrolling.
-                        self._arm_scroll_idle_resume()
+        line_delta = int(round(delta))
+        if not line_delta and delta:
+            line_delta = -1 if delta < 0 else 1
+        if not line_delta:
+            return True
+
+        try:
+            has_selection = bool(self.terminal.get_has_selection())
+        except Exception:
+            has_selection = False
+        if has_selection:
+            bind_scrollbar = getattr(self, "_bind_scrollbar_for_selection", None)
+            if callable(bind_scrollbar):
+                bind_scrollbar(True)
+            self._snapshot_selection_before_history_scroll()
+            if self._native_scrollback_available():
+                if self._continue_selection_through_native_scroll(
+                    event, line_delta
+                ):
                     return True
-            except Exception:
-                pass
-        adjustment = terminal.get_vadjustment()
-        step = max(1.0, float(adjustment.get_step_increment() or 1.0))
-        lower = float(adjustment.get_lower())
-        upper = max(
-            lower,
-            float(adjustment.get_upper()) - float(adjustment.get_page_size()),
-        )
-        value = float(adjustment.get_value()) + (delta * step)
-        adjustment.set_value(min(upper, max(lower, value)))
+                # Fallback scrolling is disabled globally so a non-selection
+                # wheel can never become synthetic Up/Down input in Codex or
+                # another TUI. Move the VTE adjustment explicitly here instead
+                # of relying on VTE's default wheel handler. A completed VTE
+                # selection remains anchored to buffer coordinates while the
+                # viewport moves, so this preserves the highlighted payload and
+                # never redraws tmux/Codex history.
+                self._move_native_history(line_delta)
+                return True
+            # In degraded VTE history, preserving the selection is safer than
+            # switching surfaces or redrawing an unrelated history owner.
+            return True
+
+        bind_scrollbar = getattr(self, "_bind_scrollbar_for_selection", None)
+        if callable(bind_scrollbar):
+            bind_scrollbar(False)
+        handler = getattr(self, "_scroll_handler", None)
+        if not callable(handler):
+            return True
+        try:
+            outcome = handler(line_delta)
+        except Exception:
+            return True
+        if not isinstance(outcome, ScrollOutcome):
+            return True
+        if outcome.disposition is ScrollDisposition.PASSTHROUGH:
+            if self._history_cursor_hidden:
+                self._set_history_cursor_hidden(False)
+            return False
+        if outcome.disposition is not ScrollDisposition.HANDLED:
+            # Unknown backend state is not permission to navigate VTE's
+            # incidental redraw history. Consume the event and stay put.
+            return True
+
+        self._sync_history_from_outcome(outcome)
+        if outcome.reached_live_edge:
+            self.prepare_for_live_input()
+        else:
+            self._set_history_cursor_hidden(True)
+            self._arm_scroll_idle_resume()
         return True
 
     # ------------------------------------------------------------------ #
@@ -1336,18 +2037,27 @@ class AttachTerminal(Gtk.Box):
         self._scroll_idle_source_id = 0
         return False
 
-    def prepare_for_live_input(self) -> None:
+    def prepare_for_live_input(self) -> bool:
+        """Return to live output only after the canonical owner acknowledges it."""
+
         self._remove_glib_source(self._scroll_idle_source_id)
         self._scroll_idle_source_id = 0
-        self.reset_scrollbar()
+        self._cancel_async_history_scroll()
         handler = self._live_focus_handler
         if callable(handler):
             try:
-                handler()
+                restored = handler()
             except Exception:
-                pass
+                return False
+            if restored is False:
+                # A failed/unknown backend restore is not permission to reset
+                # the proxy or deliver input into a possibly-open transcript.
+                return False
+        self._bind_scrollbar_for_selection(False)
+        self.scroll_to_bottom()
         self._set_history_cursor_hidden(False)
         self.request_geometry_sync(delay_ms=0)
+        return True
 
     def _on_button_release(self, _terminal, event: Gdk.EventButton) -> bool:
         # Left-button release after a drag/select → immediate auto-copy.  This
@@ -1373,9 +2083,8 @@ class AttachTerminal(Gtk.Box):
                 int(getattr(event, "state", 0) or 0)
                 & Gdk.ModifierType.SHIFT_MASK
             ):
-                self.prepare_for_live_input()
-                self.scroll_to_bottom()
-                self.terminal.grab_focus()
+                if self.prepare_for_live_input():
+                    self.terminal.grab_focus()
         return False
 
     def _copy_selection_to_clipboards_idle(self) -> bool:
@@ -1886,7 +2595,12 @@ class SessionSearchWindow(Gtk.Window):
             return
         owner_lookup = getattr(self.app_context, "window_for_window_id", None)
         owner = owner_lookup(record.window_id) if callable(owner_lookup) else None
-        (owner or self.app_context.windows[-1]).open_session(record)
+        target = owner or self.app_context.windows[-1]
+        open_user = getattr(target, "open_user_session", None)
+        if callable(open_user):
+            open_user(record)
+        else:
+            target.open_session(record)
 
 class TerminalTab:
     def __init__(self, record: SessionRecord, widget: AttachTerminal):
@@ -2349,7 +3063,7 @@ class SidePane(Gtk.Box):
     def _on_session_row_activated(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
         record = getattr(row, "_termdeck_session_record", None)
         if record is not None:
-            self.window.open_session(record)
+            self.window.open_user_session(record)
 
     def _on_session_card_press(
         self,
@@ -2378,8 +3092,10 @@ class SidePane(Gtk.Box):
             except Exception:
                 break
 
-        self.window.open_session(record)
-        return True
+        # Let GtkListBox's row-activated signal own ordinary navigation. Doing
+        # it here as well opens one physical click twice (and used to create
+        # duplicate replacement shells for a missing tmux target).
+        return False
 
     def _context_records(self, record: SessionRecord) -> list[SessionRecord]:
         if record.id in self.selected_ids:
@@ -2414,7 +3130,7 @@ class SidePane(Gtk.Box):
         menu = Gtk.Menu()
         records = self._context_records(record)
         selected_label = "Deselect" if record.id in self.selected_ids else "Select"
-        menu.append(self._menu_item("Open", lambda: self.window.open_session(record)))
+        menu.append(self._menu_item("Open", lambda: self.window.open_user_session(record)))
         menu.append(self._menu_item(selected_label, lambda: self._toggle_record_selection(record, check)))
         menu.append(self._menu_item("Rename", lambda: self.window.rename_session(record)))
         captain = self._stored_captain()
@@ -2440,15 +3156,18 @@ class SidePane(Gtk.Box):
         ):
             return
         terminate_records = getattr(self.window.app_context, "terminate_records", None)
+        terminated = 0
         if callable(terminate_records):
-            terminate_records(records)
+            terminated = terminate_records(records)
         else:
             for record in records:
-                self.window.stop_session(record)
-                self.selected_ids.discard(record.id)
+                result = self.window.stop_session(record)
+                if result is not False:
+                    terminated += 1
+                    self.selected_ids.discard(record.id)
             self.refresh()
-        if records:
-            self.window.show_toast(toast_message_for_action("killed", len(records)), kind="danger")
+        if terminated:
+            self.window.show_toast(toast_message_for_action("killed", terminated), kind="danger")
 
     def _update_count_label(self) -> None:
         selected_count = len(self.selected_ids)
@@ -2705,7 +3424,7 @@ class SidePane(Gtk.Box):
             actions.pack_end(rename, False, False, 0)
             focus = Gtk.Button(label="Open")
             _style(focus, "td-primary-action")
-            focus.connect("clicked", lambda _b, r=record: self.window.open_session(r))
+            focus.connect("clicked", lambda _b, r=record: self.window.open_user_session(r))
             focus.connect("button-press-event", self._on_session_button_press, record, check)
             actions.pack_end(focus, False, False, 0)
             card.pack_start(actions, False, False, 0)
@@ -2915,11 +3634,15 @@ class SidePane(Gtk.Box):
         dialog.destroy()
         if response != Gtk.ResponseType.OK:
             return
+        archivable = []
         for record in records:
             if record.id in self.window.tabs:
-                self.window.hide_tab(record.id)
-        archive_records(self.window.app_context.store, records)
-        for record in records:
+                if self.window.hide_tab(record.id) is False:
+                    continue
+            archivable.append(record)
+        if archivable:
+            archive_records(self.window.app_context.store, archivable)
+        for record in archivable:
             self.selected_ids.discard(record.id)
         self.refresh()
 
@@ -2933,15 +3656,18 @@ class SidePane(Gtk.Box):
         ):
             return
         terminate_records = getattr(self.window.app_context, "terminate_records", None)
+        terminated = 0
         if callable(terminate_records):
-            terminate_records(records)
+            terminated = terminate_records(records)
         else:
             for record in records:
-                self.window.stop_session(record)
-                self.selected_ids.discard(record.id)
+                result = self.window.stop_session(record)
+                if result is not False:
+                    terminated += 1
+                    self.selected_ids.discard(record.id)
             self.refresh()
-        if records:
-            self.window.show_toast(toast_message_for_action("killed", len(records)), kind="danger")
+        if terminated:
+            self.window.show_toast(toast_message_for_action("killed", terminated), kind="danger")
 
 
 class MasterWindow(Gtk.Window):
@@ -3333,11 +4059,15 @@ class MasterWindow(Gtk.Window):
             )
         if target is None:
             return
-        target.open_session(
-            record,
-            restart_missing=False,
-            remember_layout=False,
-        )
+        open_user = getattr(target, "open_user_session", None)
+        if callable(open_user):
+            open_user(record)
+        else:
+            target.open_session(
+                record,
+                restart_missing=False,
+                remember_layout=False,
+            )
         target.present()
 
     def rename_selected(self, *_args) -> None:
@@ -3465,11 +4195,18 @@ class MasterWindow(Gtk.Window):
         dialog.destroy()
         if response != Gtk.ResponseType.OK:
             return
+        archivable = []
         for record in records:
+            hidden = True
             for window in self.app_context.windows:
                 if record.id in window.tabs:
-                    window.hide_tab(record.id)
-        archive_records(self.app_context.store, records)
+                    hidden = window.hide_tab(record.id) is not False
+                    if not hidden:
+                        break
+            if hidden:
+                archivable.append(record)
+        if archivable:
+            archive_records(self.app_context.store, archivable)
         self.refresh()
 
     def kill_selected(self, *_args) -> None:
@@ -3520,9 +4257,26 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self._terminal_layout_sync_source_id = 0
         self._side_pane_layout_source_id = 0
         self._auth_combo_updating = False
-        self._auth_switch_generation = 0
+        self._auth_switch_generation: dict[str, int] = {}
         self._auth_switch_inflight: set[str] = set()
+        # A tmux attach client is deliberately allowed to exit while an account
+        # transaction replaces its server-side session.  Keep the notebook tab
+        # protected until a replacement client has proved stable; an auth action
+        # must never be reclassified as a user-visible tab close.
+        self._auth_attach_protected: set[str] = set()
         self._auth_fingerprints: dict[str, str] = {}
+        self._auth_environment_ready: dict[str, bool] = {}
+        self._auth_completion_recovery_lock = threading.Lock()
+        self._auth_completion_recoveries: list[tuple[object, ...]] = []
+        self._missing_session_replacements: set[str] = set()
+        # A durable row can be visible in the side pane before its VTE client
+        # is materialized (for example when one AttachTerminal construction
+        # fails while GTK/VTE is under load). Keep those IDs separate from
+        # the store state and retry the attach in-place; never recreate a live
+        # tmux target merely because the widget was not built yet.
+        self._restore_retry_ids: set[str] = set()
+        self._restore_retry_source_id = 0
+        self._restore_retry_attempts = 0
         # Relative point delta from the configured theme font (Ctrl++ / Ctrl+-).
         self.font_zoom_delta = 0
 
@@ -3598,6 +4352,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             ("Window overview · window totals", self.open_window_overview),
             ("Keyboard shortcuts", self.open_shortcut_window),
             ("Terminal appearance", self.open_terminal_options),
+            ("Kill Window Permanently…", self.kill_window),
             ("Quit TermDeck", self.quit_termdeck),
         ]
         overflow_menu = Gtk.Menu()
@@ -3647,6 +4402,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self._strip_new_tab = strip_new_tab
         self._strip_new_tab_idle = 0
         self.notebook.connect("size-allocate", lambda *_a: self._queue_strip_new_tab_position())
+        self.notebook.connect("size-allocate", self._on_terminal_layout_size_allocate)
         self.notebook.connect("map", lambda *_a: self._queue_strip_new_tab_position())
         self.notebook.connect("page-added", lambda *_a: self._queue_strip_new_tab_position())
         self.notebook.connect("page-removed", lambda *_a: self._queue_strip_new_tab_position())
@@ -3680,6 +4436,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.connect("key-press-event", self.on_key_press)
         self.connect("delete-event", self.on_delete)
         self.connect("destroy", self._on_destroy)
+        self.connect("size-allocate", self._on_terminal_layout_size_allocate)
+        self.connect("map", self._on_map_recover_offscreen)
         self.show_all()
         self.side.set_visible(self.tabs_pane_visible)
         if self.tabs_pane_visible:
@@ -3693,12 +4451,97 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             self._refresh_tab_directories_timer,
         )
 
+    def _on_map_recover_offscreen(self, *_args) -> None:
+        """Bring a remembered window back when its old monitor disappeared.
+
+        Window managers retain positions outside the current X screen after a
+        monitor/layout change.  The terminal clients can be attached and the
+        side pane can still be populated in that state, making the window look
+        like a restore failure.  Move only windows that do not overlap any
+        current monitor; valid multi-monitor placements remain untouched.
+        """
+
+        try:
+            if self.is_fullscreen():
+                return
+            was_maximized = bool(self.is_maximized())
+            window = self.get_window()
+            if window is None:
+                return
+            # ``get_position`` may report the client-requested origin while a
+            # window manager has already applied an obsolete frame position.
+            # Frame extents are the actual root-screen coordinates when they
+            # are available; fall back to the GTK client geometry otherwise.
+            frame = getattr(window, "get_frame_extents", lambda: None)()
+            if frame is not None:
+                x, y, width, height = frame.x, frame.y, frame.width, frame.height
+            else:
+                x, y = self.get_position()
+                width, height = self.get_size()
+            display = self.get_display()
+            monitors = []
+            for index in range(display.get_n_monitors()):
+                geometry = display.get_monitor(index).get_geometry()
+                monitors.append((geometry.x, geometry.y, geometry.width, geometry.height))
+            if not monitors:
+                return
+            overlaps = any(
+                x < mx + mw
+                and x + max(width, 1) > mx
+                and y < my + mh
+                and y + max(height, 1) > my
+                for mx, my, mw, mh in monitors
+            )
+            if overlaps:
+                return
+            primary = display.get_primary_monitor() or display.get_monitor(0)
+            geometry = primary.get_geometry()
+            target_x = geometry.x + 20
+            target_y = geometry.y + 20
+            if was_maximized:
+                # Maximize after moving the normal window so the WM computes
+                # the maximized frame on the current monitor, not the removed
+                # monitor recorded in its previous session.
+                self.unmaximize()
+            self.move(target_x, target_y)
+            if was_maximized:
+                self.maximize()
+        except Exception:
+            # Placement is a recovery aid only; never make a valid terminal
+            # restore fail because a window manager lacks geometry support.
+            return
+
     def on_delete(self, *_args) -> bool:
+        if TermDeckWindow._auth_switch_blocks_action(self, action="closing this window"):
+            return True
         # Detach VTE clients only. Leave tab rows visible so browser-style
         # multi-window restore can reopen this named window on the next launch.
         for tab in list(self.tabs.values()):
             tab.widget.detach()
         return False
+
+    def _auth_switch_blocks_action(
+        self,
+        session_id: str | None = None,
+        *,
+        action: str,
+    ) -> bool:
+        """Keep a tab/window alive until its account activation is durable."""
+
+        inflight = getattr(self, "_auth_switch_inflight", set())
+        blocked = bool(inflight) if session_id is None else session_id in inflight
+        if not blocked:
+            return False
+        name = "this terminal"
+        if session_id is not None:
+            record = self.app_context.store.get(session_id)
+            if record is not None:
+                name = record.name
+        self.show_toast(
+            f"Wait for {name}'s Codex account switch before {action}",
+            kind="warning",
+        )
+        return True
 
     def _on_destroy(self, *_args) -> None:
         self._tab_directory_refresh_alive = False
@@ -3933,6 +4776,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
     def _move_tab_to_new_window(self, record: SessionRecord) -> None:
         """Open a new TermDeck window and move *record* into it."""
+        if TermDeckWindow._auth_switch_blocks_action(self, record.id, action="moving this tab"):
+            return
         destination = self.app_context.prompt_for_new_window(
             parent=self,
             open_initial_tab=False,
@@ -4349,9 +5194,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
         self.new_tab()
 
-    def new_shell_tab(self, cwd: str | Path | None = None) -> None:
+    def new_shell_tab(self, cwd: str | Path | None = None) -> SessionRecord:
         directory = normalise_directory(cwd or Path.home())
-        self.create_session(directory_tab_name(directory), "terminal", default_shell(), directory)
+        return self.create_session(directory_tab_name(directory), "terminal", default_shell(), directory)
 
     def open_command_palette(self) -> None:
         items = build_palette_items(self.app_context.store.list())
@@ -4398,9 +5243,14 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             if record:
                 owner_lookup = getattr(self.app_context, "window_for_window_id", None)
                 owner = owner_lookup(record.window_id) if callable(owner_lookup) else None
-                (owner or self).open_session(record)
+                target = owner or self
+                open_user = getattr(target, "open_user_session", None)
+                if callable(open_user):
+                    open_user(record)
+                else:
+                    target.open_session(record)
 
-    def create_session(self, name: str, tag: str, command: str, cwd: str) -> None:
+    def create_session(self, name: str, tag: str, command: str, cwd: str) -> SessionRecord:
         directory = normalise_directory(cwd)
         clean_name = name.strip()
         if not clean_name or clean_name.casefold() in {"shell", "terminal"}:
@@ -4415,21 +5265,44 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             tab_index=self.notebook.get_n_pages(),
             visible=True,
         )
-        self.app_context.backend.create_or_resume(record)
-        pid = self.app_context.backend.pane_pid(record)
-        record = self.app_context.store.update(record.id, status="running", last_pid=pid)
-        self.open_session(
-            record,
-            known_live=True,
-            known_pid=pid,
-            known_pid_resolved=True,
-            refresh_side=False,
-        )
+        try:
+            self.app_context.backend.create_or_resume(record)
+            pid = self.app_context.backend.pane_pid(record)
+            record = self.app_context.store.update(record.id, status="running", last_pid=pid)
+            self.open_session(
+                record,
+                known_live=True,
+                known_pid=pid,
+                known_pid_resolved=True,
+                refresh_side=False,
+            )
+        except Exception:
+            # A replacement is one atomic user action.  If its tmux/session-row
+            # construction only partly succeeds, remove only that newly-created
+            # target so retrying cannot accumulate duplicate shells.
+            try:
+                self._remove_tab_widget(record.id)
+            except Exception:
+                pass
+            try:
+                self.app_context.backend.terminate(record)
+            except Exception:
+                pass
+            try:
+                self.app_context.store.delete(record.id)
+            except Exception:
+                pass
+            raise
         self.side.refresh()
+        return record
 
 
     def restore_previous_tabs(self, records: list[SessionRecord] | None = None) -> int:
         """Reattach live tabs and relaunch remembered crash-recovery tabs."""
+        retry_ids = getattr(self, "_restore_retry_ids", None)
+        if not isinstance(retry_ids, set):
+            retry_ids = set()
+            self._restore_retry_ids = retry_ids
         restored = 0
         restore_records = sorted(records, key=lambda row: row.tab_index) if records is not None else self.app_context.store.restore_candidates(
             limit=12,
@@ -4455,6 +5328,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 live_by_id = None
                 pids_by_id = {}
                 pids_resolved = False
+        failed_ids: set[str] = set()
         for record in restore_records:
             if record.id in self.tabs:
                 continue
@@ -4469,21 +5343,86 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                     known_pid_resolved=pids_resolved,
                     refresh_side=False,
                 )
-            except (OSError, TmuxError):
+            except Exception:
                 # One unavailable command/socket must not abort construction of
                 # the window or hide the rest of its remembered tabs. Keep the
                 # failed row visible so a later Restore/startup can retry it.
+                # AttachTerminal/VTE can raise ValueError, RuntimeError, or a
+                # GI exception in addition to the backend's OSError/TmuxError;
+                # all of those are per-row failures, not window failures.
+                failed_ids.add(record.id)
+                failure_status = (
+                    "recovery-pending"
+                    if str(getattr(record, "status", "")).casefold() == "recovery-pending"
+                    else "start-error"
+                )
                 self.app_context.store.update(
                     record.id,
-                    status="start-error",
+                    status=failure_status,
                     last_pid=None,
                     visible=bool(getattr(record, "visible", True)),
                 )
                 continue
             if len(self.tabs) > before:
                 restored += 1
+                retry_ids.discard(record.id)
+        if failed_ids:
+            retry_ids.update(failed_ids)
+            schedule_retry = getattr(self, "_schedule_restore_retry", None)
+            if callable(schedule_retry):
+                schedule_retry()
+        elif not retry_ids:
+            self._restore_retry_attempts = 0
         self.side.refresh()
         return restored
+
+    def _schedule_restore_retry(self) -> None:
+        """Retry only rows whose notebook client was not materialized."""
+
+        if getattr(self, "_restore_retry_source_id", 0):
+            return
+        # A bounded retry window avoids a permanent loop when a backend is
+        # genuinely unavailable while still covering slow VTE/GTK startup.
+        attempts = int(getattr(self, "_restore_retry_attempts", 0))
+        retry_ids = getattr(self, "_restore_retry_ids", set())
+        if attempts >= 30:
+            retry_ids.clear()
+            self._restore_retry_attempts = 0
+            return
+        try:
+            self._restore_retry_source_id = GLib.timeout_add(
+                2000,
+                self._retry_restore_tabs,
+            )
+        except Exception:
+            self._restore_retry_source_id = 0
+
+    def _retry_restore_tabs(self) -> bool:
+        self._restore_retry_source_id = 0
+        self._restore_retry_attempts += 1
+        retry_ids = getattr(self, "_restore_retry_ids", set())
+        ids = tuple(retry_ids)
+        if not ids:
+            self._restore_retry_attempts = 0
+            return False
+        rows = []
+        for session_id in ids:
+            if session_id in self.tabs:
+                retry_ids.discard(session_id)
+                continue
+            record = self.app_context.store.get(session_id)
+            if record is not None and bool(getattr(record, "visible", True)):
+                rows.append(record)
+            else:
+                retry_ids.discard(session_id)
+        if rows:
+            self.restore_previous_tabs(records=rows)
+        if retry_ids and self._restore_retry_attempts < 30:
+            self._schedule_restore_retry()
+            return False
+        retry_ids.clear()
+        self._restore_retry_attempts = 0
+        return False
 
     def reopen_last_closed_tab(self) -> int:
         """Browser-style reopen for the most recently hidden terminal tab."""
@@ -4491,6 +5430,17 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         records = recently_closed_records(self.app_context.store, limit=1)
         if not records:
             return 0
+        record = records[0]
+        try:
+            live = bool(self.app_context.backend.session_exists(record))
+        except (OSError, TmuxError):
+            live = True
+        if not live:
+            reopened = 1 if self.open_user_session(record) else 0
+            self.side.refresh()
+            if self.master_window is not None and self.master_window.get_visible():
+                self.master_window.refresh()
+            return reopened
         results = reopen_closed_records(
             self.app_context.store,
             records,
@@ -4503,13 +5453,204 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             if not record:
                 continue
             before = len(self.tabs)
-            self.open_session(record, restart_missing=False, remember_layout=False)
+            self.open_session(
+                record,
+                restart_missing=False,
+                remember_layout=False,
+                known_live=True,
+            )
             if record.id in self.tabs or len(self.tabs) > before:
                 reopened += 1
         self.side.refresh()
         if self.master_window is not None and self.master_window.get_visible():
             self.master_window.refresh()
         return reopened
+
+    def open_user_session(self, record: SessionRecord) -> bool:
+        """Open a selected tab without replaying or downgrading lost state."""
+
+        current = self.app_context.store.get(record.id)
+        if current is None:
+            self.show_toast("That terminal is no longer in the session store", kind="error")
+            return False
+        record = current
+        try:
+            live = bool(self.app_context.backend.session_exists(record))
+        except (OSError, TmuxError) as exc:
+            self.show_toast(f"Could not check {record.name}: {exc}", kind="error")
+            return False
+        if live:
+            try:
+                self.open_session(record, known_live=True)
+            except Exception as exc:
+                self.show_toast(f"Could not open {record.name}: {exc}", kind="error")
+                return False
+            return True
+
+        has_recovery_metadata = bool(
+            (record.recovery_command or "").strip()
+            or (record.recovery_cwd or "").strip()
+        )
+        managed_recovery = not record.external and (
+            record.status.casefold() not in {"missing", "stopped"}
+            or has_recovery_metadata
+        )
+        if managed_recovery:
+            # ``recovery-pending`` makes create_or_resume fail closed unless it
+            # has an exact Codex UUID or a validated process checkpoint.  Use an
+            # ephemeral record so a failed attempt cannot mutate durable state.
+            recovery_record = (
+                record
+                if record.status.casefold() == "recovery-pending"
+                else replace(record, status="recovery-pending")
+            )
+            try:
+                self.app_context.backend.create_or_resume(recovery_record)
+                self._remove_tab_widget(record.id)
+                self.open_session(recovery_record, known_live=True)
+            except Exception as exc:
+                self.show_toast(
+                    f"Could not recover {record.name} exactly: {exc}",
+                    kind="error",
+                )
+                self.side.refresh()
+                return False
+            self.show_toast(f"Recovered {record.name}", kind="success")
+            return True
+
+        replacements = getattr(self, "_missing_session_replacements", None)
+        if replacements is None:
+            replacements = set()
+            self._missing_session_replacements = replacements
+        if record.id in replacements:
+            return True
+
+        directory = normalise_directory(record.cwd)
+        if not Path(directory).is_dir():
+            self.show_toast(
+                f"Original session ended and its saved directory is unavailable: {directory}",
+                kind="error",
+            )
+            self.side.refresh()
+            return False
+        replacements.add(record.id)
+        try:
+            self.new_shell_tab(directory)
+        except Exception as exc:
+            replacements.discard(record.id)
+            self.show_toast(f"Could not open a replacement shell in {directory}: {exc}", kind="error")
+            self.side.refresh()
+            return False
+        try:
+            self.app_context.store.update(
+                record.id,
+                status="stopped",
+                visible=False,
+                last_pid=None,
+            )
+        except KeyError:
+            # The replacement is already usable and the stale source was
+            # concurrently removed. Keep the completion guard so another stale
+            # activation cannot create a second shell.
+            pass
+        except Exception as exc:
+            self.show_toast(
+                f"Opened a replacement shell, but could not retire {record.name}: {exc}",
+                kind="warning",
+            )
+            self.side.refresh()
+            return True
+        self._remove_tab_widget(record.id)
+        self.show_toast(
+            f"Original session ended; opened a new shell in {directory}",
+            kind="info",
+        )
+        return True
+
+    def _attach_client_should_retry(self, session_id: str) -> bool | None:
+        """Classify one exited tmux client without confusing it with its task."""
+
+        # Auth activation intentionally replaces the tmux session. Its attach
+        # client may observe the brief gap between terminate and recreate.
+        if session_id in self._auth_switch_inflight:
+            return None
+        record = self.app_context.store.get(session_id)
+        if record is None:
+            getattr(self, "_auth_attach_protected", set()).discard(session_id)
+            return False
+        if session_id in getattr(self, "_auth_attach_protected", set()):
+            try:
+                if self.app_context.backend.session_exists(record):
+                    # Keep the protection until the new attach client has
+                    # survived its stability interval. A later child exit in
+                    # that interval is still part of the same transition.
+                    return True
+            except (OSError, TmuxError):
+                # Liveness is inconclusive: never let a switch-induced gap
+                # turn into a destructive missing-tab finalizer.
+                return None
+            # The server-side replacement has not appeared yet. Keep the VTE
+            # deferred and the notebook tab visible; the auth poll retries this
+            # exact target without recreating or hiding anything.
+            return None
+        try:
+            if self.app_context.backend.session_exists(record):
+                return True
+        except (OSError, TmuxError):
+            return True
+        GLib.idle_add(self._finalize_missing_attach_target, session_id)
+        return False
+
+    def _resolve_auth_attach_gap(self, session_id: str) -> None:
+        tab = self.tabs.get(session_id)
+        if tab is None:
+            return
+        resolver = getattr(tab.widget, "resolve_deferred_attach", None)
+        if callable(resolver):
+            resolver()
+
+    def _on_auth_attach_stable(self, session_id: str) -> None:
+        """Release a no-loss auth-transition guard after a stable reattach."""
+
+        getattr(self, "_auth_attach_protected", set()).discard(session_id)
+
+    def _finalize_missing_attach_target(self, session_id: str) -> bool:
+        record = self.app_context.store.get(session_id)
+        if record is None:
+            return False
+        external = bool(record.external)
+        replaceable_missing = bool(
+            not external
+            and record.status.casefold() in {"missing", "stopped"}
+            and not (record.recovery_command or "").strip()
+            and not (record.recovery_cwd or "").strip()
+        )
+        try:
+            updated = self.app_context.store.update(
+                session_id,
+                status="missing" if external or replaceable_missing else "recovery-pending",
+                visible=False if external or replaceable_missing else record.visible,
+                last_pid=None,
+                last_opened_at=utc_now(),
+            )
+        except KeyError:
+            return False
+        self._remove_tab_widget(session_id)
+        self._renumber_visible_tabs()
+        self.side.refresh()
+        if self.master_window is not None and self.master_window.get_visible():
+            self.master_window.refresh()
+        if external or replaceable_missing:
+            self.show_toast(
+                f"{updated.name} ended; reopen it to start a managed shell in its saved directory",
+                kind="warning",
+            )
+        else:
+            self.show_toast(
+                f"{updated.name} ended; exact recovery is pending",
+                kind="warning",
+            )
+        return False
 
     def observed_status(self, record: SessionRecord, pid: int | None) -> str:
         if getattr(self.app_context.backend, "pane_snapshot_stale", False):
@@ -4610,6 +5751,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             key_press_handler=self.on_terminal_key_press,
             live_focus_handler=lambda r=record: self._restore_live_terminal(r),
             scroll_handler=lambda lines, r=record: self._scroll_terminal(r, lines),
+            selection_history_handler=lambda r=record: self._selection_history_for_terminal(r),
+            attach_exit_handler=lambda sid=record.id: self._attach_client_should_retry(sid),
+            attach_stable_handler=lambda sid=record.id: self._on_auth_attach_stable(sid),
             scrollback_extent=getattr(
                 self.app_context.backend,
                 "history_limit",
@@ -4647,22 +5791,78 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             tab.widget.terminal.grab_focus()
             self.present()
 
-    def _restore_live_terminal(self, record: SessionRecord) -> None:
+    def _restore_live_terminal(self, record: SessionRecord) -> bool:
         restore = getattr(self.app_context.backend, "restore_live_session", None)
-        if callable(restore):
-            restore(record)
+        if not callable(restore):
+            return True
+        try:
+            decision = restore(record)
+        except Exception:
+            return False
+        return decision is not False
 
-    def _scroll_terminal(self, record: SessionRecord, lines: int) -> ScrollDisposition:
+    def _scroll_terminal(self, record: SessionRecord, lines: int) -> ScrollOutcome:
         scroll = getattr(self.app_context.backend, "scroll_session", None)
-        return scroll(record, lines) if callable(scroll) else ScrollDisposition.UNHANDLED
+        if not callable(scroll):
+            return unhandled_scroll(lines, detail="backend has no history controller")
+        outcome = scroll(record, lines)
+        return (
+            outcome
+            if isinstance(outcome, ScrollOutcome)
+            else unhandled_scroll(lines, detail="invalid backend scroll outcome")
+        )
+
+    def _selection_history_for_terminal(self, record: SessionRecord) -> str:
+        """Return a bounded text snapshot for continuous selection review."""
+
+        capture = getattr(self.app_context.backend, "capture", None)
+        if not callable(capture):
+            return ""
+        lines = max(
+            100,
+            int(
+                getattr(
+                    self.app_context.backend,
+                    "history_limit",
+                    self.app_context.theme.scrollback_lines,
+                )
+            ),
+        )
+        try:
+            return str(capture(record, lines=lines) or "")
+        except Exception:
+            return ""
 
     def _sync_current_terminal_geometry(self) -> bool:
         self._terminal_layout_sync_source_id = 0
-        session_id = self.current_session_id()
-        tab = self.tabs.get(session_id) if session_id else None
-        if tab is not None:
-            tab.widget.request_geometry_sync(delay_ms=0)
+        page_num = self.notebook.get_current_page()
+        visible = self.notebook.get_nth_page(page_num)
+        if visible is None or bool(getattr(visible, "_detached", False)):
+            return False
+        terminal = getattr(visible, "terminal", None)
+        if terminal is None:
+            return False
+        try:
+            columns = max(0, int(terminal.get_column_count()))
+            rows = max(0, int(terminal.get_row_count()))
+        except Exception:
+            return False
+        if columns < 2 or rows < 2:
+            return False
+        # Gtk.Notebook does not allocate hidden pages when the window settles.
+        # Use the mapped page as the canonical grid and explicitly resize every
+        # live VTE/PTy pair so tmux never retains a hidden page's stale width.
+        for tab in list(self.tabs.values()):
+            widget = tab.widget
+            if bool(getattr(widget, "_detached", False)):
+                continue
+            apply_grid = getattr(widget, "apply_canonical_grid", None)
+            if callable(apply_grid):
+                apply_grid(columns=columns, rows=rows)
         return False
+
+    def _on_terminal_layout_size_allocate(self, *_args) -> None:
+        self._queue_current_terminal_geometry_sync()
 
     def _queue_current_terminal_geometry_sync(self) -> None:
         if self._terminal_layout_sync_source_id:
@@ -4751,15 +5951,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                     "a running external tmux environment cannot be retroactively isolated."
                 )
                 return
-            if not environment_ready:
-                combo.append("__none__", "Codex: restart terminal")
-                combo.set_active_id("__none__")
-                combo.set_sensitive(False)
-                combo.set_tooltip_text(
-                    "This live terminal predates per-tab Codex isolation or lost its private auth environment. "
-                    "Restart this terminal once before using codex-auth so another tab cannot be changed."
-                )
-                return
             if state is None:
                 combo.append("__none__", "Codex: unavailable")
                 combo.set_active_id("__none__")
@@ -4768,15 +5959,44 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 return
 
             pending = record.pending_account
-            none_label = f"Codex: {pending} pending" if pending else "Codex: no account"
+            canonical_binding_ready = bool(
+                getattr(state, "canonical_binding_ready", True)
+            )
+            if pending:
+                none_label = f"Codex: {pending} pending"
+            elif not canonical_binding_ready and state.selected_account:
+                none_label = "Codex: repair saved account binding"
+            elif environment_ready:
+                none_label = "Codex: no account"
+            else:
+                none_label = "Codex: choose account · upgrades terminal"
             combo.append("__none__", none_label)
             for account in state.accounts:
-                suffix = " · restart" if account.active and record.auth_restart_required else ""
+                if account.active and not canonical_binding_ready:
+                    suffix = " · repair"
+                elif account.active and record.auth_restart_required:
+                    suffix = " · restart"
+                else:
+                    suffix = ""
                 combo.append(account.account_key, f"{account.label}{suffix}")
-            combo.set_active_id(state.selected_account_key or "__none__")
+            combo.set_active_id(
+                (state.selected_account_key or "__none__")
+                if environment_ready and canonical_binding_ready
+                else "__none__"
+            )
             switchable = bool(state.accounts) and state.codex_auth_available and record.id not in self._auth_switch_inflight
             combo.set_sensitive(switchable)
-            if record.auth_restart_required and state.selected_account:
+            if not canonical_binding_ready and state.selected_account:
+                tooltip = (
+                    f"Reselect {state.selected_account} to bind this terminal directly to "
+                    "the canonical saved account before Codex starts."
+                )
+            elif not environment_ready and state.accounts:
+                tooltip = (
+                    "Choose an account to upgrade this managed terminal to a private Codex environment. "
+                    "TermDeck will preserve an exact Codex resume or a verified idle shell."
+                )
+            elif record.auth_restart_required and state.selected_account:
                 tooltip = (
                     f"Saved account: {state.selected_account}. Restart the running Codex process "
                     "when its current turn is finished."
@@ -4788,6 +6008,66 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             combo.set_tooltip_text(tooltip)
         finally:
             self._auth_combo_updating = False
+
+    def _queue_auth_completion_recovery(
+        self,
+        session_id: str,
+        generation: int,
+        result: CodexSwitchResult | None,
+        activation: AuthActivationResult | None,
+        error: str,
+        transaction_lock,
+        persistence_retry_attempt: int = 0,
+    ) -> None:
+        payload = (
+            session_id,
+            generation,
+            result,
+            activation,
+            error,
+            transaction_lock,
+            persistence_retry_attempt,
+        )
+        with self._auth_completion_recovery_lock:
+            self._auth_completion_recoveries.append(payload)
+
+    def _drain_auth_completion_recoveries(self) -> None:
+        """Finish callbacks whose normal GLib handoff could not be registered."""
+
+        with self._auth_completion_recovery_lock:
+            pending = self._auth_completion_recoveries
+            self._auth_completion_recoveries = []
+        for payload in pending:
+            try:
+                self._complete_auth_switch(*payload)
+            except Exception as exc:
+                # One malformed/stale callback must never drop the remaining
+                # recovery payloads (some may still own scope locks).
+                print(f"TermDeck: auth completion recovery failed: {exc}", file=sys.stderr)
+
+    def _finish_auth_switch_ui(self, session_id: str, *, protect_attach: bool = False) -> None:
+        """Release one committed generation's guard and repair its attach/UI."""
+
+        tab = self.tabs.get(session_id)
+        if protect_attach or bool(
+            tab is not None and getattr(tab.widget, "_attach_restart_deferred", False)
+        ):
+            protected = getattr(self, "_auth_attach_protected", None)
+            if protected is None:
+                protected = set()
+                self._auth_attach_protected = protected
+            protected.add(session_id)
+        self._auth_switch_inflight.discard(session_id)
+        try:
+            TermDeckWindow._resolve_auth_attach_gap(self, session_id)
+        except Exception as exc:
+            print(f"TermDeck: could not resolve auth attach for {session_id}: {exc}", file=sys.stderr)
+        try:
+            self._refresh_auth_selector()
+        except Exception as exc:
+            # Durable auth/process state is already committed at this point;
+            # a later poll or tab switch can repaint the selector.
+            print(f"TermDeck: could not refresh auth selector for {session_id}: {exc}", file=sys.stderr)
 
     def _refresh_auth_selector(self) -> bool:
         record = self.current_record()
@@ -4804,10 +6084,17 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 environment_ready = bool(check_environment(record))
             except (OSError, TmuxError):
                 environment_ready = False
+        self._auth_environment_ready[record.id] = environment_ready
+        inflight = record.id in getattr(self, "_auth_switch_inflight", set())
         try:
             state = self.app_context.codex_auth.state(record)
-            record = self._sync_observed_auth_state(record, state)
-            self._auth_fingerprints[record.id] = state.fingerprint
+            # The worker may already have changed the canonical pointer while
+            # its matching SessionStore commit is still pending.  Rendering
+            # that read-only state is useful, but synchronizing it here would
+            # bypass the transaction lock's durable commit boundary.
+            if not inflight:
+                record = self._sync_observed_auth_state(record, state)
+                self._auth_fingerprints[record.id] = state.fingerprint
             self._render_auth_selector(record, state, environment_ready=environment_ready)
         except (CodexAuthError, OSError, ValueError) as exc:
             self._render_auth_selector(
@@ -4821,6 +6108,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     def _poll_codex_auth_state(self) -> bool:
         if not self._tab_directory_refresh_alive:
             return False
+        self._drain_auth_completion_recoveries()
+        # Only account-transition attach clients receive this non-destructive
+        # retry. Ordinary exited tabs retain the normal missing-session path.
+        for session_id in tuple(getattr(self, "_auth_attach_protected", set())):
+            TermDeckWindow._resolve_auth_attach_gap(self, session_id)
         record = self.current_record()
         if record is None or record.external or record.id in self._auth_switch_inflight:
             return True
@@ -4828,9 +6120,17 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             state = self.app_context.codex_auth.state(record)
         except (CodexAuthError, OSError, ValueError):
             return True
+        environment_ready = True
+        check_environment = getattr(self.app_context.backend, "private_auth_environment_ready", None)
+        if callable(check_environment):
+            try:
+                environment_ready = bool(check_environment(record))
+            except (OSError, TmuxError):
+                environment_ready = False
         if (
             self._auth_fingerprints.get(record.id) != state.fingerprint
             or state.selected_account != record.selected_account
+            or self._auth_environment_ready.get(record.id) != environment_ready
         ):
             self._refresh_auth_selector()
         return True
@@ -4845,18 +6145,12 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if record.id in self._auth_switch_inflight:
             return
         check_environment = getattr(self.app_context.backend, "private_auth_environment_ready", None)
+        environment_ready = True
         if callable(check_environment):
             try:
                 environment_ready = bool(check_environment(record))
             except (OSError, TmuxError):
                 environment_ready = False
-            if not environment_ready:
-                self.show_toast(
-                    "Restart this terminal once before switching Codex accounts; its live shell is not privately isolated.",
-                    kind="error",
-                )
-                self._refresh_auth_selector()
-                return
         try:
             state = self.app_context.codex_auth.state(record)
         except (CodexAuthError, OSError, ValueError) as exc:
@@ -4864,16 +6158,21 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             self._refresh_auth_selector()
             return
         account = next((row for row in state.accounts if row.account_key == account_key), None)
-        if account is None or state.selected_account_key == account_key:
+        if account is None or (
+            environment_ready
+            and state.selected_account_key == account_key
+            and bool(getattr(state, "canonical_binding_ready", True))
+            and not bool(getattr(record, "auth_restart_required", False))
+        ):
             return
-
+        previous_pending_account = record.pending_account
         record = self.app_context.store.update(record.id, pending_account=account.label)
         tab = self.tabs.get(record.id)
         if tab is not None:
             tab.record = record
         self._auth_switch_inflight.add(record.id)
-        self._auth_switch_generation += 1
-        generation = self._auth_switch_generation
+        generation = self._auth_switch_generation.get(record.id, 0) + 1
+        self._auth_switch_generation[record.id] = generation
         combo.set_sensitive(False)
         self.show_toast(f"Switching {record.name} to {account.label}…", kind="info")
 
@@ -4881,22 +6180,129 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             result: CodexSwitchResult | None = None
             activation: AuthActivationResult | None = None
             error = ""
+            transaction_lock = None
             try:
-                result = self.app_context.codex_auth.switch(record, account_key)
-                if result.ok:
-                    activation = self.app_context.backend.activate_auth_change(record)
+                candidate_lock = auth_transaction_lock(record)
+                candidate_lock.__enter__()
+                transaction_lock = candidate_lock
+                # Another CLI or GUI may have completed while this worker was
+                # scheduled. Resolve and transact from the fresh canonical
+                # binding while holding the cross-process lock.
+                locked_state = self.app_context.codex_auth.state(record)
+                transaction = execute_auth_change(
+                    self.app_context.backend,
+                    self.app_context.codex_auth,
+                    record,
+                    locked_state,
+                    account_key,
+                )
+                result = transaction.switch_result
+                activation = transaction.activation
+                error = transaction.error
+            except AuthTransactionBusy as exc:
+                error = str(exc)
             except Exception as exc:
                 error = str(exc)
-            GLib.idle_add(
+            scheduled, scheduling_error = _schedule_glib_callback(
                 self._complete_auth_switch,
                 record.id,
                 generation,
                 result,
                 activation,
                 error,
+                transaction_lock,
+            )
+            if scheduled:
+                return
+
+            # No GTK callback was registered. The already-running two-second
+            # auth poll is the final handoff. Keep the matching scope lock and
+            # close/move guard with that payload: releasing either before the
+            # SessionStore commit would let a newer transaction race and make
+            # this result stale or disappear with a window close.
+            recovery_error = (
+                f"{error}; " if error else ""
+            ) + f"UI completion handoff failed; recovering on the next auth poll · {scheduling_error}"
+            self._queue_auth_completion_recovery(
+                record.id,
+                generation,
+                result,
+                activation,
+                recovery_error,
+                transaction_lock,
+            )
+            print(
+                f"TermDeck: {record.name} account completion remains protected and will "
+                f"retry on the auth poll: "
+                f"{scheduling_error}",
+                file=sys.stderr,
             )
 
-        threading.Thread(target=_worker, name=f"termdeck-auth-{record.id}", daemon=True).start()
+        # Keep Python alive if an unexpected external shutdown bypasses GTK's
+        # close/quit guards while the backend is between terminate and recreate.
+        try:
+            threading.Thread(
+                target=_worker,
+                name=f"termdeck-auth-{record.id}",
+                daemon=False,
+            ).start()
+        except Exception as exc:
+            # No worker ran, so no canonical pointer or process state changed.
+            # Restore the pre-click durable/UI state synchronously instead of
+            # leaving a permanent pending badge and close/attach guard behind.
+            restore_error = ""
+            if generation == self._auth_switch_generation.get(record.id):
+                try:
+                    restored = self.app_context.store.update(
+                        record.id,
+                        pending_account=previous_pending_account,
+                    )
+                    tab = self.tabs.get(record.id)
+                    if tab is not None:
+                        tab.record = restored
+                except Exception as restore_exc:
+                    restore_error = f"; could not restore pending state: {restore_exc}"
+                self._auth_switch_inflight.discard(record.id)
+                combo.set_sensitive(True)
+                self._refresh_auth_selector()
+            self.show_toast(
+                f"Account unchanged: could not start account switch worker: {exc}{restore_error}",
+                kind="error",
+            )
+
+    def _persist_auth_transaction_result(
+        self,
+        session_id: str,
+        result: CodexSwitchResult,
+        activation: AuthActivationResult | None,
+    ) -> SessionRecord:
+        """Persist pointer/process state before releasing the scope lock."""
+
+        activation_ok = activation is not None and activation.ok
+        updates: dict[str, object] = {
+            "selected_account": result.state.selected_account,
+            "pending_account": None,
+            "auth_restart_required": not activation_ok,
+            "auth_changed_at": utc_now(),
+        }
+        if activation is not None:
+            replacement_command = getattr(activation, "command", None)
+            replacement_cwd = getattr(activation, "cwd", None)
+            clear_recovery = bool(getattr(activation, "clear_recovery", False))
+            if replacement_command is not None:
+                updates["command"] = replacement_command
+            if replacement_cwd is not None:
+                updates["cwd"] = replacement_cwd
+            if clear_recovery:
+                updates["recovery_command"] = None
+                updates["recovery_cwd"] = None
+            elif activation.recovery_command is not None:
+                updates["recovery_command"] = activation.recovery_command
+                updates["recovery_cwd"] = activation.recovery_cwd
+            if activation.status is not None:
+                updates["status"] = activation.status
+                updates["last_pid"] = activation.pid
+        return self.app_context.store.update(session_id, **updates)
 
     def _complete_auth_switch(
         self,
@@ -4905,54 +6311,152 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         result: CodexSwitchResult | None,
         activation: AuthActivationResult | None,
         error: str,
+        transaction_lock=None,
+        persistence_retry_attempt: int = 0,
     ) -> bool:
-        self._auth_switch_inflight.discard(session_id)
-        record = self.app_context.store.get(session_id)
-        if record is None:
-            self._refresh_auth_selector()
-            return False
-        if generation != self._auth_switch_generation:
-            self._refresh_auth_selector()
-            return False
-        if result is not None and result.ok:
-            activation_ok = activation is not None and activation.ok
-            updates: dict[str, object] = {
-                "selected_account": result.state.selected_account,
-                "pending_account": None,
-                "auth_restart_required": not activation_ok,
-                "auth_changed_at": utc_now(),
-            }
-            if activation is not None:
-                if activation.recovery_command is not None:
-                    updates["recovery_command"] = activation.recovery_command
-                    updates["recovery_cwd"] = activation.recovery_cwd
-                if activation.status is not None:
-                    updates["status"] = activation.status
-                    updates["last_pid"] = activation.pid
-            record = self.app_context.store.update(
+        def _release_transaction_lock() -> None:
+            if transaction_lock is not None:
+                try:
+                    transaction_lock.__exit__(None, None, None)
+                except Exception as exc:
+                    print(
+                        f"TermDeck: could not release auth transaction lock for {session_id}: {exc}",
+                        file=sys.stderr,
+                    )
+
+        def _retry_persistence(exc: Exception, *, name: str) -> bool:
+            if not persistence_retry_attempt:
+                try:
+                    self.show_toast(
+                        f"{name}: could not save Codex account state; "
+                        f"retrying while this terminal remains protected · {exc}",
+                        kind="error",
+                    )
+                except Exception as toast_exc:
+                    # Status rendering must never prevent registration of the
+                    # durable-state retry that owns this lock and guard.
+                    print(
+                        f"TermDeck: could not show auth persistence retry status "
+                        f"for {session_id}: {toast_exc}",
+                        file=sys.stderr,
+                    )
+            retry_delay_ms = min(5000, 500 * (2 ** min(persistence_retry_attempt, 4)))
+            scheduled, scheduling_error = _schedule_glib_callback(
+                self._complete_auth_switch,
                 session_id,
-                **updates,
+                generation,
+                result,
+                activation,
+                error,
+                transaction_lock,
+                persistence_retry_attempt + 1,
+                delay_ms=retry_delay_ms,
             )
-            self._auth_fingerprints[session_id] = result.state.fingerprint
-            tab = self.tabs.get(session_id)
-            if tab is not None:
-                tab.record = record
-            if activation_ok and activation is not None and activation.restarted:
-                message = f"{record.name}: {record.selected_account} active · Codex restarted in this tab"
-                kind = "success"
-            elif activation_ok:
-                message = f"{record.name}: {record.selected_account} active for the next Codex launch"
-                kind = "success"
+            if not scheduled:
+                # The independently registered two-second auth poll is the
+                # final bounded retry path. Keep the lock and guard in its
+                # payload so no credential/process state becomes observable
+                # as committed before SessionStore catches up.
+                self._queue_auth_completion_recovery(
+                    session_id,
+                    generation,
+                    result,
+                    activation,
+                    (
+                        f"{error}; " if error else ""
+                    ) + f"durable auth retry scheduling failed · {scheduling_error}",
+                    transaction_lock,
+                    persistence_retry_attempt + 1,
+                )
+                if not persistence_retry_attempt:
+                    try:
+                        self.show_toast(
+                            f"{name}: retry timer unavailable; protected state will retry "
+                            "on the next auth poll",
+                            kind="error",
+                        )
+                    except Exception as toast_exc:
+                        print(
+                            f"TermDeck: could not show auth poll recovery status "
+                            f"for {session_id}: {toast_exc}",
+                            file=sys.stderr,
+                        )
+            return False
+
+        # A delayed callback from an older attempt owns only the lock passed in
+        # its own callback payload.  It must not tear down the guard or deferred
+        # attach owned by a newer generation for the same terminal.
+        if generation != self._auth_switch_generation.get(session_id):
+            _release_transaction_lock()
+            return False
+
+        try:
+            record = self.app_context.store.get(session_id)
+        except Exception as exc:
+            return _retry_persistence(exc, name="Terminal")
+        if record is None:
+            _release_transaction_lock()
+            if generation == self._auth_switch_generation.get(session_id):
+                TermDeckWindow._finish_auth_switch_ui(self, session_id)
+            return False
+
+        activation_ok = activation is not None and activation.ok
+        transaction_applied = result is not None and (result.ok or activation is not None)
+        try:
+            if transaction_applied:
+                record = self._persist_auth_transaction_result(
+                    session_id,
+                    result,
+                    activation,
+                )
             else:
-                detail = activation.detail if activation is not None else (error or "Codex restart did not complete")
-                message = f"{record.name}: account saved, but not active in running Codex · {detail}"
-                kind = "error"
-            self.show_toast(message, kind=kind)
-        else:
-            self.app_context.store.update(session_id, pending_account=None)
-            detail = error or (result.error if result is not None else "Codex account switch failed")
-            self.show_toast(f"Account unchanged: {detail}", kind="error")
-        self._refresh_auth_selector()
+                record = self.app_context.store.update(session_id, pending_account=None)
+        except Exception as exc:
+            # Keep both the cross-process lock and the per-tab safety guard held
+            # until this exact generation has a successful durable write.
+            return _retry_persistence(exc, name=record.name)
+
+        # The durable state now matches the credential pointer/process result;
+        # the scope lock can be released before ordinary GTK bookkeeping.
+        _release_transaction_lock()
+        try:
+            if transaction_applied:
+                self._auth_fingerprints[session_id] = result.state.fingerprint
+                tab = self.tabs.get(session_id)
+                if tab is not None:
+                    tab.record = record
+                if error:
+                    message = f"{record.name}: account change failed · {error}"
+                    kind = "error"
+                elif (
+                    activation_ok
+                    and activation is not None
+                    and activation.restarted
+                    and activation.recovery_command is not None
+                ):
+                    message = f"{record.name}: {record.selected_account} active · Codex restarted in this tab"
+                    kind = "success"
+                elif activation_ok and activation is not None and activation.restarted:
+                    message = f"{record.name}: {record.selected_account} active · terminal upgraded"
+                    kind = "success"
+                elif activation_ok:
+                    message = f"{record.name}: {record.selected_account} active for the next Codex launch"
+                    kind = "success"
+                else:
+                    detail = activation.detail if activation is not None else (error or "Codex restart did not complete")
+                    message = f"{record.name}: account saved, but not active in running Codex · {detail}"
+                    kind = "error"
+                self.show_toast(message, kind=kind)
+            else:
+                detail = error or (result.error if result is not None else "Codex account switch failed")
+                self.show_toast(f"Account unchanged: {detail}", kind="error")
+        finally:
+            if generation == self._auth_switch_generation.get(session_id):
+                TermDeckWindow._finish_auth_switch_ui(
+                    self,
+                    session_id,
+                    protect_attach=bool(getattr(activation, "restarted", False)),
+                )
         return False
 
     def _session_pause_state(self, record: SessionRecord) -> tuple[bool, int | None]:
@@ -5025,8 +6529,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if not session_id:
             return
         record = self.app_context.store.get(session_id)
-        self.hide_tab(session_id, include_pinned=True)
-        if record is not None:
+        hidden = self.hide_tab(session_id, include_pinned=True)
+        if hidden and record is not None:
             self.show_toast(f"Closed {record.name} · session still running", kind="info")
 
     def hide_current_tab(self) -> None:
@@ -5036,7 +6540,13 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     def quit_termdeck(self) -> None:
         self.app_context.quit_preserving_sessions()
 
+    def kill_window(self) -> int:
+        """Explicitly stop and forget this window; ordinary close stays durable."""
+
+        return self.app_context.kill_window(self)
+
     def _remove_tab_widget(self, session_id: str) -> bool:
+        getattr(self, "_auth_attach_protected", set()).discard(session_id)
         tab = self.tabs.pop(session_id, None)
         if not tab:
             return False
@@ -5046,12 +6556,46 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             self.notebook.remove_page(page)
         return True
 
-    def hide_tab(self, session_id: str, *, include_pinned: bool = False) -> None:
+    def _persist_live_directory_before_detach(self, record: SessionRecord) -> SessionRecord:
+        """Snapshot a last-second ``cd`` before the tmux client is detached."""
+
+        try:
+            live_directory = self.app_context.backend.current_directory(record)
+        except (OSError, TmuxError, ValueError):
+            return record
+        if not live_directory:
+            return record
+        try:
+            changes = self._directory_tracking_changes(record, live_directory)
+        except (OSError, ValueError):
+            return record
+        if not changes:
+            return record
+        try:
+            updated = self.app_context.store.update(
+                record.id,
+                last_opened_at=record.last_opened_at,
+                **changes,
+            )
+        except KeyError:
+            return record
+        self.refresh_tab_label(updated)
+        return updated
+
+    def hide_tab(self, session_id: str, *, include_pinned: bool = False) -> bool:
+        if TermDeckWindow._auth_switch_blocks_action(
+            self,
+            session_id,
+            action="closing or hiding this tab",
+        ):
+            return False
         record = self.app_context.store.get(session_id)
         if record and record.pinned and not include_pinned:
-            return
+            return False
+        if record is not None:
+            record = self._persist_live_directory_before_detach(record)
         if not self._remove_tab_widget(session_id):
-            return
+            return False
         try:
             if record is not None:
                 clear_captain = getattr(self.app_context.store, "clear_window_captain", None)
@@ -5062,17 +6606,19 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             pass
         self._renumber_visible_tabs()
         self.side.refresh()
+        return True
 
-    def stop_current_session(self) -> None:
+    def stop_current_session(self) -> int:
         session_id = self.current_session_id()
         if not session_id:
-            return
+            return 0
         record = self.app_context.store.get(session_id)
         if record:
-            self.stop_session(record)
+            return self.stop_session(record)
+        return 0
 
-    def stop_session(self, record: SessionRecord) -> None:
-        self.app_context.terminate_records([record])
+    def stop_session(self, record: SessionRecord) -> int:
+        return self.app_context.terminate_records([record])
 
     def open_master_window(self) -> None:
         if self.master_window is not None:
@@ -5486,13 +7032,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             backend = getattr(getattr(self, "app_context", None), "backend", None)
             active = getattr(backend, "scroll_view_active", None)
             if record is not None and callable(active) and active(record):
-                self._restore_live_terminal(record)
-                show_cursor = getattr(attach, "_set_history_cursor_hidden", None)
-                if callable(show_cursor):
-                    show_cursor(False)
-                reset_scrollbar = getattr(attach, "reset_scrollbar", None)
-                if callable(reset_scrollbar):
-                    reset_scrollbar()
+                if not attach.prepare_for_live_input():
+                    # Never paste into a transcript/copy-mode surface whose
+                    # live restoration could not be acknowledged.
+                    return True
             attach.paste_clipboard()
             return True
         record_getter = getattr(self, "current_record", None)
@@ -5501,16 +7044,13 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         active = getattr(backend, "scroll_view_active", None)
         if record is not None and callable(active) and active(record):
             # Do NOT snap back to live when the user presses a bare modifier
-            # key (Ctrl, Alt, Super/Win, Shift, …).  Modifier-only events carry
-            # no printable input so they must not interrupt a scroll session.
+            # key (Ctrl, Alt, Super/Win, Shift, …). Modifier-only events carry
+            # no child input and therefore do not interrupt history review.
             if not _is_modifier_only_keyval(event.keyval):
-                self._restore_live_terminal(record)
-                show_cursor = getattr(attach, "_set_history_cursor_hidden", None)
-                if callable(show_cursor):
-                    show_cursor(False)
-                reset_scrollbar = getattr(attach, "reset_scrollbar", None)
-                if callable(reset_scrollbar):
-                    reset_scrollbar()
+                if not attach.prepare_for_live_input():
+                    # Consume this key rather than leak it into the transcript
+                    # pager or tmux copy mode after a failed restore.
+                    return True
         return False
 
     @staticmethod
@@ -5529,8 +7069,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             focus = None
         if focus is attach.terminal or self._is_text_input_focus(focus):
             return False
-        attach.prepare_for_live_input()
-        attach.scroll_to_bottom()
+        if not attach.prepare_for_live_input():
+            # The event was aimed at chrome; consuming it is safer than
+            # forwarding the first character into an unresolved history view.
+            return True
         attach.terminal.grab_focus()
         # GTK chooses the key-event target before this handler runs. Merely
         # moving focus therefore loses the first character (or lets the old
@@ -5850,6 +7392,15 @@ class TermDeckApplication(Gtk.Application):
         source = self.window_for_tab(session_id)
         if source is destination or (source is None and record.window_id == destination.window_id):
             return record
+        if source is not None and session_id in (
+            getattr(source, "_auth_switch_inflight", set())
+            | getattr(source, "_auth_attach_protected", set())
+        ):
+            source.show_toast(
+                f"Wait for {record.name}'s Codex account switch before moving this tab",
+                kind="warning",
+            )
+            return None
 
         result = move_records(
             self.store,
@@ -5874,6 +7425,9 @@ class TermDeckApplication(Gtk.Application):
                 key_press_handler=destination.on_terminal_key_press,
                 live_focus_handler=lambda r=updated: destination._restore_live_terminal(r),
                 scroll_handler=lambda lines, r=updated: destination._scroll_terminal(r, lines),
+                selection_history_handler=lambda r=updated: destination._selection_history_for_terminal(r),
+                attach_exit_handler=lambda sid=session_id: destination._attach_client_should_retry(sid),
+                attach_stable_handler=lambda sid=session_id: destination._on_auth_attach_stable(sid),
             )
             tab.widget.apply_window_theme(
                 self.theme,
@@ -5927,7 +7481,28 @@ class TermDeckApplication(Gtk.Application):
         unique = {record.id: record for record in records}
         if not unique:
             return 0
+        terminated_ids: set[str] = set()
         for record in unique.values():
+            blocking_window = next(
+                (
+                    window
+                    for window in getattr(self, "windows", [])
+                    if record.id in getattr(window, "_auth_switch_inflight", set())
+                ),
+                None,
+            )
+            if blocking_window is not None:
+                blocker = getattr(blocking_window, "_auth_switch_blocks_action", None)
+                if callable(blocker):
+                    blocker(record.id, action="stopping this tab")
+                else:
+                    show_toast = getattr(blocking_window, "show_toast", None)
+                    if callable(show_toast):
+                        show_toast(
+                            f"Wait for {record.name}'s Codex account switch before stopping this tab",
+                            kind="warning",
+                        )
+                continue
             self.backend.terminate(record)
             clear_captain = getattr(self.store, "clear_window_captain", None)
             if callable(clear_captain):
@@ -5940,8 +7515,205 @@ class TermDeckApplication(Gtk.Application):
                 recovery_command=None,
                 recovery_cwd=None,
             )
-        self.close_session_tabs(set(unique))
-        return len(unique)
+            terminated_ids.add(record.id)
+        if terminated_ids:
+            self.close_session_tabs(terminated_ids)
+        return len(terminated_ids)
+
+    def confirm_kill_window(
+        self,
+        parent: TermDeckWindow,
+        records: list[SessionRecord],
+    ) -> bool:
+        """Always confirm the irreversible window-level lifecycle action."""
+
+        managed_count = sum(not bool(record.external) for record in records)
+        external_count = len(records) - managed_count
+        tab_word = "tab" if len(records) == 1 else "tabs"
+        managed_word = "session" if managed_count == 1 else "sessions"
+        external_word = "reference" if external_count == 1 else "references"
+        details = [
+            f"This permanently removes the saved window and its {len(records)} {tab_word}, "
+            "so it cannot return after restart."
+        ]
+        if managed_count:
+            details.append(
+                f"{managed_count} TermDeck-managed {managed_word} will be stopped."
+            )
+        if external_count:
+            details.append(
+                f"{external_count} external tmux tab {external_word} will be detached and "
+                "forgotten without stopping the external tmux session."
+            )
+        details.append(
+            "Closing the window instead keeps it for the next launch. This cannot be undone."
+        )
+        dialog = Gtk.MessageDialog(
+            transient_for=parent,
+            flags=0,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text=f"Kill “{parent.window_title}” permanently?",
+        )
+        dialog.format_secondary_text("\n\n".join(details))
+        response = dialog.run()
+        dialog.destroy()
+        return response == Gtk.ResponseType.OK
+
+    def kill_window(self, window: TermDeckWindow) -> int:
+        """Stop, delete, and forget one logical window after explicit consent.
+
+        Managed rows go through :meth:`terminate_records`, which owns the auth
+        transition guard. External rows are registry references only: detach
+        their clients, but never signal their independently-owned tmux sessions.
+        Any guarded or failed row keeps the logical window remembered so startup
+        can recover it and the user can retry safely.
+        """
+
+        records = list(
+            self.store.list(
+                include_archived=True,
+                window_id=window.window_id,
+            )
+        )
+        if not self.confirm_kill_window(window, records):
+            return 0
+
+        managed = [record for record in records if not bool(record.external)]
+        external = [record for record in records if bool(record.external)]
+        termination_error: Exception | None = None
+        terminated = 0
+        if managed:
+            try:
+                terminated = self.terminate_records(managed)
+            except Exception as exc:
+                # Some earlier rows may already be stopped, but the central
+                # batch does not expose their IDs. Preserve every managed row
+                # in this failure case so a retry cannot lose provenance.
+                termination_error = exc
+
+        protected_ids = {
+            session_id
+            for owner in getattr(self, "windows", [])
+            for session_id in getattr(owner, "_auth_switch_inflight", set())
+        }
+        expected_managed = [
+            record for record in managed if record.id not in protected_ids
+        ]
+        removable_managed_ids: set[str] = set()
+        if termination_error is None and terminated == len(expected_managed):
+            for record in expected_managed:
+                refreshed = self.store.get(record.id)
+                if (
+                    refreshed is not None
+                    and refreshed.status.casefold() == "stopped"
+                    and not refreshed.visible
+                    and refreshed.last_pid is None
+                    and refreshed.recovery_command is None
+                    and refreshed.recovery_cwd is None
+                ):
+                    removable_managed_ids.add(record.id)
+
+        removable_external_ids = {
+            record.id for record in external if record.id not in protected_ids
+        }
+        cleanup_errors: list[str] = []
+        if removable_external_ids:
+            try:
+                self.close_session_tabs(removable_external_ids)
+            except Exception as exc:
+                cleanup_errors.append(str(exc))
+                removable_external_ids.clear()
+
+        removable_ids = removable_managed_ids | removable_external_ids
+        deleted_ids: set[str] = set()
+        for record in records:
+            if record.id not in removable_ids:
+                continue
+            try:
+                self.store.delete(record.id)
+                deleted = self.store.get(record.id) is None
+            except Exception as exc:
+                cleanup_errors.append(str(exc))
+                continue
+            if deleted:
+                deleted_ids.add(record.id)
+
+        try:
+            remaining = self.store.list(
+                include_archived=True,
+                window_id=window.window_id,
+            )
+        except Exception as exc:
+            cleanup_errors.append(str(exc))
+            remaining = records
+
+        forgotten = False
+        if not remaining:
+            forget_window = getattr(self.store, "forget_window", None)
+            if callable(forget_window):
+                try:
+                    forgotten = bool(forget_window(window.window_id))
+                except Exception as exc:
+                    cleanup_errors.append(str(exc))
+            if not forgotten:
+                cleanup_errors.append("saved window could not be forgotten")
+
+        title = window.window_title
+        deleted_external = len(deleted_ids & {record.id for record in external})
+        other_window = next(
+            (
+                candidate
+                for candidate in getattr(self, "windows", [])
+                if candidate is not window
+            ),
+            None,
+        )
+        toast_target = other_window or window
+        show_toast = getattr(toast_target, "show_toast", None)
+
+        if forgotten:
+            managed_word = "session" if terminated == 1 else "sessions"
+            tab_word = "tab" if len(deleted_ids) == 1 else "tabs"
+            details = [f"stopped {terminated} managed {managed_word}"]
+            if deleted_external:
+                reference_word = "reference" if deleted_external == 1 else "references"
+                details.append(
+                    f"forgot {deleted_external} external {reference_word} without stopping tmux"
+                )
+            details.append(f"removed {len(deleted_ids)} saved {tab_word}")
+            if callable(show_toast):
+                show_toast(
+                    f"Killed “{title}” permanently · " + " · ".join(details),
+                    kind="danger",
+                )
+            try:
+                window.destroy()
+            except Exception as exc:
+                cleanup_errors.append(str(exc))
+            return len(deleted_ids)
+
+        remaining_count = len(remaining)
+        blocked_count = len(
+            protected_ids & {record.id for record in remaining}
+        )
+        tab_word = "tab" if len(records) == 1 else "tabs"
+        remaining_word = "tab remains" if remaining_count == 1 else "tabs remain"
+        managed_word = "session" if terminated == 1 else "sessions"
+        detail = (
+            f"Window kill incomplete · stopped {terminated} managed {managed_word} · "
+            f"removed {len(deleted_ids)} of {len(records)} {tab_word} · "
+            f"{remaining_count} {remaining_word}"
+        )
+        if blocked_count:
+            switch_word = "switch is" if blocked_count == 1 else "switches are"
+            detail += f" · {blocked_count} Codex account {switch_word} still in progress"
+        if callable(show_toast):
+            show_toast(
+                detail,
+                kind="danger" if termination_error is not None or cleanup_errors else "warning",
+            )
+        return len(deleted_ids)
 
     def _show_error(self, title: str, detail: str) -> None:
         dialog = Gtk.MessageDialog(
@@ -6113,8 +7885,21 @@ class TermDeckApplication(Gtk.Application):
             opened += 1
         return opened
 
-    def quit_preserving_sessions(self) -> None:
+    def quit_preserving_sessions(self) -> bool:
         """Close every TermDeck window while leaving tmux sessions alive."""
+
+        busy_windows = [
+            window
+            for window in self.windows
+            if getattr(window, "_auth_switch_inflight", set())
+        ]
+        if busy_windows:
+            for window in busy_windows:
+                window.show_toast(
+                    "TermDeck will stay open until the Codex account switch finishes",
+                    kind="warning",
+                )
+            return False
 
         for window in list(self.windows):
             for tab in list(window.tabs.values()):
@@ -6125,6 +7910,7 @@ class TermDeckApplication(Gtk.Application):
                 pass
         self.windows.clear()
         self.quit()
+        return True
 
     def do_activate(self) -> None:
         if not self.backend.available:
@@ -6149,27 +7935,39 @@ class TermDeckApplication(Gtk.Application):
         )
 
         # Older TermDeck versions sometimes persisted only ``codex --yolo``
-        # instead of the primary UUID. Reconciliation first identifies every
-        # missing process as recovery-pending; then this bounded source=cli
-        # archive pass can repair it on the first startup after a reboot.
-        # Unambiguous sessions resume exactly, while safe shell-backed leftovers
-        # regain their tab surface without being misrepresented as conversations.
-        if not getattr(self, "_legacy_recovery_checked", False):
-            self._legacy_recovery_checked = True
-            try:
-                self._last_legacy_recovery_result = repair_legacy_recovery(self.store)
-            except Exception:
-                self._last_legacy_recovery_result = None
+        # instead of the primary UUID.  The archive pass can inspect tens of
+        # gigabytes of rollout history, so never make notebook construction
+        # wait for it.  Rows are repaired in the background and the side pane
+        # is refreshed after the durable result is published.
+        schedule_legacy_recovery = getattr(self, "_schedule_legacy_recovery", None)
+        if callable(schedule_legacy_recovery):
+            schedule_legacy_recovery()
 
-        # Drop destroyed windows so a single-instance re-activate does not skip
-        # restore while holding stale ApplicationWindow references.
+        # Drop destroyed or unrealized windows so a single-instance re-activate
+        # does not skip restoration while holding stale ApplicationWindow
+        # references.  An unrealized window can still own VTE tmux clients; it
+        # must be detached before its records are rebuilt or reactivation will
+        # create a second client for every tab (and duplicate terminal input).
         live_windows = []
+        stale_windows = []
         for window in self.windows:
             try:
                 if window.get_realized():
                     live_windows.append(window)
+                    continue
             except Exception:
-                continue
+                pass
+            stale_windows.append(window)
+        for window in stale_windows:
+            for tab in list(getattr(window, "tabs", {}).values()):
+                try:
+                    tab.widget.detach()
+                except Exception:
+                    pass
+            try:
+                window.destroy()
+            except Exception:
+                pass
         self.windows = live_windows
 
         if not self.windows and self.workspace_path is not None:
@@ -6275,6 +8073,91 @@ class TermDeckApplication(Gtk.Application):
                 window.present()
             except Exception:
                 continue
+            recover_position = getattr(window, "_on_map_recover_offscreen", None)
+            if not callable(recover_position):
+                continue
+            # Some WMs apply their saved placement after ``present``.  A
+            # second pass after that placement prevents a disconnected
+            # monitor from leaving the restored window outside the screen.
+            for delay_ms in (250, 1500):
+                try:
+                    GLib.timeout_add(
+                        delay_ms,
+                        lambda recover=recover_position: (
+                            recover() or False
+                        ),
+                    )
+                except Exception:
+                    pass
+
+    def _schedule_legacy_recovery(self) -> None:
+        """Run the archive scan away from GTK's startup/main thread.
+
+        ``repair_legacy_recovery`` walks the shared Codex rollout archive.  On
+        a large home that can take minutes, and doing it synchronously in
+        ``do_activate`` leaves a window with its side pane constructed but no
+        notebook pages attached.  Use a separate store connection because the
+        GUI connection is thread-affine, then publish only the small result
+        and refresh already-created windows on the GTK context.
+        """
+
+        if getattr(self, "_legacy_recovery_checked", False):
+            return
+        self._legacy_recovery_checked = True
+        try:
+            store_path = self.store.path
+            auth_root = self.store.auth_root
+            account_source = self.store.account_source
+        except Exception:
+            self._last_legacy_recovery_result = None
+            return
+
+        def worker() -> None:
+            worker_store = None
+            result = None
+            try:
+                # Archive inspection is deliberately low priority: terminal
+                # attachment should win over historical metadata repair.
+                try:
+                    os.nice(10)
+                except (AttributeError, OSError):
+                    pass
+                worker_store = SessionStore(
+                    store_path,
+                    auth_root=auth_root,
+                    account_source=account_source,
+                )
+                result = repair_legacy_recovery(worker_store)
+            except Exception:
+                result = None
+            finally:
+                if worker_store is not None:
+                    try:
+                        worker_store.close()
+                    except Exception:
+                        pass
+
+            def publish() -> bool:
+                self._last_legacy_recovery_result = result
+                for window in list(self.windows):
+                    try:
+                        window.side.refresh()
+                    except Exception:
+                        pass
+                return False
+
+            try:
+                GLib.idle_add(publish)
+            except Exception:
+                # The app may be shutting down; the durable store mutation is
+                # already complete and no UI callback is required then.
+                pass
+
+        threading.Thread(
+            target=worker,
+            name="termdeck-legacy-recovery",
+            daemon=True,
+        ).start()
 
 
 # ---------------------------------------------------------------------------

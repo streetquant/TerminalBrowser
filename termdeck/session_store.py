@@ -11,7 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .codex_auth import new_auth_scope_id, prepare_auth_scope
+from .codex_auth import (
+    default_account_source,
+    new_auth_scope_id,
+    prepare_auth_scope,
+    read_auth_state,
+)
 from .models import SessionRecord
 
 APP_DIR = Path.home() / ".local" / "share" / "termdeck"
@@ -36,7 +41,9 @@ def _has_exact_codex_resume(command: str | None) -> bool:
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Browser-style close/reopen ordering needs more than second precision:
+    # several tabs can be closed in one keyboard chord burst.
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def short_id(prefix: str = "td") -> str:
@@ -66,7 +73,16 @@ class SessionStore:
             if auth_root is not None
             else (DEFAULT_AUTH_ROOT if path is None else self.path.parent / "terminal-auth")
         )
-        self.account_source = Path(account_source).expanduser() if account_source is not None else None
+        # Keep creation and observation on the same effective canonical
+        # catalogue.  prepare_auth_scope already defaults to ~/.codex; storing
+        # that resolved default here prevents the immediately-following state
+        # read from treating an inherited selection as unverifiable.
+        self._account_source_override = (
+            Path(account_source).expanduser()
+            if account_source is not None
+            else None
+        )
+        self.account_source = self._account_source_override or default_account_source()
         if self.path != Path(":memory:"):
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self.auth_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -250,11 +266,47 @@ class SessionStore:
         ).fetchall()
         return [(str(row["window_id"]), str(row["window_title"])) for row in rows]
 
-    def _new_auth_scope(self) -> tuple[str, str]:
+    def forget_window(self, window_id: str) -> bool:
+        """Remove an empty logical window from durable restore state.
+
+        Refuse while any session row still belongs to the window.  This keeps a
+        partial destructive action (for example, an auth-guarded session that
+        could not be stopped) recoverable instead of orphaning it from startup.
+        """
+
+        clean_id = (window_id or "main").strip() or "main"
+        remaining = self.conn.execute(
+            "SELECT 1 FROM sessions WHERE window_id = ? LIMIT 1",
+            (clean_id,),
+        ).fetchone()
+        if remaining is not None:
+            return False
+        self.conn.execute(
+            "DELETE FROM window_captains WHERE window_id = ?",
+            (clean_id,),
+        )
+        self.conn.execute(
+            "DELETE FROM remembered_windows WHERE window_id = ?",
+            (clean_id,),
+        )
+        self.conn.commit()
+        return True
+
+    def _new_auth_scope(self) -> tuple[str, str, str | None]:
         scope_id = new_auth_scope_id()
         codex_home = self.auth_root / scope_id
-        prepare_auth_scope(codex_home, account_source=self.account_source)
-        return scope_id, str(codex_home)
+        # None preserves the normal desktop state-database discovery fallback;
+        # account catalogue preparation still resolves the same canonical
+        # default internally.
+        prepare_auth_scope(
+            codex_home,
+            account_source=self._account_source_override,
+        )
+        state = read_auth_state(codex_home, account_source=self.account_source)
+        inherited_account = (
+            state.selected_account if state.canonical_binding_ready else None
+        )
+        return scope_id, str(codex_home), inherited_account
 
     def _ensure_auth_scopes(self) -> None:
         rows = self.conn.execute("SELECT id, auth_scope_id, codex_home FROM sessions").fetchall()
@@ -262,13 +314,20 @@ class SessionStore:
             scope_id = str(row["auth_scope_id"] or "").strip()
             codex_home = str(row["codex_home"] or "").strip()
             if not scope_id or not codex_home:
-                scope_id, codex_home = self._new_auth_scope()
+                scope_id, codex_home, inherited_account = self._new_auth_scope()
                 self.conn.execute(
-                    "UPDATE sessions SET auth_scope_id = ?, codex_home = ? WHERE id = ?",
-                    (scope_id, codex_home, row["id"]),
+                    """
+                    UPDATE sessions
+                    SET auth_scope_id = ?, codex_home = ?, selected_account = ?
+                    WHERE id = ?
+                    """,
+                    (scope_id, codex_home, inherited_account, row["id"]),
                 )
             else:
-                prepare_auth_scope(codex_home, account_source=self.account_source)
+                prepare_auth_scope(
+                    codex_home,
+                    account_source=self._account_source_override,
+                )
 
     def create(
         self,
@@ -284,7 +343,7 @@ class SessionStore:
         pinned: bool = False,
     ) -> SessionRecord:
         sid = short_id("td")
-        auth_scope_id, codex_home = self._new_auth_scope()
+        auth_scope_id, codex_home, inherited_account = self._new_auth_scope()
         cwd = str(Path(cwd or os.getcwd()).expanduser())
         now = utc_now()
         safe_tag = tmux_safe_name(tag or "default")
@@ -312,7 +371,7 @@ class SessionStore:
             recovery_cwd=None,
             auth_scope_id=auth_scope_id,
             codex_home=codex_home,
-            selected_account=None,
+            selected_account=inherited_account,
             pending_account=None,
             auth_restart_required=False,
             auth_changed_at=None,
@@ -329,10 +388,19 @@ class SessionStore:
                 codex_home=existing.codex_home,
             )
         elif not record.auth_scope_id or not record.codex_home:
-            auth_scope_id, codex_home = self._new_auth_scope()
-            record = replace(record, auth_scope_id=auth_scope_id, codex_home=codex_home)
+            auth_scope_id, codex_home, inherited_account = self._new_auth_scope()
+            record = replace(
+                record,
+                auth_scope_id=auth_scope_id,
+                codex_home=codex_home,
+                selected_account=inherited_account,
+                auth_restart_required=False,
+            )
         else:
-            prepare_auth_scope(record.codex_home, account_source=self.account_source)
+            prepare_auth_scope(
+                record.codex_home,
+                account_source=self._account_source_override,
+            )
         payload = dict(record.__dict__)
         payload["visible"] = 1 if record.visible else 0
         payload["pinned"] = 1 if getattr(record, "pinned", False) else 0
@@ -428,20 +496,19 @@ class SessionStore:
         self,
         updates: Iterable[tuple[str, str, bool, int | None]],
     ) -> int:
-        """Apply reconciliation state changes in one SQLite transaction."""
+        """Apply reconciliation state changes without reordering browser history."""
 
         rows = list(updates)
         if not rows:
             return 0
-        observed_at = utc_now()
         self.conn.executemany(
             """
             UPDATE sessions
-            SET status = ?, visible = ?, last_pid = ?, last_opened_at = ?
+            SET status = ?, visible = ?, last_pid = ?
             WHERE id = ?
             """,
             [
-                (status, 1 if visible else 0, last_pid, observed_at, session_id)
+                (status, 1 if visible else 0, last_pid, session_id)
                 for session_id, status, visible, last_pid in rows
             ],
         )

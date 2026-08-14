@@ -125,7 +125,9 @@ def main() -> int:
                 )
 
             margin = notebook_context.get_margin(Gtk.StateFlags.NORMAL)
-            expected_margin = {"top": 6, "right": 8, "bottom": 8, "left": 8}
+            # Current browser-like chrome docks the terminal notebook edge to
+            # edge; the old floating-card margin was intentionally removed.
+            expected_margin = {"top": 0, "right": 0, "bottom": 0, "left": 0}
             actual_margin = {
                 "top": int(margin.top),
                 "right": int(margin.right),

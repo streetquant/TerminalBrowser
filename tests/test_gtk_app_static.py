@@ -35,7 +35,7 @@ class GtkAppStaticTests(unittest.TestCase):
     def test_archive_recovery_runs_after_startup_reconciliation(self):
         source = GTK_APP.read_text(encoding="utf-8")
         reconcile_call = source.index("reconcile_store(\n            self.store")
-        recovery_call = source.index("repair_legacy_recovery(self.store)", reconcile_call)
+        recovery_call = source.index("schedule_legacy_recovery =", reconcile_call)
         window_restore = source.index(
             'restore_groups = getattr(self.store, "windows_for_restore", None)',
             recovery_call,
@@ -76,6 +76,12 @@ class GtkAppStaticTests(unittest.TestCase):
         self.assertNotIn("open_detected_project", source)
         self.assertNotIn("open_launcher", source)
 
+    def test_windows_recover_from_removed_monitor_layouts(self):
+        source = GTK_APP.read_text(encoding="utf-8")
+        self.assertIn('self.connect("map", self._on_map_recover_offscreen)', source)
+        self.assertIn("def _on_map_recover_offscreen", source)
+        self.assertIn("self.move(target_x, target_y)", source)
+
     def test_every_window_keeps_a_permanent_new_tab_control(self):
         source = GTK_APP.read_text(encoding="utf-8")
         self.assertIn('header_new_tab = _icon_button(\n            "New tab"', source)
@@ -92,7 +98,7 @@ class GtkAppStaticTests(unittest.TestCase):
         self.assertIn("_complete_auth_switch", source)
         self.assertIn("threading.Thread", source)
         self.assertIn("auth_restart_required=True", source)
-        self.assertIn("activate_auth_change", source)
+        self.assertIn("execute_auth_change", source)
         self.assertIn("Codex restarted in this tab", source)
         self.assertIn("auth_restart_required\": not activation_ok", source)
         self.assertIn('self.notebook.connect("switch-page", self._on_notebook_switch_page)', source)
@@ -100,8 +106,10 @@ class GtkAppStaticTests(unittest.TestCase):
         self.assertIn("record.external or record.id in self._auth_switch_inflight", source)
         self.assertIn("a running external tmux environment cannot be retroactively isolated", source)
         self.assertIn("private_auth_environment_ready", source)
-        self.assertIn('"Codex: restart terminal"', source)
-        self.assertIn("its live shell is not privately isolated", source)
+        self.assertIn('"Codex: choose account · upgrades terminal"', source)
+        self.assertIn("canonical_binding_ready", source)
+        self.assertIn('"Codex: repair saved account binding"', source)
+        self.assertIn("TermDeck will preserve an exact Codex resume or a verified idle shell", source)
 
     def test_window_overview_is_exposed_in_gui(self):
         source = GTK_APP.read_text(encoding="utf-8")

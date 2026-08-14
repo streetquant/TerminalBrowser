@@ -19,26 +19,29 @@ class TerminalSelectAutocopyTriggersTest(TestCase):
         attach = SimpleNamespace(
             terminal=TerminalStub(has_selection=True),
             _selection_pending=False,
+            _cancel_async_history_scroll=lambda: calls.append("cancel"),
+            _bind_scrollbar_for_selection=lambda active: calls.append(("bind", active)),
             _queue_selection_copy=lambda **kwargs: calls.append(kwargs),
         )
 
         AttachTerminal._on_selection_changed(attach, None)
 
         self.assertTrue(attach._selection_pending)
-        self.assertEqual(calls, [{"delay_ms": 120}])
+        self.assertEqual(calls, ["cancel", ("bind", True), {"delay_ms": 120}])
 
     def test_selection_changed_without_selection_does_not_queue_copy(self) -> None:
         calls = []
         attach = SimpleNamespace(
             terminal=TerminalStub(has_selection=False),
             _selection_pending=True,
+            _bind_scrollbar_for_selection=lambda active: calls.append(("bind", active)),
             _queue_selection_copy=lambda **kwargs: calls.append(kwargs),
         )
 
         AttachTerminal._on_selection_changed(attach, None)
 
         self.assertFalse(attach._selection_pending)
-        self.assertEqual(calls, [])
+        self.assertEqual(calls, [("bind", False)])
 
     def test_queue_selection_copy_replaces_pending_timeout(self) -> None:
         removed = []

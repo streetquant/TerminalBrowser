@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Verify first tmux attachment uses the final VTE geometry.
+"""Verify visible and hidden tmux attachments use the final VTE geometry.
 
 This catches the dotted tmux padding frame that appears when a client attaches at
-80x24 and the GTK window is maximized immediately afterwards.
+80x24 and the GTK window is maximized immediately afterwards, including on a
+notebook page that GTK does not allocate while it is hidden.
 """
 
 from __future__ import annotations
@@ -71,10 +72,23 @@ def _wait_for_matching_grid(
                     text=True,
                 ).strip()
             )
-            last = (client, tmux_window, vte)
+            tmux_pane = _parse_size(
+                subprocess.check_output(
+                    [
+                        "tmux",
+                        "display-message",
+                        "-p",
+                        "-t",
+                        record.tmux_name,
+                        "#{pane_width}x#{pane_height}",
+                    ],
+                    text=True,
+                ).strip()
+            )
+            last = (client, tmux_window, tmux_pane, vte)
             matches_expected = expected is None or vte == expected
             changed = different_from is None or vte != different_from
-            if client == tmux_window == vte and matches_expected and changed:
+            if client == tmux_window == tmux_pane == vte and matches_expected and changed:
                 return last
         time.sleep(0.01)
     raise AssertionError(f"terminal grid did not consume its allocation: {last}")
@@ -148,6 +162,7 @@ def main() -> int:
             first_client_size: tuple[int, int] | None = None
             first_vte_size: tuple[int, int] | None = None
             first_window_size: tuple[int, int] | None = None
+            first_pane_size: tuple[int, int] | None = None
             first_attach_ms: float | None = None
             deadline = started + 1.5
             while time.monotonic() < deadline:
@@ -184,10 +199,27 @@ def main() -> int:
                         text=True,
                     ).strip()
                     first_window_size = _parse_size(tmux_window)
+                    tmux_pane = subprocess.check_output(
+                        [
+                            "tmux",
+                            "display-message",
+                            "-p",
+                            "-t",
+                            record.tmux_name,
+                            "#{pane_width}x#{pane_height}",
+                        ],
+                        text=True,
+                    ).strip()
+                    first_pane_size = _parse_size(tmux_pane)
                     break
                 time.sleep(0.005)
 
-            if first_client_size is None or first_vte_size is None or first_window_size is None:
+            if (
+                first_client_size is None
+                or first_vte_size is None
+                or first_window_size is None
+                or first_pane_size is None
+            ):
                 raise AssertionError("tmux client did not attach within 1.5 seconds")
             if first_client_size != first_vte_size:
                 raise AssertionError(
@@ -197,8 +229,28 @@ def main() -> int:
                 raise AssertionError(
                     f"first tmux window size {first_window_size} did not match VTE {first_vte_size}"
                 )
+            if first_pane_size != first_vte_size:
+                raise AssertionError(
+                    f"first tmux pane size {first_pane_size} did not match VTE {first_vte_size}"
+                )
             if first_client_size == (80, 24) and first_vte_size != (80, 24):
                 raise AssertionError("tmux attached at default 80x24 before final VTE allocation")
+
+            # The first-created page is hidden by the second page before the
+            # maximize settles. It must already match the mapped page's grid;
+            # selecting it later must not be the event that repairs tmux.
+            current_page = window.notebook.page_num(tab.widget)
+            if window.notebook.get_current_page() != current_page:
+                raise AssertionError("expected shell-current to remain the selected page")
+            hidden_before_select_sizes = _wait_for_matching_grid(
+                Gtk,
+                window,
+                hidden_record,
+                hidden_tab,
+                expected=first_vte_size,
+            )
+            if window.notebook.get_current_page() != current_page:
+                raise AssertionError("hidden geometry check selected the hidden page")
 
             window.set_tabs_pane_visible(True, persist=False, notify=False)
             pane_visible_sizes = _wait_for_matching_grid(
@@ -208,6 +260,13 @@ def main() -> int:
                 tab,
                 different_from=first_vte_size,
             )
+            pane_visible_hidden_sizes = _wait_for_matching_grid(
+                Gtk,
+                window,
+                hidden_record,
+                hidden_tab,
+                expected=pane_visible_sizes[3],
+            )
             window.set_tabs_pane_visible(False, persist=False, notify=False)
             pane_hidden_sizes = _wait_for_matching_grid(
                 Gtk,
@@ -215,6 +274,13 @@ def main() -> int:
                 record,
                 tab,
                 expected=first_vte_size,
+            )
+            pane_hidden_hidden_sizes = _wait_for_matching_grid(
+                Gtk,
+                window,
+                hidden_record,
+                hidden_tab,
+                expected=pane_hidden_sizes[3],
             )
 
             # The first tab was hidden while the window maximized. Switching
@@ -292,15 +358,19 @@ def main() -> int:
                         "vte_grid": f"{first_vte_size[0]}x{first_vte_size[1]}",
                         "tmux_client_grid": f"{first_client_size[0]}x{first_client_size[1]}",
                         "tmux_window_grid": f"{first_window_size[0]}x{first_window_size[1]}",
+                        "tmux_pane_grid": f"{first_pane_size[0]}x{first_pane_size[1]}",
                         "client_surface_filled": True,
-                        "pane_visible_grid": f"{pane_visible_sizes[2][0]}x{pane_visible_sizes[2][1]}",
-                        "pane_hidden_grid": f"{pane_hidden_sizes[2][0]}x{pane_hidden_sizes[2][1]}",
-                        "switched_hidden_grid": f"{switched_hidden_sizes[2][0]}x{switched_hidden_sizes[2][1]}",
-                        "switched_current_grid": f"{switched_current_sizes[2][0]}x{switched_current_sizes[2][1]}",
-                        "zoomed_current_grid": f"{zoomed_current_sizes[2][0]}x{zoomed_current_sizes[2][1]}",
-                        "zoomed_hidden_grid": f"{zoomed_hidden_sizes[2][0]}x{zoomed_hidden_sizes[2][1]}",
-                        "reset_current_grid": f"{reset_current_sizes[2][0]}x{reset_current_sizes[2][1]}",
-                        "reset_hidden_grid": f"{reset_hidden_sizes[2][0]}x{reset_hidden_sizes[2][1]}",
+                        "hidden_before_select_grid": f"{hidden_before_select_sizes[3][0]}x{hidden_before_select_sizes[3][1]}",
+                        "pane_visible_grid": f"{pane_visible_sizes[3][0]}x{pane_visible_sizes[3][1]}",
+                        "pane_visible_hidden_grid": f"{pane_visible_hidden_sizes[3][0]}x{pane_visible_hidden_sizes[3][1]}",
+                        "pane_hidden_grid": f"{pane_hidden_sizes[3][0]}x{pane_hidden_sizes[3][1]}",
+                        "pane_hidden_hidden_grid": f"{pane_hidden_hidden_sizes[3][0]}x{pane_hidden_hidden_sizes[3][1]}",
+                        "switched_hidden_grid": f"{switched_hidden_sizes[3][0]}x{switched_hidden_sizes[3][1]}",
+                        "switched_current_grid": f"{switched_current_sizes[3][0]}x{switched_current_sizes[3][1]}",
+                        "zoomed_current_grid": f"{zoomed_current_sizes[3][0]}x{zoomed_current_sizes[3][1]}",
+                        "zoomed_hidden_grid": f"{zoomed_hidden_sizes[3][0]}x{zoomed_hidden_sizes[3][1]}",
+                        "reset_current_grid": f"{reset_current_sizes[3][0]}x{reset_current_sizes[3][1]}",
+                        "reset_hidden_grid": f"{reset_hidden_sizes[3][0]}x{reset_hidden_sizes[3][1]}",
                     },
                     indent=2,
                     sort_keys=True,

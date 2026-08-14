@@ -9,17 +9,79 @@ from unittest import mock
 
 from termdeck.resources import (
     ResourceSampler,
+    _managed_codex_observation_argv,
+    _primary_claude_session_id,
     _primary_codex_session_id,
     format_bytes,
     observe_recovery_command,
     observe_recovery_metadata,
     process_tree,
     process_tree_contains_codex,
+    safe_claude_recovery_command,
     safe_codex_recovery_command,
 )
 
 
 class ResourceTests(unittest.TestCase):
+    def test_managed_codex_observation_strips_only_exact_private_state_override(self):
+        home = "/private/terminal-auth/auth-one"
+        argv = (
+            "/usr/bin/codex",
+            "-c",
+            f'sqlite_home="{home}"',
+            "--dangerously-bypass-hook-trust",
+            "--yolo",
+            "resume",
+            "019f71b3-fa32-7251-bac3-c628f34dd154",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            target = proc / "123"
+            target.mkdir(parents=True)
+            (target / "environ").write_bytes(
+                f"CODEX_HOME={home}\0PATH=/usr/bin\0".encode()
+            )
+            with mock.patch("termdeck.resources._PROC", str(proc)):
+                cleaned = _managed_codex_observation_argv(123, argv)
+                mismatch = _managed_codex_observation_argv(
+                    123,
+                    (*argv[:2], 'sqlite_home="/private/other"', *argv[3:]),
+                )
+
+        self.assertEqual(
+            cleaned,
+            (
+                "/usr/bin/codex",
+                "--yolo",
+                "resume",
+                "019f71b3-fa32-7251-bac3-c628f34dd154",
+            ),
+        )
+        self.assertIn('sqlite_home="/private/other"', mismatch)
+
+    def test_claude_recovery_command_accepts_only_one_exact_uuid(self):
+        session_id = "d2a7ed1b-d6fd-45de-8342-5f10cfed3c07"
+        expected = f"cc-go-ulw --resume {session_id}"
+        self.assertEqual(
+            safe_claude_recovery_command(["cc-go-ulw", "--resume", session_id]),
+            expected,
+        )
+        rejected = [
+            ["cc-go-ulw"],
+            ["cc-go-ulw", "--resume"],
+            ["cc-go-ulw", "--resume", "latest"],
+            ["cc-go-ulw", "--resume", session_id, "extra prompt"],
+            ["cc-go-ulw", "-r", session_id],
+            ["claude", "--resume", session_id],
+            ["bash", "-lc", expected],
+            ["cc-go-ulw-real", "--resume", session_id],
+            ["/home/example/.local/bin/cc-go-ulw", "--resume", session_id],
+            ["cc-go-ulw", "--resume", session_id.upper()],
+        ]
+        for argv in rejected:
+            with self.subTest(argv=argv):
+                self.assertIsNone(safe_claude_recovery_command(argv))
+
     def test_codex_recovery_command_preserves_only_restart_safe_flags(self):
         session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
         self.assertEqual(
@@ -101,6 +163,53 @@ class ResourceTests(unittest.TestCase):
 
         self.assertEqual(observed, primary_id)
 
+    def test_primary_claude_session_id_excludes_nested_subagent_jsonl(self):
+        primary_id = "d2a7ed1b-d6fd-45de-8342-5f10cfed3c07"
+        subagent_id = "019f72ee-6244-7322-b922-660fcdcc91e7"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proc = root / "proc"
+            fd_dir = proc / "123" / "fd"
+            fd_dir.mkdir(parents=True)
+            project = root / ".claude" / "projects" / "-workspace-project"
+            project.mkdir(parents=True)
+            primary = project / f"{primary_id}.jsonl"
+            primary.write_text(
+                json.dumps(
+                    {
+                        "sessionId": primary_id,
+                        "cwd": "/workspace/project",
+                        "type": "user",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            subagents = project / primary_id / "subagents"
+            subagents.mkdir(parents=True)
+            subagent = subagents / f"{subagent_id}.jsonl"
+            subagent.write_text(
+                json.dumps(
+                    {
+                        "sessionId": subagent_id,
+                        "cwd": "/workspace/project",
+                        "type": "user",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (fd_dir / "5").symlink_to(primary)
+            (fd_dir / "6").symlink_to(subagent)
+
+            with mock.patch("termdeck.resources._PROC", str(proc)), mock.patch(
+                "termdeck.resources._process_cwd",
+                return_value="/workspace/project",
+            ):
+                observed = _primary_claude_session_id(123)
+
+        self.assertEqual(observed, primary_id)
+
     def test_recovery_observation_finds_codex_below_terminal_and_shell_wrappers(self):
         argv_by_pid = {
             100: ("/home/arch/.local/bin/kiro-cli-term",),
@@ -150,6 +259,37 @@ class ResourceTests(unittest.TestCase):
 
         self.assertTrue(observed)
         self.assertEqual(command, f"codex --yolo resume {session_id}")
+        self.assertEqual(cwd, "/workspace/project")
+
+    def test_recovery_observation_canonicalizes_foreground_claude_session(self):
+        session_id = "d2a7ed1b-d6fd-45de-8342-5f10cfed3c07"
+        argv_by_pid = {
+            100: ("/usr/bin/bash",),
+            101: ("/home/arch/.local/share/claude/versions/2.1.226", "--settings", "{}"),
+        }
+        with mock.patch(
+            "termdeck.resources.process_tree",
+            return_value=[100, 101],
+        ), mock.patch(
+            "termdeck.resources._process_argv",
+            side_effect=lambda pid: argv_by_pid[pid],
+        ), mock.patch(
+            "termdeck.resources._parse_stat",
+            return_value={"tty_nr": 86, "pgrp": 101, "tpgid": 101},
+        ), mock.patch(
+            "termdeck.resources._process_cwd",
+            return_value="/workspace/project",
+        ), mock.patch(
+            "termdeck.resources._primary_codex_session_id",
+            return_value=None,
+        ), mock.patch(
+            "termdeck.resources._primary_claude_session_id",
+            side_effect=lambda pid: session_id if pid == 101 else None,
+        ):
+            observed, command, cwd = observe_recovery_metadata(100)
+
+        self.assertTrue(observed)
+        self.assertEqual(command, f"cc-go-ulw --resume {session_id}")
         self.assertEqual(cwd, "/workspace/project")
 
     def test_recovery_observation_prefers_native_exact_uuid_over_node_launcher(self):

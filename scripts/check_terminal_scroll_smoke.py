@@ -24,13 +24,21 @@ def _drain(Gtk, *, until=None, timeout: float = 6.0) -> None:
     raise RuntimeError("GTK terminal state did not settle")
 
 
-def _wheel_up(terminal) -> None:
+def _wheel(terminal, button: int) -> None:
     _ok, x, y = terminal.get_window().get_origin()
     subprocess.run(
-        ["xdotool", "mousemove", "--sync", str(x + 80), str(y + 80), "click", "4"],
+        ["xdotool", "mousemove", "--sync", str(x + 80), str(y + 80), "click", str(button)],
         check=True,
         timeout=5,
     )
+
+
+def _wheel_up(terminal) -> None:
+    _wheel(terminal, 4)
+
+
+def _wheel_down(terminal) -> None:
+    _wheel(terminal, 5)
 
 
 def _events(path: Path) -> list[str]:
@@ -108,6 +116,12 @@ while time.monotonic() < deadline:
         elif pending.startswith(b"\\x1b[B") or pending.startswith(b"\\x1bOB"):
             width = 3
             events.append("transcript-down" if transcript else "composer-down")
+        elif pending.startswith(b"\x1b[5~"):
+            width = 4
+            events.append("transcript-page-up" if transcript else "composer-page-up")
+        elif pending.startswith(b"\x1b[6~"):
+            width = 4
+            events.append("transcript-page-down" if transcript else "composer-page-down")
         elif pending[0] == 0x14:
             width = 1
             transcript = not transcript
@@ -271,11 +285,52 @@ sys.stdout.flush()
             shell_cursor_hidden_during_history = shell_attach._history_cursor_hidden
             if not shell_cursor_hidden_during_history:
                 raise AssertionError("shell history left a roaming terminal cursor visible")
-            scrollbar_before_drag = float(shell_attach.scroll_adjustment.get_value())
-            shell_attach.scroll_adjustment.set_value(scrollbar_before_drag - 30.0)
-            _drain(Gtk, until=lambda: shell_scroll_state()[1] >= shell_position + 30)
-            _shell_drag_mode, shell_drag_position = shell_scroll_state()
-            scrollbar_after_drag = float(shell_attach.scroll_adjustment.get_value())
+            if shell_attach.scrollbar.get_adjustment() is not shell_attach.history_adjustment:
+                raise AssertionError("normal shell review scrollbar is not application-aware")
+            if shell_attach.history_adjustment is shell_attach.native_adjustment:
+                raise AssertionError("shell history proxy aliases VTE native scrollback")
+
+            scrollbar_before_drag = float(shell_attach.history_adjustment.get_value())
+            scrollbar_target = max(
+                float(shell_attach.history_adjustment.get_lower()),
+                scrollbar_before_drag - 30.0,
+            )
+            if scrollbar_target >= scrollbar_before_drag - 0.5:
+                raise AssertionError("application history scrollbar has no usable review range")
+            shell_attach.history_adjustment.set_value(scrollbar_target)
+            _drain(
+                Gtk,
+                until=lambda: (
+                    not shell_attach._history_worker_active
+                    and shell_scroll_state()[1] >= shell_position + 25
+                ),
+            )
+            shell_drag_mode, shell_drag_position = shell_scroll_state()
+            if shell_drag_mode != 1 or shell_drag_position <= shell_position:
+                raise AssertionError(
+                    "dragging the application scrollbar did not move tmux history: "
+                    f"{shell_position} -> {shell_drag_position}"
+                )
+            scrollbar_after_drag = float(shell_attach.history_adjustment.get_value())
+            if scrollbar_after_drag >= scrollbar_before_drag - 0.5:
+                raise AssertionError("shell history proxy did not move with the canonical owner")
+
+            # Exact regression: one downward wheel tick from a deep position
+            # must be incremental, never an implicit return to live output.
+            _wheel_down(shell_terminal)
+            _drain(
+                Gtk,
+                until=lambda: shell_scroll_state()[1] < shell_drag_position,
+            )
+            shell_down_mode, shell_down_position = shell_scroll_state()
+            expected_shell_down = max(0, shell_drag_position - 3)
+            if shell_down_mode != 1 or shell_down_position != expected_shell_down:
+                raise AssertionError(
+                    "one shell wheel-down jumped or exited history: "
+                    f"deep={shell_drag_position}, after={shell_down_position}, "
+                    f"mode={shell_down_mode}"
+                )
+
             subprocess.run(["xdotool", "key", "x"], check=True, timeout=5)
             _drain(Gtk, until=lambda: b"x" in shell_input.read_bytes() if shell_input.exists() else False)
             _drain(Gtk, until=lambda: shell_scroll_state()[0] == 0)
@@ -301,12 +356,58 @@ sys.stdout.flush()
                     and _events(codex_events).count("transcript-up") >= 3
                 ),
             )
-            before_input = _events(codex_events)
-            if "composer-up" in before_input:
+            before_drag_events = _events(codex_events)
+            if "composer-up" in before_drag_events:
                 raise AssertionError("wheel navigation reached the Codex composer")
             codex_cursor_hidden_during_history = codex_attach._history_cursor_hidden
             if not codex_cursor_hidden_during_history:
                 raise AssertionError("Codex transcript left its roaming cursor visible")
+            if codex_attach.scrollbar.get_adjustment() is not codex_attach.history_adjustment:
+                raise AssertionError("Codex normal review scrollbar is not application-aware")
+
+            codex_before_drag = float(codex_attach.history_adjustment.get_value())
+            codex_drag_target = max(
+                float(codex_attach.history_adjustment.get_lower()),
+                codex_before_drag - 96.0,
+            )
+            codex_attach.history_adjustment.set_value(codex_drag_target)
+            _drain(
+                Gtk,
+                until=lambda: (
+                    not codex_attach._history_worker_active
+                    and _events(codex_events).count("transcript-page-up") >= 4
+                ),
+            )
+            after_drag_events = _events(codex_events)
+            if any(
+                event in after_drag_events
+                for event in ("composer-up", "composer-page-up", "composer-page-down")
+            ):
+                raise AssertionError("Codex thumb drag leaked navigation into the composer")
+            if "transcript-close" in after_drag_events:
+                raise AssertionError("Codex thumb drag unexpectedly closed the transcript")
+            codex_state = app.backend.scroll_state(codex_record)
+            if codex_state is None or codex_state.depth < 90:
+                raise AssertionError(f"Codex deep drag did not establish logical depth: {codex_state!r}")
+            codex_deep_depth = codex_state.depth
+
+            # Exact regression: one downward tick after a deep thumb drag must
+            # move only one wheel quantum and must not toggle C-t closed.
+            down_before = _events(codex_events).count("transcript-down")
+            _wheel_down(codex_terminal)
+            _drain(
+                Gtk,
+                until=lambda: _events(codex_events).count("transcript-down") >= down_before + 3,
+            )
+            after_down_events = _events(codex_events)
+            codex_after_down = app.backend.scroll_state(codex_record)
+            if codex_after_down is None or codex_after_down.depth != codex_deep_depth - 3:
+                raise AssertionError(
+                    "one Codex wheel-down was not incremental: "
+                    f"before={codex_deep_depth}, after={codex_after_down!r}"
+                )
+            if "transcript-close" in after_down_events:
+                raise AssertionError("one Codex wheel-down threw review back to the composer")
 
             subprocess.run(["xdotool", "key", "x"], check=True, timeout=5)
             _drain(Gtk, until=lambda: "composer-x" in _events(codex_events))
@@ -363,6 +464,7 @@ sys.stdout.flush()
                         "shell_copy_mode": shell_mode,
                         "shell_scroll_position": shell_position,
                         "shell_drag_scroll_position": shell_drag_position,
+                        "shell_single_down_position": shell_down_position,
                         "shell_scrollbar_delta": int(
                             round(
                                 scrollbar_after_drag - scrollbar_before_drag
@@ -371,8 +473,13 @@ sys.stdout.flush()
                         "shell_cursor_hidden_during_history": shell_cursor_hidden_during_history,
                         "shell_first_key": shell_input.read_bytes().decode("ascii"),
                         "codex_events": final_events,
+                        "codex_deep_depth": codex_deep_depth,
+                        "codex_single_down_depth": codex_after_down.depth if codex_after_down is not None else None,
                         "codex_cursor_hidden_during_history": codex_cursor_hidden_during_history,
-                        "composer_history_was_not_touched": "composer-up" not in final_events,
+                        "composer_history_was_not_touched": not any(
+                            event.startswith("composer-") and event != "composer-x"
+                            for event in final_events
+                        ),
                         "native_alternate_screen": native_alt,
                         "native_copy_mode": native_mode,
                         "native_wheel_passthrough": b"\x1b[<64;" in native_input.read_bytes(),
