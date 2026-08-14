@@ -147,6 +147,9 @@ class AppSettings:
     terminal_cursor_blink: bool | None = None
     terminal_scrollback_lines: int | None = None
     side_pane_position: str = "right"
+    # Accessibility: skip decorative chrome animations (rename crossfades,
+    # toast fades) without touching functional transitions.
+    reduce_motion: bool = False
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppSettings":
@@ -213,6 +216,10 @@ class AppSettings:
         side_pane_position = normalise_side_pane_position(
             appearance.get("side_pane_position", appearance.get("side", appearance.get("sessions_pane", "right")))
         )
+        if "reduce_motion" in appearance or "reduced_motion" in appearance:
+            reduce_motion = _boolean(appearance, "reduce_motion", "reduced_motion", default=False)
+        else:
+            reduce_motion = False
 
         ui_font = None
         if "ui_font" in appearance and appearance.get("ui_font") not in {None, ""}:
@@ -275,6 +282,7 @@ class AppSettings:
             terminal_cursor_blink=terminal_cursor_blink,
             terminal_scrollback_lines=terminal_scrollback_lines,
             side_pane_position=side_pane_position,
+            reduce_motion=reduce_motion,
         )
 
     def policy_for_record(self, record) -> HealthPolicy:
@@ -341,6 +349,7 @@ class AppSettings:
             "tabs_pane_visible": self.tabs_pane_visible,
             "refresh_interval_seconds": self.ui_refresh_interval_seconds,
             "side_pane_position": self.side_pane_position,
+            "reduce_motion": self.reduce_motion,
         }
         if self.ui_font is not None:
             appearance["ui_font"] = self.ui_font
@@ -472,6 +481,7 @@ def sample_settings_json() -> str:
             "tabs_pane_visible": False,
             "refresh_interval_seconds": 5.0,
             "side_pane_position": "right",
+            "reduce_motion": False,
             "ui_font": "Sans 11",
             "ui_font_scale": 1.0,
             "terminal": {

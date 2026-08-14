@@ -51,6 +51,25 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaises(SettingsError):
                 AppSettings.load(path)
 
+    def test_reduce_motion_defaults_off_and_loads_both_spellings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.json"
+            self.assertFalse(AppSettings.load(missing).reduce_motion)
+
+            canonical = Path(tmp) / "canonical.json"
+            canonical.write_text(
+                json.dumps({"appearance": {"reduce_motion": True}}), encoding="utf-8"
+            )
+            settings = AppSettings.load(canonical)
+            self.assertTrue(settings.reduce_motion)
+            self.assertTrue(settings.budget_summary()["appearance"]["reduce_motion"])
+
+            alias = Path(tmp) / "alias.json"
+            alias.write_text(
+                json.dumps({"appearance": {"reduced_motion": True}}), encoding="utf-8"
+            )
+            self.assertTrue(AppSettings.load(alias).reduce_motion)
+
     def test_sample_settings_is_loadable_shape(self):
         payload = json.loads(sample_settings_json())
         self.assertIn("health", payload)

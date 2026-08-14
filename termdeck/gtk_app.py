@@ -2097,6 +2097,18 @@ class AttachTerminal(Gtk.Box):
 
 
 
+def _transition_duration_ms(settings: object, duration_ms: int) -> int:
+    """Honor the reduce-motion accessibility preference for one animation.
+
+    Decorative transitions collapse to instant swaps when the user asked for
+    reduced motion; GTK's global gtk-enable-animations still applies on top.
+    """
+
+    if getattr(settings, "reduce_motion", False):
+        return 0
+    return duration_ms
+
+
 def _refresh_paused(widget: Gtk.Widget) -> bool:
     """True when the widget's toplevel window is minimized.
 
@@ -4419,7 +4431,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         # Crossfade between the title label and its inline rename entry; GTK
         # globally disables this when gtk-enable-animations is off.
         title_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
-        title_stack.set_transition_duration(120)
+        title_stack.set_transition_duration(_transition_duration_ms(app_context.settings, 120))
         title_stack.add_named(title, "label")
         title_stack.add_named(title_entry, "entry")
         title_stack.set_visible_child(title)
@@ -4542,7 +4554,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         root.add_overlay(strip_new_tab)
         self.toast_revealer = Gtk.Revealer()
         self.toast_revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
-        self.toast_revealer.set_transition_duration(160)
+        self.toast_revealer.set_transition_duration(_transition_duration_ms(app_context.settings, 160))
         self.toast_revealer.set_halign(Gtk.Align.CENTER)
         self.toast_revealer.set_valign(Gtk.Align.END)
         self.toast_revealer.set_margin_bottom(18)
@@ -4823,7 +4835,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         name_stack = Gtk.Stack()
         # Match the window-title rename crossfade for tab renames.
         name_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
-        name_stack.set_transition_duration(120)
+        name_stack.set_transition_duration(_transition_duration_ms(self.app_context.settings, 120))
         name_stack.add_named(name, "label")
         name_stack.add_named(name_entry, "entry")
         name_stack.set_visible_child(name)

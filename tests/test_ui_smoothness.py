@@ -81,12 +81,41 @@ class UiSmoothnessSourceTest(unittest.TestCase):
     def test_rename_stacks_crossfade(self) -> None:
         self.assertNotIn("Gtk.StackTransitionType.NONE", self.source)
         self.assertEqual(self.source.count("Gtk.StackTransitionType.CROSSFADE"), 2)
-        # Keep the rename animation subtle: both stacks use a short 120ms fade.
+        # Keep the rename animation subtle: both stacks use a short 120ms fade
+        # routed through the reduce-motion helper (Phase 4).
         crossfade_durations = re.findall(
-            r"StackTransitionType\.CROSSFADE\)\n\s*\w+\.set_transition_duration\((\d+)\)",
+            r"StackTransitionType\.CROSSFADE\)\n\s*\w+\.set_transition_duration\("
+            r"_transition_duration_ms\([\w.]*settings, (\d+)\)\)",
             self.source,
         )
         self.assertEqual([int(value) for value in crossfade_durations], [120, 120])
+
+    def test_reduce_motion_collapses_decorative_animations(self) -> None:
+        # Phase 4: every decorative transition consults the reduce-motion
+        # setting; no fixed-duration decorative animation may bypass it.
+        self.assertIn("def _transition_duration_ms(", self.source)
+        # One definition plus exactly three call sites (two rename stacks,
+        # one toast revealer).
+        self.assertEqual(self.source.count("_transition_duration_ms("), 4)
+        self.assertIn(
+            "self.toast_revealer.set_transition_duration("
+            "_transition_duration_ms(app_context.settings, 160))",
+            self.source,
+        )
+
+    def test_reduce_motion_helper_behaviour(self) -> None:
+        from termdeck.gtk_app import _transition_duration_ms
+
+        class Reduced:
+            reduce_motion = True
+
+        class Full:
+            reduce_motion = False
+
+        self.assertEqual(_transition_duration_ms(Reduced(), 120), 0)
+        self.assertEqual(_transition_duration_ms(Full(), 160), 160)
+        # Settings objects without the field keep their animations.
+        self.assertEqual(_transition_duration_ms(object(), 120), 120)
 
 
 if __name__ == "__main__":
