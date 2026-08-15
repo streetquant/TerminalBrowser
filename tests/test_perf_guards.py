@@ -15,7 +15,10 @@ GTK_APP = pathlib.Path(__file__).resolve().parents[1] / "termdeck" / "gtk_app.py
 # Functions allowed to create subprocesses. ``_spawn`` hands the child to the
 # terminal widget; ``spawn_transport`` (inside _start_tmux_event_watcher) is
 # consumed by the control-mode client's reader thread, never the GTK main loop.
+# ``_request_client_redraw`` fires one non-blocking ``tmux refresh-client``
+# after a settled resize and never waits on the child.
 SUBPROCESS_ALLOWLIST = {
+    "_request_client_redraw",
     "_spawn",
     "_start_tmux_event_watcher.spawn_transport",
 }

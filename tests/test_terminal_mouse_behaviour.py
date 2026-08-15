@@ -1109,6 +1109,7 @@ time.sleep(2)
             _last_allocated_grid=(80, 24),
             _last_synced_grid=(80, 24),
             _sync_pty_geometry=lambda **kwargs: calls.append(("pty", kwargs)),
+            _request_client_redraw=lambda: calls.append(("redraw",)),
         )
 
         AttachTerminal.apply_canonical_grid(attach, columns=144, rows=43)
@@ -1119,6 +1120,7 @@ time.sleep(2)
             [
                 ("vte", 144, 43),
                 ("pty", {"columns": 144, "rows": 43, "force": True}),
+                ("redraw",),
             ],
         )
 
@@ -1141,18 +1143,21 @@ time.sleep(2)
     def test_failed_vte_canonical_resize_remains_retryable_after_pty_sync(self) -> None:
         terminal = SimpleNamespace(set_size=mock.Mock(side_effect=RuntimeError("resize")))
         sync_pty = mock.Mock()
+        request_redraw = mock.Mock()
         attach = SimpleNamespace(
             _detached=False,
             terminal=terminal,
             _last_allocated_grid=(80, 24),
             _last_synced_grid=(80, 24),
             _sync_pty_geometry=sync_pty,
+            _request_client_redraw=request_redraw,
         )
 
         AttachTerminal.apply_canonical_grid(attach, columns=144, rows=43)
 
         terminal.set_size.assert_called_once_with(144, 43)
         sync_pty.assert_called_once_with(columns=144, rows=43, force=True)
+        request_redraw.assert_called_once_with()
         self.assertEqual(attach._last_allocated_grid, (80, 24))
 
     def test_settled_window_geometry_fans_visible_grid_out_to_hidden_tabs(self) -> None:

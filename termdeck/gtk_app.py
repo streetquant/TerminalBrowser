@@ -463,6 +463,7 @@ class AttachTerminal(Gtk.Box):
         self._cursor_hide_source_id = 0
         self._last_allocated_grid = (0, 0)
         self._last_synced_grid = (0, 0)
+        self._client_tty: str | None = None
         self._live_focus_handler = None
         self._scroll_handler = None
         self._selection_history_handler = selection_history_handler
@@ -726,6 +727,7 @@ class AttachTerminal(Gtk.Box):
         rows = max(0, int(self.terminal.get_row_count()))
         self._last_allocated_grid = (columns, rows)
         self._sync_pty_geometry(columns=columns, rows=rows, force=True)
+        self._request_client_redraw()
         return False
 
     def apply_canonical_grid(self, *, columns: int, rows: int) -> None:
@@ -745,6 +747,34 @@ class AttachTerminal(Gtk.Box):
         else:
             self._last_allocated_grid = grid
         self._sync_pty_geometry(columns=columns, rows=rows, force=True)
+        self._request_client_redraw()
+
+    def _request_client_redraw(self) -> None:
+        """Repaint this attach client from the tmux server's screen.
+
+        Without an alternate screen, VTE rewraps its normal buffer whenever
+        the widget's column count changes, while tmux only repaints cells
+        that differ from its own client-screen model.  A debounced resize
+        storm can therefore leave stale fragments on screen that tmux
+        believes are already correct.  ``refresh-client`` forces a full
+        redraw from server truth and is visually a no-op when both agree.
+        """
+
+        tty_path = self._client_tty
+        if not tty_path or self.process is None or self.process.poll() is not None:
+            return
+        try:
+            subprocess.Popen(
+                [self.argv[0], "refresh-client", "-t", tty_path],
+                env=dict(self._child_environment),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
+        except Exception:
+            pass
 
     def _spawn_fallback(self) -> bool:
         self._spawn_fallback_source_id = 0
@@ -868,6 +898,10 @@ class AttachTerminal(Gtk.Box):
             except Exception:
                 pass
         finally:
+            try:
+                self._client_tty = os.ttyname(slave_fd)
+            except OSError:
+                self._client_tty = None
             try:
                 os.close(slave_fd)
             except OSError:
