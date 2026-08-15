@@ -17,8 +17,11 @@ DEFAULT_PALETTE = (
 class TerminalTheme:
     font: str = "Monospace 12"
     use_system_font: bool = False
-    foreground_color: str = "#d3d7cf"
-    background_color: str = "#000000"
+    # Chrome-matched defaults: the built-in terminal surface blends with the
+    # dark chrome (bg_sunken) instead of shipping a jarring pure-black pane.
+    # Terminator imports and palette packs still override these values.
+    foreground_color: str = "#dfe6f2"
+    background_color: str = "#0a0d13"
     palette: tuple[str, ...] = DEFAULT_PALETTE
     cursor_color: str | None = None
     cursor_shape: str = "block"

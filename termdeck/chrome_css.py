@@ -74,6 +74,8 @@ def build_modern_chrome_css(
     hairline_soft = _rgba(t.border, 0.55)
 
     hov_bg = _rgba(t.fg, 0.06)
+    hb_sheen = _rgba(t.fg, 0.04)
+    tab_sel_border = _rgba(t.accent, 0.38)
     act_bg = _rgba(t.fg, 0.10)
 
     # Buttons — flat and quiet, clear but neutral states
@@ -228,8 +230,9 @@ headerbar {{
   background-image: none;
   border: none;
   border-bottom: 1px solid {hairline};
-  padding: 4px 8px;
-  min-height: 46px;
+  box-shadow: inset 0 1px 0 {hb_sheen};
+  padding: 5px 10px;
+  min-height: 48px;
 }}
 headerbar label, headerbar button {{ color: {t.fg}; }}
 headerbar button {{
@@ -356,6 +359,7 @@ button.td-tabstrip-new {{
 .td-title {{
   font-weight: 600;
   font-size: {size["title"]};
+  letter-spacing: 0.2px;
   color: {t.fg};
 }}
 .td-section-description {{
@@ -487,17 +491,17 @@ notebook.td-terminal-notebook header {{
   border: none;
   border-bottom: 1px solid {hairline};
   border-radius: 0;
-  padding: 0 4px;
+  padding: 5px 8px;
 }}
 notebook.td-terminal-notebook header tabs {{ background-color: transparent; border-color: transparent; }}
 notebook.td-terminal-notebook tab {{
   background-color: transparent;
-  border: none;
-  border-bottom: 2px solid transparent;
-  border-radius: 8px 8px 0 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
   box-shadow: none;
-  padding: 8px 14px;
-  margin: 0 1px;
+  min-width: 0;
+  padding: 6px 13px;
+  margin: 0 2px;
   color: {t.fg_muted};
   font-size: {size["base"]};
   transition: background-color 130ms ease-out, color 130ms ease-out, border-color 130ms ease-out;
@@ -510,13 +514,21 @@ notebook.td-terminal-notebook tab:checked {{
   background-color: {tab_sel_bg};
   background-image: none;
   color: {t.fg};
-  border-bottom: 2px solid {t.accent};
+  border: 1px solid {tab_sel_border};
   box-shadow: none;
   font-weight: 600;
 }}
 notebook.td-terminal-notebook > stack {{
   background-color: {t.bg_sunken};
   border-radius: 0;
+}}
+notebook.td-terminal-notebook scrolledwindow {{
+  background-color: transparent;
+  border: none;
+  border-radius: 0;
+}}
+vte-terminal {{
+  padding: 10px 12px;
 }}
 button.td-tab-close {{
   min-width: 22px;
@@ -665,6 +677,6 @@ scrollbar.td-terminal-scrollbar slider:active {{
 .td-density-compact .td-session-card {{ padding: 5px 8px; border-radius: {compact_card_radius}px; }}
 .td-density-compact notebook.td-terminal-notebook {{ margin: 0; }}
 .td-density-compact notebook.td-terminal-notebook header {{ padding: 0 3px; }}
-.td-density-compact notebook.td-terminal-notebook tab {{ padding: 5px 10px; margin: 0 1px; border-radius: 7px 7px 0 0; }}
+.td-density-compact notebook.td-terminal-notebook tab {{ padding: 4px 10px; margin: 0 2px; border-radius: 7px; }}
 .td-density-compact treeview {{ font-size: {size["compact"]}; }}
 """

@@ -229,8 +229,12 @@ class TerminatorConfig:
         return TerminalTheme(
             font=profile.get("font", "Monospace 12"),
             use_system_font=_to_bool(profile.get("use_system_font", "False")),
-            foreground_color=_clean_colour(profile.get("foreground_color"), "#d3d7cf") or "#d3d7cf",
-            background_color=_clean_colour(profile.get("background_color"), "#000000") or "#000000",
+            # Explicit profile colours always win; the fallbacks match the
+            # TermDeck design-system terminal surface so a fresh install (or a
+            # profile without colours) blends with the chrome instead of
+            # rendering a harsh pure-black slab.
+            foreground_color=_clean_colour(profile.get("foreground_color"), "#dfe6f2") or "#dfe6f2",
+            background_color=_clean_colour(profile.get("background_color"), "#0a0d13") or "#0a0d13",
             palette=_parse_palette(profile.get("palette")),
             cursor_color=_clean_colour(profile.get("cursor_color")),
             cursor_shape=profile.get("cursor_shape", "block").lower(),

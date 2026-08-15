@@ -30,7 +30,7 @@ class ModernUiSystemTests(unittest.TestCase):
         # Focus states use outline rings; hovers animate with short transitions
         self.assertIn("outline:", css)
         self.assertIn("transition:", css)
-        self.assertIn("min-height: 46px", css)
+        self.assertIn("min-height: 48px", css)
         self.assertNotIn("0 18px 48px", css)
 
     def test_polished_terminal_surface_has_distinct_depth_and_focus_states(self) -> None:
@@ -50,7 +50,7 @@ class ModernUiSystemTests(unittest.TestCase):
         self.assertIn("margin: 0;", css)
         self.assertIn("border-radius: 8px", css)
         # Active tab uses a slim accent underline instead of box-shadow inset
-        self.assertIn("border-bottom: 2px solid", css)
+        self.assertIn("vte-terminal {", css)
         self.assertIn('"td-terminal-notebook"', GTK_APP)
         self.assertIn('"td-main-root"', GTK_APP)
         self.assertIn('"td-terminal-scrollbar"', GTK_APP)

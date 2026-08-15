@@ -403,7 +403,7 @@ def apply_theme(terminal: Vte.Terminal, theme: TerminalTheme, *, font_override: 
         terminal.set_font(Pango.FontDescription(font))
     terminal.set_scrollback_lines(theme.scrollback_lines)
     palette = [rgba(colour) for colour in theme.palette]
-    terminal.set_colors(rgba(theme.foreground_color, "#d3d7cf"), rgba(theme.background_color, "#000000"), palette)
+    terminal.set_colors(rgba(theme.foreground_color, "#dfe6f2"), rgba(theme.background_color, "#0a0d13"), palette)
     if theme.cursor_color:
         terminal.set_color_cursor(rgba(theme.cursor_color))
     shape = theme.cursor_shape.lower()
@@ -480,6 +480,14 @@ class AttachTerminal(Gtk.Box):
         self.set_vexpand(True)
         self.terminal.set_hexpand(True)
         self.terminal.set_vexpand(True)
+        # Content breathing room like modern terminal apps. Widget margins are
+        # used instead of CSS padding because VTE paints over its CSS box; the
+        # surrounding sunken surface matches the default terminal background,
+        # so the inset reads as seamless padding.
+        self.terminal.set_margin_start(10)
+        self.terminal.set_margin_end(4)
+        self.terminal.set_margin_top(8)
+        self.terminal.set_margin_bottom(4)
         apply_theme(self.terminal, theme, font_override=font_override)
         # Normal terminal review and VTE text selection have different history
         # owners.  The persistent scrollbar represents the application-aware
@@ -615,8 +623,8 @@ class AttachTerminal(Gtk.Box):
         # is emulator-side state the child never rewrites, so it cannot race.
         try:
             if self._history_cursor_hidden:
-                self.terminal.set_color_cursor(rgba(self.theme.background_color, "#000000"))
-                self.terminal.set_color_cursor_foreground(rgba(self.theme.foreground_color, "#d3d7cf"))
+                self.terminal.set_color_cursor(rgba(self.theme.background_color, "#0a0d13"))
+                self.terminal.set_color_cursor_foreground(rgba(self.theme.foreground_color, "#dfe6f2"))
             else:
                 self.terminal.set_color_cursor(
                     rgba(self.theme.cursor_color) if self.theme.cursor_color else None
@@ -4882,7 +4890,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             name,
             name_entry,
         )
-        label_box.pack_start(name_event, True, True, 0)
+        # Content-hugging tab: the name must not expand, otherwise the close
+        # control drifts away from the label (SOTA tabs keep them adjacent).
+        label_box.pack_start(name_event, False, False, 0)
         close = Gtk.Button(label="×")
         close.set_relief(Gtk.ReliefStyle.NONE)
         _style(close, "td-tab-close")
