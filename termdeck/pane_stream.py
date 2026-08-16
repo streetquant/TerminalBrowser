@@ -1,0 +1,512 @@
+"""Stream one tmux pane's raw bytes into a local terminal emulator.
+
+TermDeck renders terminals with VTE as the *only* terminal emulator.  tmux is
+reduced to the persistence daemon it is good at being: this controller
+attaches to one session in control mode (``tmux -C attach-session``), replays
+the pane's screen once, then forwards the pane's verbatim byte stream
+(``%output``) to the widget and the widget's input bytes back to the pane
+(``send-keys -H``).  Because the pane's raw escape stream — including
+alternate-screen switches — reaches VTE unmodified, full-screen applications
+run on VTE's real alternate screen and there is no second client-side screen
+model to diverge from.  Resizes are communicated with ``refresh-client -C``;
+no client PTY exists at all.
+
+The module is deliberately GTK-free.  Callbacks fire on internal threads and
+callers marshal them onto their event loop.
+"""
+
+from __future__ import annotations
+
+import queue
+import subprocess
+import threading
+from typing import Callable, Mapping
+
+from .tmux_control import ClientState, ControlEvent, ControlModeClient
+
+# Bytes per send-keys command.  Chunking keeps each control-mode command line
+# short while remaining far faster than interactive typing rates.
+_INPUT_CHUNK_BYTES = 64
+
+# Modes replayed from tmux pane state on (re)attach so VTE starts from the
+# same emulator state the application last negotiated.  (mode byte, set, reset)
+_MODE_SEQUENCES = (
+    ("cursor_flag", "1", None, b"\x1b[?25l"),
+    ("keypad_cursor_flag", "1", b"\x1b[?1h", None),
+    ("wrap_flag", "1", None, b"\x1b[?7l"),
+    ("insert_flag", "0", b"\x1b[4h", None),
+    ("origin_flag", "0", b"\x1b[?6h", None),
+    ("mouse_standard_flag", "0", b"\x1b[?1000h", None),
+    ("mouse_button_flag", "0", b"\x1b[?1002h", None),
+    ("mouse_all_flag", "0", b"\x1b[?1003h", None),
+    ("mouse_sgr_flag", "0", b"\x1b[?1006h", None),
+)
+
+_PANE_STATE_FORMAT = (
+    "#{pane_id} #{alternate_on} #{pane_dead} #{cursor_x} #{cursor_y}"
+    " #{cursor_flag} #{keypad_cursor_flag} #{wrap_flag} #{insert_flag}"
+    " #{origin_flag} #{mouse_standard_flag} #{mouse_button_flag}"
+    " #{mouse_all_flag} #{mouse_sgr_flag} #{history_size}"
+)
+
+_STATE_FIELDS = (
+    "pane_id",
+    "alternate_on",
+    "pane_dead",
+    "cursor_x",
+    "cursor_y",
+    "cursor_flag",
+    "keypad_cursor_flag",
+    "wrap_flag",
+    "insert_flag",
+    "origin_flag",
+    "mouse_standard_flag",
+    "mouse_button_flag",
+    "mouse_all_flag",
+    "mouse_sgr_flag",
+    "history_size",
+)
+
+_DEAD_SUBSCRIPTION = "td-pane-dead"
+
+
+def control_attach_argv(attach_argv: list[str]) -> list[str]:
+    """Turn a plain ``tmux attach-session`` argv into its control-mode form."""
+
+    if not attach_argv:
+        raise ValueError("attach_argv must not be empty")
+    return [attach_argv[0], "-C", *attach_argv[1:]]
+
+
+def attach_target(attach_argv: list[str]) -> str | None:
+    """Extract the ``-t`` session target from an attach argv, if present."""
+
+    for index, token in enumerate(attach_argv):
+        if token == "-t" and index + 1 < len(attach_argv):
+            return attach_argv[index + 1]
+    return None
+
+
+def spawn_control_transport(
+    argv: list[str],
+    environment: Mapping[str, str] | None,
+    cwd: str | None,
+) -> subprocess.Popen[bytes]:
+    """Spawn the ``tmux -C`` client used as the control-mode transport.
+
+    Stderr is discarded rather than merged: tmux writes protocol only to
+    stdout, and stray diagnostics must never corrupt %output framing.
+    """
+
+    return subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=dict(environment) if environment is not None else None,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=True,
+    )
+
+
+class PaneStreamController:
+    """Own one control-mode attachment and its pane's bidirectional stream.
+
+    Lifecycle: ``start()`` spawns the transport; on every (re)connection the
+    worker replays pane state and screen content through ``on_output`` before
+    live ``%output`` bytes flow.  ``stop()`` is terminal.  All callbacks fire
+    on internal threads.
+    """
+
+    def __init__(
+        self,
+        *,
+        attach_argv: list[str],
+        environment: Mapping[str, str] | None = None,
+        cwd: str | None = None,
+        on_output: Callable[[bytes], None],
+        on_pane_dead: Callable[[], None] | None = None,
+        on_state_change: Callable[[ClientState], None] | None = None,
+        history_lines: int = 2000,
+        command_timeout: float = 5.0,
+        client_factory: Callable[..., ControlModeClient] | None = None,
+    ) -> None:
+        self._attach_argv = list(attach_argv)
+        self._target = attach_target(self._attach_argv)
+        self._environment = dict(environment) if environment is not None else None
+        self._cwd = cwd
+        self._on_output = on_output
+        self._on_pane_dead = on_pane_dead
+        self._on_state_change = on_state_change
+        self._history_lines = max(0, int(history_lines))
+        self._command_timeout = float(command_timeout)
+
+        self._lock = threading.Lock()
+        self._tasks: queue.Queue[tuple[str, object] | None] = queue.Queue()
+        self._worker: threading.Thread | None = None
+        self._stopped = False
+        self._started = False
+        self._generation = 0
+        self._ready = False
+        self._pane_id: str | None = None
+        self._pane_dead_reported = False
+        self._replayed_history = False
+        self._pending_output: list[bytes] = []
+        self._pending_input: list[bytes] = []
+        self._size = (80, 24)
+        self._resize_queued = False
+        self._setup_attempts = 0
+
+        factory = client_factory or ControlModeClient
+        self._client = factory(
+            spawn_transport=self._spawn_transport,
+            on_event=self._handle_event,
+            on_state_change=self._handle_state_change,
+            reconnect_initial_seconds=0.25,
+            reconnect_max_seconds=4.0,
+        )
+
+    # ------------------------------------------------------------- lifecycle
+
+    @property
+    def state(self) -> ClientState:
+        return self._client.state
+
+    @property
+    def pane_id(self) -> str | None:
+        with self._lock:
+            return self._pane_id
+
+    def start(self, *, columns: int, rows: int) -> None:
+        """Begin streaming with the widget's current grid as the client size."""
+
+        with self._lock:
+            if self._started or self._stopped:
+                return
+            self._started = True
+            self._size = (max(2, int(columns)), max(2, int(rows)))
+        self._worker = threading.Thread(
+            target=self._worker_main,
+            name="pane-stream-worker",
+            daemon=True,
+        )
+        self._worker.start()
+        self._client.start()
+
+    def stop(self) -> None:
+        """Terminal shutdown; a stopped controller is never restarted."""
+
+        with self._lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            self._ready = False
+        self._client.stop()
+        self._tasks.put(None)
+        worker = self._worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=2.0)
+
+    # ------------------------------------------------------------------ I/O
+
+    def send_bytes(self, data: bytes) -> None:
+        """Queue raw input bytes for ordered delivery to the pane."""
+
+        if not data:
+            return
+        with self._lock:
+            if self._stopped:
+                return
+        self._tasks.put(("input", bytes(data)))
+
+    def resize(self, *, columns: int, rows: int) -> None:
+        """Coalesce grid changes; only the most recent size is applied."""
+
+        columns = max(2, int(columns))
+        rows = max(2, int(rows))
+        with self._lock:
+            if self._stopped:
+                return
+            if (columns, rows) == self._size and self._ready:
+                return
+            self._size = (columns, rows)
+            if self._resize_queued:
+                return
+            self._resize_queued = True
+        self._tasks.put(("resize", None))
+
+    # ------------------------------------------------------- event plumbing
+
+    def _spawn_transport(self) -> subprocess.Popen[bytes]:
+        return spawn_control_transport(
+            control_attach_argv(self._attach_argv),
+            self._environment,
+            self._cwd,
+        )
+
+    def _handle_state_change(self, state: ClientState) -> None:
+        if state is ClientState.CONNECTED:
+            with self._lock:
+                self._generation += 1
+                self._ready = False
+                self._pending_output.clear()
+                self._setup_attempts = 0
+                generation = self._generation
+            self._tasks.put(("setup", generation))
+        else:
+            with self._lock:
+                self._ready = False
+        callback = self._on_state_change
+        if callback is not None:
+            try:
+                callback(state)
+            except Exception:
+                pass
+
+    def _handle_event(self, event: ControlEvent) -> None:
+        if event.kind == "output":
+            with self._lock:
+                if self._pane_id is not None and event.pane_id != self._pane_id:
+                    return
+                payload = (event.payload or "").encode("latin-1", "replace")
+                if not payload:
+                    return
+                if not self._ready:
+                    self._pending_output.append(payload)
+                    return
+            self._emit_output(payload)
+            return
+        if event.kind == "pane-exited":
+            self._report_pane_dead()
+            return
+        if event.kind == "subscription-changed":
+            if event.args and event.args[0] == _DEAD_SUBSCRIPTION:
+                _, _, value = event.raw.partition(" : ")
+                if value.strip() == "1":
+                    self._report_pane_dead()
+            return
+
+    def _report_pane_dead(self) -> None:
+        with self._lock:
+            if self._pane_dead_reported or self._stopped:
+                return
+            self._pane_dead_reported = True
+        callback = self._on_pane_dead
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def _emit_output(self, payload: bytes) -> None:
+        try:
+            self._on_output(payload)
+        except Exception:
+            pass
+
+    # -------------------------------------------------------------- worker
+
+    def _worker_main(self) -> None:
+        while True:
+            task = self._tasks.get()
+            if task is None:
+                return
+            with self._lock:
+                if self._stopped:
+                    return
+            kind, argument = task
+            try:
+                if kind == "setup":
+                    self._run_setup(int(argument))  # type: ignore[arg-type]
+                elif kind == "resize":
+                    self._run_resize()
+                elif kind == "input":
+                    self._run_input(argument)  # type: ignore[arg-type]
+            except Exception:
+                # The worker is the only consumer of this queue; it must
+                # survive any single failing command to keep input flowing.
+                pass
+
+    def _command(self, command: str):
+        return self._client.send_command(command, timeout=self._command_timeout)
+
+    def _run_resize(self) -> None:
+        with self._lock:
+            self._resize_queued = False
+            columns, rows = self._size
+        self._command(f"refresh-client -C {columns}x{rows}")
+
+    def _run_input(self, data: bytes) -> None:
+        with self._lock:
+            pane_id = self._pane_id
+            ready = self._ready
+        if pane_id is None or not ready:
+            with self._lock:
+                self._pending_input.append(data)
+            return
+        self._send_input_bytes(pane_id, data)
+
+    def _send_input_bytes(self, pane_id: str, data: bytes) -> None:
+        for start in range(0, len(data), _INPUT_CHUNK_BYTES):
+            chunk = data[start : start + _INPUT_CHUNK_BYTES]
+            tokens = " ".join(f"{byte:02x}" for byte in chunk)
+            result = self._command(f"send-keys -t {pane_id} -H {tokens}")
+            if not result.ok:
+                # A dead pane rejects input; report once instead of spamming.
+                self._report_pane_dead()
+                return
+
+    def _run_setup(self, generation: int) -> None:
+        if not self._try_setup(generation):
+            self._schedule_setup_retry(generation)
+
+    def _try_setup(self, generation: int) -> bool:
+        with self._lock:
+            if generation != self._generation or self._stopped:
+                return True
+            columns, rows = self._size
+
+        self._command(f"refresh-client -C {columns}x{rows}")
+
+        target = self._target
+        scope = f" -t {target}" if target else ""
+        state_reply = self._command(f"list-panes{scope} -F '{_PANE_STATE_FORMAT}'")
+        if not state_reply.ok or not state_reply.lines:
+            return False
+        fields = state_reply.lines[0].split()
+        if len(fields) != len(_STATE_FIELDS):
+            return False
+        pane_state = dict(zip(_STATE_FIELDS, fields))
+        pane_id = pane_state["pane_id"]
+        with self._lock:
+            self._pane_id = pane_id
+
+        # Session-scoped subscription (empty "what" field).  Pane-scoped
+        # subscriptions (name:%id:format) are accepted but never emit
+        # %subscription-changed on tmux 3.7, while the session scope fires
+        # reliably; each TermDeck session hosts a single pane, so the
+        # session's active-pane context is exactly our pane.
+        self._command(
+            f"refresh-client -B '{_DEAD_SUBSCRIPTION}::" "#{pane_dead}'"
+        )
+
+        replay = self._build_replay(pane_state, rows)
+        if replay is None:
+            return False
+
+        with self._lock:
+            if generation != self._generation or self._stopped:
+                return True
+            buffered = b"".join(self._pending_output)
+            self._pending_output.clear()
+            pending_input = self._pending_input
+            self._pending_input = []
+            self._ready = True
+        if replay:
+            self._emit_output(replay)
+        if buffered:
+            self._emit_output(buffered)
+        for data in pending_input:
+            self._send_input_bytes(pane_id, data)
+        if pane_state.get("pane_dead") == "1":
+            self._report_pane_dead()
+        return True
+
+    def _schedule_setup_retry(self, generation: int) -> None:
+        """Back off and retry setup; a busy tmux server must not strand the tab.
+
+        The timer thread only re-queues the task; the worker re-checks
+        generation and stop state before doing any work.
+        """
+
+        with self._lock:
+            if generation != self._generation or self._stopped:
+                return
+            self._setup_attempts += 1
+            delay = min(8.0, 0.5 * (2 ** min(self._setup_attempts - 1, 4)))
+        timer = threading.Timer(delay, self._tasks.put, args=(("setup", generation),))
+        timer.daemon = True
+        timer.start()
+
+    # -------------------------------------------------------------- replay
+
+    def _capture(self, pane_id: str, arguments: str) -> list[str] | None:
+        reply = self._command(f"capture-pane -epq -t {pane_id} {arguments}")
+        if not reply.ok:
+            return None
+        return [line.encode("utf-8", "replace").decode("utf-8") for line in reply.lines]
+
+    def _build_replay(self, pane_state: dict[str, str], rows: int) -> bytes | None:
+        """Reconstruct scrollback, screen, cursor, and modes for a fresh VTE.
+
+        First attach seeds VTE's normal-screen scrollback from tmux history;
+        reconnects repaint only the visible screen so history is not
+        duplicated.  All content is emitted through the same byte channel the
+        live stream uses, so ordering with %output is preserved by the ready
+        gate in ``_run_setup``.  Returns ``None`` when a capture command
+        fails so the caller retries the whole setup.
+        """
+
+        pane_id = pane_state["pane_id"]
+        alternate = pane_state.get("alternate_on") == "1"
+        parts: list[bytes] = []
+
+        first_attach = not self._replayed_history
+
+        try:
+            history_size = max(0, int(pane_state.get("history_size", "0")))
+        except ValueError:
+            history_size = 0
+        if first_attach and self._history_lines and history_size:
+            # With an empty history tmux clamps "-E -1" onto the visible
+            # screen, which would repeat the first visible row below.
+            history = self._capture(
+                pane_id,
+                f"-J -S -{min(self._history_lines, history_size)} -E -1",
+            )
+            if history is None:
+                return None
+            text = "\r\n".join(line.rstrip() for line in history).rstrip()
+            if text:
+                parts.append(text.encode("utf-8", "replace") + b"\r\n")
+        elif not first_attach:
+            # Reconnect: repaint over whatever the widget last showed.
+            parts.append(b"\x1b[?1049l" if not alternate else b"")
+
+        if alternate:
+            parts.append(b"\x1b[?1049h")
+        parts.append(b"\x1b[2J\x1b[H" if (alternate or not first_attach) else b"")
+
+        visible = self._capture(pane_id, "-N")
+        if visible is None:
+            return None
+        self._replayed_history = True
+        while len(visible) > rows:
+            visible.pop()
+        if visible:
+            parts.append("\r\n".join(visible).encode("utf-8", "replace"))
+
+        # Cursor: after feeding, the caret rests at the end of the last fed
+        # row.  Walk it to tmux's reported position.
+        try:
+            cursor_x = max(0, int(pane_state.get("cursor_x", "0")))
+            cursor_y = max(0, int(pane_state.get("cursor_y", "0")))
+        except ValueError:
+            cursor_x, cursor_y = 0, 0
+        fed_rows = max(1, len(visible))
+        up_moves = max(0, min(fed_rows - 1, (fed_rows - 1) - cursor_y))
+        parts.append(b"\r")
+        if up_moves:
+            parts.append(f"\x1b[{up_moves}A".encode("ascii"))
+        if cursor_x:
+            parts.append(f"\x1b[{cursor_x}C".encode("ascii"))
+
+        for field, active_value, set_seq, reset_seq in _MODE_SEQUENCES:
+            value = pane_state.get(field)
+            if value == active_value and set_seq:
+                parts.append(set_seq)
+            elif value != active_value and reset_seq:
+                parts.append(reset_seq)
+
+        return b"".join(part for part in parts if part)

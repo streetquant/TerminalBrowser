@@ -67,7 +67,7 @@ class UiSmoothnessSourceTest(unittest.TestCase):
         # waiting for the next polling tick.  The reader-thread callback must
         # marshal via idle_add, bursts must coalesce through a single timeout
         # source, and shutdown must stop the client.
-        self.assertIn("from .tmux_control import ControlEvent, ControlModeClient", self.source)
+        self.assertIn("from .tmux_control import ClientState, ControlEvent, ControlModeClient", self.source)
         self.assertIn("def _start_tmux_event_watcher(self) -> None:", self.source)
         self.assertIn("GLib.idle_add(self._queue_event_refresh)", self.source)
         self.assertIn("if self._tmux_event_refresh_source is None:", self.source)

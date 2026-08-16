@@ -113,9 +113,18 @@ class ControlModeClientTests(unittest.TestCase):
         )
         return client, events, spawned
 
-    def start_connected(self, client: ControlModeClient) -> None:
+    def start_connected(
+        self,
+        client: ControlModeClient,
+        transport: FakeTransport | None = None,
+    ) -> None:
         client.start()
         wait_until(lambda: client.state is ClientState.CONNECTED)
+        if transport is not None:
+            # A real tmux control-mode server always opens the conversation
+            # with one greeting %begin/%end block before any command replies.
+            transport.stdout.feed("%begin 0 0 0")
+            transport.stdout.feed("%end 0 0 0")
 
     def tearDown(self) -> None:
         # Each test explicitly stops its own client; this assertion catches a test
@@ -127,7 +136,7 @@ class ControlModeClientTests(unittest.TestCase):
     def test_parses_session_and_window_notifications(self) -> None:
         transport = FakeTransport()
         client, events, _ = self.make_client(transport)
-        self.start_connected(client)
+        self.start_connected(client, transport)
         transcript = [
             "%sessions-changed",
             "%session-changed $3",
@@ -155,7 +164,7 @@ class ControlModeClientTests(unittest.TestCase):
     def test_output_decodes_octal_backslashes_and_latin1_bytes(self) -> None:
         transport = FakeTransport()
         client, events, _ = self.make_client(transport)
-        self.start_connected(client)
+        self.start_connected(client, transport)
         transport.stdout.feed(r"%output %5 A\015B\\C\303\251")
         wait_until(lambda: len(events) == 1)
         event = events[0]
@@ -168,7 +177,7 @@ class ControlModeClientTests(unittest.TestCase):
     def test_unknown_control_record_is_an_event_outside_a_reply(self) -> None:
         transport = FakeTransport()
         client, events, _ = self.make_client(transport)
-        self.start_connected(client)
+        self.start_connected(client, transport)
         transport.stdout.feed("%unforeseen abc 7")
         wait_until(lambda: len(events) == 1)
         self.assertEqual(events[0].kind, "unknown")
@@ -187,7 +196,7 @@ class ControlModeClientTests(unittest.TestCase):
 
         client, _, _ = self.make_client(transport, on_event=on_event)
         holder["client"] = client
-        self.start_connected(client)
+        self.start_connected(client, transport)
         transport.stdout.feed("%exit server closed")
         wait_until(lambda: client.state is ClientState.STOPPED)
         self.assertEqual(events[0].kind, "exit")
@@ -204,10 +213,36 @@ class ControlModeClientTests(unittest.TestCase):
         self.assertEqual(events, [])
         client.stop()
 
+    def test_command_enqueued_before_greeting_does_not_steal_greeting_block(self) -> None:
+        # Regression: a command queued before the greeting block arrived used to
+        # claim the greeting as its reply, shifting every later reply by one and
+        # leaving panes permanently mute.
+        transport = FakeTransport()
+        client, events, _ = self.make_client(transport)
+        client.start()
+        wait_until(lambda: client.state is ClientState.CONNECTED)
+        box: list[object] = []
+        worker = threading.Thread(target=lambda: box.append(client.send_command("list-panes")))
+        worker.start()
+        wait_until(lambda: transport.stdin.writes == [b"list-panes\n"])
+        # Greeting arrives only after the command is already queued.
+        transport.stdout.feed("%begin 1 0 0")
+        transport.stdout.feed("greeting body")
+        transport.stdout.feed("%end 1 0 0")
+        transport.stdout.feed("%begin 2 1 0")
+        transport.stdout.feed("pane state")
+        transport.stdout.feed("%end 2 1 0")
+        worker.join(1)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(box[0].ok)
+        self.assertEqual(box[0].lines, ("pane state",))
+        self.assertEqual(events, [])
+        client.stop()
+
     def test_send_command_returns_reply_body(self) -> None:
         transport = FakeTransport()
         client, _, _ = self.make_client(transport)
-        self.start_connected(client)
+        self.start_connected(client, transport)
         results: list[object] = []
         worker = threading.Thread(target=lambda: results.append(client.send_command("list-sessions")))
         worker.start()
@@ -225,7 +260,7 @@ class ControlModeClientTests(unittest.TestCase):
     def test_error_reply_returns_failed_result_and_body(self) -> None:
         transport = FakeTransport()
         client, _, _ = self.make_client(transport)
-        self.start_connected(client)
+        self.start_connected(client, transport)
         results: list[object] = []
         worker = threading.Thread(target=lambda: results.append(client.send_command("bad-command")))
         worker.start()
@@ -242,7 +277,7 @@ class ControlModeClientTests(unittest.TestCase):
     def test_two_commands_match_replies_in_fifo_order(self) -> None:
         transport = FakeTransport()
         client, _, _ = self.make_client(transport)
-        self.start_connected(client)
+        self.start_connected(client, transport)
         results: dict[str, object] = {}
         first = threading.Thread(target=lambda: results.setdefault("first", client.send_command("one")))
         second = threading.Thread(target=lambda: results.setdefault("second", client.send_command("two")))
@@ -265,7 +300,7 @@ class ControlModeClientTests(unittest.TestCase):
     def test_timeout_returns_timeout_result(self) -> None:
         transport = FakeTransport()
         client, _, _ = self.make_client(transport)
-        self.start_connected(client)
+        self.start_connected(client, transport)
         result = client.send_command("never-replies", timeout=0.02)
         self.assertFalse(result.ok)
         self.assertEqual(result.error, "timeout")
@@ -274,7 +309,7 @@ class ControlModeClientTests(unittest.TestCase):
     def test_notification_interleaved_in_reply_is_dispatched_not_body(self) -> None:
         transport = FakeTransport()
         client, events, _ = self.make_client(transport)
-        self.start_connected(client)
+        self.start_connected(client, transport)
         result_box: list[object] = []
         worker = threading.Thread(target=lambda: result_box.append(client.send_command("show")))
         worker.start()
@@ -292,7 +327,7 @@ class ControlModeClientTests(unittest.TestCase):
     def test_unknown_percent_line_inside_reply_is_preserved_as_body(self) -> None:
         transport = FakeTransport()
         client, events, _ = self.make_client(transport)
-        self.start_connected(client)
+        self.start_connected(client, transport)
         box: list[object] = []
         worker = threading.Thread(target=lambda: box.append(client.send_command("show")))
         worker.start()
@@ -310,7 +345,7 @@ class ControlModeClientTests(unittest.TestCase):
         second = FakeTransport()
         delays: list[float] = []
         client, _, spawned = self.make_client(transports=[first, second], sleep=delays.append)
-        self.start_connected(client)
+        self.start_connected(client, first)
         first.stdout.eof()
         wait_until(lambda: len(spawned) == 2)
         self.assertEqual(client.reconnect_count, 1)
@@ -329,7 +364,7 @@ class ControlModeClientTests(unittest.TestCase):
 
         client, _, _ = self.make_client(transports=[first], sleep=stop_while_waiting)
         holder["client"] = client
-        self.start_connected(client)
+        self.start_connected(client, first)
         first.stdout.eof()
         wait_until(lambda: client.state is ClientState.STOPPED)
         thread = client._reader_thread
@@ -340,7 +375,7 @@ class ControlModeClientTests(unittest.TestCase):
     def test_stop_joins_the_reader_thread(self) -> None:
         transport = FakeTransport()
         client, _, _ = self.make_client(transport)
-        self.start_connected(client)
+        self.start_connected(client, transport)
         client.stop()
         thread = client._reader_thread
         self.assertTrue(transport.terminated)
@@ -365,6 +400,54 @@ class ControlModeClientTests(unittest.TestCase):
                 on_event=lambda event: None,
                 max_pending_commands=0,
             )
+
+
+class TimeoutFramingTests(unittest.TestCase):
+    """A timed-out command's late reply must not shift later replies."""
+
+    def test_timed_out_reply_block_is_consumed_not_shifted(self) -> None:
+        transport = FakeTransport()
+        client = ControlModeClient(
+            spawn_transport=lambda: transport,
+            on_event=lambda event: None,
+        )
+        self.addCleanup(client.stop)
+        client.start()
+        wait_until(lambda: client.state is ClientState.CONNECTED)
+        transport.stdout.feed("%begin 0 0 0")
+        transport.stdout.feed("%end 0 0 0")
+
+        timed_out = client.send_command("slow-command", timeout=0.05)
+        self.assertFalse(timed_out.ok)
+        self.assertEqual(timed_out.error, "timeout")
+
+        results: list[object] = []
+        waiter = threading.Thread(
+            target=lambda: results.append(
+                client.send_command("fast-command", timeout=2.0)
+            ),
+            daemon=True,
+        )
+        waiter.start()
+        wait_until(
+            lambda: any(b"fast-command" in write for write in transport.stdin.writes)
+        )
+
+        # The late reply for the timed-out command arrives first; the reader
+        # must pair it with the abandoned FIFO entry and hand the NEXT block
+        # to the still-waiting caller.
+        transport.stdout.feed("%begin 1 1 0")
+        transport.stdout.feed("SLOW-REPLY")
+        transport.stdout.feed("%end 1 1 0")
+        transport.stdout.feed("%begin 2 2 0")
+        transport.stdout.feed("FAST-REPLY")
+        transport.stdout.feed("%end 2 2 0")
+
+        waiter.join(timeout=2.0)
+        self.assertEqual(len(results), 1)
+        result = results[0]
+        self.assertTrue(result.ok)
+        self.assertEqual(result.lines, ("FAST-REPLY",))
 
 
 if __name__ == "__main__":

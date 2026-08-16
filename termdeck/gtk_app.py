@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import os
 import pty
 import re
 import shlex
-import signal
-import struct
 import subprocess
 import sys
 import termios
@@ -15,7 +12,6 @@ import tempfile
 import threading
 import time
 import tty
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -41,7 +37,7 @@ from .command_palette import PaletteItem, build_palette_items, search_palette
 from .control_plan import ControlPlan, build_control_plan, render_control_plan_text
 from .frame_budget import FrameBudgetMonitor, hud_enabled, install_glib_probe
 from .health import HealthPolicy, classify_session, health_badge, should_pause_for_attention
-from .history_control import ScrollDisposition, ScrollOutcome, unhandled_scroll
+from .history_control import ScrollOutcome, unhandled_scroll
 from .liveness import merge_confirmed_pane_snapshot
 from .master_tasks import filter_rows
 from .models import SessionRecord, TerminalTheme
@@ -55,7 +51,8 @@ from .session_store import DEFAULT_DB_PATH, SessionStore, short_id, utc_now
 from .settings import AppSettings, SettingsError, save_terminal_options
 from .shortcuts import build_shortcut_map, index_from_key_name, shortcut_entries
 from .task_snapshot import build_task_snapshot
-from .tmux_control import ControlEvent, ControlModeClient
+from .pane_stream import PaneStreamController
+from .tmux_control import ClientState, ControlEvent, ControlModeClient
 from .command_render import default_shell, directory_tab_name, normalise_directory, render_command
 from .window_snapshot import build_window_snapshots
 from .terminator_config import load_terminator_theme
@@ -84,55 +81,6 @@ from .ui_theme import (
 )
 from .vte_stack import merge_vte_attach_environment
 from .workspace_recipe import RecipeWindow, WorkspaceRecipeError, load_recipe
-
-
-_VTE_VERSION_REPLY = re.compile(r"VTE\(\d{3,6}\)")
-_VTE_CARET_DA_REPLY = re.compile(r"\^\[\[(?:\?|>)[0-9;]+c")
-_VTE_RAW_DA_REPLY = re.compile(r"\x1b\[(?:\?|>)[0-9;]+c")
-
-# Scrollbar drags are high-frequency UI input. Bound backend work globally so
-# a large restored workspace cannot turn one drag per tab into an I/O convoy.
-_HISTORY_SCROLL_EXECUTOR = ThreadPoolExecutor(
-    max_workers=2,
-    thread_name_prefix="termdeck-history",
-)
-# ThreadPoolExecutor intentionally has an unbounded internal work queue. A
-# non-blocking admission semaphore caps all active+queued history worker chains
-# so storage stalls cannot accumulate one queued future per restored tab.
-_HISTORY_SCROLL_ADMISSION = threading.BoundedSemaphore(value=8)
-
-
-def _without_replayed_vte_probe_echo(history: str) -> str:
-    """Drop only terminal-identity replies leaked by the old attach race.
-
-    Older TermDeck clients could hand a canonical/echoing PTY to VTE before
-    the tmux attach child existed. VTE's automatic DA/XTVERSION replies then
-    became visible shell text and were retained in tmux history. The current
-    child-first/raw attach prevents new contamination; this narrow filter keeps
-    those already-persisted rows from being re-seeded into every new VTE view.
-
-    Ordinary text that merely mentions a VTE version is preserved. A line is
-    discarded only when the version token is paired with a DA reply, a complete
-    XTVERSION DCS reply, or the repeated-version/ST shape from the known leak.
-    """
-
-    kept: list[str] = []
-    for line in history.splitlines(keepends=True):
-        version_hits = len(_VTE_VERSION_REPLY.findall(line))
-        da_hits = len(_VTE_CARET_DA_REPLY.findall(line)) + len(
-            _VTE_RAW_DA_REPLY.findall(line)
-        )
-        complete_xtversion = bool(version_hits) and (
-            ("\x1bP>|VTE(" in line and "\x1b\\" in line)
-            or ("^[P>|VTE(" in line and "^[\\" in line)
-        )
-        repeated_xtversion = version_hits >= 2 and (
-            "^[\\" in line or "\x1b\\" in line
-        )
-        if complete_xtversion or (version_hits and da_hits) or repeated_xtversion:
-            continue
-        kept.append(line)
-    return "".join(kept)
 
 
 def _usable_glib_source_id(source_id) -> bool:
@@ -449,33 +397,37 @@ class AttachTerminal(Gtk.Box):
         self.argv = argv
         self.cwd = cwd
         self.theme = theme
-        self.process: subprocess.Popen[bytes] | None = None
+        self.controller: PaneStreamController | None = None
         self.pty_obj = None
+        self._loopback_fd = -1
+        self._loopback_watch_id = 0
+        self._loopback_channel = None
         self._detached = False
         self._terminally_stopped = False
-        self._spawn_source_id = 0
-        self._spawn_fallback_source_id = 0
-        self._attach_restart_source_id = 0
-        self._attach_stable_source_id = 0
-        self._attach_restart_attempts = 0
         self._attach_restart_deferred = False
+        self._connect_source_id = 0
+        self._connect_fallback_source_id = 0
+        self._attach_stable_source_id = 0
         self._resize_sync_source_id = 0
         self._cursor_hide_source_id = 0
+        self._scroll_idle_source_id = 0
         self._last_allocated_grid = (0, 0)
         self._last_synced_grid = (0, 0)
-        self._client_tty: str | None = None
         self._live_focus_handler = None
         self._scroll_handler = None
         self._selection_history_handler = selection_history_handler
         self._attach_exit_handler = attach_exit_handler
         self._attach_stable_handler = attach_stable_handler
         self._child_environment = merge_vte_attach_environment(child_environment)
-        self._native_history_primed = False
+        self._scrollback_extent = int(scrollback_extent or theme.scrollback_lines)
         self._key_press_handler_id = 0
         self._key_press_handler = None
         self._history_cursor_hidden = False
-        self._scroll_idle_source_id = 0
         self._clipboard_image_paths: set[str] = set()
+        self._output_lock = threading.Lock()
+        self._output_buffer = bytearray()
+        self._output_drain_scheduled = False
+        self._stream_generation = 0
         self.terminal = Vte.Terminal()
         self.set_hexpand(True)
         self.set_vexpand(True)
@@ -490,42 +442,18 @@ class AttachTerminal(Gtk.Box):
         self.terminal.set_margin_top(8)
         self.terminal.set_margin_bottom(4)
         apply_theme(self.terminal, theme, font_override=font_override)
-        # Normal terminal review and VTE text selection have different history
-        # owners.  The persistent scrollbar represents the application-aware
-        # tmux/Codex history controller; VTE's native adjustment is retained
-        # separately and is bound to the bar only while a real VTE selection is
-        # active.  Keeping the two coordinate systems distinct prevents both
-        # deep-drag blanking and false "live edge" detection.
+        self.terminal.set_scrollback_lines(self._scrollback_extent)
+        # Control-mode rendering: the pane stream feeds decoded pane bytes
+        # straight into VTE, so VTE's native scrollback is the single history
+        # owner. The persistent scrollbar binds directly to VTE's own
+        # adjustment — no proxy adjustment and no backend history worker.
         self.terminal_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         self.terminal_row.set_hexpand(True)
         self.terminal_row.set_vexpand(True)
         self.native_adjustment = self.terminal.get_vadjustment()
-        extent = float(max(100, int(scrollback_extent or theme.scrollback_lines)))
-        page_size = min(24.0, max(1.0, extent - 1.0))
-        self.history_adjustment = Gtk.Adjustment.new(
-            extent,
-            0.0,
-            extent + page_size,
-            3.0,
-            page_size,
-            page_size,
-        )
-        self._history_scrollbar_syncing = False
-        self._last_history_scrollbar_value = float(self.history_adjustment.get_value())
-        self._history_drag_last_requested = self._last_history_scrollbar_value
-        self._scrollbar_native_bound = False
-        self._history_request_lock = threading.Lock()
-        self._history_scroll_generation = 0
-        self._history_scroll_sequence = 0
-        self._history_last_applied_sequence = 0
-        self._pending_history_delta = 0
-        self._history_worker_active = False
-        self._history_worker_generation: int | None = None
-        self._pending_history_apply = None
-        self._history_apply_scheduled = False
         self.scrollbar = Gtk.Scrollbar.new(
             Gtk.Orientation.VERTICAL,
-            adjustment=self.history_adjustment,
+            adjustment=self.native_adjustment,
         )
         _style(self.scrollbar, "td-terminal-scrollbar")
         self.scrollbar.get_style_context().remove_class("overlay-indicator")
@@ -533,15 +461,11 @@ class AttachTerminal(Gtk.Box):
         self.scrollbar.set_hexpand(False)
         self.scrollbar.set_vexpand(True)
         self.scrollbar.set_opacity(1.0)
-        self.history_adjustment.connect(
-            "value-changed",
-            self._on_history_scrollbar_value_changed,
-        )
-        # Do not let VTE synthesize Up/Down fallback keys for an application
-        # history gesture. Alternate-screen applications that negotiate mouse
-        # reporting still receive their own wheel protocol through VTE.
+        # With VTE as the real emulator, stock wheel handling (including the
+        # arrow-key fallback inside alternate-screen apps) is the desired
+        # behaviour of a modern terminal.
         try:
-            self.terminal.set_enable_fallback_scrolling(False)
+            self.terminal.set_enable_fallback_scrolling(True)
         except Exception:
             pass
         self.terminal.set_scroll_on_output(False)
@@ -561,8 +485,7 @@ class AttachTerminal(Gtk.Box):
         self.terminal.connect("button-press-event", self._on_button_press)
         self.terminal.connect("scroll-event", self._on_terminal_scroll)
         self.terminal.connect("size-allocate", self._on_terminal_size_allocate)
-        self.terminal.connect("child-exited", self._on_attach_child_exited)
-        self.connect("destroy", lambda *_: self._cancel_pending_spawn())
+        self.connect("destroy", lambda *_: self.detach())
         self._selection_pending = False
         self._selection_autocopy_source_id = 0
         # Last select-to-copy payload — used when pasting back into this terminal
@@ -571,10 +494,10 @@ class AttachTerminal(Gtk.Box):
         self.terminal_row.pack_start(self.terminal, True, True, 0)
         self.terminal_row.pack_start(self.scrollbar, False, True, 0)
         self.pack_start(self.terminal_row, True, True, 0)
-        # tmux renders dotted padding when a client attaches at the PTY default
-        # 80x24 and the GTK window is resized immediately afterwards. Debounce
-        # the initial allocation so tmux receives the final VTE grid from frame 1.
-        self._spawn_fallback_source_id = GLib.timeout_add(500, self._spawn_fallback)
+        # The pane connects after the first stable size-allocate so tmux sees
+        # the final VTE grid from frame 1. This fallback covers widgets that
+        # never receive an allocation (e.g. hidden restored tabs).
+        self._connect_fallback_source_id = GLib.timeout_add(500, self._connect_fallback)
 
     def rebind_window_handlers(
         self,
@@ -657,28 +580,23 @@ class AttachTerminal(Gtk.Box):
         except Exception:
             pass
 
-    def _cancel_pending_spawn(self) -> None:
-        self._remove_glib_source(self._spawn_source_id)
-        self._remove_glib_source(self._spawn_fallback_source_id)
-        self._remove_glib_source(self._attach_restart_source_id)
-        self._remove_glib_source(self._attach_stable_source_id)
-        self._remove_glib_source(self._resize_sync_source_id)
-        self._remove_glib_source(self._cursor_hide_source_id)
-        self._remove_glib_source(self._scroll_idle_source_id)
-        self._spawn_source_id = 0
-        self._spawn_fallback_source_id = 0
-        self._attach_restart_source_id = 0
-        self._attach_stable_source_id = 0
-        self._resize_sync_source_id = 0
-        self._cursor_hide_source_id = 0
-        self._scroll_idle_source_id = 0
+    def _cancel_pending_connect(self) -> None:
+        for attr in (
+            "_connect_source_id",
+            "_connect_fallback_source_id",
+            "_attach_stable_source_id",
+            "_resize_sync_source_id",
+            "_cursor_hide_source_id",
+            "_scroll_idle_source_id",
+        ):
+            self._remove_glib_source(getattr(self, attr, 0))
+            setattr(self, attr, 0)
 
     def _on_terminal_size_allocate(self, _terminal, _allocation) -> None:
         columns = max(0, int(self.terminal.get_column_count()))
         rows = max(0, int(self.terminal.get_row_count()))
         self._last_allocated_grid = (columns, rows)
-        if self.process is not None:
-            self._sync_pty_geometry(columns=columns, rows=rows)
+        if self.controller is not None:
             # VTE updates its character grid as part of allocation. Read it
             # again after GTK finishes the frame so a Paned/window expansion
             # cannot leave tmux at the previous, smaller grid.
@@ -686,28 +604,28 @@ class AttachTerminal(Gtk.Box):
             return
         if (
             self._detached
-            or getattr(self, "_terminally_stopped", False)
-            or getattr(self, "_attach_restart_deferred", False)
+            or self._terminally_stopped
+            or self._attach_restart_deferred
             or columns < 2
             or rows < 2
         ):
             return
-        self._remove_glib_source(self._spawn_source_id)
-        self._spawn_source_id = GLib.timeout_add(60, self._spawn_after_stable_allocation)
+        self._remove_glib_source(self._connect_source_id)
+        self._connect_source_id = GLib.timeout_add(60, self._connect_after_stable_allocation)
 
-    def _spawn_after_stable_allocation(self) -> bool:
-        self._spawn_source_id = 0
+    def _connect_after_stable_allocation(self) -> bool:
+        self._connect_source_id = 0
         if (
-            self.process is not None
+            self.controller is not None
             or self._detached
-            or getattr(self, "_terminally_stopped", False)
-            or getattr(self, "_attach_restart_deferred", False)
+            or self._terminally_stopped
+            or self._attach_restart_deferred
         ):
             return False
         columns, rows = self._last_allocated_grid
         if columns < 2 or rows < 2:
             return False
-        self._spawn(columns=columns, rows=rows)
+        self._connect_stream(columns=columns, rows=rows)
         return False
 
     def request_geometry_sync(self, *, delay_ms: int = 45) -> None:
@@ -721,13 +639,12 @@ class AttachTerminal(Gtk.Box):
 
     def _sync_after_stable_geometry(self) -> bool:
         self._resize_sync_source_id = 0
-        if self._detached or self.process is None:
+        if self._detached or self.controller is None:
             return False
         columns = max(0, int(self.terminal.get_column_count()))
         rows = max(0, int(self.terminal.get_row_count()))
         self._last_allocated_grid = (columns, rows)
-        self._sync_pty_geometry(columns=columns, rows=rows, force=True)
-        self._request_client_redraw()
+        self._sync_stream_geometry(columns=columns, rows=rows, force=True)
         return False
 
     def apply_canonical_grid(self, *, columns: int, rows: int) -> None:
@@ -746,173 +663,196 @@ class AttachTerminal(Gtk.Box):
             pass
         else:
             self._last_allocated_grid = grid
-        self._sync_pty_geometry(columns=columns, rows=rows, force=True)
-        self._request_client_redraw()
+        self._sync_stream_geometry(columns=columns, rows=rows, force=True)
 
-    def _request_client_redraw(self) -> None:
-        """Repaint this attach client from the tmux server's screen.
-
-        Without an alternate screen, VTE rewraps its normal buffer whenever
-        the widget's column count changes, while tmux only repaints cells
-        that differ from its own client-screen model.  A debounced resize
-        storm can therefore leave stale fragments on screen that tmux
-        believes are already correct.  ``refresh-client`` forces a full
-        redraw from server truth and is visually a no-op when both agree.
-        """
-
-        tty_path = self._client_tty
-        if not tty_path or self.process is None or self.process.poll() is not None:
-            return
-        try:
-            subprocess.Popen(
-                [self.argv[0], "refresh-client", "-t", tty_path],
-                env=dict(self._child_environment),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                start_new_session=True,
-            )
-        except Exception:
-            pass
-
-    def _spawn_fallback(self) -> bool:
-        self._spawn_fallback_source_id = 0
+    def _connect_fallback(self) -> bool:
+        self._connect_fallback_source_id = 0
         if (
-            self.process is not None
+            self.controller is not None
             or self._detached
-            or getattr(self, "_terminally_stopped", False)
-            or getattr(self, "_attach_restart_deferred", False)
+            or self._terminally_stopped
+            or self._attach_restart_deferred
         ):
             return False
         columns = max(2, int(self.terminal.get_column_count() or 80))
         rows = max(2, int(self.terminal.get_row_count() or 24))
-        self._spawn(columns=columns, rows=rows)
+        self._connect_stream(columns=columns, rows=rows)
         return False
 
-    def _prime_native_scrollback(self) -> bool:
-        """Seed one restored tmux pane into VTE's normal-screen history.
+    def _ensure_loopback_pty(self) -> None:
+        """Give VTE a loopback PTY so its input side has a real terminal.
 
-        A newly attached client receives only tmux's current screen. Feeding a
-        bounded plain-text snapshot before the first attach makes already-live
-        sessions immediately scrollable without restarting or modifying the
-        process in the pane. Future terminal output remains in this same VTE
-        buffer because the attach client cannot enter the alternate screen.
+        No child process runs on the slave. Everything VTE writes to the
+        master (keystrokes, bracketed paste, DA/XTVERSION probe replies) is
+        read back off the slave and forwarded to the tmux pane through the
+        control-mode client — exactly the bytes a directly attached terminal
+        would send. Nothing is ever written to the slave: pane output goes
+        through ``terminal.feed`` so the PTY stays a one-way input channel.
         """
 
-        if self._native_history_primed:
-            return False
-        history_reader = getattr(self, "_selection_history_handler", None)
-        if not callable(history_reader):
-            return False
-        try:
-            history = history_reader()
-        except Exception:
-            return False
-        if not isinstance(history, str) or not history:
-            return False
-        history = history[-2_000_000:].replace("\x00", "")
-        history = _without_replayed_vte_probe_echo(history)
-        payload = history.rstrip("\r\n").replace("\r\n", "\n").replace(
-            "\r", "\n"
+        if self.pty_obj is not None:
+            return
+        master_fd, slave_fd = pty.openpty()
+        tty.setraw(slave_fd, when=termios.TCSANOW)
+        os.set_blocking(slave_fd, False)
+        self._loopback_fd = slave_fd
+        self.pty_obj = Vte.Pty.new_foreign_sync(master_fd, None)
+        self.terminal.set_pty(self.pty_obj)
+        # Keep a Python reference to the channel; GLib does not extend its
+        # lifetime past the watch registration.
+        self._loopback_channel = GLib.IOChannel.unix_new(slave_fd)
+        self._loopback_watch_id = GLib.io_add_watch(
+            self._loopback_channel,
+            GLib.PRIORITY_DEFAULT,
+            GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
+            self._on_loopback_readable,
         )
-        if not payload:
+
+    def _on_loopback_readable(self, _channel, condition) -> bool:
+        if condition & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
+            self._loopback_watch_id = 0
             return False
-        try:
-            self.terminal.feed((payload.replace("\n", "\r\n") + "\r\n").encode())
-        except Exception:
-            return False
-        self._native_history_primed = True
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunk = os.read(self._loopback_fd, 65536)
+            except BlockingIOError:
+                break
+            except OSError:
+                self._loopback_watch_id = 0
+                return False
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if len(chunk) < 65536:
+                break
+        data = b"".join(chunks)
+        if data and self.controller is not None and not self._detached:
+            try:
+                self.controller.send_bytes(data)
+            except Exception:
+                pass
         return True
 
-    def _sync_pty_geometry(self, *, columns: int, rows: int, force: bool = False) -> None:
-        if columns < 2 or rows < 2 or self.pty_obj is None:
+    def _sync_stream_geometry(self, *, columns: int, rows: int, force: bool = False) -> None:
+        if columns < 2 or rows < 2:
             return
         grid = (columns, rows)
         if grid == self._last_synced_grid and not force:
             return
-        try:
-            self.pty_obj.set_size(rows, columns)
-            self._last_synced_grid = grid
-        except Exception:
-            return
-        # VTE may already have applied the same kernel winsize by the time a
-        # debounced layout callback runs. An explicit SIGWINCH makes the tmux
-        # client re-read it even when a repeated TIOCSWINSZ is a no-op.
-        if self.process is not None and self.process.poll() is None:
+        self._last_synced_grid = grid
+        if self.pty_obj is not None:
             try:
-                os.killpg(os.getpgid(self.process.pid), signal.SIGWINCH)
-            except (OSError, ProcessLookupError):
-                pass
-
-    def _spawn(self, *, columns: int, rows: int) -> None:
-        if (
-            self.process is not None
-            or self._detached
-            or getattr(self, "_terminally_stopped", False)
-            or getattr(self, "_attach_restart_deferred", False)
-        ):
-            return
-        self._cancel_pending_spawn()
-        master_fd, slave_fd = pty.openpty()
-        env = dict(self._child_environment)
-        winsize = struct.pack("HHHH", rows, columns, 0, 0)
-        for fd in (master_fd, slave_fd):
-            try:
-                fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
-            except OSError:
-                pass
-        try:
-            # A newly opened slave starts with canonical input echo enabled.
-            # VTE answers DA/XTVERSION probes immediately after set_pty(); if
-            # tmux has not finished applying its own raw mode yet, those binary
-            # replies are echoed back as literal ``^[...VTE(...)`` shell text.
-            # Make the attach transport raw before exec so there is no echo
-            # window at all; tmux subsequently installs its normal client mode.
-            tty.setraw(slave_fd, when=termios.TCSANOW)
-            # Start the attach client before handing the PTY to VTE.  VTE
-            # emits DA/XTVERSION probes as soon as a PTY is assigned; if that
-            # happens while the slave has no child, the probe responses can be
-            # queued as input and become literal ``^[...`` text in the shell
-            # on every relaunch.  The child owns the slave first, so responses
-            # are consumed by the terminal stack instead of displayed.
-            self._prime_native_scrollback()
-            self.process = subprocess.Popen(
-                self.argv,
-                cwd=self.cwd,
-                env=env,
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                close_fds=True,
-                start_new_session=True,
-            )
-            self.pty_obj = Vte.Pty.new_foreign_sync(master_fd, None)
-            self._last_synced_grid = (0, 0)
-            self._sync_pty_geometry(columns=columns, rows=rows)
-            self.terminal.set_pty(self.pty_obj)
-            try:
-                self.terminal.watch_child(self.process.pid)
-                self._remove_glib_source(self._attach_stable_source_id)
-                self._attach_stable_source_id = GLib.timeout_add(2000, self._mark_attach_stable)
+                self.pty_obj.set_size(rows, columns)
             except Exception:
                 pass
-        finally:
+        controller = self.controller
+        if controller is not None:
             try:
-                self._client_tty = os.ttyname(slave_fd)
-            except OSError:
-                self._client_tty = None
-            try:
-                os.close(slave_fd)
-            except OSError:
+                controller.resize(columns=columns, rows=rows)
+            except Exception:
                 pass
 
-    def _on_attach_child_exited(self, _terminal, _status) -> None:
-        if self._detached:
+    def _connect_stream(self, *, columns: int, rows: int) -> None:
+        if (
+            self.controller is not None
+            or self._detached
+            or self._terminally_stopped
+            or self._attach_restart_deferred
+        ):
             return
-        self.process = None
-        self._remove_glib_source(self._attach_stable_source_id)
-        self._attach_stable_source_id = 0
+        self._remove_glib_source(self._connect_source_id)
+        self._remove_glib_source(self._connect_fallback_source_id)
+        self._connect_source_id = 0
+        self._connect_fallback_source_id = 0
+        self._ensure_loopback_pty()
+        self._sync_stream_geometry(columns=columns, rows=rows, force=True)
+        self._stream_generation += 1
+        generation = self._stream_generation
+        self.controller = PaneStreamController(
+            attach_argv=list(self.argv),
+            environment=dict(self._child_environment),
+            cwd=self.cwd,
+            on_output=lambda data: self._on_stream_output(generation, data),
+            on_pane_dead=lambda: self._on_stream_pane_dead(generation),
+            on_state_change=lambda state: self._on_stream_state(generation, state),
+            history_lines=self._scrollback_extent,
+        )
+        self.controller.start(columns=columns, rows=rows)
+
+    def _on_stream_output(self, generation: int, data: bytes) -> None:
+        # Runs on a PaneStreamController worker thread. Coalesce bursts under
+        # the lock and schedule at most one main-loop drain at a time.
+        if generation != self._stream_generation or self._detached:
+            return
+        with self._output_lock:
+            self._output_buffer.extend(data)
+            if self._output_drain_scheduled:
+                return
+            self._output_drain_scheduled = True
+        GLib.idle_add(self._drain_stream_output, generation)
+
+    def _drain_stream_output(self, generation: int) -> bool:
+        with self._output_lock:
+            payload = bytes(self._output_buffer)
+            self._output_buffer.clear()
+            self._output_drain_scheduled = False
+        if generation != self._stream_generation or self._detached or not payload:
+            return False
+        try:
+            self.terminal.feed(payload)
+        except Exception:
+            pass
+        return False
+
+    def _on_stream_pane_dead(self, generation: int) -> None:
+        # Runs on a PaneStreamController worker thread.
+        GLib.idle_add(self._apply_pane_dead, generation)
+
+    def _apply_pane_dead(self, generation: int) -> bool:
+        if generation != self._stream_generation or self._detached:
+            return False
+        try:
+            self.terminal.feed(b"\r\n\x1b[2m[process exited]\x1b[0m\r\n")
+        except Exception:
+            pass
+        return False
+
+    def _on_stream_state(self, generation: int, state: ClientState) -> None:
+        # Runs on a PaneStreamController worker thread.
+        GLib.idle_add(self._apply_stream_state, generation, state)
+
+    def _apply_stream_state(self, generation: int, state: ClientState) -> bool:
+        if generation != self._stream_generation or self._detached:
+            return False
+        if state is ClientState.CONNECTED:
+            # Every (re)connect replays the pane's full history. Reset the
+            # emulator first so scrollback is never duplicated; this CONNECTED
+            # idle was queued before the replay's output idle, so the reset
+            # always lands ahead of the replayed bytes.
+            with self._output_lock:
+                self._output_buffer.clear()
+            try:
+                self.terminal.reset(True, True)
+            except Exception:
+                pass
+            self._remove_glib_source(self._attach_stable_source_id)
+            self._attach_stable_source_id = GLib.timeout_add(2000, self._mark_attach_stable)
+        elif state is ClientState.RECONNECTING:
+            self._remove_glib_source(self._attach_stable_source_id)
+            self._attach_stable_source_id = 0
+            self._classify_stream_interruption()
+        return False
+
+    def _classify_stream_interruption(self) -> None:
+        """Decide whether a lost control-mode client should keep retrying.
+
+        ``True`` — transient failure: the controller keeps reconnecting on
+        its own. ``None`` — an auth transition owns the tmux target; pause
+        every connect path until the completed transaction can classify the
+        replacement exactly once. ``False`` — the session is gone for good.
+        """
+
         should_retry: bool | None = True
         handler = getattr(self, "_attach_exit_handler", None)
         if callable(handler):
@@ -923,40 +863,41 @@ class AttachTerminal(Gtk.Box):
                 # A failed liveness check is inconclusive. Preserve the normal
                 # client-only retry path instead of declaring the task dead.
                 should_retry = True
+        if should_retry is True:
+            return
         if should_retry is None:
-            # Auth activation can intentionally remove the tmux target between
-            # terminating and recreating it. Pause every spawn path until the
-            # completed transaction can classify the replacement exactly once.
             self._attach_restart_deferred = True
-            for attr in (
-                "_spawn_source_id",
-                "_spawn_fallback_source_id",
-                "_attach_restart_source_id",
-            ):
-                source_id = getattr(self, attr, 0)
-                self._remove_glib_source(source_id)
-                setattr(self, attr, 0)
-            return
-        if not should_retry:
+        else:
             self._terminally_stopped = True
-            self._cancel_pending_spawn()
-            return
-        self._schedule_attach_restart()
+        self._teardown_stream()
+
+    def _teardown_stream(self) -> None:
+        controller = self.controller
+        self.controller = None
+        self._stream_generation += 1
+        if controller is not None:
+            try:
+                controller.stop()
+            except Exception:
+                pass
+        with self._output_lock:
+            self._output_buffer.clear()
+            self._output_drain_scheduled = False
 
     def resolve_deferred_attach(self) -> bool:
-        """Classify and resume one attach client paused for an auth transition."""
+        """Classify and resume one pane stream paused for an auth transition."""
 
         if (
             self._detached
-            or getattr(self, "_terminally_stopped", False)
-            or not getattr(self, "_attach_restart_deferred", False)
+            or self._terminally_stopped
+            or not self._attach_restart_deferred
         ):
             return False
         handler = getattr(self, "_attach_exit_handler", None)
         try:
             decision = handler() if callable(handler) else True
         except Exception:
-            # As on an ordinary client exit, an inconclusive liveness query
+            # As on an ordinary interruption, an inconclusive liveness query
             # keeps the non-destructive retry path available.
             decision = True
         if decision is None:
@@ -964,48 +905,23 @@ class AttachTerminal(Gtk.Box):
         self._attach_restart_deferred = False
         if not bool(decision):
             self._terminally_stopped = True
-            self._cancel_pending_spawn()
+            self._cancel_pending_connect()
             return False
-        self._schedule_attach_restart()
-        return False
-
-    def _schedule_attach_restart(self) -> None:
-        if (
-            self._detached
-            or getattr(self, "_terminally_stopped", False)
-            or getattr(self, "_attach_restart_deferred", False)
-            or self._attach_restart_source_id
-        ):
-            return
-        exponent = min(self._attach_restart_attempts, 5)
-        delay_ms = min(5000, 150 * (2 ** exponent))
-        self._attach_restart_attempts += 1
-        self._attach_restart_source_id = GLib.timeout_add(delay_ms, self._restart_attach_client)
-
-    def _restart_attach_client(self) -> bool:
-        self._attach_restart_source_id = 0
-        if (
-            self._detached
-            or getattr(self, "_terminally_stopped", False)
-            or getattr(self, "_attach_restart_deferred", False)
-        ):
-            return False
-        if self.process is not None and self.process.poll() is None:
-            return False
-        self.process = None
+        # ``stop()`` is terminal for a controller, so resume with a fresh one
+        # sized to the current VTE grid.
         columns = max(2, int(self.terminal.get_column_count() or 80))
         rows = max(2, int(self.terminal.get_row_count() or 24))
-        try:
-            self._spawn(columns=columns, rows=rows)
-        except OSError:
-            self.process = None
-            self._schedule_attach_restart()
+        self._connect_stream(columns=columns, rows=rows)
         return False
 
     def _mark_attach_stable(self) -> bool:
         self._attach_stable_source_id = 0
-        if not self._detached and self.process is not None and self.process.poll() is None:
-            self._attach_restart_attempts = 0
+        controller = self.controller
+        if (
+            not self._detached
+            and controller is not None
+            and controller.state is ClientState.CONNECTED
+        ):
             handler = getattr(self, "_attach_stable_handler", None)
             if callable(handler):
                 try:
@@ -1017,21 +933,22 @@ class AttachTerminal(Gtk.Box):
         return False
 
     def detach(self) -> None:
+        if self._detached:
+            return
         self._detached = True
-        self._cancel_async_history_scroll()
-        self._cancel_pending_spawn()
+        self._cancel_pending_connect()
         self._cleanup_clipboard_images()
-        if not self.process or self.process.poll() is not None:
-            return
-        try:
-            os.killpg(os.getpgid(self.process.pid), signal.SIGHUP)
-        except ProcessLookupError:
-            return
-        except OSError:
+        self._teardown_stream()
+        if self._loopback_watch_id:
+            self._remove_glib_source(self._loopback_watch_id)
+            self._loopback_watch_id = 0
+        self._loopback_channel = None
+        if self._loopback_fd >= 0:
             try:
-                self.process.terminate()
-            except Exception:
+                os.close(self._loopback_fd)
+            except OSError:
                 pass
+            self._loopback_fd = -1
 
     def copy_clipboard(self) -> None:
         self._copy_selection_to_clipboards()
@@ -1044,13 +961,6 @@ class AttachTerminal(Gtk.Box):
         """Paste PRIMARY selection into the shell as input (middle-click)."""
         self._paste_from_selection(Gdk.SELECTION_PRIMARY, prefer_last=True)
 
-    def _history_bottom_value(self) -> float:
-        adjustment = self.history_adjustment
-        return max(
-            float(adjustment.get_lower()),
-            float(adjustment.get_upper()) - float(adjustment.get_page_size()),
-        )
-
     def _native_bottom_value(self) -> float:
         adjustment = self.native_adjustment
         return max(
@@ -1058,67 +968,8 @@ class AttachTerminal(Gtk.Box):
             float(adjustment.get_upper()) - float(adjustment.get_page_size()),
         )
 
-    def _bind_scrollbar_for_selection(self, active: bool) -> None:
-        """Expose VTE's adjustment only while a real VTE selection owns review."""
-
-        active = bool(active)
-        if active == self._scrollbar_native_bound:
-            return
-        try:
-            self.scrollbar.set_adjustment(
-                self.native_adjustment if active else self.history_adjustment
-            )
-        except Exception:
-            return
-        self._scrollbar_native_bound = active
-
-    def _set_history_scrollbar_value(self, value: float) -> None:
-        adjustment = self.history_adjustment
-        lower = float(adjustment.get_lower())
-        upper = self._history_bottom_value()
-        self._history_scrollbar_syncing = True
-        try:
-            adjustment.set_value(min(upper, max(lower, float(value))))
-            self._last_history_scrollbar_value = float(adjustment.get_value())
-            self._history_drag_last_requested = self._last_history_scrollbar_value
-        finally:
-            self._history_scrollbar_syncing = False
-
-    def _set_history_depth(self, depth: int, *, extent: int | None = None) -> None:
-        """Synchronize the proxy from backend/logical history depth evidence."""
-
-        clean_depth = max(0, int(depth))
-        adjustment = self.history_adjustment
-        page = max(1.0, float(adjustment.get_page_size()))
-        current_extent = max(0.0, float(adjustment.get_upper()) - page)
-        target_extent = max(
-            current_extent,
-            float(clean_depth),
-            float(max(0, int(extent))) if extent is not None else 0.0,
-        )
-        self._history_scrollbar_syncing = True
-        try:
-            if abs(target_extent - current_extent) > 0.5:
-                adjustment.set_upper(target_extent + page)
-            bottom = max(
-                float(adjustment.get_lower()),
-                float(adjustment.get_upper()) - float(adjustment.get_page_size()),
-            )
-            adjustment.set_value(
-                min(bottom, max(float(adjustment.get_lower()), bottom - clean_depth))
-            )
-            self._last_history_scrollbar_value = float(adjustment.get_value())
-            self._history_drag_last_requested = self._last_history_scrollbar_value
-        finally:
-            self._history_scrollbar_syncing = False
-
-    def _sync_history_from_outcome(self, outcome: ScrollOutcome) -> None:
-        if outcome.depth is None:
-            return
-        self._set_history_depth(outcome.depth, extent=outcome.extent)
-
     def _move_native_history(self, lines: int) -> None:
-        """Move only VTE's retained normal-screen buffer for selection review."""
+        """Move VTE's retained normal-screen buffer by whole rows."""
 
         adjustment = self.native_adjustment
         try:
@@ -1135,223 +986,17 @@ class AttachTerminal(Gtk.Box):
             return
 
     def reset_scrollbar(self) -> None:
-        """Reset the application-aware history proxy to its live endpoint."""
+        """Return the scrollbar to the live endpoint of VTE's history."""
 
-        self._set_history_depth(0)
+        self.scroll_to_bottom()
 
     def scroll_to_bottom(self) -> None:
-        """Return both application history and VTE's viewport to live output."""
+        """Return VTE's viewport to live output."""
 
-        self.reset_scrollbar()
         try:
             self.native_adjustment.set_value(self._native_bottom_value())
         except Exception:
             pass
-
-    def _cancel_async_history_scroll(self) -> None:
-        """Invalidate queued/in-flight thumb work without killing backend commands."""
-
-        with self._history_request_lock:
-            self._history_scroll_generation += 1
-            self._pending_history_delta = 0
-            self._pending_history_apply = None
-            # An already-running worker remains marked active until it observes
-            # generation drift. This prevents a second worker from racing the
-            # same widget while the old backend call is still returning.
-            self._history_drag_last_requested = self._last_history_scrollbar_value
-
-    def _queue_history_scroll_delta(self, delta: int) -> None:
-        """Coalesce one thumb movement and keep tmux I/O off the GTK thread."""
-
-        clean_delta = int(delta)
-        if not clean_delta or self._detached:
-            return
-        admitted = False
-        with self._history_request_lock:
-            self._pending_history_delta += clean_delta
-            generation = self._history_scroll_generation
-            if self._history_worker_active:
-                return
-            admitted = _HISTORY_SCROLL_ADMISSION.acquire(blocking=False)
-            if admitted:
-                self._history_worker_active = True
-                self._history_worker_generation = generation
-            else:
-                # Fail fast under global storage pressure. The proxy is restored
-                # to its last applied value on GTK rather than growing an
-                # unbounded executor queue.
-                self._pending_history_delta = 0
-                self._history_drag_last_requested = self._last_history_scrollbar_value
-        if not admitted:
-            _schedule_glib_callback(self._restore_history_proxy_after_failed_drag)
-            return
-        try:
-            _HISTORY_SCROLL_EXECUTOR.submit(
-                self._history_scroll_worker,
-                generation,
-            )
-        except RuntimeError:
-            _HISTORY_SCROLL_ADMISSION.release()
-            with self._history_request_lock:
-                if self._history_worker_generation == generation:
-                    self._history_worker_active = False
-                    self._history_worker_generation = None
-                self._pending_history_delta = 0
-            _schedule_glib_callback(self._restore_history_proxy_after_failed_drag)
-
-    def _restore_history_proxy_after_failed_drag(self) -> bool:
-        self._set_history_scrollbar_value(self._last_history_scrollbar_value)
-        return False
-
-    def _publish_async_history_scroll_outcome(
-        self,
-        generation: int,
-        sequence: int,
-        attempted_delta: int,
-        outcome,
-    ) -> None:
-        """Keep at most one pending GTK completion per terminal widget."""
-
-        schedule = False
-        with self._history_request_lock:
-            if generation != self._history_scroll_generation or self._detached:
-                return
-            self._pending_history_apply = (
-                generation,
-                sequence,
-                attempted_delta,
-                outcome,
-            )
-            if not self._history_apply_scheduled:
-                self._history_apply_scheduled = True
-                schedule = True
-        if schedule:
-            _schedule_glib_callback(self._drain_async_history_scroll_outcome)
-
-    def _drain_async_history_scroll_outcome(self) -> bool:
-        with self._history_request_lock:
-            pending = self._pending_history_apply
-            self._pending_history_apply = None
-            self._history_apply_scheduled = False
-        if pending is None:
-            return False
-        generation, sequence, attempted_delta, outcome = pending
-        return self._apply_async_history_scroll_outcome(
-            generation,
-            sequence,
-            attempted_delta,
-            outcome,
-        )
-
-    def _history_scroll_worker(self, generation: int) -> None:
-        """Serialize one admitted widget's coalesced backend navigation burst."""
-
-        try:
-            while True:
-                with self._history_request_lock:
-                    if self._detached:
-                        self._history_worker_active = False
-                        self._history_worker_generation = None
-                        return
-                    if generation != self._history_scroll_generation:
-                        # Reuse the same admitted worker chain for the newest
-                        # generation instead of queuing a replacement future.
-                        generation = self._history_scroll_generation
-                        self._history_worker_generation = generation
-                    delta = int(self._pending_history_delta)
-                    self._pending_history_delta = 0
-                    if not delta:
-                        self._history_worker_active = False
-                        self._history_worker_generation = None
-                        return
-                    self._history_scroll_sequence += 1
-                    sequence = self._history_scroll_sequence
-
-                handler = getattr(self, "_scroll_handler", None)
-                if not callable(handler):
-                    outcome = None
-                else:
-                    try:
-                        outcome = handler(delta)
-                    except Exception:
-                        outcome = None
-
-                with self._history_request_lock:
-                    stale = generation != self._history_scroll_generation or self._detached
-                    terminal_outcome = (
-                        not isinstance(outcome, ScrollOutcome)
-                        or outcome.disposition is not ScrollDisposition.HANDLED
-                        or outcome.reached_live_edge
-                    )
-                    if stale:
-                        # Do not publish old-generation UI state. Loop once more
-                        # so this same admitted worker can absorb any new delta.
-                        continue
-                    if terminal_outcome:
-                        self._pending_history_delta = 0
-                        self._history_worker_active = False
-                        self._history_worker_generation = None
-
-                self._publish_async_history_scroll_outcome(
-                    generation,
-                    sequence,
-                    delta,
-                    outcome,
-                )
-                if terminal_outcome:
-                    return
-        finally:
-            _HISTORY_SCROLL_ADMISSION.release()
-
-    def _apply_async_history_scroll_outcome(
-        self,
-        generation: int,
-        sequence: int,
-        attempted_delta: int,
-        outcome,
-    ) -> bool:
-        """Apply a worker result only if it still belongs to this live widget."""
-
-        with self._history_request_lock:
-            if generation != self._history_scroll_generation or self._detached:
-                return False
-            if sequence <= self._history_last_applied_sequence:
-                return False
-            self._history_last_applied_sequence = sequence
-        if not isinstance(outcome, ScrollOutcome):
-            self._set_history_scrollbar_value(self._last_history_scrollbar_value)
-            return False
-        if outcome.disposition is ScrollDisposition.PASSTHROUGH:
-            # A physical wheel can be passed to a TUI; a scrollbar thumb cannot.
-            # Revert the proxy without synthesizing child input.
-            self._set_history_scrollbar_value(self._last_history_scrollbar_value)
-            if self._history_cursor_hidden:
-                self._set_history_cursor_hidden(False)
-            return False
-        if outcome.disposition is not ScrollDisposition.HANDLED:
-            if outcome.reached_live_edge:
-                self._set_history_depth(0)
-            else:
-                self._set_history_scrollbar_value(self._last_history_scrollbar_value)
-            return False
-        self._sync_history_from_outcome(outcome)
-        if outcome.reached_live_edge:
-            self.prepare_for_live_input()
-            return False
-        self._set_history_cursor_hidden(True)
-        self._arm_scroll_idle_resume()
-        return False
-
-    def _on_history_scrollbar_value_changed(self, adjustment) -> None:
-        if self._history_scrollbar_syncing or self._scrollbar_native_bound:
-            return
-        requested = float(adjustment.get_value())
-        previous_requested = float(self._history_drag_last_requested)
-        delta = int(round(requested - previous_requested))
-        self._history_drag_last_requested = requested
-        if not delta:
-            return
-        self._queue_history_scroll_delta(delta)
 
     def _feed_text(self, text: str) -> bool:
         """Paste text through VTE so bracketed-paste mode can prevent submit."""
@@ -1758,16 +1403,6 @@ class AttachTerminal(Gtk.Box):
             self._selection_pending = bool(self.terminal.get_has_selection())
         except Exception:
             self._selection_pending = False
-        # While VTE owns a real selection, expose exactly the native VTE
-        # adjustment so wheel/drag extension keeps one continuous selection.
-        # Invalidate queued/in-flight thumb results before rebinding: a backend
-        # command already inside tmux may finish, but no stale completion or
-        # follow-up navigation is allowed to mutate the new selection surface.
-        # Clearing the selection atomically rebinds the persistent bar to the
-        # application-aware tmux/Codex history proxy.
-        if self._selection_pending:
-            self._cancel_async_history_scroll()
-        self._bind_scrollbar_for_selection(self._selection_pending)
         if self._selection_pending:
             self._queue_selection_copy(delay_ms=120)
 
@@ -1957,19 +1592,9 @@ class AttachTerminal(Gtk.Box):
     def _on_button_press(self, _terminal, event: Gdk.EventButton) -> bool:
         button = int(getattr(event, "button", 0) or 0)
         if button == 1:
-            # A backend history redraw that is already in flight cannot be
-            # cancelled at the tmux boundary. Do not let VTE establish a new
-            # selection underneath that redraw: invalidate pending UI work and
-            # consume this one press. The next press is accepted after the
-            # worker has observed the generation change and retired.
-            if bool(getattr(self, "_history_worker_active", False)):
-                cancel = getattr(self, "_cancel_async_history_scroll", None)
-                if callable(cancel):
-                    cancel()
-                return True
-            # Otherwise let VTE see the complete press/drag/release gesture.
-            # Live viewport restoration happens on release only when no
-            # selection was created, so ordinary drag-to-copy is preserved.
+            # Let VTE see the complete press/drag/release gesture. Live
+            # viewport restoration happens on release only when no selection
+            # was created, so ordinary drag-to-copy is preserved.
             return False
         # Middle-click paste from PRIMARY / last selection (classic terminal).
         if button == 2:
@@ -1981,12 +1606,13 @@ class AttachTerminal(Gtk.Box):
         return False
 
     def _on_terminal_scroll(self, terminal, event: Gdk.EventScroll) -> bool:
-        """Route wheel input through exactly one canonical history owner.
+        """Keep a held selection coherent while the wheel moves history.
 
-        Normal review belongs to tmux/Codex and never consults VTE's viewport
-        for the live-edge decision.  A real VTE text selection is the sole
-        exception: it remains inside the retained VTE buffer so redraws cannot
-        destroy the selected range.
+        With control-mode rendering VTE owns the one real scrollback buffer,
+        so plain wheel input uses VTE's stock handler, including negotiated
+        alternate-screen mouse protocols. Only an active text selection needs
+        help: its payload is snapshotted and a held drag is extended through
+        the scroll so redraws cannot destroy the selected range.
         """
 
         direction = getattr(event, "direction", None)
@@ -1995,6 +1621,14 @@ class AttachTerminal(Gtk.Box):
             Gdk.ScrollDirection.DOWN,
             Gdk.ScrollDirection.SMOOTH,
         }:
+            return False
+        try:
+            has_selection = bool(self.terminal.get_has_selection())
+        except Exception:
+            has_selection = False
+        if not has_selection:
+            # No selection: VTE's default wheel handling is the stock,
+            # correct terminal behaviour.
             return False
         if direction == Gdk.ScrollDirection.UP:
             delta = -3.0
@@ -2007,81 +1641,17 @@ class AttachTerminal(Gtk.Box):
             line_delta = -1 if delta < 0 else 1
         if not line_delta:
             return True
-
-        try:
-            has_selection = bool(self.terminal.get_has_selection())
-        except Exception:
-            has_selection = False
-        if has_selection:
-            bind_scrollbar = getattr(self, "_bind_scrollbar_for_selection", None)
-            if callable(bind_scrollbar):
-                bind_scrollbar(True)
-            self._snapshot_selection_before_history_scroll()
-            if self._native_scrollback_available():
-                if self._continue_selection_through_native_scroll(
-                    event, line_delta
-                ):
-                    return True
-                # Fallback scrolling is disabled globally so a non-selection
-                # wheel can never become synthetic Up/Down input in Codex or
-                # another TUI. Move the VTE adjustment explicitly here instead
-                # of relying on VTE's default wheel handler. A completed VTE
-                # selection remains anchored to buffer coordinates while the
-                # viewport moves, so this preserves the highlighted payload and
-                # never redraws tmux/Codex history.
-                self._move_native_history(line_delta)
+        self._snapshot_selection_before_history_scroll()
+        if self._native_scrollback_available():
+            if self._continue_selection_through_native_scroll(event, line_delta):
                 return True
-            # In degraded VTE history, preserving the selection is safer than
-            # switching surfaces or redrawing an unrelated history owner.
-            return True
-
-        bind_scrollbar = getattr(self, "_bind_scrollbar_for_selection", None)
-        # Native-first wheel: once VTE's normal-screen buffer holds history
-        # (seeded on attach and fed continuously because the attach client
-        # never enters the alternate screen), the wheel moves that buffer
-        # directly on the main thread with zero backend round trips. The tmux
-        # history controller keeps ownership only while no native history
-        # exists yet.
-        native_available = getattr(self, "_native_scrollback_available", None)
-        prime_native = getattr(self, "_prime_native_scrollback", None)
-        if (callable(native_available) and native_available()) or (
-            callable(prime_native) and prime_native()
-        ):
-            if callable(bind_scrollbar):
-                bind_scrollbar(True)
+            # A completed VTE selection remains anchored to buffer coordinates
+            # while the viewport moves, so moving the adjustment directly
+            # preserves the highlighted payload.
             self._move_native_history(line_delta)
-            if self._at_native_live_edge():
-                if getattr(self, "_history_cursor_hidden", False):
-                    self._set_history_cursor_hidden(False)
-            else:
-                self._set_history_cursor_hidden(True)
             return True
-        if callable(bind_scrollbar):
-            bind_scrollbar(False)
-        handler = getattr(self, "_scroll_handler", None)
-        if not callable(handler):
-            return True
-        try:
-            outcome = handler(line_delta)
-        except Exception:
-            return True
-        if not isinstance(outcome, ScrollOutcome):
-            return True
-        if outcome.disposition is ScrollDisposition.PASSTHROUGH:
-            if self._history_cursor_hidden:
-                self._set_history_cursor_hidden(False)
-            return False
-        if outcome.disposition is not ScrollDisposition.HANDLED:
-            # Unknown backend state is not permission to navigate VTE's
-            # incidental redraw history. Consume the event and stay put.
-            return True
-
-        self._sync_history_from_outcome(outcome)
-        if outcome.reached_live_edge:
-            self.prepare_for_live_input()
-        else:
-            self._set_history_cursor_hidden(True)
-            self._arm_scroll_idle_resume()
+        # In degraded VTE history, preserving the selection is safer than
+        # letting a redraw destroy the highlighted payload.
         return True
 
     # ------------------------------------------------------------------ #
@@ -2117,7 +1687,6 @@ class AttachTerminal(Gtk.Box):
 
         self._remove_glib_source(self._scroll_idle_source_id)
         self._scroll_idle_source_id = 0
-        self._cancel_async_history_scroll()
         handler = self._live_focus_handler
         if callable(handler):
             try:
@@ -2125,13 +1694,11 @@ class AttachTerminal(Gtk.Box):
             except Exception:
                 return False
             if restored is False:
-                # A failed/unknown backend restore is not permission to reset
-                # the proxy or deliver input into a possibly-open transcript.
+                # A failed/unknown backend restore is not permission to
+                # deliver input into a possibly-open transcript.
                 return False
-        self._bind_scrollbar_for_selection(False)
         self.scroll_to_bottom()
         self._set_history_cursor_hidden(False)
-        self.request_geometry_sync(delay_ms=0)
         return True
 
     def _on_button_release(self, _terminal, event: Gdk.EventButton) -> bool:

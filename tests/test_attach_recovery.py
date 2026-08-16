@@ -6,60 +6,53 @@ from unittest import mock
 
 from termdeck.gtk_app import AttachTerminal, TermDeckWindow
 from termdeck.tmux_backend import TmuxBackend
+from termdeck.tmux_control import ClientState
 
 
-def test_attach_child_exit_schedules_one_restart() -> None:
+def test_stream_reconnect_clears_stable_timer_and_classifies_once() -> None:
     removed: list[int] = []
-    scheduled: list[bool] = []
+    classified: list[bool] = []
     attach = SimpleNamespace(
         _detached=False,
-        process=object(),
+        _stream_generation=3,
         _attach_stable_source_id=17,
         _remove_glib_source=removed.append,
-        _schedule_attach_restart=lambda: scheduled.append(True),
+        _classify_stream_interruption=lambda: classified.append(True),
     )
 
-    AttachTerminal._on_attach_child_exited(attach, None, 1)
+    assert AttachTerminal._apply_stream_state(attach, 3, ClientState.RECONNECTING) is False
 
-    assert attach.process is None
     assert attach._attach_stable_source_id == 0
     assert removed == [17]
-    assert scheduled == [True]
+    assert classified == [True]
 
 
 def test_missing_attach_target_stops_every_restart_path() -> None:
-    removed: list[int] = []
-    scheduled: list[bool] = []
+    torn: list[bool] = []
     attach = SimpleNamespace(
         _detached=False,
         _terminally_stopped=False,
-        process=object(),
-        _attach_stable_source_id=17,
-        _remove_glib_source=removed.append,
-        _schedule_attach_restart=lambda: scheduled.append(True),
+        _attach_restart_deferred=False,
         _attach_exit_handler=lambda: False,
-        _cancel_pending_spawn=lambda: removed.append(99),
+        _teardown_stream=lambda: torn.append(True),
     )
 
-    AttachTerminal._on_attach_child_exited(attach, None, 1)
+    AttachTerminal._classify_stream_interruption(attach)
 
-    assert attach.process is None
     assert attach._terminally_stopped is True
-    assert scheduled == []
-    assert removed == [17, 99]
+    assert attach._attach_restart_deferred is False
+    assert torn == [True]
 
+    # A stopped widget must never schedule a new control-mode connect, even
+    # when GTK keeps delivering size allocations.
+    attach.controller = None
     attach.terminal = SimpleNamespace(
         get_column_count=lambda: 132,
         get_row_count=lambda: 43,
     )
-    attach._last_allocated_grid = (0, 0)
-    attach._sync_pty_geometry = lambda **_kwargs: scheduled.append(True)
-    attach.request_geometry_sync = lambda: scheduled.append(True)
-    attach._spawn_source_id = 0
     with mock.patch("termdeck.gtk_app.GLib.timeout_add") as timeout_add:
         AttachTerminal._on_terminal_size_allocate(attach, None, None)
     timeout_add.assert_not_called()
-    assert scheduled == []
 
 
 def _auth_gap_fixture(*, target_live: bool):
@@ -89,14 +82,20 @@ def _auth_gap_fixture(*, target_live: bool):
         _detached=False,
         _terminally_stopped=False,
         _attach_restart_deferred=False,
-        process=object(),
+        _stream_generation=1,
         _attach_stable_source_id=17,
-        _spawn_source_id=0,
-        _spawn_fallback_source_id=0,
-        _attach_restart_source_id=0,
+        controller=None,
+        terminal=SimpleNamespace(
+            get_column_count=lambda: 132,
+            get_row_count=lambda: 43,
+        ),
         _remove_glib_source=removed_sources.append,
-        _schedule_attach_restart=lambda: scheduled.append(True),
-        _cancel_pending_spawn=lambda: removed_sources.append(99),
+        _connect_stream=lambda **_kwargs: scheduled.append(True),
+        _teardown_stream=lambda: removed_sources.append(99),
+        _cancel_pending_connect=lambda: None,
+    )
+    attach._classify_stream_interruption = (
+        lambda: AttachTerminal._classify_stream_interruption(attach)
     )
     window = SimpleNamespace(
         _auth_switch_inflight={record.id},
@@ -122,18 +121,11 @@ def test_auth_switch_gap_defers_attach_and_completion_resumes_once() -> None:
         _auth_gap_fixture(target_live=True)
     )
 
-    AttachTerminal._on_attach_child_exited(attach, None, 1)
+    AttachTerminal._apply_stream_state(attach, 1, ClientState.RECONNECTING)
 
     assert attach._attach_restart_deferred is True
     assert backend_checks == []
     assert scheduled == []
-    attach.terminal = SimpleNamespace(
-        get_column_count=lambda: 132,
-        get_row_count=lambda: 43,
-    )
-    attach._last_allocated_grid = (0, 0)
-    attach._sync_pty_geometry = lambda **_kwargs: scheduled.append(True)
-    attach.request_geometry_sync = lambda: scheduled.append(True)
     with mock.patch("termdeck.gtk_app.GLib.timeout_add") as timeout_add:
         AttachTerminal._on_terminal_size_allocate(attach, None, None)
     timeout_add.assert_not_called()
@@ -170,7 +162,7 @@ def test_auth_switch_gap_completion_keeps_missing_target_tab_protected() -> None
         _auth_gap_fixture(target_live=False)
     )
 
-    AttachTerminal._on_attach_child_exited(attach, None, 1)
+    AttachTerminal._apply_stream_state(attach, 1, ClientState.RECONNECTING)
     assert attach._attach_restart_deferred is True
     assert backend_checks == []
     assert scheduled == []
@@ -191,7 +183,9 @@ def test_auth_switch_gap_completion_keeps_missing_target_tab_protected() -> None
     assert attach._attach_restart_deferred is True
     assert attach._terminally_stopped is False
     assert scheduled == []
-    assert 99 not in removed
+    # The stream was torn down exactly once when the interruption deferred;
+    # completion with a dead target must not tear it down again.
+    assert removed == [17, 99]
 
     # A delayed replacement remains eligible for in-place reattach instead of
     # being hidden from its notebook/window as a missing session.
@@ -582,59 +576,54 @@ def test_successful_commit_resolves_attach_even_if_selector_refresh_fails(capsys
     assert "could not refresh auth selector" in capsys.readouterr().err
 
 
-def test_attach_child_exit_is_ignored_after_detach() -> None:
-    scheduled: list[bool] = []
+def test_stream_state_change_is_ignored_after_detach() -> None:
+    classified: list[bool] = []
     attach = SimpleNamespace(
         _detached=True,
-        process=object(),
-        _attach_stable_source_id=11,
-        _remove_glib_source=lambda _source_id: None,
-        _schedule_attach_restart=lambda: scheduled.append(True),
+        _stream_generation=1,
+        _classify_stream_interruption=lambda: classified.append(True),
     )
 
-    AttachTerminal._on_attach_child_exited(attach, None, 0)
+    assert AttachTerminal._apply_stream_state(attach, 1, ClientState.RECONNECTING) is False
 
-    assert attach.process is not None
-    assert scheduled == []
+    assert classified == []
 
 
-def test_attach_restart_uses_current_terminal_geometry() -> None:
-    spawned: list[dict[str, int]] = []
+def test_resolve_deferred_attach_uses_current_terminal_geometry() -> None:
+    connected: list[dict[str, int]] = []
     attach = SimpleNamespace(
-        _attach_restart_source_id=42,
         _detached=False,
-        process=SimpleNamespace(poll=lambda: 1),
+        _terminally_stopped=False,
+        _attach_restart_deferred=True,
+        _attach_exit_handler=lambda: True,
         terminal=SimpleNamespace(
             get_column_count=lambda: 132,
             get_row_count=lambda: 43,
         ),
-        _spawn=lambda **kwargs: spawned.append(kwargs),
-        _schedule_attach_restart=lambda: None,
+        _connect_stream=lambda **kwargs: connected.append(kwargs),
     )
 
-    assert AttachTerminal._restart_attach_client(attach) is False
+    assert AttachTerminal.resolve_deferred_attach(attach) is False
 
-    assert attach._attach_restart_source_id == 0
-    assert attach.process is None
-    assert spawned == [{"columns": 132, "rows": 43}]
+    assert attach._attach_restart_deferred is False
+    assert connected == [{"columns": 132, "rows": 43}]
 
 
-def test_terminally_stopped_attach_cannot_be_restarted() -> None:
-    spawned: list[dict[str, int]] = []
+def test_terminally_stopped_attach_cannot_be_resumed() -> None:
+    connected: list[dict[str, int]] = []
     attach = SimpleNamespace(
-        _attach_restart_source_id=42,
         _detached=False,
         _terminally_stopped=True,
-        process=None,
+        _attach_restart_deferred=True,
         terminal=SimpleNamespace(
             get_column_count=lambda: 132,
             get_row_count=lambda: 43,
         ),
-        _spawn=lambda **kwargs: spawned.append(kwargs),
+        _connect_stream=lambda **kwargs: connected.append(kwargs),
     )
 
-    assert AttachTerminal._restart_attach_client(attach) is False
-    assert spawned == []
+    assert AttachTerminal.resolve_deferred_attach(attach) is False
+    assert connected == []
 
 
 def test_missing_attach_makes_stopped_legacy_shell_reopenable() -> None:
@@ -695,63 +684,68 @@ def test_missing_attach_makes_stopped_legacy_shell_reopenable() -> None:
     assert updates[-1]["status"] == "missing"
 
 
-def test_attach_restart_failure_requeues() -> None:
-    scheduled: list[bool] = []
-
-    def fail_spawn(**_kwargs) -> None:
-        raise OSError("pty unavailable")
-
+def test_teardown_stream_stops_controller_and_bumps_generation() -> None:
+    stops: list[bool] = []
     attach = SimpleNamespace(
-        _attach_restart_source_id=9,
-        _detached=False,
-        process=None,
-        terminal=SimpleNamespace(
-            get_column_count=lambda: 0,
-            get_row_count=lambda: 0,
-        ),
-        _spawn=fail_spawn,
-        _schedule_attach_restart=lambda: scheduled.append(True),
+        controller=SimpleNamespace(stop=lambda: stops.append(True)),
+        _stream_generation=4,
+        _output_lock=threading.Lock(),
+        _output_buffer=bytearray(b"stale"),
+        _output_drain_scheduled=True,
     )
 
-    assert AttachTerminal._restart_attach_client(attach) is False
+    AttachTerminal._teardown_stream(attach)
 
-    assert attach.process is None
-    assert scheduled == [True]
+    assert attach.controller is None
+    assert stops == [True]
+    assert attach._stream_generation == 5
+    assert bytes(attach._output_buffer) == b""
+    assert attach._output_drain_scheduled is False
 
 
-def test_attach_restart_backoff_is_bounded_and_coalesced() -> None:
+def test_stale_stream_output_is_discarded_after_teardown() -> None:
+    fed: list[bytes] = []
     attach = SimpleNamespace(
         _detached=False,
-        _attach_restart_source_id=0,
-        _attach_restart_attempts=0,
-        _restart_attach_client=lambda: False,
+        _stream_generation=2,
+        _output_lock=threading.Lock(),
+        _output_buffer=bytearray(b"stale"),
+        _output_drain_scheduled=True,
+        terminal=SimpleNamespace(feed=fed.append),
     )
-    with mock.patch("termdeck.gtk_app.GLib.timeout_add", return_value=77) as timeout_add:
-        AttachTerminal._schedule_attach_restart(attach)
-        assert attach._attach_restart_source_id == 77
-        assert attach._attach_restart_attempts == 1
-        timeout_add.assert_called_once_with(150, attach._restart_attach_client)
 
-        AttachTerminal._schedule_attach_restart(attach)
-        assert timeout_add.call_count == 1
+    # A drain queued by the previous controller generation must clear its
+    # buffered bytes without painting them into the live emulator.
+    assert AttachTerminal._drain_stream_output(attach, 1) is False
 
-        attach._attach_restart_source_id = 0
-        attach._attach_restart_attempts = 20
-        AttachTerminal._schedule_attach_restart(attach)
-        assert timeout_add.call_args.args[0] <= 5000
+    assert fed == []
+    assert bytes(attach._output_buffer) == b""
+    assert attach._output_drain_scheduled is False
 
 
-def test_attach_stable_period_resets_backoff() -> None:
+def test_attach_stable_notifies_handler_only_while_connected() -> None:
+    notified: list[bool] = []
     attach = SimpleNamespace(
         _attach_stable_source_id=91,
         _detached=False,
-        process=SimpleNamespace(poll=lambda: None),
-        _attach_restart_attempts=5,
+        controller=SimpleNamespace(state=ClientState.CONNECTED),
+        _attach_stable_handler=lambda: notified.append(True),
     )
 
     assert AttachTerminal._mark_attach_stable(attach) is False
     assert attach._attach_stable_source_id == 0
-    assert attach._attach_restart_attempts == 0
+    assert notified == [True]
+
+    disconnected = SimpleNamespace(
+        _attach_stable_source_id=7,
+        _detached=False,
+        controller=None,
+        _attach_stable_handler=lambda: notified.append(True),
+    )
+
+    assert AttachTerminal._mark_attach_stable(disconnected) is False
+    assert disconnected._attach_stable_source_id == 0
+    assert notified == [True]
 
 
 def test_recovery_metadata_survives_shell_fallback() -> None:

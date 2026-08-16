@@ -162,6 +162,7 @@ class ControlModeClient:
         self._queued: Deque[_PendingCommand] = deque()
         self._active: _PendingCommand | None = None
         self._swallow_block = False
+        self._greeting_pending = False
         self.reconnect_count = 0
 
     @property
@@ -250,14 +251,11 @@ class ControlModeClient:
         while not pending.done.is_set():
             remaining = self._remaining(deadline)
             if remaining is not None and remaining <= 0:
-                with self._lock:
-                    # A command whose reply has not started can safely be removed.
-                    # An active reply must remain owned by the reader to preserve
-                    # framing for later queued commands.
-                    try:
-                        self._queued.remove(pending)
-                    except ValueError:
-                        pass
+                # The command's bytes were already written, so tmux will still
+                # emit a reply block for it.  The pending entry must stay in
+                # the FIFO so the reader consumes that block when it arrives;
+                # removing it here would pair every later reply with the
+                # wrong caller and permanently desync the connection.
                 return CommandResult(False, (), "timeout")
             pending.done.wait(remaining)
 
@@ -282,6 +280,12 @@ class ControlModeClient:
                     break
                 self._transport = transport
                 self._swallow_block = False
+                # tmux opens every control connection with one %begin/%end
+                # block for the attach command itself. Claim it by position:
+                # a caller can enqueue a command before the reader parses the
+                # greeting, and letting that command steal the greeting block
+                # shifts every later reply onto the wrong caller.
+                self._greeting_pending = True
             self._connected_event.set()
             self._set_state(ClientState.CONNECTED)
             backoff = self._reconnect_initial_seconds
@@ -328,14 +332,18 @@ class ControlModeClient:
         """Parse one line, returning true only when tmux explicitly sent ``%exit``."""
         if raw.startswith("%begin") and (raw == "%begin" or raw[6:7].isspace()):
             with self._lock:
-                if self._active is None and not self._swallow_block and self._queued:
-                    self._active = self._queued.popleft()
-                elif self._active is None:
-                    # tmux sends an attach-command greeting after each connection.
-                    # With no waiting caller it is protocol noise, not an event.
-                    self._swallow_block = True
-                else:
+                if self._active is not None:
                     self._active.lines.append(raw)
+                elif self._greeting_pending:
+                    # The first block on a connection is always the attach
+                    # greeting, never a queued command's reply.
+                    self._greeting_pending = False
+                    self._swallow_block = True
+                elif not self._swallow_block and self._queued:
+                    self._active = self._queued.popleft()
+                else:
+                    # A block with no waiting caller is protocol noise.
+                    self._swallow_block = True
             return False
 
         if raw.startswith("%end") and (raw == "%end" or raw[4:5].isspace()):

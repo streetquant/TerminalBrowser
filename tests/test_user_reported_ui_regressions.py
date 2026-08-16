@@ -14,27 +14,28 @@ def _section(source: str, start_marker: str, end_marker: str) -> str:
 
 
 class UserReportedUiRegressionTests(unittest.TestCase):
-    def test_terminal_attach_waits_for_final_grid_and_seeds_pty_geometry(self) -> None:
+    def test_terminal_attach_waits_for_final_grid_and_seeds_stream_geometry(self) -> None:
         terminal = _section(GTK_APP, "class AttachTerminal", "class WindowOverview")
         self.assertIn('self.terminal.connect("size-allocate", self._on_terminal_size_allocate)', terminal)
-        self.assertIn("GLib.timeout_add(60, self._spawn_after_stable_allocation)", terminal)
-        self.assertIn("termios.TIOCSWINSZ", terminal)
-        self.assertIn('struct.pack("HHHH", rows, columns, 0, 0)', terminal)
-        self.assertIn("self.pty_obj.set_size(rows, columns)", terminal)
-        self.assertNotIn("        self._spawn()", terminal)
+        self.assertIn("GLib.timeout_add(60, self._connect_after_stable_allocation)", terminal)
+        self.assertIn("self._connect_stream(columns=columns, rows=rows)", terminal)
+        self.assertIn("def request_geometry_sync", terminal)
+        self.assertNotIn("termios.TIOCSWINSZ", terminal)
+        self.assertNotIn("_spawn_after_stable_allocation", terminal)
 
-    def test_terminal_attach_starts_child_before_vte_probe(self) -> None:
-        terminal = _section(GTK_APP, "def _spawn(self, *, columns: int, rows: int)", "    def _on_attach_child_exited")
+    def test_terminal_attach_probe_replies_route_to_controller_without_echo(self) -> None:
+        terminal = _section(GTK_APP, "def _ensure_loopback_pty", "    def _connect_stream")
         self.assertLess(
             terminal.index("tty.setraw(slave_fd, when=termios.TCSANOW)"),
-            terminal.index("self.process = subprocess.Popen("),
-        )
-        self.assertLess(
-            terminal.index("self.process = subprocess.Popen("),
             terminal.index("self.pty_obj = Vte.Pty.new_foreign_sync(master_fd, None)"),
         )
-        self.assertIn("DA/XTVERSION probes", terminal)
-        self.assertIn("there is no echo", terminal)
+        self.assertLess(
+            terminal.index("self.pty_obj = Vte.Pty.new_foreign_sync(master_fd, None)"),
+            terminal.index("self.terminal.set_pty(self.pty_obj)"),
+        )
+        self.assertIn("DA/XTVERSION probe replies", terminal)
+        self.assertIn("self.controller.send_bytes(data)", terminal)
+        self.assertNotIn("subprocess.Popen", terminal)
 
     def test_terminal_selection_syncs_to_external_clipboards_and_has_right_click_menu(self) -> None:
         terminal = _section(GTK_APP, "class AttachTerminal", "class WindowOverview")
@@ -138,31 +139,29 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertNotIn("lambda: self.window.retag_sessions(records)", side)
         self.assertIn("lambda: self._kill_records(records)", side)
 
-    def test_terminal_history_ownership_cannot_regress_to_native_vte_scrollbar(self) -> None:
+    def test_terminal_history_is_owned_by_native_vte_scrollback(self) -> None:
         terminal = _section(GTK_APP, "class AttachTerminal", "class WindowOverview")
-        wheel = _section(terminal, "def _on_terminal_scroll", "# ------------------------------------------------------------------ #\n    # Scroll-idle auto-resume")
-        thumb = _section(terminal, "def _on_history_scrollbar_value_changed", "def _feed_text")
 
         self.assertIn("self.native_adjustment = self.terminal.get_vadjustment()", terminal)
-        self.assertIn("self.history_adjustment = Gtk.Adjustment.new(", terminal)
-        self.assertNotIn("self.history_adjustment = self.terminal.get_vadjustment()", terminal)
+        self.assertIn("adjustment=self.native_adjustment,", terminal)
+        self.assertNotIn("self.history_adjustment", terminal)
         self.assertNotIn("_scrollbar_at_live_edge", terminal)
         self.assertNotIn("def _move_scrollbar", terminal)
+        self.assertNotIn("_queue_history_scroll_delta", terminal)
         self.assertIn("def _move_native_history", terminal)
-        self.assertIn("outcome.reached_live_edge", wheel)
-        self.assertNotIn("get_vadjustment", wheel)
-        self.assertIn("self._queue_history_scroll_delta(delta)", thumb)
-        self.assertNotIn("self._scroll_handler(", thumb)
+        self.assertIn("self.terminal.set_enable_fallback_scrolling(True)", terminal)
+        self.assertIn("self.terminal.set_scroll_on_output(False)", terminal)
+        self.assertIn("self.terminal.set_scroll_on_keystroke(True)", terminal)
 
-    def test_terminal_history_live_edge_is_backend_evidence_not_scrollbar_geometry(self) -> None:
+    def test_terminal_wheel_defers_to_vte_unless_a_selection_is_held(self) -> None:
         terminal = _section(GTK_APP, "class AttachTerminal", "class WindowOverview")
         wheel = _section(terminal, "def _on_terminal_scroll", "# ------------------------------------------------------------------ #\n    # Scroll-idle auto-resume")
 
-        self.assertIn("if outcome.reached_live_edge:", wheel)
-        self.assertIn("self.prepare_for_live_input()", wheel)
-        self.assertNotIn("line_delta > 0 and", wheel)
+        self.assertIn("if not has_selection:", wheel)
+        self.assertIn("self._move_native_history(line_delta)", wheel)
+        self.assertNotIn("reached_live_edge", wheel)
         self.assertNotIn("_history_bottom_value()", wheel)
-        self.assertNotIn("_native_bottom_value()", wheel)
+        self.assertNotIn("prepare_for_live_input", wheel)
 
     def test_heavy_search_filters_debounce_refresh_work(self) -> None:
         self.assertIn("def _connect_debounced_refresh", GTK_APP)
