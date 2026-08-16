@@ -7,11 +7,21 @@ replay assembly, and setup retry logic without any tmux server.
 
 from __future__ import annotations
 
+import pathlib
+import signal
+import sys
+import tempfile
 import threading
 import time
 import unittest
 
-from termdeck.pane_stream import PaneStreamController, _STATE_FIELDS
+from termdeck.pane_stream import (
+    PaneStreamController,
+    StreamSetupGate,
+    _STATE_FIELDS,
+    spawn_control_transport,
+    terminate_orphan_control_clients,
+)
 from termdeck.tmux_control import ClientState, CommandResult, ControlEvent
 
 
@@ -196,6 +206,209 @@ class PaneStreamControllerTests(unittest.TestCase):
         controller.start(columns=80, rows=24)
         controller.stop()
         self.assertTrue(client.stopped)
+
+
+class StreamSetupGateTests(unittest.TestCase):
+    def test_limit_bounds_concurrent_holders(self) -> None:
+        gate = StreamSetupGate(limit=1)
+        self.assertTrue(gate.acquire(object()))
+        acquired = threading.Event()
+
+        def worker() -> None:
+            gate.acquire(object())
+            acquired.set()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        time.sleep(0.15)
+        self.assertFalse(acquired.is_set())
+        gate.release()
+        wait_until(acquired.is_set)
+        gate.release()
+
+    def test_promote_moves_waiting_token_ahead(self) -> None:
+        gate = StreamSetupGate(limit=1)
+        self.assertTrue(gate.acquire(object()))
+        order: list[str] = []
+
+        def worker(name: str, token: object) -> None:
+            gate.acquire(token)
+            order.append(name)
+            gate.release()
+
+        first_token = object()
+        second_token = object()
+        threading.Thread(
+            target=worker, args=("first", first_token), daemon=True
+        ).start()
+        wait_until(lambda: len(gate._waiting) == 1)
+        threading.Thread(
+            target=worker, args=("second", second_token), daemon=True
+        ).start()
+        wait_until(lambda: len(gate._waiting) == 2)
+        gate.promote(second_token)
+        gate.release()
+        wait_until(lambda: len(order) == 2)
+        self.assertEqual(order, ["second", "first"])
+
+    def test_abort_while_waiting_returns_false(self) -> None:
+        gate = StreamSetupGate(limit=1)
+        self.assertTrue(gate.acquire(object()))
+        abort = threading.Event()
+        results: list[bool] = []
+
+        def worker() -> None:
+            results.append(gate.acquire(object(), should_abort=abort.is_set))
+
+        threading.Thread(target=worker, daemon=True).start()
+        abort.set()
+        wait_until(lambda: bool(results))
+        self.assertEqual(results, [False])
+        gate.release()
+
+
+class ControllerGateIntegrationTests(unittest.TestCase):
+    def make_gated_controller(self, gate, tag, order):
+        created: dict[str, FakeControlClient] = {}
+
+        def factory(**factory_kwargs) -> FakeControlClient:
+            client = FakeControlClient(**factory_kwargs)
+            created["client"] = client
+            return client
+
+        controller = PaneStreamController(
+            attach_argv=["tmux", "attach-session", "-t", tag],
+            on_output=lambda data, tag=tag: order.append(tag),
+            client_factory=factory,
+            setup_gate=gate,
+        )
+        self.addCleanup(controller.stop)
+        client = created["client"]
+        client.script("list-panes", CommandResult(True, (state_line(0),), None))
+        client.script("capture-pane", CommandResult(True, ("ready$",), None))
+        return controller, client
+
+    def test_setup_waits_for_a_free_gate_slot(self) -> None:
+        gate = StreamSetupGate(limit=1)
+        self.assertTrue(gate.acquire(object()))
+        order: list[str] = []
+        controller, client = self.make_gated_controller(gate, "a", order)
+        controller.start(columns=80, rows=24)
+        client.connect()
+        time.sleep(0.2)
+        self.assertEqual(client.count("list-panes"), 0)
+        gate.release()
+        wait_until(lambda: order)
+        self.assertEqual(client.count("list-panes"), 1)
+
+    def test_slot_is_released_after_setup_finishes(self) -> None:
+        gate = StreamSetupGate(limit=1)
+        order: list[str] = []
+        controller, client = self.make_gated_controller(gate, "a", order)
+        controller.start(columns=80, rows=24)
+        client.connect()
+        wait_until(lambda: order)
+        wait_until(lambda: gate._active == 0)
+
+    def test_prioritize_setup_jumps_the_queue(self) -> None:
+        gate = StreamSetupGate(limit=1)
+        self.assertTrue(gate.acquire(object()))
+        order: list[str] = []
+        background, background_client = self.make_gated_controller(
+            gate, "background", order
+        )
+        visible, visible_client = self.make_gated_controller(
+            gate, "visible", order
+        )
+        background.start(columns=80, rows=24)
+        background_client.connect()
+        wait_until(lambda: len(gate._waiting) == 1)
+        visible.start(columns=80, rows=24)
+        visible_client.connect()
+        wait_until(lambda: len(gate._waiting) == 2)
+        visible.prioritize_setup()
+        gate.release()
+        wait_until(lambda: len(order) >= 2)
+        self.assertEqual(order[0], "visible")
+
+
+class OrphanControlClientSweepTests(unittest.TestCase):
+    def _add_process(self, root, pid, argv, ppid, comm="tmux") -> None:
+        directory = root / str(pid)
+        directory.mkdir()
+        (directory / "cmdline").write_bytes(b"\x00".join(argv) + b"\x00")
+        (directory / "stat").write_text(
+            f"{pid} ({comm}) S {ppid} {pid} {pid} 0 -1 4194304 0 0 0 0",
+            encoding="latin-1",
+        )
+
+    def test_only_orphaned_prefixed_clients_are_signalled(self) -> None:
+        root = pathlib.Path(tempfile.mkdtemp())
+        control = [b"/usr/bin/tmux", b"-C", b"attach-session", b"-t"]
+        self._add_process(root, 101, control + [b"termdeck_programs_1"], ppid=1)
+        self._add_process(root, 102, control + [b"termdeck_programs_2"], ppid=4242)
+        self._add_process(
+            root,
+            103,
+            [b"/usr/bin/tmux", b"attach-session", b"-t", b"termdeck_x", b"-f"],
+            ppid=1,
+        )
+        self._add_process(root, 104, control + [b"someone_elses_session"], ppid=1)
+        self._add_process(
+            root,
+            105,
+            [b"/usr/bin/nvim", b"-C", b"attach-session", b"-t", b"termdeck_y"],
+            ppid=1,
+            comm="nvim",
+        )
+        killed: list[tuple[int, int]] = []
+        count = terminate_orphan_control_clients(
+            proc_root=str(root),
+            kill=lambda pid, sig: killed.append((pid, sig)),
+        )
+        self.assertEqual(killed, [(101, signal.SIGTERM)])
+        self.assertEqual(count, 1)
+
+    def test_missing_proc_root_is_harmless(self) -> None:
+        count = terminate_orphan_control_clients(
+            proc_root="/nonexistent/proc-root",
+            kill=lambda pid, sig: (_ for _ in ()).throw(AssertionError("no kill")),
+        )
+        self.assertEqual(count, 0)
+
+    def test_failed_kill_is_not_counted(self) -> None:
+        root = pathlib.Path(tempfile.mkdtemp())
+        self._add_process(
+            root,
+            201,
+            [b"/usr/bin/tmux", b"-C", b"attach-session", b"-t", b"termdeck_z"],
+            ppid=1,
+        )
+
+        def failing_kill(pid: int, sig: int) -> None:
+            raise ProcessLookupError(pid)
+
+        count = terminate_orphan_control_clients(
+            proc_root=str(root), kill=failing_kill
+        )
+        self.assertEqual(count, 0)
+
+
+class TransportParentDeathTests(unittest.TestCase):
+    def test_spawned_child_has_the_parent_death_signal_set(self) -> None:
+        probe = (
+            "import ctypes, signal, sys; "
+            "value = ctypes.c_int(0); "
+            "ctypes.CDLL(None, use_errno=True).prctl(2, ctypes.byref(value), 0, 0, 0); "
+            "sys.exit(0 if value.value == int(signal.SIGTERM) else 3)"
+        )
+        process = spawn_control_transport([sys.executable, "-c", probe], None, None)
+        try:
+            self.assertEqual(process.wait(timeout=10), 0)
+        finally:
+            for stream in (process.stdin, process.stdout):
+                if stream is not None:
+                    stream.close()
 
 
 if __name__ == "__main__":

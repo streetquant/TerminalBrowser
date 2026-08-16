@@ -17,9 +17,12 @@ callers marshal them onto their event loop.
 
 from __future__ import annotations
 
+import os
 import queue
+import signal
 import subprocess
 import threading
+from collections import deque
 from typing import Callable, Mapping
 
 from .tmux_control import ClientState, ControlEvent, ControlModeClient
@@ -87,6 +90,29 @@ def attach_target(attach_argv: list[str]) -> str | None:
     return None
 
 
+_PR_SET_PDEATHSIG = 1
+
+
+def bind_transport_to_parent_death() -> None:
+    """Runs in the forked child: SIGTERM this transport when its parent dies.
+
+    Control clients otherwise survive a crashed or SIGKILLed instance, stay
+    attached to the shared tmux server forever, and every restart stacks a
+    new generation of zombie clients on top until the server drowns in
+    them.
+    """
+
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(_PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0)
+    except Exception:
+        # Best effort: without the death signal the transport merely behaves
+        # as before; the startup orphan sweep remains as the fallback.
+        pass
+
+
 def spawn_control_transport(
     argv: list[str],
     environment: Mapping[str, str] | None,
@@ -107,7 +133,149 @@ def spawn_control_transport(
         stderr=subprocess.DEVNULL,
         close_fds=True,
         start_new_session=True,
+        preexec_fn=bind_transport_to_parent_death,
     )
+
+
+# Concurrent attach setups allowed per process.  Every setup issues a
+# refresh, a list-panes, and up to two capture-pane commands against the
+# single-threaded tmux server; running every tab at once forms a convoy in
+# which each command exceeds its timeout and the retries multiply the load.
+# A small window keeps enough overlap to hide round-trip latency while the
+# queue drains strictly in (priority, arrival) order.
+_SETUP_CONCURRENCY = 6
+
+
+class StreamSetupGate:
+    """Rank and bound the attach setups running against one tmux server.
+
+    ``acquire`` blocks its caller (a controller worker thread) until the
+    token reaches the head of the queue and a slot is free; ``promote``
+    moves the tab the user is looking at to the head so a visible terminal
+    never waits behind dozens of background tabs.
+    """
+
+    def __init__(self, limit: int = _SETUP_CONCURRENCY) -> None:
+        self._condition = threading.Condition()
+        self._limit = max(1, int(limit))
+        self._active = 0
+        self._waiting: deque[object] = deque()
+
+    def acquire(
+        self,
+        token: object,
+        *,
+        priority: bool = False,
+        should_abort: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Wait for a setup slot; ``False`` when the caller aborted the wait."""
+
+        with self._condition:
+            if priority:
+                self._waiting.appendleft(token)
+            else:
+                self._waiting.append(token)
+            while True:
+                if should_abort is not None and should_abort():
+                    try:
+                        self._waiting.remove(token)
+                    except ValueError:
+                        pass
+                    self._condition.notify_all()
+                    return False
+                if self._active < self._limit and self._waiting[0] is token:
+                    self._waiting.popleft()
+                    self._active += 1
+                    return True
+                # Bounded wait so an abort (stop or reconnect) is noticed
+                # promptly even without a matching notify.
+                self._condition.wait(0.25)
+
+    def release(self) -> None:
+        with self._condition:
+            self._active = max(0, self._active - 1)
+            self._condition.notify_all()
+
+    def promote(self, token: object) -> None:
+        """Move a waiting token to the queue head; unknown tokens are ignored."""
+
+        with self._condition:
+            try:
+                self._waiting.remove(token)
+            except ValueError:
+                return
+            self._waiting.appendleft(token)
+            self._condition.notify_all()
+
+
+_DEFAULT_SETUP_GATE = StreamSetupGate()
+
+
+def terminate_orphan_control_clients(
+    session_prefix: str = "termdeck_",
+    *,
+    proc_root: str = "/proc",
+    kill: Callable[[int, int], None] = os.kill,
+) -> int:
+    """SIGTERM ``tmux -C attach-session`` clients inherited by PID 1.
+
+    A control-mode client is only a viewer: killing it never touches the
+    tmux session, its pane, or the process running inside.  Candidates must
+    be reparented to init (their spawning instance is dead) and target a
+    session with our prefix, so live instances and user processes are never
+    affected.  Returns the number of clients signalled.
+    """
+
+    reaped = 0
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(
+                os.path.join(proc_root, entry, "cmdline"), "rb"
+            ) as handle:
+                argv = [part for part in handle.read().split(b"\x00") if part]
+            with open(
+                os.path.join(proc_root, entry, "stat"),
+                "r",
+                encoding="latin-1",
+            ) as handle:
+                stat_line = handle.read()
+        except OSError:
+            continue
+        if len(argv) < 5:
+            continue
+        executable = os.path.basename(argv[0].decode("latin-1", "replace"))
+        if executable != "tmux":
+            continue
+        arguments = [part.decode("latin-1", "replace") for part in argv[1:]]
+        if "-C" not in arguments or "attach-session" not in arguments:
+            continue
+        target = None
+        for index, word in enumerate(arguments):
+            if word == "-t" and index + 1 < len(arguments):
+                target = arguments[index + 1]
+        if target is None or not target.startswith(session_prefix):
+            continue
+        # The parent PID is the fourth stat field; split after the closing
+        # paren so an unusual executable name cannot shift fields.
+        try:
+            ppid = int(stat_line.rsplit(") ", 1)[1].split()[1])
+        except (IndexError, ValueError):
+            continue
+        if ppid != 1:
+            continue
+        try:
+            kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        reaped += 1
+    return reaped
 
 
 class PaneStreamController:
@@ -131,6 +299,7 @@ class PaneStreamController:
         history_lines: int = 2000,
         command_timeout: float = 5.0,
         client_factory: Callable[..., ControlModeClient] | None = None,
+        setup_gate: StreamSetupGate | None = None,
     ) -> None:
         self._attach_argv = list(attach_argv)
         self._target = attach_target(self._attach_argv)
@@ -157,6 +326,11 @@ class PaneStreamController:
         self._size = (80, 24)
         self._resize_queued = False
         self._setup_attempts = 0
+        self._setup_gate = (
+            setup_gate if setup_gate is not None else _DEFAULT_SETUP_GATE
+        )
+        self._setup_token: object = object()
+        self._setup_priority = False
 
         factory = client_factory or ControlModeClient
         self._client = factory(
@@ -235,6 +409,20 @@ class PaneStreamController:
                 return
             self._resize_queued = True
         self._tasks.put(("resize", None))
+
+    def prioritize_setup(self) -> None:
+        """Move this pane to the head of the shared setup queue.
+
+        Called when the tab becomes visible: a terminal the user is looking
+        at must never wait behind dozens of background tabs replaying their
+        history.
+        """
+
+        with self._lock:
+            if self._stopped or self._ready:
+                return
+            self._setup_priority = True
+        self._setup_gate.promote(self._setup_token)
 
     # ------------------------------------------------------- event plumbing
 
@@ -358,7 +546,22 @@ class PaneStreamController:
                 return
 
     def _run_setup(self, generation: int) -> None:
-        if not self._try_setup(generation):
+        def abandoned() -> bool:
+            with self._lock:
+                return generation != self._generation or self._stopped
+
+        with self._lock:
+            priority = self._setup_priority
+        acquired = self._setup_gate.acquire(
+            self._setup_token, priority=priority, should_abort=abandoned
+        )
+        if not acquired:
+            return
+        try:
+            finished = self._try_setup(generation)
+        finally:
+            self._setup_gate.release()
+        if not finished:
             self._schedule_setup_retry(generation)
 
     def _try_setup(self, generation: int) -> bool:

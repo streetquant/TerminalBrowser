@@ -51,7 +51,11 @@ from .session_store import DEFAULT_DB_PATH, SessionStore, short_id, utc_now
 from .settings import AppSettings, SettingsError, save_terminal_options
 from .shortcuts import build_shortcut_map, index_from_key_name, shortcut_entries
 from .task_snapshot import build_task_snapshot
-from .pane_stream import PaneStreamController
+from .pane_stream import (
+    PaneStreamController,
+    bind_transport_to_parent_death,
+    terminate_orphan_control_clients,
+)
 from .tmux_control import ClientState, ControlEvent, ControlModeClient
 from .command_render import default_shell, directory_tab_name, normalise_directory, render_command
 from .window_snapshot import build_window_snapshots
@@ -1687,6 +1691,14 @@ class AttachTerminal(Gtk.Box):
 
         self._remove_glib_source(self._scroll_idle_source_id)
         self._scroll_idle_source_id = 0
+        controller = getattr(self, "controller", None)
+        if controller is not None:
+            # The user is looking at this tab: jump the shared setup queue so
+            # a freshly started instance connects visible terminals first.
+            try:
+                controller.prioritize_setup()
+            except Exception:
+                pass
         handler = self._live_focus_handler
         if callable(handler):
             try:
@@ -7010,6 +7022,16 @@ class TermDeckApplication(Gtk.Application):
                 ui_font=self.settings.ui_font,
                 ui_font_scale=self.settings.ui_font_scale,
             )
+        # Control clients orphaned by a crashed or killed instance stay
+        # attached to the shared tmux server, and every restart stacks another
+        # generation on top of them; reap ours before this instance attaches
+        # its own.  Only tmux -C attach-session processes whose parent is gone
+        # (PID 1) and whose target carries the termdeck_ prefix are touched,
+        # so live instances and user processes are never at risk.
+        try:
+            terminate_orphan_control_clients()
+        except Exception:
+            pass
         self._frame_budget_monitor = None
         if hud_enabled():
             # Opt-in (T1000_PERF_HUD=1) stall evidence: a lightweight GLib tick
@@ -7076,11 +7098,14 @@ class TermDeckApplication(Gtk.Application):
         executable = self.backend.executable
 
         def spawn_transport() -> "subprocess.Popen[bytes]":
+            # The parent-death signal keeps this watcher from surviving as
+            # a zombie client when the app dies without running its cleanup.
             return subprocess.Popen(
                 [executable, "-C", "attach-session"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
+                preexec_fn=bind_transport_to_parent_death,
             )
 
         self._tmux_events_client = ControlModeClient(
