@@ -15,6 +15,9 @@ from termdeck.models import DEFAULT_PALETTE, TerminalTheme
 from termdeck.settings import AppSettings
 from termdeck.ui_theme import (
     TERMINAL_MIN_CURSOR_CONTRAST,
+    greyscale_contrast_overrides,
+    osc4_sequence,
+    xterm_indexed_color,
     TERMINAL_MIN_FG_CONTRAST,
     TERMINAL_MIN_PALETTE_CONTRAST,
     apply_terminal_palette,
@@ -111,7 +114,7 @@ class RaiseContrastBehaviour(unittest.TestCase):
 
     def test_no_change_returns_same_theme_object(self):
         theme = TerminalTheme(
-            foreground_color="#ffffff",
+            foreground_color="#bbbbbb",
             background_color="#000000",
             palette=tuple(["#bbbbbb"] * 16),
         )
@@ -131,6 +134,65 @@ class DefaultsAndWiring(unittest.TestCase):
 
         source = inspect.getsource(gtk_app.apply_theme)
         self.assertIn("ensure_legible_theme", source)
+
+
+class BlackRendersAsForeground(unittest.TestCase):
+    def test_black_slots_become_foreground_on_dark_backgrounds(self):
+        base = TerminalTheme()
+        for name in terminal_palette_names():
+            themed = ensure_legible_theme(apply_terminal_palette(base, name))
+            self.assertEqual(themed.palette[0], themed.foreground_color, name)
+            self.assertEqual(themed.palette[8], themed.foreground_color, name)
+
+    def test_true_black_kept_on_light_backgrounds(self):
+        theme = TerminalTheme(
+            foreground_color="#1a1a1a",
+            background_color="#f6f7f9",
+            palette=tuple(["#000000"] + ["#444444"] * 15),
+        )
+        self.assertEqual(ensure_legible_theme(theme).palette[0], "#000000")
+
+
+class IndexedGreyLifting(unittest.TestCase):
+    def test_xterm_indexed_color_reference_values(self):
+        self.assertEqual(xterm_indexed_color(16), "#000000")
+        self.assertEqual(xterm_indexed_color(196), "#ff0000")
+        self.assertEqual(xterm_indexed_color(231), "#ffffff")
+        self.assertEqual(xterm_indexed_color(232), "#080808")
+        self.assertEqual(xterm_indexed_color(255), "#eeeeee")
+        self.assertIsNone(xterm_indexed_color(15))
+        self.assertIsNone(xterm_indexed_color(256))
+
+    def test_dark_greys_lifted_colored_entries_untouched(self):
+        theme = ensure_legible_theme(
+            apply_terminal_palette(TerminalTheme(), "t1000")
+        )
+        overrides = greyscale_contrast_overrides(theme)
+        indices = [index for index, _ in overrides]
+        self.assertIn(16, indices)
+        self.assertIn(232, indices)
+        self.assertNotIn(196, indices)
+        self.assertNotIn(231, indices)
+        for index, color in overrides:
+            self.assertGreaterEqual(
+                contrast_ratio(color, theme.background_color),
+                TERMINAL_MIN_PALETTE_CONTRAST,
+                index,
+            )
+
+    def test_osc4_sequence_wire_format(self):
+        payload = osc4_sequence(((16, "#ffffff"), (232, "#a0a0a0")))
+        self.assertTrue(payload.startswith(b"\x1b]4;16;rgb:ff/ff/ff\x07"))
+        self.assertIn(b"\x1b]4;232;rgb:a0/a0/a0\x07", payload)
+        self.assertEqual(osc4_sequence(()), b"")
+
+    def test_apply_theme_feeds_indexed_overrides(self):
+        from termdeck import gtk_app
+
+        source = inspect.getsource(gtk_app.apply_theme)
+        self.assertIn("greyscale_contrast_overrides", source)
+        self.assertIn("osc4_sequence", source)
+        self.assertIn("terminal.feed", source)
 
 
 if __name__ == "__main__":

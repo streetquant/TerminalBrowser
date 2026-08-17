@@ -71,6 +71,8 @@ from .tmux_backend import (
 from .ui_theme import (
     apply_terminal_palette,
     ensure_legible_theme,
+    greyscale_contrast_overrides,
+    osc4_sequence,
     build_chrome_css,
     cursor_shape_names,
     format_resource_cue,
@@ -360,6 +362,11 @@ def apply_theme(terminal: Vte.Terminal, theme: TerminalTheme, *, font_override: 
     terminal.set_scrollback_lines(theme.scrollback_lines)
     palette = [rgba(colour) for colour in theme.palette]
     terminal.set_colors(rgba(theme.foreground_color, "#dfe6f2"), rgba(theme.background_color, "#0a0d13"), palette)
+    indexed_overrides = greyscale_contrast_overrides(theme)
+    if indexed_overrides:
+        # Lift near-invisible xterm-256 greys (dim TUI text) as well; the
+        # 16-slot palette above cannot reach indexed colors 16-255.
+        terminal.feed(osc4_sequence(indexed_overrides))
     if theme.cursor_color:
         terminal.set_color_cursor(rgba(theme.cursor_color))
     shape = theme.cursor_shape.lower()

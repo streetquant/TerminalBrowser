@@ -24,6 +24,9 @@ class TerminalStub:
     def set_cursor_shape(self, shape) -> None:
         self.calls.append(("cursor_shape", shape))
 
+    def feed(self, data) -> None:
+        self.calls.append(("feed", bytes(data)))
+
     def set_cursor_blink_mode(self, mode) -> None:
         if self.fail_blink:
             raise RuntimeError("blink mode unsupported")

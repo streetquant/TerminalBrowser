@@ -553,6 +553,65 @@ def raise_contrast(color: str, background: str, minimum: float) -> str:
     return lifted
 
 
+_XTERM_CUBE_LEVELS = (0, 95, 135, 175, 215, 255)
+
+
+def xterm_indexed_color(index: int) -> str | None:
+    """Standard xterm-256 color for indices 16-255 (None outside range)."""
+
+    if 16 <= index <= 231:
+        value = index - 16
+        red = _XTERM_CUBE_LEVELS[value // 36]
+        green = _XTERM_CUBE_LEVELS[(value // 6) % 6]
+        blue = _XTERM_CUBE_LEVELS[value % 6]
+        return "#{:02x}{:02x}{:02x}".format(red, green, blue)
+    if 232 <= index <= 255:
+        level = 8 + (index - 232) * 10
+        return "#{:02x}{:02x}{:02x}".format(level, level, level)
+    return None
+
+
+def greyscale_contrast_overrides(theme: TerminalTheme) -> tuple[tuple[int, str], ...]:
+    """xterm-256 grey entries that need lifting against the theme background.
+
+    TUIs (codex, claude, htop, ...) draw dim text with indexed greys from the
+    256-color table, which VTE resolves internally - the 16-slot palette
+    cannot fix those. Only true greys (r == g == b) are lifted so colored
+    cube entries used for accents and panel backgrounds stay untouched.
+    """
+
+    background = theme.background_color
+    if _parse_hex_color(background) is None:
+        return ()
+    overrides: list[tuple[int, str]] = []
+    for index in range(16, 256):
+        color = xterm_indexed_color(index)
+        if color is None:
+            continue
+        red, green, blue = _parse_hex_color(color)
+        if not (red == green == blue):
+            continue
+        lifted = raise_contrast(color, background, TERMINAL_MIN_PALETTE_CONTRAST)
+        if lifted != color:
+            overrides.append((index, lifted))
+    return tuple(overrides)
+
+
+def osc4_sequence(overrides: tuple[tuple[int, str], ...]) -> bytes:
+    """OSC 4 escape stream redefining indexed colors inside VTE."""
+
+    parts: list[str] = []
+    for index, color in overrides:
+        parsed = _parse_hex_color(color)
+        if parsed is None:
+            continue
+        red, green, blue = parsed
+        parts.append(
+            "\x1b]4;{};rgb:{:02x}/{:02x}/{:02x}\x07".format(index, red, green, blue)
+        )
+    return "".join(parts).encode("ascii")
+
+
 def ensure_legible_theme(theme: TerminalTheme) -> TerminalTheme:
     """Enforce terminal minimum-contrast floors on a TerminalTheme.
 
@@ -574,6 +633,14 @@ def ensure_legible_theme(theme: TerminalTheme) -> TerminalTheme:
         raise_contrast(entry, background, TERMINAL_MIN_PALETTE_CONTRAST)
         for entry in theme.palette
     )
+    if relative_luminance(background) < 0.5:
+        # On dark surfaces ANSI black and bright black render as the theme
+        # foreground: "black" text shows white instead of a dark slate.
+        bright = list(palette)
+        for slot in (0, 8):
+            if slot < len(bright):
+                bright[slot] = foreground
+        palette = tuple(bright)
     if palette != tuple(theme.palette):
         updates["palette"] = palette
     if theme.cursor_color:
