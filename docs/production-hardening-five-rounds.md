@@ -745,3 +745,56 @@ no unexplained stderr, worker, Xvfb, transport, or GUI leak remains
 - No deletion of the previous release until rollback and post-activation evidence
   are complete.
 - No BR or Goal closure based only on unit tests or textual review.
+
+### Round 5 implementation completed
+
+- Promoted the release metadata coherently to `0.2.11`: package metadata,
+  `termdeck.__version__`, the bundled development record, changelog, and release
+  notes agree. Historical releases and the empty future `Unreleased` sections
+  remain intact.
+- Audited the complete source delta, file modes, generated/debris boundaries,
+  and staged secret surface. All new source, tests, scripts, and documentation
+  use repository-standard regular-file modes; `gitleaks` found no staged secret.
+- Committed the exact reviewed implementation before promotion. No source edit is
+  permitted after the final promotion commit without restarting commit-addressed
+  tests, reproducible build, upstream, install, and activation gates.
+- Preserved the existing tmux/VTE/Codex task model throughout. Release build and
+  installation are non-destructive; activation is restricted to the GUI process,
+  and rollback retains the prior immutable release or pre-managed launcher.
+
+### Round 5 commit-addressed validation completed
+
+- The focused release/lifecycle/rendering gate passed `340` tests and `10`
+  subtests on one clean commit.
+- Deterministic rendering validation passed `100,000` arbitrary-byte streams,
+  `20,000` reference-model streams, `248` mutation cases, and `46,875`
+  contrast-grid cases.
+- The clean-tree disposable release workflow produced `build_mode=release`,
+  bound the wheel to the exact source commit, installed `63` verified members,
+  invoked doctor and release information from outside the checkout, rejected
+  member/bootstrap/launcher tamper before import, repaired the stable launcher,
+  exercised legacy rollback, and left all `281` semantic runtime rows unchanged.
+- The complete inherited suite passed with
+  `1153 passed, 1 skipped, 45 warnings, 98 subtests passed`.
+- All `16` strict GTK/VTE/tmux smokes passed with empty stderr. Semantic state,
+  Xvfb PIDs, live T1000 reader TIDs, Git HEAD, and worktree cleanliness were
+  invariant across the matrix.
+
+### Round 5 review and promotion evidence boundary
+
+Round 5 began only after the two sealed Round 4 reviews accepted the operational
+implementation and fixed the promotion plan. A final model-free replay is run
+against the immutable production commit and artifact after this ledger is part of
+the tree. Its exact commit SHA, wheel/manifest/release hashes, private-upstream
+SHA, installed identity, GUI activation receipt, semantic-state equality, worker
+receipts, and BR closure evidence are intentionally recorded in the append-only
+BR and durable Goal receipts rather than embedded here: embedding the hash of the
+commit containing its own hash would be self-referential and would invalidate the
+artifact it claims to identify.
+
+The Round 5 stop decision is therefore fail-closed: this source document records
+the implementation, pre-promotion verification, invariant gates, and evidence
+location; the release is accepted only when the external immutable receipts prove
+all hard equations from the Round 5 gate. If any final replay, upstream, install,
+activation, rollback, or semantic-state obligation fails, the BR and Goal remain
+open and the prior installation remains authoritative.
