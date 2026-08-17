@@ -6968,6 +6968,89 @@ def application_id_for_database(db_path: str | Path | None = None) -> str:
     return _application_id_for_canonical_database(canonical_database_path(db_path))
 
 
+def payload_revival_candidates(records) -> "list[SessionRecord]":
+    """Order live managed sessions whose exact payload may need relaunching.
+
+    A host crash removes tmux and is handled by ``recovery-pending``.  A
+    payload crash inside a surviving session leaves only the launch command's
+    trailing fallback shell running, so reconcile keeps reporting ``running``
+    while the tab replays a finished Codex/Claude conversation.  Only rows
+    with the complete exact-recovery tuple qualify; every actual replacement
+    decision stays inside the backend's fail-closed placeholder recovery.
+    """
+
+    rows = [
+        record
+        for record in records
+        if not bool(getattr(record, "external", False))
+        and str(getattr(record, "status", "")).casefold() == "running"
+        and bool((getattr(record, "codex_home", None) or "").strip())
+        and bool((getattr(record, "recovery_command", None) or "").strip())
+        and bool((getattr(record, "recovery_cwd", None) or "").strip())
+    ]
+    rows.sort(
+        key=lambda record: (
+            not bool(getattr(record, "visible", True)),
+            str(getattr(record, "window_id", "")),
+            int(getattr(record, "tab_index", 0)),
+            str(getattr(record, "name", "")),
+        )
+    )
+    return rows
+
+
+def revive_dead_payload_sessions(backend, records, store=None) -> "tuple[int, int]":
+    """Relaunch exact-recovery payloads over proven idle placeholder shells.
+
+    Every record is probed through ``create_or_resume`` with an ephemeral
+    ``recovery-pending`` copy: that path verifies the pane still owns the
+    expected conversation (a cheap no-op when the payload is alive), respawns
+    only a verified idle fallback shell, and fails closed on running jobs,
+    different recovery UUIDs, or unverifiable process identity.  Returns
+    ``(revived, failed)`` where ``failed`` counts refused replacements.
+    """
+
+    revived = 0
+    failed = 0
+    for record in records:
+        probe = (
+            record
+            if str(getattr(record, "status", "")).casefold() == "recovery-pending"
+            else replace(record, status="recovery-pending")
+        )
+        try:
+            before_pid = backend.pane_pid(record)
+        except (OSError, TmuxError):
+            before_pid = None
+        try:
+            backend.create_or_resume(probe)
+        except Exception:
+            # The backend refused to replace this pane (live job, foreign
+            # conversation, missing private wrapper, ...). Leave the tab
+            # attached exactly as it is; never guess with send-keys.
+            failed += 1
+            continue
+        try:
+            after_pid = backend.pane_pid(record)
+        except (OSError, TmuxError):
+            after_pid = None
+        if after_pid is None or after_pid == before_pid:
+            # The payload was already alive; nothing was replaced.
+            continue
+        revived += 1
+        if store is not None:
+            try:
+                store.update(
+                    record.id,
+                    status="running",
+                    last_pid=after_pid,
+                    last_opened_at=utc_now(),
+                )
+            except Exception:
+                pass
+    return revived, failed
+
+
 class TermDeckApplication(Gtk.Application):
     def __init__(self, db_path: str | Path | None = None, workspace_path: str | Path | None = None):
         canonical_db_path = canonical_database_path(db_path)
@@ -7001,6 +7084,7 @@ class TermDeckApplication(Gtk.Application):
         self._last_persistence_result: PersistenceResult | None = None
         self._legacy_recovery_checked = False
         self._last_legacy_recovery_result: LegacyRecoveryResult | None = None
+        self._payload_revival_started = False
         # Shared snapshot memo: multiple periodic table refreshers (window
         # overview, tab manager) reuse one tmux/proc sampling pass per tick
         # instead of each running their own identical pass.
@@ -7918,6 +8002,15 @@ class TermDeckApplication(Gtk.Application):
         if callable(schedule_legacy_recovery):
             schedule_legacy_recovery()
 
+        # Reconcile cannot detect a crashed Codex/Claude payload: the tmux
+        # session and its trailing fallback shell survive, so the row stays
+        # ``running`` while its tab replays a dead conversation.  Give the
+        # notebooks a moment to attach, then relaunch those payloads in place
+        # through the backend's fail-closed placeholder recovery.
+        payload_revival_timeout = getattr(self, "_payload_revival_timeout", None)
+        if callable(payload_revival_timeout):
+            GLib.timeout_add_seconds(2, payload_revival_timeout)
+
         # Drop destroyed or unrealized windows so a single-instance re-activate
         # does not skip restoration while holding stale ApplicationWindow
         # references.  An unrealized window can still own VTE tmux clients; it
@@ -8133,6 +8226,116 @@ class TermDeckApplication(Gtk.Application):
             name="termdeck-legacy-recovery",
             daemon=True,
         ).start()
+
+    def _payload_revival_timeout(self) -> bool:
+        """One-shot GLib callback: start the payload revival sweep once."""
+
+        self._schedule_payload_revival()
+        return False
+
+    def _schedule_payload_revival(self) -> None:
+        """Relaunch dead Codex/Claude payloads inside surviving tmux sessions.
+
+        Reconcile cannot see a payload crash: the session and its fallback
+        shell are alive, so the registry says ``running`` while the notebook
+        replays a conversation that ended days ago.  Probe every qualifying
+        row through the backend's fail-closed placeholder recovery on one
+        low-priority worker thread — serial on purpose, so a machine-wide
+        restart cannot fan out dozens of heavyweight resume processes at
+        once — and publish only a small summary back on the GTK context.
+        """
+
+        if getattr(self, "_payload_revival_started", False):
+            return
+        self._payload_revival_started = True
+        try:
+            records = self.store.list()
+        except Exception:
+            return
+        candidates = payload_revival_candidates(records)
+        if not candidates:
+            return
+        try:
+            store_path = self.store.path
+            auth_root = self.store.auth_root
+            account_source = self.store.account_source
+        except Exception:
+            store_path = None
+            auth_root = None
+            account_source = None
+
+        def worker() -> None:
+            try:
+                os.nice(10)
+            except (AttributeError, OSError):
+                pass
+            worker_store = None
+            if store_path is not None:
+                # The GUI store connection is thread-affine; use a private one.
+                try:
+                    worker_store = SessionStore(
+                        store_path,
+                        auth_root=auth_root,
+                        account_source=account_source,
+                    )
+                except Exception:
+                    worker_store = None
+            try:
+                revived, failed = revive_dead_payload_sessions(
+                    self.backend,
+                    candidates,
+                    store=worker_store,
+                )
+            finally:
+                if worker_store is not None:
+                    try:
+                        worker_store.close()
+                    except Exception:
+                        pass
+            if not revived and not failed:
+                return
+
+            def publish() -> bool:
+                for window in list(self.windows):
+                    try:
+                        window.side.refresh()
+                    except Exception:
+                        pass
+                show_toast = (
+                    getattr(self.windows[0], "show_toast", None)
+                    if self.windows
+                    else None
+                )
+                if callable(show_toast):
+                    if revived:
+                        message = (
+                            f"Relaunched {revived} coding session"
+                            f"{'s' if revived != 1 else ''} in place"
+                        )
+                        if failed:
+                            message += f"; {failed} could not be replaced safely"
+                        show_toast(message, kind="warning" if failed else "success")
+                    else:
+                        show_toast(
+                            f"{failed} remembered session"
+                            f"{'s' if failed != 1 else ''} could not be relaunched safely",
+                            kind="warning",
+                        )
+                return False
+
+            try:
+                GLib.idle_add(publish)
+            except Exception:
+                # The app may be shutting down; respawned payloads keep
+                # running inside tmux and need no UI callback.
+                pass
+
+        threading.Thread(
+            target=worker,
+            name="termdeck-payload-revival",
+            daemon=True,
+        ).start()
+
 
 
 # ---------------------------------------------------------------------------
