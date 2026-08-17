@@ -89,10 +89,10 @@ def main() -> int:
                 raise AssertionError("terminal notebook lost its polished surface class")
             if attach.terminal_row.get_children() != [attach.terminal, attach.scrollbar]:
                 raise AssertionError("terminal scrollbar is not placed on VTE's right edge")
-            if attach.scrollbar.get_adjustment() == attach.terminal.get_vadjustment():
-                raise AssertionError(
-                    "terminal scrollbar still uses VTE's empty tmux alternate-screen range"
-                )
+            if attach.native_adjustment is not attach.terminal.get_vadjustment():
+                raise AssertionError("terminal lost its native VTE adjustment identity")
+            if attach.scrollbar.get_adjustment() is not attach.native_adjustment:
+                raise AssertionError("terminal scrollbar is not bound to VTE-native history")
             if not attach.scrollbar.get_visible():
                 raise AssertionError("terminal scrollbar is not visible")
             if not attach.scrollbar.get_style_context().has_class("td-terminal-scrollbar"):
@@ -113,10 +113,17 @@ def main() -> int:
                 "page_size": float(scrollbar_adjustment.get_page_size()),
                 "value": float(scrollbar_adjustment.get_value()),
             }
-            if scrollbar_range["upper"] <= scrollbar_range["page_size"]:
+            if (
+                scrollbar_range["upper"] < scrollbar_range["lower"]
+                or scrollbar_range["page_size"] < 0
+                or not (
+                    scrollbar_range["lower"]
+                    <= scrollbar_range["value"]
+                    <= max(scrollbar_range["lower"], scrollbar_range["upper"])
+                )
+            ):
                 raise AssertionError(
-                    "terminal scrollbar has no usable range, so GTK cannot draw its thumb: "
-                    f"{scrollbar_range}"
+                    f"terminal scrollbar exposes an incoherent native range: {scrollbar_range}"
                 )
             if scrollbar_allocation.width < 14:
                 raise AssertionError(

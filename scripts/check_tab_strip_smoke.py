@@ -10,6 +10,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from smoke_support import stream_ready
+
 
 def _drain_gtk(Gtk, *, until=None, timeout: float = 3.0) -> None:
     deadline = time.monotonic() + timeout
@@ -185,7 +187,7 @@ def main() -> int:
             _drain_gtk(
                 Gtk,
                 until=lambda: renamed.id in window.tabs
-                and window.tabs[renamed.id].widget.process is not None,
+                and stream_ready(window.tabs[renamed.id].widget),
             )
             reopened = app.store.get(renamed.id)
             if reopened is None or not reopened.visible:

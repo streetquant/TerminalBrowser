@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections import deque
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -17,6 +19,7 @@ class FakeStdout:
         self._condition = threading.Condition()
         self._lines: deque[bytes] = deque()
         self._eof = False
+        self.closed = False
 
     def feed(self, line: str | bytes) -> None:
         data = line.encode("latin-1") if isinstance(line, str) else line
@@ -31,6 +34,10 @@ class FakeStdout:
             self._eof = True
             self._condition.notify_all()
 
+    def close(self) -> None:
+        self.closed = True
+        self.eof()
+
     def readline(self) -> bytes:
         with self._condition:
             while not self._lines and not self._eof:
@@ -44,14 +51,21 @@ class FakeStdin:
     def __init__(self) -> None:
         self.writes: list[bytes] = []
         self._lock = threading.Lock()
+        self.closed = False
 
     def write(self, data: bytes) -> int:
         with self._lock:
+            if self.closed:
+                raise BrokenPipeError("fake stdin is closed")
             self.writes.append(data)
         return len(data)
 
     def flush(self) -> None:
-        return None
+        if self.closed:
+            raise BrokenPipeError("fake stdin is closed")
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeTransport:
@@ -59,16 +73,37 @@ class FakeTransport:
         self.stdout = FakeStdout()
         self.stdin = FakeStdin()
         self.terminated = False
+        self.killed = False
+        self.wait_calls: list[float | None] = []
 
     def terminate(self) -> None:
         self.terminated = True
         self.stdout.eof()
 
+    def kill(self) -> None:
+        self.killed = True
+        self.terminated = True
+        self.stdout.eof()
+
     def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
         return 0
 
     def poll(self) -> int | None:
         return 0 if self.terminated else None
+
+
+class StubbornTransport(FakeTransport):
+    """Ignore TERM until the teardown helper reaches its kill fallback."""
+
+    def terminate(self) -> None:
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        if not self.killed:
+            raise TimeoutError("still running")
+        return 0
 
 
 def wait_until(predicate: object, timeout: float = 1.0) -> None:
@@ -379,9 +414,52 @@ class ControlModeClientTests(unittest.TestCase):
         client.stop()
         thread = client._reader_thread
         self.assertTrue(transport.terminated)
+        self.assertTrue(transport.stdin.closed)
+        self.assertTrue(transport.stdout.closed)
+        self.assertEqual(transport.wait_calls, [0.75])
         self.assertIs(client.state, ClientState.STOPPED)
         self.assertIsNotNone(thread)
         self.assertFalse(thread.is_alive())
+
+    def test_stubborn_transport_is_killed_reaped_and_closed(self) -> None:
+        transport = StubbornTransport()
+
+        ControlModeClient._terminate_quietly(transport)
+
+        self.assertTrue(transport.killed)
+        self.assertTrue(transport.stdin.closed)
+        self.assertTrue(transport.stdout.closed)
+        self.assertEqual(transport.wait_calls, [0.75, 0.75])
+        self.assertEqual(transport.poll(), 0)
+
+    def test_real_subprocess_transport_is_reaped_and_pipes_are_closed(self) -> None:
+        transport = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import signal,time; "
+                    "signal.signal(signal.SIGTERM, lambda *_: None); "
+                    "time.sleep(60)"
+                ),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(
+            lambda: transport.kill() if transport.poll() is None else None
+        )
+
+        ControlModeClient._terminate_quietly(transport)
+
+        self.assertIsNotNone(transport.poll())
+        self.assertIsNotNone(transport.stdin)
+        self.assertIsNotNone(transport.stdout)
+        self.assertIsNotNone(transport.stderr)
+        self.assertTrue(transport.stdin.closed)
+        self.assertTrue(transport.stdout.closed)
+        self.assertTrue(transport.stderr.closed)
 
     def test_repeated_start_is_harmless(self) -> None:
         transport = FakeTransport()

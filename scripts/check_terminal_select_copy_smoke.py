@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import tempfile
 import time
@@ -145,41 +144,26 @@ def main() -> int:
             terminal = widget.terminal
             _drain_gtk(
                 Gtk,
-                until=lambda: widget.process is not None and widget.process.poll() is None,
-            )
-            # Relaunch only the disposable tmux attach client. The pane/shell
-            # remains alive, and the replacement must not echo VTE's terminal
-            # capability probes as literal ``^[...VTE(...)`` prompt garbage.
-            original_attach_pid = widget.process.pid
-            os.killpg(os.getpgid(original_attach_pid), signal.SIGHUP)
-            _drain_gtk(
-                Gtk,
                 until=lambda: (
-                    widget.process is not None
-                    and widget.process.pid != original_attach_pid
-                    and widget.process.poll() is None
+                    widget.controller is not None
+                    and getattr(widget.controller, "_ready", False)
+                    and terminal.get_mapped()
                 ),
             )
-            _drain_gtk(Gtk, timeout=0.4)
-            reattach_text = "\n".join(
-                (
-                    app.backend.capture(record, lines=20),
-                    terminal.get_text_format(Vte.Format.TEXT) or "",
-                )
-            )
-            probe_fragments = ("VTE(", "?61;1;21;22;28c", ">61;8401;1c")
-            leaked_probes = [fragment for fragment in probe_fragments if fragment in reattach_text]
-            if leaked_probes:
-                raise AssertionError(
-                    f"reattached terminal displayed capability probes: {leaked_probes!r}"
-                )
+            # Control-mode rendering has no disposable ``AttachTerminal.process``
+            # child. The controller's committed ready state is the attachment
+            # boundary; terminal-identity probe echo has its own dedicated real
+            # VTE regression and must not be reintroduced as a stale process test.
             app.backend.send_text(
                 record,
                 (
                     "i=0; while [ $i -lt 300 ]; do "
                     "printf 'TERMDECK_SCROLLBACK_%03d________________________________\\n' \"$i\"; "
                     "i=$((i + 1)); done; "
-                    f"clear; printf '%s\\n' {MARKER}"
+                    # ``clear`` commonly emits CSI 3J and correctly erases the
+                    # one VTE-owned scrollback buffer. Clear only the visible
+                    # screen so this smoke retains history for selection tests.
+                    f"printf '\\033[H\\033[2J%s\\n' {MARKER}"
                 ),
                 enter=True,
             )
@@ -368,7 +352,7 @@ def main() -> int:
                 json.dumps(
                     {
                         "ok": True,
-                        "clean_attach_relaunch": True,
+                        "control_mode_ready": True,
                         "selected_text": selected,
                         "selection_stays_visible": True,
                         "clipboard_exact": True,

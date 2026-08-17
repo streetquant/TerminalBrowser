@@ -14,6 +14,8 @@ from types import SimpleNamespace
 
 import gi
 
+from smoke_support import stream_ready
+
 gi.require_version("GdkPixbuf", "2.0")
 
 
@@ -145,7 +147,7 @@ def main() -> int:
             record = window.current_record()
             if record is None:
                 raise AssertionError("no current record was available for keyboard routing")
-            _drain_gtk(Gtk, until=lambda: attach.process is not None)
+            _drain_gtk(Gtk, until=lambda: stream_ready(attach))
             command = (
                 f": > {shlex.quote(str(ready_marker))}; "
                 f"stty -icanon -echo min 1 time 0; "

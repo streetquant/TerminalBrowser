@@ -611,6 +611,95 @@ class TerminalMouseBehaviourTest(TestCase):
             ["restore", "bottom", ("cursor-hidden", False)],
         )
 
+    def test_live_input_latches_priority_before_controller_exists(self) -> None:
+        attach = SimpleNamespace(
+            _scroll_idle_source_id=0,
+            _remove_glib_source=lambda _source_id: None,
+            _setup_priority_requested=False,
+            controller=None,
+            _live_focus_handler=lambda: True,
+            scroll_to_bottom=lambda: None,
+            _set_history_cursor_hidden=lambda _hidden: None,
+        )
+
+        restored = AttachTerminal.prepare_for_live_input(attach)
+
+        self.assertTrue(restored)
+        self.assertTrue(attach._setup_priority_requested)
+
+    def test_latched_priority_is_applied_before_controller_start(self) -> None:
+        calls = []
+        controller = SimpleNamespace(
+            prioritize_setup=lambda: calls.append("priority"),
+            start=lambda **kwargs: calls.append(("start", kwargs)),
+        )
+        attach = SimpleNamespace(
+            controller=None,
+            _detached=False,
+            _terminally_stopped=False,
+            _attach_restart_deferred=False,
+            _connect_source_id=11,
+            _connect_fallback_source_id=12,
+            _remove_glib_source=lambda source_id: calls.append(("remove", source_id)),
+            _ensure_loopback_pty=lambda: calls.append("pty"),
+            _sync_stream_geometry=lambda **kwargs: calls.append(("sync", kwargs)),
+            _stream_generation=0,
+            argv=["tmux", "attach-session", "-t", "demo"],
+            _child_environment={},
+            cwd="/tmp",
+            _on_stream_output=lambda *_args: None,
+            _on_stream_pane_dead=lambda *_args: None,
+            _on_stream_state=lambda *_args: None,
+            _scrollback_extent=2000,
+            _contrast_filter=SimpleNamespace(reset=lambda: calls.append("reset")),
+            _setup_priority_requested=True,
+        )
+
+        with mock.patch("termdeck.gtk_app.PaneStreamController", return_value=controller):
+            AttachTerminal._connect_stream(attach, columns=132, rows=43)
+
+        priority_index = calls.index("priority")
+        start_index = next(index for index, call in enumerate(calls) if call[0] == "start")
+        self.assertLess(priority_index, start_index)
+        self.assertEqual(calls[start_index], ("start", {"columns": 132, "rows": 43}))
+
+    def test_priority_failure_does_not_prevent_controller_start(self) -> None:
+        started = []
+
+        def fail_priority() -> None:
+            raise RuntimeError("priority gate unavailable")
+
+        controller = SimpleNamespace(
+            prioritize_setup=fail_priority,
+            start=lambda **kwargs: started.append(kwargs),
+        )
+        attach = SimpleNamespace(
+            controller=None,
+            _detached=False,
+            _terminally_stopped=False,
+            _attach_restart_deferred=False,
+            _connect_source_id=0,
+            _connect_fallback_source_id=0,
+            _remove_glib_source=lambda _source_id: None,
+            _ensure_loopback_pty=lambda: None,
+            _sync_stream_geometry=lambda **_kwargs: None,
+            _stream_generation=0,
+            argv=["tmux", "attach-session", "-t", "demo"],
+            _child_environment={},
+            cwd="/tmp",
+            _on_stream_output=lambda *_args: None,
+            _on_stream_pane_dead=lambda *_args: None,
+            _on_stream_state=lambda *_args: None,
+            _scrollback_extent=2000,
+            _contrast_filter=SimpleNamespace(reset=lambda: None),
+            _setup_priority_requested=True,
+        )
+
+        with mock.patch("termdeck.gtk_app.PaneStreamController", return_value=controller):
+            AttachTerminal._connect_stream(attach, columns=100, rows=30)
+
+        self.assertEqual(started, [{"columns": 100, "rows": 30}])
+
     def test_failed_live_restore_does_not_mutate_view_or_release_input_surface(self) -> None:
         calls = []
         attach = SimpleNamespace(

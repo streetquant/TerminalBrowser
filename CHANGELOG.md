@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+## 0.2.11
+
+- Fixed restored or newly selected Codex tabs that could remain connected but blank. Visible-tab setup priority is now latched before the delayed controller exists, setup exceptions retry until the pre-ready transaction commits, and CONNECTED reset plus pane replay are serialized through one GTK output drain so a late idle cannot erase a complete screen.
+- Corrected tmux pane-mode replay: `*_flag=1` now means enabled, and every cursor, keypad, wrap, insert, origin, and mouse mode receives an explicit set or reset sequence. Normal shells therefore keep VTE-native scrollback instead of accidentally enabling all mouse protocols and forwarding wheel events into the pane.
+- Added ISO colon-form SGR contrast handling for direct RGB and indexed foregrounds, including the forms used by modern TUIs. Supported low-contrast ink is lifted to the 4.5:1 stream floor; unrelated colon attributes, explicit backgrounds, reverse video, and unknown colour spaces retain fail-open semantics.
+- Replaced the obsolete tmux-copy-mode scroll smoke with a real GTK/VTE contract test covering native shell history, incremental wheel movement, alternate-screen fallback arrows, negotiated SGR mouse events, and zero tmux copy-mode entry.
+- Added a real VTE pixel smoke proving formerly invisible colon truecolour, faint truecolour, and indexed-grey text remains readable on the default dark surface.
+- Made tmux control transports, setup retries, pre-ready input/output, GTK delivery, and teardown explicitly bounded and deterministically owned. Stuck or failed clients are closed, killed when necessary, reaped, and prevented from leaking timers, threads, buffers, or BrokenPipe finalizers.
+- Made SGR filtering total over arbitrary pane bytes with bounded decimal/sequence parsing, chunk-equivalent streaming, state taint/recovery, exact VTE no-op semantics for invalid RGB/indexed values, and fail-open unknown colour spaces.
+- Fixed minimum-contrast endpoint selection on saturated mid-tone backgrounds by considering both black and white rather than assuming luminance alone determines the reachable direction.
+- Added deterministic, offline, double-built wheel releases with commit/tree/build identity, strict metadata/RECORD/path verification, canonical manifests, and content-addressed release IDs.
+- Added an atomic managed installer and rollback path that binds Python, bootstrap, launcher, state, manifest, artifact, and installed file set; rejects symlinks, writable or hard-linked payloads, tamper, races, and partial publication; and never restarts persistent tmux/Codex tasks.
+- Extended the existing doctor and redaction-safe diagnostics with managed-release posture, plus a read-only semantic runtime receipt for install/restart non-interference.
+- Verified 1,153 tests plus 98 subtests, deterministic parser and release-property gates, a complete isolated build/install/tamper/rollback workflow, and all 16 strict GTK/VTE/tmux runtime smokes with empty stderr and unchanged persistent semantic state.
+
 ## 0.2.10
 
 - Added fail-closed legacy Codex archive recovery for tabs saved before exact UUID persistence. Startup reads only bounded primary `source="cli"` metadata, matches exact project directories or unique near-time sessions, prevents duplicate UUID resumes, and restores unprovable shell-backed tabs as shells without calling them exact conversations.

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .build_info import release_status
 from .resource_budget import BudgetConfigError, assess_budgets, load_budgets
 from .resources import ResourceSampler
 from .session_store import DEFAULT_DB_PATH, SessionStore
@@ -133,6 +134,7 @@ def build_diagnostic_payload(*, db_path: str | Path | None = None, config_path: 
         "schema_version": 1,
         "generated_at": _utc_now(),
         "termdeck": {"version": __version__},
+        "release": release_status(verify_artifact=False),
         "platform": {
             "python": sys.version.split()[0],
             "implementation": platform.python_implementation(),

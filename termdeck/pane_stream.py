@@ -27,22 +27,35 @@ from typing import Callable, Mapping
 
 from .tmux_control import ClientState, ControlEvent, ControlModeClient
 
-# Bytes per send-keys command.  Chunking keeps each control-mode command line
+# Bytes per send-keys command. Chunking keeps each control-mode command line
 # short while remaining far faster than interactive typing rates.
 _INPUT_CHUNK_BYTES = 64
 
+# A transport may connect while tmux is busy replaying a large registry. Bound
+# every pre-ready collection so a wedged server or an accidental paste cannot
+# turn one tab into unbounded process memory. Output overflow retries from a
+# fresh authoritative capture; input overflow rejects the new atomic payload.
+_MAX_PENDING_OUTPUT_BYTES = 8 * 1024 * 1024
+_MAX_PENDING_OUTPUT_CHUNKS = 4096
+_MAX_PENDING_INPUT_BYTES = 1024 * 1024
+_MAX_PENDING_INPUT_CHUNKS = 2048
+
 # Modes replayed from tmux pane state on (re)attach so VTE starts from the
-# same emulator state the application last negotiated.  (mode byte, set, reset)
+# same emulator state the application last negotiated. tmux reports these
+# ``*_flag`` fields as 1 when enabled and 0 when disabled. Emit both sides of
+# every transition: a fresh/reconnected VTE may otherwise retain a stale mode.
+# Inverting the mouse flags makes an ordinary shell capture wheel input instead
+# of scrolling native history, which is indistinguishable from a broken pane.
 _MODE_SEQUENCES = (
-    ("cursor_flag", "1", None, b"\x1b[?25l"),
-    ("keypad_cursor_flag", "1", b"\x1b[?1h", None),
-    ("wrap_flag", "1", None, b"\x1b[?7l"),
-    ("insert_flag", "0", b"\x1b[4h", None),
-    ("origin_flag", "0", b"\x1b[?6h", None),
-    ("mouse_standard_flag", "0", b"\x1b[?1000h", None),
-    ("mouse_button_flag", "0", b"\x1b[?1002h", None),
-    ("mouse_all_flag", "0", b"\x1b[?1003h", None),
-    ("mouse_sgr_flag", "0", b"\x1b[?1006h", None),
+    ("cursor_flag", "1", b"\x1b[?25h", b"\x1b[?25l"),
+    ("keypad_cursor_flag", "1", b"\x1b[?1h", b"\x1b[?1l"),
+    ("wrap_flag", "1", b"\x1b[?7h", b"\x1b[?7l"),
+    ("insert_flag", "1", b"\x1b[4h", b"\x1b[4l"),
+    ("origin_flag", "1", b"\x1b[?6h", b"\x1b[?6l"),
+    ("mouse_standard_flag", "1", b"\x1b[?1000h", b"\x1b[?1000l"),
+    ("mouse_button_flag", "1", b"\x1b[?1002h", b"\x1b[?1002l"),
+    ("mouse_all_flag", "1", b"\x1b[?1003h", b"\x1b[?1003l"),
+    ("mouse_sgr_flag", "1", b"\x1b[?1006h", b"\x1b[?1006l"),
 )
 
 _PANE_STATE_FORMAT = (
@@ -322,10 +335,16 @@ class PaneStreamController:
         self._pane_dead_reported = False
         self._replayed_history = False
         self._pending_output: list[bytes] = []
+        self._pending_output_bytes = 0
+        self._pending_output_overflowed = False
         self._pending_input: list[bytes] = []
+        self._unsent_input_bytes = 0
+        self._unsent_input_chunks = 0
         self._size = (80, 24)
         self._resize_queued = False
         self._setup_attempts = 0
+        self._setup_retry_timer: threading.Timer | None = None
+        self._setup_retry_generation: int | None = None
         self._setup_gate = (
             setup_gate if setup_gate is not None else _DEFAULT_SETUP_GATE
         )
@@ -352,6 +371,12 @@ class PaneStreamController:
         with self._lock:
             return self._pane_id
 
+    def _take_setup_retry_locked(self) -> threading.Timer | None:
+        timer = self._setup_retry_timer
+        self._setup_retry_timer = None
+        self._setup_retry_generation = None
+        return timer
+
     def start(self, *, columns: int, rows: int) -> None:
         """Begin streaming with the widget's current grid as the client size."""
 
@@ -376,6 +401,15 @@ class PaneStreamController:
                 return
             self._stopped = True
             self._ready = False
+            retry_timer = self._take_setup_retry_locked()
+            self._pending_output.clear()
+            self._pending_output_bytes = 0
+            self._pending_output_overflowed = False
+            self._pending_input.clear()
+            self._unsent_input_bytes = 0
+            self._unsent_input_chunks = 0
+        if retry_timer is not None:
+            retry_timer.cancel()
         self._client.stop()
         self._tasks.put(None)
         worker = self._worker
@@ -384,15 +418,29 @@ class PaneStreamController:
 
     # ------------------------------------------------------------------ I/O
 
-    def send_bytes(self, data: bytes) -> None:
-        """Queue raw input bytes for ordered delivery to the pane."""
+    def send_bytes(self, data: bytes) -> bool:
+        """Queue one atomic input payload, returning false at the bounded limit.
+
+        Existing accepted input is never truncated to make room for a newer
+        paste. The caller can therefore report the rejected payload honestly
+        instead of replaying an ambiguous suffix after setup completes.
+        """
 
         if not data:
-            return
+            return True
+        payload = bytes(data)
         with self._lock:
             if self._stopped:
-                return
-        self._tasks.put(("input", bytes(data)))
+                return False
+            if (
+                self._unsent_input_bytes + len(payload) > _MAX_PENDING_INPUT_BYTES
+                or self._unsent_input_chunks >= _MAX_PENDING_INPUT_CHUNKS
+            ):
+                return False
+            self._unsent_input_bytes += len(payload)
+            self._unsent_input_chunks += 1
+        self._tasks.put(("input", payload))
+        return True
 
     def resize(self, *, columns: int, rows: int) -> None:
         """Coalesce grid changes; only the most recent size is applied."""
@@ -434,23 +482,33 @@ class PaneStreamController:
         )
 
     def _handle_state_change(self, state: ClientState) -> None:
-        if state is ClientState.CONNECTED:
-            with self._lock:
+        generation: int | None = None
+        with self._lock:
+            retry_timer = self._take_setup_retry_locked()
+            if state is ClientState.CONNECTED:
                 self._generation += 1
                 self._ready = False
                 self._pending_output.clear()
+                self._pending_output_bytes = 0
+                self._pending_output_overflowed = False
                 self._setup_attempts = 0
                 generation = self._generation
-            self._tasks.put(("setup", generation))
-        else:
-            with self._lock:
+            else:
                 self._ready = False
+        if retry_timer is not None:
+            retry_timer.cancel()
         callback = self._on_state_change
         if callback is not None:
             try:
+                # The UI uses CONNECTED as an ordered reset marker. Publish it
+                # before the setup worker can emit replay bytes; otherwise two
+                # independent GTK idles can race and a late reset can erase the
+                # first complete screen of an otherwise healthy attachment.
                 callback(state)
             except Exception:
                 pass
+        if generation is not None:
+            self._tasks.put(("setup", generation))
 
     def _handle_event(self, event: ControlEvent) -> None:
         if event.kind == "output":
@@ -461,7 +519,22 @@ class PaneStreamController:
                 if not payload:
                     return
                 if not self._ready:
+                    if self._pending_output_overflowed:
+                        return
+                    projected = self._pending_output_bytes + len(payload)
+                    if (
+                        projected > _MAX_PENDING_OUTPUT_BYTES
+                        or len(self._pending_output) >= _MAX_PENDING_OUTPUT_CHUNKS
+                    ):
+                        # Do not retain a suffix whose prefix was discarded.
+                        # The setup transaction will retry from a fresh tmux
+                        # capture, which is the authoritative recovery source.
+                        self._pending_output.clear()
+                        self._pending_output_bytes = 0
+                        self._pending_output_overflowed = True
+                        return
                     self._pending_output.append(payload)
+                    self._pending_output_bytes = projected
                     return
             self._emit_output(payload)
             return
@@ -519,6 +592,13 @@ class PaneStreamController:
     def _command(self, command: str):
         return self._client.send_command(command, timeout=self._command_timeout)
 
+    def _release_unsent_input(self, data: bytes) -> None:
+        with self._lock:
+            self._unsent_input_bytes = max(
+                0, self._unsent_input_bytes - len(data)
+            )
+            self._unsent_input_chunks = max(0, self._unsent_input_chunks - 1)
+
     def _run_resize(self) -> None:
         with self._lock:
             self._resize_queued = False
@@ -529,13 +609,17 @@ class PaneStreamController:
         with self._lock:
             pane_id = self._pane_id
             ready = self._ready
-        if pane_id is None or not ready:
-            with self._lock:
-                self._pending_input.append(data)
-            return
-        self._send_input_bytes(pane_id, data)
+            if pane_id is None or not ready:
+                if not self._stopped:
+                    self._pending_input.append(data)
+                    return
+        try:
+            if pane_id is not None and ready:
+                self._send_input_bytes(pane_id, data)
+        finally:
+            self._release_unsent_input(data)
 
-    def _send_input_bytes(self, pane_id: str, data: bytes) -> None:
+    def _send_input_bytes(self, pane_id: str, data: bytes) -> bool:
         for start in range(0, len(data), _INPUT_CHUNK_BYTES):
             chunk = data[start : start + _INPUT_CHUNK_BYTES]
             tokens = " ".join(f"{byte:02x}" for byte in chunk)
@@ -543,7 +627,8 @@ class PaneStreamController:
             if not result.ok:
                 # A dead pane rejects input; report once instead of spamming.
                 self._report_pane_dead()
-                return
+                return False
+        return True
 
     def _run_setup(self, generation: int) -> None:
         def abandoned() -> bool:
@@ -559,6 +644,17 @@ class PaneStreamController:
             return
         try:
             finished = self._try_setup(generation)
+        except Exception:
+            # ``_ready`` is the setup transaction's commit point. Before it,
+            # the transport is already CONNECTED and no later state edge will
+            # restart a failed setup, so retry is required to escape a blank
+            # tab. After it, retrying would replay an already-visible pane.
+            with self._lock:
+                finished = (
+                    generation != self._generation
+                    or self._stopped
+                    or self._ready
+                )
         finally:
             self._setup_gate.release()
         if not finished:
@@ -569,6 +665,12 @@ class PaneStreamController:
             if generation != self._generation or self._stopped:
                 return True
             columns, rows = self._size
+            # Establish a capture boundary. Everything before this point is
+            # represented by the authoritative tmux capture; only later live
+            # output needs buffering behind the setup commit.
+            self._pending_output.clear()
+            self._pending_output_bytes = 0
+            self._pending_output_overflowed = False
 
         self._command(f"refresh-client -C {columns}x{rows}")
 
@@ -601,36 +703,73 @@ class PaneStreamController:
         with self._lock:
             if generation != self._generation or self._stopped:
                 return True
+            if self._pending_output_overflowed:
+                # The incremental suffix is incomplete. Retry from a fresh
+                # capture instead of committing a terminal with missing bytes.
+                self._pending_output.clear()
+                self._pending_output_bytes = 0
+                self._pending_output_overflowed = False
+                return False
             buffered = b"".join(self._pending_output)
             self._pending_output.clear()
+            self._pending_output_bytes = 0
             pending_input = self._pending_input
             self._pending_input = []
+            self._replayed_history = True
             self._ready = True
         if replay:
             self._emit_output(replay)
         if buffered:
             self._emit_output(buffered)
-        for data in pending_input:
-            self._send_input_bytes(pane_id, data)
+        for index, data in enumerate(pending_input):
+            try:
+                sent = self._send_input_bytes(pane_id, data)
+            finally:
+                self._release_unsent_input(data)
+            if not sent:
+                # The pane is no longer accepting input. Release ownership of
+                # the untouched suffix rather than retrying it into a new task.
+                for remaining in pending_input[index + 1 :]:
+                    self._release_unsent_input(remaining)
+                break
         if pane_state.get("pane_dead") == "1":
             self._report_pane_dead()
         return True
 
-    def _schedule_setup_retry(self, generation: int) -> None:
-        """Back off and retry setup; a busy tmux server must not strand the tab.
+    def _fire_setup_retry(self, generation: int) -> None:
+        with self._lock:
+            if self._setup_retry_generation != generation:
+                return
+            self._setup_retry_timer = None
+            self._setup_retry_generation = None
+            if generation != self._generation or self._stopped:
+                return
+        self._tasks.put(("setup", generation))
 
-        The timer thread only re-queues the task; the worker re-checks
-        generation and stop state before doing any work.
-        """
+    def _schedule_setup_retry(self, generation: int) -> None:
+        """Own at most one bounded retry timer for the current generation."""
 
         with self._lock:
             if generation != self._generation or self._stopped:
                 return
+            if self._setup_retry_timer is not None:
+                return
             self._setup_attempts += 1
             delay = min(8.0, 0.5 * (2 ** min(self._setup_attempts - 1, 4)))
-        timer = threading.Timer(delay, self._tasks.put, args=(("setup", generation),))
-        timer.daemon = True
-        timer.start()
+            timer = threading.Timer(delay, self._fire_setup_retry, args=(generation,))
+            timer.daemon = True
+            self._setup_retry_timer = timer
+            self._setup_retry_generation = generation
+        try:
+            timer.start()
+        except Exception:
+            with self._lock:
+                if self._setup_retry_timer is timer:
+                    self._setup_retry_timer = None
+                    self._setup_retry_generation = None
+            # A timer-allocation failure is rare but not permission to strand
+            # a connected tab. Requeue once through the existing worker path.
+            self._tasks.put(("setup", generation))
 
     # -------------------------------------------------------------- replay
 
@@ -684,7 +823,6 @@ class PaneStreamController:
         visible = self._capture(pane_id, "-N")
         if visible is None:
             return None
-        self._replayed_history = True
         while len(visible) > rows:
             visible.pop()
         if visible:

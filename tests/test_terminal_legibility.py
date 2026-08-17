@@ -106,6 +106,23 @@ class RaiseContrastBehaviour(unittest.TestCase):
         lifted = raise_contrast("#fafafa", "#f6f7f9", 4.5)
         self.assertGreaterEqual(contrast_ratio(lifted, "#f6f7f9"), 4.5)
 
+    def test_saturated_midtone_uses_the_reachable_endpoint(self):
+        background = "#107aff"
+        self.assertLess(contrast_ratio("#ffffff", background), 4.5)
+        self.assertGreaterEqual(contrast_ratio("#000000", background), 4.5)
+        lifted = raise_contrast("#ffffff", background, 4.5)
+        self.assertNotEqual(lifted, "#ffffff")
+        self.assertGreaterEqual(contrast_ratio(lifted, background), 4.5)
+
+    def test_impossible_minimum_returns_strongest_endpoint(self):
+        background = "#107aff"
+        lifted = raise_contrast("#107aff", background, 99.0)
+        self.assertEqual(lifted, "#000000")
+        self.assertGreater(
+            contrast_ratio(lifted, background),
+            contrast_ratio("#ffffff", background),
+        )
+
     def test_fails_open_on_junk_input(self):
         self.assertEqual(raise_contrast("nonsense", "#000000", 3.0), "nonsense")
         self.assertEqual(raise_contrast("#123456", "junk", 3.0), "#123456")

@@ -531,30 +531,63 @@ def _blend_hex(color: str, target: str, amount: float) -> str:
 
 
 def raise_contrast(color: str, background: str, minimum: float) -> str:
-    """Blend ``color`` just far enough toward legibility on ``background``.
+    """Blend ``color`` the shortest distance to a contrast-safe endpoint.
 
-    Already-legible colors are returned untouched, unparseable values fail
-    open, and the blend direction (toward white on dark surfaces, toward
-    black on light ones) preserves the original hue as far as possible.
+    Already-legible colors are returned untouched and unparseable values fail
+    open.  Both black and white are considered because a coarse
+    ``background luminance < 0.5`` rule is wrong for saturated mid-tone
+    surfaces: for example white reaches only 4.0:1 on ``#107aff`` while black
+    reaches 5.25:1.  Among reachable endpoints, choose the smallest RGB blend
+    amount so the original hue is preserved as far as the requested floor
+    allows.
     """
 
     if _parse_hex_color(color) is None or _parse_hex_color(background) is None:
         return color
+    minimum = max(1.0, float(minimum))
     if contrast_ratio(color, background) >= minimum:
         return color
-    target = "#ffffff" if relative_luminance(background) < 0.5 else "#000000"
-    low, high = 0.0, 1.0
-    for _ in range(24):
-        middle = (low + high) / 2
-        if contrast_ratio(_blend_hex(color, target, middle), background) >= minimum:
-            high = middle
-        else:
-            low = middle
-    lifted = _blend_hex(color, target, high)
-    if contrast_ratio(lifted, background) < minimum:
-        # The floor is unreachable from this hue; return the best endpoint.
-        return target
-    return lifted
+
+    candidates: list[tuple[float, str, float]] = []
+    for target in ("#000000", "#ffffff"):
+        endpoint_ratio = contrast_ratio(target, background)
+        if endpoint_ratio < minimum:
+            continue
+        low, high = 0.0, 1.0
+        for _ in range(24):
+            middle = (low + high) / 2
+            candidate = _blend_hex(color, target, middle)
+            if contrast_ratio(candidate, background) >= minimum:
+                high = middle
+            else:
+                low = middle
+        lifted = _blend_hex(color, target, high)
+        # Eight-bit rounding can leave the binary-search boundary one channel
+        # step short. Advance monotonically toward the proven endpoint until
+        # the rendered colour reaches the floor.
+        if contrast_ratio(lifted, background) < minimum:
+            for step in range(1, 257):
+                amount = min(1.0, high + step / 255.0)
+                lifted = _blend_hex(color, target, amount)
+                if contrast_ratio(lifted, background) >= minimum:
+                    high = amount
+                    break
+        ratio = contrast_ratio(lifted, background)
+        if ratio >= minimum:
+            candidates.append((high, lifted, ratio))
+
+    if candidates:
+        # Blend distance is primary; excess contrast is only a stable tie-break.
+        _amount, lifted, _ratio = min(candidates, key=lambda item: (item[0], item[2]))
+        return lifted
+
+    # A caller may ask for an impossible ratio (>21). Return the endpoint with
+    # the strongest attainable contrast rather than an endpoint chosen by an
+    # unrelated luminance heuristic.
+    return max(
+        ("#000000", "#ffffff"),
+        key=lambda target: contrast_ratio(target, background),
+    )
 
 
 _XTERM_CUBE_LEVELS = (0, 95, 135, 175, 215, 255)

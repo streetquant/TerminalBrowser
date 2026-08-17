@@ -1,5 +1,53 @@
 # Release notes
 
+## Unreleased
+
+## 0.2.11
+
+This release makes restored terminals deterministic at the rendering boundary and makes the application itself reproducibly releasable, atomically installable, independently verifiable, and rollback-capable without sacrificing tmux persistence or per-tab Codex isolation.
+
+### Codex sessions now become visible and interactive deterministically
+
+- A selected tab keeps attachment priority even when GTK selection happens before its delayed pane controller exists.
+- A transient setup exception cannot strand a connected blank tab; pre-ready setup retries with bounded backoff, while post-ready failures never replay an already-visible pane.
+- VTE reset and tmux replay now cross the GTK boundary as one ordered operation, eliminating the race where a late CONNECTED idle cleared a screen that had already loaded.
+- tmux mode flags are replayed with their real truth values. Ordinary shells no longer start with all mouse protocols enabled, so their wheel and scrollbar use VTE-native history; alternate-screen applications still receive fallback arrows or their negotiated mouse protocol.
+
+### Dark terminal content remains readable
+
+- Modern colon-form SGR colours such as `38:2::16:16:16` and `38:5:236` pass through the same 4.5:1 minimum-contrast guard as semicolon-form RGB/indexed colours.
+- Underline styles, explicit backgrounds, reverse video, split escape sequences, and unknown colour spaces retain their original semantics; only supported low-contrast foreground ink is rewritten.
+- A real VTE pixel smoke now proves the formerly invisible truecolour, faint, and indexed-grey cases are readable on the default `#0a0d13` surface.
+
+### Bounded transport and stream ownership
+
+- Every tmux control transport now closes its write side, terminates with a bounded grace period, uses a kill fallback when needed, closes all streams, reaps the child, and joins its reader without self-join races.
+- Setup owns at most one retry timer per stream generation. Pre-ready input/output and GTK delivery queues have byte and item caps; overflow reconnects only the disposable control path and replays the authoritative persistent pane.
+- Scheduler failures clear their latch instead of stranding output, rejected input is reported once, and disposable smokes destroy stream controllers before terminating isolated tmux sessions.
+- Auth recreation uses the complete prior session/pane/process identity, avoiding false same-second rejection and PID-reuse ambiguity while preserving private `CODEX_HOME` scope.
+
+### Total, semantics-preserving terminal colour filtering
+
+- Complete and partial escape sequences, decimal parameters, and retained grammar state are explicitly bounded. Arbitrary byte streams terminate without parser exceptions and produce the same result under arbitrary chunking.
+- RGB and indexed values outside `0..255` remain byte-identical VTE no-ops instead of corrupting tracked colour state. Structurally unknowable SGR taints inference until a full reset; unknown colour spaces remain fail-open.
+- Background colours, reverse video, C1 bytes, underline styles, and unrelated SGR attributes retain their emulator semantics.
+- Contrast lifting now tests both black and white endpoints, closing the saturated-background case where white was unreachable but black satisfied the body-text floor.
+
+### Reproducible, content-addressed production releases
+
+- `t1000 release build` snapshots a clean Git tree, exports it without following links, injects a canonical build record, builds twice offline with the commit timestamp as `SOURCE_DATE_EPOCH`, and rejects unequal wheels.
+- Verification requires the exact distribution/version filename and dist-info directory, one pure-Python `py3-none-any` tag, one `t1000 = termdeck.cli:main` entry point, matching package/metadata/build versions, exact RECORD coverage and hashes, safe paths, and bounded archive sizes.
+- Managed installation publishes a read-only, single-link, content-addressed release tree and atomically binds it to the exact interpreter, self-verifying bootstrap, stable launcher, canonical state, manifest, and artifact. Any write or postcondition failure restores every preimage.
+- Managed and legacy rollback use the same transaction model. The bootstrap verifies all identities, modes, paths, hashes, RECORD members, and the selected state before importing TermDeck; a concurrent state change triggers a bounded re-exec rather than mixing releases.
+- Existing `doctor`, diagnostics, desktop integration, shutdown persistence, tmux task ownership, and Codex auth boundaries are extended rather than replaced.
+
+### Verification
+
+- Full inherited suite: 1,153 passed, 1 skipped, 98 subtests passed.
+- All 16 strict runtime smokes passed with empty stderr and unchanged Xvfb, reader-thread, candidate-file, and semantic runtime identities.
+- Deterministic parser checks covered 100,000 arbitrary-byte streams, 20,000 reference-model streams, mutation boundaries, and real VTE pixels.
+- The isolated release workflow proved double-build reproducibility, outside-checkout invocation, doctor/status identity, member/bootstrap/launcher tamper rejection before import, repair, rollback, and unchanged 281-row persistent semantic state.
+
 ## 0.2.10
 
 TermDeck is leaner on screen and much harder to stall. The rendering stack remains GTK/VTE; this release removes avoidable synchronous Python-side work instead of replacing the native terminal engine.

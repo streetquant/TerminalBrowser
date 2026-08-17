@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify TermDeck's minimal mapped HeaderBar under a real GTK/X11 display."""
+"""Verify T1000's mapped HeaderBar and inline-title hierarchy under GTK/X11."""
 
 from __future__ import annotations
 
@@ -74,13 +74,21 @@ def main() -> int:
                 raise AssertionError("main window does not use a GTK HeaderBar")
 
             custom_title = header.get_custom_title()
-            if not isinstance(custom_title, Gtk.Label):
-                raise AssertionError("HeaderBar custom title must be one label")
-            if custom_title.get_text() != "Backend":
+            if not isinstance(custom_title, Gtk.EventBox):
+                raise AssertionError("HeaderBar custom title must expose the inline-title event box")
+            title_stack = custom_title.get_child()
+            if not isinstance(title_stack, Gtk.Stack):
+                raise AssertionError("inline title event box lost its label/entry stack")
+            visible_title = title_stack.get_visible_child()
+            if visible_title is not window.window_title_label or not isinstance(
+                visible_title, Gtk.Label
+            ):
+                raise AssertionError("HeaderBar did not start on the exact window-title label")
+            if visible_title.get_text() != "Backend":
                 raise AssertionError(
-                    f"in-app title must be the window name only: {custom_title.get_text()!r}"
+                    f"in-app title must be the window name only: {visible_title.get_text()!r}"
                 )
-            if window.get_title() != "TermDeck · Backend":
+            if window.get_title() != "T1000 · Backend":
                 raise AssertionError(
                     f"native title must retain the app prefix: {window.get_title()!r}"
                 )
@@ -116,7 +124,7 @@ def main() -> int:
             ]
             expected_menu = [
                 "Rename window",
-                "New TermDeck window",
+                "New T1000 window",
                 "Search tabs",
                 "Command palette",
                 "Reopen closed tab",
@@ -125,7 +133,8 @@ def main() -> int:
                 "Window overview · window totals",
                 "Keyboard shortcuts",
                 "Terminal appearance",
-                "Quit TermDeck",
+                "Kill Window Permanently…",
+                "Quit T1000",
             ]
             if menu_labels != expected_menu:
                 raise AssertionError(f"unexpected ordered More menu: {menu_labels}")
@@ -134,7 +143,7 @@ def main() -> int:
                 json.dumps(
                     {
                         "ok": True,
-                        "in_app_title": custom_title.get_text(),
+                        "in_app_title": visible_title.get_text(),
                         "native_title": window.get_title(),
                         "visible_actions": sorted(actions),
                         "more_actions": menu_labels,

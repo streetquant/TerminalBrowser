@@ -4,7 +4,12 @@ import threading
 from types import MethodType, SimpleNamespace
 from unittest import mock
 
-from termdeck.gtk_app import AttachTerminal, TermDeckWindow
+from termdeck.gtk_app import (
+    AttachTerminal,
+    TermDeckWindow,
+    _INPUT_REJECTED_MESSAGE,
+    _MAX_STREAM_OUTPUT_BUFFER_BYTES,
+)
 from termdeck.tmux_backend import TmuxBackend
 from termdeck.tmux_control import ClientState
 
@@ -684,6 +689,220 @@ def test_missing_attach_makes_stopped_legacy_shell_reopenable() -> None:
     assert updates[-1]["status"] == "missing"
 
 
+def test_connected_reset_and_replay_share_one_ordered_drain() -> None:
+    calls: list[object] = []
+    scheduled: list[tuple[object, tuple[object, ...]]] = []
+
+    class Filter:
+        def reset(self) -> None:
+            calls.append("filter-reset")
+
+        def process(self, payload: bytes) -> bytes:
+            calls.append(("process", payload))
+            return b"filtered:" + payload
+
+    attach = SimpleNamespace(
+        _detached=False,
+        _stream_generation=7,
+        _output_lock=threading.Lock(),
+        _output_buffer=bytearray(b"previous-connection"),
+        _output_drain_scheduled=False,
+        _stream_reset_pending=False,
+        _stream_output_overflowed=False,
+        _stream_recovery_scheduled=False,
+        _last_stream_scheduling_error="",
+        _input_rejection_reported=False,
+        terminal=SimpleNamespace(
+            reset=lambda clear_tabstops, clear_history: calls.append(
+                ("reset", clear_tabstops, clear_history)
+            ),
+            feed=lambda payload: calls.append(("feed", payload)),
+        ),
+        _contrast_filter=Filter(),
+    )
+    attach._remember_stream_scheduling_error = MethodType(
+        AttachTerminal._remember_stream_scheduling_error, attach
+    )
+    attach._request_stream_output_drain = MethodType(
+        AttachTerminal._request_stream_output_drain, attach
+    )
+    attach._drain_stream_output = MethodType(AttachTerminal._drain_stream_output, attach)
+    attach._apply_stream_state = lambda *_args: False
+
+    with mock.patch(
+        "termdeck.gtk_app.GLib.idle_add",
+        side_effect=lambda callback, *args: scheduled.append((callback, args))
+        or len(scheduled),
+    ):
+        AttachTerminal._on_stream_state(attach, 7, ClientState.CONNECTED)
+        # Reproduce the old race: setup completes before GTK runs the queued
+        # CONNECTED idle. Replay must join the already-scheduled reset drain,
+        # not be erased by a later independent callback.
+        AttachTerminal._on_stream_output(attach, 7, b"replay-screen")
+
+    assert len(scheduled) == 2
+    assert scheduled[0][0] == attach._drain_stream_output
+    assert scheduled[1][0] == attach._apply_stream_state
+    assert bytes(attach._output_buffer) == b"replay-screen"
+    assert attach._stream_reset_pending is True
+
+    assert AttachTerminal._drain_stream_output(attach, 7) is False
+
+    assert calls == [
+        ("reset", True, True),
+        "filter-reset",
+        ("process", b"replay-screen"),
+        ("feed", b"filtered:replay-screen"),
+    ]
+    assert bytes(attach._output_buffer) == b""
+    assert attach._output_drain_scheduled is False
+    assert attach._stream_reset_pending is False
+
+
+def test_output_schedule_failure_keeps_bytes_and_clears_the_latch() -> None:
+    attach = SimpleNamespace(
+        _detached=False,
+        _stream_generation=3,
+        _output_lock=threading.Lock(),
+        _output_buffer=bytearray(),
+        _output_drain_scheduled=False,
+        _stream_reset_pending=False,
+        _stream_output_overflowed=False,
+        _stream_recovery_scheduled=False,
+        _last_stream_scheduling_error="",
+    )
+    attach._remember_stream_scheduling_error = MethodType(
+        AttachTerminal._remember_stream_scheduling_error, attach
+    )
+    attach._request_stream_output_drain = MethodType(
+        AttachTerminal._request_stream_output_drain, attach
+    )
+    attach._request_stream_overflow_recovery = MethodType(
+        AttachTerminal._request_stream_overflow_recovery, attach
+    )
+    attach._drain_stream_output = lambda _generation: False
+
+    with mock.patch(
+        "termdeck.gtk_app._schedule_glib_callback",
+        return_value=(False, "primary and fallback unavailable"),
+    ):
+        AttachTerminal._on_stream_output(attach, 3, b"replay")
+
+    assert bytes(attach._output_buffer) == b"replay"
+    assert attach._output_drain_scheduled is False
+    assert "fallback unavailable" in attach._last_stream_scheduling_error
+
+
+def test_connected_state_apply_retries_a_failed_output_schedule() -> None:
+    calls: list[int] = []
+    attach = SimpleNamespace(
+        _detached=False,
+        _stream_generation=5,
+        _attach_stable_source_id=0,
+        _remove_glib_source=lambda _source_id: None,
+        _request_stream_output_drain=lambda generation: calls.append(generation) or True,
+        _mark_attach_stable=lambda: False,
+    )
+
+    with mock.patch("termdeck.gtk_app.GLib.timeout_add", return_value=81):
+        assert AttachTerminal._apply_stream_state(
+            attach, 5, ClientState.CONNECTED
+        ) is False
+
+    assert calls == [5]
+    assert attach._attach_stable_source_id == 81
+
+
+def test_output_backlog_overflow_schedules_one_authoritative_reconnect() -> None:
+    events: list[object] = []
+    scheduled: list[tuple[object, tuple[object, ...]]] = []
+    attach = SimpleNamespace(
+        _detached=False,
+        _terminally_stopped=False,
+        _attach_restart_deferred=False,
+        _stream_generation=6,
+        _output_lock=threading.Lock(),
+        _output_buffer=bytearray(),
+        _output_drain_scheduled=False,
+        _stream_reset_pending=False,
+        _stream_output_overflowed=False,
+        _stream_recovery_scheduled=False,
+        _last_stream_scheduling_error="",
+        terminal=SimpleNamespace(
+            get_column_count=lambda: 132,
+            get_row_count=lambda: 43,
+        ),
+        _teardown_stream=lambda: events.append("teardown"),
+        _connect_stream=lambda **kwargs: events.append(("connect", kwargs)),
+    )
+    attach._remember_stream_scheduling_error = MethodType(
+        AttachTerminal._remember_stream_scheduling_error, attach
+    )
+    attach._request_stream_output_drain = MethodType(
+        AttachTerminal._request_stream_output_drain, attach
+    )
+    attach._request_stream_overflow_recovery = MethodType(
+        AttachTerminal._request_stream_overflow_recovery, attach
+    )
+    attach._recover_stream_output_overflow = MethodType(
+        AttachTerminal._recover_stream_output_overflow, attach
+    )
+
+    with mock.patch(
+        "termdeck.gtk_app._MAX_STREAM_OUTPUT_BUFFER_BYTES", 4
+    ), mock.patch(
+        "termdeck.gtk_app._schedule_glib_callback",
+        side_effect=lambda callback, *args, **_kwargs: scheduled.append(
+            (callback, args)
+        )
+        or (True, ""),
+    ):
+        AttachTerminal._on_stream_output(attach, 6, b"12345")
+        AttachTerminal._on_stream_output(attach, 6, b"ignored while recovering")
+
+    assert bytes(attach._output_buffer) == b""
+    assert attach._stream_output_overflowed is True
+    assert attach._stream_recovery_scheduled is True
+    assert len(scheduled) == 1
+
+    callback, args = scheduled[0]
+    assert callback(*args) is False
+    assert events == [
+        "teardown",
+        ("connect", {"columns": 132, "rows": 43}),
+    ]
+    assert attach._stream_output_overflowed is False
+    assert attach._stream_recovery_scheduled is False
+
+
+def test_rejected_loopback_input_is_reported_once_until_input_recovers() -> None:
+    feeds: list[bytes] = []
+    accepted = iter((False, False, True, False))
+    attach = SimpleNamespace(
+        _loopback_fd=7,
+        _loopback_watch_id=1,
+        controller=SimpleNamespace(send_bytes=lambda _data: next(accepted)),
+        _detached=False,
+        _input_rejection_reported=False,
+        terminal=SimpleNamespace(feed=feeds.append),
+    )
+
+    def run_once() -> None:
+        with mock.patch(
+            "termdeck.gtk_app.os.read",
+            side_effect=[b"payload", BlockingIOError()],
+        ):
+            assert AttachTerminal._on_loopback_readable(attach, None, 0) is True
+
+    run_once()
+    run_once()
+    run_once()
+    run_once()
+
+    assert feeds == [_INPUT_REJECTED_MESSAGE, _INPUT_REJECTED_MESSAGE]
+    assert attach._input_rejection_reported is True
+
+
 def test_teardown_stream_stops_controller_and_bumps_generation() -> None:
     stops: list[bool] = []
     attach = SimpleNamespace(
@@ -692,6 +911,10 @@ def test_teardown_stream_stops_controller_and_bumps_generation() -> None:
         _output_lock=threading.Lock(),
         _output_buffer=bytearray(b"stale"),
         _output_drain_scheduled=True,
+        _stream_reset_pending=True,
+        _stream_output_overflowed=True,
+        _stream_recovery_scheduled=True,
+        _input_rejection_reported=True,
     )
 
     AttachTerminal._teardown_stream(attach)
@@ -701,6 +924,10 @@ def test_teardown_stream_stops_controller_and_bumps_generation() -> None:
     assert attach._stream_generation == 5
     assert bytes(attach._output_buffer) == b""
     assert attach._output_drain_scheduled is False
+    assert attach._stream_reset_pending is False
+    assert attach._stream_output_overflowed is False
+    assert attach._stream_recovery_scheduled is False
+    assert attach._input_rejection_reported is False
 
 
 def test_stale_stream_output_is_discarded_after_teardown() -> None:

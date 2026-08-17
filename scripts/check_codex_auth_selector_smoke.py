@@ -11,6 +11,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from smoke_support import stream_ready
+
 
 def _drain_gtk(Gtk, *, until=None, timeout: float = 6.0) -> None:
     deadline = time.monotonic() + timeout
@@ -147,7 +149,7 @@ Path({str(probe)!r}).write_text(json.dumps({{
                 Gtk,
                 until=lambda: bool(app.windows)
                 and record.id in app.windows[0].tabs
-                and app.windows[0].tabs[record.id].widget.process is not None,
+                and stream_ready(app.windows[0].tabs[record.id].widget),
             )
             window = app.windows[0]
             toast_messages: list[tuple[str, str]] = []
@@ -217,14 +219,10 @@ Path({str(probe)!r}).write_text(json.dumps({{
                     check=True,
                 )
                 _drain_gtk(Gtk)
-                # Some CI/window-manager combinations do not transfer the
-                # keyboard grab to a newly mapped combo popup after an XTest
-                # click. Calling popup() is idempotent when the physical click
-                # already opened it and gives the real Gtk.ComboBox popup the
-                # grab otherwise; selection still happens through real key
-                # events and the production ``changed`` signal.
-                combo.popup()
-                _drain_gtk(Gtk)
+                # When the physical click mapped the popup, route real key
+                # events through that production surface. Do not call
+                # ``Gtk.ComboBox.popup()`` without a trigger event: GTK warns
+                # and some window managers give that synthetic popup no grab.
                 subprocess.run(["xdotool", "key", "End", "Return"], check=True)
                 settle_deadline = time.monotonic() + 0.75
                 while time.monotonic() < settle_deadline:
@@ -296,13 +294,13 @@ Path({str(probe)!r}).write_text(json.dumps({{
                 Gtk,
                 until=lambda: bool(
                     window.tabs.get(record.id) is not None
-                    and window.tabs[record.id].widget.process is not None
+                    and stream_ready(window.tabs[record.id].widget)
                     and app.backend.session_exists(updated)
                 ),
                 timeout=6.0,
             )
             tab = window.tabs.get(record.id)
-            if tab is None or tab.widget.process is None:
+            if tab is None or not stream_ready(tab.widget):
                 raise AssertionError("account switch removed or detached the selected tab")
             if not app.backend.session_exists(updated):
                 raise AssertionError("account switch did not leave the selected tmux session live")

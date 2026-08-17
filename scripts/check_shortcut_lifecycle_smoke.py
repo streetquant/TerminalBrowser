@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from smoke_support import stream_ready
+
 
 def _drain_gtk(Gtk, *, until=None, timeout: float = 3.0) -> None:
     deadline = time.monotonic() + timeout
@@ -87,7 +89,7 @@ def main() -> int:
                 Gtk,
                 until=lambda: len(app.windows) == 2
                 and all(
-                    tab.widget.process is not None
+                    stream_ready(tab.widget)
                     for window in app.windows
                     for tab in window.tabs.values()
                 ),

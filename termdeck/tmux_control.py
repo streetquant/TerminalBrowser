@@ -486,8 +486,64 @@ class ControlModeClient:
         return max(0.0, deadline - self._clock())
 
     @staticmethod
-    def _terminate_quietly(transport: _Transport) -> None:
+    def _close_stream_quietly(stream: object | None) -> None:
+        """Close one transport stream without letting teardown mask its cause."""
+
+        close = getattr(stream, "close", None)
+        if not callable(close):
+            return
         try:
-            transport.terminate()
+            close()
         except Exception:
+            # A pipe can report BrokenPipe while being closed after its child
+            # exits. It is still closed from this process's ownership model.
             pass
+
+    @staticmethod
+    def _poll_quietly(transport: _Transport) -> object | None:
+        try:
+            return transport.poll()
+        except Exception:
+            return None
+
+    @classmethod
+    def _terminate_quietly(cls, transport: _Transport) -> None:
+        """Close, terminate, reap, and finally release one control transport.
+
+        Merely calling ``terminate`` leaves ``Popen`` pipe objects to be closed
+        by interpreter finalization.  That produced noisy ``BrokenPipeError``
+        traces and can retain zombie children during repeated GUI teardown.
+        The write side closes first, then TERM receives a bounded grace period;
+        a supported ``kill`` method is the final fallback.  Every stream is
+        closed in ``finally`` so this routine remains idempotent under stop/EOF
+        races between the owner and reader threads.
+        """
+
+        stdin = getattr(transport, "stdin", None)
+        stdout = getattr(transport, "stdout", None)
+        stderr = getattr(transport, "stderr", None)
+        cls._close_stream_quietly(stdin)
+        try:
+            if cls._poll_quietly(transport) is None:
+                try:
+                    transport.terminate()
+                except Exception:
+                    pass
+            try:
+                transport.wait(timeout=0.75)
+            except Exception:
+                if cls._poll_quietly(transport) is None:
+                    kill = getattr(transport, "kill", None)
+                    if callable(kill):
+                        try:
+                            kill()
+                        except Exception:
+                            pass
+                try:
+                    transport.wait(timeout=0.75)
+                except Exception:
+                    pass
+        finally:
+            cls._close_stream_quietly(stdout)
+            cls._close_stream_quietly(stderr)
+            cls._close_stream_quietly(stdin)

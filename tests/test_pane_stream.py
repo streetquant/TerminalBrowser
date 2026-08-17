@@ -14,10 +14,14 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from termdeck.pane_stream import (
     PaneStreamController,
     StreamSetupGate,
+    _MAX_PENDING_INPUT_BYTES,
+    _MAX_PENDING_INPUT_CHUNKS,
+    _MAX_PENDING_OUTPUT_CHUNKS,
     _STATE_FIELDS,
     spawn_control_transport,
     terminate_orphan_control_clients,
@@ -64,12 +68,12 @@ class FakeControlClient:
         self.on_event = kwargs["on_event"]
         self._lock = threading.Lock()
         self.commands: list[str] = []
-        self._script: list[tuple[str, CommandResult]] = []
+        self._script: list[tuple[str, CommandResult | Exception]] = []
         self.state = ClientState.CONNECTING
         self.started = False
         self.stopped = False
 
-    def script(self, prefix: str, result: CommandResult) -> None:
+    def script(self, prefix: str, result: CommandResult | Exception) -> None:
         with self._lock:
             self._script.append((prefix, result))
 
@@ -89,6 +93,8 @@ class FakeControlClient:
             for index, (prefix, result) in enumerate(self._script):
                 if command.startswith(prefix):
                     del self._script[index]
+                    if isinstance(result, Exception):
+                        raise result
                     return result
         return CommandResult(True, (), None)
 
@@ -116,6 +122,23 @@ class PaneStreamControllerTests(unittest.TestCase):
         self.addCleanup(controller.stop)
         return controller, created["client"], outputs
 
+    def test_connected_state_is_published_before_setup_is_enqueued(self) -> None:
+        events: list[tuple[str, object]] = []
+        controller, _client, _outputs = self.make_controller(
+            on_state_change=lambda state: events.append(("state", state))
+        )
+
+        with mock.patch.object(
+            controller._tasks,
+            "put",
+            side_effect=lambda task: events.append(("task", task)),
+        ):
+            controller._handle_state_change(ClientState.CONNECTED)
+
+        self.assertEqual(events[0], ("state", ClientState.CONNECTED))
+        self.assertEqual(events[1][0], "task")
+        self.assertEqual(events[1][1][0], "setup")
+
     def test_zero_history_size_skips_the_history_capture(self) -> None:
         controller, client, outputs = self.make_controller()
         client.script("list-panes", CommandResult(True, (state_line(0),), None))
@@ -140,6 +163,51 @@ class PaneStreamControllerTests(unittest.TestCase):
         self.assertIn(b"prompt$", data)
         self.assertEqual(client.count("-S -120 -E -1"), 1)
 
+    def test_normal_shell_replay_disables_mouse_modes_for_native_scrollback(self) -> None:
+        controller, client, outputs = self.make_controller()
+        client.script("list-panes", CommandResult(True, (state_line(0),), None))
+        client.script("capture-pane", CommandResult(True, ("prompt$",), None))
+        controller.start(columns=80, rows=24)
+        client.connect()
+        wait_until(lambda: outputs)
+
+        replay = b"".join(outputs)
+        for mode in (1000, 1002, 1003, 1006):
+            self.assertIn(f"\x1b[?{mode}l".encode(), replay)
+            self.assertNotIn(f"\x1b[?{mode}h".encode(), replay)
+        self.assertIn(b"\x1b[4l", replay)
+        self.assertIn(b"\x1b[?6l", replay)
+
+    def test_active_tui_modes_are_replayed_as_enabled(self) -> None:
+        controller, client, outputs = self.make_controller()
+        active = state_line(
+            0,
+            keypad_cursor_flag="1",
+            insert_flag="1",
+            origin_flag="1",
+            mouse_standard_flag="1",
+            mouse_button_flag="1",
+            mouse_all_flag="1",
+            mouse_sgr_flag="1",
+        )
+        client.script("list-panes", CommandResult(True, (active,), None))
+        client.script("capture-pane", CommandResult(True, ("tui",), None))
+        controller.start(columns=80, rows=24)
+        client.connect()
+        wait_until(lambda: outputs)
+
+        replay = b"".join(outputs)
+        for sequence in (
+            b"\x1b[?1h",
+            b"\x1b[4h",
+            b"\x1b[?6h",
+            b"\x1b[?1000h",
+            b"\x1b[?1002h",
+            b"\x1b[?1003h",
+            b"\x1b[?1006h",
+        ):
+            self.assertIn(sequence, replay)
+
     def test_failed_list_panes_is_retried_until_the_server_answers(self) -> None:
         controller, client, outputs = self.make_controller()
         client.script("list-panes", CommandResult(False, (), "timeout"))
@@ -150,6 +218,34 @@ class PaneStreamControllerTests(unittest.TestCase):
         wait_until(lambda: outputs, timeout=5.0)
         self.assertGreaterEqual(client.count("list-panes"), 2)
         self.assertIn(b"prompt$", b"".join(outputs))
+
+    def test_setup_exception_is_retried_instead_of_stranding_connected_tab(self) -> None:
+        controller, client, outputs = self.make_controller()
+        client.script("list-panes", RuntimeError("transient setup failure"))
+        client.script("list-panes", CommandResult(True, (state_line(0),), None))
+        client.script("capture-pane", CommandResult(True, ("prompt$",), None))
+        controller.start(columns=80, rows=24)
+        client.connect()
+
+        wait_until(lambda: outputs, timeout=2.0)
+
+        self.assertGreaterEqual(client.count("list-panes"), 2)
+        self.assertIn(b"prompt$", b"".join(outputs))
+
+    def test_exception_after_ready_does_not_replay_the_pane(self) -> None:
+        controller, client, outputs = self.make_controller()
+        client.script("list-panes", CommandResult(True, (state_line(0),), None))
+        client.script("capture-pane", CommandResult(True, ("prompt$",), None))
+        client.script("send-keys", RuntimeError("input transport failed"))
+        controller.start(columns=80, rows=24)
+        controller.send_bytes(b"x")
+        client.connect()
+
+        wait_until(lambda: outputs)
+        time.sleep(0.7)
+
+        self.assertEqual(client.count("list-panes"), 1)
+        self.assertEqual(b"".join(outputs).count(b"prompt$"), 1)
 
     def test_failed_visible_capture_retries_setup_without_losing_history(self) -> None:
         controller, client, outputs = self.make_controller()
@@ -174,10 +270,82 @@ class PaneStreamControllerTests(unittest.TestCase):
         client.script("list-panes", CommandResult(True, (state_line(0),), None))
         client.script("capture-pane", CommandResult(True, ("prompt$",), None))
         controller.start(columns=80, rows=24)
-        controller.send_bytes(b"hi")
+        self.assertTrue(controller.send_bytes(b"hi"))
         client.connect()
         wait_until(lambda: client.count("send-keys") == 1)
         self.assertEqual(client.count("send-keys -t %1 -H 68 69"), 1)
+        wait_until(lambda: controller._unsent_input_bytes == 0)
+        self.assertEqual(controller._unsent_input_chunks, 0)
+
+    def test_input_byte_limit_rejects_new_payload_without_truncating_existing(self) -> None:
+        controller, _client, _outputs = self.make_controller()
+        accepted = b"x" * _MAX_PENDING_INPUT_BYTES
+
+        self.assertTrue(controller.send_bytes(accepted))
+        self.assertFalse(controller.send_bytes(b"y"))
+
+        self.assertEqual(controller._unsent_input_bytes, len(accepted))
+        self.assertEqual(controller._unsent_input_chunks, 1)
+        queued = controller._tasks.get_nowait()
+        self.assertEqual(queued, ("input", accepted))
+
+    def test_input_chunk_limit_bounds_many_tiny_events(self) -> None:
+        controller, _client, _outputs = self.make_controller()
+        for _index in range(_MAX_PENDING_INPUT_CHUNKS):
+            self.assertTrue(controller.send_bytes(b"x"))
+
+        self.assertFalse(controller.send_bytes(b"overflow"))
+        self.assertEqual(controller._unsent_input_chunks, _MAX_PENDING_INPUT_CHUNKS)
+        self.assertEqual(controller._unsent_input_bytes, _MAX_PENDING_INPUT_CHUNKS)
+
+    def test_pre_ready_output_overflow_retries_from_authoritative_history(self) -> None:
+        controller, client, outputs = self.make_controller()
+        for _attempt in range(2):
+            client.script("list-panes", CommandResult(True, (state_line(10),), None))
+            client.script("capture-pane", CommandResult(True, ("old output",), None))
+            client.script("capture-pane", CommandResult(True, ("screen",), None))
+        original_build = controller._build_replay
+        build_count = 0
+
+        def overflow_first_build(pane_state, rows):
+            nonlocal build_count
+            build_count += 1
+            replay = original_build(pane_state, rows)
+            if build_count == 1:
+                controller._handle_event(
+                    ControlEvent("output", "%output %1 overflow", (), "%1", "x" * 17)
+                )
+            return replay
+
+        controller._build_replay = overflow_first_build  # type: ignore[method-assign]
+        controller.start(columns=80, rows=24)
+        with mock.patch("termdeck.pane_stream._MAX_PENDING_OUTPUT_BYTES", 16):
+            client.connect()
+            wait_until(lambda: outputs, timeout=3.0)
+
+        merged = b"".join(outputs)
+        self.assertEqual(build_count, 2)
+        self.assertEqual(client.count("-S -10 -E -1"), 2)
+        self.assertEqual(merged.count(b"old output"), 1)
+        self.assertEqual(merged.count(b"screen"), 1)
+        self.assertNotIn(b"x" * 17, merged)
+        self.assertTrue(controller._replayed_history)
+        self.assertEqual(controller._pending_output_bytes, 0)
+        self.assertFalse(controller._pending_output_overflowed)
+
+    def test_pre_ready_output_chunk_limit_bounds_list_overhead(self) -> None:
+        controller, _client, _outputs = self.make_controller()
+        event = ControlEvent("output", "%output %1 x", (), "%1", "x")
+        for _index in range(_MAX_PENDING_OUTPUT_CHUNKS):
+            controller._handle_event(event)
+
+        self.assertEqual(len(controller._pending_output), _MAX_PENDING_OUTPUT_CHUNKS)
+        self.assertEqual(controller._pending_output_bytes, _MAX_PENDING_OUTPUT_CHUNKS)
+        controller._handle_event(event)
+
+        self.assertEqual(controller._pending_output, [])
+        self.assertEqual(controller._pending_output_bytes, 0)
+        self.assertTrue(controller._pending_output_overflowed)
 
     def test_dead_pane_subscription_reports_death_once(self) -> None:
         dead: list[int] = []
@@ -206,6 +374,88 @@ class PaneStreamControllerTests(unittest.TestCase):
         controller.start(columns=80, rows=24)
         controller.stop()
         self.assertTrue(client.stopped)
+
+    def test_setup_retry_has_one_owner_and_stop_cancels_it(self) -> None:
+        controller, _client, _outputs = self.make_controller()
+        controller._generation = 4
+        created = []
+
+        class FakeTimer:
+            def __init__(self, delay, callback, args=()):
+                self.delay = delay
+                self.callback = callback
+                self.args = args
+                self.daemon = False
+                self.started = False
+                self.cancelled = False
+                created.append(self)
+
+            def start(self):
+                self.started = True
+
+            def cancel(self):
+                self.cancelled = True
+
+        with mock.patch("termdeck.pane_stream.threading.Timer", FakeTimer):
+            controller._schedule_setup_retry(4)
+            controller._schedule_setup_retry(4)
+
+        self.assertEqual(len(created), 1)
+        self.assertTrue(created[0].started)
+        self.assertIs(controller._setup_retry_timer, created[0])
+        controller.stop()
+        self.assertTrue(created[0].cancelled)
+        self.assertIsNone(controller._setup_retry_timer)
+        self.assertIsNone(controller._setup_retry_generation)
+
+    def test_setup_retry_callback_clears_owner_and_queues_once(self) -> None:
+        controller, _client, _outputs = self.make_controller()
+        controller._generation = 7
+        created = []
+
+        class FakeTimer:
+            def __init__(self, delay, callback, args=()):
+                self.callback = callback
+                self.args = args
+                self.daemon = False
+                created.append(self)
+
+            def start(self):
+                return None
+
+            def cancel(self):
+                return None
+
+        with mock.patch("termdeck.pane_stream.threading.Timer", FakeTimer):
+            controller._schedule_setup_retry(7)
+
+        created[0].callback(*created[0].args)
+        self.assertIsNone(controller._setup_retry_timer)
+        self.assertIsNone(controller._setup_retry_generation)
+        self.assertEqual(controller._tasks.get_nowait(), ("setup", 7))
+
+    def test_setup_retry_timer_start_failure_requeues_immediately(self) -> None:
+        controller, _client, _outputs = self.make_controller()
+        controller._generation = 9
+
+        class BrokenTimer:
+            daemon = False
+
+            def __init__(self, _delay, _callback, args=()):
+                self.args = args
+
+            def start(self):
+                raise RuntimeError("thread allocation unavailable")
+
+            def cancel(self):
+                return None
+
+        with mock.patch("termdeck.pane_stream.threading.Timer", BrokenTimer):
+            controller._schedule_setup_retry(9)
+
+        self.assertIsNone(controller._setup_retry_timer)
+        self.assertIsNone(controller._setup_retry_generation)
+        self.assertEqual(controller._tasks.get_nowait(), ("setup", 9))
 
 
 class StreamSetupGateTests(unittest.TestCase):

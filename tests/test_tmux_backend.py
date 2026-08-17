@@ -1728,6 +1728,9 @@ class TmuxBackendTests(unittest.TestCase):
             ready, detail = backend._await_auth_recreation_ready(
                 record,
                 previous_session_created="1700000000",
+                previous_pane_id="%1",
+                previous_pane_pid=100,
+                previous_pane_start_time=1,
                 expected_recovery_command=recovery,
                 expected_recovery_cwd="/workspace/repo",
                 timeout=0.05,
@@ -1736,6 +1739,141 @@ class TmuxBackendTests(unittest.TestCase):
         self.assertEqual(ready, identity)
         self.assertEqual(detail, "")
         observe.assert_called_once_with(4242)
+
+    def test_auth_recreation_accepts_same_second_with_fresh_pane_process_identity(self):
+        record = _auth_record(status="running")
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity(
+            session_created="1700000000",
+            pane_id="%2",
+            pane_pid=4242,
+        )
+
+        with mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            TmuxBackend, "_auth_process_identity", return_value=("S", 22)
+        ), mock.patch.object(
+            TmuxBackend,
+            "_private_auth_process_tree_environment_ready",
+            return_value=True,
+        ):
+            ready, detail = backend._await_auth_recreation_ready(
+                record,
+                previous_session_created="1700000000",
+                previous_pane_id="%1",
+                previous_pane_pid=100,
+                previous_pane_start_time=1,
+                expected_recovery_command=None,
+                expected_recovery_cwd=None,
+                timeout=0.05,
+            )
+
+        self.assertEqual(ready, identity)
+        self.assertEqual(detail, "")
+
+    def test_auth_recreation_rejects_the_complete_previous_identity(self):
+        record = _auth_record(status="running")
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity(
+            session_created="1700000000",
+            pane_id="%1",
+            pane_pid=100,
+        )
+
+        with mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            TmuxBackend, "_auth_process_identity", return_value=("S", 1)
+        ), mock.patch(
+            "termdeck.tmux_backend.time.monotonic", side_effect=[100.0, 101.0]
+        ), mock.patch("termdeck.tmux_backend.time.sleep") as sleep:
+            ready, detail = backend._await_auth_recreation_ready(
+                record,
+                previous_session_created="1700000000",
+                previous_pane_id="%1",
+                previous_pane_pid=100,
+                previous_pane_start_time=1,
+                expected_recovery_command=None,
+                expected_recovery_cwd=None,
+                timeout=0.05,
+            )
+
+        self.assertEqual(ready, identity)
+        self.assertIn("session, pane, and process identity", detail)
+        sleep.assert_not_called()
+
+    def test_failed_auth_recreation_cleanup_waits_for_exact_process_exit(self):
+        record = _auth_record(status="running")
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity(pane_pid=4242)
+
+        with mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            backend, "_terminate_auth_session"
+        ) as terminate, mock.patch.object(
+            backend, "_auth_session_exists", return_value=False
+        ), mock.patch.object(
+            backend,
+            "_auth_process_identity",
+            side_effect=[("S", 22), ("S", 22), None],
+        ), mock.patch("termdeck.tmux_backend.time.sleep") as sleep:
+            cleaned, detail = backend._cleanup_failed_auth_recreation(
+                record, identity, timeout=0.5
+            )
+
+        self.assertTrue(cleaned)
+        self.assertEqual(detail, "")
+        terminate.assert_called_once_with(record)
+        sleep.assert_called_once_with(0.025)
+
+    def test_failed_auth_recreation_cleanup_accepts_pid_reuse_as_old_process_exit(self):
+        record = _auth_record(status="running")
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity(pane_pid=4242)
+
+        with mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            backend, "_terminate_auth_session"
+        ), mock.patch.object(
+            backend, "_auth_session_exists", return_value=False
+        ), mock.patch.object(
+            backend,
+            "_auth_process_identity",
+            side_effect=[("S", 22), ("S", 23)],
+        ):
+            cleaned, detail = backend._cleanup_failed_auth_recreation(
+                record, identity, timeout=0.5
+            )
+
+        self.assertTrue(cleaned)
+        self.assertEqual(detail, "")
+
+    def test_failed_auth_recreation_cleanup_fails_when_exact_process_stays_live(self):
+        record = _auth_record(status="running")
+        backend = TmuxBackend(executable="tmux")
+        identity = _auth_pane_identity(pane_pid=4242)
+
+        with mock.patch.object(
+            backend, "_inspect_auth_pane", return_value=identity
+        ), mock.patch.object(
+            backend, "_terminate_auth_session"
+        ), mock.patch.object(
+            backend, "_auth_session_exists", return_value=False
+        ), mock.patch.object(
+            backend, "_auth_process_identity", return_value=("S", 22)
+        ), mock.patch(
+            "termdeck.tmux_backend.time.monotonic", side_effect=[100.0, 101.0]
+        ), mock.patch("termdeck.tmux_backend.time.sleep") as sleep:
+            cleaned, detail = backend._cleanup_failed_auth_recreation(
+                record, identity, timeout=0.05
+            )
+
+        self.assertFalse(cleaned)
+        self.assertIn("process remained live", detail)
+        sleep.assert_not_called()
 
     def test_auth_recreation_readiness_rejects_wrong_recovery_takeover(self):
         expected_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
@@ -1769,6 +1907,9 @@ class TmuxBackendTests(unittest.TestCase):
             ready, detail = backend._await_auth_recreation_ready(
                 record,
                 previous_session_created="1700000000",
+                previous_pane_id="%1",
+                previous_pane_pid=100,
+                previous_pane_start_time=1,
                 expected_recovery_command=f"codex --yolo resume {expected_id}",
                 expected_recovery_cwd="/workspace/repo",
                 timeout=0.05,

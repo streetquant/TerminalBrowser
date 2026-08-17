@@ -10,6 +10,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from smoke_support import stream_ready, stream_snapshot
+
 
 def _drain_gtk(Gtk, *, until=None, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
@@ -137,14 +139,12 @@ def main() -> int:
             record = next(row for row in app.store.list(window_id=source.window_id) if row.name == "move-me")
             moved_tab = source.tabs[record.id]
             moved_widget = moved_tab.widget
-            _drain_gtk(
-                Gtk,
-                until=lambda: moved_widget.process is not None and moved_widget.process.poll() is None,
-            )
-            process = moved_widget.process
-            if process is None:
-                raise AssertionError("source tab did not start its tmux client")
-            client_pid = process.pid
+            _drain_gtk(Gtk, until=lambda: stream_ready(moved_widget))
+            before_stream = stream_snapshot(moved_widget)
+            if before_stream is None:
+                raise AssertionError("source tab did not start its pane stream")
+            controller = before_stream.controller
+            stream_generation = before_stream.generation
             pane_pid = app.backend.pane_pid(record)
 
             source.open_master_window()
@@ -187,7 +187,7 @@ def main() -> int:
 
             def accept_new_window_dialog() -> bool:
                 for toplevel in Gtk.Window.list_toplevels():
-                    if toplevel.get_title() != "New TermDeck window":
+                    if toplevel.get_title() != "New T1000 window":
                         continue
                     toplevel.entry.set_text("Created destination")
                     toplevel.response(Gtk.ResponseType.OK)
@@ -230,8 +230,18 @@ def main() -> int:
                 )
             if destination.tabs[record.id].widget is not moved_widget:
                 raise AssertionError("move replaced the live VTE widget")
-            if moved_widget.process is not process or process.pid != client_pid or process.poll() is not None:
-                raise AssertionError("move restarted or stopped the existing tmux client")
+            after_stream = stream_snapshot(moved_widget)
+            if (
+                after_stream is None
+                or after_stream.controller is not controller
+                or after_stream.generation != stream_generation
+                or not after_stream.ready
+                or after_stream.stopped
+            ):
+                raise AssertionError(
+                    "move restarted or stopped the existing pane stream: "
+                    f"before={before_stream!r}, after={after_stream!r}"
+                )
             if moved_widget._detached:
                 raise AssertionError("move detached the existing terminal widget")
             if not app.backend.session_exists(refreshed):
@@ -246,7 +256,8 @@ def main() -> int:
                         "right_click_row": True,
                         "source_excluded": True,
                         "same_vte_widget": True,
-                        "same_tmux_client_pid": client_pid,
+                        "same_stream_controller": True,
+                        "stream_generation": stream_generation,
                         "same_tmux_pane_pid": pane_pid,
                         "destination_focused": True,
                         "new_window_destination": True,

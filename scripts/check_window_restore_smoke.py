@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,77 @@ def _wait_for_attached_client(
     )
 
 
+def _write_private_recovery_state(
+    path: Path,
+    *,
+    thread_id: str,
+    rollout_path: Path,
+    cwd: Path,
+) -> None:
+    """Create the bounded native-state precondition for exact private recovery.
+
+    Production refuses to run ``codex resume`` in a private CODEX_HOME unless
+    its SQLx ledger and backfill marker are complete. The smoke must satisfy
+    that boundary explicitly rather than relying on an empty test directory or
+    mocking the hardened recovery path away.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        connection.executescript(
+            """
+            CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            );
+            CREATE TABLE backfill_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                status TEXT NOT NULL,
+                last_watermark TEXT,
+                last_success_at INTEGER,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                cwd TEXT NOT NULL
+            );
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO _sqlx_migrations(
+                version, description, success, checksum, execution_time
+            ) VALUES (?, ?, 1, ?, ?)
+            """,
+            [
+                (version, f"migration {version}", bytes([version]) * 48, version * 10)
+                for version in range(1, 47)
+            ],
+        )
+        connection.execute(
+            """
+            INSERT INTO backfill_state(
+                id, status, last_watermark, last_success_at, updated_at
+            ) VALUES (1, 'complete', NULL, 1234, 1234)
+            """
+        )
+        connection.execute(
+            "INSERT INTO threads(id, rollout_path, cwd) VALUES (?, ?, ?)",
+            (thread_id, str(rollout_path), str(cwd)),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    path.chmod(0o600)
+
+
 def main() -> int:
     # Keep TMUX_TMPDIR comfortably below the Unix-domain socket path limit,
     # including when CI places TMPDIR under a deep checkout path.
@@ -64,6 +136,8 @@ def main() -> int:
         fake_bin = root / "bin"
         recovery_cwd = root / "recovered-repo"
         recovery_marker = root / "recovered-command.txt"
+        codex_session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        exact_recovery_command = f"codex --yolo resume {codex_session_id}"
         home.mkdir()
         tmux_tmp.mkdir(mode=0o700)
         fake_bin.mkdir()
@@ -160,10 +234,36 @@ def main() -> int:
                     )
 
             # This tab originally launched a shell, then ran Codex inside it.
+            # Populate the immutable private scope SessionStore created for the
+            # row; production recovery must see a complete native state DB and
+            # an executable wrapper before it is allowed to run the exact UUID.
+            raw_private_home = (records[0].codex_home or "").strip()
+            if not raw_private_home or not records[0].auth_scope_id:
+                raise AssertionError("created recovery row has no private auth identity")
+            private_home = Path(raw_private_home)
+            private_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            private_home.chmod(0o700)
+            private_bin = private_home / "bin"
+            private_bin.mkdir(parents=True, exist_ok=True, mode=0o700)
+            private_bin.chmod(0o700)
+            private_codex = private_bin / "codex"
+            private_codex.write_bytes(fake_codex.read_bytes())
+            private_codex.chmod(0o700)
+            private_rollout = root / f"{codex_session_id}.jsonl"
+            private_rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+            private_rollout.chmod(0o600)
+            private_state = private_home / "state_5.sqlite"
+            private_state.unlink(missing_ok=True)
+            private_state.with_name(f"{private_state.name}-wal").unlink(missing_ok=True)
+            private_state.with_name(f"{private_state.name}-shm").unlink(missing_ok=True)
+            _write_private_recovery_state(
+                private_state,
+                thread_id=codex_session_id,
+                rollout_path=private_rollout,
+                cwd=recovery_cwd,
+            )
             # Its separately persisted recovery command must run before the
             # recreated tab returns to that shell.
-            codex_session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
-            exact_recovery_command = f"codex --yolo resume {codex_session_id}"
             records[0] = app.store.update(
                 records[0].id,
                 recovery_command=exact_recovery_command,
@@ -251,7 +351,10 @@ def main() -> int:
                     f"restarted={len(restarted)}, deferred={len(deferred)}"
                 )
             recovered = recovery_marker.read_text(encoding="utf-8").splitlines()
-            if recovered != [f"--yolo resume {codex_session_id}", str(recovery_cwd)]:
+            expected_recovery_argv = (
+                f"--dangerously-bypass-hook-trust --yolo resume {codex_session_id}"
+            )
+            if recovered != [expected_recovery_argv, str(recovery_cwd)]:
                 raise AssertionError(
                     "saved foreground Codex command or cwd was not restored: "
                     f"actual={recovered!r}"

@@ -3659,11 +3659,22 @@ class TmuxBackend:
         self,
         record: SessionRecord,
         identity: _AuthPaneIdentity | None,
+        *,
+        timeout: float = 1.5,
     ) -> tuple[bool, str]:
-        """Remove only the freshly observed session and prove it disappeared."""
+        """Remove only the freshly observed session and prove it disappeared.
+
+        ``kill-session`` is synchronous for tmux's registry, but the pane child
+        can take a few scheduler turns to consume SIGHUP and be reaped.  Bind to
+        its kernel start time before mutation, then wait boundedly for that exact
+        process to disappear, become a zombie, or be replaced by PID reuse.
+        """
 
         if identity is None:
             return False, "fresh terminal identity was never established"
+        process_before = self._auth_process_identity(identity.pane_pid)
+        if process_before is None:
+            return False, "fresh terminal process identity was unavailable before cleanup"
         try:
             current = self._inspect_auth_pane(record)
         except (OSError, TmuxError) as exc:
@@ -3679,21 +3690,40 @@ class TmuxBackend:
                 return False, "failed terminal remained live after cleanup"
         except (OSError, TmuxError) as exc:
             return False, f"could not prove the failed terminal exited: {exc}"
-        process_identity = self._auth_process_identity(identity.pane_pid)
-        if process_identity is not None:
-            return False, "failed terminal process remained live after cleanup"
-        return True, ""
+
+        expected_start_time = process_before[1]
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        while True:
+            process_after = self._auth_process_identity(identity.pane_pid)
+            if (
+                process_after is None
+                or process_after[1] != expected_start_time
+                or process_after[0] == "Z"
+            ):
+                return True, ""
+            if time.monotonic() >= deadline:
+                return False, "failed terminal process remained live after cleanup"
+            time.sleep(0.025)
 
     def _await_auth_recreation_ready(
         self,
         record: SessionRecord,
         *,
         previous_session_created: str | None,
+        previous_pane_id: str | None,
+        previous_pane_pid: int | None,
+        previous_pane_start_time: int | None,
         expected_recovery_command: str | None,
         expected_recovery_cwd: str | None,
         timeout: float = 3.0,
     ) -> tuple[_AuthPaneIdentity | None, str]:
-        """Wait boundedly for a fresh, process-bound, exact recovery receipt."""
+        """Wait boundedly for a fresh, process-bound, exact recovery receipt.
+
+        tmux exposes ``session_created`` at one-second resolution.  A valid
+        destroy/recreate transaction can therefore share that timestamp with
+        the old session. Freshness is rejected only when the complete prior
+        session/pane/process identity survives, including the kernel start time.
+        """
 
         deadline = time.monotonic() + max(0.05, timeout)
         last_detail = "fresh tmux pane was not ready"
@@ -3705,8 +3735,19 @@ class TmuxBackend:
                 last_detail = f"fresh tmux pane could not be inspected: {exc}"
             if identity is not None:
                 process_identity = self._auth_process_identity(identity.pane_pid)
-                if previous_session_created and identity.session_created == previous_session_created:
-                    last_detail = "tmux reused the old session identity"
+                reused_previous_identity = bool(
+                    previous_session_created
+                    and previous_pane_id
+                    and previous_pane_pid is not None
+                    and previous_pane_start_time is not None
+                    and identity.session_created == previous_session_created
+                    and identity.pane_id == previous_pane_id
+                    and identity.pane_pid == previous_pane_pid
+                    and process_identity is not None
+                    and process_identity[1] == previous_pane_start_time
+                )
+                if reused_previous_identity:
+                    last_detail = "tmux reused the old session, pane, and process identity"
                 elif process_identity is None:
                     last_detail = "fresh pane process identity was unavailable"
                 elif not (
@@ -3915,6 +3956,9 @@ class TmuxBackend:
             created_identity, readiness_error = self._await_auth_recreation_ready(
                 resumed,
                 previous_session_created=plan.session_created,
+                previous_pane_id=plan.pane_id,
+                previous_pane_pid=plan.pane_pid,
+                previous_pane_start_time=plan.pane_start_time,
                 expected_recovery_command=plan.recovery_command,
                 expected_recovery_cwd=plan.recovery_cwd,
             )

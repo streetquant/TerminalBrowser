@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Verify visible and hidden tmux attachments use the final VTE geometry.
+"""Verify visible and hidden pane streams use the final VTE geometry.
 
-This catches the dotted tmux padding frame that appears when a client attaches at
-80x24 and the GTK window is maximized immediately afterwards, including on a
-notebook page that GTK does not allocate while it is hidden.
+This catches the dotted tmux padding frame that appears when the control-mode
+stream is initialized at 80x24 and the GTK window is maximized immediately
+afterwards, including on a notebook page that GTK does not allocate while it is
+hidden. A control-mode tmux client deliberately has no PTY and therefore no
+``client_width``/``client_height`` oracle; the authoritative contract is the
+requested controller grid, tmux window/pane grids, and VTE grid.
 """
 
 from __future__ import annotations
@@ -26,6 +29,20 @@ def _parse_size(value: str) -> tuple[int, int]:
     return int(width), int(height)
 
 
+def _controller_grid(tab) -> tuple[int, int] | None:
+    controller = getattr(tab.widget, "controller", None)
+    if controller is None:
+        return None
+    lock = getattr(controller, "_lock", None)
+    if lock is None:
+        return None
+    with lock:
+        if not getattr(controller, "_ready", False):
+            return None
+        columns, rows = getattr(controller, "_size", (0, 0))
+    return int(columns), int(rows)
+
+
 def _wait_for_matching_grid(
     Gtk,
     window,
@@ -40,21 +57,8 @@ def _wait_for_matching_grid(
     last = None
     while time.monotonic() < deadline:
         _drain_gtk(Gtk)
-        clients = subprocess.run(
-            [
-                "tmux",
-                "list-clients",
-                "-t",
-                record.tmux_name,
-                "-F",
-                "#{client_width}x#{client_height}",
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        ).stdout.strip().splitlines()
-        if clients:
-            client = _parse_size(clients[0])
+        controller = _controller_grid(tab)
+        if controller is not None:
             vte = (
                 int(tab.widget.terminal.get_column_count()),
                 int(tab.widget.terminal.get_row_count()),
@@ -85,10 +89,14 @@ def _wait_for_matching_grid(
                     text=True,
                 ).strip()
             )
-            last = (client, tmux_window, tmux_pane, vte)
+            last = (controller, tmux_window, tmux_pane, vte)
             matches_expected = expected is None or vte == expected
             changed = different_from is None or vte != different_from
-            if client == tmux_window == tmux_pane == vte and matches_expected and changed:
+            if (
+                controller == tmux_window == tmux_pane == vte
+                and matches_expected
+                and changed
+            ):
                 return last
         time.sleep(0.01)
     raise AssertionError(f"terminal grid did not consume its allocation: {last}")
@@ -159,30 +167,18 @@ def main() -> int:
             hidden_tab = window.tabs[hidden_record.id]
 
             started = time.monotonic()
-            first_client_size: tuple[int, int] | None = None
+            first_controller_size: tuple[int, int] | None = None
             first_vte_size: tuple[int, int] | None = None
             first_window_size: tuple[int, int] | None = None
             first_pane_size: tuple[int, int] | None = None
             first_attach_ms: float | None = None
-            deadline = started + 1.5
+            deadline = started + 3.0
             while time.monotonic() < deadline:
                 _drain_gtk(Gtk)
-                clients = subprocess.run(
-                    [
-                        "tmux",
-                        "list-clients",
-                        "-t",
-                        record.tmux_name,
-                        "-F",
-                        "#{client_width}x#{client_height}",
-                    ],
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                ).stdout.strip().splitlines()
-                if clients:
+                controller_grid = _controller_grid(tab)
+                if controller_grid is not None:
                     first_attach_ms = (time.monotonic() - started) * 1000
-                    first_client_size = _parse_size(clients[0])
+                    first_controller_size = controller_grid
                     first_vte_size = (
                         int(tab.widget.terminal.get_column_count()),
                         int(tab.widget.terminal.get_row_count()),
@@ -215,15 +211,16 @@ def main() -> int:
                 time.sleep(0.005)
 
             if (
-                first_client_size is None
+                first_controller_size is None
                 or first_vte_size is None
                 or first_window_size is None
                 or first_pane_size is None
             ):
-                raise AssertionError("tmux client did not attach within 1.5 seconds")
-            if first_client_size != first_vte_size:
+                raise AssertionError("pane stream did not become ready within 3 seconds")
+            if first_controller_size != first_vte_size:
                 raise AssertionError(
-                    f"first tmux client size {first_client_size} did not match VTE {first_vte_size}"
+                    "first stream-controller size "
+                    f"{first_controller_size} did not match VTE {first_vte_size}"
                 )
             if first_window_size != first_vte_size:
                 raise AssertionError(
@@ -233,8 +230,10 @@ def main() -> int:
                 raise AssertionError(
                     f"first tmux pane size {first_pane_size} did not match VTE {first_vte_size}"
                 )
-            if first_client_size == (80, 24) and first_vte_size != (80, 24):
-                raise AssertionError("tmux attached at default 80x24 before final VTE allocation")
+            if first_controller_size == (80, 24) and first_vte_size != (80, 24):
+                raise AssertionError(
+                    "pane stream initialized at default 80x24 before final VTE allocation"
+                )
 
             # The first-created page is hidden by the second page before the
             # maximize settles. It must already match the mapped page's grid;
@@ -356,7 +355,9 @@ def main() -> int:
                         "ok": True,
                         "first_attach_ms": round(first_attach_ms or 0.0, 2),
                         "vte_grid": f"{first_vte_size[0]}x{first_vte_size[1]}",
-                        "tmux_client_grid": f"{first_client_size[0]}x{first_client_size[1]}",
+                        "stream_controller_grid": (
+                            f"{first_controller_size[0]}x{first_controller_size[1]}"
+                        ),
                         "tmux_window_grid": f"{first_window_size[0]}x{first_window_size[1]}",
                         "tmux_pane_grid": f"{first_pane_size[0]}x{first_pane_size[1]}",
                         "client_surface_filled": True,

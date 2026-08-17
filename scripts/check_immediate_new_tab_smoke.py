@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from smoke_support import stream_ready
+
 
 def _drain_gtk(Gtk, *, until=None, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
@@ -75,7 +77,7 @@ def main() -> int:
                 until=lambda: bool(
                     app.windows
                     and len(app.windows[0].tabs) == 1
-                    and next(iter(app.windows[0].tabs.values())).widget.process is not None
+                    and stream_ready(next(iter(app.windows[0].tabs.values())).widget)
                 ),
             )
 
@@ -105,7 +107,7 @@ def main() -> int:
                 Gtk,
                 until=lambda: len(window.tabs) == 2
                 and len(app.store.list()) == 2
-                and all(tab.widget.process is not None for tab in window.tabs.values()),
+                and all(stream_ready(tab.widget) for tab in window.tabs.values()),
             )
             created = [record for record in app.store.list() if record.id not in before_ids]
             if len(created) != 1:

@@ -12,6 +12,7 @@ from . import __version__
 from .activity import activity_to_dicts, filter_activities, render_activity_table, scan_activities, sort_activities
 from .codex_auth import CodexAuthError, CodexAuthManager
 from .browser_snapshot import BrowserSnapshotError, browser_snapshot_json, import_browser_snapshot, load_snapshot, restore_plan
+from .build_info import BuildIdentityError, release_status
 from .command_palette import build_palette_items, search_palette, serialise_palette_items
 from .capture_search import render_output_search_table, search_session_output
 from .control_plan import build_control_plan
@@ -23,6 +24,15 @@ from .health import classify_session, health_badge, should_pause_for_attention
 from .persistence import persist_live_sessions, persistence_candidates
 from .quickstart import build_quickstart
 from .redaction import redact_text
+from .release_manager import (
+    ReleaseError,
+    build_release,
+    install_release,
+    managed_release_status,
+    rollback_release,
+    semantic_runtime_snapshot,
+    verify_wheel,
+)
 from .resource_budget import BudgetConfigError, assess_budgets, default_budgets, load_budgets, render_budget_table, sample_budget_json
 from .resources import ResourceSampler, format_bytes
 from .session_lifecycle import archive_records, hide_records, lifecycle_payload, move_records, pin_records, recently_closed_records, rename_record, reopen_closed_records, retag_records, show_records, unpin_records
@@ -252,6 +262,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "gui_import": gui_import,
         "terminator_config": str(theme.source_path) if theme.source_path and theme.source_path.exists() else "not found; using defaults",
         "session_db": str(DEFAULT_DB_PATH),
+        "release": release_status(verify_artifact=False),
     }
     _print_json(checks)
     missing_runtime = (
@@ -285,6 +296,103 @@ def cmd_diagnostics(args: argparse.Namespace) -> int:
     if isinstance(payload, dict):
         payload.setdefault("ok", True)
         payload.setdefault("action", "diagnostics")
+    _print_json(payload)
+    return 0
+
+
+def _print_release_error(action: str, exc: Exception) -> int:
+    _print_json({"ok": False, "action": action, "error": str(exc)})
+    return 2
+
+
+def cmd_release_info(args: argparse.Namespace) -> int:
+    """Report the running build plus the selected managed-release pointer."""
+
+    try:
+        payload = {
+            "ok": True,
+            "action": "release-info",
+            "runtime": release_status(
+                verify_artifact=bool(getattr(args, "verify", False)),
+                managed_root=getattr(args, "root", None),
+            ),
+            "managed": managed_release_status(
+                root=getattr(args, "root", None),
+                bin_dir=getattr(args, "bin_dir", None),
+                verify=bool(getattr(args, "verify", False)),
+            ),
+        }
+    except (BuildIdentityError, ReleaseError, OSError, ValueError) as exc:
+        return _print_release_error("release-info", exc)
+    payload["ok"] = bool(payload["runtime"].get("ok")) and bool(
+        payload["managed"].get("ok")
+    )
+    _print_json(payload)
+    return 0 if payload["ok"] else 2
+
+
+def cmd_release_build(args: argparse.Namespace) -> int:
+    try:
+        payload = build_release(
+            args.source,
+            args.output,
+            allow_dirty=bool(getattr(args, "allow_dirty", False)),
+            python=getattr(args, "python", None),
+            overwrite=bool(getattr(args, "overwrite", False)),
+        )
+    except (BuildIdentityError, ReleaseError, OSError, ValueError) as exc:
+        return _print_release_error("release-build", exc)
+    _print_json(payload)
+    return 0
+
+
+def cmd_release_verify(args: argparse.Namespace) -> int:
+    try:
+        payload = verify_wheel(args.wheel, manifest_path=args.manifest).as_dict()
+    except (BuildIdentityError, ReleaseError, OSError, ValueError) as exc:
+        return _print_release_error("release-verify", exc)
+    payload.update({"ok": True, "action": "release-verify"})
+    _print_json(payload)
+    return 0
+
+
+def cmd_release_install(args: argparse.Namespace) -> int:
+    try:
+        payload = install_release(
+            args.wheel,
+            args.manifest,
+            root=getattr(args, "root", None),
+            bin_dir=getattr(args, "bin_dir", None),
+            python=getattr(args, "python", None),
+            lock_timeout=float(getattr(args, "lock_timeout", 15.0)),
+        )
+    except (BuildIdentityError, ReleaseError, OSError, ValueError) as exc:
+        return _print_release_error("release-install", exc)
+    _print_json(payload)
+    return 0
+
+
+def cmd_release_rollback(args: argparse.Namespace) -> int:
+    try:
+        payload = rollback_release(
+            root=getattr(args, "root", None),
+            bin_dir=getattr(args, "bin_dir", None),
+            release_id=getattr(args, "release_id", None),
+            to_legacy=bool(getattr(args, "legacy", False)),
+            lock_timeout=float(getattr(args, "lock_timeout", 15.0)),
+        )
+    except (BuildIdentityError, ReleaseError, OSError, ValueError) as exc:
+        return _print_release_error("release-rollback", exc)
+    _print_json(payload)
+    return 0
+
+
+def cmd_release_snapshot(args: argparse.Namespace) -> int:
+    try:
+        payload = semantic_runtime_snapshot(db_path=getattr(args, "db", None))
+    except (ReleaseError, OSError, TmuxError, ValueError) as exc:
+        return _print_release_error("release-snapshot", exc)
+    payload.update({"ok": True, "action": "release-snapshot"})
     _print_json(payload)
     return 0
 
@@ -1535,6 +1643,71 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_arg(diagnostics)
     diagnostics.add_argument("--output", type=Path, default=None, help="write a ZIP diagnostic bundle instead of printing the full JSON report")
     diagnostics.set_defaults(func=cmd_diagnostics)
+
+    release = sub.add_parser(
+        "release",
+        help="build, verify, install, inspect, or roll back immutable local releases",
+    )
+    release_sub = release.add_subparsers(dest="release_command", required=True)
+
+    release_info = release_sub.add_parser(
+        "info",
+        help="report the running build and managed-release pointer",
+    )
+    release_info.add_argument("--root", type=Path, default=None, help="override the managed release root")
+    release_info.add_argument("--bin-dir", type=Path, default=None, help="override the stable launcher directory")
+    release_info.add_argument("--verify", action="store_true", help="hash and verify the installed wheel/tree")
+    release_info.set_defaults(func=cmd_release_info)
+
+    release_build = release_sub.add_parser(
+        "build",
+        help="build twice offline and emit a reproducible wheel plus manifest",
+    )
+    release_build.add_argument("source", nargs="?", type=Path, default=Path("."))
+    release_build.add_argument("--output", type=Path, required=True)
+    release_build.add_argument("--python", type=Path, default=None)
+    release_build.add_argument("--allow-dirty", action="store_true", help="label a non-final dirty-tree candidate explicitly")
+    release_build.add_argument("--overwrite", action="store_true")
+    release_build.set_defaults(func=cmd_release_build)
+
+    release_verify = release_sub.add_parser(
+        "verify",
+        help="verify wheel paths, RECORD, bundled build identity, and manifest",
+    )
+    release_verify.add_argument("wheel", type=Path)
+    release_verify.add_argument("manifest", type=Path)
+    release_verify.set_defaults(func=cmd_release_verify)
+
+    release_install = release_sub.add_parser(
+        "install",
+        help="atomically publish a verified content-addressed user release",
+    )
+    release_install.add_argument("wheel", type=Path)
+    release_install.add_argument("manifest", type=Path)
+    release_install.add_argument("--root", type=Path, default=None)
+    release_install.add_argument("--bin-dir", type=Path, default=None)
+    release_install.add_argument("--python", type=Path, default=None)
+    release_install.add_argument("--lock-timeout", type=float, default=15.0)
+    release_install.set_defaults(func=cmd_release_install)
+
+    release_rollback = release_sub.add_parser(
+        "rollback",
+        help="atomically select the previous verified release or preserved launcher",
+    )
+    release_rollback.add_argument("--root", type=Path, default=None)
+    release_rollback.add_argument("--bin-dir", type=Path, default=None)
+    rollback_target = release_rollback.add_mutually_exclusive_group()
+    rollback_target.add_argument("--release-id", default=None)
+    rollback_target.add_argument("--legacy", action="store_true")
+    release_rollback.add_argument("--lock-timeout", type=float, default=15.0)
+    release_rollback.set_defaults(func=cmd_release_rollback)
+
+    release_snapshot = release_sub.add_parser(
+        "snapshot",
+        help="hash persistent tmux/Codex session identity for non-destructive release gates",
+    )
+    release_snapshot.add_argument("--db", type=Path, default=None)
+    release_snapshot.set_defaults(func=cmd_release_snapshot)
 
     diagnose_freeze = sub.add_parser(
         "diagnose-freeze",

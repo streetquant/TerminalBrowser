@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "t1000"
-version = "0.2.10"
+version = "0.2.11"
 description = "The terminal manager that never breaks down — named after the T-1000 from Terminator 2."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,3 +29,6 @@ t1000 = "termdeck.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["termdeck*"]
+
+[tool.setuptools.package-data]
+termdeck = ["_build_info.json"]

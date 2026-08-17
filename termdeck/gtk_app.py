@@ -91,6 +91,16 @@ from .vte_stack import merge_vte_attach_environment
 from .workspace_recipe import RecipeWindow, WorkspaceRecipeError, load_recipe
 
 
+# The worker thread can briefly outrun GTK during a repaint or compositor stall.
+# Beyond this finite backlog, retaining an arbitrary suffix would corrupt VTE's
+# terminal state; reconnecting the control transport gives us an authoritative
+# tmux replay while leaving the persistent pane/process untouched.
+_MAX_STREAM_OUTPUT_BUFFER_BYTES = 16 * 1024 * 1024
+_INPUT_REJECTED_MESSAGE = (
+    b"\r\n\x1b[1;31m[T1000 input buffer full; this payload was not sent]\x1b[0m\r\n"
+)
+
+
 def _usable_glib_source_id(source_id) -> bool:
     return isinstance(source_id, int) and not isinstance(source_id, bool) and source_id > 0
 
@@ -423,6 +433,9 @@ class AttachTerminal(Gtk.Box):
         self._attach_restart_deferred = False
         self._connect_source_id = 0
         self._connect_fallback_source_id = 0
+        # Notebook selection can precede the delayed stream connect.
+        # Latch that demand so the visible tab cannot lose queue priority.
+        self._setup_priority_requested = False
         self._attach_stable_source_id = 0
         self._resize_sync_source_id = 0
         self._cursor_hide_source_id = 0
@@ -443,6 +456,14 @@ class AttachTerminal(Gtk.Box):
         self._output_lock = threading.Lock()
         self._output_buffer = bytearray()
         self._output_drain_scheduled = False
+        self._stream_output_overflowed = False
+        self._stream_recovery_scheduled = False
+        self._last_stream_scheduling_error = ""
+        self._input_rejection_reported = False
+        # CONNECTED is an ordered emulator-reset marker. It shares the output
+        # drain with replay bytes so a late GTK idle can never erase a screen
+        # that the setup worker already reconstructed.
+        self._stream_reset_pending = False
         self._stream_generation = 0
         # Programs that choose absolute colours (Codex styles headings
         # near-black when it mis-detects a dark terminal as light) cannot
@@ -751,9 +772,18 @@ class AttachTerminal(Gtk.Box):
         data = b"".join(chunks)
         if data and self.controller is not None and not self._detached:
             try:
-                self.controller.send_bytes(data)
+                accepted = self.controller.send_bytes(data)
             except Exception:
-                pass
+                accepted = False
+            if accepted is False:
+                if not self._input_rejection_reported:
+                    self._input_rejection_reported = True
+                    try:
+                        self.terminal.feed(_INPUT_REJECTED_MESSAGE)
+                    except Exception:
+                        pass
+            elif accepted is True:
+                self._input_rejection_reported = False
         return True
 
     def _sync_stream_geometry(self, *, columns: int, rows: int, force: bool = False) -> None:
@@ -801,26 +831,142 @@ class AttachTerminal(Gtk.Box):
             history_lines=self._scrollback_extent,
         )
         self._contrast_filter.reset()
+        if getattr(self, "_setup_priority_requested", False):
+            # ``switch-page`` commonly runs before allocation creates
+            # the controller. Apply its latched priority before start,
+            # so the first setup enters the gate ahead of background tabs.
+            try:
+                self.controller.prioritize_setup()
+            except Exception:
+                # Priority is a latency optimization; controller startup is the
+                # liveness boundary and must continue if promotion ever fails.
+                pass
         self.controller.start(columns=columns, rows=rows)
+
+    def _remember_stream_scheduling_error(self, error: str) -> None:
+        self._last_stream_scheduling_error = str(error or "")[-2000:]
+
+    def _request_stream_output_drain(self, generation: int) -> bool:
+        """Schedule the one ordered GTK drain without leaving a stuck latch."""
+
+        if generation != self._stream_generation or self._detached:
+            return False
+        with self._output_lock:
+            if generation != self._stream_generation or self._detached:
+                return False
+            if self._output_drain_scheduled:
+                return True
+            if not self._output_buffer and not self._stream_reset_pending:
+                return True
+            self._output_drain_scheduled = True
+        scheduled, error = _schedule_glib_callback(
+            self._drain_stream_output,
+            generation,
+        )
+        if scheduled:
+            self._remember_stream_scheduling_error("")
+            return True
+        with self._output_lock:
+            if generation == self._stream_generation:
+                self._output_drain_scheduled = False
+        self._remember_stream_scheduling_error(error)
+        return False
+
+    def _request_stream_overflow_recovery(self, generation: int) -> bool:
+        """Schedule one control-transport reconnect after a GTK backlog overflow."""
+
+        if generation != self._stream_generation or self._detached:
+            return False
+        with self._output_lock:
+            if generation != self._stream_generation or self._detached:
+                return False
+            if self._stream_recovery_scheduled:
+                return True
+            self._stream_recovery_scheduled = True
+        scheduled, error = _schedule_glib_callback(
+            self._recover_stream_output_overflow,
+            generation,
+        )
+        if scheduled:
+            self._remember_stream_scheduling_error("")
+            return True
+        with self._output_lock:
+            if generation == self._stream_generation:
+                self._stream_recovery_scheduled = False
+        self._remember_stream_scheduling_error(error)
+        return False
+
+    def _recover_stream_output_overflow(self, generation: int) -> bool:
+        """Reconnect only the client transport; the persistent tmux pane survives."""
+
+        with self._output_lock:
+            self._stream_recovery_scheduled = False
+            if (
+                generation != self._stream_generation
+                or self._detached
+                or not self._stream_output_overflowed
+            ):
+                return False
+            self._stream_output_overflowed = False
+            self._output_buffer.clear()
+            self._output_drain_scheduled = False
+            self._stream_reset_pending = False
+        if self._terminally_stopped or self._attach_restart_deferred:
+            return False
+        self._teardown_stream()
+        if self._detached or self._terminally_stopped or self._attach_restart_deferred:
+            return False
+        columns = max(2, int(self.terminal.get_column_count() or 80))
+        rows = max(2, int(self.terminal.get_row_count() or 24))
+        self._connect_stream(columns=columns, rows=rows)
+        return False
 
     def _on_stream_output(self, generation: int, data: bytes) -> None:
         # Runs on a PaneStreamController worker thread. Coalesce bursts under
         # the lock and schedule at most one main-loop drain at a time.
-        if generation != self._stream_generation or self._detached:
+        if generation != self._stream_generation or self._detached or not data:
             return
+        overflowed = False
         with self._output_lock:
-            self._output_buffer.extend(data)
-            if self._output_drain_scheduled:
-                return
-            self._output_drain_scheduled = True
-        GLib.idle_add(self._drain_stream_output, generation)
+            if self._stream_output_overflowed:
+                overflowed = True
+            elif len(self._output_buffer) + len(data) > _MAX_STREAM_OUTPUT_BUFFER_BYTES:
+                # An arbitrary suffix cannot be fed safely into a stateful
+                # terminal emulator. Drop the incomplete backlog and reconnect
+                # the client so tmux can replay an authoritative screen.
+                self._output_buffer.clear()
+                self._stream_output_overflowed = True
+                overflowed = True
+            else:
+                self._output_buffer.extend(data)
+        if overflowed:
+            self._request_stream_overflow_recovery(generation)
+        else:
+            self._request_stream_output_drain(generation)
 
     def _drain_stream_output(self, generation: int) -> bool:
         with self._output_lock:
+            overflowed = bool(getattr(self, "_stream_output_overflowed", False))
+            reset_pending = bool(getattr(self, "_stream_reset_pending", False))
+            self._stream_reset_pending = False
             payload = bytes(self._output_buffer)
             self._output_buffer.clear()
             self._output_drain_scheduled = False
-        if generation != self._stream_generation or self._detached or not payload:
+        if generation != self._stream_generation or self._detached:
+            return False
+        if overflowed:
+            self._request_stream_overflow_recovery(generation)
+            return False
+        if reset_pending:
+            # Reset and replay are consumed by this one GTK callback. The
+            # CONNECTED marker may be drained before or together with replay,
+            # but it can never run later and erase an already-fed screen.
+            try:
+                self.terminal.reset(True, True)
+                self._contrast_filter.reset()
+            except Exception:
+                pass
+        if not payload:
             return False
         try:
             self.terminal.feed(self._contrast_filter.process(payload))
@@ -830,7 +976,12 @@ class AttachTerminal(Gtk.Box):
 
     def _on_stream_pane_dead(self, generation: int) -> None:
         # Runs on a PaneStreamController worker thread.
-        GLib.idle_add(self._apply_pane_dead, generation)
+        scheduled, error = _schedule_glib_callback(
+            self._apply_pane_dead,
+            generation,
+        )
+        if not scheduled:
+            self._remember_stream_scheduling_error(error)
 
     def _apply_pane_dead(self, generation: int) -> bool:
         if generation != self._stream_generation or self._detached:
@@ -843,22 +994,36 @@ class AttachTerminal(Gtk.Box):
 
     def _on_stream_state(self, generation: int, state: ClientState) -> None:
         # Runs on a PaneStreamController worker thread.
-        GLib.idle_add(self._apply_stream_state, generation, state)
+        if generation != self._stream_generation or self._detached:
+            return
+        if state is ClientState.CONNECTED:
+            with self._output_lock:
+                # Controller ordering guarantees this marker is published before
+                # setup can emit replay. Discard only bytes from the previous
+                # connection, then serialize reset with the new replay through
+                # the same GTK drain instead of racing two independent idles.
+                self._output_buffer.clear()
+                self._stream_reset_pending = True
+                self._stream_output_overflowed = False
+                self._stream_recovery_scheduled = False
+            self._input_rejection_reported = False
+            self._request_stream_output_drain(generation)
+        scheduled, error = _schedule_glib_callback(
+            self._apply_stream_state,
+            generation,
+            state,
+        )
+        if not scheduled:
+            self._remember_stream_scheduling_error(error)
 
     def _apply_stream_state(self, generation: int, state: ClientState) -> bool:
         if generation != self._stream_generation or self._detached:
             return False
         if state is ClientState.CONNECTED:
-            # Every (re)connect replays the pane's full history. Reset the
-            # emulator first so scrollback is never duplicated; this CONNECTED
-            # idle was queued before the replay's output idle, so the reset
-            # always lands ahead of the replayed bytes.
-            with self._output_lock:
-                self._output_buffer.clear()
-            try:
-                self.terminal.reset(True, True)
-            except Exception:
-                pass
+            # Emulator reset belongs to the ordered output drain above. Retry
+            # that scheduling here: a transient worker-thread scheduling
+            # failure must not leave the committed replay buffered forever.
+            self._request_stream_output_drain(generation)
             self._remove_glib_source(self._attach_stable_source_id)
             self._attach_stable_source_id = GLib.timeout_add(2000, self._mark_attach_stable)
         elif state is ClientState.RECONNECTING:
@@ -906,6 +1071,10 @@ class AttachTerminal(Gtk.Box):
         with self._output_lock:
             self._output_buffer.clear()
             self._output_drain_scheduled = False
+            self._stream_reset_pending = False
+            self._stream_output_overflowed = False
+            self._stream_recovery_scheduled = False
+        self._input_rejection_reported = False
 
     def resolve_deferred_attach(self) -> bool:
         """Classify and resume one pane stream paused for an auth transition."""
@@ -1710,6 +1879,10 @@ class AttachTerminal(Gtk.Box):
 
         self._remove_glib_source(self._scroll_idle_source_id)
         self._scroll_idle_source_id = 0
+        # Selection is durable even when GTK reaches this idle before the
+        # allocation-delayed controller exists. ``_connect_stream`` consumes
+        # the latch before starting that controller.
+        self._setup_priority_requested = True
         controller = getattr(self, "controller", None)
         if controller is not None:
             # The user is looking at this tab: jump the shared setup queue so
