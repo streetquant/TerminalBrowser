@@ -16,6 +16,7 @@ CHROME_THEME_NAMES = ("dark", "noir", "light", "system")
 DENSITY_NAMES = ("comfortable", "compact")
 CURSOR_SHAPE_NAMES = ("block", "underline", "ibeam")
 TERMINAL_PALETTE_NAMES = (
+    "t1000",
     "terminator",
     "catppuccin",
     "tokyo-night",
@@ -148,6 +149,15 @@ CHROME_TOKENS: Mapping[str, ChromeTokens] = {
 
 # Named 16-color VTE packs + fg/bg. Values are modern community palettes.
 TERMINAL_PALETTE_PACKS: Mapping[str, dict[str, object]] = {
+    "t1000": {
+        # Signature pack: deep ink surface shared with the dark chrome, plus
+        # luminous accents drawn from the same family as the chrome tokens.
+        "label": "T1000 Ink (signature)",
+        "foreground": "#dfe6f2",
+        "background": "#0a0d13",
+        "cursor": "#82aaff",
+        "palette": DEFAULT_PALETTE,
+    },
     "terminator": {
         "label": "Terminator / system default",
         "foreground": "#d3d7cf",
@@ -233,7 +243,7 @@ TERMINAL_PALETTE_PACKS: Mapping[str, dict[str, object]] = {
         "background": "#282c34",
         "cursor": "#528bff",
         "palette": (
-            "#282c34",
+            "#5c6370",
             "#e06c75",
             "#98c379",
             "#e5c07b",
@@ -265,7 +275,7 @@ TERMINAL_PALETTE_PACKS: Mapping[str, dict[str, object]] = {
             "#d33682",
             "#2aa198",
             "#eee8d5",
-            "#002b36",
+            "#586e75",
             "#cb4b16",
             "#586e75",
             "#657b83",
@@ -313,9 +323,11 @@ def normalise_density(name: str | None) -> str:
 
 
 def normalise_terminal_palette(name: str | None) -> str:
-    cleaned = str(name or "terminator").strip().lower().replace("_", "-")
+    cleaned = str(name or "t1000").strip().lower().replace("_", "-")
     aliases = {
-        "default": "terminator",
+        "default": "t1000",
+        "ink": "t1000",
+        "signature": "t1000",
         "system": "terminator",
         "tokyo": "tokyo-night",
         "tokyonight": "tokyo-night",
@@ -327,7 +339,7 @@ def normalise_terminal_palette(name: str | None) -> str:
     }
     cleaned = aliases.get(cleaned, cleaned)
     if cleaned not in TERMINAL_PALETTE_NAMES:
-        return "terminator"
+        return "t1000"
     return cleaned
 
 
@@ -477,6 +489,102 @@ def contrast_ratio(first: str, second: str) -> float:
         (relative_luminance(first), relative_luminance(second)), reverse=True
     )
     return (lighter + 0.05) / (darker + 0.05)
+
+
+# Minimum-contrast floors for terminal rendering (VTE). This is the same
+# legibility feature the best terminal emulators ship (WezTerm's
+# ``minimum_contrast``, iTerm2's "Minimum Contrast"): colors are gently
+# blended toward legibility while preserving hue, so a TUI that prints ANSI
+# black on a dark background can never render invisible text — including
+# themes imported from Terminator configs.
+TERMINAL_MIN_PALETTE_CONTRAST = 3.0
+TERMINAL_MIN_FG_CONTRAST = 4.5
+TERMINAL_MIN_CURSOR_CONTRAST = 3.0
+
+
+def _parse_hex_color(color: str | None) -> tuple[int, int, int] | None:
+    text = str(color or "").strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(ch * 2 for ch in text)
+    if len(text) != 6:
+        return None
+    try:
+        return tuple(int(text[index : index + 2], 16) for index in (0, 2, 4))
+    except ValueError:
+        return None
+
+
+def _blend_hex(color: str, target: str, amount: float) -> str:
+    source = _parse_hex_color(color)
+    destination = _parse_hex_color(target)
+    if source is None or destination is None:
+        return color
+    mixed = tuple(
+        int(round(start + (end - start) * amount))
+        for start, end in zip(source, destination)
+    )
+    return "#{:02x}{:02x}{:02x}".format(*mixed)
+
+
+def raise_contrast(color: str, background: str, minimum: float) -> str:
+    """Blend ``color`` just far enough toward legibility on ``background``.
+
+    Already-legible colors are returned untouched, unparseable values fail
+    open, and the blend direction (toward white on dark surfaces, toward
+    black on light ones) preserves the original hue as far as possible.
+    """
+
+    if _parse_hex_color(color) is None or _parse_hex_color(background) is None:
+        return color
+    if contrast_ratio(color, background) >= minimum:
+        return color
+    target = "#ffffff" if relative_luminance(background) < 0.5 else "#000000"
+    low, high = 0.0, 1.0
+    for _ in range(24):
+        middle = (low + high) / 2
+        if contrast_ratio(_blend_hex(color, target, middle), background) >= minimum:
+            high = middle
+        else:
+            low = middle
+    lifted = _blend_hex(color, target, high)
+    if contrast_ratio(lifted, background) < minimum:
+        # The floor is unreachable from this hue; return the best endpoint.
+        return target
+    return lifted
+
+
+def ensure_legible_theme(theme: TerminalTheme) -> TerminalTheme:
+    """Enforce terminal minimum-contrast floors on a TerminalTheme.
+
+    Foreground text must clear ``TERMINAL_MIN_FG_CONTRAST``; all sixteen
+    palette entries and the cursor clear their own floors against the theme
+    background. Returns the theme unchanged when everything already passes.
+    """
+
+    background = theme.background_color
+    if _parse_hex_color(background) is None:
+        return theme
+    updates: dict[str, object] = {}
+    foreground = raise_contrast(
+        theme.foreground_color, background, TERMINAL_MIN_FG_CONTRAST
+    )
+    if foreground != theme.foreground_color:
+        updates["foreground_color"] = foreground
+    palette = tuple(
+        raise_contrast(entry, background, TERMINAL_MIN_PALETTE_CONTRAST)
+        for entry in theme.palette
+    )
+    if palette != tuple(theme.palette):
+        updates["palette"] = palette
+    if theme.cursor_color:
+        cursor = raise_contrast(
+            theme.cursor_color, background, TERMINAL_MIN_CURSOR_CONTRAST
+        )
+        if cursor != theme.cursor_color:
+            updates["cursor_color"] = cursor
+    if not updates:
+        return theme
+    return replace(theme, **updates)  # type: ignore[arg-type]
 
 
 def contrast_violations(tokens: ChromeTokens) -> list[str]:

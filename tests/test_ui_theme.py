@@ -156,7 +156,7 @@ class UiThemeTests(unittest.TestCase):
             path.write_text(json.dumps({"health": {"critical_cpu_percent": 111}}), encoding="utf-8")
             settings = AppSettings.load(path)
             self.assertEqual(settings.chrome_theme, "dark")
-            self.assertEqual(settings.terminal_palette, "terminator")
+            self.assertEqual(settings.terminal_palette, "t1000")
             self.assertEqual(settings.ui_density, "comfortable")
             self.assertFalse(settings.tabs_pane_visible)
 

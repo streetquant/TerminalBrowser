@@ -70,6 +70,7 @@ from .tmux_backend import (
 )
 from .ui_theme import (
     apply_terminal_palette,
+    ensure_legible_theme,
     build_chrome_css,
     cursor_shape_names,
     format_resource_cue,
@@ -348,6 +349,9 @@ def rgba(value: str | None, fallback: str = "#000000"):
 
 
 def apply_theme(terminal: Vte.Terminal, theme: TerminalTheme, *, font_override: str | None = None) -> None:
+    # SOTA-terminal minimum contrast: never let a palette pack or an imported
+    # Terminator theme render invisible ANSI text on its own background.
+    theme = ensure_legible_theme(theme)
     if theme.use_system_font and not font_override:
         pass
     else:

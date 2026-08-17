@@ -132,7 +132,7 @@ class AppSettings:
     keyboard_profile: str = "browser"
     import_terminator_keybindings: bool = True
     chrome_theme: str = "dark"
-    terminal_palette: str = "terminator"
+    terminal_palette: str = "t1000"
     ui_density: str = "comfortable"
     tabs_pane_visible: bool = False
     ui_refresh_interval_seconds: float = 5.0
@@ -191,7 +191,7 @@ class AppSettings:
         if chrome_theme not in chrome_theme_names():
             raise SettingsError(f"appearance.chrome_theme must be one of: {', '.join(chrome_theme_names())}")
         terminal_palette = normalise_terminal_palette(
-            appearance.get("terminal_palette", appearance.get("palette", payload.get("terminal_palette", "terminator")))
+            appearance.get("terminal_palette", appearance.get("palette", payload.get("terminal_palette", "t1000")))
         )
         if terminal_palette not in terminal_palette_names():
             raise SettingsError(f"appearance.terminal_palette must be one of: {', '.join(terminal_palette_names())}")

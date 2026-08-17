@@ -5,11 +5,15 @@ from pathlib import Path
 from typing import Mapping
 
 
+# Signature "t1000 ink" 16-color set. Tuned for the chrome-matched dark
+# surface (#0a0d13): ANSI black is a visible slate instead of #000000 so
+# full-screen TUIs that print black/bright-black text stay readable, and
+# the accent hues mirror the app chrome (periwinkle / rose / mint / amber).
 DEFAULT_PALETTE = (
-    "#000000", "#cc0000", "#4e9a06", "#c4a000",
-    "#3465a4", "#75507b", "#06989a", "#d3d7cf",
-    "#555753", "#ef2929", "#8ae234", "#fce94f",
-    "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec",
+    "#5a6488", "#f7768e", "#9ece6a", "#e0af68",
+    "#82aaff", "#bb9af7", "#7dcfff", "#c8d3ea",
+    "#737ea3", "#ff9db4", "#b9f27c", "#f2cd8a",
+    "#a9c5ff", "#d5b8ff", "#b0e7ff", "#f1f5ff",
 )
 
 
