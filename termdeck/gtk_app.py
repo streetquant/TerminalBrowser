@@ -68,6 +68,7 @@ from .tmux_backend import (
     auth_transaction_lock,
     execute_auth_change,
 )
+from .ansi_contrast import SgrContrastFilter
 from .ui_theme import (
     apply_terminal_palette,
     ensure_legible_theme,
@@ -443,6 +444,11 @@ class AttachTerminal(Gtk.Box):
         self._output_buffer = bytearray()
         self._output_drain_scheduled = False
         self._stream_generation = 0
+        # Programs that choose absolute colours (Codex styles headings
+        # near-black when it mis-detects a dark terminal as light) cannot
+        # be reached by the VTE palette, so pane bytes pass through a
+        # contrast floor on the way in.
+        self._contrast_filter = SgrContrastFilter(theme)
         self.terminal = Vte.Terminal()
         self.set_hexpand(True)
         self.set_vexpand(True)
@@ -546,6 +552,7 @@ class AttachTerminal(Gtk.Box):
 
     def apply_window_theme(self, theme: TerminalTheme, *, font_override: str) -> None:
         self.theme = theme
+        self._contrast_filter.set_theme(theme)
         apply_theme(self.terminal, theme, font_override=font_override)
         if self._history_cursor_hidden:
             self._set_history_cursor_hidden(True)
@@ -793,6 +800,7 @@ class AttachTerminal(Gtk.Box):
             on_state_change=lambda state: self._on_stream_state(generation, state),
             history_lines=self._scrollback_extent,
         )
+        self._contrast_filter.reset()
         self.controller.start(columns=columns, rows=rows)
 
     def _on_stream_output(self, generation: int, data: bytes) -> None:
@@ -815,7 +823,7 @@ class AttachTerminal(Gtk.Box):
         if generation != self._stream_generation or self._detached or not payload:
             return False
         try:
-            self.terminal.feed(payload)
+            self.terminal.feed(self._contrast_filter.process(payload))
         except Exception:
             pass
         return False

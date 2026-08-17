@@ -500,6 +500,10 @@ def contrast_ratio(first: str, second: str) -> float:
 TERMINAL_MIN_PALETTE_CONTRAST = 3.0
 TERMINAL_MIN_FG_CONTRAST = 4.5
 TERMINAL_MIN_CURSOR_CONTRAST = 3.0
+# Colours a program picks itself (indexed or truecolour SGR) bypass the
+# palette entirely, so the stream filter holds them to the body-text floor
+# rather than the large-text floor used for palette slots.
+TERMINAL_MIN_STREAM_CONTRAST = 4.5
 
 
 def _parse_hex_color(color: str | None) -> tuple[int, int, int] | None:

@@ -103,6 +103,10 @@ def _stock_fallback_environment() -> dict[str, str]:
     }
 
 
+#: ``light foreground;dark background`` in the COLORFGBG convention.
+DARK_COLORFGBG = "15;0"
+
+
 def vte_attach_environment() -> dict[str, str]:
     """Environment for one tmux client rendered into TermDeck's VTE.
 
@@ -132,4 +136,8 @@ def merge_vte_attach_environment(
 ) -> dict[str, str]:
     environment = dict(os.environ if base is None else base)
     environment.update(vte_attach_environment())
+    # Every shipped terminal palette is dark. Codex and other TUIs read
+    # COLORFGBG to pick their ink; an inherited light value is what makes
+    # them paint near-black headings, so state the truth for the child.
+    environment["COLORFGBG"] = DARK_COLORFGBG
     return environment
