@@ -71,6 +71,7 @@ _RELEASE_VERSION_PREFIX = re.compile(
     r"^([0-9]+)\.([0-9]+)\.([0-9]+)(?:[A-Za-z0-9.+-].*)?$"
 )
 _FROZEN_RELEASE_MIN_VERSION = (0, 2, 13)
+_MANAGED_BIN_DIR_ENV = "T1000_MANAGED_BIN_DIR"
 _UUID = re.compile(
     r"(?<![0-9a-f])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])",
     re.IGNORECASE,
@@ -156,6 +157,17 @@ class _FileSnapshot:
     mode: int = 0
 
 
+def _default_managed_bin_dir(
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    environment = os.environ if env is None else env
+    configured = environment.get(_MANAGED_BIN_DIR_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local" / "bin"
+
+
 def release_layout(
     *,
     root: str | Path | None = None,
@@ -165,7 +177,7 @@ def release_layout(
         Path(root).expanduser() if root is not None else default_managed_root()
     ).absolute()
     binaries = (
-        Path(bin_dir).expanduser() if bin_dir is not None else Path.home() / ".local" / "bin"
+        Path(bin_dir).expanduser() if bin_dir is not None else _default_managed_bin_dir()
     ).absolute()
     return ReleaseLayout(
         root=managed,
@@ -1682,6 +1694,7 @@ except Exception as exc:
 
 os.environ.pop("T1000_BOOTSTRAP_STATE_RETRY", None)
 os.environ["T1000_MANAGED_ROOT"] = str(ROOT)
+os.environ["T1000_MANAGED_BIN_DIR"] = str(launcher.parent)
 os.environ["T1000_RELEASE_MANIFEST"] = str(manifest_path)
 os.environ["T1000_RELEASE_STATE"] = str(STATE)
 sys.path.insert(0, str(site))

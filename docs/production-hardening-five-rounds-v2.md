@@ -524,8 +524,69 @@ new releases to enforce their own immutability.
   and zero manufactured events. Neither produced a sustained product finding.
 - Static compilation and `git diff --check` pass.
 
-The 0.2.13 source repair is accepted for immutable promotion. A final exact-source
-revalidation follows this evidence-only documentation refresh. Clean commit and
-private push, reproducible clean-commit artifacts, controlled replacement of the
-live GUI, installed-runtime replay, final independent review, and BR closure
-remain mandatory before Round 5 is accepted.
+The 0.2.13 source repair was accepted for immutable promotion and committed as
+`551ff0f1ad22318a53b6c1d4b0d475432e9651c7`. Its two clean builds were
+byte-identical, but the required isolated artifact replay found one further
+runtime-layout defect before any production mutation.
+
+### Clean-artifact custom-bin finding
+
+The clean artifact installed successfully under an isolated custom managed root
+and custom launcher directory. Source-side managed verification passed, every
+new release directory was mode `0555`, and the generated launcher reported
+`t1000 0.2.13`. Invoking that same launcher as `release info --verify` failed,
+however, because the bootstrap propagated `T1000_MANAGED_ROOT` but not the
+validated custom launcher directory. The runtime release layout therefore fell
+back to `~/.local/bin` and compared canonical state against the host production
+launcher rather than the launcher that had actually executed the process.
+
+The artifact itself remained valid. The failed self-inspection proved that
+custom install layout had not survived the bootstrap-to-CLI boundary. The first
+0.2.13 artifact was rejected for final promotion; the stable live 0.2.12 GUI was
+left untouched.
+
+### Custom-bin repair model and implementation
+
+Runtime bin-directory selection now follows one explicit precedence relation:
+
+```text
+BinDir(explicit, runtime, default) =
+    explicit                 when supplied
+    runtime                  when T1000_MANAGED_BIN_DIR is non-empty
+    ~/.local/bin             otherwise
+```
+
+The environment value is not accepted as release authority by the bootstrap. The
+bootstrap first validates canonical state, Python, bootstrap bytes, launcher
+path, launcher hash, release tree, artifact, RECORD, and a stable state reread.
+Only then does it overwrite `T1000_MANAGED_BIN_DIR` with the verified launcher's
+parent before importing installed CLI code. A stale or hostile inherited value
+therefore cannot redirect a managed process, while explicit API and CLI
+`bin_dir` arguments remain authoritative.
+
+Failing-first tests reproduced all three missing contracts: environment fallback,
+custom managed status without an explicit bin argument, and bootstrap
+propagation. The implementation then passed:
+
+- `3` focused precedence/bootstrap/custom-status tests;
+- all `78` release-manager tests;
+- the `157` release/CLI/build/diagnostics/tmux/pane focused tests;
+- static compilation and `git diff --check`.
+
+Fresh reviewer snapshot `snap-6b6a3d6a2c11f81cbc63789e5d0c6976` bound
+`release_manager.py` SHA-256
+`3c77638a2190e63f3d6f6b6b80313522fa201b5d7e4d60a52442fbd4a7891cd3`
+and test SHA-256
+`9b01adfd490189712580cd57ed2d330cce1daabd160c3305c04fde86862fb9ef`,
+passed the focused property checks and all `78` release-manager tests, and
+produced receipt
+`ae65edf7f38f471d35f300650301ab08fb61709ef2092e6195695394ae573148`.
+The independent test-runner snapshot passed all `157` focused tests and all `78`
+release-manager tests before its final `compileall` step was refused by the
+read-only sealed snapshot filesystem; canonical static compilation passed. This
+is retained as a worker-harness limitation, not a product failure.
+
+The custom-bin repair is accepted for another exact full source/runtime gate,
+then a follow-up clean commit and reproducible artifact. Production install,
+rollback proof, exact activation, installed replay, final independent review,
+and BR closure remain mandatory before Round 5 is accepted.

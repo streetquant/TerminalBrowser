@@ -33,6 +33,13 @@ An adversarial verifier later inserted the installed `site` directory into `sys.
 - The scanner still requires canonical interpreter and bootstrap paths, matching `/proc/<pid>/exe`, Linux boot ID, PID start ticks, UID, repeated cmdline stability, and an exact supported GUI tail.
 - A launcher template upgrade is accepted only when the current launcher bytes match the SHA-256 already recorded in canonical managed state. A different unrecorded launcher remains an outside-tamper failure.
 
+### Custom managed installs retain their launcher directory
+
+- Clean-artifact replay under an isolated custom managed root and custom bin directory exposed that runtime `release info` could fall back to `~/.local/bin` even though the generated launcher itself was valid. The root identity was propagated; the custom launcher directory was not.
+- Runtime layout selection now has one explicit order: a supplied `bin_dir`, then a non-empty `T1000_MANAGED_BIN_DIR`, then the unchanged `~/.local/bin` default.
+- The bootstrap does not trust an inherited value. Only after validating canonical state, the launcher path, launcher bytes, and state stability does it overwrite `T1000_MANAGED_BIN_DIR` with the verified launcher's parent before importing the CLI.
+- Custom launchers can therefore run `release info --verify`, process inventory, rollback, and related managed commands without repeating `--bin-dir`; explicit API or CLI arguments still override the runtime default.
+
 ### Regression coverage
 
 - Synthetic 0.2.13 installs prove every directory is `0555`, same-UID file creation raises `PermissionError`, and a direct import without `-B` produces no `__pycache__` or `.pyc` member.

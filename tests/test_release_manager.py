@@ -1377,6 +1377,54 @@ def test_installed_tree_rejects_extra_files_symlinks_and_writable_payloads(
     assert verify_installed_tree(release_dir)["ok"] is True
 
 
+def test_release_layout_bin_dir_precedence_uses_runtime_environment(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "managed"
+    inherited = tmp_path / "runtime-bin"
+    explicit = tmp_path / "explicit-bin"
+
+    with mock.patch.dict(
+        os.environ,
+        {"T1000_MANAGED_BIN_DIR": str(inherited)},
+        clear=False,
+    ):
+        assert release_layout(root=root).bin_dir == inherited.absolute()
+        assert release_layout(root=root, bin_dir=explicit).bin_dir == explicit.absolute()
+
+    with mock.patch.dict(
+        os.environ,
+        {"T1000_MANAGED_BIN_DIR": "   "},
+        clear=False,
+    ):
+        assert release_layout(root=root).bin_dir == (Path.home() / ".local" / "bin").absolute()
+
+
+def test_custom_bin_environment_recovers_managed_status_without_explicit_argument(
+    tmp_path: Path,
+) -> None:
+    wheel, manifest_path, manifest = artifact(tmp_path, "e", version="0.2.13")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "custom-bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel, manifest_path, root=root, bin_dir=bin_dir)
+
+    try:
+        with mock.patch.dict(
+            os.environ,
+            {"T1000_MANAGED_BIN_DIR": str(bin_dir)},
+            clear=False,
+        ):
+            status = managed_release_status(root=root, verify=True)
+        assert status["ok"] is True
+        assert status["verified"] is True
+        assert status["launcher"] == str((bin_dir / "t1000").absolute())
+        assert status["state"]["current_release_id"] == manifest["release_id"]
+        assert status["release"]["frozen_directories"] is True
+    finally:
+        thaw_directories(root)
+
+
 @pytest.mark.parametrize(
     ("version", "expected"),
     [
@@ -1410,6 +1458,10 @@ def test_launcher_bootstrap_and_staged_import_preserve_isolation_and_no_bytecode
     assert 'str(bootstrap),\n                *sys.argv[1:],' in bootstrap
     assert "sys.dont_write_bytecode = True" in bootstrap
     assert 'os.environ["PYTHONDONTWRITEBYTECODE"] = "1"' in bootstrap
+    managed_bin_assignment = 'os.environ["T1000_MANAGED_BIN_DIR"] = str(launcher.parent)'
+    assert managed_bin_assignment in bootstrap
+    assert bootstrap.index(managed_bin_assignment) > bootstrap.index("latest_state =")
+    assert bootstrap.index(managed_bin_assignment) < bootstrap.index("sys.path.insert(0, str(site))")
 
     with mock.patch("termdeck.release_manager._run") as run:
         _verify_staged_import(tmp_path / "release", python)
