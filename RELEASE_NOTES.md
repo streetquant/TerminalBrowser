@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+## 0.2.12
+
+This release fixes the corrupted characters that could appear throughout a restored Codex terminal and hardens the complete byte, control-protocol, release, and activation path around that correction. It preserves the existing GTK/VTE/tmux architecture, persistent tasks, terminal interaction behavior, and per-tab Codex account isolation.
+
+### Codex Unicode replay is byte-faithful
+
+- Tmux control-mode command output is represented internally as a reversible Latin-1 byte carrier. Initial pane capture previously treated that carrier as decoded text and encoded it as UTF-8 again, turning valid bytes for glyphs such as `•`, `└`, `│`, `…`, `─`, `»`, `—`, and `’` into mojibake.
+- `CommandResult.byte_lines` now exposes the exact immutable command-body bytes. Binary consumers use that API instead of guessing an encoding from the textual protocol carrier.
+- Pane history and visible-screen replay are assembled as bytes, preserving UTF-8, CSI/SGR/OSC sequences, backslashes, line boundaries, and arbitrary eight-bit values until VTE receives the stream.
+- Live `%output` remains on its existing byte-preserving path. Replay ordering, contrast correction, cursor/mode restoration, scrolling, selection, alternate-screen behavior, and reconnect recovery are unchanged.
+
+### Tmux command bodies cannot impersonate protocol records
+
+- A captured terminal can legitimately contain lines beginning with `%output`, `%message`, `%window-add`, `%begin`, `%end`, or `%error`. These lines were previously at risk of being dispatched as fake notifications or prematurely terminating a command reply.
+- Reply framing now accepts only an exact full-line `%begin`, `%end`, or `%error` record followed by three decimal fields. A closing record must match the opening time, command number, and flags.
+- While a reply or greeting block is active, every nonmatching line belongs to that block, including notification-looking and malformed frame-looking text. Genuine notifications continue to dispatch outside command blocks.
+- Real tmux diagnostics remain in the reply body and are preserved byte-for-byte; the human-readable body is used as the error summary instead of the numeric frame identity.
+
+### Race-aware managed-GUI identity
+
+- `release info` now reports one read-only managed-GUI inventory instead of relying on `pgrep`, process-name matching, or command-line substrings.
+- A GUI candidate must begin with the exact configured Python executable, `-I`, and managed bootstrap argv elements; `/proc/<pid>/exe` must resolve to that interpreter; and the remaining arguments must be one of the supported GUI invocation forms. Managed CLI commands and substring lookalikes are excluded.
+- Every accepted observation is bound to the current Linux boot ID, PID, process start ticks, real/effective UID, executable, invocation kind, argument count, and SHA-256 of its raw cmdline. Repeated reads reject PID reuse, exec, exit, permission failure, and torn observations.
+- Internal empty argv elements are retained, preventing malformed extra arguments from collapsing into the default no-argument GUI form.
+- Runtime posture is explicit: `stopped`, `single-gui`, `multiple-gui`, or `scan-incomplete`. Incomplete and multiple-GUI evidence refuses activation, while process posture remains logically separate from immutable release integrity.
+- Arbitrary database, workspace, recovery, account, and `CODEX_HOME` values are never returned.
+
+### Real regression coverage
+
+- The Unicode replay smoke creates a disposable real tmux pane, compares authoritative capture with the pane replay, passes the bytes through the real contrast filter and VTE widget, and proves that valid Unicode is visible while common mojibake forms are absent.
+- The command-body smoke compares direct tmux capture with `ControlModeClient.byte_lines` for percent-prefixed body text and Unicode, requiring identical SHA-256 values and zero manufactured events.
+- The managed-process smoke independently rechecks boot ID, PID/start-time/UID/executable/cmdline-hash identity in real procfs, proves the verifier does not match itself, and rejects private argv leakage.
+
+### Verification
+
+- Full inherited suite: 1,182 passed, 1 skipped, 98 subtests passed.
+- Release subsystem: 82 tests covering source snapshot, reproducible build, wheel/manifest/RECORD identity, transactional install, tamper rejection, repair, rollback, release CLI, build status, and diagnostics.
+- All 19 strict GTK/VTE/tmux runtime smokes passed with empty stderr and unchanged source, Git, Xvfb, managed-process, and 281-row semantic runtime identities.
+- Independent sealed reviews replayed the process scanner over 20,000 generated argv vectors, exact GUI grammar boundaries, race/error cases, redaction and non-mutation contracts, and the complete release-test surface.
+
 ## 0.2.11
 
 This release makes restored terminals deterministic at the rendering boundary and makes the application itself reproducibly releasable, atomically installable, independently verifiable, and rollback-capable without sacrificing tmux persistence or per-tab Codex isolation.

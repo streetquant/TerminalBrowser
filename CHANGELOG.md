@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.2.12
+
+- Fixed restored and newly attached terminal panes corrupting valid UTF-8 Codex glyphs during initial replay. Tmux command replies now expose an explicit immutable byte view, and pane history plus visible-screen replay remain bytes until they enter VTE.
+- Preserved arbitrary command-reply content beginning with `%output`, `%message`, `%window-add`, `%begin`, `%end`, or `%error`. Control framing now requires an exact three-decimal-field marker with matching identity; every other line inside a reply remains body data.
+- Corrected tmux error reporting to retain exact body bytes and use the human-readable body as the caller-facing diagnostic rather than exposing numeric frame metadata.
+- Added real tmux/VTE regressions proving Unicode history and screen replay remain byte-faithful, common mojibake is absent, percent-prefixed pane text is preserved, and command bodies cannot manufacture asynchronous events.
+- Added a read-only, redaction-safe managed-GUI inventory based on exact interpreter/`-I`/bootstrap argv elements, canonical executable, Linux boot ID, PID start ticks, UID, and repeated cmdline observations. Substring lookalikes and CLI invocations are excluded; incomplete or multiple-GUI evidence fails activation closed without conflating runtime posture with release integrity.
+- Extended release verification with stable process posture while preserving all tmux/Codex sessions, per-tab `CODEX_HOME` scopes, scrolling, selection, contrast correction, restoration, and managed rollback behavior.
+- Verified 1,182 tests plus 98 subtests, the complete reproducible build/install/tamper/rollback workflow, and all 19 strict GTK/VTE/tmux runtime smokes with empty stderr, unchanged 281-row semantic state, stable source/Git/process identity, and no leaked smoke process.
+
 ## 0.2.11
 
 - Fixed restored or newly selected Codex tabs that could remain connected but blank. Visible-tab setup priority is now latched before the delayed controller exists, setup exceptions retry until the pre-ready transaction commits, and CONNECTED reset plus pane replay are serialized through one GTK output drain so a late idle cannot erase a complete screen.

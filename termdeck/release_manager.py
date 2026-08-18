@@ -71,6 +71,10 @@ _UUID = re.compile(
     r"(?<![0-9a-f])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])",
     re.IGNORECASE,
 )
+_MANAGED_GUI_PROCESS_SCHEMA = "t1000.managed-gui-processes.v1"
+_BOOT_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 
 class ReleaseError(RuntimeError):
@@ -2017,21 +2021,536 @@ def _verify_managed_activation(
     }
 
 
+@dataclass(frozen=True)
+class _ProcObservation:
+    """Stable fields read from one same-UID ``/proc/<pid>`` directory."""
+
+    pid: int
+    process_start_ticks: int
+    real_uid: int
+    effective_uid: int
+    argv: tuple[bytes, ...]
+    cmdline_sha256: str
+    executable: Path | None = None
+
+
+def _read_boot_id(proc_root: Path) -> str:
+    """Return the canonical Linux boot ID that scopes PID/start-tick identity."""
+
+    boot_id = (proc_root / "sys" / "kernel" / "random" / "boot_id").read_text(
+        encoding="ascii"
+    ).strip()
+    if _BOOT_ID.fullmatch(boot_id) is None:
+        raise ValueError("boot_id is not a canonical lowercase UUID")
+    return boot_id
+
+
+def _same_proc_observation(
+    left: _ProcObservation,
+    right: _ProcObservation,
+    *,
+    include_executable: bool,
+) -> bool:
+    """Compare one process identity without trusting PID alone."""
+
+    stable = (
+        left.pid == right.pid
+        and left.process_start_ticks == right.process_start_ticks
+        and left.real_uid == right.real_uid
+        and left.effective_uid == right.effective_uid
+        and left.argv == right.argv
+        and left.cmdline_sha256 == right.cmdline_sha256
+    )
+    if not stable:
+        return False
+    return not include_executable or left.executable == right.executable
+
+
+def _parse_proc_start_ticks(raw: str) -> int:
+    """Return Linux proc-stat field 22 without misparsing spaces in ``comm``."""
+
+    end = raw.rfind(")")
+    fields = raw[end + 2 :].split() if end >= 0 else []
+    try:
+        value = int(fields[19])
+    except (IndexError, ValueError) as exc:
+        raise ValueError("process stat has no valid start-time field") from exc
+    if value < 0:
+        raise ValueError("process start-time field is negative")
+    return value
+
+
+def _parse_proc_uids(raw: str) -> tuple[int, int]:
+    for line in raw.splitlines():
+        if not line.startswith("Uid:"):
+            continue
+        values = line.split(":", 1)[1].split()
+        try:
+            real_uid = int(values[0])
+            effective_uid = int(values[1])
+        except (IndexError, ValueError) as exc:
+            raise ValueError("process status has an invalid Uid field") from exc
+        if real_uid < 0 or effective_uid < 0:
+            raise ValueError("process status has a negative Uid field")
+        return real_uid, effective_uid
+    raise ValueError("process status has no Uid field")
+
+
+def _parse_proc_argv(raw: bytes) -> tuple[bytes, ...]:
+    """Preserve internal empty argv elements while dropping the final terminator.
+
+    Linux exposes argv as NUL-separated bytes. Filtering all empty fields would
+    let an invocation such as ``[python, -I, bootstrap, ""]`` masquerade as the
+    no-argument GUI form. Only the one conventional trailing NUL is structural;
+    every earlier empty field remains part of process identity and classification.
+    """
+
+    parts = raw.split(b"\0")
+    if parts and parts[-1] == b"":
+        parts.pop()
+    return tuple(parts)
+
+
+def _read_proc_observation(
+    process_dir: Path,
+    *,
+    include_executable: bool,
+) -> _ProcObservation:
+    try:
+        pid = int(process_dir.name)
+    except ValueError as exc:
+        raise ValueError("process directory name is not numeric") from exc
+    stat_raw = (process_dir / "stat").read_text(encoding="utf-8")
+    status_raw = (process_dir / "status").read_text(encoding="utf-8")
+    cmdline = (process_dir / "cmdline").read_bytes()
+    real_uid, effective_uid = _parse_proc_uids(status_raw)
+    executable: Path | None = None
+    if include_executable:
+        executable = (process_dir / "exe").resolve(strict=True)
+    return _ProcObservation(
+        pid=pid,
+        process_start_ticks=_parse_proc_start_ticks(stat_raw),
+        real_uid=real_uid,
+        effective_uid=effective_uid,
+        argv=_parse_proc_argv(cmdline),
+        cmdline_sha256=sha256_bytes(cmdline),
+        executable=executable,
+    )
+
+
+def _consume_path_options(
+    arguments: Sequence[bytes],
+    *,
+    allowed: frozenset[bytes],
+) -> bool:
+    """Recognise argparse path options without retaining their private values."""
+
+    seen: set[bytes] = set()
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        option: bytes | None = None
+        inline_value: bytes | None = None
+        for candidate in allowed:
+            if token == candidate:
+                option = candidate
+                break
+            prefix = candidate + b"="
+            if token.startswith(prefix):
+                option = candidate
+                inline_value = token[len(prefix) :]
+                break
+        if option is None or option in seen:
+            return False
+        seen.add(option)
+        if inline_value is not None:
+            if not inline_value:
+                return False
+            index += 1
+            continue
+        if index + 1 >= len(arguments) or not arguments[index + 1]:
+            return False
+        index += 2
+    return True
+
+
+def _managed_gui_invocation_kind(tail: tuple[bytes, ...]) -> str | None:
+    """Classify only CLI forms that deterministically dispatch to ``cmd_gui``."""
+
+    if not tail:
+        return "default-gui"
+    if tail[0] == b"gui":
+        if _consume_path_options(
+            tail[1:],
+            allowed=frozenset({b"--db", b"--workspace"}),
+        ):
+            return "explicit-gui"
+        return None
+    if _consume_path_options(tail, allowed=frozenset({b"--workspace"})):
+        return "workspace-gui"
+    return None
+
+
+def _process_issue_list(counts: Mapping[str, int]) -> list[dict[str, object]]:
+    return [
+        {"code": code, "count": int(count)}
+        for code, count in sorted(counts.items())
+        if count > 0
+    ]
+
+
+def _process_posture(
+    *,
+    complete: bool,
+    gui_count: int,
+) -> tuple[str, dict[str, object]]:
+    if not complete:
+        return (
+            "scan-incomplete",
+            {
+                "safe": False,
+                "decision": "refuse-incomplete",
+                "requires_shutdown": False,
+            },
+        )
+    if gui_count == 0:
+        return (
+            "stopped",
+            {"safe": True, "decision": "start", "requires_shutdown": False},
+        )
+    if gui_count == 1:
+        return (
+            "single-gui",
+            {
+                "safe": True,
+                "decision": "replace-single",
+                "requires_shutdown": True,
+            },
+        )
+    return (
+        "multiple-gui",
+        {
+            "safe": False,
+            "decision": "refuse-multiple",
+            "requires_shutdown": False,
+        },
+    )
+
+
+def _scan_managed_gui_processes(
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    *,
+    proc_root: Path,
+    expected_uid: int,
+) -> dict[str, object]:
+    """Read managed GUI identity without signalling or mutating any process.
+
+    Numeric proc directories owned by another user are ignored before file
+    reads. Same-user disappearances and PID reuse are expected scan races;
+    unreadable or malformed same-user records make the result fail closed.
+    """
+
+    current = state.get("current_release_id")
+    configured = isinstance(current, str) and bool(current)
+    base: dict[str, object] = {
+        "schema": _MANAGED_GUI_PROCESS_SCHEMA,
+        "managed_release_configured": configured,
+        "expected_uid": expected_uid,
+        "boot_id": "",
+        "expected_identity": {
+            "python_executable": "",
+            "bootstrap_path": "",
+            "argv_prefix_sha256": "",
+        },
+        "complete": True,
+        "posture": "stopped",
+        "gui_count": 0,
+        "processes": [],
+        "activation": {
+            "safe": True,
+            "decision": "start",
+            "requires_shutdown": False,
+        },
+        "scanned_pid_count": 0,
+        "same_uid_pid_count": 0,
+        "ignored_process_count": 0,
+        "vanished_process_count": 0,
+        "raced_process_count": 0,
+        "issues": [],
+    }
+    if not configured:
+        return base
+
+    issue_counts: dict[str, int] = {}
+
+    def issue(code: str) -> None:
+        issue_counts[code] = issue_counts.get(code, 0) + 1
+
+    if expected_uid < 0:
+        issue("expected-uid-invalid")
+        posture, activation = _process_posture(complete=False, gui_count=0)
+        base.update(
+            {
+                "complete": False,
+                "posture": posture,
+                "activation": activation,
+                "issues": _process_issue_list(issue_counts),
+            }
+        )
+        return base
+
+    try:
+        root_stat = proc_root.lstat()
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            raise ValueError("proc root is not a real directory")
+        process_dirs = sorted(
+            (entry for entry in proc_root.iterdir() if entry.name.isdigit()),
+            key=lambda entry: int(entry.name),
+        )
+    except (OSError, ValueError):
+        issue("proc-root-unavailable")
+        posture, activation = _process_posture(complete=False, gui_count=0)
+        base.update(
+            {
+                "complete": False,
+                "posture": posture,
+                "activation": activation,
+                "issues": _process_issue_list(issue_counts),
+            }
+        )
+        return base
+
+    try:
+        configured_python = Path(str(state.get("python_executable", ""))).resolve(
+            strict=True
+        )
+        configured_bootstrap = layout.bootstrap_path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        issue("expected-identity-unavailable")
+        posture, activation = _process_posture(complete=False, gui_count=0)
+        base.update(
+            {
+                "complete": False,
+                "posture": posture,
+                "activation": activation,
+                "issues": _process_issue_list(issue_counts),
+            }
+        )
+        return base
+
+    prefix = (
+        os.fsencode(str(configured_python)),
+        b"-I",
+        os.fsencode(str(configured_bootstrap)),
+    )
+    base["expected_identity"] = {
+        "python_executable": str(configured_python),
+        "bootstrap_path": str(configured_bootstrap),
+        "argv_prefix_sha256": sha256_bytes(b"\0".join(prefix) + b"\0"),
+    }
+    try:
+        boot_id = _read_boot_id(proc_root)
+    except FileNotFoundError:
+        issue("boot-id-unavailable")
+        boot_id = ""
+    except (OSError, UnicodeError):
+        issue("boot-id-unavailable")
+        boot_id = ""
+    except ValueError:
+        issue("boot-id-invalid")
+        boot_id = ""
+    if not boot_id:
+        posture, activation = _process_posture(complete=False, gui_count=0)
+        base.update(
+            {
+                "boot_id": "",
+                "complete": False,
+                "posture": posture,
+                "activation": activation,
+                "issues": _process_issue_list(issue_counts),
+            }
+        )
+        return base
+    base["boot_id"] = boot_id
+
+    processes: list[dict[str, object]] = []
+    scanned = same_uid = ignored = vanished = raced = 0
+    for process_dir in process_dirs:
+        scanned += 1
+        try:
+            entry_stat = process_dir.lstat()
+        except FileNotFoundError:
+            vanished += 1
+            continue
+        except OSError:
+            issue("proc-entry-unreadable")
+            continue
+        if entry_stat.st_uid != expected_uid:
+            ignored += 1
+            continue
+        same_uid += 1
+        if stat.S_ISLNK(entry_stat.st_mode) or not stat.S_ISDIR(entry_stat.st_mode):
+            issue("same-uid-entry-invalid")
+            continue
+        try:
+            first = _read_proc_observation(process_dir, include_executable=False)
+        except (FileNotFoundError, ProcessLookupError):
+            vanished += 1
+            continue
+        except PermissionError:
+            issue("same-uid-entry-unreadable")
+            continue
+        except (OSError, UnicodeError, ValueError):
+            issue("same-uid-entry-malformed")
+            continue
+        if first.real_uid != expected_uid or first.effective_uid != expected_uid:
+            ignored += 1
+            continue
+        if first.argv[:3] != prefix:
+            ignored += 1
+            continue
+        invocation = _managed_gui_invocation_kind(first.argv[3:])
+        if invocation is None:
+            # Managed CLI invocations (including this release-info process) are
+            # intentionally absent from the GUI inventory.
+            ignored += 1
+            continue
+        try:
+            second = _read_proc_observation(process_dir, include_executable=True)
+        except (FileNotFoundError, ProcessLookupError):
+            vanished += 1
+            issue("same-uid-candidate-vanished")
+            continue
+        except PermissionError:
+            issue("same-uid-candidate-unreadable")
+            continue
+        except (OSError, UnicodeError, ValueError):
+            issue("same-uid-candidate-malformed")
+            continue
+        if not _same_proc_observation(first, second, include_executable=False):
+            raced += 1
+            issue("same-uid-candidate-raced")
+            continue
+        if second.executable != configured_python:
+            ignored += 1
+            continue
+        try:
+            confirmed = _read_proc_observation(process_dir, include_executable=True)
+        except (FileNotFoundError, ProcessLookupError):
+            vanished += 1
+            issue("same-uid-candidate-vanished")
+            continue
+        except PermissionError:
+            issue("same-uid-candidate-unreadable")
+            continue
+        except (OSError, UnicodeError, ValueError):
+            issue("same-uid-candidate-malformed")
+            continue
+        if not _same_proc_observation(second, confirmed, include_executable=True):
+            # A second stable full observation closes the torn-read window
+            # between cmdline and /proc/<pid>/exe and rejects PID reuse or exec.
+            raced += 1
+            issue("same-uid-candidate-raced")
+            continue
+        processes.append(
+            {
+                "boot_id": boot_id,
+                "pid": confirmed.pid,
+                "process_start_ticks": confirmed.process_start_ticks,
+                "uid": confirmed.effective_uid,
+                "executable": str(confirmed.executable),
+                "invocation_kind": invocation,
+                "argument_count": len(confirmed.argv),
+                "cmdline_sha256": confirmed.cmdline_sha256,
+            }
+        )
+
+    processes.sort(key=lambda item: (int(item["process_start_ticks"]), int(item["pid"])))
+    complete = not issue_counts
+    posture, activation = _process_posture(
+        complete=complete,
+        gui_count=len(processes),
+    )
+    base.update(
+        {
+            "complete": complete,
+            "posture": posture,
+            "gui_count": len(processes),
+            "processes": processes,
+            "activation": activation,
+            "scanned_pid_count": scanned,
+            "same_uid_pid_count": same_uid,
+            "ignored_process_count": ignored,
+            "vanished_process_count": vanished,
+            "raced_process_count": raced,
+            "issues": _process_issue_list(issue_counts),
+        }
+    )
+    return base
+
+
+def managed_gui_process_status(
+    *,
+    root: str | Path | None = None,
+    bin_dir: str | Path | None = None,
+    proc_root: str | Path = "/proc",
+    expected_uid: int | None = None,
+) -> dict[str, object]:
+    """Return a redaction-safe, read-only inventory of managed T1000 GUIs."""
+
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    try:
+        state = load_managed_state(layout)
+    except (OSError, ReleaseError):
+        posture, activation = _process_posture(complete=False, gui_count=0)
+        return {
+            "schema": _MANAGED_GUI_PROCESS_SCHEMA,
+            "managed_release_configured": False,
+            "expected_uid": os.getuid() if expected_uid is None else int(expected_uid),
+            "complete": False,
+            "posture": posture,
+            "gui_count": 0,
+            "processes": [],
+            "activation": activation,
+            "scanned_pid_count": 0,
+            "same_uid_pid_count": 0,
+            "ignored_process_count": 0,
+            "vanished_process_count": 0,
+            "raced_process_count": 0,
+            "issues": [{"code": "managed-state-invalid", "count": 1}],
+        }
+    return _scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=Path(proc_root),
+        expected_uid=os.getuid() if expected_uid is None else int(expected_uid),
+    )
+
+
 def managed_release_status(
     *,
     root: str | Path | None = None,
     bin_dir: str | Path | None = None,
     verify: bool = False,
+    proc_root: str | Path = "/proc",
+    expected_uid: int | None = None,
 ) -> dict[str, object]:
     layout = release_layout(root=root, bin_dir=bin_dir)
     try:
         state = load_managed_state(layout)
-    except ReleaseError as exc:
+    except (OSError, ReleaseError) as exc:
         return {
             "ok": False,
             "action": "release-status",
             "root": str(layout.root),
             "error": str(exc),
+            "runtime_processes": managed_gui_process_status(
+                root=root,
+                bin_dir=bin_dir,
+                proc_root=proc_root,
+                expected_uid=expected_uid,
+            ),
         }
     payload: dict[str, object] = {
         "ok": True,
@@ -2042,6 +2561,16 @@ def managed_release_status(
         "state": state,
         "verified": False,
     }
+    # Runtime posture is deliberately orthogonal to artifact integrity. A
+    # stopped or multiply launched GUI does not make immutable release files
+    # corrupt; callers receive both facts and may apply a fail-closed activation
+    # policy without shell substring matching.
+    payload["runtime_processes"] = _scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=Path(proc_root),
+        expected_uid=os.getuid() if expected_uid is None else int(expected_uid),
+    )
     if state == _default_state():
         return payload
     try:

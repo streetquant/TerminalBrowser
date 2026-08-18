@@ -19,6 +19,7 @@ from unittest import mock
 
 import pytest
 
+import termdeck.release_manager as release_manager
 from termdeck.build_info import (
     BUILD_INFO_SCHEMA,
     MANAGED_STATE_SCHEMA,
@@ -35,6 +36,7 @@ from termdeck.release_manager import (
     _copy_snapshot,
     install_release,
     load_managed_state,
+    managed_gui_process_status,
     managed_release_status,
     release_layout,
     release_lock,
@@ -51,6 +53,7 @@ from termdeck.session_store import SessionStore
 VERSION = "0.2.10"
 DIST_INFO = f"t1000-{VERSION}.dist-info"
 WHEEL_NAME = f"t1000-{VERSION}-py3-none-any.whl"
+BOOT_ID = "11111111-2222-4333-8444-555555555555"
 
 
 def build_info(seed: str) -> dict[str, object]:
@@ -163,6 +166,77 @@ def artifact(tmp_path: Path, seed: str) -> tuple[Path, Path, dict[str, object]]:
     manifest_path = root / f"{wheel.stem}.release.json"
     manifest = write_manifest(manifest_path, wheel, info)
     return wheel, manifest_path, manifest
+
+
+def managed_process_fixture(
+    tmp_path: Path,
+) -> tuple[Path, Path, object, dict[str, object], Path]:
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    layout.root.mkdir(parents=True)
+    layout.bin_dir.mkdir(parents=True)
+    layout.bootstrap_path.write_text("# managed bootstrap\n", encoding="utf-8")
+    layout.bootstrap_path.chmod(0o555)
+    python = Path(sys.executable).resolve(strict=True)
+    state = validate_managed_state(
+        {
+            "schema": MANAGED_STATE_SCHEMA,
+            "generation": 1,
+            "current_release_id": "a" * 64,
+            "previous_release_id": None,
+            "manifest_sha256": "b" * 64,
+            "python_executable": str(python),
+            "bootstrap_sha256": "c" * 64,
+            "launcher_path": str(layout.launcher_path),
+            "launcher_sha256": "d" * 64,
+            "legacy_launcher": None,
+        }
+    )
+    layout.state_path.write_bytes(canonical_json_bytes(state))
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    boot_id_path = proc_root / "sys" / "kernel" / "random" / "boot_id"
+    boot_id_path.parent.mkdir(parents=True)
+    boot_id_path.write_text(BOOT_ID + "\n", encoding="ascii")
+    return root, bin_dir, layout, state, proc_root
+
+
+def write_fake_proc_process(
+    proc_root: Path,
+    pid: int,
+    *,
+    argv: tuple[bytes, ...],
+    executable: Path,
+    uid: int | None = None,
+    start_ticks: int = 100,
+    malformed_stat: bool = False,
+    malformed_status: bool = False,
+) -> Path:
+    process_dir = proc_root / str(pid)
+    process_dir.mkdir()
+    if malformed_stat:
+        (process_dir / "stat").write_text("malformed\n", encoding="utf-8")
+    else:
+        # Fields after ``comm`` begin at proc field 3. Start time is field 22,
+        # therefore index 19 in this suffix.
+        suffix = ["S", "1", *("0" for _ in range(17)), str(start_ticks), "0"]
+        (process_dir / "stat").write_text(
+            f"{pid} (t1000 process) {' '.join(suffix)}\n",
+            encoding="utf-8",
+        )
+    process_uid = os.getuid() if uid is None else uid
+    if malformed_status:
+        status = "Name:\tt1000\nUid:\tbroken\n"
+    else:
+        status = (
+            "Name:\tt1000\n"
+            f"Uid:\t{process_uid}\t{process_uid}\t{process_uid}\t{process_uid}\n"
+        )
+    (process_dir / "status").write_text(status, encoding="utf-8")
+    (process_dir / "cmdline").write_bytes(b"\0".join(argv) + b"\0")
+    (process_dir / "exe").symlink_to(executable)
+    return process_dir
 
 
 def init_git_project(root: Path) -> None:
@@ -614,6 +688,483 @@ def test_legacy_rollback_rejects_backup_outside_managed_legacy_root(
     layout.state_path.write_bytes(canonical_json_bytes(validate_managed_state(state)))
     with pytest.raises(ReleaseError, match="escaped"):
         rollback_release(root=root, bin_dir=bin_dir, to_legacy=True)
+
+
+@pytest.mark.parametrize(
+    ("tail", "expected"),
+    [
+        ((), "default-gui"),
+        ((b"gui",), "explicit-gui"),
+        ((b"gui", b"--db", b"/db", b"--workspace=/workspace"), "explicit-gui"),
+        ((b"--workspace", b"/workspace"), "workspace-gui"),
+        ((b"--workspace=/workspace",), "workspace-gui"),
+        ((b"release", b"info", b"--verify"), None),
+        ((b"gui", b"--db"), None),
+        ((b"gui", b"--workspace=/one", b"--workspace=/two"), None),
+        ((b"--db", b"/db"), None),
+    ],
+)
+def test_managed_gui_invocation_classification_is_exact(
+    tail: tuple[bytes, ...],
+    expected: str | None,
+) -> None:
+    assert release_manager._managed_gui_invocation_kind(tail) == expected
+
+
+def test_internal_empty_argv_element_cannot_masquerade_as_default_gui(
+    tmp_path: Path,
+) -> None:
+    root, bin_dir, layout, _state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    python = Path(sys.executable).resolve(strict=True)
+    bootstrap = layout.bootstrap_path.resolve(strict=True)
+    prefix = (os.fsencode(str(python)), b"-I", os.fsencode(str(bootstrap)))
+    write_fake_proc_process(
+        proc_root,
+        77,
+        argv=prefix + (b"",),
+        executable=python,
+        start_ticks=700,
+    )
+
+    status = managed_gui_process_status(
+        root=root,
+        bin_dir=bin_dir,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+
+    assert status["complete"] is True
+    assert status["posture"] == "stopped"
+    assert status["gui_count"] == 0
+    assert status["ignored_process_count"] == 1
+    raw = (proc_root / "77" / "cmdline").read_bytes()
+    assert release_manager._parse_proc_argv(raw) == prefix + (b"",)
+
+
+def test_managed_gui_process_status_classifies_exact_forms_without_private_args(
+    tmp_path: Path,
+) -> None:
+    root, bin_dir, layout, _state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    python = Path(sys.executable).resolve(strict=True)
+    bootstrap = layout.bootstrap_path.resolve(strict=True)
+    prefix = (os.fsencode(str(python)), b"-I", os.fsencode(str(bootstrap)))
+
+    write_fake_proc_process(
+        proc_root,
+        301,
+        argv=prefix,
+        executable=python,
+        start_ticks=300,
+    )
+    write_fake_proc_process(
+        proc_root,
+        101,
+        argv=prefix
+        + (b"gui", b"--db=/secret/db", b"--workspace", b"/secret/workspace"),
+        executable=python,
+        start_ticks=100,
+    )
+    write_fake_proc_process(
+        proc_root,
+        201,
+        argv=prefix + (b"--workspace", b"/secret/default-workspace"),
+        executable=python,
+        start_ticks=200,
+    )
+    write_fake_proc_process(
+        proc_root,
+        401,
+        argv=prefix + (b"release", b"info", b"--verify"),
+        executable=python,
+        start_ticks=400,
+    )
+    write_fake_proc_process(
+        proc_root,
+        501,
+        argv=(prefix[0], b"-I", prefix[2] + b".lookalike"),
+        executable=python,
+        start_ticks=500,
+    )
+    wrong_executable = tmp_path / "wrong-python"
+    wrong_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    wrong_executable.chmod(0o755)
+    write_fake_proc_process(
+        proc_root,
+        601,
+        argv=prefix,
+        executable=wrong_executable,
+        start_ticks=600,
+    )
+    write_fake_proc_process(
+        proc_root,
+        701,
+        argv=prefix,
+        executable=python,
+        uid=uid + 1,
+        start_ticks=700,
+    )
+
+    status = managed_gui_process_status(
+        root=root,
+        bin_dir=bin_dir,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+
+    assert status["complete"] is True
+    assert status["posture"] == "multiple-gui"
+    assert status["gui_count"] == 3
+    assert status["boot_id"] == BOOT_ID
+    assert status["expected_identity"] == {
+        "python_executable": str(python),
+        "bootstrap_path": str(bootstrap),
+        "argv_prefix_sha256": sha256_bytes(b"\0".join(prefix) + b"\0"),
+    }
+    assert status["activation"] == {
+        "safe": False,
+        "decision": "refuse-multiple",
+        "requires_shutdown": False,
+    }
+    processes = status["processes"]
+    assert [item["pid"] for item in processes] == [101, 201, 301]
+    assert [item["invocation_kind"] for item in processes] == [
+        "explicit-gui",
+        "workspace-gui",
+        "default-gui",
+    ]
+    assert all(item["uid"] == uid for item in processes)
+    assert all(item["boot_id"] == BOOT_ID for item in processes)
+    assert all(item["executable"] == str(python) for item in processes)
+    assert status["scanned_pid_count"] == 7
+    assert status["same_uid_pid_count"] == 7
+    assert status["ignored_process_count"] == 4
+    assert status["issues"] == []
+    encoded = json.dumps(status, sort_keys=True)
+    assert "/secret/" not in encoded
+    expected_default = b"\0".join(prefix) + b"\0"
+    default = next(item for item in processes if item["pid"] == 301)
+    assert default["argument_count"] == 3
+    assert default["cmdline_sha256"] == sha256_bytes(expected_default)
+
+
+def test_managed_gui_process_status_reports_stopped_and_single_gui(
+    tmp_path: Path,
+) -> None:
+    root, bin_dir, layout, _state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    python = Path(sys.executable).resolve(strict=True)
+    bootstrap = layout.bootstrap_path.resolve(strict=True)
+    prefix = (os.fsencode(str(python)), b"-I", os.fsencode(str(bootstrap)))
+
+    stopped = managed_gui_process_status(
+        root=root,
+        bin_dir=bin_dir,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    assert stopped["posture"] == "stopped"
+    assert stopped["activation"] == {
+        "safe": True,
+        "decision": "start",
+        "requires_shutdown": False,
+    }
+
+    write_fake_proc_process(
+        proc_root,
+        42,
+        argv=prefix + (b"gui", b"--workspace=/workspace"),
+        executable=python,
+        start_ticks=99,
+    )
+    running = managed_gui_process_status(
+        root=root,
+        bin_dir=bin_dir,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    assert running["posture"] == "single-gui"
+    assert running["gui_count"] == 1
+    assert running["activation"] == {
+        "safe": True,
+        "decision": "replace-single",
+        "requires_shutdown": True,
+    }
+
+
+def test_managed_gui_process_status_fails_closed_on_incomplete_same_uid_scan(
+    tmp_path: Path,
+) -> None:
+    root, bin_dir, layout, _state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    python = Path(sys.executable).resolve(strict=True)
+    bootstrap = layout.bootstrap_path.resolve(strict=True)
+    prefix = (os.fsencode(str(python)), b"-I", os.fsencode(str(bootstrap)))
+    write_fake_proc_process(
+        proc_root,
+        8,
+        argv=prefix,
+        executable=python,
+        malformed_stat=True,
+    )
+
+    malformed = managed_gui_process_status(
+        root=root,
+        bin_dir=bin_dir,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    assert malformed["complete"] is False
+    assert malformed["posture"] == "scan-incomplete"
+    assert malformed["activation"]["safe"] is False
+    assert malformed["issues"] == [
+        {"code": "same-uid-entry-malformed", "count": 1}
+    ]
+
+    missing = managed_gui_process_status(
+        root=root,
+        bin_dir=bin_dir,
+        proc_root=tmp_path / "missing-proc",
+        expected_uid=uid,
+    )
+    assert missing["posture"] == "scan-incomplete"
+    assert missing["issues"] == [{"code": "proc-root-unavailable", "count": 1}]
+
+
+@pytest.mark.parametrize(
+    ("boot_value", "expected_code"),
+    [
+        (None, "boot-id-unavailable"),
+        ("not-a-canonical-boot-id", "boot-id-invalid"),
+    ],
+)
+def test_managed_gui_process_status_requires_canonical_boot_identity(
+    tmp_path: Path,
+    boot_value: str | None,
+    expected_code: str,
+) -> None:
+    root, bin_dir, _layout, _state, proc_root = managed_process_fixture(tmp_path)
+    boot_path = proc_root / "sys" / "kernel" / "random" / "boot_id"
+    if boot_value is None:
+        boot_path.unlink()
+    else:
+        boot_path.write_text(boot_value + "\n", encoding="ascii")
+
+    status = managed_gui_process_status(
+        root=root,
+        bin_dir=bin_dir,
+        proc_root=proc_root,
+        expected_uid=os.getuid(),
+    )
+
+    assert status["complete"] is False
+    assert status["posture"] == "scan-incomplete"
+    assert status["boot_id"] == ""
+    assert status["issues"] == [{"code": expected_code, "count": 1}]
+
+
+def test_managed_gui_process_status_rejects_numeric_proc_symlink_and_negative_uid(
+    tmp_path: Path,
+) -> None:
+    root, bin_dir, _layout, _state, proc_root = managed_process_fixture(tmp_path)
+    outside = tmp_path / "outside-process"
+    outside.mkdir()
+    (proc_root / "77").symlink_to(outside, target_is_directory=True)
+
+    symlinked = managed_gui_process_status(
+        root=root,
+        bin_dir=bin_dir,
+        proc_root=proc_root,
+        expected_uid=os.getuid(),
+    )
+    assert symlinked["complete"] is False
+    assert symlinked["posture"] == "scan-incomplete"
+    assert symlinked["issues"] == [
+        {"code": "same-uid-entry-invalid", "count": 1}
+    ]
+
+    invalid_uid = managed_gui_process_status(
+        root=root,
+        bin_dir=bin_dir,
+        proc_root=proc_root,
+        expected_uid=-1,
+    )
+    assert invalid_uid["complete"] is False
+    assert invalid_uid["posture"] == "scan-incomplete"
+    assert invalid_uid["issues"] == [
+        {"code": "expected-uid-invalid", "count": 1}
+    ]
+
+
+def test_managed_gui_process_status_rechecks_candidate_after_executable_read(
+    tmp_path: Path,
+) -> None:
+    root, bin_dir, layout, _state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    python = Path(sys.executable).resolve(strict=True)
+    bootstrap = layout.bootstrap_path.resolve(strict=True)
+    prefix = (os.fsencode(str(python)), b"-I", os.fsencode(str(bootstrap)))
+    process_dir = write_fake_proc_process(
+        proc_root,
+        91,
+        argv=prefix,
+        executable=python,
+        start_ticks=123,
+    )
+    first = release_manager._read_proc_observation(
+        process_dir, include_executable=False
+    )
+    second = release_manager._read_proc_observation(
+        process_dir, include_executable=True
+    )
+    reused = release_manager._ProcObservation(
+        pid=second.pid,
+        process_start_ticks=second.process_start_ticks + 1,
+        real_uid=second.real_uid,
+        effective_uid=second.effective_uid,
+        argv=second.argv,
+        cmdline_sha256=second.cmdline_sha256,
+        executable=second.executable,
+    )
+
+    with mock.patch.object(
+        release_manager,
+        "_read_proc_observation",
+        side_effect=[first, second, reused],
+    ):
+        status = managed_gui_process_status(
+            root=root,
+            bin_dir=bin_dir,
+            proc_root=proc_root,
+            expected_uid=uid,
+        )
+
+    assert status["complete"] is False
+    assert status["posture"] == "scan-incomplete"
+    assert status["raced_process_count"] == 1
+    assert status["issues"] == [
+        {"code": "same-uid-candidate-raced", "count": 1}
+    ]
+
+
+def test_managed_gui_process_status_handles_permission_pid_reuse_and_vanish(
+    tmp_path: Path,
+) -> None:
+    root, bin_dir, layout, _state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    python = Path(sys.executable).resolve(strict=True)
+    bootstrap = layout.bootstrap_path.resolve(strict=True)
+    prefix = (os.fsencode(str(python)), b"-I", os.fsencode(str(bootstrap)))
+    process_dir = write_fake_proc_process(
+        proc_root,
+        9,
+        argv=prefix,
+        executable=python,
+        start_ticks=123,
+    )
+    first = release_manager._read_proc_observation(
+        process_dir, include_executable=False
+    )
+    second = release_manager._read_proc_observation(
+        process_dir, include_executable=True
+    )
+
+    with mock.patch.object(
+        release_manager,
+        "_read_proc_observation",
+        side_effect=PermissionError("denied"),
+    ):
+        unreadable = managed_gui_process_status(
+            root=root,
+            bin_dir=bin_dir,
+            proc_root=proc_root,
+            expected_uid=uid,
+        )
+    assert unreadable["posture"] == "scan-incomplete"
+    assert unreadable["issues"] == [
+        {"code": "same-uid-entry-unreadable", "count": 1}
+    ]
+
+    reused = release_manager._ProcObservation(
+        pid=second.pid,
+        process_start_ticks=second.process_start_ticks + 1,
+        real_uid=second.real_uid,
+        effective_uid=second.effective_uid,
+        argv=second.argv,
+        cmdline_sha256=second.cmdline_sha256,
+        executable=second.executable,
+    )
+    with mock.patch.object(
+        release_manager,
+        "_read_proc_observation",
+        side_effect=[first, reused],
+    ):
+        raced = managed_gui_process_status(
+            root=root,
+            bin_dir=bin_dir,
+            proc_root=proc_root,
+            expected_uid=uid,
+        )
+    assert raced["complete"] is False
+    assert raced["posture"] == "scan-incomplete"
+    assert raced["raced_process_count"] == 1
+    assert raced["issues"] == [
+        {"code": "same-uid-candidate-raced", "count": 1}
+    ]
+
+    with mock.patch.object(
+        release_manager,
+        "_read_proc_observation",
+        side_effect=[first, FileNotFoundError()],
+    ):
+        vanished = managed_gui_process_status(
+            root=root,
+            bin_dir=bin_dir,
+            proc_root=proc_root,
+            expected_uid=uid,
+        )
+    assert vanished["complete"] is False
+    assert vanished["posture"] == "scan-incomplete"
+    assert vanished["vanished_process_count"] == 1
+    assert vanished["issues"] == [
+        {"code": "same-uid-candidate-vanished", "count": 1}
+    ]
+
+
+def test_managed_release_status_keeps_process_posture_separate_from_integrity(
+    tmp_path: Path,
+) -> None:
+    root, bin_dir, layout, _state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    python = Path(sys.executable).resolve(strict=True)
+    bootstrap = layout.bootstrap_path.resolve(strict=True)
+    prefix = (os.fsencode(str(python)), b"-I", os.fsencode(str(bootstrap)))
+    for pid in (11, 12):
+        write_fake_proc_process(
+            proc_root,
+            pid,
+            argv=prefix,
+            executable=python,
+            start_ticks=pid,
+        )
+
+    with mock.patch(
+        "termdeck.release_manager._verify_managed_activation",
+        return_value={"current_release_id": "a" * 64, "legacy": False},
+    ):
+        status = managed_release_status(
+            root=root,
+            bin_dir=bin_dir,
+            verify=False,
+            proc_root=proc_root,
+            expected_uid=uid,
+        )
+
+    assert status["ok"] is True
+    assert status["runtime_processes"]["posture"] == "multiple-gui"
+    assert status["runtime_processes"]["activation"]["safe"] is False
+    assert status["verified"] is False
 
 
 @pytest.mark.parametrize(

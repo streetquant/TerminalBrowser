@@ -60,6 +60,12 @@ def state_line(history_size: int = 0, **overrides: str) -> str:
     return " ".join(values[name] for name in _STATE_FIELDS)
 
 
+def control_reply_line(payload: bytes) -> str:
+    """Model ControlModeClient's reversible one-codepoint-per-byte carrier."""
+
+    return payload.decode("latin-1")
+
+
 class FakeControlClient:
     """Synchronous scripted stand-in for ControlModeClient."""
 
@@ -139,6 +145,21 @@ class PaneStreamControllerTests(unittest.TestCase):
         self.assertEqual(events[1][0], "task")
         self.assertEqual(events[1][1][0], "setup")
 
+    def test_capture_consumes_the_explicit_byte_lines_api(self) -> None:
+        raw = "• explicit bytes".encode("utf-8") + b"-\x80-\xff"
+
+        class ByteOnlyReply:
+            ok = True
+            byte_lines = (raw,)
+
+            @property
+            def lines(self):
+                raise AssertionError("binary capture must not inspect text carrier lines")
+
+        controller, _client, _outputs = self.make_controller()
+        with mock.patch.object(controller, "_command", return_value=ByteOnlyReply()):
+            self.assertEqual(controller._capture("%1", "-S -10"), [raw])
+
     def test_zero_history_size_skips_the_history_capture(self) -> None:
         controller, client, outputs = self.make_controller()
         client.script("list-panes", CommandResult(True, (state_line(0),), None))
@@ -162,6 +183,45 @@ class PaneStreamControllerTests(unittest.TestCase):
         self.assertIn(b"old output", data)
         self.assertIn(b"prompt$", data)
         self.assertEqual(client.count("-S -120 -E -1"), 1)
+
+    def test_capture_replay_restores_utf8_and_escape_bytes_exactly(self) -> None:
+        controller, client, outputs = self.make_controller()
+        history = "• Explored └ history".encode()
+        visible = b"\x1b[1m" + "│ … ─ visible".encode() + b"\x1b[0m"
+        client.script("list-panes", CommandResult(True, (state_line(1),), None))
+        client.script(
+            "capture-pane",
+            CommandResult(True, (control_reply_line(history),), None),
+        )
+        client.script(
+            "capture-pane",
+            CommandResult(True, (control_reply_line(visible),), None),
+        )
+
+        controller.start(columns=80, rows=24)
+        client.connect()
+        wait_until(lambda: outputs)
+        replay = b"".join(outputs)
+
+        self.assertIn(history, replay)
+        self.assertIn(visible, replay)
+        self.assertNotIn(history.decode("latin-1").encode(), replay)
+        self.assertNotIn(visible.decode("latin-1").encode(), replay)
+
+    def test_capture_replay_preserves_arbitrary_eight_bit_reply_bytes(self) -> None:
+        controller, client, outputs = self.make_controller()
+        raw = b"raw-\\-\x80-\xff"
+        client.script("list-panes", CommandResult(True, (state_line(0),), None))
+        client.script(
+            "capture-pane",
+            CommandResult(True, (control_reply_line(raw),), None),
+        )
+
+        controller.start(columns=80, rows=24)
+        client.connect()
+        wait_until(lambda: outputs)
+
+        self.assertIn(raw, b"".join(outputs))
 
     def test_normal_shell_replay_disables_mouse_modes_for_native_scrollback(self) -> None:
         controller, client, outputs = self.make_controller()

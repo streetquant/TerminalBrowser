@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+import re
 import threading
 import time
 from typing import Any, Callable, Deque, Protocol
@@ -38,11 +39,24 @@ class ControlEvent:
 
 @dataclass(frozen=True)
 class CommandResult:
-    """The complete reply for one command, preserving tmux body line boundaries."""
+    """One command reply with both protocol-text and exact-byte views.
+
+    ``lines`` is the reader's Latin-1 one-codepoint-per-byte carrier. It is
+    convenient for ASCII tmux metadata such as ``list-panes`` fields, but it is
+    not decoded user text. Binary-preserving consumers such as ``capture-pane``
+    must use :attr:`byte_lines` so a future caller cannot accidentally apply a
+    second UTF-8 encoding to bytes that already came from the pane.
+    """
 
     ok: bool
     lines: tuple[str, ...]
     error: str | None
+
+    @property
+    def byte_lines(self) -> tuple[bytes, ...]:
+        """Return command body lines as their exact transport bytes."""
+
+        return tuple(line.encode("latin-1", "strict") for line in self.lines)
 
 
 class _ReadableBinary(Protocol):
@@ -109,6 +123,15 @@ _NOTIFICATION_KINDS = {
     "%window-renamed": "window-renamed",
 }
 
+# tmux command blocks use exactly ``%kind time command-number flags`` and all
+# three arguments are decimal integers. Keeping the fields as strings avoids
+# unbounded integer conversion while still giving us a stable identity to match
+# the closing marker. Prefix lookalikes in capture-pane output are body data.
+# The wire format does not quote a body line that exactly equals the matching
+# terminator, so that one collision is inherently indistinguishable; the first
+# exact matching end/error must retain protocol authority.
+_FRAME_MARKER = re.compile(r"^%(begin|end|error) ([0-9]+) ([0-9]+) ([0-9]+)$")
+
 
 class ControlModeClient:
     """Maintain one reconnecting tmux ``-C`` transport and route its protocol.
@@ -162,6 +185,7 @@ class ControlModeClient:
         self._queued: Deque[_PendingCommand] = deque()
         self._active: _PendingCommand | None = None
         self._swallow_block = False
+        self._block_identity: tuple[str, str, str] | None = None
         self._greeting_pending = False
         self.reconnect_count = 0
 
@@ -280,6 +304,7 @@ class ControlModeClient:
                     break
                 self._transport = transport
                 self._swallow_block = False
+                self._block_identity = None
                 # tmux opens every control connection with one %begin/%end
                 # block for the attach command itself. Claim it by position:
                 # a caller can enqueue a command before the reader parses the
@@ -329,45 +354,82 @@ class ControlModeClient:
         return False
 
     def _handle_line(self, raw: str) -> bool:
-        """Parse one line, returning true only when tmux explicitly sent ``%exit``."""
-        if raw.startswith("%begin") and (raw == "%begin" or raw[6:7].isspace()):
-            with self._lock:
-                if self._active is not None:
-                    self._active.lines.append(raw)
-                elif self._greeting_pending:
-                    # The first block on a connection is always the attach
-                    # greeting, never a queued command's reply.
-                    self._greeting_pending = False
-                    self._swallow_block = True
-                elif not self._swallow_block and self._queued:
-                    self._active = self._queued.popleft()
-                else:
-                    # A block with no waiting caller is protocol noise.
-                    self._swallow_block = True
-            return False
+        """Parse one line, returning true only when tmux explicitly sent ``%exit``.
 
-        if raw.startswith("%end") and (raw == "%end" or raw[4:5].isspace()):
-            with self._lock:
-                if self._active is not None:
-                    pending = self._active
-                    self._active = None
-                    pending.result = CommandResult(True, tuple(pending.lines), None)
-                    pending.done.set()
-                else:
-                    self._swallow_block = False
-            return False
+        tmux guarantees that notifications never occur inside a command output
+        block. Therefore an active block owns every non-matching line, even when
+        pane text begins with a notification-looking ``%output`` or ``%message``
+        prefix. Only a syntactically valid terminator whose three decimal fields
+        match the opening marker may finish that block.
+        """
 
-        if raw.startswith("%error") and (raw == "%error" or raw[6:7].isspace()):
+        marker_match = _FRAME_MARKER.fullmatch(raw)
+        if marker_match is not None:
+            marker_kind = marker_match.group(1)
+            marker_identity = marker_match.group(2, 3, 4)
+            if marker_kind == "begin":
+                with self._lock:
+                    if self._active is not None:
+                        # Nested blocks are not part of the protocol. A valid-
+                        # looking line emitted by capture-pane is still body.
+                        self._active.lines.append(raw)
+                    elif self._swallow_block:
+                        # The unclaimed greeting/noise block owns its body too.
+                        pass
+                    else:
+                        self._block_identity = marker_identity
+                        if self._greeting_pending:
+                            # The first block on a connection is always the
+                            # attach greeting, never a queued command's reply.
+                            self._greeting_pending = False
+                            self._swallow_block = True
+                        elif self._queued:
+                            self._active = self._queued.popleft()
+                        else:
+                            # A block with no waiting caller is protocol noise.
+                            self._swallow_block = True
+                return False
+
             with self._lock:
-                if self._active is not None:
-                    pending = self._active
-                    self._active = None
-                    error = raw[6:].strip() or "tmux error"
-                    pending.result = CommandResult(False, tuple(pending.lines), error)
-                    pending.done.set()
+                if marker_identity != self._block_identity:
+                    if self._active is not None:
+                        self._active.lines.append(raw)
+                    # Mismatched lookalikes inside an unclaimed block are body
+                    # that the caller intentionally does not observe.
+                    if self._active is not None or self._swallow_block:
+                        return False
                 else:
-                    self._swallow_block = False
-            return False
+                    self._block_identity = None
+                    if self._active is not None:
+                        pending = self._active
+                        self._active = None
+                        if marker_kind == "end":
+                            pending.result = CommandResult(
+                                True, tuple(pending.lines), None
+                            )
+                        else:
+                            # tmux puts human-readable diagnostics in the body;
+                            # the matching %error record contains only numeric
+                            # frame identity. Preserve the body in ``lines`` and
+                            # expose the same text as the caller-facing summary.
+                            error = "\n".join(pending.lines).strip() or "tmux error"
+                            pending.result = CommandResult(
+                                False, tuple(pending.lines), error
+                            )
+                        pending.done.set()
+                    else:
+                        self._swallow_block = False
+                    return False
+
+        # Once a command block is active, every non-matching line is body. The
+        # control-mode contract explicitly forbids asynchronous notifications
+        # inside a block, so dispatching them here would corrupt command output.
+        with self._lock:
+            if self._active is not None:
+                self._active.lines.append(raw)
+                return False
+            if self._swallow_block:
+                return False
 
         name = raw.partition(" ")[0] if raw.startswith("%") else ""
         if name in _NOTIFICATION_KINDS:
@@ -377,12 +439,6 @@ class ControlModeClient:
             self._dispatch_event(event)
             return event.kind == "exit"
 
-        with self._lock:
-            if self._active is not None:
-                self._active.lines.append(raw)
-                return False
-            if self._swallow_block:
-                return False
         if raw.startswith("%"):
             self._dispatch_event(
                 ControlEvent("unknown", raw, tuple(raw.split()[1:]), None, None)
@@ -390,7 +446,7 @@ class ControlModeClient:
         return False
 
     def _notification_from_line(self, raw: str) -> ControlEvent | None:
-        """Recognize notifications before treating percent-prefixed body text as data."""
+        """Parse one out-of-band notification after block ownership is resolved."""
         if not raw.startswith("%"):
             return None
         name, separator, remainder = raw.partition(" ")
@@ -471,6 +527,8 @@ class ControlModeClient:
 
     def _fail_all_locked(self, error: str) -> None:
         """Release every blocked sender when a connection can no longer reply."""
+        self._block_identity = None
+        self._swallow_block = False
         if self._active is not None:
             self._active.result = CommandResult(False, tuple(self._active.lines), error)
             self._active.done.set()

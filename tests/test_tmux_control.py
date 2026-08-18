@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 from collections import deque
+import random
 import subprocess
 import sys
 import threading
 import time
 import unittest
 
-from termdeck.tmux_control import ClientState, ControlModeClient
+from termdeck.tmux_control import (
+    ClientState,
+    CommandResult,
+    ControlModeClient,
+    _FRAME_MARKER,
+    _PendingCommand,
+)
 
 
 class FakeStdout:
@@ -292,6 +299,42 @@ class ControlModeClientTests(unittest.TestCase):
         self.assertEqual(results[0].lines, ("alpha", "beta"))
         client.stop()
 
+    def test_command_reply_uses_latin1_as_a_reversible_byte_carrier(self) -> None:
+        transport = FakeTransport()
+        client, _, _ = self.make_client(transport)
+        self.start_connected(client, transport)
+        raw = "• └ │ … ─".encode("utf-8") + b"-\x80-\xff"
+        results: list[object] = []
+        worker = threading.Thread(target=lambda: results.append(client.send_command("capture-pane")))
+        worker.start()
+        wait_until(lambda: transport.stdin.writes == [b"capture-pane\n"])
+        transport.stdout.feed("%begin 2 1 0")
+        transport.stdout.feed(raw)
+        transport.stdout.feed("%end 2 1 0")
+        worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(results[0].ok)
+        self.assertEqual(results[0].lines[0].encode("latin-1"), raw)
+        self.assertEqual(results[0].byte_lines, (raw,))
+        client.stop()
+
+    def test_command_result_byte_lines_cover_all_octets_and_are_immutable(self) -> None:
+        raw = bytes(range(256))
+        result = CommandResult(True, (raw.decode("latin-1"),), None)
+
+        self.assertEqual(result.byte_lines, (raw,))
+        self.assertIsInstance(result.byte_lines, tuple)
+        with self.assertRaises(AttributeError):
+            result.lines = ()  # type: ignore[misc]
+
+    def test_error_result_exposes_its_body_bytes_without_touching_error_text(self) -> None:
+        raw = b"\x1b[31merror-\x80-\xff"
+        result = CommandResult(False, (raw.decode("latin-1"),), "denied")
+
+        self.assertEqual(result.byte_lines, (raw,))
+        self.assertEqual(result.error, "denied")
+
     def test_error_reply_returns_failed_result_and_body(self) -> None:
         transport = FakeTransport()
         client, _, _ = self.make_client(transport)
@@ -301,12 +344,32 @@ class ControlModeClientTests(unittest.TestCase):
         worker.start()
         wait_until(lambda: bool(transport.stdin.writes))
         transport.stdout.feed("%begin 3 2 0")
-        transport.stdout.feed("details")
-        transport.stdout.feed("%error 3 2 denied")
+        transport.stdout.feed("first detail")
+        transport.stdout.feed("second detail")
+        # Real tmux error terminators have the same three decimal fields as the
+        # matching %begin marker; human-readable error text is reply body data.
+        transport.stdout.feed("%error 3 2 0")
         worker.join(1)
         self.assertFalse(results[0].ok)
-        self.assertEqual(results[0].lines, ("details",))
-        self.assertEqual(results[0].error, "3 2 denied")
+        self.assertEqual(results[0].lines, ("first detail", "second detail"))
+        self.assertEqual(results[0].error, "first detail\nsecond detail")
+        client.stop()
+
+    def test_empty_error_reply_uses_stable_fallback_text(self) -> None:
+        transport = FakeTransport()
+        client, _, _ = self.make_client(transport)
+        self.start_connected(client, transport)
+        results: list[object] = []
+        worker = threading.Thread(target=lambda: results.append(client.send_command("bad-command")))
+        worker.start()
+        wait_until(lambda: bool(transport.stdin.writes))
+        transport.stdout.feed("%begin 8 3 0")
+        transport.stdout.feed("%error 8 3 0")
+        worker.join(1)
+
+        self.assertFalse(results[0].ok)
+        self.assertEqual(results[0].lines, ())
+        self.assertEqual(results[0].error, "tmux error")
         client.stop()
 
     def test_two_commands_match_replies_in_fifo_order(self) -> None:
@@ -341,7 +404,7 @@ class ControlModeClientTests(unittest.TestCase):
         self.assertEqual(result.error, "timeout")
         client.stop()
 
-    def test_notification_interleaved_in_reply_is_dispatched_not_body(self) -> None:
+    def test_notification_looking_lines_inside_reply_are_preserved_as_body(self) -> None:
         transport = FakeTransport()
         client, events, _ = self.make_client(transport)
         self.start_connected(client, transport)
@@ -352,11 +415,50 @@ class ControlModeClientTests(unittest.TestCase):
         transport.stdout.feed("%begin 5 1 0")
         transport.stdout.feed("first")
         transport.stdout.feed("%window-add @9")
+        transport.stdout.feed("%output %999 literal pane text")
+        transport.stdout.feed("%message literal pane message")
         transport.stdout.feed("last")
         transport.stdout.feed("%end 5 1 0")
         worker.join(1)
-        self.assertEqual(result_box[0].lines, ("first", "last"))
-        self.assertEqual([event.kind for event in events], ["window-add"])
+        self.assertEqual(
+            result_box[0].lines,
+            (
+                "first",
+                "%window-add @9",
+                "%output %999 literal pane text",
+                "%message literal pane message",
+                "last",
+            ),
+        )
+        # tmux guarantees that notifications never occur inside an output block;
+        # notification-looking command output is therefore body data.
+        self.assertEqual(events, [])
+        client.stop()
+
+    def test_frame_lookalikes_inside_reply_wait_for_the_matching_terminator(self) -> None:
+        transport = FakeTransport()
+        client, events, _ = self.make_client(transport)
+        self.start_connected(client, transport)
+        result_box: list[object] = []
+        worker = threading.Thread(target=lambda: result_box.append(client.send_command("show")))
+        worker.start()
+        wait_until(lambda: bool(transport.stdin.writes))
+        transport.stdout.feed("%begin 7 4 0")
+        body = (
+            "%begin 999 999 0",
+            "%end literal suffix",
+            "%end 7 999 0",
+            "%error 7 4 denied",
+            "%error literal suffix",
+            "last",
+        )
+        for line in body:
+            transport.stdout.feed(line)
+        transport.stdout.feed("%end 7 4 0")
+        worker.join(1)
+        self.assertEqual(result_box[0].lines, body)
+        self.assertTrue(result_box[0].ok)
+        self.assertEqual(events, [])
         client.stop()
 
     def test_unknown_percent_line_inside_reply_is_preserved_as_body(self) -> None:
@@ -374,6 +476,73 @@ class ControlModeClientTests(unittest.TestCase):
         self.assertEqual(box[0].lines, ("%not-a-notification survives",))
         self.assertEqual(events, [])
         client.stop()
+
+    def test_frame_marker_requires_exact_three_ascii_decimal_fields(self) -> None:
+        accepted = (
+            "%begin 0 0 0",
+            "%end 1787010028 290 1",
+            "%error " + ("9" * 4096) + " 2 3",
+        )
+        rejected = (
+            "%begin",
+            "%begin 1 2",
+            "%begin 1 2 3 extra",
+            "%begin +1 2 3",
+            "%begin ١ 2 3",
+            "%end 1 2 -1",
+            "%error 1 2 denied",
+            " %end 1 2 3",
+            "%END 1 2 3",
+        )
+
+        for line in accepted:
+            self.assertIsNotNone(_FRAME_MARKER.fullmatch(line), line)
+        for line in rejected:
+            self.assertIsNone(_FRAME_MARKER.fullmatch(line), line)
+
+    def test_random_reply_body_needs_matching_identity_to_close(self) -> None:
+        rng = random.Random(0x544D55584652414D)
+        events: list[object] = []
+        client = ControlModeClient(
+            spawn_transport=lambda: FakeTransport(),
+            on_event=events.append,
+        )
+        alphabet = tuple(value for value in range(256) if value not in (10, 13))
+
+        for case in range(1000):
+            identity = (str(1_000_000 + case), str(case), str(case % 4))
+            pending = _PendingCommand()
+            client._active = pending
+            client._swallow_block = False
+            client._block_identity = identity
+            body: list[str] = []
+            for index in range(12):
+                variants = (
+                    f"%output %999 literal-{case}-{index}",
+                    f"%message literal-{case}-{index}",
+                    f"%window-add @{case}",
+                    f"%begin {identity[0]} {int(identity[1]) + 1} {identity[2]}",
+                    f"%end {identity[0]} {int(identity[1]) + 1} {identity[2]}",
+                    f"%error {identity[0]} {int(identity[1]) + 1} {identity[2]}",
+                    "%begin 1 2 3 extra",
+                    "%end literal suffix",
+                    "%error 1 2 denied",
+                    "%not-a-notification survives",
+                    bytes(rng.choice(alphabet) for _ in range(24)).decode("latin-1"),
+                )
+                line = variants[rng.randrange(len(variants))]
+                body.append(line)
+                self.assertFalse(client._handle_line(line))
+                self.assertIs(client._active, pending)
+
+            self.assertEqual(events, [])
+            self.assertFalse(client._handle_line(f"%end {' '.join(identity)}"))
+            self.assertIsNone(client._active)
+            self.assertIsNone(client._block_identity)
+            self.assertTrue(pending.done.is_set())
+            self.assertIsNotNone(pending.result)
+            self.assertTrue(pending.result.ok)
+            self.assertEqual(pending.result.lines, tuple(body))
 
     def test_eof_reconnects_with_injected_backoff(self) -> None:
         first = FakeTransport()

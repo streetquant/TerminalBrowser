@@ -773,11 +773,14 @@ class PaneStreamController:
 
     # -------------------------------------------------------------- replay
 
-    def _capture(self, pane_id: str, arguments: str) -> list[str] | None:
+    def _capture(self, pane_id: str, arguments: str) -> list[bytes] | None:
         reply = self._command(f"capture-pane -epq -t {pane_id} {arguments}")
         if not reply.ok:
             return None
-        return [line.encode("utf-8", "replace").decode("utf-8") for line in reply.lines]
+        # CommandResult owns the Latin-1 carrier reversal. Keeping that
+        # conversion at the protocol boundary prevents replay consumers from
+        # guessing an encoding and repeating the historical UTF-8 double pass.
+        return list(reply.byte_lines)
 
     def _build_replay(self, pane_state: dict[str, str], rows: int) -> bytes | None:
         """Reconstruct scrollback, screen, cursor, and modes for a fresh VTE.
@@ -809,9 +812,9 @@ class PaneStreamController:
             )
             if history is None:
                 return None
-            text = "\r\n".join(line.rstrip() for line in history).rstrip()
+            text = b"\r\n".join(line.rstrip() for line in history).rstrip()
             if text:
-                parts.append(text.encode("utf-8", "replace") + b"\r\n")
+                parts.append(text + b"\r\n")
         elif not first_attach:
             # Reconnect: repaint over whatever the widget last showed.
             parts.append(b"\x1b[?1049l" if not alternate else b"")
@@ -826,7 +829,7 @@ class PaneStreamController:
         while len(visible) > rows:
             visible.pop()
         if visible:
-            parts.append("\r\n".join(visible).encode("utf-8", "replace"))
+            parts.append(b"\r\n".join(visible))
 
         # Cursor: after feeding, the caret rests at the end of the last fed
         # row.  Walk it to tmux's reported position.
