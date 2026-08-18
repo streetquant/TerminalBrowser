@@ -586,7 +586,157 @@ release-manager tests before its final `compileall` step was refused by the
 read-only sealed snapshot filesystem; canonical static compilation passed. This
 is retained as a worker-harness limitation, not a product failure.
 
-The custom-bin repair is accepted for another exact full source/runtime gate,
-then a follow-up clean commit and reproducible artifact. Production install,
-rollback proof, exact activation, installed replay, final independent review,
-and BR closure remain mandatory before Round 5 is accepted.
+The custom-bin repair was accepted for another exact full source/runtime gate,
+then committed and reproducibly built. Its isolated replay passed custom-root and
+custom-launcher self-inspection. Production promotion subsequently exposed a
+separate cross-version rollback defect, described below.
+
+### Complete activation-bundle rollback finding
+
+The GUI was bound to one exact systemd/procfs identity and stopped gracefully.
+All `151` persistent tmux sessions, `151` pane process identities, the single tmux
+server, `281` semantic rows, and `281` authentication/`CODEX_HOME` boundaries
+remained unchanged. The exact 0.2.13 artifact installed and verified. A real
+rollback then selected verified 0.2.11 release
+`6b1321e01cc7fd6addd14f7b7889af0fe1f4c66f3373fe831ee6e40e99108bf5`.
+
+The rollback was only application-complete:
+
+- `t1000 --version` correctly reported 0.2.11;
+- current-source verification accepted the 0.2.11 release tree;
+- the 0.2.11 runtime's own `release info --verify` rejected canonical state with
+  `managed state names a non-canonical bootstrap identity`.
+
+State had selected the historical release while retaining the newer bootstrap and
+launcher. The correct generation ontology is therefore:
+
+```text
+ActivationGeneration(r) =
+    (release_tree_r, bootstrap_r, launcher_r, python_identity, state_r)
+```
+
+A rollback is valid only when the complete tuple is internally consistent.
+Production was restored to verified 0.2.13 with 0.2.11 retained as previous; the
+GUI remained stopped while source repair proceeded.
+
+### Iteration 1 — complete transactional activation rollback
+
+Failing-first tests reproduced the application-only rollback and required target
+activation derivation, exact selected-release verification, transactional
+publication, reinstall repair, and rollback of every preimage.
+
+The implementation:
+
+- derives the target bootstrap and launcher by importing the selected release's
+  own `termdeck.release_manager` under `-I -B`;
+- requires exact module/package provenance from the target wheel;
+- accepts a closed canonical JSON/base64 response with byte counts and SHA-256;
+- writes target bootstrap, state, and launcher in one transaction;
+- restores bootstrap, state, and launcher preimages after any write or
+  post-publication verification failure;
+- verifies the published transaction against the exact target activation;
+- upgrades an authenticated historical activation back to current templates on
+  reinstall.
+
+The focused surface passed `8` tests and the full release-manager suite passed
+`85` tests. Reviewer snapshot `snap-a989cf29a89647ec280903610d7c4c7b`
+independently passed focused cases and all `85` tests before a read-only
+`compileall` refusal; the refusal did not modify or invalidate product evidence.
+
+### Iteration 2 — state hashes are evidence, not authority
+
+Adversarial review found that install still allowed the launcher hash recorded in
+state as a prior identity. A compromised state/launcher pair could therefore
+self-authorize repair.
+
+A single state-activation resolver now applies this relation:
+
+```text
+CanonicalActivation(state, selected_release) =
+    current_source_activation
+        when both state hashes equal current-source hashes
+    selected_release_activation
+        when both state hashes equal bytes derived from the selected wheel
+    reject
+        otherwise
+```
+
+Install derives historical identity from the selected wheel without requiring the
+possibly contaminated extracted site. This preserves recovery from the known
+0.2.12 `__pycache__` contamination while refusing arbitrary state-recorded
+bootstrap or launcher bytes. Missing launcher, missing bootstrap, and damaged
+bootstrap remain repairable only after historical state identity is authenticated.
+
+The focused surface passed `8` tests and all `90` release-manager tests. Reviewer
+snapshot `snap-ed29674c47187474e58507bb9a18c984` passed `13` targeted tests and
+all `90` tests with receipt
+`d7a4182bf706ca07554ae71f1a3d40a52c8b2c0641dda620abd6c11af728973c`.
+A separate snapshot passed `169` release/CLI/build/diagnostics/tmux/pane tests.
+
+### Iteration 3 — descriptor-anchored artifacts and bounded probes
+
+Adversarial review then identified two resource and path-boundary gaps: a
+wheel-only recovery path could follow symlinked release/artifacts directories,
+and `subprocess.run` could accumulate unbounded probe output before post-return
+size checks.
+
+The repaired activation probe:
+
+1. opens the managed root, `releases`, selected release, and `artifacts` through an
+   `openat`/`O_NOFOLLOW` descriptor chain;
+2. reads only direct-child manifest and wheel names;
+3. requires manifest and wheel files to be regular, read-only, single-link,
+   stable during the read, and within fixed size limits;
+4. verifies canonical manifest identity plus wheel hash/size;
+5. copies the exact bytes into a private `0700` temporary directory and reverifies
+   that private wheel/manifest pair;
+6. imports only the private wheel under `-I -B`;
+7. incrementally drains stdout and stderr with fixed byte limits and a wall-clock
+   deadline;
+8. launches a private process group and terminates the group on timeout or
+   overflow.
+
+Symlinked release/artifacts containers, stdout overflow, stderr overflow, and
+probe timeout were reproduced failing-first. The focused surface passed `6`
+tests and all `95` release-manager tests. Reviewer snapshot
+`snap-244a280736c697e215224fbd64587bb7` independently passed `24` targeted tests
+and all `95` tests with receipt
+`5f6613aab787eaa1c549807659603db7299b4b7bfdc6c24030bb5e0fef86fc69`.
+A separate snapshot passed `174` focused integration tests.
+
+### Iteration 4 — descendant containment and real historical compatibility
+
+A final process-containment review found that cleanup returned early when the
+process-group leader had already exited. A descendant could retain inherited
+stdout/stderr descriptors and survive the timeout path. Failing-first coverage
+now launches exactly that topology. Cleanup probes process-group existence rather
+than leader status, sends bounded TERM then KILL escalation to the complete group,
+and independently verifies that no live descendant survives.
+
+The retained real 0.2.11 wheel was then used directly as historical evidence. The
+new descriptor-anchored probe derived:
+
+- bootstrap SHA-256
+  `001824ed8d7da5ff96f110d1e9045307be28677b031e67d2c38e38582a21bab9`;
+- launcher SHA-256
+  `f298b0b195326b84ead27ca17ab7faed70e986ecdb67516f596a4666f14ed67d`;
+- the historical exact `-I` launcher without retroactively inventing `-B`.
+
+The focused release/CLI/build/diagnostics/tmux/pane surface passed `175` tests,
+the complete release workflow passed, and all `96` release-manager tests passed.
+The final exact-source gate then passed `1,216` inherited tests, one intentional
+skip, and `98` subtests. All `18` sandbox-applicable strict GTK/VTE/tmux smokes
+passed with empty stderr, and the separate real user-session process smoke proved
+a complete safe `stopped` posture with zero GUI candidates. The semantic payload
+remained SHA-256
+`5b840a12df3d8fe00b59c42dfc8c3107553ffea3bdad9c0597618611548ac93e`;
+the `281` authentication/`CODEX_HOME` boundaries remained SHA-256
+`8d6fa311a79a39a90d8aeb3a27ab3b41bcb74f6d371b4d84152ed76a7b5bf957`.
+Source diff, Git HEAD/status, stopped GUI unit, Xvfb inventory, and smoke-process
+inventory were unchanged.
+
+Iteration 5 remains the immutable source/artifact promotion and real production
+replay: final source gate, independent review, exact commit/private push,
+byte-identical clean builds, isolated 0.2.13 -> 0.2.11 -> 0.2.13 activation
+replay, production install/rollback/reinstall, one exact `isolated-no-bytecode`
+GUI, installed terminal/process/resource verification, and BR closure.

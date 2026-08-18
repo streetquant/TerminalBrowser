@@ -24,8 +24,10 @@ import io
 import json
 import os
 import re
+import selectors
 import shlex
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -66,6 +68,10 @@ _MAX_WHEEL_MEMBER_BYTES = 128 * 1024 * 1024
 _MAX_WHEEL_TOTAL_BYTES = 512 * 1024 * 1024
 _MAX_WHEEL_ARCHIVE_BYTES = 512 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+_MAX_ACTIVATION_SOURCE_BYTES = 2 * 1024 * 1024
+_MAX_ACTIVATION_PROBE_OUTPUT_BYTES = 6 * 1024 * 1024
+_MAX_ACTIVATION_PROBE_STDERR_BYTES = 64 * 1024
+_ACTIVATION_PROBE_SCHEMA = "t1000.activation-probe.v1"
 _RELEASE_ID = re.compile(r"^[0-9a-f]{64}$")
 _RELEASE_VERSION_PREFIX = re.compile(
     r"^([0-9]+)\.([0-9]+)\.([0-9]+)(?:[A-Za-z0-9.+-].*)?$"
@@ -157,6 +163,32 @@ class _FileSnapshot:
     mode: int = 0
 
 
+@dataclass(frozen=True)
+class _ActivationBundle:
+    """Canonical bootstrap and launcher bytes for one managed release generation."""
+
+    bootstrap: bytes
+    launcher: bytes
+    bootstrap_sha256: str
+    launcher_sha256: str
+    origin: str
+
+
+@dataclass(frozen=True)
+class _BoundedProcessResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+@dataclass(frozen=True)
+class _ActivationArtifactSnapshot:
+    manifest: dict[str, object]
+    manifest_bytes: bytes
+    wheel_name: str
+    wheel_bytes: bytes
+
+
 def _default_managed_bin_dir(
     *,
     env: Mapping[str, str] | None = None,
@@ -217,6 +249,147 @@ def _run(
             f"command exited {completed.returncode}: {shlex.join(argv)}: {detail}"
         )
     return completed
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Boundedly terminate a child and every descendant in its private group.
+
+    The group leader may already have exited while a descendant still owns an
+    inherited pipe. Group existence, not the leader's return code, therefore
+    controls escalation.
+    """
+
+    process_group = process.pid
+
+    def group_exists() -> bool:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    if group_exists():
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 0.5
+        while group_exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if group_exists():
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 0.5
+            while group_exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+    if process.poll() is None:
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def _run_bounded_output(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str] | None,
+    timeout: float,
+    stdout_limit: int,
+    stderr_limit: int,
+) -> _BoundedProcessResult:
+    """Run one process with hard in-memory output and wall-clock bounds.
+
+    Pipes are drained incrementally through a selector. The child receives a new
+    process group so timeout or overflow terminates descendants as well as the
+    direct process, preventing a probe from retaining pipes after its parent exits.
+    """
+
+    if not argv or any(not isinstance(item, str) or not item for item in argv):
+        raise ReleaseError("bounded command argv is empty or invalid")
+    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+        raise ReleaseError("bounded command timeout must be positive")
+    for label, limit in (("stdout", stdout_limit), ("stderr", stderr_limit)):
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ReleaseError(f"bounded command {label} limit must be positive")
+    try:
+        process = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            env=dict(env) if env is not None else None,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as exc:
+        raise ReleaseError(f"command failed to execute: {shlex.join(argv)}: {exc}") from exc
+    assert process.stdout is not None and process.stderr is not None
+    selector = selectors.DefaultSelector()
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+    streams = {"stdout": process.stdout, "stderr": process.stderr}
+    deadline = time.monotonic() + float(timeout)
+    try:
+        for label, stream in streams.items():
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, label)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ReleaseError(f"command timed out after {timeout:.3f}s: {shlex.join(argv)}")
+            events = selector.select(min(0.1, remaining))
+            if not events:
+                continue
+            for key, _mask in events:
+                label = str(key.data)
+                buffer = buffers[label]
+                limit = limits[label]
+                try:
+                    chunk = os.read(key.fd, min(64 * 1024, limit - len(buffer) + 1))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                buffer.extend(chunk)
+                if len(buffer) > limit:
+                    raise ReleaseError(
+                        f"command {label} exceeded the {limit}-byte limit: {shlex.join(argv)}"
+                    )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReleaseError(f"command timed out after {timeout:.3f}s: {shlex.join(argv)}")
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise ReleaseError(
+                f"command timed out after {timeout:.3f}s: {shlex.join(argv)}"
+            ) from exc
+        stdout = bytes(buffers["stdout"])
+        stderr = bytes(buffers["stderr"])
+        if returncode != 0:
+            detail_bytes = stderr or stdout or b"command failed"
+            detail = detail_bytes[:4096].decode("utf-8", "replace").strip()
+            raise ReleaseError(
+                f"command exited {returncode}: {shlex.join(argv)}: {detail}"
+            )
+        return _BoundedProcessResult(returncode, stdout, stderr)
+    except Exception:
+        _terminate_process_group(process)
+        raise
+    finally:
+        selector.close()
+        for stream in streams.values():
+            stream.close()
+        if process.poll() is None:
+            _terminate_process_group(process)
 
 
 def _git(root: Path, *args: str, timeout: float = 30.0) -> str:
@@ -675,6 +848,172 @@ def _read_regular_file_bytes(
         return content
     finally:
         os.close(descriptor)
+
+
+def _open_real_directory_at(
+    path: str | Path,
+    *,
+    label: str,
+    dir_fd: int | None = None,
+) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(os.fspath(path), flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise ReleaseError(f"could not open {label} as a real directory: {exc}") from exc
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ReleaseError(f"{label} is not a real directory")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _read_immutable_file_at(
+    directory_fd: int,
+    name: str,
+    *,
+    label: str,
+    maximum_bytes: int,
+) -> bytes:
+    if (
+        not isinstance(name, str)
+        or not name
+        or "/" in name
+        or "\\" in name
+        or "\x00" in name
+        or name in {".", ".."}
+    ):
+        raise ReleaseError(f"{label} has an unsafe direct-child name")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise ReleaseError(f"could not open {label} safely: {exc}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ReleaseError(f"{label} is not a regular file")
+        if stat.S_IMODE(before.st_mode) & 0o222 or before.st_nlink != 1:
+            raise ReleaseError(f"{label} is writable or hard-linked")
+        if before.st_size < 0 or before.st_size > maximum_bytes:
+            raise ReleaseError(f"{label} exceeds the {maximum_bytes}-byte safety limit")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ReleaseError(f"{label} changed or truncated while being read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ReleaseError(f"{label} grew while being read")
+        after = os.fstat(descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+            before.st_nlink,
+            stat.S_IMODE(before.st_mode),
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+            after.st_nlink,
+            stat.S_IMODE(after.st_mode),
+        )
+        if identity_after != identity_before:
+            raise ReleaseError(f"{label} changed while being read")
+        content = b"".join(chunks)
+        if len(content) != before.st_size:
+            raise ReleaseError(f"{label} size changed while being read")
+        return content
+    finally:
+        os.close(descriptor)
+
+
+def _read_activation_artifact_snapshot(
+    layout: ReleaseLayout,
+    release_id: str,
+) -> _ActivationArtifactSnapshot:
+    """Read manifest and wheel through a no-follow descriptor chain.
+
+    Only the activation artifacts are required. The extracted site may be
+    contaminated and remain repairable, but neither the managed root, release,
+    artifacts directory, manifest, nor wheel can be redirected through symlinks.
+    """
+
+    if _RELEASE_ID.fullmatch(release_id) is None:
+        raise ReleaseError("activation target release id is unsafe")
+    root_fd = _open_real_directory_at(layout.root, label="managed release root")
+    releases_fd: int | None = None
+    release_fd: int | None = None
+    artifacts_fd: int | None = None
+    try:
+        releases_fd = _open_real_directory_at(
+            "releases",
+            label="managed releases directory",
+            dir_fd=root_fd,
+        )
+        release_fd = _open_real_directory_at(
+            release_id,
+            label="activation target release",
+            dir_fd=releases_fd,
+        )
+        manifest_bytes = _read_immutable_file_at(
+            release_fd,
+            "manifest.json",
+            label="activation target manifest",
+            maximum_bytes=_MAX_MANIFEST_BYTES,
+        )
+        try:
+            manifest = validate_release_manifest(json.loads(manifest_bytes.decode("utf-8")))
+        except (UnicodeDecodeError, json.JSONDecodeError, BuildIdentityError) as exc:
+            raise ReleaseError(f"activation target manifest is invalid: {exc}") from exc
+        if manifest_bytes != canonical_json_bytes(manifest):
+            raise ReleaseError("activation target manifest is not canonical")
+        if manifest.get("release_id") != release_id:
+            raise ReleaseError("activation target manifest and release id disagree")
+        wheel_name = manifest.get("wheel")
+        if not isinstance(wheel_name, str):
+            raise ReleaseError("activation target manifest has no wheel name")
+        artifacts_fd = _open_real_directory_at(
+            "artifacts",
+            label="activation target artifacts directory",
+            dir_fd=release_fd,
+        )
+        wheel_bytes = _read_immutable_file_at(
+            artifacts_fd,
+            wheel_name,
+            label="activation target wheel",
+            maximum_bytes=_MAX_WHEEL_ARCHIVE_BYTES,
+        )
+        if (
+            len(wheel_bytes) != manifest.get("wheel_size")
+            or sha256_bytes(wheel_bytes) != manifest.get("wheel_sha256")
+        ):
+            raise ReleaseError("activation target wheel hash or size does not match manifest")
+        return _ActivationArtifactSnapshot(
+            manifest=dict(manifest),
+            manifest_bytes=manifest_bytes,
+            wheel_name=wheel_name,
+            wheel_bytes=wheel_bytes,
+        )
+    finally:
+        for descriptor in (artifacts_fd, release_fd, releases_fd, root_fd):
+            if descriptor is not None:
+                os.close(descriptor)
 
 
 def _verified_wheel_bytes(verified: VerifiedWheel) -> bytes:
@@ -1718,6 +2057,320 @@ def _launcher_source(layout: ReleaseLayout, python: Path) -> bytes:
     return ("#!/bin/sh\nset -eu\n" + command).encode("utf-8")
 
 
+def _activation_bundle(
+    bootstrap: bytes,
+    launcher: bytes,
+    *,
+    origin: str,
+) -> _ActivationBundle:
+    """Validate and bind one complete managed activation template."""
+
+    if origin not in {"current-source", "selected-release"}:
+        raise ReleaseError(f"unsupported activation-bundle origin: {origin}")
+    for label, content in (("bootstrap", bootstrap), ("launcher", launcher)):
+        if not isinstance(content, bytes) or not content:
+            raise ReleaseError(f"managed {label} source is empty or not bytes")
+        if len(content) > _MAX_ACTIVATION_SOURCE_BYTES:
+            raise ReleaseError(f"managed {label} source exceeds the byte limit")
+        if b"\x00" in content:
+            raise ReleaseError(f"managed {label} source contains a NUL byte")
+    return _ActivationBundle(
+        bootstrap=bootstrap,
+        launcher=launcher,
+        bootstrap_sha256=sha256_bytes(bootstrap),
+        launcher_sha256=sha256_bytes(launcher),
+        origin=origin,
+    )
+
+
+def _validated_activation_bundle(
+    bundle: _ActivationBundle,
+    *,
+    expected_origin: str | None = None,
+) -> _ActivationBundle:
+    if not isinstance(bundle, _ActivationBundle):
+        raise ReleaseError("managed activation bundle has an invalid type")
+    validated = _activation_bundle(
+        bundle.bootstrap,
+        bundle.launcher,
+        origin=bundle.origin,
+    )
+    if expected_origin is not None and validated.origin != expected_origin:
+        raise ReleaseError(
+            "managed activation bundle has the wrong origin: "
+            f"{validated.origin!r} != {expected_origin!r}"
+        )
+    if (
+        validated.bootstrap_sha256 != bundle.bootstrap_sha256
+        or validated.launcher_sha256 != bundle.launcher_sha256
+    ):
+        raise ReleaseError("managed activation bundle hashes do not match its bytes")
+    return validated
+
+
+def _current_activation_bundle(
+    layout: ReleaseLayout,
+    interpreter: Path,
+) -> _ActivationBundle:
+    return _activation_bundle(
+        _bootstrap_source(layout, interpreter),
+        _launcher_source(layout, interpreter),
+        origin="current-source",
+    )
+
+
+def _state_activation_bundle(
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    interpreter: Path,
+    *,
+    expected_activation: _ActivationBundle | None = None,
+    verify_selected_release: bool,
+) -> _ActivationBundle:
+    """Authenticate state hashes against code, never against state itself.
+
+    Current-source hashes are accepted directly. Historical hashes must match the
+    exact activation deterministically derived from the selected immutable wheel.
+    Install uses the wheel-only path so it can repair a contaminated extracted
+    tree; status verification additionally requires the selected release tree.
+    """
+
+    current = state.get("current_release_id")
+    if not isinstance(current, str) or _RELEASE_ID.fullmatch(current) is None:
+        raise ReleaseError("managed current release id is invalid")
+    current_activation = _current_activation_bundle(layout, interpreter)
+    state_bootstrap_hash = state.get("bootstrap_sha256")
+    state_launcher_hash = state.get("launcher_sha256")
+    if (
+        state_bootstrap_hash == current_activation.bootstrap_sha256
+        and state_launcher_hash == current_activation.launcher_sha256
+    ):
+        return current_activation
+
+    if expected_activation is not None:
+        selected = _validated_activation_bundle(
+            expected_activation,
+            expected_origin="selected-release",
+        )
+    elif verify_selected_release:
+        selected = _verified_release_activation_bundle(layout, current, interpreter)
+    else:
+        selected = _derive_release_activation_bundle(layout, current, interpreter)
+    if state_bootstrap_hash != selected.bootstrap_sha256:
+        raise ReleaseError("managed state names a non-canonical bootstrap identity")
+    if state_launcher_hash != selected.launcher_sha256:
+        raise ReleaseError("managed state names a non-canonical launcher identity")
+    return selected
+
+
+def _decode_activation_probe_source(
+    payload: Mapping[str, object],
+    *,
+    label: str,
+) -> bytes:
+    encoded = payload.get(f"{label}_base64")
+    size = payload.get(f"{label}_size")
+    digest = payload.get(f"{label}_sha256")
+    if not isinstance(encoded, str) or not encoded:
+        raise ReleaseError(f"activation probe returned no {label} source")
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise ReleaseError(f"activation probe returned an invalid {label} size")
+    if size > _MAX_ACTIVATION_SOURCE_BYTES:
+        raise ReleaseError(f"activation probe {label} source exceeds the byte limit")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ReleaseError(f"activation probe returned an invalid {label} SHA-256")
+    try:
+        content = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise ReleaseError(f"activation probe returned invalid {label} base64") from exc
+    if len(content) != size:
+        raise ReleaseError(f"activation probe {label} size does not match its bytes")
+    if sha256_bytes(content) != digest:
+        raise ReleaseError(f"activation probe {label} SHA-256 does not match its bytes")
+    return content
+
+
+def _derive_release_activation_bundle(
+    layout: ReleaseLayout,
+    release_id: str,
+    interpreter: Path,
+) -> _ActivationBundle:
+    """Derive canonical activation bytes from one descriptor-anchored wheel.
+
+    Manifest and wheel bytes are read through an ``openat``/``O_NOFOLLOW``
+    directory chain. A private verified copy is then imported under ``-I -B`` so
+    a writable historical extracted site cannot create bytecode, redirect the
+    probe through symlinks, or race the child between verification and import.
+    """
+
+    snapshot = _read_activation_artifact_snapshot(layout, release_id)
+    try:
+        resolved_interpreter = interpreter.resolve(strict=True)
+    except OSError as exc:
+        raise ReleaseError(f"could not resolve activation Python interpreter: {exc}") from exc
+    _regular_file_hash(
+        resolved_interpreter,
+        label="activation Python interpreter",
+        executable=True,
+    )
+    probe = r'''
+from __future__ import annotations
+import base64
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+wheel = Path(sys.argv[1]).resolve(strict=True)
+root = Path(sys.argv[2]).absolute()
+bin_dir = Path(sys.argv[3]).absolute()
+interpreter = Path(sys.argv[4]).resolve(strict=True)
+release_id = sys.argv[5]
+sys.path.insert(0, str(wheel))
+import termdeck
+import termdeck.release_manager as manager
+
+module_path = str(manager.__file__)
+package_path = str(termdeck.__file__)
+expected_module = f"{wheel}/termdeck/release_manager.py"
+expected_package = f"{wheel}/termdeck/__init__.py"
+if module_path != expected_module or package_path != expected_package:
+    raise RuntimeError(
+        f"activation import escaped target wheel: {module_path!r}, {package_path!r}"
+    )
+layout = manager.release_layout(root=root, bin_dir=bin_dir)
+bootstrap = manager._bootstrap_source(layout, interpreter)
+launcher = manager._launcher_source(layout, interpreter)
+if not isinstance(bootstrap, bytes) or not isinstance(launcher, bytes):
+    raise RuntimeError("activation source functions did not return bytes")
+payload = {
+    "schema": "t1000.activation-probe.v1",
+    "release_id": release_id,
+    "module_path": module_path,
+    "package_path": package_path,
+    "managed_root": str(root),
+    "bin_dir": str(bin_dir),
+    "python_executable": str(interpreter),
+    "bootstrap_base64": base64.b64encode(bootstrap).decode("ascii"),
+    "bootstrap_sha256": hashlib.sha256(bootstrap).hexdigest(),
+    "bootstrap_size": len(bootstrap),
+    "launcher_base64": base64.b64encode(launcher).decode("ascii"),
+    "launcher_sha256": hashlib.sha256(launcher).hexdigest(),
+    "launcher_size": len(launcher),
+}
+sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+'''
+    probe_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"PATH", "LANG", "LC_ALL", "TZ"}
+    }
+    probe_env.update(
+        {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONHASHSEED": "0",
+        }
+    )
+    with tempfile.TemporaryDirectory(prefix="t1000-activation-probe-") as temporary:
+        temporary_root = Path(temporary)
+        temporary_root.chmod(0o700)
+        wheel = temporary_root / snapshot.wheel_name
+        manifest_path = temporary_root / "manifest.json"
+        _atomic_write_bytes(wheel, snapshot.wheel_bytes, mode=0o400)
+        _atomic_write_bytes(manifest_path, snapshot.manifest_bytes, mode=0o400)
+        verified = verify_wheel(wheel, manifest_path=manifest_path)
+        if verified.manifest is None or verified.manifest.get("release_id") != release_id:
+            raise ReleaseError("activation target wheel and release id disagree")
+        resolved_wheel = wheel.resolve(strict=True)
+        expected_module = f"{resolved_wheel}/termdeck/release_manager.py"
+        expected_package = f"{resolved_wheel}/termdeck/__init__.py"
+        completed = _run_bounded_output(
+            [
+                str(resolved_interpreter),
+                "-I",
+                "-B",
+                "-c",
+                probe,
+                str(resolved_wheel),
+                str(layout.root),
+                str(layout.bin_dir),
+                str(resolved_interpreter),
+                release_id,
+            ],
+            cwd=temporary_root,
+            env=probe_env,
+            timeout=60,
+            stdout_limit=_MAX_ACTIVATION_PROBE_OUTPUT_BYTES,
+            stderr_limit=_MAX_ACTIVATION_PROBE_STDERR_BYTES,
+        )
+        if completed.stderr:
+            raise ReleaseError("activation probe emitted unexpected stderr")
+        if not completed.stdout:
+            raise ReleaseError("activation probe output is empty")
+        try:
+            output = completed.stdout.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ReleaseError("activation probe output was not valid UTF-8") from exc
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise ReleaseError("activation probe output is not valid JSON") from exc
+        if not isinstance(payload, Mapping):
+            raise ReleaseError("activation probe output is not a JSON object")
+        expected_fields = {
+            "schema",
+            "release_id",
+            "module_path",
+            "package_path",
+            "managed_root",
+            "bin_dir",
+            "python_executable",
+            "bootstrap_base64",
+            "bootstrap_sha256",
+            "bootstrap_size",
+            "launcher_base64",
+            "launcher_sha256",
+            "launcher_size",
+        }
+        if set(payload) != expected_fields:
+            raise ReleaseError("activation probe fields differ from the closed contract")
+        canonical_output = json.dumps(
+            dict(payload),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if output != canonical_output:
+            raise ReleaseError("activation probe output is not canonical JSON")
+        expected_identity = {
+            "schema": _ACTIVATION_PROBE_SCHEMA,
+            "release_id": release_id,
+            "module_path": expected_module,
+            "package_path": expected_package,
+            "managed_root": str(layout.root),
+            "bin_dir": str(layout.bin_dir),
+            "python_executable": str(resolved_interpreter),
+        }
+        for key, expected in expected_identity.items():
+            if payload.get(key) != expected:
+                raise ReleaseError(f"activation probe {key} does not match the target")
+        bootstrap = _decode_activation_probe_source(payload, label="bootstrap")
+        launcher = _decode_activation_probe_source(payload, label="launcher")
+        return _activation_bundle(
+            bootstrap,
+            launcher,
+            origin="selected-release",
+        )
+
+
+def _verified_release_activation_bundle(
+    layout: ReleaseLayout,
+    release_id: str,
+    interpreter: Path,
+) -> _ActivationBundle:
+    _verify_release_dir(layout, release_id)
+    return _derive_release_activation_bundle(layout, release_id, interpreter)
+
+
 def _backup_legacy_launcher(layout: ReleaseLayout) -> dict[str, object] | None:
     if not _path_lexists(layout.launcher_path):
         return None
@@ -1911,25 +2564,32 @@ def install_release(
                     "an existing managed root cannot change its stable launcher path"
                 )
 
-        expected_launcher = _launcher_source(layout, interpreter)
-        expected_launcher_hash = sha256_bytes(expected_launcher)
-        expected_bootstrap = _bootstrap_source(layout, interpreter)
-        expected_bootstrap_hash = sha256_bytes(expected_bootstrap)
+        current_activation = _current_activation_bundle(layout, interpreter)
+        expected_launcher = current_activation.launcher
+        expected_launcher_hash = current_activation.launcher_sha256
+        expected_bootstrap = current_activation.bootstrap
+        expected_bootstrap_hash = current_activation.bootstrap_sha256
         legacy = state.get("legacy_launcher")
+        prior_activation = (
+            _state_activation_bundle(
+                layout,
+                state,
+                interpreter,
+                verify_selected_release=False,
+            )
+            if current is not None
+            else None
+        )
         existing_hash = _optional_regular_hash(
             layout.launcher_path,
             label="t1000 launcher",
             executable=True,
         )
-        recorded_launcher_hash = (
-            str(state.get("launcher_sha256")) if current is not None else None
-        )
-        allowed_existing = {
-            None,
-            expected_launcher_hash,
-            recorded_launcher_hash,
-            str(legacy.get("sha256")) if isinstance(legacy, Mapping) else None,
-        }
+        allowed_existing = {None, expected_launcher_hash}
+        if prior_activation is not None:
+            allowed_existing.add(prior_activation.launcher_sha256)
+        elif isinstance(legacy, Mapping):
+            allowed_existing.add(str(legacy.get("sha256")))
         if current is not None and existing_hash not in allowed_existing:
             raise ReleaseError("managed t1000 launcher changed outside the release manager")
 
@@ -1963,12 +2623,11 @@ def install_release(
             label="t1000 launcher",
             executable=True,
         )
-        allowed_prior = {
-            None,
-            expected_launcher_hash,
-            recorded_launcher_hash,
-            str(legacy.get("sha256")) if isinstance(legacy, Mapping) else None,
-        }
+        allowed_prior = {None, expected_launcher_hash}
+        if prior_activation is not None:
+            allowed_prior.add(prior_activation.launcher_sha256)
+        elif isinstance(legacy, Mapping):
+            allowed_prior.add(str(legacy.get("sha256")))
         if current_launcher_hash not in allowed_prior:
             raise ReleaseError("t1000 launcher changed before atomic publication")
 
@@ -2150,6 +2809,23 @@ def rollback_release(
         if target == current:
             raise ReleaseError("rollback target is already current")
         _verify_release_dir(layout, target)
+        interpreter = Path(str(state.get("python_executable", "")))
+        _regular_file_hash(
+            interpreter,
+            label="managed Python interpreter",
+            executable=True,
+        )
+        try:
+            resolved_interpreter = interpreter.resolve(strict=True)
+        except OSError as exc:
+            raise ReleaseError(f"could not resolve managed Python interpreter: {exc}") from exc
+        if str(resolved_interpreter) != str(state.get("python_executable")):
+            raise ReleaseError("managed Python interpreter path is not canonical")
+        target_activation = _derive_release_activation_bundle(
+            layout,
+            target,
+            resolved_interpreter,
+        )
         manifest_hash = _regular_file_hash(
             layout.releases_dir / target / "manifest.json",
             label="rollback target manifest",
@@ -2161,10 +2837,10 @@ def rollback_release(
                 "current_release_id": target,
                 "previous_release_id": current,
                 "manifest_sha256": manifest_hash,
-                "python_executable": state.get("python_executable"),
-                "bootstrap_sha256": state.get("bootstrap_sha256"),
-                "launcher_path": state.get("launcher_path"),
-                "launcher_sha256": state.get("launcher_sha256"),
+                "python_executable": str(resolved_interpreter),
+                "bootstrap_sha256": target_activation.bootstrap_sha256,
+                "launcher_path": str(layout.launcher_path),
+                "launcher_sha256": target_activation.launcher_sha256,
                 "legacy_launcher": state.get("legacy_launcher"),
             }
         )
@@ -2175,16 +2851,33 @@ def rollback_release(
             observed = load_managed_state(layout)
             if observed != new_state:
                 raise ReleaseError("published managed rollback state differs from transaction")
-            _verify_managed_activation(layout, observed, verify_release=True)
+            _verify_managed_activation(
+                layout,
+                observed,
+                verify_release=True,
+                expected_activation=target_activation,
+            )
 
         _publish_files_transactionally(
             [
+                (
+                    layout.bootstrap_path,
+                    target_activation.bootstrap,
+                    0o755,
+                    "managed bootstrap",
+                ),
                 (
                     layout.state_path,
                     canonical_json_bytes(new_state),
                     0o600,
                     "managed state",
-                )
+                ),
+                (
+                    layout.launcher_path,
+                    target_activation.launcher,
+                    0o755,
+                    "t1000 launcher",
+                ),
             ],
             verify=verify_managed_publication,
         )
@@ -2194,6 +2887,7 @@ def rollback_release(
             "release_id": target,
             "previous_release_id": current,
             "state_generation": new_state["generation"],
+            "activation_origin": target_activation.origin,
             "live_processes_restarted": False,
         }
 
@@ -2203,8 +2897,15 @@ def _verify_managed_activation(
     state: Mapping[str, object],
     *,
     verify_release: bool,
+    expected_activation: _ActivationBundle | None = None,
 ) -> dict[str, object]:
-    """Verify the launcher/bootstrap/interpreter and selected release as one unit."""
+    """Verify the launcher/bootstrap/interpreter and selected release as one unit.
+
+    A normal installation must match the current release-manager templates. A
+    cross-version rollback may instead match the exact templates deterministically
+    derived from the selected, fully verified release. State-recorded hashes are
+    never accepted as their own authority.
+    """
 
     configured_launcher = Path(str(state.get("launcher_path", "")))
     if configured_launcher != layout.launcher_path:
@@ -2236,23 +2937,23 @@ def _verify_managed_activation(
     if str(resolved_interpreter) != str(state.get("python_executable")):
         raise ReleaseError("managed Python interpreter path is not canonical")
 
-    expected_bootstrap_hash = sha256_bytes(
-        _bootstrap_source(layout, resolved_interpreter)
+    activation = _state_activation_bundle(
+        layout,
+        state,
+        resolved_interpreter,
+        expected_activation=expected_activation,
+        verify_selected_release=verify_release,
     )
-    expected_launcher_hash = sha256_bytes(
-        _launcher_source(layout, resolved_interpreter)
-    )
-    if state.get("bootstrap_sha256") != expected_bootstrap_hash:
-        raise ReleaseError("managed state names a non-canonical bootstrap identity")
-    if state.get("launcher_sha256") != expected_launcher_hash:
-        raise ReleaseError("managed state names a non-canonical launcher identity")
+
     bootstrap_hash = _regular_file_hash(
         layout.bootstrap_path,
         label="managed bootstrap",
         executable=True,
     )
-    if bootstrap_hash != expected_bootstrap_hash:
+    if bootstrap_hash != activation.bootstrap_sha256:
         raise ReleaseError("managed bootstrap SHA-256 does not match state.json")
+    if launcher_hash != activation.launcher_sha256:
+        raise ReleaseError("managed launcher SHA-256 does not match canonical activation")
 
     manifest_path = layout.releases_dir / current / "manifest.json"
     manifest_hash = _regular_file_hash(manifest_path, label="managed release manifest")
@@ -2271,6 +2972,7 @@ def _verify_managed_activation(
         "python_executable": str(resolved_interpreter),
         "bootstrap_sha256": bootstrap_hash,
         "launcher_sha256": launcher_hash,
+        "activation_origin": activation.origin,
         "release": release,
         "legacy": False,
     }

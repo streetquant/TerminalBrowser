@@ -31,7 +31,7 @@ An adversarial verifier later inserted the installed `site` directory into `sys.
 
 - Managed-GUI discovery recognizes the prior exact `[python, -I, bootstrap]` prefix and the new canonical `[python, -I, -B, bootstrap]` prefix. Each record reports `legacy-isolated` or `isolated-no-bytecode` as a redaction-safe launch profile.
 - The scanner still requires canonical interpreter and bootstrap paths, matching `/proc/<pid>/exe`, Linux boot ID, PID start ticks, UID, repeated cmdline stability, and an exact supported GUI tail.
-- A launcher template upgrade is accepted only when the current launcher bytes match the SHA-256 already recorded in canonical managed state. A different unrecorded launcher remains an outside-tamper failure.
+- A launcher or bootstrap template upgrade is accepted only when its state identity is authenticated against executable code: either the current source template or exact bytes derived from the selected immutable release wheel. State-recorded hashes are evidence to verify, never authority by themselves.
 
 ### Custom managed installs retain their launcher directory
 
@@ -39,6 +39,15 @@ An adversarial verifier later inserted the installed `site` directory into `sys.
 - Runtime layout selection now has one explicit order: a supplied `bin_dir`, then a non-empty `T1000_MANAGED_BIN_DIR`, then the unchanged `~/.local/bin` default.
 - The bootstrap does not trust an inherited value. Only after validating canonical state, the launcher path, launcher bytes, and state stability does it overwrite `T1000_MANAGED_BIN_DIR` with the verified launcher's parent before importing the CLI.
 - Custom launchers can therefore run `release info --verify`, process inventory, rollback, and related managed commands without repeating `--bin-dir`; explicit API or CLI arguments still override the runtime default.
+
+### Rollback selects one complete activation bundle
+
+- Real promotion replay proved that changing only `current_release_id` was not a complete cross-version rollback. The selected 0.2.11 application started and reported its version, but its own `release info --verify` rejected the still-newer 0.2.13 bootstrap and launcher hashes.
+- A managed generation is now treated as `(release tree, bootstrap bytes, launcher bytes, interpreter, state)`. Rollback derives the target version's deterministic bootstrap and launcher from its verified wheel under `-I -B`, then publishes bootstrap, canonical state, and launcher in one rollback-capable transaction.
+- The historical wheel is read through an `openat`/`O_NOFOLLOW` chain rooted at the managed installation. The release and artifacts directories must be real direct children; the manifest and wheel must be read-only, single-link, canonical, and hash/size consistent. The possibly contaminated extracted site is not trusted for recovery.
+- Probe bytes are copied into a private `0700` directory, reverified, and imported only from that copy. Stdout, stderr, elapsed time, and the complete process group are bounded while the probe runs. Symlink redirection, malformed or oversized output, inherited-pipe descendants, timeout, and output overflow fail closed.
+- Install authenticates an existing activation against the current template or the selected immutable wheel before repairing missing or damaged bootstrap/launcher files. An arbitrary pair of hashes written into state cannot authorize its own replacement.
+- Reinstalling a newer release after rollback upgrades the authenticated historical activation back to the current `-I -B` templates. Failure during any bootstrap, state, launcher, or post-publication verification write restores every preimage.
 
 ### Regression coverage
 

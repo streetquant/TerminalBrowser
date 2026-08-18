@@ -529,9 +529,18 @@ def test_atomic_install_upgrade_rollback_idempotence_and_legacy_restore(tmp_path
     assert verify_installed_tree(root / "releases" / str(manifest_a["release_id"]))["ok"]
     assert verify_installed_tree(root / "releases" / str(manifest_b["release_id"]))["ok"]
 
-    rolled = rollback_release(root=root, bin_dir=bin_dir)
+    python = Path(str(state["python_executable"]))
+    target = target_activation_bundle(layout, python)
+    with mock.patch(
+        "termdeck.release_manager._derive_release_activation_bundle",
+        return_value=target,
+    ):
+        rolled = rollback_release(root=root, bin_dir=bin_dir)
     assert rolled["release_id"] == manifest_a["release_id"]
-    with mock.patch("termdeck.release_manager._verify_staged_import"):
+    with mock.patch(
+        "termdeck.release_manager._derive_release_activation_bundle",
+        return_value=target,
+    ), mock.patch("termdeck.release_manager._verify_staged_import"):
         idempotent = install_release(wheel_a, manifest_a_path, root=root, bin_dir=bin_dir)
     assert idempotent["idempotent"] is True
 
@@ -557,7 +566,7 @@ def test_install_refuses_external_launcher_change(tmp_path: Path) -> None:
         install_release(wheel_b, manifest_b_path, root=root, bin_dir=bin_dir)
 
 
-def test_install_upgrades_launcher_from_hash_recorded_in_managed_state(
+def test_install_upgrades_verified_selected_release_activation(
     tmp_path: Path,
 ) -> None:
     wheel_a, manifest_a_path, _ = artifact(tmp_path, "a", version="0.2.12")
@@ -569,16 +578,19 @@ def test_install_upgrades_launcher_from_hash_recorded_in_managed_state(
     layout = release_layout(root=root, bin_dir=bin_dir)
     state = load_managed_state(layout)
     python = Path(str(state["python_executable"]))
-    prior_launcher = (
-        "#!/bin/sh\nset -eu\n"
-        f'exec {python} -I {layout.bootstrap_path} "$@"\n'
-    ).encode("utf-8")
-    layout.launcher_path.write_bytes(prior_launcher)
+    prior = target_activation_bundle(layout, python, label="selected-release")
+    layout.bootstrap_path.write_bytes(prior.bootstrap)
+    layout.bootstrap_path.chmod(0o755)
+    layout.launcher_path.write_bytes(prior.launcher)
     layout.launcher_path.chmod(0o755)
-    state["launcher_sha256"] = sha256_bytes(prior_launcher)
+    state["bootstrap_sha256"] = prior.bootstrap_sha256
+    state["launcher_sha256"] = prior.launcher_sha256
     layout.state_path.write_bytes(canonical_json_bytes(validate_managed_state(state)))
 
-    with mock.patch("termdeck.release_manager._verify_staged_import"):
+    with mock.patch(
+        "termdeck.release_manager._derive_release_activation_bundle",
+        return_value=prior,
+    ), mock.patch("termdeck.release_manager._verify_staged_import"):
         upgraded = install_release(
             wheel_b,
             manifest_b_path,
@@ -588,11 +600,544 @@ def test_install_upgrades_launcher_from_hash_recorded_in_managed_state(
 
     assert upgraded["repaired"] is True
     assert upgraded["release_id"] != state["current_release_id"]
+    assert layout.bootstrap_path.read_bytes() == _bootstrap_source(layout, python)
     assert layout.launcher_path.read_bytes() == _launcher_source(layout, python)
-    assert load_managed_state(layout)["launcher_sha256"] == sha256_bytes(
+    repaired = load_managed_state(layout)
+    assert repaired["bootstrap_sha256"] == sha256_bytes(_bootstrap_source(layout, python))
+    assert repaired["launcher_sha256"] == sha256_bytes(_launcher_source(layout, python))
+    thaw_directories(root / "releases" / str(upgraded["release_id"]))
+
+
+def target_activation_bundle(
+    layout: object,
+    python: Path,
+    *,
+    label: str = "target",
+) -> object:
+    bootstrap = (
+        f"#!/usr/bin/{python.name}\n# {label} bootstrap for {layout.root}\n"
+    ).encode("utf-8")
+    launcher = (
+        "#!/bin/sh\nset -eu\n"
+        f'exec {python} -I {layout.bootstrap_path} "$@"\n'
+        f"# {label}\n"
+    ).encode("utf-8")
+    return release_manager._ActivationBundle(
+        bootstrap=bootstrap,
+        launcher=launcher,
+        bootstrap_sha256=sha256_bytes(bootstrap),
+        launcher_sha256=sha256_bytes(launcher),
+        origin="selected-release",
+    )
+
+
+def test_install_rejects_arbitrary_state_recorded_historical_activation(
+    tmp_path: Path,
+) -> None:
+    wheel_a, manifest_a_path, _ = artifact(tmp_path, "a", version="0.2.12")
+    wheel_b, manifest_b_path, _ = artifact(tmp_path, "b", version="0.2.13")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel_a, manifest_a_path, root=root, bin_dir=bin_dir)
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    state = load_managed_state(layout)
+    python = Path(str(state["python_executable"]))
+    canonical = target_activation_bundle(layout, python, label="canonical-selected")
+    arbitrary = target_activation_bundle(layout, python, label="arbitrary-recorded")
+    layout.bootstrap_path.write_bytes(arbitrary.bootstrap)
+    layout.bootstrap_path.chmod(0o755)
+    layout.launcher_path.write_bytes(arbitrary.launcher)
+    layout.launcher_path.chmod(0o755)
+    state["bootstrap_sha256"] = arbitrary.bootstrap_sha256
+    state["launcher_sha256"] = arbitrary.launcher_sha256
+    state_bytes = canonical_json_bytes(validate_managed_state(state))
+    layout.state_path.write_bytes(state_bytes)
+
+    with mock.patch(
+        "termdeck.release_manager._derive_release_activation_bundle",
+        return_value=canonical,
+    ), mock.patch("termdeck.release_manager._verify_staged_import"), pytest.raises(
+        ReleaseError,
+        match="non-canonical|selected release",
+    ):
+        install_release(
+            wheel_b,
+            manifest_b_path,
+            root=root,
+            bin_dir=bin_dir,
+        )
+
+    assert layout.state_path.read_bytes() == state_bytes
+    assert layout.bootstrap_path.read_bytes() == arbitrary.bootstrap
+    assert layout.launcher_path.read_bytes() == arbitrary.launcher
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["bootstrap-missing", "bootstrap-tampered", "launcher-missing"],
+)
+def test_install_repairs_damaged_files_from_authenticated_historical_state(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    wheel_a, manifest_a_path, _ = artifact(tmp_path, "a", version="0.2.12")
+    wheel_b, manifest_b_path, _ = artifact(tmp_path, "b", version="0.2.13")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel_a, manifest_a_path, root=root, bin_dir=bin_dir)
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    state = load_managed_state(layout)
+    python = Path(str(state["python_executable"]))
+    prior = target_activation_bundle(layout, python, label="authenticated-historical")
+    layout.bootstrap_path.write_bytes(prior.bootstrap)
+    layout.bootstrap_path.chmod(0o755)
+    layout.launcher_path.write_bytes(prior.launcher)
+    layout.launcher_path.chmod(0o755)
+    state["bootstrap_sha256"] = prior.bootstrap_sha256
+    state["launcher_sha256"] = prior.launcher_sha256
+    layout.state_path.write_bytes(canonical_json_bytes(validate_managed_state(state)))
+    if damage == "bootstrap-missing":
+        layout.bootstrap_path.unlink()
+    elif damage == "bootstrap-tampered":
+        layout.bootstrap_path.write_bytes(b"#!/bin/sh\n# damaged bootstrap\n")
+        layout.bootstrap_path.chmod(0o755)
+    else:
+        layout.launcher_path.unlink()
+
+    with mock.patch(
+        "termdeck.release_manager._derive_release_activation_bundle",
+        return_value=prior,
+    ), mock.patch("termdeck.release_manager._verify_staged_import"):
+        repaired = install_release(
+            wheel_b,
+            manifest_b_path,
+            root=root,
+            bin_dir=bin_dir,
+        )
+
+    assert repaired["repaired"] is True
+    assert layout.bootstrap_path.read_bytes() == _bootstrap_source(layout, python)
+    assert layout.launcher_path.read_bytes() == _launcher_source(layout, python)
+    current = load_managed_state(layout)
+    assert current["bootstrap_sha256"] == sha256_bytes(_bootstrap_source(layout, python))
+    assert current["launcher_sha256"] == sha256_bytes(_launcher_source(layout, python))
+
+
+def test_install_authenticates_historical_activation_from_wheel_not_extracted_site(
+    tmp_path: Path,
+) -> None:
+    wheel_a, manifest_a_path, _ = artifact(tmp_path, "a", version="0.2.12")
+    wheel_b, manifest_b_path, _ = artifact(tmp_path, "b", version="0.2.13")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel_a, manifest_a_path, root=root, bin_dir=bin_dir)
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    state = load_managed_state(layout)
+    python = Path(str(state["python_executable"]))
+    prior = target_activation_bundle(layout, python, label="wheel-authority")
+    layout.bootstrap_path.write_bytes(prior.bootstrap)
+    layout.bootstrap_path.chmod(0o755)
+    layout.launcher_path.write_bytes(prior.launcher)
+    layout.launcher_path.chmod(0o755)
+    state["bootstrap_sha256"] = prior.bootstrap_sha256
+    state["launcher_sha256"] = prior.launcher_sha256
+    layout.state_path.write_bytes(canonical_json_bytes(validate_managed_state(state)))
+    release_dir = root / "releases" / str(state["current_release_id"])
+    contamination = release_dir / "site" / "termdeck" / "unexpected.py"
+    contamination.write_text("unexpected = True\n", encoding="utf-8")
+
+    with mock.patch(
+        "termdeck.release_manager._derive_release_activation_bundle",
+        return_value=prior,
+    ) as derive, mock.patch("termdeck.release_manager._verify_staged_import"):
+        installed = install_release(
+            wheel_b,
+            manifest_b_path,
+            root=root,
+            bin_dir=bin_dir,
+        )
+
+    derive.assert_called_once_with(layout, str(state["current_release_id"]), python)
+    assert installed["ok"] is True
+    assert contamination.exists()
+
+
+@pytest.mark.parametrize("linked_component", ["release", "artifacts"])
+def test_selected_release_activation_rejects_symlinked_artifact_container(
+    tmp_path: Path,
+    linked_component: str,
+) -> None:
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    external = tmp_path / "external-release"
+    artifacts = external / "artifacts"
+    wheel = artifacts / f"t1000-{VERSION}-py3-none-any.whl"
+    manager_source = (
+        "from pathlib import Path\n"
+        "class Layout:\n"
+        "    def __init__(self, root, bin_dir):\n"
+        "        self.root = Path(root).absolute()\n"
+        "        self.bin_dir = Path(bin_dir).absolute()\n"
+        "        self.bootstrap_path = self.root / 'bootstrap.py'\n"
+        "def release_layout(*, root=None, bin_dir=None):\n"
+        "    return Layout(root, bin_dir)\n"
+        "def _bootstrap_source(layout, python):\n"
+        "    return f'BOOT:{layout.root}:{layout.bin_dir}:{python}'.encode()\n"
+        "def _launcher_source(layout, python):\n"
+        "    return f'LAUNCH:{layout.bootstrap_path}:{python}'.encode()\n"
+    ).encode("utf-8")
+    info = write_wheel(
+        wheel,
+        seed="d",
+        extra_members={"termdeck/release_manager.py": manager_source},
+    )
+    manifest_path = external / "manifest.json"
+    manifest = write_manifest(manifest_path, wheel, info)
+    wheel.chmod(0o444)
+    manifest_path.chmod(0o444)
+    release_id = str(manifest["release_id"])
+    layout.releases_dir.mkdir(parents=True)
+    selected = layout.releases_dir / release_id
+    if linked_component == "release":
+        selected.symlink_to(external, target_is_directory=True)
+    else:
+        selected.mkdir()
+        shutil.copyfile(manifest_path, selected / "manifest.json")
+        (selected / "manifest.json").chmod(0o444)
+        (selected / "artifacts").symlink_to(artifacts, target_is_directory=True)
+
+    with pytest.raises(ReleaseError, match="real directory|symlink|unsafe"):
+        release_manager._derive_release_activation_bundle(
+            layout,
+            release_id,
+            Path(sys.executable).resolve(strict=True),
+        )
+
+
+@pytest.mark.parametrize(
+    ("stream", "program", "message"),
+    [
+        ("stdout", "import os; os.write(1, b'x' * 4096)", "stdout"),
+        ("stderr", "import os; os.write(2, b'x' * 4096)", "stderr"),
+    ],
+)
+def test_bounded_process_runner_terminates_output_overflow(
+    tmp_path: Path,
+    stream: str,
+    program: str,
+    message: str,
+) -> None:
+    with pytest.raises(ReleaseError, match=message):
+        release_manager._run_bounded_output(
+            [str(Path(sys.executable).resolve()), "-I", "-B", "-c", program],
+            cwd=tmp_path,
+            env={"PYTHONDONTWRITEBYTECODE": "1"},
+            timeout=5.0,
+            stdout_limit=128,
+            stderr_limit=128,
+        )
+
+
+def test_bounded_process_runner_kills_descendant_after_group_leader_exits(
+    tmp_path: Path,
+) -> None:
+    pid_path = tmp_path / "descendant.pid"
+    descendant = (
+        "import os,sys,time; "
+        "open(sys.argv[1], 'w').write(str(os.getpid())); "
+        "sys.stdout.flush(); time.sleep(30)"
+    )
+    leader = (
+        "import subprocess,sys; "
+        "subprocess.Popen([sys.executable, '-I', '-B', '-c', sys.argv[1], sys.argv[2]]); "
+        "raise SystemExit(0)"
+    )
+    descendant_pid: int | None = None
+    try:
+        with pytest.raises(ReleaseError, match="timed out"):
+            release_manager._run_bounded_output(
+                [
+                    str(Path(sys.executable).resolve()),
+                    "-I",
+                    "-B",
+                    "-c",
+                    leader,
+                    descendant,
+                    str(pid_path),
+                ],
+                cwd=tmp_path,
+                env={"PYTHONDONTWRITEBYTECODE": "1"},
+                timeout=0.2,
+                stdout_limit=128,
+                stderr_limit=128,
+            )
+        for _ in range(100):
+            if pid_path.exists() and pid_path.read_text(encoding="ascii").strip():
+                descendant_pid = int(pid_path.read_text(encoding="ascii").strip())
+                break
+            time.sleep(0.01)
+        assert descendant_pid is not None
+        for _ in range(100):
+            if not (Path("/proc") / str(descendant_pid)).exists():
+                break
+            time.sleep(0.01)
+        assert not (Path("/proc") / str(descendant_pid)).exists()
+    finally:
+        if descendant_pid is not None and (Path("/proc") / str(descendant_pid)).exists():
+            try:
+                os.kill(descendant_pid, 9)
+            except ProcessLookupError:
+                pass
+
+
+def test_bounded_process_runner_returns_exact_bytes_and_times_out(tmp_path: Path) -> None:
+    completed = release_manager._run_bounded_output(
+        [
+            str(Path(sys.executable).resolve()),
+            "-I",
+            "-B",
+            "-c",
+            "import os; os.write(1,b'out'); os.write(2,b'err')",
+        ],
+        cwd=tmp_path,
+        env={"PYTHONDONTWRITEBYTECODE": "1"},
+        timeout=5.0,
+        stdout_limit=128,
+        stderr_limit=128,
+    )
+    assert completed.returncode == 0
+    assert completed.stdout == b"out"
+    assert completed.stderr == b"err"
+    with pytest.raises(ReleaseError, match="timed out"):
+        release_manager._run_bounded_output(
+            [
+                str(Path(sys.executable).resolve()),
+                "-I",
+                "-B",
+                "-c",
+                "import time; time.sleep(5)",
+            ],
+            cwd=tmp_path,
+            env={"PYTHONDONTWRITEBYTECODE": "1"},
+            timeout=0.05,
+            stdout_limit=128,
+            stderr_limit=128,
+        )
+
+
+def test_selected_release_activation_derivation_is_isolated_and_path_bound(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    target_source = (
+        "from pathlib import Path\n"
+        "class Layout:\n"
+        "    def __init__(self, root, bin_dir):\n"
+        "        self.root = Path(root).absolute()\n"
+        "        self.bin_dir = Path(bin_dir).absolute()\n"
+        "        self.bootstrap_path = self.root / 'bootstrap.py'\n"
+        "def release_layout(*, root=None, bin_dir=None):\n"
+        "    return Layout(root, bin_dir)\n"
+        "def _bootstrap_source(layout, python):\n"
+        "    return f'BOOT:{layout.root}:{layout.bin_dir}:{python}'.encode()\n"
+        "def _launcher_source(layout, python):\n"
+        "    return f'LAUNCH:{layout.bootstrap_path}:{python}'.encode()\n"
+    ).encode("utf-8")
+    wheel = tmp_path / "target" / WHEEL_NAME
+    info = write_wheel(
+        wheel,
+        extra_members={"termdeck/release_manager.py": target_source},
+    )
+    manifest_source = wheel.with_suffix(".release.json")
+    manifest = write_manifest(manifest_source, wheel, info)
+    release_id = str(manifest["release_id"])
+    release_dir = root / "releases" / release_id
+    artifacts = release_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    installed_wheel = artifacts / wheel.name
+    shutil.copyfile(wheel, installed_wheel)
+    installed_wheel.chmod(0o444)
+    installed_manifest = release_dir / "manifest.json"
+    shutil.copyfile(manifest_source, installed_manifest)
+    installed_manifest.chmod(0o444)
+    python = Path(sys.executable).resolve(strict=True)
+
+    bundle = release_manager._derive_release_activation_bundle(
+        layout,
+        release_id,
+        python,
+    )
+
+    assert bundle.origin == "selected-release"
+    assert bundle.bootstrap == f"BOOT:{layout.root}:{layout.bin_dir}:{python}".encode()
+    assert bundle.launcher == f"LAUNCH:{layout.bootstrap_path}:{python}".encode()
+    assert bundle.bootstrap_sha256 == sha256_bytes(bundle.bootstrap)
+    assert bundle.launcher_sha256 == sha256_bytes(bundle.launcher)
+    assert list(release_dir.rglob("*.pyc")) == []
+    assert list(release_dir.rglob("__pycache__")) == []
+
+
+def test_managed_rollback_publishes_target_activation_and_reinstall_repairs_it(
+    tmp_path: Path,
+) -> None:
+    wheel_a, manifest_a_path, manifest_a = artifact(tmp_path, "a")
+    wheel_b, manifest_b_path, manifest_b = artifact(tmp_path, "b")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel_a, manifest_a_path, root=root, bin_dir=bin_dir)
+        install_release(wheel_b, manifest_b_path, root=root, bin_dir=bin_dir)
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    python = Path(str(load_managed_state(layout)["python_executable"]))
+    target = target_activation_bundle(layout, python)
+
+    with mock.patch(
+        "termdeck.release_manager._derive_release_activation_bundle",
+        return_value=target,
+    ):
+        rolled = rollback_release(
+            root=root,
+            bin_dir=bin_dir,
+            release_id=str(manifest_a["release_id"]),
+        )
+
+    state = load_managed_state(layout)
+    assert rolled["release_id"] == manifest_a["release_id"]
+    assert rolled["activation_origin"] == "selected-release"
+    assert state["current_release_id"] == manifest_a["release_id"]
+    assert state["previous_release_id"] == manifest_b["release_id"]
+    assert state["bootstrap_sha256"] == target.bootstrap_sha256
+    assert state["launcher_sha256"] == target.launcher_sha256
+    assert layout.bootstrap_path.read_bytes() == target.bootstrap
+    assert layout.launcher_path.read_bytes() == target.launcher
+
+    with mock.patch(
+        "termdeck.release_manager._derive_release_activation_bundle",
+        return_value=target,
+    ), mock.patch("termdeck.release_manager._verify_staged_import"):
+        reinstalled = install_release(
+            wheel_b,
+            manifest_b_path,
+            root=root,
+            bin_dir=bin_dir,
+        )
+    repaired_state = load_managed_state(layout)
+    assert reinstalled["release_id"] == manifest_b["release_id"]
+    assert reinstalled["repaired"] is True
+    assert layout.bootstrap_path.read_bytes() == _bootstrap_source(layout, python)
+    assert layout.launcher_path.read_bytes() == _launcher_source(layout, python)
+    assert repaired_state["bootstrap_sha256"] == sha256_bytes(
+        _bootstrap_source(layout, python)
+    )
+    assert repaired_state["launcher_sha256"] == sha256_bytes(
         _launcher_source(layout, python)
     )
-    thaw_directories(root / "releases" / str(upgraded["release_id"]))
+
+
+@pytest.mark.parametrize("failure_target", ["bootstrap", "state", "launcher", "verify"])
+def test_managed_rollback_failure_restores_complete_activation_preimage(
+    tmp_path: Path,
+    failure_target: str,
+) -> None:
+    wheel_a, manifest_a_path, manifest_a = artifact(tmp_path, "a")
+    wheel_b, manifest_b_path, manifest_b = artifact(tmp_path, "b")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel_a, manifest_a_path, root=root, bin_dir=bin_dir)
+        install_release(wheel_b, manifest_b_path, root=root, bin_dir=bin_dir)
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    state_before = layout.state_path.read_bytes()
+    bootstrap_before = layout.bootstrap_path.read_bytes()
+    launcher_before = layout.launcher_path.read_bytes()
+    python = Path(str(load_managed_state(layout)["python_executable"]))
+    target = target_activation_bundle(layout, python)
+    real_atomic = _atomic_write_bytes
+    failed = False
+    target_path = {
+        "bootstrap": layout.bootstrap_path,
+        "state": layout.state_path,
+        "launcher": layout.launcher_path,
+    }.get(failure_target)
+
+    def fail_once(path: Path, content: bytes, *, mode: int = 0o644) -> None:
+        nonlocal failed
+        if target_path is not None and Path(path) == target_path and not failed:
+            failed = True
+            raise OSError(f"simulated managed rollback {failure_target} failure")
+        real_atomic(Path(path), content, mode=mode)
+
+    verification = (
+        mock.patch(
+            "termdeck.release_manager._verify_managed_activation",
+            side_effect=ReleaseError("simulated managed rollback verification failure"),
+        )
+        if failure_target == "verify"
+        else nullcontext()
+    )
+    with mock.patch(
+        "termdeck.release_manager._derive_release_activation_bundle",
+        return_value=target,
+    ), mock.patch(
+        "termdeck.release_manager._atomic_write_bytes",
+        side_effect=fail_once,
+    ), verification, pytest.raises(ReleaseError, match="rolled back"):
+        rollback_release(
+            root=root,
+            bin_dir=bin_dir,
+            release_id=str(manifest_a["release_id"]),
+        )
+
+    assert layout.state_path.read_bytes() == state_before
+    assert layout.bootstrap_path.read_bytes() == bootstrap_before
+    assert layout.launcher_path.read_bytes() == launcher_before
+    state = load_managed_state(layout)
+    assert state["current_release_id"] == manifest_b["release_id"]
+    assert state["previous_release_id"] == manifest_a["release_id"]
+
+
+def test_managed_activation_accepts_only_exact_selected_release_bundle(
+    tmp_path: Path,
+) -> None:
+    wheel, manifest_path, _manifest = artifact(tmp_path, "a")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel, manifest_path, root=root, bin_dir=bin_dir)
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    state = load_managed_state(layout)
+    python = Path(str(state["python_executable"]))
+    target = target_activation_bundle(layout, python)
+    layout.bootstrap_path.write_bytes(target.bootstrap)
+    layout.bootstrap_path.chmod(0o755)
+    layout.launcher_path.write_bytes(target.launcher)
+    layout.launcher_path.chmod(0o755)
+    state["bootstrap_sha256"] = target.bootstrap_sha256
+    state["launcher_sha256"] = target.launcher_sha256
+    layout.state_path.write_bytes(canonical_json_bytes(validate_managed_state(state)))
+
+    with mock.patch(
+        "termdeck.release_manager._verified_release_activation_bundle",
+        return_value=target,
+    ):
+        accepted = managed_release_status(root=root, bin_dir=bin_dir, verify=True)
+    assert accepted["ok"] is True
+    assert accepted["activation"]["activation_origin"] == "selected-release"
+
+    wrong = target_activation_bundle(layout, python, label="wrong")
+    with mock.patch(
+        "termdeck.release_manager._verified_release_activation_bundle",
+        return_value=wrong,
+    ):
+        rejected = managed_release_status(root=root, bin_dir=bin_dir, verify=True)
+    assert rejected["ok"] is False
+    assert "canonical bootstrap" in str(rejected["error"])
 
 
 def test_interrupted_state_publication_keeps_previous_release_selected(tmp_path: Path) -> None:
