@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.2.14
+
+This release supersedes 0.2.13 for deterministic promotion. The installed 0.2.13 runtime remains a verified rollback generation, but a fresh exact-source replay found that the wheel backend inherited the caller's `umask`: the same source and payload bytes produced central-directory file modes `0644` under `umask 022` and `0600` under `umask 077`. Because the wheel hash is part of the manifest and release ID, ambient process state changed the content-addressed production identity.
+
+### Release identity is independent of caller umask
+
+- Both backend builds run in an isolated `-I -B` child. That child alone applies `umask 022`; the controller and concurrent application threads never receive a process-global umask mutation.
+- Before the two-build comparison, the release manager parses the bounded single-disk ZIP central directory and canonicalizes every regular member to exact Unix `0644`, every directory member to exact Unix `0755`, creator system to Unix, and internal/low external attributes to zero.
+- The normalizer patches only central-directory metadata. It proves member payload hashes, compressed sizes and streams, local-header offsets, CRCs, timestamps, ordering, names, extra fields, comments, extraction requirements, and RECORD content are unchanged before atomically replacing the temporary wheel.
+- Empty, multi-disk, ZIP64-sentinel, commented, prefixed, trailing-data, truncated, malformed-signature, inconsistent-count, size, offset, or member-name archives fail closed before publication.
+
+### Strict new policy with historical rollback compatibility
+
+- Verification requires exact canonical metadata for 0.2.14 and later. Unknown future version syntax also receives the strict policy rather than silently opting out.
+- Retained real 0.2.11, 0.2.12, and 0.2.13 wheels use ordinary `0644` members and a generated RECORD member at `0664`. That narrow, version-gated legacy exception remains acceptance-only so those already verified generations continue to roll back safely. Every newly built 0.2.14 member is `0644`.
+- 0.2.13 is not rewritten or silently relabeled. 0.2.14 receives a new build, manifest, release ID, immutable release tree, and complete install/rollback/reinstall proof.
+
+### Regression boundary
+
+The repair is confined to release construction and archive verification. GTK/VTE rendering, raw tmux control framing, pane streaming, scrolling, selection, clipboard behavior, session restoration, Codex recovery, account switching, per-tab `CODEX_HOME`, SQLite semantics, and persistent tmux processes are unchanged.
+
 ## 0.2.13
 
 This release completes the installed-runtime hardening discovered during the 0.2.12 promotion. The terminal byte and tmux framing corrections remain unchanged. The new work makes the content-addressed release tree enforce its own immutability and preserves Python isolation and bytecode suppression across every launch and re-exec boundary.

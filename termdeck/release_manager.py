@@ -30,6 +30,7 @@ import shutil
 import signal
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -77,6 +78,17 @@ _RELEASE_VERSION_PREFIX = re.compile(
     r"^([0-9]+)\.([0-9]+)\.([0-9]+)(?:[A-Za-z0-9.+-].*)?$"
 )
 _FROZEN_RELEASE_MIN_VERSION = (0, 2, 13)
+_CANONICAL_WHEEL_METADATA_MIN_VERSION = (0, 2, 14)
+_ZIP_CENTRAL_SIGNATURE = b"PK\x01\x02"
+_ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
+_ZIP_CENTRAL_HEADER_BYTES = 46
+_ZIP_EOCD_BYTES = 22
+_ZIP_MAX_COMMENT_BYTES = 65_535
+_BUILD_RUNNER_SOURCE = (
+    "import os, runpy\n"
+    "os.umask(0o22)\n"
+    "runpy.run_module('build', run_name='__main__', alter_sys=True)\n"
+)
 _MANAGED_BIN_DIR_ENV = "T1000_MANAGED_BIN_DIR"
 _UUID = re.compile(
     r"(?<![0-9a-f])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])",
@@ -572,6 +584,203 @@ def _copy_snapshot(snapshot: SourceSnapshot, destination: Path) -> None:
     os.utime(destination, (epoch, epoch), follow_symlinks=False)
 
 
+def _wheel_eocd_offset(content: bytes) -> int:
+    """Locate one EOCD record that accounts for the exact archive length."""
+
+    if len(content) < _ZIP_EOCD_BYTES:
+        raise ReleaseError("built wheel has no complete end of central directory")
+    lower = max(0, len(content) - _ZIP_EOCD_BYTES - _ZIP_MAX_COMMENT_BYTES)
+    cursor = content.rfind(_ZIP_EOCD_SIGNATURE, lower)
+    while cursor >= 0:
+        if cursor + _ZIP_EOCD_BYTES <= len(content):
+            comment_length = struct.unpack_from("<H", content, cursor + 20)[0]
+            if cursor + _ZIP_EOCD_BYTES + comment_length == len(content):
+                return cursor
+        cursor = content.rfind(_ZIP_EOCD_SIGNATURE, lower, cursor)
+    raise ReleaseError("built wheel end of central directory is missing or has trailing bytes")
+
+
+def _canonical_wheel_external_attr(*, directory: bool) -> int:
+    mode = (stat.S_IFDIR | 0o755) if directory else (stat.S_IFREG | 0o644)
+    return (mode << 16) | (0x10 if directory else 0)
+
+
+def _wheel_unpatched_identity(info: zipfile.ZipInfo) -> tuple[object, ...]:
+    """Fields that central-directory permission normalization must preserve."""
+
+    return (
+        info.filename,
+        info.CRC,
+        info.file_size,
+        info.compress_size,
+        info.compress_type,
+        info.date_time,
+        info.header_offset,
+        info.flag_bits,
+        info.extra,
+        info.comment,
+        info.extract_version,
+        info.create_version,
+        info.volume,
+    )
+
+
+def _canonicalize_built_wheel_metadata(wheel_path: str | Path) -> None:
+    """Normalize only ZIP central metadata that can inherit caller umask.
+
+    Backend wheel payloads, compression streams, local headers, offsets, CRCs,
+    timestamps, ordering, and RECORD content remain byte-for-byte untouched.
+    The accepted build grammar is deliberately narrower than the general ZIP
+    reader: one disk, no ZIP64 sentinels, no comment/trailing bytes, and one
+    exact central-directory sequence.  Any malformed input fails before the
+    original temporary wheel is replaced.
+    """
+
+    wheel = Path(wheel_path).expanduser().absolute()
+    original = _read_regular_file_bytes(
+        wheel,
+        label="backend-built wheel",
+        maximum_bytes=_MAX_WHEEL_ARCHIVE_BYTES,
+    )
+    eocd = _wheel_eocd_offset(original)
+    (
+        disk_number,
+        central_disk,
+        entries_on_disk,
+        total_entries,
+        central_size,
+        central_offset,
+        comment_length,
+    ) = struct.unpack_from("<4H2IH", original, eocd + 4)
+    if comment_length != 0:
+        raise ReleaseError("backend-built wheel must not contain an archive comment")
+    if disk_number != 0 or central_disk != 0 or entries_on_disk != total_entries:
+        raise ReleaseError("backend-built wheel must use one complete ZIP disk")
+    if (
+        total_entries in {0, 0xFFFF}
+        or central_size == 0xFFFFFFFF
+        or central_offset == 0xFFFFFFFF
+    ):
+        raise ReleaseError("backend-built wheel uses unsupported empty or ZIP64 metadata")
+    if total_entries > _MAX_WHEEL_ENTRIES:
+        raise ReleaseError(f"backend-built wheel entry count is unsafe: {total_entries}")
+    if central_offset + central_size != eocd:
+        raise ReleaseError("backend-built wheel central-directory bounds are inconsistent")
+
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(original), "r")
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ReleaseError(f"could not open backend-built wheel: {exc}") from exc
+    with archive:
+        infos = _validate_wheel_members(archive)
+        if len(infos) != total_entries or archive.start_dir != central_offset:
+            raise ReleaseError("backend-built wheel central-directory count or offset disagrees")
+        if infos[0].header_offset != 0:
+            raise ReleaseError("backend-built wheel contains a noncanonical archive prefix")
+        before_identity = tuple(_wheel_unpatched_identity(info) for info in infos)
+
+    normalized = bytearray(original)
+    cursor = central_offset
+    changed_ranges: list[tuple[int, int]] = []
+    for info in infos:
+        if cursor + _ZIP_CENTRAL_HEADER_BYTES > eocd:
+            raise ReleaseError("backend-built wheel has a truncated central header")
+        if original[cursor : cursor + 4] != _ZIP_CENTRAL_SIGNATURE:
+            raise ReleaseError("backend-built wheel has a malformed central header signature")
+        extract_version = struct.unpack_from("<H", original, cursor + 6)[0]
+        flags = struct.unpack_from("<H", original, cursor + 8)[0]
+        compressed_size, uncompressed_size = struct.unpack_from(
+            "<II", original, cursor + 20
+        )
+        filename_length, extra_length, member_comment_length = struct.unpack_from(
+            "<HHH", original, cursor + 28
+        )
+        disk_start = struct.unpack_from("<H", original, cursor + 34)[0]
+        local_header_offset = struct.unpack_from("<I", original, cursor + 42)[0]
+        end = (
+            cursor
+            + _ZIP_CENTRAL_HEADER_BYTES
+            + filename_length
+            + extra_length
+            + member_comment_length
+        )
+        if end > eocd or filename_length == 0:
+            raise ReleaseError("backend-built wheel central member bounds are invalid")
+        if disk_start != 0:
+            raise ReleaseError("backend-built wheel member starts on another disk")
+        if (
+            extract_version >= 45
+            or compressed_size == 0xFFFFFFFF
+            or uncompressed_size == 0xFFFFFFFF
+            or local_header_offset == 0xFFFFFFFF
+        ):
+            raise ReleaseError("backend-built wheel member uses unsupported ZIP64 metadata")
+        raw_name = original[
+            cursor + _ZIP_CENTRAL_HEADER_BYTES :
+            cursor + _ZIP_CENTRAL_HEADER_BYTES + filename_length
+        ]
+        encoding = "utf-8" if flags & 0x800 else "cp437"
+        try:
+            decoded_name = raw_name.decode(encoding)
+        except UnicodeDecodeError as exc:
+            raise ReleaseError("backend-built wheel member name encoding is invalid") from exc
+        if decoded_name != info.filename:
+            raise ReleaseError("backend-built wheel central member ordering or name disagrees")
+        _safe_member_name(decoded_name)
+        made_by = struct.unpack_from("<H", original, cursor + 4)[0]
+        normalized_made_by = (3 << 8) | (made_by & 0xFF)
+        struct.pack_into("<H", normalized, cursor + 4, normalized_made_by)
+        struct.pack_into("<H", normalized, cursor + 36, 0)
+        struct.pack_into(
+            "<I",
+            normalized,
+            cursor + 38,
+            _canonical_wheel_external_attr(directory=info.is_dir()),
+        )
+        changed_ranges.extend(
+            ((cursor + 4, cursor + 6), (cursor + 36, cursor + 42))
+        )
+        cursor = end
+    if cursor != eocd or cursor - central_offset != central_size:
+        raise ReleaseError("backend-built wheel central directory was not consumed exactly")
+
+    previous = 0
+    for start, end in sorted(changed_ranges):
+        if original[previous:start] != normalized[previous:start]:
+            raise ReleaseError("wheel normalization changed bytes outside central metadata")
+        previous = end
+    if original[previous:] != normalized[previous:]:
+        raise ReleaseError("wheel normalization changed bytes outside central metadata")
+
+    normalized_bytes = bytes(normalized)
+    try:
+        normalized_archive = zipfile.ZipFile(io.BytesIO(normalized_bytes), "r")
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ReleaseError(f"normalized wheel could not be reopened: {exc}") from exc
+    with normalized_archive:
+        after_infos = _validate_wheel_members(normalized_archive)
+        after_identity = tuple(_wheel_unpatched_identity(info) for info in after_infos)
+        if after_identity != before_identity or normalized_archive.comment:
+            raise ReleaseError("wheel normalization changed payload or archive identity")
+        for info in after_infos:
+            expected = _canonical_wheel_external_attr(directory=info.is_dir())
+            if (
+                info.create_system != 3
+                or info.internal_attr != 0
+                or info.external_attr != expected
+            ):
+                raise ReleaseError("wheel normalization did not publish canonical metadata")
+
+    _atomic_write_bytes(wheel, normalized_bytes, mode=0o600)
+    persisted = _read_regular_file_bytes(
+        wheel,
+        label="normalized backend-built wheel",
+        maximum_bytes=_MAX_WHEEL_ARCHIVE_BYTES,
+    )
+    if persisted != normalized_bytes:
+        raise ReleaseError("normalized backend-built wheel changed during publication")
+
+
 def _build_wheel_once(
     snapshot: SourceSnapshot,
     *,
@@ -596,8 +805,10 @@ def _build_wheel_once(
     _run(
         [
             python,
-            "-m",
-            "build",
+            "-I",
+            "-B",
+            "-c",
+            _BUILD_RUNNER_SOURCE,
             "--wheel",
             "--no-isolation",
             "--outdir",
@@ -611,6 +822,7 @@ def _build_wheel_once(
     wheels = sorted(output.glob("*.whl"))
     if len(wheels) != 1:
         raise ReleaseError(f"expected one wheel from build {label}, found {len(wheels)}")
+    _canonicalize_built_wheel_metadata(wheels[0])
     return wheels[0]
 
 
@@ -732,6 +944,59 @@ def _validate_wheel_members(archive: zipfile.ZipFile) -> tuple[zipfile.ZipInfo, 
             elif file_type not in {0, stat.S_IFREG}:
                 raise ReleaseError(f"wheel contains symlink or special file: {name}")
     return tuple(infos)
+
+
+def _release_requires_canonical_wheel_metadata(version: object) -> bool:
+    """Apply strict canonical archive metadata to 0.2.14 and future builds."""
+
+    if not isinstance(version, str):
+        return True
+    match = _RELEASE_VERSION_PREFIX.fullmatch(version)
+    if match is None:
+        return True
+    try:
+        numeric = tuple(int(component) for component in match.groups())
+    except ValueError:
+        return True
+    return numeric >= _CANONICAL_WHEEL_METADATA_MIN_VERSION
+
+
+def _validate_wheel_permission_metadata(
+    infos: Sequence[zipfile.ZipInfo],
+    *,
+    version: object,
+    dist_info: str,
+) -> None:
+    strict = _release_requires_canonical_wheel_metadata(version)
+    legacy_record = f"{dist_info}/RECORD"
+    for info in infos:
+        name = _safe_member_name(info.filename)
+        if strict:
+            expected_attrs = {_canonical_wheel_external_attr(directory=info.is_dir())}
+            policy = "canonical"
+        elif info.is_dir():
+            expected_attrs = {_canonical_wheel_external_attr(directory=True)}
+            policy = "legacy"
+        elif name == legacy_record:
+            expected_attrs = {
+                (stat.S_IFREG | 0o644) << 16,
+                (stat.S_IFREG | 0o664) << 16,
+            }
+            policy = "legacy"
+        else:
+            expected_attrs = {(stat.S_IFREG | 0o644) << 16}
+            policy = "legacy"
+        if (
+            info.create_system != 3
+            or info.internal_attr != 0
+            or info.external_attr not in expected_attrs
+        ):
+            expected_text = ",".join(f"{value:#x}" for value in sorted(expected_attrs))
+            raise ReleaseError(
+                f"{policy} wheel metadata mismatch for {name}: "
+                f"creator={info.create_system}, internal={info.internal_attr}, "
+                f"external={info.external_attr:#x}, expected={expected_text}"
+            )
 
 
 def _record_hash(content: bytes) -> str:
@@ -1089,6 +1354,11 @@ def verify_wheel(
         version = str(metadata.get("Version", "")).strip()
         if distribution.casefold().replace("_", "-") != "t1000" or not version:
             raise ReleaseError("wheel METADATA does not identify a versioned t1000 distribution")
+        _validate_wheel_permission_metadata(
+            infos,
+            version=version,
+            dist_info=dist_info,
+        )
         _validate_wheel_metadata(
             wheel=wheel,
             dist_info=dist_info,

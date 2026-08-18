@@ -740,3 +740,17 @@ replay: final source gate, independent review, exact commit/private push,
 byte-identical clean builds, isolated 0.2.13 -> 0.2.11 -> 0.2.13 activation
 replay, production install/rollback/reinstall, one exact `isolated-no-bytecode`
 GUI, installed terminal/process/resource verification, and BR closure.
+
+## 11. Round 5 promotion replay: canonical wheel modes (0.2.14)
+
+A final clean-worktree replay of commit `c63db9b...` passed all 1,216 inherited tests, all 96 then-current release-manager tests, and the 175-test focused release/tmux/pane set. Two builds performed under `umask 077` matched each other but did not match the promoted 0.2.13 wheel. Member payloads, ordering, timestamps, compression, CRCs, local offsets, source identity, and build ID were identical; 59 central-directory `external_attr` values alone encoded `0600` instead of the promoted artifact's `0644`. Ambient caller umask therefore changed the wheel hash, canonical manifest, release ID, and content-addressed production identity.
+
+The accepted 0.2.14 repair models the requirement as
+
+```text
+forall u1,u2: Normalize(Build(S,u1)) = Normalize(Build(S,u2))
+```
+
+for one immutable source snapshot `S`. Builds execute in an isolated child whose umask is local to that process. A bounded central-directory parser then canonicalizes only creator/internal/external permission metadata and proves every other archive and member identity is unchanged before atomic publication. Verification enforces exact canonical metadata for 0.2.14 and future versions while preserving the narrow historical RECORD-mode exception observed in retained verified 0.2.11–0.2.13 rollback wheels.
+
+The implementation was developed from failing-first tests and subjected to five adversarial plan reviews covering backend dependence, recompression risk, historical rollback, process-global umask races, and binary-parser corruption. Malformed ZIP boundaries are regression-tested as fail-before-mutation cases. Production 0.2.13 remains untouched until the superseding 0.2.14 artifact completes clean-source, cross-umask, isolated rollback, production rollback/reinstall, installed-runtime, and independent-review acceptance.

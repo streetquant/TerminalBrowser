@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.14
+
+- Canonicalized wheel central-directory metadata before the reproducibility comparison. Every newly built regular member is now exact Unix `0644` with zero internal/low external attributes, independent of the caller's `umask`; content-addressed wheel, manifest, and release IDs therefore remain identical across `umask 022` and `077`.
+- Kept the build controller's process-wide `umask` untouched. The isolated child build runner uses the configured interpreter with `-I -B`, applies `022` only inside that child, and retains the existing offline, no-isolation, no-bytecode, fixed-epoch, bounded build contract.
+- Added a bounded single-disk/non-ZIP64 central-directory normalizer that changes only creator/internal/external metadata, proves compressed payloads, local headers, offsets, CRCs, timestamps, order, names, and RECORD content are unchanged, and atomically publishes only after the proof passes.
+- Made verification require the canonical archive policy for 0.2.14 and future/unknown version syntax. Verified 0.2.11–0.2.13 rollback artifacts remain accepted through an explicit legacy exception for their generated RECORD member's historical `0664` mode.
+- Added failing-first cross-umask builds, mode-only/idempotence properties, malformed EOCD/central-directory rejection, strict metadata negatives, legacy compatibility, and parent-umask non-interference coverage. No GTK/VTE, tmux framing, terminal interaction, session persistence, recovery, or authentication path changed.
+
 ## 0.2.13
 
 - Enforced release-directory immutability for newly built releases. Version 0.2.13 and later publish every release directory as mode `0555`, while files remain read-only and single-link, so a same-UID process cannot add `__pycache__`, bytecode, or arbitrary members after verification.

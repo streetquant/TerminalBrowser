@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -79,10 +80,18 @@ def record_hash(content: bytes) -> str:
     ).rstrip(b"=").decode("ascii")
 
 
-def _zip_info(name: str, *, mode: int = stat.S_IFREG | 0o644) -> zipfile.ZipInfo:
+def _zip_info(
+    name: str,
+    *,
+    mode: int = stat.S_IFREG | 0o644,
+    create_system: int = 3,
+    internal_attr: int = 0,
+    external_low_attr: int = 0,
+) -> zipfile.ZipInfo:
     info = zipfile.ZipInfo(name, date_time=(2024, 1, 1, 0, 0, 0))
-    info.create_system = 3
-    info.external_attr = mode << 16
+    info.create_system = create_system
+    info.internal_attr = internal_attr
+    info.external_attr = (mode << 16) | external_low_attr
     info.compress_type = zipfile.ZIP_DEFLATED
     return info
 
@@ -93,6 +102,10 @@ def write_wheel(
     seed: str = "a",
     extra_members: dict[str, bytes] | None = None,
     special_modes: dict[str, int] | None = None,
+    default_mode: int = stat.S_IFREG | 0o644,
+    create_systems: dict[str, int] | None = None,
+    internal_attrs: dict[str, int] | None = None,
+    external_low_attrs: dict[str, int] | None = None,
     duplicate: str | None = None,
     omit_record: str | None = None,
     extra_record: str | None = None,
@@ -142,8 +155,17 @@ def write_wheel(
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as archive:
         for name, content in members.items():
-            mode = (special_modes or {}).get(name, stat.S_IFREG | 0o644)
-            archive.writestr(_zip_info(name, mode=mode), content)
+            mode = (special_modes or {}).get(name, default_mode)
+            archive.writestr(
+                _zip_info(
+                    name,
+                    mode=mode,
+                    create_system=(create_systems or {}).get(name, 3),
+                    internal_attr=(internal_attrs or {}).get(name, 0),
+                    external_low_attr=(external_low_attrs or {}).get(name, 0),
+                ),
+                content,
+            )
         if duplicate:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
@@ -177,6 +199,36 @@ def artifact(
     manifest_path = root / f"{wheel.stem}.release.json"
     manifest = write_manifest(manifest_path, wheel, info)
     return wheel, manifest_path, manifest
+
+
+def wheel_payload_identity(path: Path) -> tuple[tuple[object, ...], ...]:
+    with zipfile.ZipFile(path) as archive:
+        return tuple(
+            (
+                info.filename,
+                hashlib.sha256(archive.read(info)).hexdigest(),
+                info.CRC,
+                info.file_size,
+                info.compress_size,
+                info.compress_type,
+                info.date_time,
+                info.header_offset,
+                info.flag_bits,
+                info.extra,
+                info.comment,
+            )
+            for info in archive.infolist()
+        )
+
+
+def process_umask() -> int:
+    status = Path("/proc/self/status")
+    if not status.is_file():
+        pytest.skip("process umask observation requires Linux /proc")
+    for line in status.read_text(encoding="utf-8").splitlines():
+        if line.startswith("Umask:"):
+            return int(line.split(":", 1)[1].strip(), 8)
+    raise AssertionError("/proc/self/status has no Umask field")
 
 
 def thaw_directories(root: Path) -> None:
@@ -332,6 +384,277 @@ def test_verify_valid_wheel_and_manifest(tmp_path: Path) -> None:
     assert verified.build_info == manifest["build_info"]
     assert verified.distribution == "t1000"
     assert f"{DIST_INFO}/RECORD" in verified.members
+
+
+def test_canonicalize_built_wheel_metadata_is_mode_only_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    version = "0.2.14"
+    masked = tmp_path / "masked" / f"t1000-{version}-py3-none-any.whl"
+    canonical = tmp_path / "canonical" / f"t1000-{version}-py3-none-any.whl"
+    write_wheel(masked, version=version, default_mode=stat.S_IFREG | 0o600)
+    write_wheel(canonical, version=version)
+    masked_payload = wheel_payload_identity(masked)
+    canonical_payload = wheel_payload_identity(canonical)
+    assert masked_payload == canonical_payload
+
+    release_manager._canonicalize_built_wheel_metadata(masked)
+    release_manager._canonicalize_built_wheel_metadata(canonical)
+
+    assert masked.read_bytes() == canonical.read_bytes()
+    assert wheel_payload_identity(masked) == masked_payload
+    assert wheel_payload_identity(canonical) == canonical_payload
+    with zipfile.ZipFile(masked) as archive:
+        for info in archive.infolist():
+            assert info.create_system == 3
+            assert info.internal_attr == 0
+            assert info.external_attr & 0xFFFF == 0
+            assert release_manager._wheel_member_mode(info) == stat.S_IFREG | 0o644
+
+    once = masked.read_bytes()
+    release_manager._canonicalize_built_wheel_metadata(masked)
+    assert masked.read_bytes() == once
+
+
+def test_canonicalize_built_wheel_metadata_rejects_trailing_bytes_without_mutation(
+    tmp_path: Path,
+) -> None:
+    wheel = tmp_path / WHEEL_NAME
+    write_wheel(wheel)
+    wheel.write_bytes(wheel.read_bytes() + b"trailing")
+    before = wheel.read_bytes()
+    with pytest.raises(ReleaseError, match="trailing|end of central directory"):
+        release_manager._canonicalize_built_wheel_metadata(wheel)
+    assert wheel.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "zip64-entries",
+        "multi-disk",
+        "central-size",
+        "central-offset",
+        "archive-comment",
+        "central-signature",
+        "member-zip64-size",
+        "member-zip64-offset",
+        "member-zip64-version",
+    ],
+)
+def test_canonicalize_built_wheel_metadata_fails_closed_on_malformed_zip_structure(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    wheel = tmp_path / f"{mutation}.whl"
+    write_wheel(wheel)
+    content = bytearray(wheel.read_bytes())
+    eocd = content.rfind(b"PK\x05\x06")
+    assert eocd >= 0
+    if mutation == "zip64-entries":
+        struct.pack_into("<H", content, eocd + 10, 0xFFFF)
+    elif mutation == "multi-disk":
+        struct.pack_into("<H", content, eocd + 4, 1)
+    elif mutation == "central-size":
+        size = struct.unpack_from("<I", content, eocd + 12)[0]
+        struct.pack_into("<I", content, eocd + 12, size + 1)
+    elif mutation == "central-offset":
+        offset = struct.unpack_from("<I", content, eocd + 16)[0]
+        struct.pack_into("<I", content, eocd + 16, offset + 1)
+    elif mutation == "archive-comment":
+        struct.pack_into("<H", content, eocd + 20, 1)
+        content.extend(b"x")
+    elif mutation == "central-signature":
+        offset = struct.unpack_from("<I", content, eocd + 16)[0]
+        content[offset : offset + 4] = b"BAD!"
+    elif mutation == "member-zip64-size":
+        offset = struct.unpack_from("<I", content, eocd + 16)[0]
+        struct.pack_into("<I", content, offset + 20, 0xFFFFFFFF)
+    elif mutation == "member-zip64-offset":
+        offset = struct.unpack_from("<I", content, eocd + 16)[0]
+        struct.pack_into("<I", content, offset + 42, 0xFFFFFFFF)
+    elif mutation == "member-zip64-version":
+        offset = struct.unpack_from("<I", content, eocd + 16)[0]
+        struct.pack_into("<H", content, offset + 6, 45)
+    else:
+        raise AssertionError(mutation)
+    wheel.write_bytes(content)
+    before = wheel.read_bytes()
+    with pytest.raises(ReleaseError):
+        release_manager._canonicalize_built_wheel_metadata(wheel)
+    assert wheel.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ("0.2.13", False),
+        ("0.2.13.post1", False),
+        ("0.2.14", True),
+        ("0.2.14rc1", True),
+        ("1.0.0", True),
+        ("future", True),
+        (None, True),
+    ],
+)
+def test_canonical_wheel_metadata_policy_is_version_gated(
+    version: object,
+    expected: bool,
+) -> None:
+    assert release_manager._release_requires_canonical_wheel_metadata(version) is expected
+
+
+def test_verify_canonical_wheel_metadata_is_version_gated(tmp_path: Path) -> None:
+    current = "0.2.14"
+    current_record = f"t1000-{current}.dist-info/RECORD"
+    canonical = tmp_path / "canonical" / f"t1000-{current}-py3-none-any.whl"
+    info = write_wheel(canonical, version=current)
+    manifest = canonical.with_suffix(".release.json")
+    write_manifest(manifest, canonical, info)
+    verify_wheel(canonical, manifest_path=manifest)
+
+    noncanonical = tmp_path / "noncanonical" / canonical.name
+    info = write_wheel(
+        noncanonical,
+        version=current,
+        special_modes={current_record: stat.S_IFREG | 0o664},
+    )
+    noncanonical_manifest = noncanonical.with_suffix(".release.json")
+    write_manifest(noncanonical_manifest, noncanonical, info)
+    with pytest.raises(ReleaseError, match="canonical wheel metadata"):
+        verify_wheel(noncanonical, manifest_path=noncanonical_manifest)
+
+    non_unix = tmp_path / "non-unix" / canonical.name
+    info = write_wheel(
+        non_unix,
+        version=current,
+        create_systems={"termdeck/__init__.py": 0},
+    )
+    non_unix_manifest = non_unix.with_suffix(".release.json")
+    write_manifest(non_unix_manifest, non_unix, info)
+    with pytest.raises(ReleaseError, match="canonical wheel metadata"):
+        verify_wheel(non_unix, manifest_path=non_unix_manifest)
+
+    legacy = "0.2.13"
+    legacy_record = f"t1000-{legacy}.dist-info/RECORD"
+    legacy_wheel = tmp_path / "legacy" / f"t1000-{legacy}-py3-none-any.whl"
+    info = write_wheel(
+        legacy_wheel,
+        version=legacy,
+        special_modes={legacy_record: stat.S_IFREG | 0o664},
+    )
+    legacy_manifest = legacy_wheel.with_suffix(".release.json")
+    write_manifest(legacy_manifest, legacy_wheel, info)
+    verify_wheel(legacy_wheel, manifest_path=legacy_manifest)
+
+    legacy_noncanonical = (
+        tmp_path / "legacy-noncanonical" / f"t1000-{legacy}-py3-none-any.whl"
+    )
+    info = write_wheel(
+        legacy_noncanonical,
+        version=legacy,
+        default_mode=stat.S_IFREG | 0o600,
+    )
+    legacy_noncanonical_manifest = legacy_noncanonical.with_suffix(".release.json")
+    write_manifest(legacy_noncanonical_manifest, legacy_noncanonical, info)
+    with pytest.raises(ReleaseError, match="legacy wheel metadata"):
+        verify_wheel(
+            legacy_noncanonical,
+            manifest_path=legacy_noncanonical_manifest,
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "kwargs"),
+    [
+        ("mode-0600", {"special_modes": {"termdeck/__init__.py": stat.S_IFREG | 0o600}}),
+        ("mode-0755", {"special_modes": {"termdeck/__init__.py": stat.S_IFREG | 0o755}}),
+        ("internal", {"internal_attrs": {"termdeck/__init__.py": 1}}),
+        ("low-external", {"external_low_attrs": {"termdeck/__init__.py": 1}}),
+        (
+            "directory",
+            {
+                "extra_members": {"termdeck/data/": b""},
+                "special_modes": {"termdeck/data/": stat.S_IFDIR | 0o700},
+                "external_low_attrs": {"termdeck/data/": 0x10},
+            },
+        ),
+    ],
+)
+def test_verify_rejects_each_noncanonical_current_wheel_metadata_dimension(
+    tmp_path: Path,
+    case: str,
+    kwargs: dict[str, object],
+) -> None:
+    version = "0.2.14"
+    wheel = tmp_path / case / f"t1000-{version}-py3-none-any.whl"
+    info = write_wheel(wheel, version=version, **kwargs)
+    manifest = wheel.with_suffix(".release.json")
+    write_manifest(manifest, wheel, info)
+    with pytest.raises(ReleaseError, match="canonical wheel metadata"):
+        verify_wheel(wheel, manifest_path=manifest)
+
+
+def test_build_release_is_reproducible_across_caller_umask(tmp_path: Path) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    runner = tmp_path / "build_under_umask.py"
+    runner.write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "requested = int(sys.argv[3], 8)\n"
+        "os.umask(requested)\n"
+        "def observed_umask():\n"
+        "    for line in Path('/proc/self/status').read_text().splitlines():\n"
+        "        if line.startswith('Umask:'):\n"
+        "            return int(line.split(':', 1)[1].strip(), 8)\n"
+        "    raise RuntimeError('missing process umask')\n"
+        "from termdeck.release_manager import build_release\n"
+        "result = build_release(sys.argv[1], sys.argv[2], allow_dirty=True, "
+        "python=sys.executable)\n"
+        "result['caller_umask_after'] = observed_umask()\n"
+        "result['caller_umask_expected'] = requested\n"
+        "print(json.dumps(result, sort_keys=True))\n",
+        encoding="utf-8",
+    )
+    environment = {**os.environ, "PYTHONPATH": str(repository), "PYTHONDONTWRITEBYTECODE": "1"}
+    before_umask = process_umask()
+    results = []
+    for value in ("022", "077"):
+        output = tmp_path / f"release-{value}"
+        completed = subprocess.run(
+            [sys.executable, "-B", str(runner), str(repository), str(output), value],
+            cwd=tmp_path,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+            timeout=180,
+        )
+        assert completed.stderr == ""
+        results.append(json.loads(completed.stdout))
+    assert process_umask() == before_umask
+
+    first, second = results
+    first_wheel = Path(str(first["wheel"]))
+    second_wheel = Path(str(second["wheel"]))
+    first_manifest = Path(str(first["manifest"]))
+    second_manifest = Path(str(second["manifest"]))
+    assert first["caller_umask_after"] == first["caller_umask_expected"] == 0o22
+    assert second["caller_umask_after"] == second["caller_umask_expected"] == 0o77
+    assert first["release_id"] == second["release_id"]
+    assert first["wheel_sha256"] == second["wheel_sha256"]
+    assert first_wheel.read_bytes() == second_wheel.read_bytes()
+    assert first_manifest.read_bytes() == second_manifest.read_bytes()
+    with zipfile.ZipFile(first_wheel) as archive:
+        assert archive.infolist()
+        assert all(
+            info.create_system == 3
+            and info.internal_attr == 0
+            and info.external_attr & 0xFFFF == 0
+            and release_manager._wheel_member_mode(info) == stat.S_IFREG | 0o644
+            for info in archive.infolist()
+        )
 
 
 def test_verify_rejects_symlinked_wheel_and_manifest_inputs(tmp_path: Path) -> None:
