@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.2.13
+
+- Enforced release-directory immutability for newly built releases. Version 0.2.13 and later publish every release directory as mode `0555`, while files remain read-only and single-link, so a same-UID process cannot add `__pycache__`, bytecode, or arbitrary members after verification.
+- Preserved verified rollback compatibility for 0.2.11 and 0.2.12 through an explicit version-gated directory policy; their historical `0755` directories remain verifiable, while any writable directory in a 0.2.13+ tree fails both source-side and bootstrap verification.
+- Added safe cleanup for a uniquely owned staging tree that fails after directory freezing. Cleanup thaws only that `.staging-<release-id>-…` path, refuses unowned paths, never follows directory symlinks, and cannot remove a published final release.
+- Kept Python isolation and bytecode suppression across every launch boundary: the stable launcher, staged-import verifier, and bootstrap state-race re-exec now use `-I -B`, while the bootstrap still sets `sys.dont_write_bytecode` and `PYTHONDONTWRITEBYTECODE` before importing installed code.
+- Extended managed-GUI identity to recognize both the legacy `[python, -I, bootstrap]` prefix and the canonical `[python, -I, -B, bootstrap]` prefix, reporting the observed launch profile without exposing private argv values.
+- Allowed a managed launcher template upgrade only when the existing launcher bytes match the SHA-256 already recorded in canonical managed state; unrelated launcher changes remain rejected as outside tampering.
+- Corrected the installed-runtime investigation: the 0.2.12 GUI did not create bytecode. An adversarial verifier bypassed the managed bootstrap and direct-imported the installed site without `-B`, exposing that the release directories were owner-writable. The bootstrap correctly rejected the resulting contamination; 0.2.13 closes the underlying write capability rather than weakening that check.
+
 ## 0.2.12
 
 - Fixed restored and newly attached terminal panes corrupting valid UTF-8 Codex glyphs during initial replay. Tmux command replies now expose an explicit immutable byte view, and pane history plus visible-screen replay remain bytes until they enter VTE.

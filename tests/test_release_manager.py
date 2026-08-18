@@ -33,7 +33,11 @@ from termdeck.build_info import (
 from termdeck.release_manager import (
     ReleaseError,
     _atomic_write_bytes,
+    _bootstrap_source,
     _copy_snapshot,
+    _launcher_source,
+    _stage_release,
+    _verify_staged_import,
     install_release,
     load_managed_state,
     managed_gui_process_status,
@@ -56,10 +60,10 @@ WHEEL_NAME = f"t1000-{VERSION}-py3-none-any.whl"
 BOOT_ID = "11111111-2222-4333-8444-555555555555"
 
 
-def build_info(seed: str) -> dict[str, object]:
+def build_info(seed: str, *, version: str = VERSION) -> dict[str, object]:
     info: dict[str, object] = {
         "schema": BUILD_INFO_SCHEMA,
-        "version": VERSION,
+        "version": version,
         "source_commit": seed * 40,
         "source_tree_sha256": seed * 64,
         "source_date_epoch": 1_700_000_000,
@@ -95,30 +99,32 @@ def write_wheel(
     bad_hash: str | None = None,
     bad_size: str | None = None,
     entry_point: str = "t1000 = termdeck.cli:main\n",
-    dist_info: str = DIST_INFO,
+    dist_info: str | None = None,
     wheel_metadata: str | None = None,
+    version: str = VERSION,
 ) -> dict[str, object]:
-    info = build_info(seed)
+    info = build_info(seed, version=version)
+    resolved_dist_info = dist_info or f"t1000-{version}.dist-info"
     members: dict[str, bytes] = {
-        "termdeck/__init__.py": f'__version__ = "{VERSION}"\n'.encode(),
+        "termdeck/__init__.py": f'__version__ = "{version}"\n'.encode(),
         "termdeck/cli.py": b"def main():\n    return 0\n",
         "termdeck/_build_info.json": canonical_json_bytes(info),
-        f"{dist_info}/METADATA": (
-            f"Metadata-Version: 2.1\nName: t1000\nVersion: {VERSION}\n\n"
+        f"{resolved_dist_info}/METADATA": (
+            f"Metadata-Version: 2.1\nName: t1000\nVersion: {version}\n\n"
         ).encode(),
-        f"{dist_info}/WHEEL": (
+        f"{resolved_dist_info}/WHEEL": (
             wheel_metadata
             or (
                 "Wheel-Version: 1.0\nGenerator: tests\nRoot-Is-Purelib: true\n"
                 "Tag: py3-none-any\n"
             )
         ).encode(),
-        f"{dist_info}/entry_points.txt": (
+        f"{resolved_dist_info}/entry_points.txt": (
             "[console_scripts]\n" + entry_point
         ).encode(),
     }
     members.update(extra_members or {})
-    record_name = f"{dist_info}/RECORD"
+    record_name = f"{resolved_dist_info}/RECORD"
     rows: list[tuple[str, str, str]] = []
     for name, content in sorted(members.items()):
         if name == omit_record:
@@ -159,13 +165,33 @@ def write_manifest(path: Path, wheel: Path, info: dict[str, object]) -> dict[str
     return manifest
 
 
-def artifact(tmp_path: Path, seed: str) -> tuple[Path, Path, dict[str, object]]:
+def artifact(
+    tmp_path: Path,
+    seed: str,
+    *,
+    version: str = VERSION,
+) -> tuple[Path, Path, dict[str, object]]:
     root = tmp_path / seed
-    wheel = root / WHEEL_NAME
-    info = write_wheel(wheel, seed=seed)
+    wheel = root / f"t1000-{version}-py3-none-any.whl"
+    info = write_wheel(wheel, seed=seed, version=version)
     manifest_path = root / f"{wheel.stem}.release.json"
     manifest = write_manifest(manifest_path, wheel, info)
     return wheel, manifest_path, manifest
+
+
+def thaw_directories(root: Path) -> None:
+    """Restore owner-write permission so pytest can remove frozen test trees."""
+
+    if not root.exists():
+        return
+    for current, directories, _files in os.walk(root, topdown=True, followlinks=False):
+        directory = Path(current)
+        if not directory.is_symlink():
+            directory.chmod(0o755)
+        for name in directories:
+            child = directory / name
+            if not child.is_symlink():
+                child.chmod(0o755)
 
 
 def managed_process_fixture(
@@ -531,6 +557,44 @@ def test_install_refuses_external_launcher_change(tmp_path: Path) -> None:
         install_release(wheel_b, manifest_b_path, root=root, bin_dir=bin_dir)
 
 
+def test_install_upgrades_launcher_from_hash_recorded_in_managed_state(
+    tmp_path: Path,
+) -> None:
+    wheel_a, manifest_a_path, _ = artifact(tmp_path, "a", version="0.2.12")
+    wheel_b, manifest_b_path, _ = artifact(tmp_path, "b", version="0.2.13")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel_a, manifest_a_path, root=root, bin_dir=bin_dir)
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    state = load_managed_state(layout)
+    python = Path(str(state["python_executable"]))
+    prior_launcher = (
+        "#!/bin/sh\nset -eu\n"
+        f'exec {python} -I {layout.bootstrap_path} "$@"\n'
+    ).encode("utf-8")
+    layout.launcher_path.write_bytes(prior_launcher)
+    layout.launcher_path.chmod(0o755)
+    state["launcher_sha256"] = sha256_bytes(prior_launcher)
+    layout.state_path.write_bytes(canonical_json_bytes(validate_managed_state(state)))
+
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        upgraded = install_release(
+            wheel_b,
+            manifest_b_path,
+            root=root,
+            bin_dir=bin_dir,
+        )
+
+    assert upgraded["repaired"] is True
+    assert upgraded["release_id"] != state["current_release_id"]
+    assert layout.launcher_path.read_bytes() == _launcher_source(layout, python)
+    assert load_managed_state(layout)["launcher_sha256"] == sha256_bytes(
+        _launcher_source(layout, python)
+    )
+    thaw_directories(root / "releases" / str(upgraded["release_id"]))
+
+
 def test_interrupted_state_publication_keeps_previous_release_selected(tmp_path: Path) -> None:
     wheel_a, manifest_a_path, manifest_a = artifact(tmp_path, "a")
     wheel_b, manifest_b_path, _ = artifact(tmp_path, "b")
@@ -742,6 +806,43 @@ def test_internal_empty_argv_element_cannot_masquerade_as_default_gui(
     assert release_manager._parse_proc_argv(raw) == prefix + (b"",)
 
 
+def test_managed_gui_process_status_accepts_no_bytecode_launcher_prefix(
+    tmp_path: Path,
+) -> None:
+    root, bin_dir, layout, _state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    python = Path(sys.executable).resolve(strict=True)
+    bootstrap = layout.bootstrap_path.resolve(strict=True)
+    prefix = (
+        os.fsencode(str(python)),
+        b"-I",
+        b"-B",
+        os.fsencode(str(bootstrap)),
+    )
+    write_fake_proc_process(
+        proc_root,
+        78,
+        argv=prefix + (b"gui",),
+        executable=python,
+        start_ticks=701,
+    )
+
+    status = managed_gui_process_status(
+        root=root,
+        bin_dir=bin_dir,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+
+    assert status["complete"] is True
+    assert status["posture"] == "single-gui"
+    assert status["gui_count"] == 1
+    record = status["processes"][0]
+    assert record["pid"] == 78
+    assert record["launch_profile"] == "isolated-no-bytecode"
+    assert record["argument_count"] == 5
+
+
 def test_managed_gui_process_status_classifies_exact_forms_without_private_args(
     tmp_path: Path,
 ) -> None:
@@ -817,10 +918,25 @@ def test_managed_gui_process_status_classifies_exact_forms_without_private_args(
     assert status["posture"] == "multiple-gui"
     assert status["gui_count"] == 3
     assert status["boot_id"] == BOOT_ID
+    no_bytecode_prefix = (prefix[0], b"-I", b"-B", prefix[2])
     assert status["expected_identity"] == {
         "python_executable": str(python),
         "bootstrap_path": str(bootstrap),
-        "argv_prefix_sha256": sha256_bytes(b"\0".join(prefix) + b"\0"),
+        "argv_prefix_sha256": sha256_bytes(
+            b"\0".join(no_bytecode_prefix) + b"\0"
+        ),
+        "accepted_argv_prefixes": [
+            {
+                "launch_profile": "isolated-no-bytecode",
+                "argv_prefix_sha256": sha256_bytes(
+                    b"\0".join(no_bytecode_prefix) + b"\0"
+                ),
+            },
+            {
+                "launch_profile": "legacy-isolated",
+                "argv_prefix_sha256": sha256_bytes(b"\0".join(prefix) + b"\0"),
+            },
+        ],
     }
     assert status["activation"] == {
         "safe": False,
@@ -1259,6 +1375,156 @@ def test_installed_tree_rejects_extra_files_symlinks_and_writable_payloads(
         verify_installed_tree(release_dir)
     hardlink.unlink()
     assert verify_installed_tree(release_dir)["ok"] is True
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ("0.2.11", False),
+        ("0.2.12", False),
+        ("0.2.12.post1", False),
+        ("0.2.13", True),
+        ("0.2.13rc1", True),
+        ("1.0.0", True),
+        ("future", True),
+    ],
+)
+def test_frozen_directory_policy_is_version_gated(
+    version: str,
+    expected: bool,
+) -> None:
+    info = build_info("a", version=version)
+    assert release_manager._release_requires_frozen_directories(info) is expected
+
+
+def test_launcher_bootstrap_and_staged_import_preserve_isolation_and_no_bytecode(
+    tmp_path: Path,
+) -> None:
+    layout = release_layout(root=tmp_path / "managed", bin_dir=tmp_path / "bin")
+    python = Path(sys.executable).resolve(strict=True)
+    launcher = _launcher_source(layout, python).decode("utf-8")
+    bootstrap = _bootstrap_source(layout, python).decode("utf-8")
+
+    assert f"exec {python} -I -B {layout.bootstrap_path}" in launcher
+    assert 'str(configured_python),\n                "-I",\n                "-B",' in bootstrap
+    assert 'str(bootstrap),\n                *sys.argv[1:],' in bootstrap
+    assert "sys.dont_write_bytecode = True" in bootstrap
+    assert 'os.environ["PYTHONDONTWRITEBYTECODE"] = "1"' in bootstrap
+
+    with mock.patch("termdeck.release_manager._run") as run:
+        _verify_staged_import(tmp_path / "release", python)
+    argv = run.call_args.args[0]
+    assert argv[:4] == [str(python), "-I", "-B", "-c"]
+
+
+def test_new_policy_install_freezes_directories_and_blocks_bytecode_creation(
+    tmp_path: Path,
+) -> None:
+    wheel, manifest_path, manifest = artifact(tmp_path, "f", version="0.2.13")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        result = install_release(
+            wheel,
+            manifest_path,
+            root=root,
+            bin_dir=bin_dir,
+            python=Path(sys.executable),
+        )
+    release_dir = root / "releases" / str(manifest["release_id"])
+    site = release_dir / "site"
+    try:
+        directories = [release_dir, *sorted(path for path in release_dir.rglob("*") if path.is_dir())]
+        assert directories
+        assert all(stat.S_IMODE(path.lstat().st_mode) == 0o555 for path in directories)
+        assert result["release_id"] == manifest["release_id"]
+        verified = verify_installed_tree(release_dir)
+        assert verified["frozen_directories"] is True
+
+        with pytest.raises(PermissionError):
+            (site / "termdeck" / "same-user-write.py").write_text(
+                "unexpected = True\n", encoding="utf-8"
+            )
+
+        environment = dict(os.environ)
+        environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        environment.pop("PYTHONPYCACHEPREFIX", None)
+        code = (
+            "import sys; from pathlib import Path; "
+            "site=Path(sys.argv[1]).resolve(); sys.path.insert(0,str(site)); "
+            "import termdeck,termdeck.cli; "
+            "assert Path(termdeck.__file__).resolve().is_relative_to(site)"
+        )
+        subprocess.run(
+            [str(Path(sys.executable).resolve()), "-I", "-c", code, str(site)],
+            cwd=tmp_path,
+            env=environment,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert not list(release_dir.rglob("*.pyc"))
+        assert not list(release_dir.rglob("__pycache__"))
+    finally:
+        thaw_directories(release_dir)
+
+
+def test_legacy_release_directories_remain_backward_verifiable(tmp_path: Path) -> None:
+    wheel, manifest_path, manifest = artifact(tmp_path, "b", version="0.2.12")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel, manifest_path, root=root, bin_dir=bin_dir)
+    release_dir = root / "releases" / str(manifest["release_id"])
+    try:
+        assert stat.S_IMODE(release_dir.lstat().st_mode) & 0o200
+        verified = verify_installed_tree(release_dir)
+        assert verified["frozen_directories"] is False
+    finally:
+        thaw_directories(release_dir)
+
+
+def test_new_policy_verifier_rejects_writable_directory(tmp_path: Path) -> None:
+    wheel, manifest_path, manifest = artifact(tmp_path, "c", version="0.2.13")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel, manifest_path, root=root, bin_dir=bin_dir)
+    release_dir = root / "releases" / str(manifest["release_id"])
+    target = release_dir / "site" / "termdeck"
+    try:
+        target.chmod(0o755)
+        with pytest.raises(ReleaseError, match="directory.*writable|frozen directory"):
+            verify_installed_tree(release_dir)
+    finally:
+        thaw_directories(release_dir)
+
+
+def test_failed_verification_cleans_a_frozen_unique_staging_tree(tmp_path: Path) -> None:
+    wheel, manifest_path, _manifest = artifact(tmp_path, "c", version="0.2.13")
+    verified = verify_wheel(wheel, manifest_path=manifest_path)
+    layout = release_layout(root=tmp_path / "managed", bin_dir=tmp_path / "bin")
+
+    def freeze_then_fail(path: str | Path) -> dict[str, object]:
+        stage = Path(path)
+        for current, _directories, _files in os.walk(stage, topdown=False, followlinks=False):
+            Path(current).chmod(0o555)
+        raise ReleaseError("simulated verification failure after freeze")
+
+    with mock.patch(
+        "termdeck.release_manager.verify_installed_tree",
+        side_effect=freeze_then_fail,
+    ), pytest.raises(ReleaseError, match="after freeze"):
+        _stage_release(layout, verified, manifest_path)
+
+    leftovers = list(layout.releases_dir.glob(".staging-*"))
+    try:
+        assert leftovers == []
+    finally:
+        for leftover in leftovers:
+            thaw_directories(leftover)
+            shutil.rmtree(leftover, ignore_errors=True)
 
 
 def test_release_lock_rejects_symlinked_root_and_lock_file(tmp_path: Path) -> None:

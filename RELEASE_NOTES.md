@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+## 0.2.13
+
+This release completes the installed-runtime hardening discovered during the 0.2.12 promotion. The terminal byte and tmux framing corrections remain unchanged. The new work makes the content-addressed release tree enforce its own immutability and preserves Python isolation and bytecode suppression across every launch and re-exec boundary.
+
+### Corrected investigation result
+
+The first 0.2.12 GUI started through the managed bootstrap with `sys.dont_write_bytecode` and `PYTHONDONTWRITEBYTECODE=1` already set. Its service log remained empty, and its startup timestamp preceded the bytecode files by several minutes. The GUI did not create them.
+
+An adversarial verifier later inserted the installed `site` directory into `sys.path` and imported it directly under Python without `-B`, bypassing the managed bootstrap. Because the release directories were mode `0755`, that verifier created writable `__pycache__/*.pyc` members. The next stable-launcher invocation correctly rejected the changed file set and writable members. The detection was correct; the missing control was enforced directory immutability.
+
+### Release trees are now actually immutable
+
+- Releases whose build version is 0.2.13 or later freeze every staging-tree directory to exact mode `0555` before verification and publication. Payload files remain read-only and single-link.
+- A same-UID process can read and execute the release but cannot add bytecode, cache directories, or arbitrary files. A direct import without `-B` therefore succeeds without mutating the tree.
+- Source-side verification and the self-contained managed bootstrap independently walk the complete release tree and reject symlinks, special directories, escapes, and any non-`0555` directory for the new policy.
+- The policy is version-gated. Verified 0.2.11 and 0.2.12 releases remain valid rollback targets with their historical directory modes; unknown future version syntax fails closed into the stricter policy.
+- A failed verification after freezing thaws and removes only the unique `.staging-<release-id>-…` path owned by that install operation. Cleanup refuses any path outside the release staging namespace and never follows a directory symlink.
+
+### Python launch invariants survive every path
+
+- The stable launcher now invokes the configured interpreter with both `-I` and `-B`.
+- The staged-import verifier also uses `-I -B`.
+- If managed state changes during bootstrap verification, the bounded `os.execv` retry preserves `-I -B` instead of silently dropping isolation on re-entry.
+- The bootstrap continues to set `sys.dont_write_bytecode` and `PYTHONDONTWRITEBYTECODE` before any installed package import, providing defense in depth even though the frozen tree already prevents writes.
+
+### Backward-compatible process and launcher identity
+
+- Managed-GUI discovery recognizes the prior exact `[python, -I, bootstrap]` prefix and the new canonical `[python, -I, -B, bootstrap]` prefix. Each record reports `legacy-isolated` or `isolated-no-bytecode` as a redaction-safe launch profile.
+- The scanner still requires canonical interpreter and bootstrap paths, matching `/proc/<pid>/exe`, Linux boot ID, PID start ticks, UID, repeated cmdline stability, and an exact supported GUI tail.
+- A launcher template upgrade is accepted only when the current launcher bytes match the SHA-256 already recorded in canonical managed state. A different unrecorded launcher remains an outside-tamper failure.
+
+### Regression coverage
+
+- Synthetic 0.2.13 installs prove every directory is `0555`, same-UID file creation raises `PermissionError`, and a direct import without `-B` produces no `__pycache__` or `.pyc` member.
+- Directory-mode tamper is rejected for 0.2.13, while a 0.2.12 fixture remains verifiable.
+- Failure injected after freezing proves staging cleanup leaves no `.staging-*` path.
+- Launcher, staged-import, and state-race re-exec tests require `-I -B`.
+- Process tests cover both exact prefixes and retain the existing self-match, substring, UID, executable, boot, PID-reuse, redaction, and incomplete-scan boundaries.
+
 ## 0.2.12
 
 This release fixes the corrupted characters that could appear throughout a restored Codex terminal and hardens the complete byte, control-protocol, release, and activation path around that correction. It preserves the existing GTK/VTE/tmux architecture, persistent tasks, terminal interaction behavior, and per-tab Codex account isolation.

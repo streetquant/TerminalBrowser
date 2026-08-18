@@ -67,6 +67,10 @@ _MAX_WHEEL_TOTAL_BYTES = 512 * 1024 * 1024
 _MAX_WHEEL_ARCHIVE_BYTES = 512 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 _RELEASE_ID = re.compile(r"^[0-9a-f]{64}$")
+_RELEASE_VERSION_PREFIX = re.compile(
+    r"^([0-9]+)\.([0-9]+)\.([0-9]+)(?:[A-Za-z0-9.+-].*)?$"
+)
+_FROZEN_RELEASE_MIN_VERSION = (0, 2, 13)
 _UUID = re.compile(
     r"(?<![0-9a-f])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])",
     re.IGNORECASE,
@@ -986,6 +990,31 @@ def _state_digest(path: Path) -> str | None:
     return _optional_regular_hash(path, label="managed state")
 
 
+def _release_requires_frozen_directories(
+    build_info: Mapping[str, object],
+) -> bool:
+    """Gate enforced directory immutability without breaking legacy rollback.
+
+    Releases before 0.2.13 were published with read-only files inside ordinary
+    owner-writable directories. They remain valid rollback targets. Starting at
+    0.2.13, every directory must be frozen to mode 0555. Unknown version syntax
+    fails closed into the stricter policy so a future build cannot accidentally
+    opt out of immutability merely by changing its version spelling.
+    """
+
+    version = build_info.get("version")
+    if not isinstance(version, str):
+        return True
+    match = _RELEASE_VERSION_PREFIX.fullmatch(version)
+    if match is None:
+        return True
+    try:
+        numeric = tuple(int(component) for component in match.groups())
+    except ValueError:
+        return True
+    return numeric >= _FROZEN_RELEASE_MIN_VERSION
+
+
 def _default_state() -> dict[str, object]:
     return {
         "schema": MANAGED_STATE_SCHEMA,
@@ -1122,6 +1151,93 @@ def _fsync_tree(root: Path) -> None:
         _fsync_directory(directory)
 
 
+def _freeze_release_tree(root: Path) -> int:
+    """Freeze one unique staging tree to read/execute-only directories.
+
+    All release files are already immutable at this point. Directory write
+    permission is the remaining same-UID mutation capability because Python or a
+    verifier could otherwise add ``__pycache__`` or arbitrary files. Validation
+    happens before chmod, then directories are frozen bottom-up so no partially
+    inspected path becomes the immutable published tree.
+    """
+
+    root_mode = root.lstat().st_mode
+    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+        raise ReleaseError("staging release root is not a real directory")
+    resolved_root = root.resolve(strict=True)
+    directories: list[Path] = []
+
+    def walk_error(error: OSError) -> None:
+        raise ReleaseError(f"could not inspect staging release tree: {error}")
+
+    for current, names, files in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+        onerror=walk_error,
+    ):
+        directory = Path(current)
+        directory_mode = directory.lstat().st_mode
+        if stat.S_ISLNK(directory_mode) or not stat.S_ISDIR(directory_mode):
+            raise ReleaseError(f"staging release contains an unsafe directory: {directory}")
+        try:
+            directory.resolve(strict=True).relative_to(resolved_root)
+        except ValueError as exc:
+            raise ReleaseError(f"staging release directory escaped root: {directory}") from exc
+        directories.append(directory)
+        for name in names:
+            child = directory / name
+            child_mode = child.lstat().st_mode
+            if stat.S_ISLNK(child_mode) or not stat.S_ISDIR(child_mode):
+                raise ReleaseError(f"staging release contains an unsafe directory: {child}")
+        for name in files:
+            path = directory / name
+            entry = path.lstat()
+            if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
+                raise ReleaseError(f"staging release contains an unsafe file: {path}")
+            if stat.S_IMODE(entry.st_mode) & 0o222 or entry.st_nlink != 1:
+                raise ReleaseError(f"staging release file is writable or hard-linked: {path}")
+
+    for directory in reversed(directories):
+        directory.chmod(0o555)
+    _fsync_tree(root)
+    return len(directories)
+
+
+def _verify_release_directories(root: Path, *, frozen: bool) -> int:
+    """Verify real in-root directories and, for new releases, exact mode 0555."""
+
+    resolved_root = root.resolve(strict=True)
+    count = 0
+
+    def walk_error(error: OSError) -> None:
+        raise ReleaseError(f"could not inspect installed release directories: {error}")
+
+    for current, directories, _files in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+        onerror=walk_error,
+    ):
+        directory = Path(current)
+        entry_mode = directory.lstat().st_mode
+        if stat.S_ISLNK(entry_mode) or not stat.S_ISDIR(entry_mode):
+            raise ReleaseError(f"installed release contains an unsafe directory: {directory}")
+        try:
+            directory.resolve(strict=True).relative_to(resolved_root)
+        except ValueError as exc:
+            raise ReleaseError(f"installed release directory escaped root: {directory}") from exc
+        if frozen and stat.S_IMODE(entry_mode) != 0o555:
+            raise ReleaseError(f"installed frozen directory is writable or has wrong mode: {directory}")
+        count += 1
+        for name in directories:
+            child = directory / name
+            child_mode = child.lstat().st_mode
+            if stat.S_ISLNK(child_mode) or not stat.S_ISDIR(child_mode):
+                raise ReleaseError(f"installed release contains an unsafe directory: {child}")
+    return count
+
+
 def _installed_site_files(site: Path) -> set[str]:
     """Return the exact regular-file set, rejecting links and special files."""
 
@@ -1202,6 +1318,14 @@ def verify_installed_tree(release_dir: str | Path) -> dict[str, object]:
         raise ReleaseError(str(exc)) from exc
     if manifest_path.read_bytes() != canonical_json_bytes(manifest):
         raise ReleaseError("installed release manifest is not canonical")
+    build_info = manifest.get("build_info")
+    if not isinstance(build_info, Mapping):
+        raise ReleaseError("installed release manifest has no build-info mapping")
+    frozen_directories = _release_requires_frozen_directories(build_info)
+    installed_directories = _verify_release_directories(
+        root,
+        frozen=frozen_directories,
+    )
     wheel = root / "artifacts" / str(manifest["wheel"])
     wheel_stat = wheel.lstat()
     if (
@@ -1234,6 +1358,8 @@ def verify_installed_tree(release_dir: str | Path) -> dict[str, object]:
         "release_id": manifest["release_id"],
         "wheel_sha256": verified.sha256,
         "installed_members": len(verified.members),
+        "installed_directories": installed_directories,
+        "frozen_directories": frozen_directories,
     }
 
 
@@ -1319,6 +1445,51 @@ def real_directory(path, label):
     if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
         raise RuntimeError(f"{label} is not a real directory: {path}")
     return path.resolve(strict=True)
+
+
+def frozen_directories_required(build_info):
+    version = build_info.get("version") if isinstance(build_info, dict) else None
+    if not isinstance(version, str):
+        return True
+    match = re.fullmatch(
+        r"([0-9]+)\.([0-9]+)\.([0-9]+)(?:[A-Za-z0-9.+-].*)?",
+        version,
+    )
+    if match is None:
+        return True
+    try:
+        numeric = tuple(int(component) for component in match.groups())
+    except ValueError:
+        return True
+    return numeric >= (0, 2, 13)
+
+
+def verify_release_directories(root, *, frozen):
+    resolved_root = root.resolve(strict=True)
+
+    def walk_error(error):
+        raise RuntimeError(f"could not inspect managed release directories: {error}")
+
+    for current, directories, _names in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+        onerror=walk_error,
+    ):
+        directory = Path(current)
+        mode = directory.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise RuntimeError(f"managed release contains an unsafe directory: {directory}")
+        directory.resolve(strict=True).relative_to(resolved_root)
+        if frozen and stat.S_IMODE(mode) != 0o555:
+            raise RuntimeError(
+                f"managed frozen directory is writable or has wrong mode: {directory}"
+            )
+        for name in directories:
+            child = directory / name
+            child_mode = child.lstat().st_mode
+            if stat.S_ISLNK(child_mode) or not stat.S_ISDIR(child_mode):
+                raise RuntimeError(f"managed release contains an unsafe directory: {child}")
 
 
 try:
@@ -1413,6 +1584,8 @@ try:
     }
     if digest_bytes(canonical(build_fields)) != build_info.get("build_id"):
         raise RuntimeError("managed build_id mismatch")
+    frozen_directories = frozen_directories_required(build_info)
+    verify_release_directories(release, frozen=frozen_directories)
     wheel_hash = manifest.get("wheel_sha256")
     if not isinstance(wheel_hash, str) or re.fullmatch(r"[0-9a-f]{64}", wheel_hash) is None:
         raise RuntimeError("managed wheel SHA-256 is invalid")
@@ -1495,7 +1668,13 @@ try:
         os.environ["T1000_BOOTSTRAP_STATE_RETRY"] = str(retry + 1)
         os.execv(
             str(configured_python),
-            [str(configured_python), str(bootstrap), *sys.argv[1:]],
+            [
+                str(configured_python),
+                "-I",
+                "-B",
+                str(bootstrap),
+                *sys.argv[1:],
+            ],
         )
 except Exception as exc:
     print(f"t1000 managed launcher refused an invalid release: {exc}", file=sys.stderr)
@@ -1522,7 +1701,7 @@ raise SystemExit(main())
 
 
 def _launcher_source(layout: ReleaseLayout, python: Path) -> bytes:
-    command = f'exec {shlex.quote(str(python))} -I {shlex.quote(str(layout.bootstrap_path))} "$@"\n'
+    command = f'exec {shlex.quote(str(python))} -I -B {shlex.quote(str(layout.bootstrap_path))} "$@"\n'
     return ("#!/bin/sh\nset -eu\n" + command).encode("utf-8")
 
 
@@ -1557,6 +1736,54 @@ def _verify_release_dir(layout: ReleaseLayout, release_id: str) -> dict[str, obj
     return result
 
 
+def _remove_staging_tree(
+    layout: ReleaseLayout,
+    stage: Path,
+    *,
+    release_id: str,
+) -> None:
+    """Remove only this installer's unique staging path, thawing directories safely."""
+
+    expected_prefix = f".staging-{release_id}-"
+    if stage.parent != layout.releases_dir or not stage.name.startswith(expected_prefix):
+        raise ReleaseError(f"refusing to remove an unowned staging path: {stage}")
+    if not _path_lexists(stage):
+        return
+    mode = stage.lstat().st_mode
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        stage.unlink()
+        _fsync_directory(layout.releases_dir)
+        return
+
+    def walk_error(error: OSError) -> None:
+        raise ReleaseError(f"could not inspect failed staging tree: {error}")
+
+    for current, directories, _files in os.walk(
+        stage,
+        topdown=True,
+        followlinks=False,
+        onerror=walk_error,
+    ):
+        directory = Path(current)
+        entry_mode = directory.lstat().st_mode
+        if stat.S_ISLNK(entry_mode) or not stat.S_ISDIR(entry_mode):
+            raise ReleaseError(f"failed staging tree contains an unsafe directory: {directory}")
+        directory.chmod(0o700)
+        for name in directories:
+            child = directory / name
+            child_mode = child.lstat().st_mode
+            if stat.S_ISLNK(child_mode):
+                continue
+            if not stat.S_ISDIR(child_mode):
+                raise ReleaseError(f"failed staging tree contains a non-directory: {child}")
+            child.chmod(0o700)
+    try:
+        shutil.rmtree(stage)
+    except OSError as exc:
+        raise ReleaseError(f"could not remove failed staging tree: {stage}: {exc}") from exc
+    _fsync_directory(layout.releases_dir)
+
+
 def _stage_release(
     layout: ReleaseLayout,
     verified: VerifiedWheel,
@@ -1587,12 +1814,18 @@ def _stage_release(
             canonical_json_bytes(verified.manifest),
             mode=0o444,
         )
+        build_info = verified.manifest.get("build_info")
+        if not isinstance(build_info, Mapping):
+            raise ReleaseError("verified manifest has no build-info mapping")
+        if _release_requires_frozen_directories(build_info):
+            _freeze_release_tree(stage)
         verify_installed_tree(stage)
         os.replace(stage, final)
         _fsync_directory(layout.releases_dir)
-    finally:
-        if stage.exists():
-            shutil.rmtree(stage, ignore_errors=True)
+    except Exception:
+        if _path_lexists(stage):
+            _remove_staging_tree(layout, stage, release_id=release_id)
+        raise
     return final
 
 
@@ -1617,7 +1850,11 @@ def _verify_staged_import(release_dir: Path, python: Path) -> None:
         "assert Path(termdeck.cli.__file__).resolve().is_relative_to(site);"
         "print(json.dumps({'ok':True,'release_id':manifest['release_id'],'build_id':build['build_id']},sort_keys=True))"
     )
-    _run([str(python), "-I", "-c", code, str(release_dir)], cwd=release_dir, timeout=60)
+    _run(
+        [str(python), "-I", "-B", "-c", code, str(release_dir)],
+        cwd=release_dir,
+        timeout=60,
+    )
 
 
 def install_release(
@@ -1671,9 +1908,13 @@ def install_release(
             label="t1000 launcher",
             executable=True,
         )
+        recorded_launcher_hash = (
+            str(state.get("launcher_sha256")) if current is not None else None
+        )
         allowed_existing = {
             None,
             expected_launcher_hash,
+            recorded_launcher_hash,
             str(legacy.get("sha256")) if isinstance(legacy, Mapping) else None,
         }
         if current is not None and existing_hash not in allowed_existing:
@@ -1712,6 +1953,7 @@ def install_release(
         allowed_prior = {
             None,
             expected_launcher_hash,
+            recorded_launcher_hash,
             str(legacy.get("sha256")) if isinstance(legacy, Mapping) else None,
         }
         if current_launcher_hash not in allowed_prior:
@@ -2339,15 +2581,34 @@ def _scan_managed_gui_processes(
         )
         return base
 
-    prefix = (
+    legacy_prefix = (
         os.fsencode(str(configured_python)),
         b"-I",
         os.fsencode(str(configured_bootstrap)),
     )
+    no_bytecode_prefix = (
+        os.fsencode(str(configured_python)),
+        b"-I",
+        b"-B",
+        os.fsencode(str(configured_bootstrap)),
+    )
+    accepted_prefixes = (
+        ("isolated-no-bytecode", no_bytecode_prefix),
+        ("legacy-isolated", legacy_prefix),
+    )
     base["expected_identity"] = {
         "python_executable": str(configured_python),
         "bootstrap_path": str(configured_bootstrap),
-        "argv_prefix_sha256": sha256_bytes(b"\0".join(prefix) + b"\0"),
+        "argv_prefix_sha256": sha256_bytes(
+            b"\0".join(no_bytecode_prefix) + b"\0"
+        ),
+        "accepted_argv_prefixes": [
+            {
+                "launch_profile": profile,
+                "argv_prefix_sha256": sha256_bytes(b"\0".join(prefix) + b"\0"),
+            }
+            for profile, prefix in accepted_prefixes
+        ],
     }
     try:
         boot_id = _read_boot_id(proc_root)
@@ -2407,10 +2668,17 @@ def _scan_managed_gui_processes(
         if first.real_uid != expected_uid or first.effective_uid != expected_uid:
             ignored += 1
             continue
-        if first.argv[:3] != prefix:
+        launch_profile: str | None = None
+        prefix_length = 0
+        for profile, candidate_prefix in accepted_prefixes:
+            if first.argv[: len(candidate_prefix)] == candidate_prefix:
+                launch_profile = profile
+                prefix_length = len(candidate_prefix)
+                break
+        if launch_profile is None:
             ignored += 1
             continue
-        invocation = _managed_gui_invocation_kind(first.argv[3:])
+        invocation = _managed_gui_invocation_kind(first.argv[prefix_length:])
         if invocation is None:
             # Managed CLI invocations (including this release-info process) are
             # intentionally absent from the GUI inventory.
@@ -2460,6 +2728,7 @@ def _scan_managed_gui_processes(
                 "process_start_ticks": confirmed.process_start_ticks,
                 "uid": confirmed.effective_uid,
                 "executable": str(confirmed.executable),
+                "launch_profile": launch_profile,
                 "invocation_kind": invocation,
                 "argument_count": len(confirmed.argv),
                 "cmdline_sha256": confirmed.cmdline_sha256,

@@ -398,3 +398,134 @@ The production rollback point is the currently verified release
 `6b1321e01cc7fd6addd14f7b7889af0fe1f4c66f3373fe831ee6e40e99108bf5`.
 Persistent tmux/Codex sessions and per-tab authentication scopes remain outside
 release ownership and may not be killed, recreated, or migrated by promotion.
+
+## Round 5 — promotion, installed-runtime finding, and superseding repair
+
+### First promotion candidate: 0.2.12
+
+The accepted Round 1–4 source was versioned as 0.2.12, passed the complete source
+and runtime gates, committed as
+`af5e663eac6c498e39e9d1e7162ea479cd6aaea8`, and pushed to the verified private
+upstream. Two independent clean builds produced identical artifacts:
+
+- release ID
+  `f87f94aec7bc9d8c469eb91560316caf7dcb02650c151fcafd8f4c3e08d3fcc1`;
+- wheel SHA-256
+  `80bce10002fd4efd5eddb5c99a3e6411f3aa3a130528b6b0af74bbb29a18a372`;
+- manifest SHA-256
+  `bf6ca3a586de803b3211f2753e40b3b2bfc25a1081d30b49b7f2d570069feb68`.
+
+The production manager transactionally installed 0.2.12, rolled back to the
+verified 0.2.11 release
+`6b1321e01cc7fd6addd14f7b7889af0fe1f4c66f3373fe831ee6e40e99108bf5`,
+verified that rollback, and reinstalled 0.2.12. The exact 281-row semantic
+snapshot and the 281-row per-tab authentication/`CODEX_HOME` receipt remained
+unchanged. One managed GUI then started as a user service with exact stable
+boot/PID/start/UID/executable/cmdline identity and an empty application log.
+
+### Installed-runtime adversarial finding
+
+A later verifier tried to inspect the installed package by inserting the managed
+`site` directory into `sys.path` and importing it directly under Python without
+`-B`. That verifier bypassed the managed bootstrap. Timestamp evidence proved
+that the GUI had started several minutes earlier and had not created bytecode;
+the direct importer created eleven writable `.pyc` members under
+`site/termdeck/__pycache__` because release directories were mode 0755.
+
+The next normal stable-launcher invocation correctly refused the changed file set
+and writable members with exit 78. Detection was therefore working as designed,
+but the content-addressed release had relied on cooperative import behavior:
+read-only files inside owner-writable directories did not enforce immutability.
+The same review also found that a bootstrap state-race retry used `os.execv`
+without retaining the launcher's `-I` flag.
+
+Disposition: 0.2.12 is not the final accepted release. Its running GUI was kept
+stable while a superseding source repair was developed; the contaminated release
+remains evidence and must not become the final rollback target.
+
+### Superseding 0.2.13 repair model
+
+The directory policy is explicitly version-gated:
+
+```text
+FrozenDirsRequired(v) = false  for v < 0.2.13
+FrozenDirsRequired(v) = true   for v >= 0.2.13 or unknown future syntax
+```
+
+This preserves verified 0.2.11/0.2.12 rollback compatibility while requiring
+new releases to enforce their own immutability.
+
+### Repair implementation
+
+- New-policy staging validates every directory and file, then freezes all release
+  directories bottom-up to exact mode 0555 before verification and publication.
+  Files remain read-only and single-link.
+- Source verification and the self-contained managed bootstrap independently
+  reject symlinks, special directories, escapes, and any non-0555 directory in a
+  0.2.13-or-later tree. Unknown version syntax fails closed into the stricter
+  policy.
+- A failed operation after freezing can remove only its unique direct-child
+  `.staging-<release-id>-…` path. Cleanup thaws directories, refuses an unowned
+  path, does not follow directory symlinks, and cannot remove a published release.
+- The stable launcher, staged-import verifier, and bootstrap state-race re-exec
+  now preserve both `-I` and `-B`. The bootstrap still sets
+  `sys.dont_write_bytecode` and `PYTHONDONTWRITEBYTECODE` before imports.
+- Managed-GUI discovery accepts both the historical
+  `[python, -I, bootstrap]` prefix and the canonical
+  `[python, -I, -B, bootstrap]` prefix, reporting `legacy-isolated` or
+  `isolated-no-bytecode` without exposing private argv values.
+- A launcher-template upgrade is accepted only if the current launcher bytes
+  equal the SHA-256 already recorded in canonical managed state. An unrelated
+  launcher change remains outside tampering and is rejected.
+- Version, development build identity, changelog, and release notes now identify
+  the superseding candidate as 0.2.13 and retain the corrected causal account.
+
+### Repair verification and source-review acceptance
+
+- Failing-first tests reproduced the writable-directory, missing-`-B`, missing
+  re-exec-isolation, unsupported new process-prefix, and frozen-cleanup gaps.
+- The repaired focused immutability/invocation/process surface passed `18` tests.
+- The complete release-manager suite passed `76` tests, including legacy
+  compatibility, direct non-`-B` import without bytecode creation, same-UID write
+  refusal, directory-mode tamper rejection, safe frozen-stage cleanup, both exact
+  process prefixes, outside-launcher tamper rejection, and authenticated launcher
+  upgrade.
+- The versioned release/CLI/build/diagnostics/tmux/pane focused surface passed
+  `155` tests.
+- The complete inherited suite passed `1,196` tests with one intentional skip and
+  `98` passing subtests. All `18` sandbox-applicable strict runtime smokes passed
+  with empty stderr; the real user-session procfs gate separately bound the still
+  running 0.2.12 GUI as one stable `legacy-isolated` process.
+- The dirty-candidate release workflow passed reproducible double build,
+  installation, the new directory policy, tamper rejection, launcher repair,
+  outside-checkout inspection, legacy rollback, and unchanged `281`-row semantic
+  state.
+- The semantic payload remained SHA-256
+  `5b840a12df3d8fe00b59c42dfc8c3107553ffea3bdad9c0597618611548ac93e`.
+  The `281` authentication/`CODEX_HOME` boundaries remained SHA-256
+  `8d6fa311a79a39a90d8aeb3a27ab3b41bcb74f6d371b4d84152ed76a7b5bf957`.
+  Source bytes, Git state, the live GUI identity, the Xvfb set, and smoke-process
+  inventory were unchanged.
+- Read-only reviewer snapshot `snap-90fd2725de5a15260da8a17ea9471ea3`
+  independently bound the implementation and tests, passed `38` targeted cases
+  and all `76` release-manager tests, and verified the frozen-directory,
+  `-I`/`-B`, cleanup, and dual-prefix surfaces. Receipt:
+  `8c135c1882a81c53b81c3a529cb076ed5525e4c5a2bd8c21d8130b98f25f17e6`.
+- Test-runner snapshot `snap-d3e52a38c02005215f63326b03c52e56`
+  independently passed the `155` focused tests and all `76` release-manager tests
+  against the exact source/version hashes. Receipt:
+  `b0b79c3cdaaab78fa8481617bcafcdd09f2778791dc1d4a629bd0e56291a4d8d`.
+- Two broader worker attempts completed their test steps before environment-bound
+  smoke failures. The procfs smoke correctly rejected the intentionally
+  contaminated host 0.2.12 tree and is deferred to the installed 0.2.13
+  user-session gate. A transient worker-TMP tmux smoke passed unchanged on replay
+  with identical direct/reply SHA-256
+  `7c62e05a630e1a5c32c77d326c432c0744fc8ff1235b9023155165484aa2ea75`
+  and zero manufactured events. Neither produced a sustained product finding.
+- Static compilation and `git diff --check` pass.
+
+The 0.2.13 source repair is accepted for immutable promotion. A final exact-source
+revalidation follows this evidence-only documentation refresh. Clean commit and
+private push, reproducible clean-commit artifacts, controlled replacement of the
+live GUI, installed-runtime replay, final independent review, and BR closure
+remain mandatory before Round 5 is accepted.
