@@ -2,6 +2,63 @@
 
 ## Unreleased
 
+## 0.2.15
+
+T1000 0.2.15 repairs the Codex composer failure reported against the installed 0.2.14 runtime and closes the surrounding startup, containment-notification, validation, and release-evidence gaps without replacing the existing GTK/VTE/tmux architecture.
+
+### One authoritative geometry exists before the first composer frame
+
+A full-screen TUI draws immediately after its terminal is created. The prior GUI path could create a missing tmux payload at tmux's implicit `80x24`, then resize it after GTK/VTE settled on the real grid. Codex briefly composed two incompatible layouts, leaving clipped borders, displaced blocks, or a collapsed composer.
+
+The accepted invariant is now:
+
+```text
+payload first grid = VTE grid = tmux pane grid
+                   = tmux window grid = control-stream grid
+```
+
+Visible tabs, first tabs in empty windows, restored missing tabs, exact recovery, hidden workspace recipes, and all-hidden windows all use the canonical mapped grid. Deferred startup owns rollback of a newly created session row and partial tmux target, while durable recovery rows retain their retry semantics.
+
+### Private contained-resize admission is exact and fail closed
+
+A resize notification is admitted only for the production containment graph:
+
+```text
+tmux pane root -> outer bwrap -> inner bwrap session leader -> private Codex witness
+```
+
+The witness must carry the complete private TermDeck tuple:
+
+```text
+CODEX_HOME
+TERMDECK_AUTH_SCOPE_ID
+CODEX_TERMDECK_GATE_ROOT
+```
+
+Each key must occur exactly once; values must be UTF-8, canonical, absolute where required, scope-consistent, and unchanged at commit. Copied names, partial/duplicate tuples, intervening processes, sibling sandboxes, ambiguous witnesses, changed parent edges, or unreadable evidence produce a no-op.
+
+On pidfd-capable Linux systems, the exact witness is opened with `pidfd_open`, revalidated while the descriptor is held, checked for exit, and sent only `SIGWINCH` through `pidfd_send_signal`. The numeric process-group fallback remains available only for genuine capability absence or `ENOSYS`; lookup, permission, identity, topology, tuple, liveness, and sender failures never widen into fallback.
+
+### Resize work no longer blocks ordered terminal input
+
+One bounded process-wide dispatcher performs containment discovery and signaling outside the pane worker. Ordinary resize requests are latest-value coalesced by callback/pane identity. Setup nudge and final notifications use unique bounded tickets so recovery still completes before pane capture and replay. Queue capacity, history, wait time, error representation, and shutdown are finite.
+
+### Release evidence exercises the selected package
+
+The canonical validation manifest covers every discovered test file and 21 smokes. Each test file runs in a fresh bounded process; smokes have explicit environment, timeout, output, and JSON contracts. The selected-package contained-composer smoke builds and verifies a wheel, imports `termdeck`, `pane_stream`, and `resize_signal` only from that extracted site, creates the exact containment graph, and proves:
+
+- the composer redraw completes before stream readiness;
+- the collapsed alternate-screen frame is absent from committed replay;
+- pane, window, controller, and requested grids are identical;
+- no terminal input is sent and no payload is restarted;
+- pane, outer/inner bwrap, private payload, and MCP-sibling identities survive;
+- the MCP-like sibling receives no signal;
+- pidfd-witness signaling is used on capable hosts.
+
+### Compatibility and operational boundary
+
+The managed installer, immutable release tree, bootstrap/launcher authentication, deterministic wheel policy, and retained 0.2.11-0.2.14 rollback generations remain intact. The new containment signal path is Linux/procfs-specific and fails closed elsewhere. Kernels without pidfd support retain the complete userspace identity/topology revalidation fallback.
+
 ## 0.2.14
 
 This release supersedes 0.2.13 for deterministic promotion. The installed 0.2.13 runtime remains a verified rollback generation, but a fresh exact-source replay found that the wheel backend inherited the caller's `umask`: the same source and payload bytes produced central-directory file modes `0644` under `umask 022` and `0600` under `umask 077`. Because the wheel hash is part of the manifest and release ID, ambient process state changed the content-addressed production identity.

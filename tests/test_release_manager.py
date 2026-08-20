@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import copy
+import concurrent.futures
 from contextlib import nullcontext
 import csv
 import hashlib
@@ -12,6 +14,7 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
 import warnings
 import zipfile
@@ -315,6 +318,38 @@ def write_fake_proc_process(
     (process_dir / "cmdline").write_bytes(b"\0".join(argv) + b"\0")
     (process_dir / "exe").symlink_to(executable)
     return process_dir
+
+
+def process_observer_receipt(
+    *,
+    layout,
+    state: dict[str, object],
+    status: dict[str, object],
+    expected_uid: int,
+    source_module: Path | None = None,
+) -> dict[str, object]:
+    module = (
+        Path(release_manager.__file__).resolve(strict=True)
+        if source_module is None
+        else source_module.resolve(strict=False)
+    )
+    return {
+        "schema": release_manager._PROCESS_OBSERVER_RECEIPT_SCHEMA,
+        "ok": True,
+        "error_code": "",
+        "observer": "systemd-user-manager",
+        "source_root": str(module.parent.parent),
+        "source_module": str(module),
+        "root": str(layout.root),
+        "bin_dir": str(layout.bin_dir),
+        "current_release_id": state["current_release_id"],
+        "managed_state_sha256": sha256_bytes(canonical_json_bytes(state)),
+        "expected_uid": expected_uid,
+        "stable_samples": 2,
+        "stable": True,
+        "state_stable": True,
+        "status": status,
+    }
 
 
 def init_git_project(root: Path) -> None:
@@ -2114,6 +2149,2723 @@ def test_managed_gui_process_status_handles_permission_pid_reuse_and_vanish(
     assert vanished["issues"] == [
         {"code": "same-uid-candidate-vanished", "count": 1}
     ]
+
+
+def test_process_observer_receipt_requires_complete_stable_samples(
+    tmp_path: Path,
+) -> None:
+    root, bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    python = Path(sys.executable).resolve(strict=True)
+    bootstrap = layout.bootstrap_path.resolve(strict=True)
+    prefix = (os.fsencode(str(python)), b"-I", os.fsencode(str(bootstrap)))
+    write_fake_proc_process(
+        proc_root,
+        42,
+        argv=prefix,
+        executable=python,
+        start_ticks=99,
+    )
+    complete = release_manager._scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    activation = {"current_release_id": state["current_release_id"], "legacy": False}
+
+    with mock.patch.object(
+        release_manager,
+        "_verify_managed_activation",
+        return_value=activation,
+    ), mock.patch.object(
+        release_manager,
+        "_scan_managed_gui_processes",
+        side_effect=[complete, copy.deepcopy(complete)],
+    ):
+        receipt = release_manager.managed_gui_process_observer_receipt(
+            root=root,
+            bin_dir=bin_dir,
+            proc_root=proc_root,
+            expected_uid=uid,
+        )
+    assert receipt["ok"] is True
+    assert receipt["error_code"] == ""
+    assert receipt["stable"] is True
+    assert receipt["state_stable"] is True
+    assert receipt["stable_samples"] == 2
+    assert receipt["status"] == complete
+    assert receipt["managed_state_sha256"] == sha256_bytes(
+        canonical_json_bytes(state)
+    )
+
+    unstable = copy.deepcopy(complete)
+    unstable["processes"][0]["process_start_ticks"] += 1
+    with mock.patch.object(
+        release_manager,
+        "_verify_managed_activation",
+        return_value=activation,
+    ), mock.patch.object(
+        release_manager,
+        "_scan_managed_gui_processes",
+        side_effect=[complete, unstable],
+    ):
+        receipt = release_manager.managed_gui_process_observer_receipt(
+            root=root,
+            bin_dir=bin_dir,
+            proc_root=proc_root,
+            expected_uid=uid,
+        )
+    assert receipt["ok"] is False
+    assert receipt["error_code"] == "process-scan-unstable"
+
+    incomplete = copy.deepcopy(complete)
+    incomplete.update(
+        {
+            "complete": False,
+            "posture": "scan-incomplete",
+            "activation": {
+                "safe": False,
+                "decision": "refuse-incomplete",
+                "requires_shutdown": False,
+            },
+            "issues": [{"code": "same-uid-candidate-unreadable", "count": 1}],
+        }
+    )
+    with mock.patch.object(
+        release_manager,
+        "_verify_managed_activation",
+        return_value=activation,
+    ), mock.patch.object(
+        release_manager,
+        "_scan_managed_gui_processes",
+        side_effect=[incomplete, copy.deepcopy(incomplete)],
+    ):
+        receipt = release_manager.managed_gui_process_observer_receipt(
+            root=root,
+            bin_dir=bin_dir,
+            proc_root=proc_root,
+            expected_uid=uid,
+        )
+    assert receipt["ok"] is False
+    assert receipt["error_code"] == "process-scan-incomplete"
+
+
+def test_process_observer_receipt_detects_managed_state_change(
+    tmp_path: Path,
+) -> None:
+    root, bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    complete = release_manager._scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    changed = copy.deepcopy(state)
+    changed["generation"] = int(changed["generation"]) + 1
+    with mock.patch.object(
+        release_manager,
+        "load_managed_state",
+        side_effect=[state, changed],
+    ), mock.patch.object(
+        release_manager,
+        "_verify_managed_activation",
+        return_value={"current_release_id": state["current_release_id"]},
+    ), mock.patch.object(
+        release_manager,
+        "_scan_managed_gui_processes",
+        side_effect=[complete, copy.deepcopy(complete)],
+    ):
+        receipt = release_manager.managed_gui_process_observer_receipt(
+            root=root,
+            bin_dir=bin_dir,
+            proc_root=proc_root,
+            expected_uid=uid,
+        )
+    assert receipt["ok"] is False
+    assert receipt["state_stable"] is False
+    assert receipt["error_code"] == "managed-state-changed"
+
+
+def test_process_observer_receipt_validation_accepts_exact_and_rejects_tamper(
+    tmp_path: Path,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    python = Path(sys.executable).resolve(strict=True)
+    bootstrap = layout.bootstrap_path.resolve(strict=True)
+    prefix = (os.fsencode(str(python)), b"-I", os.fsencode(str(bootstrap)))
+    write_fake_proc_process(
+        proc_root,
+        42,
+        argv=prefix,
+        executable=python,
+        start_ticks=99,
+    )
+    status = release_manager._scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    source_module = Path(release_manager.__file__).resolve(strict=True)
+    valid = process_observer_receipt(
+        layout=layout,
+        state=state,
+        status=status,
+        expected_uid=uid,
+        source_module=source_module,
+    )
+    assert release_manager._validate_process_observer_receipt(
+        valid,
+        layout=layout,
+        state=state,
+        expected_uid=uid,
+        direct=status,
+        source_module=source_module,
+    ) == status
+
+    tampered: list[dict[str, object]] = []
+    for field, value in (
+        ("managed_state_sha256", "0" * 64),
+        ("current_release_id", "f" * 64),
+        ("expected_uid", uid + 1),
+        ("source_module", str(tmp_path / "wrong.py")),
+        ("stable", False),
+    ):
+        candidate = copy.deepcopy(valid)
+        candidate[field] = value
+        tampered.append(candidate)
+    incomplete = copy.deepcopy(valid)
+    incomplete["status"]["complete"] = False
+    tampered.append(incomplete)
+    wrong_identity = copy.deepcopy(valid)
+    wrong_identity["status"]["expected_identity"] = {"python_executable": "/wrong"}
+    tampered.append(wrong_identity)
+    wrong_boot = copy.deepcopy(valid)
+    wrong_boot["status"]["boot_id"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    tampered.append(wrong_boot)
+    omitted = copy.deepcopy(valid)
+    omitted["status"]["processes"] = []
+    tampered.append(omitted)
+    recursive = copy.deepcopy(valid)
+    recursive["status"]["observer"] = {"mode": "unexpected"}
+    tampered.append(recursive)
+    private = copy.deepcopy(valid)
+    private["status"]["processes"][0]["argv"] = ["secret"]
+    tampered.append(private)
+
+    for candidate in tampered:
+        with pytest.raises(ReleaseError, match="process observer"):
+            release_manager._validate_process_observer_receipt(
+                candidate,
+                layout=layout,
+                state=state,
+                expected_uid=uid,
+                direct=status,
+                source_module=source_module,
+            )
+
+
+def test_process_observer_routes_only_incomplete_real_proc_scans(
+    tmp_path: Path,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    complete = release_manager._scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    incomplete = copy.deepcopy(complete)
+    incomplete.update(
+        {
+            "complete": False,
+            "posture": "scan-incomplete",
+            "processes": [],
+            "gui_count": 0,
+            "issues": [{"code": "same-uid-candidate-unreadable", "count": 1}],
+        }
+    )
+
+    with mock.patch.object(
+        release_manager, "_scan_managed_gui_processes", return_value=complete
+    ), mock.patch.object(
+        release_manager, "_scan_managed_gui_processes_via_user_manager"
+    ) as broker:
+        direct = release_manager._observe_managed_gui_processes(
+            layout,
+            state,
+            proc_root=proc_root,
+            expected_uid=uid,
+            allow_user_manager_broker=True,
+        )
+    assert direct["observer"] == {
+        "mode": "direct",
+        "direct_complete": True,
+        "broker_attempted": False,
+        "broker_result": "not-needed",
+        "singleflight_role": "none",
+        "broker_shared": False,
+        "direct_singleflight_role": "leader",
+        "direct_shared": False,
+        "direct_scan_result": "accepted",
+    }
+    broker.assert_not_called()
+
+    with mock.patch.object(
+        release_manager, "_scan_managed_gui_processes", return_value=incomplete
+    ), mock.patch.object(
+        release_manager, "_canonical_real_proc_root", return_value=True
+    ), mock.patch.object(
+        release_manager,
+        "_scan_managed_gui_processes_via_user_manager",
+        return_value=(
+            complete,
+            "accepted",
+            {"singleflight_role": "leader", "broker_shared": False},
+        ),
+    ) as broker:
+        observed = release_manager._observe_managed_gui_processes(
+            layout,
+            state,
+            proc_root=Path("/proc"),
+            expected_uid=uid,
+            allow_user_manager_broker=True,
+        )
+    assert observed["complete"] is True
+    assert observed["observer"]["mode"] == "systemd-user-manager"
+    assert observed["observer"]["broker_result"] == "accepted"
+    broker.assert_called_once()
+
+    with mock.patch.object(
+        release_manager, "_scan_managed_gui_processes", return_value=incomplete
+    ), mock.patch.object(
+        release_manager, "_canonical_real_proc_root", return_value=True
+    ), mock.patch.object(
+        release_manager,
+        "_scan_managed_gui_processes_via_user_manager",
+        return_value=(
+            None,
+            "broker-receipt-rejected",
+            {"singleflight_role": "follower", "broker_shared": True},
+        ),
+    ):
+        failed = release_manager._observe_managed_gui_processes(
+            layout,
+            state,
+            proc_root=Path("/proc"),
+            expected_uid=uid,
+            allow_user_manager_broker=True,
+        )
+    assert failed["complete"] is False
+    assert failed["observer"]["mode"] == "direct"
+    assert failed["observer"]["broker_result"] == "broker-receipt-rejected"
+
+    with mock.patch.object(
+        release_manager, "_scan_managed_gui_processes", return_value=incomplete
+    ), mock.patch.object(
+        release_manager, "_scan_managed_gui_processes_via_user_manager"
+    ) as broker:
+        fake = release_manager._observe_managed_gui_processes(
+            layout,
+            state,
+            proc_root=proc_root,
+            expected_uid=uid,
+            allow_user_manager_broker=True,
+        )
+    assert fake["complete"] is False
+    broker.assert_not_called()
+
+    with mock.patch.object(
+        release_manager, "_scan_managed_gui_processes", return_value=incomplete
+    ), mock.patch.object(
+        release_manager, "_canonical_real_proc_root", return_value=True
+    ), mock.patch.dict(
+        os.environ, {release_manager._PROCESS_OBSERVER_ENV: "1"}
+    ), mock.patch.object(
+        release_manager, "_scan_managed_gui_processes_via_user_manager"
+    ) as broker:
+        recursive = release_manager._observe_managed_gui_processes(
+            layout,
+            state,
+            proc_root=Path("/proc"),
+            expected_uid=uid,
+            allow_user_manager_broker=True,
+        )
+    assert recursive["complete"] is False
+    broker.assert_not_called()
+
+
+def test_user_manager_process_observer_dispatch_is_bounded_and_revalidated(
+    tmp_path: Path,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    complete = release_manager._scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    direct = copy.deepcopy(complete)
+    direct.update(
+        {
+            "complete": False,
+            "posture": "scan-incomplete",
+            "processes": [],
+            "gui_count": 0,
+            "issues": [{"code": "same-uid-candidate-unreadable", "count": 1}],
+        }
+    )
+    payload = process_observer_receipt(
+        layout=layout,
+        state=state,
+        status=complete,
+        expected_uid=uid,
+    )
+    activation = {"current_release_id": state["current_release_id"], "legacy": False}
+    completed = release_manager._BoundedProcessResult(
+        0,
+        canonical_json_bytes(payload),
+        b"",
+    )
+    with mock.patch.object(
+        release_manager, "_verify_managed_activation", return_value=activation
+    ) as verify, mock.patch.object(
+        release_manager, "_trusted_systemd_run", return_value=Path("/usr/bin/systemd-run")
+    ), mock.patch.object(
+        release_manager, "_run_bounded_output", return_value=completed
+    ) as run:
+        observed, result, flight = release_manager._scan_managed_gui_processes_via_user_manager(
+            layout,
+            state,
+            expected_uid=uid,
+            direct=direct,
+        )
+    assert result == "accepted"
+    assert observed == complete
+    assert flight == {
+        "singleflight_role": "leader",
+        "broker_shared": False,
+        "cross_process_role": "leader",
+        "cross_process_shared": False,
+        "cross_process_result": "published",
+    }
+    # Two transport checks, one pre-publication redaction/identity validation,
+    # and one caller-local validation after consuming the shared bytes.
+    assert verify.call_count == 4
+    command = run.call_args.args[0]
+    assert command[:5] == [
+        "/usr/bin/systemd-run",
+        "--user",
+        "--wait",
+        "--collect",
+        "--pipe",
+    ]
+    assert "--quiet" in command
+    assert any(item.startswith("--property=RuntimeMaxSec=") for item in command)
+    assert "--property=TimeoutStopSec=2s" in command
+    assert f"--setenv={release_manager._PROCESS_OBSERVER_ENV}=1" in command
+    python_index = command.index(str(Path(sys.executable).resolve(strict=True)))
+    assert command[python_index + 1 : python_index + 4] == ["-I", "-B", "-c"]
+    assert command[python_index + 4] == release_manager._PROCESS_OBSERVER_HELPER_SOURCE
+    assert command[-5:] == [
+        str(Path(release_manager.__file__).resolve(strict=True).parent.parent),
+        str(Path(release_manager.__file__).resolve(strict=True)),
+        str(layout.root),
+        str(layout.bin_dir),
+        str(uid),
+    ]
+    assert run.call_args.kwargs["timeout"] == pytest.approx(
+        release_manager._PROCESS_OBSERVER_TIMEOUT_SECONDS + 2.0
+    )
+    client_environment = run.call_args.kwargs["env"]
+    assert "PYTHONPATH" not in client_environment
+    assert client_environment["HOME"] == str(Path.home().resolve(strict=True))
+    assert client_environment["XDG_RUNTIME_DIR"] == f"/run/user/{uid}"
+    assert client_environment["DBUS_SESSION_BUS_ADDRESS"] == (
+        f"unix:path=/run/user/{uid}/bus"
+    )
+    assert client_environment["LANG"] == client_environment["LC_ALL"] == "C.UTF-8"
+    assert client_environment["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert client_environment["PYTHONHASHSEED"] == "0"
+
+
+def test_user_manager_process_observer_rejects_bad_execution_and_receipts(
+    tmp_path: Path,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    complete = release_manager._scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    direct = copy.deepcopy(complete)
+    direct.update({"complete": False, "processes": [], "gui_count": 0})
+    valid = process_observer_receipt(
+        layout=layout,
+        state=state,
+        status=complete,
+        expected_uid=uid,
+    )
+    tampered = copy.deepcopy(valid)
+    tampered["managed_state_sha256"] = "0" * 64
+    cases = (
+        (release_manager._BoundedProcessResult(7, b"", b""), "broker-command-failed"),
+        (release_manager._BoundedProcessResult(0, b"{}\n", b"warning"), "broker-stderr-not-empty"),
+        (release_manager._BoundedProcessResult(0, b"not-json", b""), "broker-output-invalid"),
+        (
+            release_manager._BoundedProcessResult(
+                0, canonical_json_bytes(tampered), b""
+            ),
+            "broker-receipt-rejected",
+        ),
+    )
+    activation = {"current_release_id": state["current_release_id"], "legacy": False}
+    for completed, expected in cases:
+        with mock.patch.object(
+            release_manager, "_verify_managed_activation", return_value=activation
+        ), mock.patch.object(
+            release_manager,
+            "_trusted_systemd_run",
+            return_value=Path("/usr/bin/systemd-run"),
+        ), mock.patch.object(
+            release_manager, "_run_bounded_output", return_value=completed
+        ):
+            observed, result, flight = release_manager._scan_managed_gui_processes_via_user_manager(
+                layout,
+                state,
+                expected_uid=uid,
+                direct=direct,
+            )
+        assert observed is None
+        assert result == expected
+        assert flight == {
+        "singleflight_role": "leader",
+        "broker_shared": False,
+        "cross_process_role": "leader",
+        "cross_process_shared": False,
+        "cross_process_result": "published",
+    }
+
+    with mock.patch.object(
+        release_manager, "_verify_managed_activation", return_value=activation
+    ), mock.patch.object(
+        release_manager, "_trusted_systemd_run", return_value=Path("/usr/bin/systemd-run")
+    ), mock.patch.object(
+        release_manager,
+        "_run_bounded_output",
+        side_effect=ReleaseError("timed out"),
+    ):
+        observed, result, flight = release_manager._scan_managed_gui_processes_via_user_manager(
+            layout,
+            state,
+            expected_uid=uid,
+            direct=direct,
+        )
+    assert observed is None
+    assert result == "broker-dispatch-failed"
+    assert flight == {
+        "singleflight_role": "leader",
+        "broker_shared": False,
+        "cross_process_role": "leader",
+        "cross_process_shared": False,
+        "cross_process_result": "published",
+    }
+
+
+
+def test_process_observer_flight_key_binds_all_shared_assumptions(
+    tmp_path: Path,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    python = Path(sys.executable).resolve(strict=True)
+    bootstrap = layout.bootstrap_path.resolve(strict=True)
+    prefix = (os.fsencode(str(python)), b"-I", os.fsencode(str(bootstrap)))
+    write_fake_proc_process(
+        proc_root,
+        42,
+        argv=prefix,
+        executable=python,
+        start_ticks=99,
+    )
+    direct = release_manager._scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    source_module = Path(release_manager.__file__).resolve(strict=True)
+    base = release_manager._process_observer_flight_key(
+        layout,
+        state,
+        expected_uid=uid,
+        direct=direct,
+        source_module=source_module,
+    )
+
+    different_process_subset = copy.deepcopy(direct)
+    different_process_subset["processes"] = []
+    assert release_manager._process_observer_flight_key(
+        layout,
+        state,
+        expected_uid=uid,
+        direct=different_process_subset,
+        source_module=source_module,
+    ) == base
+
+    changed_state = copy.deepcopy(state)
+    changed_state["generation"] = int(changed_state["generation"]) + 1
+    changed_boot = copy.deepcopy(direct)
+    changed_boot["boot_id"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    changed_identity = copy.deepcopy(direct)
+    changed_identity["expected_identity"] = {
+        **dict(changed_identity["expected_identity"]),
+        "python_executable": "/different/python",
+    }
+    alternate_layout = release_layout(
+        root=tmp_path / "other-managed",
+        bin_dir=tmp_path / "other-bin",
+    )
+    alternate_source = tmp_path / "other-release-manager.py"
+    alternate_source.write_text("# alternate source\n", encoding="utf-8")
+    variants = (
+        release_manager._process_observer_flight_key(
+            layout,
+            changed_state,
+            expected_uid=uid,
+            direct=direct,
+            source_module=source_module,
+        ),
+        release_manager._process_observer_flight_key(
+            layout,
+            state,
+            expected_uid=uid + 1,
+            direct=direct,
+            source_module=source_module,
+        ),
+        release_manager._process_observer_flight_key(
+            layout,
+            state,
+            expected_uid=uid,
+            direct=changed_boot,
+            source_module=source_module,
+        ),
+        release_manager._process_observer_flight_key(
+            layout,
+            state,
+            expected_uid=uid,
+            direct=changed_identity,
+            source_module=source_module,
+        ),
+        release_manager._process_observer_flight_key(
+            alternate_layout,
+            state,
+            expected_uid=uid,
+            direct=direct,
+            source_module=source_module,
+        ),
+        release_manager._process_observer_flight_key(
+            layout,
+            state,
+            expected_uid=uid,
+            direct=direct,
+            source_module=alternate_source,
+        ),
+    )
+    assert all(candidate != base for candidate in variants)
+
+
+def test_process_observer_singleflight_coalesces_only_inflight_requests() -> None:
+    key = ("same-observation",)
+    entered = threading.Event()
+    release = threading.Event()
+    counter_lock = threading.Lock()
+    dispatch_count = 0
+
+    def dispatch() -> release_manager._ProcessObserverTransportResult:
+        nonlocal dispatch_count
+        with counter_lock:
+            dispatch_count += 1
+        entered.set()
+        assert release.wait(2.0)
+        return release_manager._ProcessObserverTransportResult(
+            "broker-output-ready",
+            b"{}\n",
+        )
+
+    with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+        assert not release_manager._PROCESS_OBSERVER_FLIGHTS
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        leader = executor.submit(
+            release_manager._process_observer_transport_singleflight,
+            key,
+            dispatch,
+        )
+        assert entered.wait(1.0)
+        followers = [
+            executor.submit(
+                release_manager._process_observer_transport_singleflight,
+                key,
+                dispatch,
+            )
+            for _ in range(15)
+        ]
+        deadline = time.monotonic() + 1.0
+        while not all(future.running() for future in followers):
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        time.sleep(0.05)
+        release.set()
+        results = [leader.result(timeout=2.0)] + [
+            future.result(timeout=2.0) for future in followers
+        ]
+
+    assert dispatch_count == 1
+    roles = [metadata["singleflight_role"] for _result, metadata in results]
+    assert roles.count("leader") == 1
+    assert roles.count("follower") == 15
+    assert sum(bool(metadata["broker_shared"]) for _result, metadata in results) == 15
+    assert all(result.result_code == "broker-output-ready" for result, _metadata in results)
+    with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+        assert not release_manager._PROCESS_OBSERVER_FLIGHTS
+
+    def fresh_dispatch() -> release_manager._ProcessObserverTransportResult:
+        nonlocal dispatch_count
+        with counter_lock:
+            dispatch_count += 1
+        return release_manager._ProcessObserverTransportResult(
+            "broker-output-ready",
+            b"{}\n",
+        )
+
+    for _ in range(2):
+        result, metadata = release_manager._process_observer_transport_singleflight(
+            key,
+            dispatch=fresh_dispatch,
+        )
+        assert result.result_code == "broker-output-ready"
+        assert metadata == {"singleflight_role": "leader", "broker_shared": False}
+    # The first concurrent interval used one dispatch; each later non-overlapping
+    # call was a fresh leader rather than a completed-result cache hit.
+    assert dispatch_count == 3
+
+
+def test_process_observer_singleflight_does_not_merge_different_keys() -> None:
+    barrier = threading.Barrier(2)
+    counter_lock = threading.Lock()
+    calls: list[str] = []
+
+    def dispatch(label: str) -> release_manager._ProcessObserverTransportResult:
+        with counter_lock:
+            calls.append(label)
+        barrier.wait(timeout=2.0)
+        return release_manager._ProcessObserverTransportResult(
+            "broker-output-ready",
+            label.encode("ascii"),
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            release_manager._process_observer_transport_singleflight,
+            ("one",),
+            lambda: dispatch("one"),
+        )
+        second = executor.submit(
+            release_manager._process_observer_transport_singleflight,
+            ("two",),
+            lambda: dispatch("two"),
+        )
+        results = (first.result(timeout=3.0), second.result(timeout=3.0))
+    assert sorted(calls) == ["one", "two"]
+    assert all(
+        metadata == {"singleflight_role": "leader", "broker_shared": False}
+        for _result, metadata in results
+    )
+    with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+        assert not release_manager._PROCESS_OBSERVER_FLIGHTS
+
+
+def test_process_observer_singleflight_follower_timeout_is_fail_closed() -> None:
+    key = ("stalled-leader",)
+    flight = release_manager._ProcessObserverFlight()
+    with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+        assert not release_manager._PROCESS_OBSERVER_FLIGHTS
+        release_manager._PROCESS_OBSERVER_FLIGHTS[key] = flight
+    dispatch = mock.Mock(side_effect=AssertionError("follower dispatched unexpectedly"))
+    try:
+        with mock.patch.object(
+            release_manager,
+            "_PROCESS_OBSERVER_FOLLOWER_WAIT_SECONDS",
+            0.01,
+        ):
+            result, metadata = release_manager._process_observer_transport_singleflight(
+                key,
+                dispatch,
+            )
+        assert result.result_code == "broker-singleflight-timeout"
+        assert metadata == {"singleflight_role": "follower", "broker_shared": True}
+        dispatch.assert_not_called()
+    finally:
+        with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+            release_manager._PROCESS_OBSERVER_FLIGHTS.pop(key, None)
+
+
+def test_process_observer_singleflight_leader_exception_releases_followers() -> None:
+    key = ("leader-exception",)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def dispatch() -> release_manager._ProcessObserverTransportResult:
+        entered.set()
+        assert release.wait(2.0)
+        raise RuntimeError("unexpected observer failure")
+
+    with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+        assert not release_manager._PROCESS_OBSERVER_FLIGHTS
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        leader = executor.submit(
+            release_manager._process_observer_transport_singleflight,
+            key,
+            dispatch,
+        )
+        assert entered.wait(1.0)
+        followers = [
+            executor.submit(
+                release_manager._process_observer_transport_singleflight,
+                key,
+                dispatch,
+            )
+            for _ in range(4)
+        ]
+        deadline = time.monotonic() + 1.0
+        while not all(future.running() for future in followers):
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        time.sleep(0.05)
+        release.set()
+        with pytest.raises(RuntimeError, match="unexpected observer failure"):
+            leader.result(timeout=2.0)
+        follower_results = [future.result(timeout=2.0) for future in followers]
+
+    assert all(
+        result.result_code == "broker-leader-exception"
+        and metadata == {"singleflight_role": "follower", "broker_shared": True}
+        for result, metadata in follower_results
+    )
+    with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+        assert not release_manager._PROCESS_OBSERVER_FLIGHTS
+
+
+def test_shared_process_observer_transport_keeps_caller_specific_validation(
+    tmp_path: Path,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    python = Path(sys.executable).resolve(strict=True)
+    bootstrap = layout.bootstrap_path.resolve(strict=True)
+    prefix = (os.fsencode(str(python)), b"-I", os.fsencode(str(bootstrap)))
+    write_fake_proc_process(
+        proc_root,
+        42,
+        argv=prefix,
+        executable=python,
+        start_ticks=99,
+    )
+    complete = release_manager._scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    direct_empty = copy.deepcopy(complete)
+    direct_empty.update(
+        {
+            "complete": False,
+            "posture": "scan-incomplete",
+            "processes": [],
+            "gui_count": 0,
+            "issues": [{"code": "same-uid-candidate-unreadable", "count": 1}],
+        }
+    )
+    direct_subset = copy.deepcopy(complete)
+    direct_subset.update(
+        {
+            "complete": False,
+            "posture": "scan-incomplete",
+            "issues": [{"code": "same-uid-candidate-unreadable", "count": 1}],
+        }
+    )
+    payload = process_observer_receipt(
+        layout=layout,
+        state=state,
+        status=complete,
+        expected_uid=uid,
+    )
+    transport = release_manager._ProcessObserverTransportResult(
+        "broker-output-ready",
+        canonical_json_bytes(payload),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    counter_lock = threading.Lock()
+    validation_lock = threading.Lock()
+    dispatch_count = 0
+    validated_subset_sizes: list[int] = []
+    original_validate = release_manager._validate_process_observer_receipt
+
+    def dispatch(*_args, **_kwargs) -> release_manager._ProcessObserverTransportResult:
+        nonlocal dispatch_count
+        with counter_lock:
+            dispatch_count += 1
+        entered.set()
+        assert release.wait(2.0)
+        return transport
+
+    def validate(payload_value, **kwargs):
+        with validation_lock:
+            validated_subset_sizes.append(len(kwargs["direct"]["processes"]))
+        return original_validate(payload_value, **kwargs)
+
+    activation = {"current_release_id": state["current_release_id"], "legacy": False}
+    with mock.patch.object(
+        release_manager,
+        "_dispatch_process_observer_transport",
+        side_effect=dispatch,
+    ), mock.patch.object(
+        release_manager,
+        "_verify_managed_activation",
+        return_value=activation,
+    ), mock.patch.object(
+        release_manager,
+        "_validate_process_observer_receipt",
+        side_effect=validate,
+    ):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            leader = executor.submit(
+                release_manager._scan_managed_gui_processes_via_user_manager,
+                layout,
+                state,
+                expected_uid=uid,
+                direct=direct_empty,
+            )
+            assert entered.wait(1.0)
+            follower = executor.submit(
+                release_manager._scan_managed_gui_processes_via_user_manager,
+                layout,
+                state,
+                expected_uid=uid,
+                direct=direct_subset,
+            )
+            deadline = time.monotonic() + 1.0
+            while not follower.running():
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            time.sleep(0.05)
+            release.set()
+            results = (leader.result(timeout=2.0), follower.result(timeout=2.0))
+
+    assert dispatch_count == 1
+    # The leader validates its empty direct subset before publication and again
+    # as a caller; the follower independently validates its one-process subset.
+    assert sorted(validated_subset_sizes) == [0, 0, 1]
+    assert all(status == complete and result == "accepted" for status, result, _meta in results)
+    roles = sorted(meta["singleflight_role"] for _status, _result, meta in results)
+    assert roles == ["follower", "leader"]
+    assert sum(bool(meta["broker_shared"]) for _status, _result, meta in results) == 1
+    with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+        assert not release_manager._PROCESS_OBSERVER_FLIGHTS
+
+
+def test_shared_process_observer_follower_revalidates_current_state(
+    tmp_path: Path,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    complete = release_manager._scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    direct = copy.deepcopy(complete)
+    direct.update({"complete": False, "processes": [], "gui_count": 0})
+    payload = process_observer_receipt(
+        layout=layout,
+        state=state,
+        status=complete,
+        expected_uid=uid,
+    )
+    changed = copy.deepcopy(state)
+    changed["generation"] = int(changed["generation"]) + 1
+    transport = release_manager._ProcessObserverTransportResult(
+        "broker-output-ready",
+        canonical_json_bytes(payload),
+    )
+    with mock.patch.object(
+        release_manager,
+        "_process_observer_transport_singleflight",
+        return_value=(
+            transport,
+            {"singleflight_role": "follower", "broker_shared": True},
+        ),
+    ), mock.patch.object(
+        release_manager,
+        "load_managed_state",
+        return_value=changed,
+    ):
+        observed, result, metadata = (
+            release_manager._scan_managed_gui_processes_via_user_manager(
+                layout,
+                state,
+                expected_uid=uid,
+                direct=direct,
+            )
+        )
+    assert observed is None
+    assert result == "broker-receipt-rejected"
+    assert metadata == {
+        "singleflight_role": "follower",
+        "broker_shared": True,
+        "cross_process_role": "none",
+        "cross_process_shared": False,
+        "cross_process_result": "not-attempted",
+    }
+
+
+
+def test_direct_process_scan_flight_key_binds_namespace_state_and_source(
+    tmp_path: Path,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    source_module = Path(release_manager.__file__).resolve(strict=True)
+    base = release_manager._direct_process_scan_flight_key(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=uid,
+        source_module=source_module,
+    )
+
+    changed_state = copy.deepcopy(state)
+    changed_state["generation"] = int(changed_state["generation"]) + 1
+    other_proc = tmp_path / "other-proc"
+    other_proc.mkdir()
+    other_layout = release_layout(
+        root=tmp_path / "other-managed",
+        bin_dir=tmp_path / "other-bin",
+    )
+    variants = (
+        release_manager._direct_process_scan_flight_key(
+            layout,
+            changed_state,
+            proc_root=proc_root,
+            expected_uid=uid,
+            source_module=source_module,
+        ),
+        release_manager._direct_process_scan_flight_key(
+            layout,
+            state,
+            proc_root=proc_root,
+            expected_uid=uid + 1,
+            source_module=source_module,
+        ),
+        release_manager._direct_process_scan_flight_key(
+            layout,
+            state,
+            proc_root=other_proc,
+            expected_uid=uid,
+            source_module=source_module,
+        ),
+        release_manager._direct_process_scan_flight_key(
+            other_layout,
+            state,
+            proc_root=proc_root,
+            expected_uid=uid,
+            source_module=source_module,
+        ),
+        release_manager._direct_process_scan_flight_key(
+            layout,
+            state,
+            proc_root=proc_root,
+            expected_uid=uid,
+            source_module=tmp_path / "other-release-manager.py",
+        ),
+    )
+    assert all(candidate != base for candidate in variants)
+
+
+def test_direct_process_scan_singleflight_coalesces_and_reparses(
+    tmp_path: Path,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    status = release_manager._scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    counter_lock = threading.Lock()
+    calls = 0
+
+    def scan(*_args, **_kwargs):
+        nonlocal calls
+        with counter_lock:
+            calls += 1
+        entered.set()
+        assert release.wait(2.0)
+        return copy.deepcopy(status)
+
+    def call():
+        return release_manager._scan_managed_gui_processes_singleflight(
+            layout,
+            state,
+            proc_root=proc_root,
+            expected_uid=uid,
+        )
+
+    with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+        assert not release_manager._PROCESS_OBSERVER_FLIGHTS
+    with mock.patch.object(
+        release_manager,
+        "_scan_managed_gui_processes",
+        side_effect=scan,
+    ):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            leader = executor.submit(call)
+            assert entered.wait(1.0)
+            followers = [executor.submit(call) for _ in range(15)]
+            deadline = time.monotonic() + 1.0
+            while not all(future.running() for future in followers):
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            time.sleep(0.05)
+            release.set()
+            results = [leader.result(timeout=2.0)] + [
+                future.result(timeout=2.0) for future in followers
+            ]
+
+    assert calls == 1
+    roles = [metadata["direct_singleflight_role"] for _result, metadata in results]
+    assert roles.count("leader") == 1
+    assert roles.count("follower") == 15
+    assert sum(bool(metadata["direct_shared"]) for _result, metadata in results) == 15
+    assert all(metadata["direct_scan_result"] == "accepted" for _result, metadata in results)
+    payloads = [result for result, _metadata in results]
+    assert all(result == status for result in payloads)
+    assert len({id(result) for result in payloads}) == 16
+    assert len({id(result["processes"]) for result in payloads}) == 16
+    assert len({id(result["issues"]) for result in payloads}) == 16
+    with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+        assert not release_manager._PROCESS_OBSERVER_FLIGHTS
+
+    sequential_calls = 0
+
+    def sequential_scan(*_args, **_kwargs):
+        nonlocal sequential_calls
+        sequential_calls += 1
+        return copy.deepcopy(status)
+
+    with mock.patch.object(
+        release_manager,
+        "_scan_managed_gui_processes",
+        side_effect=sequential_scan,
+    ):
+        first, first_meta = call()
+        second, second_meta = call()
+    assert sequential_calls == 2
+    assert first == second == status
+    assert first is not second
+    assert first_meta == second_meta == {
+        "direct_singleflight_role": "leader",
+        "direct_shared": False,
+        "direct_scan_result": "accepted",
+    }
+
+
+def test_direct_process_scan_singleflight_does_not_merge_different_keys(
+    tmp_path: Path,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    other_proc = tmp_path / "other-proc"
+    other_proc.mkdir()
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    calls: list[str] = []
+
+    def scan(_layout, _state, *, proc_root: Path, expected_uid: int):
+        del _layout, _state, expected_uid
+        label = str(proc_root)
+        with lock:
+            calls.append(label)
+        barrier.wait(timeout=2.0)
+        return release_manager._direct_scan_failure_status(
+            state,
+            expected_uid=uid,
+            issue_code="expected-test-result",
+        )
+
+    def call(root: Path):
+        return release_manager._scan_managed_gui_processes_singleflight(
+            layout,
+            state,
+            proc_root=root,
+            expected_uid=uid,
+        )
+
+    with mock.patch.object(
+        release_manager,
+        "_scan_managed_gui_processes",
+        side_effect=scan,
+    ):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(call, proc_root)
+            second = executor.submit(call, other_proc)
+            results = (first.result(timeout=3.0), second.result(timeout=3.0))
+    assert sorted(calls) == sorted([str(proc_root), str(other_proc)])
+    assert all(
+        metadata == {
+            "direct_singleflight_role": "leader",
+            "direct_shared": False,
+            "direct_scan_result": "accepted",
+        }
+        for _result, metadata in results
+    )
+    with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+        assert not release_manager._PROCESS_OBSERVER_FLIGHTS
+
+
+def test_direct_process_scan_timeout_is_synthetic_and_does_not_rescan(
+    tmp_path: Path,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    source_module = Path(release_manager.__file__).resolve(strict=True)
+    key = release_manager._direct_process_scan_flight_key(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=uid,
+        source_module=source_module,
+    )
+    flight = release_manager._ProcessObserverFlight()
+    with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+        assert not release_manager._PROCESS_OBSERVER_FLIGHTS
+        release_manager._PROCESS_OBSERVER_FLIGHTS[key] = flight
+    try:
+        with mock.patch.object(
+            release_manager,
+            "_PROCESS_DIRECT_SCAN_FOLLOWER_WAIT_SECONDS",
+            0.01,
+        ), mock.patch.object(
+            release_manager,
+            "_scan_managed_gui_processes",
+        ) as scan:
+            status, metadata = release_manager._scan_managed_gui_processes_singleflight(
+                layout,
+                state,
+                proc_root=proc_root,
+                expected_uid=uid,
+            )
+        scan.assert_not_called()
+        assert status["complete"] is False
+        assert status["posture"] == "scan-incomplete"
+        assert status["activation"]["safe"] is False
+        assert status["issues"] == [
+            {"code": "direct-singleflight-timeout", "count": 1}
+        ]
+        assert metadata == {
+            "direct_singleflight_role": "follower",
+            "direct_shared": True,
+            "direct_scan_result": "direct-singleflight-timeout",
+        }
+    finally:
+        with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+            release_manager._PROCESS_OBSERVER_FLIGHTS.pop(key, None)
+
+
+def test_direct_process_scan_failure_is_synthetic_and_registry_is_cleared(
+    tmp_path: Path,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    with mock.patch.object(
+        release_manager,
+        "_scan_managed_gui_processes",
+        side_effect=RuntimeError("procfs reader failed"),
+    ):
+        status, metadata = release_manager._scan_managed_gui_processes_singleflight(
+            layout,
+            state,
+            proc_root=proc_root,
+            expected_uid=uid,
+        )
+    assert status["complete"] is False
+    assert status["activation"] == {
+        "safe": False,
+        "decision": "refuse-incomplete",
+        "requires_shutdown": False,
+    }
+    assert status["issues"] == [{"code": "direct-scan-failed", "count": 1}]
+    assert metadata == {
+        "direct_singleflight_role": "leader",
+        "direct_shared": False,
+        "direct_scan_result": "direct-scan-failed",
+    }
+    with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
+        assert not release_manager._PROCESS_OBSERVER_FLIGHTS
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.update({"schema": "wrong-schema"}),
+        lambda payload: payload.update({"expected_uid": int(payload["expected_uid"]) + 1}),
+        lambda payload: payload.update({"argv": ["private"]}),
+        lambda payload: payload.update({"gui_count": True}),
+    ],
+)
+def test_direct_process_scan_rejects_invalid_shared_bytes(
+    tmp_path: Path,
+    mutation,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    valid = release_manager._scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=uid,
+    )
+    mutation(valid)
+    transport = release_manager._ProcessObserverTransportResult(
+        "direct-scan-output-ready",
+        canonical_json_bytes(valid),
+    )
+    with mock.patch.object(
+        release_manager,
+        "_process_observer_transport_singleflight",
+        return_value=(
+            transport,
+            {"singleflight_role": "follower", "broker_shared": True},
+        ),
+    ):
+        status, metadata = release_manager._scan_managed_gui_processes_singleflight(
+            layout,
+            state,
+            proc_root=proc_root,
+            expected_uid=uid,
+        )
+    assert status["complete"] is False
+    assert status["issues"] == [
+        {"code": "direct-scan-output-invalid", "count": 1}
+    ]
+    assert metadata == {
+        "direct_singleflight_role": "follower",
+        "direct_shared": True,
+        "direct_scan_result": "direct-scan-output-invalid",
+    }
+
+
+def test_observer_never_brokers_after_synthetic_direct_failure(
+    tmp_path: Path,
+) -> None:
+    _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
+    uid = os.getuid()
+    synthetic = release_manager._direct_scan_failure_status(
+        state,
+        expected_uid=uid,
+        issue_code="direct-singleflight-timeout",
+    )
+    metadata = {
+        "direct_singleflight_role": "follower",
+        "direct_shared": True,
+        "direct_scan_result": "direct-singleflight-timeout",
+    }
+    with mock.patch.object(
+        release_manager,
+        "_scan_managed_gui_processes_singleflight",
+        return_value=(synthetic, metadata),
+    ), mock.patch.object(
+        release_manager,
+        "_scan_managed_gui_processes_via_user_manager",
+    ) as broker:
+        observed = release_manager._observe_managed_gui_processes(
+            layout,
+            state,
+            proc_root=Path("/proc"),
+            expected_uid=uid,
+            allow_user_manager_broker=True,
+        )
+    broker.assert_not_called()
+    assert observed["complete"] is False
+    assert observed["issues"] == [
+        {"code": "direct-singleflight-timeout", "count": 1}
+    ]
+    assert observed["observer"]["direct_scan_result"] == (
+        "direct-singleflight-timeout"
+    )
+    assert observed["observer"]["broker_attempted"] is False
+
+
+
+def test_cross_process_flight_publication_is_private_and_start_bound(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "cross-runtime"
+    root = release_manager._canonical_process_cross_root(
+        uid,
+        runtime_root=runtime,
+    )
+    assert root == runtime.absolute()
+    metadata = root.lstat()
+    assert stat.S_ISDIR(metadata.st_mode)
+    assert stat.S_IMODE(metadata.st_mode) == 0o700
+    assert metadata.st_uid == uid
+
+    key = ("cross-publication", "v2")
+    concurrent_start = time.monotonic_ns()
+    leader = release_manager._admit_cross_process_flight(
+        key,
+        expected_uid=uid,
+        runtime_root=runtime,
+        request_started_monotonic_ns=concurrent_start,
+    )
+    follower = release_manager._admit_cross_process_flight(
+        key,
+        expected_uid=uid,
+        runtime_root=runtime,
+        request_started_monotonic_ns=concurrent_start,
+    )
+    assert leader.role == "leader"
+    assert follower.role == "follower"
+    assert follower.nonce == leader.nonce
+    assert follower.result_path == leader.result_path
+    assert follower.leader_pid == leader.leader_pid == os.getpid()
+    assert follower.leader_start_ticks == leader.leader_start_ticks
+    for protocol_file in (leader.state_path, leader.lock_path):
+        observed = protocol_file.lstat()
+        assert stat.S_ISREG(observed.st_mode)
+        assert stat.S_IMODE(observed.st_mode) == 0o600
+        assert observed.st_uid == uid
+        assert observed.st_nlink == 1
+
+    raw = b'{"redaction_safe":true}\n'
+    published = release_manager._publish_cross_result(
+        leader,
+        release_manager._ProcessObserverTransportResult(
+            "broker-output-ready",
+            raw,
+        ),
+        expected_uid=uid,
+    )
+    assert published == release_manager._ProcessObserverTransportResult(
+        "broker-output-ready",
+        raw,
+    )
+    state = release_manager._read_cross_json(
+        leader.state_path,
+        expected_uid=uid,
+        max_bytes=release_manager._PROCESS_CROSS_MAX_STATE_BYTES,
+    )
+    assert state is not None
+    assert state["phase"] == "published"
+    published_ns = int(state["published_monotonic_ns"])
+    assert concurrent_start <= published_ns
+    result_metadata = leader.result_path.lstat()
+    assert stat.S_ISREG(result_metadata.st_mode)
+    assert stat.S_IMODE(result_metadata.st_mode) == 0o600
+    assert result_metadata.st_uid == uid
+    assert result_metadata.st_nlink == 1
+    assert release_manager._wait_cross_result(
+        follower,
+        expected_uid=uid,
+    ) == published
+
+    late_concurrent = release_manager._admit_cross_process_flight(
+        key,
+        expected_uid=uid,
+        runtime_root=runtime,
+        request_started_monotonic_ns=concurrent_start,
+    )
+    assert late_concurrent.role == "follower"
+    assert late_concurrent.nonce == leader.nonce
+    assert release_manager._wait_cross_result(
+        late_concurrent,
+        expected_uid=uid,
+    ) == published
+
+    while time.monotonic_ns() <= published_ns:
+        pass
+    post_publication_start = time.monotonic_ns()
+    fresh = release_manager._admit_cross_process_flight(
+        key,
+        expected_uid=uid,
+        runtime_root=runtime,
+        request_started_monotonic_ns=post_publication_start,
+    )
+    assert fresh.role == "leader"
+    assert fresh.nonce != leader.nonce
+    assert fresh.result_path != leader.result_path
+    # The fresh post-publication leader replaces only admission state. A
+    # previously admitted follower can still consume the old nonce-bound result.
+    assert release_manager._wait_cross_result(
+        late_concurrent,
+        expected_uid=uid,
+    ) == published
+    release_manager._clear_matching_cross_state(fresh, expected_uid=uid)
+
+
+def test_cross_process_follower_uses_fresh_clock_after_state_read(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = release_manager._canonical_process_cross_root(
+        uid,
+        runtime_root=tmp_path / "fresh-clock-after-state-read",
+    )
+    key = ("fresh-clock-after-state-read",)
+    key_sha256 = sha256_bytes(canonical_json_bytes(key))
+    nonce = "a" * 32
+    result_name = f"result-{key_sha256}-{nonce}.json"
+    start_ticks = release_manager._process_start_time(os.getpid())
+    assert start_ticks is not None
+    state_path = runtime / f"flight-{key_sha256}.json"
+    release_manager._atomic_write_bytes(
+        state_path,
+        canonical_json_bytes(
+            {
+                "schema": release_manager._PROCESS_CROSS_STATE_SCHEMA,
+                "key_sha256": key_sha256,
+                "nonce": nonce,
+                "result_name": result_name,
+                "leader_pid": os.getpid(),
+                "leader_start_ticks": start_ticks,
+                "boot_id": release_manager._read_boot_id(Path("/proc")),
+                "started_monotonic_ns": 100,
+                "phase": "running",
+                "published_monotonic_ns": 0,
+            }
+        ),
+        mode=0o600,
+    )
+
+    # The caller samples 90 before waiting for the registry lock. The live
+    # leader publishes its state at 100 before the follower reads it. Admission
+    # must refresh the clock after reading state and validate with 110; using
+    # the stale 90 sample incorrectly gives a negative age and creates a second
+    # leader.
+    with mock.patch.object(
+        release_manager,
+        "_cleanup_cross_results",
+    ), mock.patch.object(
+        release_manager.time,
+        "monotonic_ns",
+        side_effect=[90, 110],
+    ):
+        follower = release_manager._admit_cross_process_flight(
+            key,
+            expected_uid=uid,
+            runtime_root=runtime,
+        )
+
+    assert follower.role == "follower"
+    assert follower.nonce == nonce
+    assert follower.leader_pid == os.getpid()
+    assert follower.leader_start_ticks == start_ticks
+
+
+def test_cross_process_published_result_does_not_require_live_publisher(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "published-dead-leader"
+    key = ("published-dead-leader",)
+    concurrent_start = time.monotonic_ns()
+    leader = release_manager._admit_cross_process_flight(
+        key,
+        expected_uid=uid,
+        runtime_root=runtime,
+        request_started_monotonic_ns=concurrent_start,
+    )
+    published = release_manager._publish_cross_result(
+        leader,
+        release_manager._ProcessObserverTransportResult(
+            "broker-output-ready",
+            b"published\n",
+        ),
+        expected_uid=uid,
+    )
+    with mock.patch.object(
+        release_manager,
+        "_process_start_time",
+        return_value=None,
+    ):
+        follower = release_manager._admit_cross_process_flight(
+            key,
+            expected_uid=uid,
+            runtime_root=runtime,
+            request_started_monotonic_ns=concurrent_start,
+        )
+    assert follower.role == "follower"
+    assert follower.nonce == leader.nonce
+    assert release_manager._wait_cross_result(
+        follower,
+        expected_uid=uid,
+    ) == published
+
+
+@pytest.mark.parametrize("request_start", [True, -1, "123", 1.5])
+def test_cross_process_request_start_rejects_invalid_values(
+    tmp_path: Path,
+    request_start: object,
+) -> None:
+    uid = os.getuid()
+    with pytest.raises(ReleaseError, match="request start"):
+        release_manager._admit_cross_process_flight(
+            ("invalid-request-start", repr(request_start)),
+            expected_uid=uid,
+            runtime_root=tmp_path / repr(request_start),
+            request_started_monotonic_ns=request_start,
+        )
+
+
+
+def test_cross_process_request_start_rejects_future_value(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    with pytest.raises(ReleaseError, match="request start"):
+        release_manager._admit_cross_process_flight(
+            ("future-request-start",),
+            expected_uid=uid,
+            runtime_root=tmp_path / "future",
+            request_started_monotonic_ns=time.monotonic_ns() + 1_000_000_000,
+        )
+
+
+def test_cross_process_published_state_cleanup_is_bounded(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "published-state-cleanup"
+    leader = release_manager._admit_cross_process_flight(
+        ("published-state-cleanup",),
+        expected_uid=uid,
+        runtime_root=runtime,
+    )
+    release_manager._publish_cross_result(
+        leader,
+        release_manager._ProcessObserverTransportResult(
+            "broker-output-ready",
+            b"cleanup\n",
+        ),
+        expected_uid=uid,
+    )
+    assert leader.state_path.exists()
+    assert leader.result_path.exists()
+    with mock.patch.object(
+        release_manager,
+        "_PROCESS_CROSS_LATE_JOIN_TTL_NS",
+        0,
+    ):
+        time.sleep(0.001)
+        release_manager._cleanup_cross_results(
+            runtime,
+            expected_uid=uid,
+            current_boot_id=leader.boot_id,
+        )
+    assert not leader.state_path.exists()
+    # Result retention is independently longer so already-admitted followers
+    # are not stranded when the late-join marker expires.
+    assert leader.result_path.exists()
+
+
+def test_cross_process_distinct_keys_use_one_bounded_registry_lock(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "registry-cardinality"
+    key_count = 64
+    for index in range(key_count):
+        observed = release_manager._process_observer_cross_process_singleflight(
+            ("registry-cardinality", str(index)),
+            expected_uid=uid,
+            runtime_root=runtime,
+            dispatch=lambda index=index: release_manager._ProcessObserverTransportResult(
+                "broker-output-ready",
+                f'{{"index":{index}}}\n'.encode("ascii"),
+            ),
+        )
+        assert observed.result_code == "broker-output-ready"
+        assert observed.cross_process_role == "leader"
+        assert observed.cross_process_shared is False
+
+    lock_names = sorted(path.name for path in runtime.glob("*.lock"))
+    legacy_lock_names = [
+        name
+        for name in lock_names
+        if name.startswith("flight-") and name.endswith(".lock")
+    ]
+    assert lock_names == ["registry.lock"]
+    assert legacy_lock_names == []
+    state_paths = sorted(runtime.glob("flight-*.json"))
+    assert len(state_paths) == key_count
+    for state_path in state_paths:
+        state = release_manager._read_cross_json(
+            state_path,
+            expected_uid=uid,
+            max_bytes=release_manager._PROCESS_CROSS_MAX_STATE_BYTES,
+        )
+        assert state is not None
+        assert state["phase"] == "published"
+        assert int(state["published_monotonic_ns"]) > 0
+
+
+
+def test_cross_process_registry_lock_preserves_legacy_locks_as_inert(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = release_manager._canonical_process_cross_root(
+        uid,
+        runtime_root=tmp_path / "legacy-locks",
+    )
+    legacy = runtime / f"flight-{'a' * 64}.lock"
+    legacy.write_bytes(b"legacy-lock-inode\n")
+    legacy.chmod(0o600)
+    before = legacy.lstat()
+    before_sha256 = sha256_file(legacy)
+
+    for index in range(4):
+        observed = release_manager._process_observer_cross_process_singleflight(
+            ("legacy-lock-preservation", str(index)),
+            expected_uid=uid,
+            runtime_root=runtime,
+            dispatch=lambda index=index: release_manager._ProcessObserverTransportResult(
+                "broker-output-ready",
+                f'{{"legacy_probe":{index}}}\n'.encode("ascii"),
+            ),
+        )
+        assert observed.result_code == "broker-output-ready"
+        assert observed.cross_process_role == "leader"
+
+    after = legacy.lstat()
+    assert (after.st_dev, after.st_ino, after.st_nlink) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_nlink,
+    )
+    assert sha256_file(legacy) == before_sha256
+    assert release_manager._PROCESS_CROSS_LEGACY_LOCK_NAME.fullmatch(
+        legacy.name
+    )
+    assert sorted(path.name for path in runtime.glob("*.lock")) == [
+        legacy.name,
+        release_manager._PROCESS_CROSS_REGISTRY_LOCK_NAME,
+    ]
+
+
+def test_cross_process_registry_lock_is_released_before_different_key_dispatch(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "different-key-concurrency"
+    barrier = threading.Barrier(2)
+    entered: list[str] = []
+    entered_lock = threading.Lock()
+
+    def dispatch(label: str) -> release_manager._ProcessObserverTransportResult:
+        with entered_lock:
+            entered.append(label)
+        barrier.wait(timeout=2.0)
+        return release_manager._ProcessObserverTransportResult(
+            "broker-output-ready",
+            label.encode("ascii") + b"\n",
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            release_manager._process_observer_cross_process_singleflight,
+            ("different-key", "one"),
+            expected_uid=uid,
+            runtime_root=runtime,
+            dispatch=lambda: dispatch("one"),
+        )
+        second = executor.submit(
+            release_manager._process_observer_cross_process_singleflight,
+            ("different-key", "two"),
+            expected_uid=uid,
+            runtime_root=runtime,
+            dispatch=lambda: dispatch("two"),
+        )
+        results = (first.result(timeout=3.0), second.result(timeout=3.0))
+
+    assert sorted(entered) == ["one", "two"]
+    assert all(result.cross_process_role == "leader" for result in results)
+    assert sorted(path.name for path in runtime.glob("*.lock")) == [
+        release_manager._PROCESS_CROSS_REGISTRY_LOCK_NAME
+    ]
+
+
+def test_cross_process_registry_lock_wait_is_bounded(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = release_manager._canonical_process_cross_root(
+        uid,
+        runtime_root=tmp_path / "held-registry-lock",
+    )
+    lock_path = runtime / release_manager._PROCESS_CROSS_REGISTRY_LOCK_NAME
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        release_manager.fcntl.flock(descriptor, release_manager.fcntl.LOCK_EX)
+        started = time.monotonic()
+        with pytest.raises(ReleaseError, match="timed out"):
+            with release_manager._cross_process_lock(
+                runtime,
+                expected_uid=uid,
+                wait_seconds=0.03,
+            ):
+                raise AssertionError("unreachable")
+        elapsed = time.monotonic() - started
+        assert 0.02 <= elapsed < 0.5
+    finally:
+        release_manager.fcntl.flock(descriptor, release_manager.fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("shape", ["symlink", "directory", "wrong-mode", "hard-link"])
+def test_cross_process_registry_lock_rejects_unsafe_shapes(
+    tmp_path: Path,
+    shape: str,
+) -> None:
+    uid = os.getuid()
+    runtime = release_manager._canonical_process_cross_root(
+        uid,
+        runtime_root=tmp_path / shape,
+    )
+    lock_path = runtime / release_manager._PROCESS_CROSS_REGISTRY_LOCK_NAME
+    if shape == "symlink":
+        target = runtime / "target"
+        target.write_bytes(b"")
+        target.chmod(0o600)
+        lock_path.symlink_to(target)
+    elif shape == "directory":
+        lock_path.mkdir(mode=0o700)
+    elif shape == "wrong-mode":
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o644)
+    elif shape == "hard-link":
+        target = runtime / "target"
+        target.write_bytes(b"")
+        target.chmod(0o600)
+        os.link(target, lock_path)
+    else:  # pragma: no cover - parametrization contract
+        raise AssertionError(shape)
+
+    with pytest.raises(ReleaseError, match="registry lock"):
+        release_manager._admit_cross_process_flight(
+            ("unsafe-registry-lock", shape),
+            expected_uid=uid,
+            runtime_root=runtime,
+        )
+
+
+def test_cross_process_runtime_and_protocol_files_reject_unsafe_shapes(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    unsafe = tmp_path / "unsafe-runtime"
+    unsafe.mkdir(mode=0o700)
+    unsafe.chmod(0o755)
+    with pytest.raises(ReleaseError, match="unsafe"):
+        release_manager._canonical_process_cross_root(
+            uid,
+            runtime_root=unsafe,
+        )
+    target = tmp_path / "runtime-target"
+    target.mkdir(mode=0o700)
+    linked_runtime = tmp_path / "linked-runtime"
+    linked_runtime.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ReleaseError, match="unsafe"):
+        release_manager._canonical_process_cross_root(
+            uid,
+            runtime_root=linked_runtime,
+        )
+    with pytest.raises(ReleaseError, match="UID"):
+        release_manager._canonical_process_cross_root(
+            uid + 1,
+            runtime_root=tmp_path / "wrong-user-runtime",
+        )
+
+    root = tmp_path / "files"
+    root.mkdir(mode=0o700)
+    wrong_mode = root / "wrong-mode.json"
+    wrong_mode.write_text("{}\n", encoding="utf-8")
+    wrong_mode.chmod(0o644)
+    with pytest.raises(ReleaseError, match="unsafe|oversized"):
+        release_manager._read_cross_file(
+            wrong_mode,
+            expected_uid=uid,
+            max_bytes=1024,
+        )
+
+    regular = root / "regular.json"
+    regular.write_text("{}\n", encoding="utf-8")
+    regular.chmod(0o600)
+    hardlink = root / "hardlink.json"
+    os.link(regular, hardlink)
+    with pytest.raises(ReleaseError, match="unsafe|oversized"):
+        release_manager._read_cross_file(
+            hardlink,
+            expected_uid=uid,
+            max_bytes=1024,
+        )
+
+    symlink = root / "symlink.json"
+    symlink.symlink_to(regular)
+    with pytest.raises(ReleaseError, match="unsafe|oversized"):
+        release_manager._read_cross_file(
+            symlink,
+            expected_uid=uid,
+            max_bytes=1024,
+        )
+
+    oversized = root / "oversized.json"
+    oversized.write_bytes(b"x" * 1025)
+    oversized.chmod(0o600)
+    with pytest.raises(ReleaseError, match="unsafe|oversized"):
+        release_manager._read_cross_file(
+            oversized,
+            expected_uid=uid,
+            max_bytes=1024,
+        )
+
+    noncanonical = root / "noncanonical.json"
+    noncanonical.write_text('{"value": 1}\n', encoding="utf-8")
+    noncanonical.chmod(0o600)
+    with pytest.raises(ReleaseError, match="not canonical"):
+        release_manager._read_cross_json(
+            noncanonical,
+            expected_uid=uid,
+            max_bytes=1024,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["pid-reuse", "expired", "wrong-boot", "invalid-schema", "extra-field"],
+)
+def test_cross_process_stale_or_invalid_leader_is_replaced(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / mutation
+    key = ("stale-leader", mutation)
+    first = release_manager._admit_cross_process_flight(
+        key,
+        expected_uid=uid,
+        runtime_root=runtime,
+    )
+    state = release_manager._read_cross_json(
+        first.state_path,
+        expected_uid=uid,
+        max_bytes=release_manager._PROCESS_CROSS_MAX_STATE_BYTES,
+    )
+    assert state is not None
+    if mutation == "pid-reuse":
+        state["leader_start_ticks"] = int(state["leader_start_ticks"]) + 1
+    elif mutation == "expired":
+        state["started_monotonic_ns"] = (
+            time.monotonic_ns() - release_manager._PROCESS_CROSS_MAX_AGE_NS - 1
+        )
+    elif mutation == "wrong-boot":
+        state["boot_id"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    elif mutation == "invalid-schema":
+        state["schema"] = "wrong-schema"
+    elif mutation == "extra-field":
+        state["unexpected"] = True
+    else:  # pragma: no cover - parametrization contract
+        raise AssertionError(mutation)
+    release_manager._atomic_write_bytes(
+        first.state_path,
+        canonical_json_bytes(state),
+        mode=0o600,
+    )
+
+    replacement = release_manager._admit_cross_process_flight(
+        key,
+        expected_uid=uid,
+        runtime_root=runtime,
+    )
+    assert replacement.role == "leader"
+    assert replacement.nonce != first.nonce
+    release_manager._clear_matching_cross_state(replacement, expected_uid=uid)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "schema",
+        "key",
+        "nonce",
+        "result-code",
+        "base64",
+        "size",
+        "digest",
+        "publisher-pid",
+        "publisher-start",
+        "boot",
+        "expired",
+        "future",
+        "extra-field",
+    ],
+)
+def test_cross_process_result_receipt_rejects_tampering(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / mutation
+    admission = release_manager._admit_cross_process_flight(
+        ("result-tamper", mutation),
+        expected_uid=uid,
+        runtime_root=runtime,
+    )
+    payload = release_manager._cross_result_payload(
+        admission,
+        release_manager._ProcessObserverTransportResult(
+            "broker-output-ready",
+            b"safe-output\n",
+        ),
+    )
+    if mutation == "schema":
+        payload["schema"] = "wrong-schema"
+    elif mutation == "key":
+        payload["key_sha256"] = "0" * 64
+    elif mutation == "nonce":
+        payload["nonce"] = "0" * 32
+    elif mutation == "result-code":
+        payload["result_code"] = "NOT VALID"
+    elif mutation == "base64":
+        payload["stdout_base64"] = "%%%"
+    elif mutation == "size":
+        payload["stdout_size"] = int(payload["stdout_size"]) + 1
+    elif mutation == "digest":
+        payload["stdout_sha256"] = "0" * 64
+    elif mutation == "publisher-pid":
+        payload["publisher_pid"] = admission.leader_pid + 1
+    elif mutation == "publisher-start":
+        payload["publisher_start_ticks"] = admission.leader_start_ticks + 1
+    elif mutation == "boot":
+        payload["boot_id"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    elif mutation == "expired":
+        payload["published_monotonic_ns"] = (
+            time.monotonic_ns() - release_manager._PROCESS_CROSS_RESULT_TTL_NS - 1
+        )
+    elif mutation == "future":
+        payload["published_monotonic_ns"] = time.monotonic_ns() + 1_000_000_000
+    elif mutation == "extra-field":
+        payload["unexpected"] = True
+    else:  # pragma: no cover - parametrization contract
+        raise AssertionError(mutation)
+    release_manager._atomic_write_bytes(
+        admission.result_path,
+        canonical_json_bytes(payload),
+        mode=0o600,
+    )
+    with pytest.raises(ReleaseError, match="invalid"):
+        release_manager._read_cross_result(admission, expected_uid=uid)
+    release_manager._clear_matching_cross_state(admission, expected_uid=uid)
+
+
+def test_cross_process_follower_timeout_does_not_dispatch_duplicate(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "timeout"
+    key = ("cross-timeout",)
+    leader = release_manager._admit_cross_process_flight(
+        key,
+        expected_uid=uid,
+        runtime_root=runtime,
+    )
+    dispatch = mock.Mock(
+        side_effect=AssertionError("cross-process follower dispatched unexpectedly")
+    )
+    try:
+        with mock.patch.object(
+            release_manager,
+            "_PROCESS_CROSS_WAIT_SECONDS",
+            0.01,
+        ):
+            observed = release_manager._process_observer_cross_process_singleflight(
+                key,
+                expected_uid=uid,
+                dispatch=dispatch,
+                runtime_root=runtime,
+            )
+        dispatch.assert_not_called()
+        assert observed.result_code == "cross-process-follower-timeout"
+        assert observed.cross_process_role == "follower"
+        assert observed.cross_process_shared is True
+        assert observed.cross_process_result == "cross-process-follower-timeout"
+    finally:
+        release_manager._clear_matching_cross_state(leader, expected_uid=uid)
+
+
+def test_cross_process_unavailable_runtime_falls_back_to_local_dispatch(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o700)
+    unsafe.chmod(0o755)
+    local = release_manager._ProcessObserverTransportResult(
+        "broker-output-ready",
+        b"local\n",
+    )
+    dispatch = mock.Mock(return_value=local)
+    observed = release_manager._process_observer_cross_process_singleflight(
+        ("fallback-local",),
+        expected_uid=uid,
+        dispatch=dispatch,
+        runtime_root=unsafe,
+    )
+    dispatch.assert_called_once_with()
+    assert observed == release_manager._ProcessObserverTransportResult(
+        "broker-output-ready",
+        b"local\n",
+        "unavailable-local",
+        False,
+        "unavailable-local",
+    )
+
+
+def test_cross_process_leader_exception_publishes_and_wakes_followers(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "leader-exception"
+    key = ("cross-leader-exception",)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def leader_dispatch() -> release_manager._ProcessObserverTransportResult:
+        entered.set()
+        assert release.wait(2.0)
+        raise RuntimeError("unexpected broker failure")
+
+    follower_dispatch = mock.Mock(
+        side_effect=AssertionError("cross-process follower dispatched unexpectedly")
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        leader = executor.submit(
+            release_manager._process_observer_cross_process_singleflight,
+            key,
+            expected_uid=uid,
+            dispatch=leader_dispatch,
+            runtime_root=runtime,
+        )
+        assert entered.wait(1.0)
+        follower = executor.submit(
+            release_manager._process_observer_cross_process_singleflight,
+            key,
+            expected_uid=uid,
+            dispatch=follower_dispatch,
+            runtime_root=runtime,
+        )
+        deadline = time.monotonic() + 1.0
+        while not follower.running():
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        time.sleep(0.05)
+        release.set()
+        with pytest.raises(RuntimeError, match="unexpected broker failure"):
+            leader.result(timeout=2.0)
+        follower_result = follower.result(timeout=2.0)
+    follower_dispatch.assert_not_called()
+    assert follower_result.result_code == "cross-process-leader-exception"
+    assert follower_result.cross_process_role == "follower"
+    assert follower_result.cross_process_shared is True
+    assert follower_result.cross_process_result == "shared"
+    state_files = list(runtime.glob("flight-*.json"))
+    assert len(state_files) == 1
+    state = release_manager._read_cross_json(
+        state_files[0],
+        expected_uid=uid,
+        max_bytes=release_manager._PROCESS_CROSS_MAX_STATE_BYTES,
+    )
+    assert state is not None
+    assert state["phase"] == "published"
+    assert int(state["published_monotonic_ns"]) > 0
+
+
+def test_cross_process_result_cleanup_and_capacity_are_bounded(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "cleanup"
+    first = release_manager._admit_cross_process_flight(
+        ("cleanup-stale",),
+        expected_uid=uid,
+        runtime_root=runtime,
+    )
+    payload = release_manager._cross_result_payload(
+        first,
+        release_manager._ProcessObserverTransportResult(
+            "broker-output-ready",
+            b"stale\n",
+        ),
+    )
+    payload["published_monotonic_ns"] = (
+        time.monotonic_ns() - release_manager._PROCESS_CROSS_RESULT_TTL_NS - 1
+    )
+    release_manager._atomic_write_bytes(
+        first.result_path,
+        canonical_json_bytes(payload),
+        mode=0o600,
+    )
+    release_manager._clear_matching_cross_state(first, expected_uid=uid)
+    release_manager._cleanup_cross_results(
+        runtime,
+        expected_uid=uid,
+        current_boot_id=first.boot_id,
+    )
+    assert not first.result_path.exists()
+
+    fresh = release_manager._admit_cross_process_flight(
+        ("cleanup-capacity",),
+        expected_uid=uid,
+        runtime_root=runtime,
+    )
+    release_manager._publish_cross_result(
+        fresh,
+        release_manager._ProcessObserverTransportResult(
+            "broker-output-ready",
+            b"fresh\n",
+        ),
+        expected_uid=uid,
+    )
+    with mock.patch.object(
+        release_manager,
+        "_PROCESS_CROSS_MAX_CLEANUP_ENTRIES",
+        1,
+    ), pytest.raises(ReleaseError, match="capacity"):
+        release_manager._cleanup_cross_results(
+            runtime,
+            expected_uid=uid,
+            current_boot_id=fresh.boot_id,
+        )
+
+
+
+def test_cross_process_runtime_directory_entry_work_is_bounded(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = release_manager._canonical_process_cross_root(
+        uid,
+        runtime_root=tmp_path / "directory-entry-bound",
+    )
+    for index in range(5):
+        unrelated = runtime / f"unrelated-{index}"
+        unrelated.write_bytes(b"inert\n")
+        unrelated.chmod(0o600)
+
+    with mock.patch.object(
+        release_manager,
+        "_PROCESS_CROSS_MAX_DIRECTORY_ENTRIES",
+        4,
+        create=True,
+    ), pytest.raises(ReleaseError, match="entry bound"):
+        release_manager._cleanup_cross_results(
+            runtime,
+            expected_uid=uid,
+            current_boot_id=release_manager._read_boot_id(Path("/proc")),
+        )
+
+
+
+def test_cross_process_oversized_state_cleanup_never_widens_to_result_bound(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = release_manager._canonical_process_cross_root(
+        uid,
+        runtime_root=tmp_path / "typed-state-cleanup-bound",
+    )
+    state_path = runtime / f"flight-{'a' * 64}.json"
+    state_path.write_bytes(b"x" * (1024 * 1024))
+    state_path.chmod(0o600)
+    original = release_manager._read_cross_file
+    calls: list[tuple[int, str, int]] = []
+
+    def traced(path, *, expected_uid, max_bytes):
+        try:
+            content = original(
+                path,
+                expected_uid=expected_uid,
+                max_bytes=max_bytes,
+            )
+        except Exception as exc:
+            calls.append((max_bytes, type(exc).__name__, 0))
+            raise
+        calls.append((max_bytes, "returned", 0 if content is None else len(content)))
+        return content
+
+    with mock.patch.object(
+        release_manager,
+        "_read_cross_file",
+        side_effect=traced,
+    ):
+        usage = release_manager._cleanup_cross_results(
+            runtime,
+            expected_uid=uid,
+            current_boot_id=release_manager._read_boot_id(Path("/proc")),
+        )
+
+    assert calls == [
+        (
+            release_manager._PROCESS_CROSS_MAX_STATE_BYTES,
+            "ReleaseError",
+            0,
+        )
+    ]
+    assert not state_path.exists()
+    assert usage.state_count == 0
+
+
+def test_cross_process_typed_unlink_removes_oversized_files_without_body_reads(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = release_manager._canonical_process_cross_root(
+        uid,
+        runtime_root=tmp_path / "typed-oversized-removal",
+    )
+    state_path = runtime / f"flight-{'b' * 64}.json"
+    result_path = runtime / f"result-{'c' * 64}-{'d' * 32}.json"
+    state_path.write_bytes(b"s" * (release_manager._PROCESS_CROSS_MAX_STATE_BYTES + 1))
+    result_path.write_bytes(b"r" * (release_manager._PROCESS_CROSS_MAX_RESULT_BYTES + 1))
+    state_path.chmod(0o600)
+    result_path.chmod(0o600)
+
+    with mock.patch.object(
+        release_manager.os,
+        "read",
+        side_effect=AssertionError("oversized removal must not read file bodies"),
+    ):
+        release_manager._unlink_cross_file(
+            state_path,
+            expected_uid=uid,
+            kind=release_manager._PROCESS_CROSS_FILE_STATE,
+        )
+        release_manager._unlink_cross_file(
+            result_path,
+            expected_uid=uid,
+            kind=release_manager._PROCESS_CROSS_FILE_RESULT,
+        )
+    assert not state_path.exists()
+    assert not result_path.exists()
+
+
+def test_cross_process_typed_unlink_reads_small_file_only_within_kind_bound(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = release_manager._canonical_process_cross_root(
+        uid,
+        runtime_root=tmp_path / "typed-small-removal",
+    )
+    state_path = runtime / f"flight-{'e' * 64}.json"
+    payload = b"small-state-payload"
+    state_path.write_bytes(payload)
+    state_path.chmod(0o600)
+    original_read = os.read
+    read_sizes: list[int] = []
+
+    def bounded_read(descriptor, size):
+        read_sizes.append(size)
+        return original_read(descriptor, size)
+
+    with mock.patch.object(release_manager.os, "read", side_effect=bounded_read):
+        release_manager._unlink_cross_file(
+            state_path,
+            expected_uid=uid,
+            kind=release_manager._PROCESS_CROSS_FILE_STATE,
+        )
+    assert not state_path.exists()
+    assert sum(read_sizes) <= len(payload)
+    assert max(read_sizes) <= release_manager._PROCESS_CROSS_MAX_STATE_BYTES
+
+
+def test_cross_process_typed_unlink_rejects_kind_name_mismatch(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = release_manager._canonical_process_cross_root(
+        uid,
+        runtime_root=tmp_path / "typed-name-mismatch",
+    )
+    state_path = runtime / f"flight-{'f' * 64}.json"
+    state_path.write_bytes(b"{}\n")
+    state_path.chmod(0o600)
+
+    with pytest.raises(ReleaseError, match="kind does not match"):
+        release_manager._unlink_cross_file(
+            state_path,
+            expected_uid=uid,
+            kind=release_manager._PROCESS_CROSS_FILE_RESULT,
+        )
+    with pytest.raises(ReleaseError, match="kind is invalid"):
+        release_manager._unlink_cross_file(
+            state_path,
+            expected_uid=uid,
+            kind="largest-bound",
+        )
+    assert state_path.exists()
+
+
+def test_cross_process_typed_unlink_refuses_unsafe_file_shapes(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = release_manager._canonical_process_cross_root(
+        uid,
+        runtime_root=tmp_path / "typed-unsafe-shapes",
+    )
+    target = runtime / "target"
+    target.write_bytes(b"target")
+    target.chmod(0o600)
+
+    symlink_path = runtime / f"flight-{'1' * 64}.json"
+    symlink_path.symlink_to(target.name)
+    hardlink_path = runtime / f"flight-{'2' * 64}.json"
+    os.link(target, hardlink_path)
+    wrong_mode_path = runtime / f"flight-{'3' * 64}.json"
+    wrong_mode_path.write_bytes(b"{}")
+    wrong_mode_path.chmod(0o644)
+    directory_path = runtime / f"flight-{'4' * 64}.json"
+    directory_path.mkdir(mode=0o700)
+
+    for candidate in (symlink_path, hardlink_path, wrong_mode_path, directory_path):
+        with pytest.raises(ReleaseError, match="unsafe for removal"):
+            release_manager._unlink_cross_file(
+                candidate,
+                expected_uid=uid,
+                kind=release_manager._PROCESS_CROSS_FILE_STATE,
+            )
+        assert os.path.lexists(candidate)
+    assert target.read_bytes() == b"target"
+
+
+def test_cross_process_typed_unlink_refuses_path_identity_replacement(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = release_manager._canonical_process_cross_root(
+        uid,
+        runtime_root=tmp_path / "typed-identity-replacement",
+    )
+    state_path = runtime / f"flight-{'5' * 64}.json"
+    backup = runtime / "original.backup"
+    state_path.write_bytes(b"original")
+    state_path.chmod(0o600)
+    original_lstat = Path.lstat
+    matching_calls = 0
+
+    def racing_lstat(candidate: Path):
+        nonlocal matching_calls
+        if candidate == state_path:
+            matching_calls += 1
+            if matching_calls == 2:
+                state_path.rename(backup)
+                state_path.write_bytes(b"replaced")
+                state_path.chmod(0o600)
+        return original_lstat(candidate)
+
+    with mock.patch.object(
+        Path,
+        "lstat",
+        autospec=True,
+        side_effect=racing_lstat,
+    ), pytest.raises(ReleaseError, match="pathname changed"):
+        release_manager._unlink_cross_file(
+            state_path,
+            expected_uid=uid,
+            kind=release_manager._PROCESS_CROSS_FILE_STATE,
+        )
+    assert state_path.read_bytes() == b"replaced"
+    assert backup.read_bytes() == b"original"
+
+
+def test_cross_process_cleanup_uses_one_bounded_directory_snapshot(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "one-directory-snapshot"
+    leader = release_manager._admit_cross_process_flight(
+        ("one-directory-snapshot",),
+        expected_uid=uid,
+        runtime_root=runtime,
+    )
+    release_manager._publish_cross_result(
+        leader,
+        release_manager._ProcessObserverTransportResult(
+            "broker-output-ready",
+            b"snapshot\n",
+        ),
+        expected_uid=uid,
+    )
+    original_iterdir = Path.iterdir
+    with mock.patch.object(
+        Path,
+        "iterdir",
+        autospec=True,
+        side_effect=original_iterdir,
+    ) as iterdir:
+        usage = release_manager._cleanup_cross_results(
+            runtime,
+            expected_uid=uid,
+            current_boot_id=leader.boot_id,
+        )
+    assert iterdir.call_count == 1
+    assert usage.result_count == 1
+    assert usage.state_count == 1
+    assert usage.total_result_bytes == leader.result_path.stat().st_size
+    assert usage.directory_entries == len(list(runtime.iterdir()))
+
+
+def test_cross_process_publication_enforces_aggregate_result_bytes_at_commit(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "publication-result-byte-bound"
+    with mock.patch.object(
+        release_manager,
+        "_PROCESS_CROSS_MAX_TOTAL_RESULT_BYTES",
+        1,
+    ):
+        first = release_manager._admit_cross_process_flight(
+            ("publication-result-byte-bound", "first"),
+            expected_uid=uid,
+            runtime_root=runtime,
+        )
+        second = release_manager._admit_cross_process_flight(
+            ("publication-result-byte-bound", "second"),
+            expected_uid=uid,
+            runtime_root=runtime,
+        )
+        assert first.role == second.role == "leader"
+        for admission in (first, second):
+            with pytest.raises(ReleaseError, match="capacity"):
+                release_manager._publish_cross_result(
+                    admission,
+                    release_manager._ProcessObserverTransportResult(
+                        "broker-output-ready",
+                        b"x",
+                    ),
+                    expected_uid=uid,
+                )
+    assert list(runtime.glob("result-*.json")) == []
+    for admission in (first, second):
+        state = release_manager._read_cross_json(
+            admission.state_path,
+            expected_uid=uid,
+            max_bytes=release_manager._PROCESS_CROSS_MAX_STATE_BYTES,
+        )
+        assert state is not None
+        assert state["phase"] == "running"
+        assert state["nonce"] == admission.nonce
+
+
+def test_cross_process_publication_stages_state_before_final_result_visibility(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "publication-order"
+    leader = release_manager._admit_cross_process_flight(
+        ("publication-order",),
+        expected_uid=uid,
+        runtime_root=runtime,
+    )
+    original_write = release_manager._atomic_write_bytes
+    observed: list[str] = []
+
+    def ordered_write(path, content, *, mode=0o644):
+        if path == leader.result_path:
+            assert not leader.result_path.exists()
+            state = release_manager._read_cross_json(
+                leader.state_path,
+                expected_uid=uid,
+                max_bytes=release_manager._PROCESS_CROSS_MAX_STATE_BYTES,
+            )
+            assert state is not None
+            assert state["phase"] == "published"
+            assert int(state["published_monotonic_ns"]) > 0
+            observed.append("state-before-result")
+        return original_write(path, content, mode=mode)
+
+    with mock.patch.object(
+        release_manager,
+        "_atomic_write_bytes",
+        side_effect=ordered_write,
+    ):
+        published = release_manager._publish_cross_result(
+            leader,
+            release_manager._ProcessObserverTransportResult(
+                "broker-output-ready",
+                b"ordered\n",
+            ),
+            expected_uid=uid,
+        )
+    assert observed == ["state-before-result"]
+    assert published.result_code == "broker-output-ready"
+    assert leader.result_path.exists()
+
+
+def test_cross_process_publication_failure_restores_running_state_and_no_result(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "publication-rollback"
+    leader = release_manager._admit_cross_process_flight(
+        ("publication-rollback",),
+        expected_uid=uid,
+        runtime_root=runtime,
+    )
+    original_write = release_manager._atomic_write_bytes
+
+    def fail_final_result(path, content, *, mode=0o644):
+        if path == leader.result_path:
+            raise OSError("simulated final result failure")
+        return original_write(path, content, mode=mode)
+
+    with mock.patch.object(
+        release_manager,
+        "_atomic_write_bytes",
+        side_effect=fail_final_result,
+    ), pytest.raises(ReleaseError, match="rolled back"):
+        release_manager._publish_cross_result(
+            leader,
+            release_manager._ProcessObserverTransportResult(
+                "broker-output-ready",
+                b"rollback\n",
+            ),
+            expected_uid=uid,
+        )
+    assert not leader.result_path.exists()
+    state = release_manager._read_cross_json(
+        leader.state_path,
+        expected_uid=uid,
+        max_bytes=release_manager._PROCESS_CROSS_MAX_STATE_BYTES,
+    )
+    assert state is not None
+    assert state["phase"] == "running"
+    assert state["published_monotonic_ns"] == 0
+    assert state["nonce"] == leader.nonce
+
+
+def test_cross_process_publication_rejects_exact_aggregate_byte_boundary(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "publication-exact-byte-boundary"
+    leader = release_manager._admit_cross_process_flight(
+        ("publication-exact-byte-boundary",),
+        expected_uid=uid,
+        runtime_root=runtime,
+    )
+    result = release_manager._ProcessObserverTransportResult(
+        "broker-output-ready",
+        b"boundary\n",
+    )
+    candidate_size = len(
+        canonical_json_bytes(release_manager._cross_result_payload(leader, result))
+    )
+    with mock.patch.object(
+        release_manager,
+        "_PROCESS_CROSS_MAX_TOTAL_RESULT_BYTES",
+        candidate_size,
+    ), pytest.raises(ReleaseError, match="capacity"):
+        release_manager._publish_cross_result(
+            leader,
+            result,
+            expected_uid=uid,
+        )
+    assert not leader.result_path.exists()
+    state = release_manager._read_cross_json(
+        leader.state_path,
+        expected_uid=uid,
+        max_bytes=release_manager._PROCESS_CROSS_MAX_STATE_BYTES,
+    )
+    assert state is not None and state["phase"] == "running"
+
+
+def test_cross_process_total_result_bytes_are_bounded(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    runtime = tmp_path / "total-result-byte-bound"
+    leader = release_manager._admit_cross_process_flight(
+        ("total-result-byte-bound",),
+        expected_uid=uid,
+        runtime_root=runtime,
+    )
+    release_manager._publish_cross_result(
+        leader,
+        release_manager._ProcessObserverTransportResult(
+            "broker-output-ready",
+            b"bounded-result\n",
+        ),
+        expected_uid=uid,
+    )
+    assert leader.result_path.stat().st_size > 1
+
+    with mock.patch.object(
+        release_manager,
+        "_PROCESS_CROSS_MAX_TOTAL_RESULT_BYTES",
+        1,
+        create=True,
+    ), pytest.raises(ReleaseError, match="capacity"):
+        release_manager._cleanup_cross_results(
+            runtime,
+            expected_uid=uid,
+            current_boot_id=leader.boot_id,
+        )
+
+
+def test_trusted_systemd_run_accepts_canonical_system_path_and_rejects_local_copy(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("systemd-run") is None:
+        pytest.skip("systemd-run is unavailable")
+    trusted = release_manager._trusted_systemd_run()
+    assert trusted.is_absolute()
+    assert trusted.name == "systemd-run"
+
+    local = tmp_path / "systemd-run"
+    local.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    local.chmod(0o755)
+    with mock.patch("termdeck.release_manager.shutil.which", return_value=str(local)):
+        with pytest.raises(ReleaseError, match="trusted system executable"):
+            release_manager._trusted_systemd_run()
 
 
 def test_managed_release_status_keeps_process_posture_separate_from_integrity(

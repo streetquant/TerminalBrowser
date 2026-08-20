@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.2.15
+
+- Fixed Codex composer startup corruption at its root. GUI-owned and restored tmux payloads now start only after VTE has a settled character grid, and `new-session -x/-y`, the tmux pane/window, control-mode stream, and the payload's first full-screen frame share that exact geometry. Hidden and all-hidden workspace recipes use the same mapped-window grid.
+- Made the initial replay path preserve valid UTF-8 and control bodies while preventing a pre-controller focus event from poisoning the live-input retry window or consuming the user's first key.
+- Bound contained-resize recovery to the exact TermDeck process graph and private launch tuple: pane root, same-domain outer `bwrap`, direct inner `bwrap` session leader, and one private Codex witness carrying a unique and internally consistent `CODEX_HOME`, `TERMDECK_AUTH_SCOPE_ID`, and `CODEX_TERMDECK_GATE_ROOT` tuple.
+- Pinned the final resize signal to the exact private Codex witness with Linux pidfds on capable kernels. Lookup, permission, liveness, identity, topology, tuple, and signal failures remain fail-closed; the fully revalidated process-group compatibility path is used only when pidfds are genuinely unavailable.
+- Moved procfs and pidfd work off the ordered pane setup/resize/input worker. One bounded coalescing dispatcher handles ordinary resize bursts, while setup nudge/final notifications retain finite completion barriers before authoritative capture and replay.
+- Added one canonical bounded validation contract covering every discovered test and all 21 GTK/VTE/tmux smokes. A selected-package contained-composer smoke proves alternate-screen recovery before readiness, exact grid preservation, no collapsed-frame replay, no terminal input, no payload restart, MCP-sibling isolation, pidfd signaling, and package-site import binding.
+- Hardened managed-GUI observation and cross-process evidence publication with exact release/source/state/UID/boot/namespace identity, single-flight coordination, aggregate result-capacity enforcement, protocol-typed bounded deletion, canonical private receipts, and fail-closed incomplete postures.
+- Preserved terminal byte fidelity, scrolling, selection, clipboard, tab/window restoration, persistent tmux and Codex payloads, per-tab authentication isolation, SQLite semantics, immutable managed releases, and exact historical rollback.
+
 ## 0.2.14
 
 - Canonicalized wheel central-directory metadata before the reproducibility comparison. Every newly built regular member is now exact Unix `0644` with zero internal/low external attributes, independent of the caller's `umask`; content-addressed wheel, manifest, and release IDs therefore remain identical across `umask 022` and `077`.

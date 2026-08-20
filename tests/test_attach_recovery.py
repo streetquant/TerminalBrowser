@@ -32,6 +32,85 @@ def test_stream_reconnect_clears_stable_timer_and_classifies_once() -> None:
     assert classified == [True]
 
 
+def test_missing_target_is_prepared_at_exact_grid_before_stream_start() -> None:
+    events: list[object] = []
+    controller = SimpleNamespace(
+        start=lambda **kwargs: events.append(("start", kwargs)),
+        prioritize_setup=lambda: events.append("priority"),
+    )
+    attach = SimpleNamespace(
+        controller=None,
+        _detached=False,
+        _terminally_stopped=False,
+        _attach_restart_deferred=False,
+        _connect_source_id=11,
+        _connect_fallback_source_id=12,
+        _remove_glib_source=lambda source_id: events.append(("remove", source_id)),
+        _prepare_target_handler=lambda columns, rows: events.append(
+            ("prepare", columns, rows)
+        )
+        or True,
+        _prepare_target_error_handler=lambda exc: events.append(("error", str(exc))),
+        _ensure_loopback_pty=lambda: events.append("pty"),
+        _sync_stream_geometry=lambda **kwargs: events.append(("sync", kwargs)),
+        _stream_generation=0,
+        argv=["tmux", "attach"],
+        _child_environment={},
+        cwd="/tmp",
+        _on_stream_output=lambda *_args: None,
+        _on_stream_pane_dead=lambda *_args: None,
+        _on_stream_state=lambda *_args: None,
+        _scrollback_extent=1000,
+        _contrast_filter=SimpleNamespace(reset=lambda: events.append("contrast")),
+        _setup_priority_requested=True,
+    )
+
+    with mock.patch("termdeck.gtk_app.PaneStreamController", return_value=controller):
+        AttachTerminal._connect_stream(attach, columns=132, rows=43)
+
+    assert events[:5] == [
+        ("remove", 11),
+        ("remove", 12),
+        ("prepare", 132, 43),
+        "pty",
+        ("sync", {"columns": 132, "rows": 43, "force": True}),
+    ]
+    assert events[-3:] == ["contrast", "priority", ("start", {"columns": 132, "rows": 43})]
+    assert attach.controller is controller
+    assert attach._prepare_target_handler is None
+    assert attach._prepare_target_error_handler is None
+
+
+def test_missing_target_prepare_failure_never_creates_stream() -> None:
+    errors: list[str] = []
+
+    def fail_prepare(_columns, _rows):
+        raise RuntimeError("launch failed")
+
+    attach = SimpleNamespace(
+        controller=None,
+        _detached=False,
+        _terminally_stopped=False,
+        _attach_restart_deferred=False,
+        _connect_source_id=0,
+        _connect_fallback_source_id=0,
+        _remove_glib_source=lambda _source_id: None,
+        _prepare_target_handler=fail_prepare,
+        _prepare_target_error_handler=lambda exc: errors.append(str(exc)),
+        _ensure_loopback_pty=lambda: (_ for _ in ()).throw(
+            AssertionError("failed preparation must not allocate a PTY")
+        ),
+    )
+
+    with mock.patch("termdeck.gtk_app.PaneStreamController") as controller:
+        AttachTerminal._connect_stream(attach, columns=132, rows=43)
+
+    controller.assert_not_called()
+    assert attach.controller is None
+    assert attach._terminally_stopped is True
+    assert errors == ["launch failed"]
+
+
 def test_missing_attach_target_stops_every_restart_path() -> None:
     torn: list[bool] = []
     attach = SimpleNamespace(

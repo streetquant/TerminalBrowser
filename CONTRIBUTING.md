@@ -18,9 +18,11 @@ pip install -e .
 # 4. Create a branch
 git checkout -b feat/my-feature
 
-# 5. Make your changes, then run checks
-python3 -m compileall -q termdeck tests
-python3 -m pytest tests -q
+# 5. Make your changes, then run the authoritative bounded checks
+python3 scripts/run_validation.py \
+  --profile ci \
+  --output .validation/ci \
+  --python "$(command -v python3)"
 
 # 6. Push and open a PR against main
 git push origin feat/my-feature
@@ -53,8 +55,8 @@ git push origin feat/my-feature
 ## PR checklist
 
 Before opening a PR:
-- [ ] `python3 -m compileall -q termdeck tests` passes
-- [ ] `python3 -m pytest tests -q` passes
+- [ ] `python3 scripts/run_validation.py --profile ci --output .validation/ci --python "$(command -v python3)"` passes
+- [ ] The generated validation receipt reports `"ok": true` and the source fingerprint is unchanged
 - [ ] New behaviour has a test or a clear reason why one isn’t needed
 - [ ] No new third-party Python runtime dependencies added
 - [ ] Commit messages are imperative present tense (`fix: ...`, `feat: ...`, `docs: ...`)

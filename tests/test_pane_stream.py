@@ -18,6 +18,7 @@ from unittest import mock
 
 from termdeck.pane_stream import (
     PaneStreamController,
+    ResizeSignalDispatcher,
     StreamSetupGate,
     _MAX_PENDING_INPUT_BYTES,
     _MAX_PENDING_INPUT_CHUNKS,
@@ -41,6 +42,7 @@ def wait_until(predicate, timeout: float = 3.0) -> None:
 def state_line(history_size: int = 0, **overrides: str) -> str:
     values = {
         "pane_id": "%1",
+        "pane_pid": "4242",
         "alternate_on": "0",
         "pane_dead": "0",
         "cursor_x": "0",
@@ -516,6 +518,143 @@ class PaneStreamControllerTests(unittest.TestCase):
         self.assertIsNone(controller._setup_retry_timer)
         self.assertIsNone(controller._setup_retry_generation)
         self.assertEqual(controller._tasks.get_nowait(), ("setup", 9))
+
+
+    def test_live_resize_does_not_wait_for_containment_callback(self) -> None:
+        dispatcher = ResizeSignalDispatcher(max_pending=8, history_limit=16)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking(_pid: int, _columns: int, _rows: int) -> None:
+            entered.set()
+            assert release.wait(3.0)
+
+        self.addCleanup(lambda: (release.set(), dispatcher.shutdown(1.0)))
+        controller, client, outputs = self.make_controller(
+            on_resize_applied=blocking,
+            resize_signal_dispatcher=dispatcher,
+            repair_on_setup=False,
+        )
+        state = state_line(0, pane_pid="8181")
+        client.script("list-panes", CommandResult(True, (state,), None))
+        client.script("capture-pane", CommandResult(True, ("ready$",), None))
+        controller.start(columns=90, rows=30)
+        client.connect()
+        wait_until(lambda: outputs)
+
+        controller.resize(columns=120, rows=50)
+        assert entered.wait(1.0)
+        self.assertTrue(controller.send_bytes(b"x"))
+        wait_until(lambda: client.count("send-keys -t %1 -H 78") == 1)
+        self.assertFalse(release.is_set())
+        release.set()
+
+    def test_setup_capture_waits_for_notification_barrier_completion(self) -> None:
+        dispatcher = ResizeSignalDispatcher(max_pending=8, history_limit=16)
+        entered = threading.Event()
+        release = threading.Event()
+        calls: list[tuple[int, int, int]] = []
+
+        def blocking(pid: int, columns: int, rows: int) -> None:
+            calls.append((pid, columns, rows))
+            if len(calls) == 1:
+                entered.set()
+                assert release.wait(3.0)
+
+        self.addCleanup(lambda: (release.set(), dispatcher.shutdown(1.0)))
+        controller, client, outputs = self.make_controller(
+            on_resize_applied=blocking,
+            resize_signal_dispatcher=dispatcher,
+            resize_signal_timeout=2.0,
+        )
+        state = state_line(0, pane_pid="8282")
+        client.script("list-panes", CommandResult(True, (state,), None))
+        client.script("list-panes", CommandResult(True, (state,), None))
+        client.script("capture-pane", CommandResult(True, ("ready$",), None))
+        controller.start(columns=100, rows=40)
+        client.connect()
+
+        assert entered.wait(1.0)
+        time.sleep(0.05)
+        self.assertEqual(client.count("capture-pane"), 0)
+        self.assertEqual(outputs, [])
+        release.set()
+        wait_until(lambda: outputs)
+        self.assertEqual(
+            calls,
+            [(8282, 99, 40), (8282, 100, 40)],
+        )
+        self.assertEqual(client.count("capture-pane"), 1)
+
+    def test_containment_aware_setup_nudges_and_restores_before_replay(self) -> None:
+        notifications: list[tuple[int, int, int]] = []
+        controller, client, outputs = self.make_controller(
+            on_resize_applied=lambda pid, columns, rows: notifications.append(
+                (pid, columns, rows)
+            )
+        )
+        initial = state_line(0, pane_pid="5151")
+        client.script("list-panes", CommandResult(True, (initial,), None))
+        client.script("list-panes", CommandResult(True, (initial,), None))
+        client.script("capture-pane", CommandResult(True, ("ready$",), None))
+
+        controller.start(columns=100, rows=40)
+        client.connect()
+        wait_until(lambda: outputs)
+
+        refreshes = [command for command in client.commands if command.startswith("refresh-client -C")]
+        self.assertEqual(refreshes[:2], ["refresh-client -C 99x40", "refresh-client -C 100x40"])
+        self.assertEqual(notifications, [(5151, 99, 40), (5151, 100, 40)])
+        self.assertEqual(client.count("list-panes"), 2)
+
+    def test_live_resize_notifies_only_after_successful_tmux_commit(self) -> None:
+        notifications: list[tuple[int, int, int]] = []
+        controller, client, outputs = self.make_controller(
+            on_resize_applied=lambda pid, columns, rows: notifications.append(
+                (pid, columns, rows)
+            )
+        )
+        state = state_line(0, pane_pid="6161")
+        client.script("list-panes", CommandResult(True, (state,), None))
+        client.script("list-panes", CommandResult(True, (state,), None))
+        client.script("capture-pane", CommandResult(True, ("ready$",), None))
+        controller.start(columns=90, rows=30)
+        client.connect()
+        wait_until(lambda: outputs)
+        notifications.clear()
+
+        controller.resize(columns=120, rows=50)
+        wait_until(lambda: notifications)
+        self.assertEqual(notifications, [(6161, 120, 50)])
+
+        client.script(
+            "refresh-client -C 121x50",
+            CommandResult(False, (), "resize refused"),
+        )
+        controller.resize(columns=121, rows=50)
+        wait_until(lambda: client.count("refresh-client -C 121x50") == 1)
+        time.sleep(0.05)
+        self.assertEqual(notifications, [(6161, 120, 50)])
+
+    def test_resize_callback_exception_cannot_strand_setup(self) -> None:
+        calls: list[tuple[int, int, int]] = []
+
+        def broken(pid: int, columns: int, rows: int) -> None:
+            calls.append((pid, columns, rows))
+            raise RuntimeError("optional signal propagation failed")
+
+        controller, client, outputs = self.make_controller(on_resize_applied=broken)
+        state = state_line(0, pane_pid="7171")
+        client.script("list-panes", CommandResult(True, (state,), None))
+        client.script("list-panes", CommandResult(True, (state,), None))
+        client.script("capture-pane", CommandResult(True, ("ready$",), None))
+        controller.start(columns=80, rows=24)
+        client.connect()
+        wait_until(lambda: outputs)
+
+        self.assertEqual(calls, [(7171, 79, 24), (7171, 80, 24)])
+        self.assertIn(b"ready$", b"".join(outputs))
+
 
 
 class StreamSetupGateTests(unittest.TestCase):

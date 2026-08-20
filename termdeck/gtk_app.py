@@ -105,6 +105,32 @@ def _usable_glib_source_id(source_id) -> bool:
     return isinstance(source_id, int) and not isinstance(source_id, bool) and source_id > 0
 
 
+def _private_resize_handler(backend, record):
+    """Build a worker-safe resize callback from immutable row identity.
+
+    ``PaneStreamController`` invokes this callback on its ordered worker.
+    SessionStore's SQLite connection is GTK-thread-affine, so the callback must
+    never resolve the row later. ``auth_scope_id`` and ``codex_home`` are
+    immutable identity fields in SessionStore; capture them once while the
+    terminal is constructed on the GTK thread.
+    """
+
+    propagate_resize = getattr(backend, "propagate_terminal_resize", None)
+    codex_home = str(getattr(record, "codex_home", "") or "").strip()
+    auth_scope_id = str(getattr(record, "auth_scope_id", "") or "").strip()
+    if not callable(propagate_resize) or not codex_home or not auth_scope_id:
+        return None
+
+    def resize_applied(pane_root_pid: int, _columns: int, _rows: int):
+        return propagate_resize(
+            pane_root_pid,
+            codex_home=codex_home,
+            auth_scope_id=auth_scope_id,
+        )
+
+    return resize_applied
+
+
 def _schedule_glib_callback(callback, *args, delay_ms: int = 0) -> tuple[bool, str]:
     """Schedule one main-context callback with an independent source fallback."""
 
@@ -418,6 +444,11 @@ class AttachTerminal(Gtk.Box):
         scrollback_extent: int | None = None,
         font_override: str | None = None,
         child_environment: dict[str, str] | None = None,
+        prepare_target_handler=None,
+        prepare_target_error_handler=None,
+        resize_applied_handler=None,
+        repair_on_setup: bool = True,
+        connect_enabled: bool = True,
     ):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.argv = argv
@@ -433,6 +464,9 @@ class AttachTerminal(Gtk.Box):
         self._attach_restart_deferred = False
         self._connect_source_id = 0
         self._connect_fallback_source_id = 0
+        # Geometry-only recipe probes reuse this exact VTE/scrollbar layout but
+        # must never create a control transport or tmux target.
+        self._connect_enabled = bool(connect_enabled)
         # Notebook selection can precede the delayed stream connect.
         # Latch that demand so the visible tab cannot lose queue priority.
         self._setup_priority_requested = False
@@ -447,6 +481,14 @@ class AttachTerminal(Gtk.Box):
         self._selection_history_handler = selection_history_handler
         self._attach_exit_handler = attach_exit_handler
         self._attach_stable_handler = attach_stable_handler
+        # A GUI-owned missing tmux target is created only after VTE has a
+        # settled allocation. This prevents full-screen TUIs such as Codex from
+        # drawing their first splash at tmux's implicit 80x24 and then being
+        # resized underneath that frame.
+        self._prepare_target_handler = prepare_target_handler
+        self._prepare_target_error_handler = prepare_target_error_handler
+        self._resize_applied_handler = resize_applied_handler
+        self._repair_on_setup = bool(repair_on_setup)
         self._child_environment = merge_vte_attach_environment(child_environment)
         self._scrollback_extent = int(scrollback_extent or theme.scrollback_lines)
         self._key_press_handler_id = 0
@@ -538,8 +580,13 @@ class AttachTerminal(Gtk.Box):
         self.pack_start(self.terminal_row, True, True, 0)
         # The pane connects after the first stable size-allocate so tmux sees
         # the final VTE grid from frame 1. This fallback covers widgets that
-        # never receive an allocation (e.g. hidden restored tabs).
-        self._connect_fallback_source_id = GLib.timeout_add(500, self._connect_fallback)
+        # never receive an allocation (e.g. hidden restored tabs). A geometry-
+        # only recipe probe deliberately owns no fallback or control transport.
+        if self._connect_enabled:
+            self._connect_fallback_source_id = GLib.timeout_add(
+                500,
+                self._connect_fallback,
+            )
 
     def rebind_window_handlers(
         self,
@@ -646,7 +693,8 @@ class AttachTerminal(Gtk.Box):
             self.request_geometry_sync()
             return
         if (
-            self._detached
+            not bool(getattr(self, "_connect_enabled", True))
+            or self._detached
             or self._terminally_stopped
             or self._attach_restart_deferred
             or columns < 2
@@ -659,7 +707,8 @@ class AttachTerminal(Gtk.Box):
     def _connect_after_stable_allocation(self) -> bool:
         self._connect_source_id = 0
         if (
-            self.controller is not None
+            not bool(getattr(self, "_connect_enabled", True))
+            or self.controller is not None
             or self._detached
             or self._terminally_stopped
             or self._attach_restart_deferred
@@ -711,7 +760,8 @@ class AttachTerminal(Gtk.Box):
     def _connect_fallback(self) -> bool:
         self._connect_fallback_source_id = 0
         if (
-            self.controller is not None
+            not bool(getattr(self, "_connect_enabled", True))
+            or self.controller is not None
             or self._detached
             or self._terminally_stopped
             or self._attach_restart_deferred
@@ -807,7 +857,8 @@ class AttachTerminal(Gtk.Box):
 
     def _connect_stream(self, *, columns: int, rows: int) -> None:
         if (
-            self.controller is not None
+            not bool(getattr(self, "_connect_enabled", True))
+            or self.controller is not None
             or self._detached
             or self._terminally_stopped
             or self._attach_restart_deferred
@@ -817,6 +868,26 @@ class AttachTerminal(Gtk.Box):
         self._remove_glib_source(self._connect_fallback_source_id)
         self._connect_source_id = 0
         self._connect_fallback_source_id = 0
+        prepare_target = getattr(self, "_prepare_target_handler", None)
+        if prepare_target is not None:
+            try:
+                prepared = prepare_target(columns, rows)
+                if prepared is False:
+                    raise RuntimeError("terminal target preparation was refused")
+            except Exception as exc:
+                self._terminally_stopped = True
+                error_handler = getattr(self, "_prepare_target_error_handler", None)
+                if callable(error_handler):
+                    try:
+                        error_handler(exc)
+                    except Exception:
+                        pass
+                return
+            # The target now exists at this exact grid. Never execute the
+            # potentially stateful launch callback a second time on resize or
+            # reconnect; subsequent geometry changes belong to the controller.
+            self._prepare_target_handler = None
+            self._prepare_target_error_handler = None
         self._ensure_loopback_pty()
         self._sync_stream_geometry(columns=columns, rows=rows, force=True)
         self._stream_generation += 1
@@ -828,6 +899,8 @@ class AttachTerminal(Gtk.Box):
             on_output=lambda data: self._on_stream_output(generation, data),
             on_pane_dead=lambda: self._on_stream_pane_dead(generation),
             on_state_change=lambda state: self._on_stream_state(generation, state),
+            on_resize_applied=getattr(self, "_resize_applied_handler", None),
+            repair_on_setup=bool(getattr(self, "_repair_on_setup", True)),
             history_lines=self._scrollback_extent,
         )
         self._contrast_filter.reset()
@@ -1884,13 +1957,20 @@ class AttachTerminal(Gtk.Box):
         # the latch before starting that controller.
         self._setup_priority_requested = True
         controller = getattr(self, "controller", None)
-        if controller is not None:
-            # The user is looking at this tab: jump the shared setup queue so
-            # a freshly started instance connects visible terminals first.
-            try:
-                controller.prioritize_setup()
-            except Exception:
-                pass
+        if controller is None:
+            # Notebook selection can focus a VTE before its delayed target and
+            # stream controller exist. Calling the backend restore path here
+            # targets a session that has not been created yet, poisons the
+            # bounded retry window, and makes the user's first real key look
+            # unsafe. Latch setup priority, but refuse input until a controller
+            # owns the target; the next key can then be queued or delivered.
+            return False
+        # The user is looking at this tab: jump the shared setup queue so a
+        # freshly started instance connects visible terminals first.
+        try:
+            controller.prioritize_setup()
+        except Exception:
+            pass
         handler = self._live_focus_handler
         if callable(handler):
             try:
@@ -4252,6 +4332,19 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self._restore_retry_ids: set[str] = set()
         self._restore_retry_source_id = 0
         self._restore_retry_attempts = 0
+        # GUI workspace recipes launch hidden/background payloads only after a
+        # mapped terminal surface proves one stable canonical grid.  All fields
+        # are window-local and are cancelled before destruction.
+        self._recipe_geometry_source_id = 0
+        self._recipe_geometry_probe = None
+        self._recipe_geometry_probe_show_tabs = True
+        self._recipe_geometry_probe_window_hidden = False
+        self._recipe_geometry_last_grid = (0, 0)
+        self._recipe_geometry_stable_samples = 0
+        self._recipe_geometry_deadline = 0.0
+        self._recipe_hidden_records: tuple[SessionRecord, ...] = ()
+        self._recipe_hidden_launch_errors: tuple[tuple[str, str], ...] = ()
+        self._recipe_canonical_grid = (0, 0)
         # Relative point delta from the configured theme font (Ctrl++ / Ctrl+-).
         self.font_zoom_delta = 0
 
@@ -4535,6 +4628,14 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             except Exception:
                 pass
             self._side_pane_layout_source_id = 0
+        if self._recipe_geometry_source_id:
+            try:
+                GLib.source_remove(self._recipe_geometry_source_id)
+            except Exception:
+                pass
+            self._recipe_geometry_source_id = 0
+        self._recipe_hidden_records = ()
+        self._cleanup_recipe_geometry_probe()
         windows = getattr(self.app_context, "windows", None)
         if isinstance(windows, list) and self in windows:
             windows.remove(self)
@@ -5248,16 +5349,76 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             visible=True,
         )
         try:
-            self.app_context.backend.create_or_resume(record)
-            pid = self.app_context.backend.pane_pid(record)
-            record = self.app_context.store.update(record.id, status="running", last_pid=pid)
-            self.open_session(
-                record,
-                known_live=True,
-                known_pid=pid,
-                known_pid_resolved=True,
-                refresh_side=False,
+            create_at_grid = getattr(
+                self.app_context.backend,
+                "create_or_resume_at_grid",
+                None,
             )
+            get_current_page = getattr(self.notebook, "get_current_page", None)
+            get_nth_page = getattr(self.notebook, "get_nth_page", None)
+            page = (
+                get_nth_page(get_current_page())
+                if callable(get_current_page) and callable(get_nth_page)
+                else None
+            )
+            visible_terminal = getattr(page, "terminal", None)
+            columns = (
+                max(0, int(visible_terminal.get_column_count()))
+                if visible_terminal is not None
+                else 0
+            )
+            rows = (
+                max(0, int(visible_terminal.get_row_count()))
+                if visible_terminal is not None
+                else 0
+            )
+            if callable(create_at_grid) and columns >= 2 and rows >= 2:
+                # New tabs in an existing window inherit the mapped VTE grid,
+                # so their first TUI frame never passes through 80x24.
+                create_at_grid(record, columns=columns, rows=rows)
+                pid = self.app_context.backend.pane_pid(record)
+                record = self.app_context.store.update(
+                    record.id,
+                    status="running",
+                    last_pid=pid,
+                )
+                self.open_session(
+                    record,
+                    known_live=True,
+                    known_pid=pid,
+                    known_pid_resolved=True,
+                    refresh_side=False,
+                )
+            elif callable(create_at_grid):
+                # An empty window has no prior terminal from which to inherit a
+                # grid. Create its VTE page first and let open_session launch the
+                # payload at that page's settled allocation. Async failure owns
+                # the same rollback contract as the synchronous path below.
+                self.open_session(
+                    record,
+                    known_live=False,
+                    known_pid=None,
+                    known_pid_resolved=True,
+                    refresh_side=False,
+                    rollback_new_record_on_failure=True,
+                )
+            else:
+                # Compatibility for non-production backends that implement only
+                # the historical synchronous API.
+                self.app_context.backend.create_or_resume(record)
+                pid = self.app_context.backend.pane_pid(record)
+                record = self.app_context.store.update(
+                    record.id,
+                    status="running",
+                    last_pid=pid,
+                )
+                self.open_session(
+                    record,
+                    known_live=True,
+                    known_pid=pid,
+                    known_pid_resolved=True,
+                    refresh_side=False,
+                )
         except Exception:
             # A replacement is one atomic user action.  If its tmux/session-row
             # construction only partly succeeds, remove only that newly-created
@@ -5324,6 +5485,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                     known_pid=pids_by_id.get(record.id),
                     known_pid_resolved=pids_resolved,
                     refresh_side=False,
+                    retry_start_failure=True,
                 )
             except Exception:
                 # One unavailable command/socket must not abort construction of
@@ -5487,7 +5649,38 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 else replace(record, status="recovery-pending")
             )
             try:
-                self.app_context.backend.create_or_resume(recovery_record)
+                create_at_grid = getattr(
+                    self.app_context.backend,
+                    "create_or_resume_at_grid",
+                    None,
+                )
+                notebook = getattr(self, "notebook", None)
+                get_current_page = getattr(notebook, "get_current_page", None)
+                get_nth_page = getattr(notebook, "get_nth_page", None)
+                page = (
+                    get_nth_page(get_current_page())
+                    if callable(get_current_page) and callable(get_nth_page)
+                    else None
+                )
+                terminal = getattr(page, "terminal", None)
+                columns = (
+                    max(0, int(terminal.get_column_count()))
+                    if terminal is not None
+                    else 0
+                )
+                rows = (
+                    max(0, int(terminal.get_row_count()))
+                    if terminal is not None
+                    else 0
+                )
+                if callable(create_at_grid) and columns >= 2 and rows >= 2:
+                    create_at_grid(
+                        recovery_record,
+                        columns=columns,
+                        rows=rows,
+                    )
+                else:
+                    self.app_context.backend.create_or_resume(recovery_record)
                 self._remove_tab_widget(record.id)
                 self.open_session(recovery_record, known_live=True)
             except Exception as exc:
@@ -5681,21 +5874,38 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         known_pid: int | None = None,
         known_pid_resolved: bool = False,
         refresh_side: bool = True,
+        retry_start_failure: bool = False,
+        rollback_new_record_on_failure: bool = False,
     ) -> None:
-        live_session = self.app_context.backend.session_exists(record) if known_live is None else known_live
-        if not live_session:
-            if not restart_missing:
-                self.app_context.store.update(record.id, status="stopped", last_pid=None, visible=False)
-                if refresh_side:
-                    self.side.refresh()
-                return
-            self.app_context.backend.create_or_resume(record)
-            known_pid = None
-        pid = (
-            known_pid
-            if live_session and known_live is not None and known_pid_resolved
-            else self.app_context.backend.pane_pid(record)
+        live_session = (
+            self.app_context.backend.session_exists(record)
+            if known_live is None
+            else known_live
         )
+        if not live_session and not restart_missing:
+            self.app_context.store.update(
+                record.id,
+                status="stopped",
+                last_pid=None,
+                visible=False,
+            )
+            if refresh_side:
+                self.side.refresh()
+            return
+
+        # Missing GUI targets are intentionally not started here.  VTE has not
+        # received its final allocation yet, and tmux would otherwise launch a
+        # full-screen application at its implicit 80x24 before the first GTK
+        # resize.  AttachTerminal invokes ``prepare_target`` exactly once after
+        # the grid settles, then creates the control-mode attachment.
+        launch_after_allocation = not live_session
+        pid = None
+        if live_session:
+            pid = (
+                known_pid
+                if known_live is not None and known_pid_resolved
+                else self.app_context.backend.pane_pid(record)
+            )
         status = self.observed_status(record, pid)
         layout_changes = {}
         if remember_layout:
@@ -5709,10 +5919,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             if not record.window_id or record.window_id == self.window_id:
                 layout_changes["window_id"] = self.window_id
                 layout_changes["window_title"] = self.window_title
-        if not live_session:
-            # A newly launched tmux process will read the currently selected
-            # private auth.json, so any previous restart requirement is now met.
-            layout_changes["auth_restart_required"] = False
         record = self.app_context.store.update(
             record.id,
             last_opened_at=utc_now(),
@@ -5723,17 +5929,128 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if record.id in self.tabs:
             self._focus_session(record.id)
             return
-        configure = getattr(self.app_context.backend, "configure_interactive_session", None)
-        if callable(configure):
+        configure = getattr(
+            self.app_context.backend,
+            "configure_interactive_session",
+            None,
+        )
+        if live_session and callable(configure):
             configure(record)
+
+        def prepare_target(columns: int, rows: int, *, session_id=record.id) -> bool:
+            current = self.app_context.store.get(session_id)
+            if current is None:
+                raise TmuxError("terminal record disappeared before startup")
+            create_at_grid = getattr(
+                self.app_context.backend,
+                "create_or_resume_at_grid",
+                None,
+            )
+            if callable(create_at_grid):
+                create_at_grid(current, columns=columns, rows=rows)
+            else:
+                # Third-party test/backends retain their existing API.  The
+                # production TmuxBackend always provides the exact-grid method.
+                self.app_context.backend.create_or_resume(current)
+            if callable(configure):
+                configure(current)
+            new_pid = self.app_context.backend.pane_pid(current)
+            updated = self.app_context.store.update(
+                session_id,
+                status=self.observed_status(current, new_pid),
+                last_pid=new_pid,
+                auth_restart_required=False,
+            )
+            tab = self.tabs.get(session_id)
+            if tab is not None:
+                tab.record = updated
+            if refresh_side:
+                self.side.refresh()
+            return True
+
+        def prepare_target_failed(exc: Exception, *, session_id=record.id) -> None:
+            def finalize() -> bool:
+                current = self.app_context.store.get(session_id)
+                self._remove_tab_widget(session_id)
+                if rollback_new_record_on_failure:
+                    # This row/target was created solely for one New Tab action.
+                    # Roll back both halves even when tmux creation succeeded but
+                    # a later configure/PID step failed asynchronously.
+                    if current is not None:
+                        try:
+                            self.app_context.backend.terminate(current)
+                        except Exception:
+                            pass
+                    try:
+                        self.app_context.store.delete(session_id)
+                    except Exception:
+                        pass
+                else:
+                    failure_status = (
+                        "recovery-pending"
+                        if current is not None
+                        and str(current.status).casefold() == "recovery-pending"
+                        else "start-error"
+                    )
+                    try:
+                        self.app_context.store.update(
+                            session_id,
+                            status=failure_status,
+                            last_pid=None,
+                            visible=True,
+                        )
+                    except KeyError:
+                        pass
+                if retry_start_failure and not rollback_new_record_on_failure:
+                    retry_ids = getattr(self, "_restore_retry_ids", None)
+                    if not isinstance(retry_ids, set):
+                        retry_ids = set()
+                        self._restore_retry_ids = retry_ids
+                    retry_ids.add(session_id)
+                    schedule_retry = getattr(self, "_schedule_restore_retry", None)
+                    if callable(schedule_retry):
+                        schedule_retry()
+                self.show_toast(
+                    f"Could not start {record.name}: {exc}",
+                    kind="error",
+                )
+                if refresh_side:
+                    self.side.refresh()
+                return False
+
+            GLib.idle_add(finalize)
+
+        def current_callback_record(
+            session_id: str = record.id,
+            fallback: SessionRecord = record,
+        ) -> SessionRecord:
+            # Deferred startup replaces the provisional `new` row with its live
+            # PID/status after tmux is created. Input, scrolling, and selection
+            # callbacks must resolve that current row instead of retaining the
+            # pre-launch snapshot; otherwise the first chrome-routed key can be
+            # consumed by a false "live restore failed" decision.
+            return self.app_context.store.get(session_id) or fallback
+
+        resize_handler = _private_resize_handler(
+            self.app_context.backend,
+            record,
+        )
+
         terminal = AttachTerminal(
             self.app_context.backend.attach_command(record),
             record.cwd,
             self.app_context.theme,
             key_press_handler=self.on_terminal_key_press,
-            live_focus_handler=lambda r=record: self._restore_live_terminal(r),
-            scroll_handler=lambda lines, r=record: self._scroll_terminal(r, lines),
-            selection_history_handler=lambda r=record: self._selection_history_for_terminal(r),
+            live_focus_handler=lambda: self._restore_live_terminal(
+                current_callback_record()
+            ),
+            scroll_handler=lambda lines: self._scroll_terminal(
+                current_callback_record(),
+                lines,
+            ),
+            selection_history_handler=lambda: self._selection_history_for_terminal(
+                current_callback_record()
+            ),
             attach_exit_handler=lambda sid=record.id: self._attach_client_should_retry(sid),
             attach_stable_handler=lambda sid=record.id: self._on_auth_attach_stable(sid),
             scrollback_extent=getattr(
@@ -5742,6 +6059,12 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 self.app_context.theme.scrollback_lines,
             ),
             font_override=self.zoomed_font(),
+            prepare_target_handler=(prepare_target if launch_after_allocation else None),
+            prepare_target_error_handler=(
+                prepare_target_failed if launch_after_allocation else None
+            ),
+            resize_applied_handler=resize_handler,
+            repair_on_setup=live_session,
         )
         tab = TerminalTab(record, terminal)
         self.tabs[record.id] = tab
@@ -5814,6 +6137,249 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             return str(capture(record, lines=lines) or "")
         except Exception:
             return ""
+
+    def _cleanup_recipe_geometry_probe(self) -> None:
+        probe = getattr(self, "_recipe_geometry_probe", None)
+        if probe is None:
+            return
+        self._recipe_geometry_probe = None
+        try:
+            page = self.notebook.page_num(probe)
+            if page >= 0:
+                self.notebook.remove_page(page)
+        except Exception:
+            pass
+        try:
+            probe.destroy()
+        except Exception:
+            try:
+                probe.detach()
+            except Exception:
+                pass
+        try:
+            self.notebook.set_show_tabs(
+                bool(getattr(self, "_recipe_geometry_probe_show_tabs", True))
+            )
+        except Exception:
+            pass
+        if bool(getattr(self, "_recipe_geometry_probe_window_hidden", False)):
+            self._recipe_geometry_probe_window_hidden = False
+            try:
+                self.set_opacity(1.0)
+            except Exception:
+                pass
+
+    def _recipe_geometry_widget(self):
+        probe = getattr(self, "_recipe_geometry_probe", None)
+        if probe is not None:
+            return probe
+        try:
+            page = self.notebook.get_current_page()
+            widget = self.notebook.get_nth_page(page)
+        except Exception:
+            widget = None
+        if widget is not None and getattr(widget, "terminal", None) is not None:
+            return widget
+        records = getattr(self, "_recipe_hidden_records", ())
+        if not records:
+            return None
+        # An all-hidden recipe still needs the exact VTE + margins + scrollbar
+        # allocation that a later visible tab will receive. This transient page
+        # has no session row, tmux target, or control stream.
+        probe = AttachTerminal(
+            [],
+            records[0].cwd,
+            self.app_context.theme,
+            scrollback_extent=getattr(
+                self.app_context.backend,
+                "history_limit",
+                self.app_context.theme.scrollback_lines,
+            ),
+            font_override=self.zoomed_font(),
+            connect_enabled=False,
+        )
+        self._recipe_geometry_probe = probe
+        try:
+            self._recipe_geometry_probe_show_tabs = bool(
+                self.notebook.get_show_tabs()
+            )
+        except Exception:
+            self._recipe_geometry_probe_show_tabs = True
+        # Keep the real tab strip in the layout: hiding it yields two extra rows
+        # and would resize a background TUI when the first real tab is opened.
+        # Suppress the transient geometry page visually instead of changing the
+        # measured allocation.
+        try:
+            self.set_opacity(0.0)
+            self._recipe_geometry_probe_window_hidden = True
+        except Exception:
+            self._recipe_geometry_probe_window_hidden = False
+        label = Gtk.Label(label="")
+        page = self.notebook.append_page(probe, label)
+        probe.show_all()
+        self.notebook.set_current_page(page)
+        return probe
+
+    def start_hidden_recipe_records(
+        self,
+        records: list[SessionRecord] | tuple[SessionRecord, ...],
+    ) -> None:
+        """Start GUI recipe background rows only at one settled window grid."""
+
+        pending = tuple(records)
+        if not pending:
+            return
+        if self._recipe_geometry_source_id or self._recipe_hidden_records:
+            raise RuntimeError("hidden workspace recipe launch is already pending")
+        self._recipe_hidden_records = pending
+        self._recipe_geometry_last_grid = (0, 0)
+        self._recipe_geometry_stable_samples = 0
+        self._recipe_geometry_deadline = time.monotonic() + 3.0
+        self._recipe_hidden_launch_errors = ()
+        self._recipe_geometry_widget()
+        self._recipe_geometry_source_id = GLib.timeout_add(
+            50,
+            self._poll_recipe_geometry,
+        )
+
+    def _fail_pending_hidden_recipe_records(self, detail: str) -> None:
+        errors: list[tuple[str, str]] = []
+        records = self._recipe_hidden_records
+        self._recipe_hidden_records = ()
+        for record in records:
+            current = self.app_context.store.get(record.id)
+            if current is None:
+                continue
+            try:
+                self.app_context.store.update(
+                    current.id,
+                    status="start-error",
+                    last_pid=None,
+                    visible=False,
+                )
+            except Exception:
+                pass
+            errors.append((current.id, detail))
+        self._recipe_hidden_launch_errors = tuple(errors)
+
+    def _launch_hidden_recipe_records_at_grid(
+        self,
+        records: tuple[SessionRecord, ...],
+        *,
+        columns: int,
+        rows: int,
+    ) -> None:
+        create_at_grid = getattr(
+            self.app_context.backend,
+            "create_or_resume_at_grid",
+            None,
+        )
+        if not callable(create_at_grid):
+            detail = "backend has no exact-grid creation surface"
+            errors: list[tuple[str, str]] = []
+            for record in records:
+                current = self.app_context.store.get(record.id)
+                if current is None:
+                    continue
+                try:
+                    self.app_context.store.update(
+                        current.id,
+                        status="start-error",
+                        last_pid=None,
+                        visible=False,
+                    )
+                except Exception:
+                    pass
+                errors.append((current.id, detail))
+            self._recipe_hidden_launch_errors = tuple(errors)
+            return
+        errors: list[tuple[str, str]] = []
+        for record in records:
+            current = self.app_context.store.get(record.id)
+            if current is None:
+                continue
+            try:
+                create_at_grid(current, columns=columns, rows=rows)
+                pid = self.app_context.backend.pane_pid(current)
+                self.app_context.store.update(
+                    current.id,
+                    status="running",
+                    last_pid=pid,
+                    visible=False,
+                    auth_restart_required=False,
+                )
+            except Exception as exc:
+                # A recipe row is durable, but a partially created tmux target is
+                # not. Remove only that target and retain the hidden row for an
+                # explicit later retry.
+                try:
+                    self.app_context.backend.terminate(current)
+                except Exception:
+                    pass
+                try:
+                    self.app_context.store.update(
+                        current.id,
+                        status="start-error",
+                        last_pid=None,
+                        visible=False,
+                    )
+                except Exception:
+                    pass
+                errors.append((current.id, str(exc)))
+        self._recipe_hidden_launch_errors = tuple(errors)
+
+    def _poll_recipe_geometry(self) -> bool:
+        if not getattr(self, "_tab_directory_refresh_alive", False):
+            self._recipe_geometry_source_id = 0
+            self._recipe_hidden_records = ()
+            self._cleanup_recipe_geometry_probe()
+            return False
+        widget = self._recipe_geometry_widget()
+        terminal = getattr(widget, "terminal", None)
+        try:
+            grid = (
+                max(0, int(terminal.get_column_count())),
+                max(0, int(terminal.get_row_count())),
+            )
+        except Exception:
+            grid = (0, 0)
+        if grid[0] >= 2 and grid[1] >= 2:
+            if grid == self._recipe_geometry_last_grid:
+                self._recipe_geometry_stable_samples += 1
+            else:
+                self._recipe_geometry_last_grid = grid
+                self._recipe_geometry_stable_samples = 1
+            if self._recipe_geometry_stable_samples >= 2:
+                self._recipe_geometry_source_id = 0
+                self._recipe_canonical_grid = grid
+                records = self._recipe_hidden_records
+                self._recipe_hidden_records = ()
+                self._launch_hidden_recipe_records_at_grid(
+                    records,
+                    columns=grid[0],
+                    rows=grid[1],
+                )
+                self._cleanup_recipe_geometry_probe()
+                self.side.refresh()
+                if self._recipe_hidden_launch_errors:
+                    self.show_toast(
+                        f"Could not start {len(self._recipe_hidden_launch_errors)} hidden workspace tab(s)",
+                        kind="warning",
+                    )
+                return False
+        if time.monotonic() >= self._recipe_geometry_deadline:
+            self._recipe_geometry_source_id = 0
+            self._fail_pending_hidden_recipe_records(
+                "canonical terminal geometry did not settle"
+            )
+            self._cleanup_recipe_geometry_probe()
+            self.side.refresh()
+            self.show_toast(
+                "Hidden workspace tabs were not started because terminal geometry did not settle",
+                kind="warning",
+            )
+            return False
+        return True
 
     def _sync_current_terminal_geometry(self) -> bool:
         self._terminal_layout_sync_source_id = 0
@@ -8099,6 +8665,7 @@ class TermDeckApplication(Gtk.Application):
             restore_records=[],
         )
         self.windows.append(win)
+        hidden_records: list[SessionRecord] = []
         for tab_index, tab in enumerate(recipe_window.tabs):
             command = render_command(tab.command, cwd=tab.cwd)
             record = self.store.create(
@@ -8112,19 +8679,22 @@ class TermDeckApplication(Gtk.Application):
                 visible=tab.visible,
                 pinned=tab.pinned,
             )
-            self.backend.create_or_resume(record)
-            pid = self.backend.pane_pid(record)
-            record = self.store.update(record.id, status="running", last_pid=pid, visible=tab.visible)
             if tab.visible:
+                # Let the VTE page settle before creating tmux. The callback in
+                # ``open_session`` passes that exact grid to ``new-session -x/-y``.
                 win.open_session(
                     record,
                     restart_missing=True,
                     remember_layout=False,
-                    known_live=True,
-                    known_pid=pid,
+                    known_live=False,
+                    known_pid=None,
                     known_pid_resolved=True,
                     refresh_side=False,
                 )
+            else:
+                hidden_records.append(record)
+        if hidden_records:
+            win.start_hidden_recipe_records(hidden_records)
         win.side.refresh()
         return win
 

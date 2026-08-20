@@ -1,4 +1,4 @@
-name: CI
+name: ci
 
 on:
   push:
@@ -10,156 +10,115 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.10', '3.11', '3.12']
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install TermDeck
-        run: pip install -e .
-      - name: Syntax check
-        run: python -m compileall -q termdeck tests scripts
-      - name: CLI smoke
+      - name: Install package without optional GUI bindings
         run: |
-          python -m termdeck workspace-plan --sample > /tmp/termdeck.workspace.json
-          python -m termdeck workspace-plan /tmp/termdeck.workspace.json
-          python -m termdeck palette master --db :memory:
-          python -m termdeck sessions --db :memory:
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e .
+      - name: Compile and check CLI compatibility
+        run: |
+          PYTHONPYCACHEPREFIX=/tmp/termdeck-compat-pycache .venv/bin/python -m compileall -q termdeck tests scripts
+          .venv/bin/t1000 version
+      - name: Validate authoritative inventory contract
+        run: |
+          rm -rf /tmp/termdeck-manifest-${{ matrix.python-version }}
+          .venv/bin/python scripts/run_validation.py \
+            --check-manifest \
+            --profile ci \
+            --output /tmp/termdeck-manifest-${{ matrix.python-version }}
 
   tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Install GTK test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            gir1.2-gtk-3.0 \
-            gir1.2-vte-2.91 \
-            python3-gi \
-            python3-pip \
-            python3-venv
-      - name: Install TermDeck with system GTK bindings
-        run: |
-          python3 -m venv --system-site-packages .venv-gtk
-          .venv-gtk/bin/python -m pip install --upgrade pip
-          .venv-gtk/bin/python -m pip install pytest pytest-subtests -e .
-      - name: Full test suite
-        env:
-          NO_AT_BRIDGE: '1'
-        run: .venv-gtk/bin/python -m pytest tests -q
-
-  ui-smoke:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install GTK and visual-smoke dependencies
+      - name: Install GTK/VTE, terminal and validation dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             dbus-x11 \
             gir1.2-gtk-3.0 \
             gir1.2-vte-2.91 \
-            imagemagick \
+            libgtk-3-0 \
+            libvte-2.91-0 \
             python3-gi \
-            python3-pip \
-            python3-venv \
+            python3-pytest \
             tmux \
-            x11-utils \
             xdotool \
             xvfb
-      - name: Install TermDeck with system GTK bindings
+          python3 -m venv --system-site-packages .venv-gtk
+          .venv-gtk/bin/python -m pip install --upgrade pip
+          .venv-gtk/bin/python -m pip install -e .
+      - name: Run every test file in a bounded fresh process
         run: |
-          python3 -m venv --system-site-packages .venv-ui
-          .venv-ui/bin/python -m pip install --upgrade pip
-          .venv-ui/bin/python -m pip install -e .
-      - name: Verify terminal-first Tabs pane lifecycle
-        run: >-
-          xvfb-run -a dbus-run-session --
-          .venv-ui/bin/python scripts/check_tabs_pane_smoke.py
-      - name: Verify every remembered window restores
-        run: >-
-          xvfb-run -a dbus-run-session --
-          .venv-ui/bin/python scripts/check_window_restore_smoke.py
-      - name: Verify Tab Manager window relocation
-        run: >-
-          xvfb-run -a dbus-run-session --
-          .venv-ui/bin/python scripts/check_tab_manager_move_smoke.py
-      - name: Verify minimal header chrome
-        run: >-
-          xvfb-run -a dbus-run-session --
-          .venv-ui/bin/python scripts/check_header_smoke.py
-      - name: Verify minimal tab strip
-        run: >-
-          xvfb-run -a dbus-run-session --
-          .venv-ui/bin/python scripts/check_tab_strip_smoke.py
-      - name: Verify typo-tolerant Search Tabs
-        run: >-
-          xvfb-run -a dbus-run-session --
-          .venv-ui/bin/python scripts/check_fuzzy_search_smoke.py
-      - name: Verify startup terminal geometry
-        run: >-
-          xvfb-run -a dbus-run-session --
-          .venv-ui/bin/python scripts/check_startup_geometry_smoke.py
-      - name: Verify Ctrl+W and Ctrl+Q lifecycle
-        run: >-
-          xvfb-run -a dbus-run-session --
-          .venv-ui/bin/python scripts/check_shortcut_lifecycle_smoke.py
-      - name: Verify Ctrl+Shift+V clipboard paste
-        run: >-
-          xvfb-run -a dbus-run-session --
-          .venv-ui/bin/python scripts/check_clipboard_paste_smoke.py
-      - name: Verify terminal select-to-copy
-        run: >-
-          xvfb-run -a dbus-run-session --
-          .venv-ui/bin/python scripts/check_terminal_select_copy_smoke.py
-      - name: Verify immediate Ctrl+T tab creation
-        run: >-
-          xvfb-run -a dbus-run-session --
-          .venv-ui/bin/python scripts/check_immediate_new_tab_smoke.py
-      - name: Verify polished visual hierarchy
-        run: >-
-          xvfb-run -a dbus-run-session --
-          .venv-ui/bin/python scripts/check_visual_polish_smoke.py
-      - name: Verify wheel scrolling never becomes TUI key input
-        run: >-
-          xvfb-run -a dbus-run-session --
-          .venv-ui/bin/python scripts/check_terminal_scroll_smoke.py
-      - name: Render desktop GTK layout
-        run: .venv-ui/bin/python scripts/render_ui_smoke.py --output termdeck-ui-smoke-desktop.png
-      - name: Render compact GTK layout
-        run: >-
-          .venv-ui/bin/python scripts/render_ui_smoke.py
-          --output termdeck-ui-smoke-compact.png
-          --window-width 640
-          --window-height 520
-      - name: Upload rendered UI frames
+          rm -rf validation-tests
+          .venv-gtk/bin/python scripts/run_validation.py \
+            --profile ci \
+            --tests-only \
+            --output validation-tests
+      - name: Upload validation evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: termdeck-ui-smoke
-          path: termdeck-ui-smoke-*.png
+          name: validation-tests
+          path: validation-tests
           if-no-files-found: error
-          retention-days: 7
 
-  perf:
+  ui-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK/VTE, tmux, X11 and D-Bus smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            dbus-x11 \
+            gir1.2-gtk-3.0 \
+            gir1.2-vte-2.91 \
+            libgtk-3-0 \
+            libvte-2.91-0 \
+            python3-gi \
+            python3-pytest \
+            tmux \
+            xdotool \
+            xvfb
+          python3 -m venv --system-site-packages .venv-gtk
+          .venv-gtk/bin/python -m pip install --upgrade pip
+          .venv-gtk/bin/python -m pip install -e .
+      - name: Run the complete portable smoke inventory
+        run: |
+          rm -rf validation-smokes
+          .venv-gtk/bin/python scripts/run_validation.py \
+            --profile ci \
+            --smokes-only \
+            --output validation-smokes
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-smokes
+          path: validation-smokes
+          if-no-files-found: error
+
+  performance:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install TermDeck
-        run: pip install -e .
-      - name: Run headless perf probes
-        run: python scripts/perf_probe.py --json-out termdeck-perf-probe.json
-      - name: Upload perf probe results
-        uses: actions/upload-artifact@v4
-        with:
-          name: termdeck-perf-probe
-          path: termdeck-perf-probe.json
-          if-no-files-found: error
-          retention-days: 30
+      - name: Install tmux and package
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e .
+      - name: Enforce backend latency thresholds
+        run: |
+          .venv/bin/python scripts/perf_probe.py --sessions 36 --iterations 5 --assert-thresholds

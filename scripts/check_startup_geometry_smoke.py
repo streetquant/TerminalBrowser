@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -113,6 +115,27 @@ def main() -> int:
         os.environ["TMUX_TMPDIR"] = str(tmux_tmp)
         os.environ["NO_AT_BRIDGE"] = "1"
 
+        initial_grid_path = root / "payload-initial-grid.json"
+        grid_probe = root / "grid_probe.py"
+        grid_probe.write_text(
+            """from __future__ import annotations
+import json, os, sys, time
+from pathlib import Path
+size = os.get_terminal_size()
+out = Path(sys.argv[1])
+out.write_text(json.dumps({"columns": size.columns, "rows": size.lines}) + "\\n", encoding="utf-8")
+# Model a full-screen startup application without depending on host shell
+# startup files. The first alternate-screen frame must use the final grid.
+sys.stdout.write("\\x1b[?1049h\\x1b[2J\\x1b[HSTARTUP GRID %dx%d\\r\\n" % (size.columns, size.lines))
+sys.stdout.flush()
+time.sleep(30)
+""",
+            encoding="utf-8",
+        )
+        current_command = shlex.join(
+            [sys.executable, str(grid_probe), str(initial_grid_path)]
+        )
+
         workspace = root / "workspace.json"
         workspace.write_text(
             json.dumps(
@@ -131,7 +154,7 @@ def main() -> int:
                                 {
                                     "name": "shell-current",
                                     "tag": "terminal",
-                                    "command": "{shell}",
+                                    "command": current_command,
                                     "cwd": str(root),
                                 }
                             ],
@@ -233,6 +256,40 @@ def main() -> int:
             if first_controller_size == (80, 24) and first_vte_size != (80, 24):
                 raise AssertionError(
                     "pane stream initialized at default 80x24 before final VTE allocation"
+                )
+            # Private auth/config preparation can briefly precede the user
+            # command even though the pane/controller already exist. Wait for
+            # the bounded launch marker rather than confusing wrapper latency
+            # with a missing payload.
+            payload_deadline = time.monotonic() + 5.0
+            while time.monotonic() < payload_deadline and not initial_grid_path.is_file():
+                _drain_gtk(Gtk)
+                time.sleep(0.005)
+            if not initial_grid_path.is_file():
+                diagnostic_capture = app.backend.capture(record, lines=40)
+                diagnostic_pane = app.backend._run(
+                    [
+                        "display-message",
+                        "-p",
+                        "-t",
+                        record.tmux_name,
+                        "#{pane_pid}|#{pane_current_command}|#{pane_dead}|#{pane_start_command}",
+                    ],
+                    check=False,
+                ).stdout.strip()
+                raise AssertionError(
+                    "payload did not record its initial terminal grid; "
+                    f"pane={diagnostic_pane!r}; capture={diagnostic_capture!r}"
+                )
+            initial_grid_payload = json.loads(initial_grid_path.read_text(encoding="utf-8"))
+            payload_initial_grid = (
+                int(initial_grid_payload["columns"]),
+                int(initial_grid_payload["rows"]),
+            )
+            if payload_initial_grid != first_vte_size:
+                raise AssertionError(
+                    "payload rendered its first frame before final VTE allocation: "
+                    f"payload={payload_initial_grid}, VTE={first_vte_size}"
                 )
 
             # The first-created page is hidden by the second page before the
@@ -355,6 +412,9 @@ def main() -> int:
                         "ok": True,
                         "first_attach_ms": round(first_attach_ms or 0.0, 2),
                         "vte_grid": f"{first_vte_size[0]}x{first_vte_size[1]}",
+                        "payload_initial_grid": (
+                            f"{payload_initial_grid[0]}x{payload_initial_grid[1]}"
+                        ),
                         "stream_controller_grid": (
                             f"{first_controller_size[0]}x{first_controller_size[1]}"
                         ),

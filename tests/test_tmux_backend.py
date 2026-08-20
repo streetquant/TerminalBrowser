@@ -260,6 +260,84 @@ class FakeCheckpointManager:
 
 
 class TmuxBackendTests(unittest.TestCase):
+    def test_resize_propagation_binds_witness_to_persistent_private_scope(self):
+        expected = object()
+        with mock.patch(
+            "termdeck.tmux_backend._propagate_terminal_resize",
+            return_value=expected,
+        ) as propagate:
+            result = TmuxBackend.propagate_terminal_resize(
+                1234,
+                codex_home="/tmp/auth-test",
+                auth_scope_id="auth-test",
+            )
+
+        self.assertIs(result, expected)
+        call = propagate.call_args
+        self.assertEqual(call.args, (1234,))
+        private_tuple = call.kwargs["expected_private_tuple"]
+        self.assertEqual(private_tuple.codex_home, "/tmp/auth-test")
+        self.assertEqual(private_tuple.auth_scope_id, "auth-test")
+        self.assertEqual(
+            private_tuple.gate_root,
+            "/tmp/auth-test/.termdeck-codex-lifetime",
+        )
+
+    def test_resize_propagation_without_complete_persistent_scope_is_noop(self):
+        with mock.patch("termdeck.tmux_backend._propagate_terminal_resize") as propagate:
+            result = TmuxBackend.propagate_terminal_resize(
+                1234,
+                codex_home="/tmp/auth-test",
+                auth_scope_id="auth-other",
+            )
+
+        self.assertFalse(result.signalled)
+        self.assertEqual(
+            result.reason,
+            "persistent private Codex identity is unavailable",
+        )
+        propagate.assert_not_called()
+
+    def test_auth_session_exists_retries_one_timeout_with_command_budget(self):
+        backend = TmuxBackend(query_timeout=0.35, command_timeout=2.0)
+        record = _auth_record()
+        timeout = subprocess.CompletedProcess(
+            ["tmux", "has-session"],
+            124,
+            "",
+            "tmux command timed out after 0.35s: has-session",
+        )
+        exists = subprocess.CompletedProcess(
+            ["tmux", "has-session"],
+            0,
+            "",
+            "",
+        )
+
+        with mock.patch.object(backend, "_run", side_effect=[timeout, exists]) as run:
+            self.assertTrue(backend._auth_session_exists(record))
+
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].kwargs["timeout"], backend.query_timeout)
+        self.assertEqual(run.call_args_list[1].kwargs["timeout"], backend.command_timeout)
+        self.assertTrue(run.call_args_list[1].kwargs["bypass_query_backoff"])
+
+    def test_auth_session_exists_repeated_timeout_remains_fail_closed(self):
+        backend = TmuxBackend(query_timeout=0.35, command_timeout=2.0)
+        record = _auth_record()
+        timeout = subprocess.CompletedProcess(
+            ["tmux", "has-session"],
+            124,
+            "",
+            "tmux command timed out",
+        )
+
+        with mock.patch.object(backend, "_run", side_effect=[timeout, timeout]) as run:
+            with self.assertRaises(TmuxError):
+                backend._auth_session_exists(record)
+
+        self.assertEqual(run.call_count, 2)
+
     def test_recovery_pending_relaunches_exact_claude_session_without_dmtcp(self):
         session_id = "d2a7ed1b-d6fd-45de-8342-5f10cfed3c07"
         with tempfile.TemporaryDirectory() as tmp:
@@ -763,6 +841,46 @@ class TmuxBackendTests(unittest.TestCase):
 
         self.assertEqual(run.call_args_list[0].args[0][-1], "wrapped(/bin/bash)")
         self.assertNotIn("api_key=secret", run.call_args_list[0].args[0][-1])
+
+    def test_gui_sized_launch_sets_exact_first_tmux_grid(self):
+        record = _record(command="codex --yolo", status="new")
+        backend = TmuxBackend(executable="tmux")
+        completed = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="", stderr=""
+        )
+
+        with mock.patch.object(
+            backend, "session_exists", return_value=False
+        ), mock.patch.object(backend, "_run", return_value=completed) as run:
+            backend.create_or_resume_at_grid(record, columns=132, rows=43)
+
+        launch = run.call_args_list[0].args[0]
+        self.assertEqual(launch[:8], [
+            "new-session",
+            "-d",
+            "-s",
+            record.tmux_name,
+            "-x",
+            "132",
+            "-y",
+            "43",
+        ])
+        self.assertEqual(launch[-1], "codex --yolo")
+
+    def test_gui_sized_launch_rejects_invalid_grids_before_tmux(self):
+        record = _record(command="/bin/bash", status="new")
+        backend = TmuxBackend(executable="tmux")
+        invalid = ((1, 24), (80, 1), (1001, 24), (80, 1001), (True, 24))
+        for columns, rows in invalid:
+            with self.subTest(columns=columns, rows=rows), mock.patch.object(
+                backend, "_run"
+            ) as run, self.assertRaisesRegex(TmuxError, "initial terminal grid"):
+                backend.create_or_resume_at_grid(
+                    record,
+                    columns=columns,
+                    rows=rows,
+                )
+            run.assert_not_called()
 
     def test_default_backend_launches_new_non_codex_tabs_without_dmtcp(self):
         record = _record(command="/bin/bash", status="new")

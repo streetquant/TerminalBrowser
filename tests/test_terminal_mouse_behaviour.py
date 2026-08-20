@@ -598,6 +598,7 @@ class TerminalMouseBehaviourTest(TestCase):
         attach = SimpleNamespace(
             _scroll_idle_source_id=0,
             _remove_glib_source=lambda source_id: None,
+            controller=SimpleNamespace(prioritize_setup=lambda: calls.append("priority")),
             _live_focus_handler=lambda: calls.append("restore") or True,
             scroll_to_bottom=lambda: calls.append("bottom"),
             _set_history_cursor_hidden=lambda hidden: calls.append(("cursor-hidden", hidden)),
@@ -608,24 +609,149 @@ class TerminalMouseBehaviourTest(TestCase):
         self.assertTrue(restored)
         self.assertEqual(
             calls,
-            ["restore", "bottom", ("cursor-hidden", False)],
+            ["priority", "restore", "bottom", ("cursor-hidden", False)],
         )
 
     def test_live_input_latches_priority_before_controller_exists(self) -> None:
+        calls = []
         attach = SimpleNamespace(
             _scroll_idle_source_id=0,
             _remove_glib_source=lambda _source_id: None,
             _setup_priority_requested=False,
             controller=None,
-            _live_focus_handler=lambda: True,
-            scroll_to_bottom=lambda: None,
-            _set_history_cursor_hidden=lambda _hidden: None,
+            _live_focus_handler=lambda: calls.append("restore") or True,
+            scroll_to_bottom=lambda: calls.append("bottom"),
+            _set_history_cursor_hidden=lambda _hidden: calls.append("cursor"),
         )
 
         restored = AttachTerminal.prepare_for_live_input(attach)
 
-        self.assertTrue(restored)
+        self.assertFalse(restored)
         self.assertTrue(attach._setup_priority_requested)
+        self.assertEqual(calls, [])
+
+    def test_geometry_only_attach_never_schedules_or_starts_a_stream(self) -> None:
+        attach = SimpleNamespace(
+            _connect_enabled=False,
+            controller=None,
+            _detached=False,
+            _terminally_stopped=False,
+            _attach_restart_deferred=False,
+            _connect_source_id=0,
+            _connect_fallback_source_id=0,
+            _last_allocated_grid=(0, 0),
+            terminal=SimpleNamespace(
+                get_column_count=lambda: 132,
+                get_row_count=lambda: 43,
+            ),
+            _remove_glib_source=lambda _source_id: None,
+        )
+
+        with mock.patch("termdeck.gtk_app.GLib.timeout_add") as timeout_add:
+            AttachTerminal._on_terminal_size_allocate(attach, None, None)
+        timeout_add.assert_not_called()
+        self.assertEqual(attach._last_allocated_grid, (132, 43))
+        self.assertFalse(AttachTerminal._connect_fallback(attach))
+
+        with mock.patch("termdeck.gtk_app.PaneStreamController") as controller:
+            AttachTerminal._connect_stream(attach, columns=132, rows=43)
+        controller.assert_not_called()
+        self.assertIsNone(attach.controller)
+
+    def test_recipe_geometry_requires_two_equal_samples_before_launch(self) -> None:
+        record = SimpleNamespace(id="hidden", cwd="/tmp")
+        terminal = SimpleNamespace(
+            get_column_count=lambda: 132,
+            get_row_count=lambda: 43,
+        )
+        launch = mock.Mock()
+        cleanup = mock.Mock()
+        refresh = mock.Mock()
+        window = SimpleNamespace(
+            _tab_directory_refresh_alive=True,
+            _recipe_geometry_source_id=41,
+            _recipe_geometry_last_grid=(0, 0),
+            _recipe_geometry_stable_samples=0,
+            _recipe_geometry_deadline=time.monotonic() + 10,
+            _recipe_hidden_records=(record,),
+            _recipe_hidden_launch_errors=(),
+            _recipe_canonical_grid=(0, 0),
+            _recipe_geometry_widget=lambda: SimpleNamespace(terminal=terminal),
+            _launch_hidden_recipe_records_at_grid=launch,
+            _cleanup_recipe_geometry_probe=cleanup,
+            side=SimpleNamespace(refresh=refresh),
+            show_toast=mock.Mock(),
+        )
+
+        self.assertTrue(TermDeckWindow._poll_recipe_geometry(window))
+        launch.assert_not_called()
+        self.assertEqual(window._recipe_geometry_stable_samples, 1)
+
+        self.assertFalse(TermDeckWindow._poll_recipe_geometry(window))
+        launch.assert_called_once_with((record,), columns=132, rows=43)
+        cleanup.assert_called_once_with()
+        refresh.assert_called_once_with()
+        self.assertEqual(window._recipe_canonical_grid, (132, 43))
+        self.assertEqual(window._recipe_hidden_records, ())
+        self.assertEqual(window._recipe_geometry_source_id, 0)
+
+    def test_hidden_recipe_launch_isolates_one_failed_target(self) -> None:
+        good = SimpleNamespace(id="good")
+        bad = SimpleNamespace(id="bad")
+        rows = {"good": good, "bad": bad}
+        updates = []
+        terminated = []
+
+        class Store:
+            def get(self, session_id):
+                return rows.get(session_id)
+
+            def update(self, session_id, **changes):
+                updates.append((session_id, changes))
+                return rows[session_id]
+
+        class Backend:
+            def create_or_resume_at_grid(self, record, *, columns, rows):
+                if record.id == "bad":
+                    raise RuntimeError("boom")
+                self.grid = (columns, rows)
+
+            def pane_pid(self, record):
+                return 4242 if record.id == "good" else None
+
+            def terminate(self, record):
+                terminated.append(record.id)
+
+        window = SimpleNamespace(
+            app_context=SimpleNamespace(store=Store(), backend=Backend()),
+            _recipe_hidden_launch_errors=(),
+        )
+
+        TermDeckWindow._launch_hidden_recipe_records_at_grid(
+            window,
+            (good, bad),
+            columns=132,
+            rows=43,
+        )
+
+        self.assertEqual(terminated, ["bad"])
+        self.assertEqual(window._recipe_hidden_launch_errors, (("bad", "boom"),))
+        self.assertIn(
+            (
+                "good",
+                {
+                    "status": "running",
+                    "last_pid": 4242,
+                    "visible": False,
+                    "auth_restart_required": False,
+                },
+            ),
+            updates,
+        )
+        self.assertIn(
+            ("bad", {"status": "start-error", "last_pid": None, "visible": False}),
+            updates,
+        )
 
     def test_latched_priority_is_applied_before_controller_start(self) -> None:
         calls = []
@@ -705,6 +831,9 @@ class TerminalMouseBehaviourTest(TestCase):
         attach = SimpleNamespace(
             _scroll_idle_source_id=0,
             _remove_glib_source=lambda source_id: None,
+            controller=SimpleNamespace(
+                prioritize_setup=lambda: calls.append("priority")
+            ),
             _live_focus_handler=lambda: calls.append("restore") or False,
             scroll_to_bottom=lambda: calls.append("bottom"),
             _set_history_cursor_hidden=lambda hidden: calls.append(("cursor", hidden)),
@@ -713,7 +842,7 @@ class TerminalMouseBehaviourTest(TestCase):
         restored = AttachTerminal.prepare_for_live_input(attach)
 
         self.assertFalse(restored)
-        self.assertEqual(calls, ["restore"])
+        self.assertEqual(calls, ["priority", "restore"])
 
     def test_notebook_switch_restores_live_view_and_syncs_selected_page(self) -> None:
         calls = []

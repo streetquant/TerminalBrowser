@@ -18,11 +18,13 @@ from __future__ import annotations
 import base64
 import configparser
 import csv
+import errno
 import fcntl
 import hashlib
 import io
 import json
 import os
+import pwd
 import re
 import selectors
 import shlex
@@ -34,6 +36,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import uuid
@@ -95,6 +98,81 @@ _UUID = re.compile(
     re.IGNORECASE,
 )
 _MANAGED_GUI_PROCESS_SCHEMA = "t1000.managed-gui-processes.v1"
+_PROCESS_OBSERVER_RECEIPT_SCHEMA = "t1000.managed-gui-process-observer-receipt.v1"
+_PROCESS_OBSERVER_ENV = "T1000_PROCESS_SCAN_BROKER"
+_PROCESS_OBSERVER_TIMEOUT_SECONDS = 10.0
+_PROCESS_OBSERVER_STDOUT_BYTES = 2 * 1024 * 1024
+_PROCESS_OBSERVER_STDERR_BYTES = 64 * 1024
+_PROCESS_OBSERVER_FOLLOWER_WAIT_SECONDS = _PROCESS_OBSERVER_TIMEOUT_SECONDS + 5.0
+_PROCESS_DIRECT_SCAN_FOLLOWER_WAIT_SECONDS = 5.0
+_PROCESS_CROSS_STATE_SCHEMA = "t1000.process-observer-cross-flight.v2"
+_PROCESS_CROSS_RESULT_SCHEMA = "t1000.process-observer-cross-result.v1"
+_PROCESS_CROSS_ROOT_NAME = "t1000-process-observer"
+_PROCESS_CROSS_REGISTRY_LOCK_NAME = "registry.lock"
+_PROCESS_CROSS_LOCK_WAIT_SECONDS = 2.0
+_PROCESS_CROSS_LOCK_MAX_WAIT_SECONDS = 10.0
+_PROCESS_CROSS_LOCK_POLL_SECONDS = 0.01
+_PROCESS_CROSS_LEGACY_LOCK_NAME = re.compile(r"^flight-([0-9a-f]{64})\.lock$")
+_PROCESS_CROSS_WAIT_SECONDS = _PROCESS_OBSERVER_TIMEOUT_SECONDS + 5.0
+_PROCESS_CROSS_MAX_AGE_NS = int((_PROCESS_CROSS_WAIT_SECONDS + 5.0) * 1_000_000_000)
+_PROCESS_CROSS_LATE_JOIN_TTL_NS = _PROCESS_CROSS_MAX_AGE_NS
+_PROCESS_CROSS_RESULT_TTL_NS = 60 * 1_000_000_000
+_PROCESS_CROSS_MAX_STATE_BYTES = 16 * 1024
+_PROCESS_CROSS_MAX_RESULT_BYTES = 4 * 1024 * 1024
+_PROCESS_CROSS_MAX_CLEANUP_ENTRIES = 256
+_PROCESS_CROSS_MAX_DIRECTORY_ENTRIES = 8192
+_PROCESS_CROSS_MAX_TOTAL_RESULT_BYTES = 64 * 1024 * 1024
+_PROCESS_CROSS_RESULT_NAME = re.compile(
+    r"^result-([0-9a-f]{64})-([0-9a-f]{32})\.json$"
+)
+_PROCESS_CROSS_STATE_NAME = re.compile(r"^flight-([0-9a-f]{64})\.json$")
+_PROCESS_CROSS_FILE_STATE = "state"
+_PROCESS_CROSS_FILE_RESULT = "result"
+_PROCESS_OBSERVER_STABLE_FIELDS = (
+    "schema",
+    "managed_release_configured",
+    "expected_uid",
+    "boot_id",
+    "expected_identity",
+    "complete",
+    "posture",
+    "gui_count",
+    "processes",
+    "activation",
+    "issues",
+)
+_PROCESS_OBSERVER_HELPER_SOURCE = r'''
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+SCHEMA = "t1000.managed-gui-process-observer-receipt.v1"
+
+try:
+    source_root = Path(sys.argv[1]).resolve(strict=True)
+    expected_module = Path(sys.argv[2]).resolve(strict=True)
+    managed_root = Path(sys.argv[3]).absolute()
+    managed_bin = Path(sys.argv[4]).absolute()
+    expected_uid = int(sys.argv[5])
+    sys.path.insert(0, str(source_root))
+    from termdeck import release_manager as manager
+
+    observed_module = Path(manager.__file__).resolve(strict=True)
+    if observed_module != expected_module:
+        raise RuntimeError("observer module path mismatch")
+    payload = manager.managed_gui_process_observer_receipt(
+        root=managed_root,
+        bin_dir=managed_bin,
+        expected_uid=expected_uid,
+    )
+except Exception:
+    payload = {"schema": SCHEMA, "ok": False, "error_code": "observer-failed"}
+
+sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+raise SystemExit(0 if payload.get("ok") else 3)
+'''
 _BOOT_ID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
@@ -191,6 +269,53 @@ class _BoundedProcessResult:
     returncode: int
     stdout: bytes
     stderr: bytes
+
+
+@dataclass(frozen=True)
+class _ProcessObserverTransportResult:
+    """Immutable output shared only while one broker transport is in progress."""
+
+    result_code: str
+    stdout: bytes = b""
+    cross_process_role: str = "none"
+    cross_process_shared: bool = False
+    cross_process_result: str = "not-attempted"
+
+
+@dataclass(frozen=True)
+class _ProcessCrossAdmission:
+    role: str
+    root: Path
+    key_sha256: str
+    nonce: str
+    result_path: Path
+    state_path: Path
+    lock_path: Path
+    boot_id: str
+    leader_pid: int
+    leader_start_ticks: int
+
+
+@dataclass(frozen=True)
+class _ProcessCrossUsage:
+    """Bounded protocol storage measured from one directory snapshot."""
+
+    directory_entries: int
+    result_count: int
+    state_count: int
+    total_result_bytes: int
+
+
+class _ProcessObserverFlight:
+    """One process-local in-progress observation; never a completed-result cache."""
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.result: _ProcessObserverTransportResult | None = None
+
+
+_PROCESS_OBSERVER_FLIGHT_LOCK = threading.Lock()
+_PROCESS_OBSERVER_FLIGHTS: dict[tuple[str, ...], _ProcessObserverFlight] = {}
 
 
 @dataclass(frozen=True)
@@ -3744,12 +3869,1982 @@ def _scan_managed_gui_processes(
     return base
 
 
+def _process_scan_stable_projection(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Return only decision-relevant fields from one direct process scan."""
+
+    return {field: payload.get(field) for field in _PROCESS_OBSERVER_STABLE_FIELDS}
+
+
+def managed_gui_process_observer_receipt(
+    *,
+    root: str | Path | None = None,
+    bin_dir: str | Path | None = None,
+    proc_root: str | Path = "/proc",
+    expected_uid: int | None = None,
+) -> dict[str, object]:
+    """Emit two stable direct scans for a brokered observer namespace.
+
+    This function never dispatches another broker.  It is intentionally usable
+    from an isolated Python helper launched by the systemd user manager, whose
+    procfs permissions can differ from the original caller's containment.
+    """
+
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    state = load_managed_state(layout)
+    current = state.get("current_release_id")
+    if not isinstance(current, str) or _RELEASE_ID.fullmatch(current) is None:
+        raise ReleaseError("managed process observer requires a selected release")
+    uid = os.getuid() if expected_uid is None else int(expected_uid)
+    activation = _verify_managed_activation(layout, state, verify_release=True)
+    if activation.get("current_release_id") != current:
+        raise ReleaseError("managed process observer activation changed release")
+    state_sha256 = sha256_bytes(canonical_json_bytes(state))
+    first = _scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=Path(proc_root),
+        expected_uid=uid,
+    )
+    second = _scan_managed_gui_processes(
+        layout,
+        state,
+        proc_root=Path(proc_root),
+        expected_uid=uid,
+    )
+    observed_state = load_managed_state(layout)
+    state_stable = observed_state == state
+    if state_stable:
+        observed_activation = _verify_managed_activation(
+            layout,
+            observed_state,
+            verify_release=True,
+        )
+        state_stable = observed_activation.get("current_release_id") == current
+    stable = _process_scan_stable_projection(first) == _process_scan_stable_projection(
+        second
+    )
+    complete = bool(first.get("complete")) and bool(second.get("complete"))
+    ok = state_stable and stable and complete
+    error_code = ""
+    if not state_stable:
+        error_code = "managed-state-changed"
+    elif not stable:
+        error_code = "process-scan-unstable"
+    elif not complete:
+        error_code = "process-scan-incomplete"
+    source_module = Path(__file__).resolve(strict=True)
+    return {
+        "schema": _PROCESS_OBSERVER_RECEIPT_SCHEMA,
+        "ok": ok,
+        "error_code": error_code,
+        "observer": "systemd-user-manager",
+        "source_root": str(source_module.parent.parent),
+        "source_module": str(source_module),
+        "root": str(layout.root),
+        "bin_dir": str(layout.bin_dir),
+        "current_release_id": current,
+        "managed_state_sha256": state_sha256,
+        "expected_uid": uid,
+        "stable_samples": 2,
+        "stable": stable,
+        "state_stable": state_stable,
+        "status": first,
+    }
+
+
+def _trusted_systemd_run() -> Path:
+    candidate = shutil.which("systemd-run")
+    if not candidate:
+        raise ReleaseError("systemd-run is unavailable")
+    try:
+        executable = Path(candidate).resolve(strict=True)
+        metadata = executable.stat()
+        trusted_roots = tuple(
+            path.resolve(strict=True) for path in (Path("/usr"), Path("/bin")) if path.exists()
+        )
+    except OSError as exc:
+        raise ReleaseError("systemd-run cannot be inspected") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not os.access(executable, os.X_OK)
+        or os.access(executable, os.W_OK)
+        or not any(executable.is_relative_to(root) for root in trusted_roots)
+    ):
+        raise ReleaseError("systemd-run is not a trusted system executable")
+    # User namespaces may expose host-root-owned files through the overflow UID,
+    # so numeric owner 0 is not a portable trust predicate.  Instead bind trust
+    # to a canonical system prefix and require that neither the executable nor
+    # any directory beneath that prefix is writable by this observer.
+    for root in trusted_roots:
+        if not executable.is_relative_to(root):
+            continue
+        current = executable.parent
+        while True:
+            directory = current.stat()
+            if (
+                not stat.S_ISDIR(directory.st_mode)
+                or directory.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or os.access(current, os.W_OK)
+            ):
+                raise ReleaseError("systemd-run system path is writable")
+            if current == root:
+                break
+            current = current.parent
+        break
+    return executable
+
+
+def _observer_client_environment(
+    systemd_run: Path,
+    *,
+    expected_uid: int,
+) -> dict[str, str]:
+    """Construct a canonical user-manager client environment without ambient bus trust."""
+
+    if expected_uid != os.geteuid():
+        raise ReleaseError("process observer UID differs from the current user")
+    try:
+        account = pwd.getpwuid(expected_uid)
+        home = Path(account.pw_dir).resolve(strict=True)
+        runtime = Path("/run/user") / str(expected_uid)
+        runtime_metadata = runtime.lstat()
+        bus = runtime / "bus"
+        bus_metadata = bus.lstat()
+    except (KeyError, OSError) as exc:
+        raise ReleaseError("canonical user-manager environment is unavailable") from exc
+    if (
+        runtime.is_symlink()
+        or not stat.S_ISDIR(runtime_metadata.st_mode)
+        or runtime_metadata.st_uid != expected_uid
+        or stat.S_IMODE(runtime_metadata.st_mode) != 0o700
+    ):
+        raise ReleaseError("canonical user runtime directory is unsafe")
+    if (
+        bus.is_symlink()
+        or not stat.S_ISSOCK(bus_metadata.st_mode)
+        or bus_metadata.st_uid != expected_uid
+    ):
+        raise ReleaseError("canonical user-manager bus is unsafe")
+    environment = {
+        "HOME": str(home),
+        "USER": account.pw_name,
+        "LOGNAME": account.pw_name,
+        "SHELL": account.pw_shell or "/bin/sh",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "XDG_RUNTIME_DIR": str(runtime),
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus}",
+    }
+    environment["PATH"] = os.pathsep.join(
+        dict.fromkeys(
+            (
+                str(systemd_run.parent),
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+            )
+        )
+    )
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONHASHSEED"] = "0"
+    return environment
+
+
+def _receipt_contains_private_process_data(value: object) -> bool:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if str(key).casefold() in {"argv", "cmdline"}:
+                return True
+            if _receipt_contains_private_process_data(child):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_receipt_contains_private_process_data(child) for child in value)
+    return False
+
+
+def _validate_process_observer_receipt(
+    payload: object,
+    *,
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    expected_uid: int,
+    direct: Mapping[str, object],
+    source_module: Path,
+) -> dict[str, object]:
+    if not isinstance(payload, Mapping):
+        raise ReleaseError("process observer receipt is not an object")
+    current = state.get("current_release_id")
+    expected_state_sha256 = sha256_bytes(canonical_json_bytes(state))
+    expected_source_root = source_module.parent.parent
+    required = {
+        "schema": _PROCESS_OBSERVER_RECEIPT_SCHEMA,
+        "ok": True,
+        "error_code": "",
+        "observer": "systemd-user-manager",
+        "source_root": str(expected_source_root),
+        "source_module": str(source_module),
+        "root": str(layout.root),
+        "bin_dir": str(layout.bin_dir),
+        "current_release_id": current,
+        "managed_state_sha256": expected_state_sha256,
+        "expected_uid": expected_uid,
+        "stable_samples": 2,
+        "stable": True,
+        "state_stable": True,
+    }
+    for key, expected in required.items():
+        if payload.get(key) != expected:
+            raise ReleaseError(f"process observer receipt failed field {key}")
+    status = payload.get("status")
+    if not isinstance(status, Mapping):
+        raise ReleaseError("process observer receipt has no status object")
+    if status.get("schema") != _MANAGED_GUI_PROCESS_SCHEMA:
+        raise ReleaseError("process observer status schema is invalid")
+    if status.get("complete") is not True or status.get("issues") != []:
+        raise ReleaseError("process observer status is incomplete")
+    if status.get("expected_uid") != expected_uid:
+        raise ReleaseError("process observer status changed expected UID")
+    if status.get("managed_release_configured") is not True:
+        raise ReleaseError("process observer lost the selected release")
+    if status.get("expected_identity") != direct.get("expected_identity"):
+        raise ReleaseError("process observer changed expected process identity")
+    direct_boot = direct.get("boot_id")
+    if isinstance(direct_boot, str) and direct_boot and status.get("boot_id") != direct_boot:
+        raise ReleaseError("process observer changed boot identity")
+    broker_processes = status.get("processes")
+    direct_processes = direct.get("processes")
+    if not isinstance(broker_processes, list) or not isinstance(direct_processes, list):
+        raise ReleaseError("process observer returned invalid process records")
+    for process in direct_processes:
+        if process not in broker_processes:
+            raise ReleaseError("process observer omitted a directly verified process")
+    if "observer" in status or _receipt_contains_private_process_data(payload):
+        raise ReleaseError("process observer receipt exposed private process data")
+    return dict(status)
+
+
+def _process_observer_flight_key(
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    *,
+    expected_uid: int,
+    direct: Mapping[str, object],
+    source_module: Path,
+) -> tuple[str, ...]:
+    """Bind one in-progress flight to every shared observation assumption."""
+
+    current = state.get("current_release_id")
+    boot_id = direct.get("boot_id")
+    expected_identity = direct.get("expected_identity")
+    if not isinstance(current, str) or _RELEASE_ID.fullmatch(current) is None:
+        raise ReleaseError("process observer requires a selected release")
+    if not isinstance(boot_id, str) or _BOOT_ID.fullmatch(boot_id) is None:
+        raise ReleaseError("process observer direct boot identity is invalid")
+    if not isinstance(expected_identity, Mapping):
+        raise ReleaseError("process observer expected identity is invalid")
+    return (
+        str(layout.root),
+        str(layout.bin_dir),
+        str(expected_uid),
+        sha256_bytes(canonical_json_bytes(state)),
+        current,
+        str(source_module),
+        sha256_file(source_module),
+        boot_id,
+        sha256_bytes(canonical_json_bytes(expected_identity)),
+    )
+
+
+def _dispatch_process_observer_transport(
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    *,
+    expected_uid: int,
+    source_module: Path,
+) -> _ProcessObserverTransportResult:
+    """Run one bounded broker transport without caller-specific validation."""
+
+    try:
+        current = state.get("current_release_id")
+        if not isinstance(current, str) or _RELEASE_ID.fullmatch(current) is None:
+            raise ReleaseError("process observer requires a selected release")
+        before_state_sha256 = sha256_bytes(canonical_json_bytes(state))
+        activation = _verify_managed_activation(layout, state, verify_release=True)
+        if activation.get("current_release_id") != current:
+            raise ReleaseError("process observer activation release mismatch")
+        systemd_run = _trusted_systemd_run()
+        source_root = source_module.parent.parent
+        configured_python = Path(str(state.get("python_executable", ""))).resolve(
+            strict=True
+        )
+        unit = f"t1000-process-observer-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+        client_environment = _observer_client_environment(
+            systemd_run,
+            expected_uid=expected_uid,
+        )
+        home = client_environment["HOME"]
+        command = [
+            str(systemd_run),
+            "--user",
+            "--wait",
+            "--collect",
+            "--pipe",
+            "--quiet",
+            f"--unit={unit}",
+            "--property=Type=exec",
+            f"--property=RuntimeMaxSec={int(_PROCESS_OBSERVER_TIMEOUT_SECONDS)}s",
+            "--property=TimeoutStopSec=2s",
+            "--property=WorkingDirectory=/",
+            f"--setenv=HOME={home}",
+            "--setenv=PYTHONDONTWRITEBYTECODE=1",
+            "--setenv=PYTHONHASHSEED=0",
+            f"--setenv={_PROCESS_OBSERVER_ENV}=1",
+            str(configured_python),
+            "-I",
+            "-B",
+            "-c",
+            _PROCESS_OBSERVER_HELPER_SOURCE,
+            str(source_root),
+            str(source_module),
+            str(layout.root),
+            str(layout.bin_dir),
+            str(expected_uid),
+        ]
+        completed = _run_bounded_output(
+            command,
+            cwd=Path("/"),
+            env=client_environment,
+            timeout=_PROCESS_OBSERVER_TIMEOUT_SECONDS + 2.0,
+            stdout_limit=_PROCESS_OBSERVER_STDOUT_BYTES,
+            stderr_limit=_PROCESS_OBSERVER_STDERR_BYTES,
+        )
+    except (OSError, ReleaseError, RuntimeError, ValueError):
+        return _ProcessObserverTransportResult("broker-dispatch-failed")
+    if completed.returncode != 0:
+        return _ProcessObserverTransportResult("broker-command-failed")
+    if completed.stderr:
+        return _ProcessObserverTransportResult("broker-stderr-not-empty")
+    try:
+        json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return _ProcessObserverTransportResult("broker-output-invalid")
+    try:
+        observed_state = load_managed_state(layout)
+        if sha256_bytes(canonical_json_bytes(observed_state)) != before_state_sha256:
+            raise ReleaseError("managed state changed during process observation")
+        observed_activation = _verify_managed_activation(
+            layout,
+            observed_state,
+            verify_release=True,
+        )
+        if observed_activation.get("current_release_id") != current:
+            raise ReleaseError("managed activation changed during process observation")
+    except (OSError, ReleaseError, RuntimeError, ValueError):
+        return _ProcessObserverTransportResult("broker-receipt-rejected")
+    return _ProcessObserverTransportResult(
+        "broker-output-ready",
+        bytes(completed.stdout),
+    )
+
+
+def _publish_process_observer_flight(
+    key: tuple[str, ...],
+    flight: _ProcessObserverFlight,
+    result: _ProcessObserverTransportResult,
+) -> None:
+    """Publish exactly once and remove the registry entry before new admission."""
+
+    with _PROCESS_OBSERVER_FLIGHT_LOCK:
+        flight.result = result
+        if _PROCESS_OBSERVER_FLIGHTS.get(key) is flight:
+            del _PROCESS_OBSERVER_FLIGHTS[key]
+        flight.event.set()
+
+
+def _process_observer_transport_singleflight(
+    key: tuple[str, ...],
+    dispatch: Callable[[], _ProcessObserverTransportResult],
+    *,
+    wait_seconds: float = _PROCESS_OBSERVER_FOLLOWER_WAIT_SECONDS,
+    timeout_code: str = "broker-singleflight-timeout",
+    invalid_code: str = "broker-singleflight-invalid",
+    leader_exception_code: str = "broker-leader-exception",
+) -> tuple[_ProcessObserverTransportResult, dict[str, object]]:
+    """Share only one in-progress transport; completed results are never cached."""
+
+    with _PROCESS_OBSERVER_FLIGHT_LOCK:
+        flight = _PROCESS_OBSERVER_FLIGHTS.get(key)
+        leader = flight is None
+        if flight is None:
+            flight = _ProcessObserverFlight()
+            _PROCESS_OBSERVER_FLIGHTS[key] = flight
+
+    if not leader:
+        if not flight.event.wait(wait_seconds):
+            return (
+                _ProcessObserverTransportResult(timeout_code),
+                {"singleflight_role": "follower", "broker_shared": True},
+            )
+        result = flight.result
+        if not isinstance(result, _ProcessObserverTransportResult):
+            result = _ProcessObserverTransportResult(invalid_code)
+        return result, {"singleflight_role": "follower", "broker_shared": True}
+
+    try:
+        result = dispatch()
+        if not isinstance(result, _ProcessObserverTransportResult):
+            raise TypeError("process observer dispatch returned an invalid result")
+    except BaseException:
+        _publish_process_observer_flight(
+            key,
+            flight,
+            _ProcessObserverTransportResult(leader_exception_code),
+        )
+        raise
+    _publish_process_observer_flight(key, flight, result)
+    return result, {"singleflight_role": "leader", "broker_shared": False}
+
+
+
+def _transport_with_cross_process(
+    result: _ProcessObserverTransportResult,
+    *,
+    role: str,
+    shared: bool,
+    cross_result: str,
+) -> _ProcessObserverTransportResult:
+    return _ProcessObserverTransportResult(
+        result.result_code,
+        bytes(result.stdout),
+        role,
+        shared,
+        cross_result,
+    )
+
+
+def _canonical_process_cross_root(
+    expected_uid: int,
+    *,
+    runtime_root: Path | None = None,
+) -> Path:
+    """Return a private runtime directory for cross-process observer flights."""
+
+    if expected_uid != os.geteuid():
+        raise ReleaseError("cross-process observer UID differs from the current user")
+
+    def validate_root(root: Path) -> Path:
+        try:
+            metadata = root.lstat()
+        except OSError as exc:
+            raise ReleaseError("cross-process observer runtime is unavailable") from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != expected_uid
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ReleaseError("cross-process observer runtime is unsafe")
+        return root
+
+    if runtime_root is not None:
+        root = Path(runtime_root).absolute()
+        try:
+            root.mkdir(mode=0o700, parents=False, exist_ok=True)
+        except OSError as exc:
+            raise ReleaseError("cross-process observer runtime cannot be created") from exc
+        return validate_root(root)
+
+    runtime = Path("/run/user") / str(expected_uid)
+    try:
+        runtime_metadata = runtime.lstat()
+    except OSError as exc:
+        raise ReleaseError("canonical user runtime directory is unavailable") from exc
+    if (
+        stat.S_ISLNK(runtime_metadata.st_mode)
+        or not stat.S_ISDIR(runtime_metadata.st_mode)
+        or runtime_metadata.st_uid != expected_uid
+        or stat.S_IMODE(runtime_metadata.st_mode) != 0o700
+    ):
+        raise ReleaseError("canonical user runtime directory is unsafe")
+    canonical = runtime / _PROCESS_CROSS_ROOT_NAME
+    try:
+        canonical.mkdir(mode=0o700, parents=False, exist_ok=True)
+    except OSError as exc:
+        if exc.errno not in {errno.EROFS, errno.EACCES, errno.EPERM}:
+            raise ReleaseError("canonical observer runtime cannot be created") from exc
+    else:
+        return validate_root(canonical)
+    if _path_lexists(canonical):
+        return validate_root(canonical)
+
+    temporary = Path("/tmp")
+    try:
+        temporary_metadata = temporary.lstat()
+    except OSError as exc:
+        raise ReleaseError("containment observer runtime is unavailable") from exc
+    conventional_tmp = bool(
+        temporary_metadata.st_mode & stat.S_ISVTX
+        and temporary_metadata.st_mode & stat.S_IWOTH
+    )
+    private_tmp = bool(
+        temporary_metadata.st_uid == expected_uid
+        and stat.S_IMODE(temporary_metadata.st_mode) == 0o700
+    )
+    if (
+        stat.S_ISLNK(temporary_metadata.st_mode)
+        or not stat.S_ISDIR(temporary_metadata.st_mode)
+        or not (conventional_tmp or private_tmp)
+    ):
+        raise ReleaseError("containment temporary root is unsafe")
+    boot_id = _read_boot_id(Path("/proc"))
+    fallback = temporary / (
+        f"{_PROCESS_CROSS_ROOT_NAME}-{expected_uid}-{boot_id.replace('-', '')[:16]}"
+    )
+    try:
+        fallback.mkdir(mode=0o700, parents=False, exist_ok=True)
+    except OSError as exc:
+        raise ReleaseError("containment observer runtime cannot be created") from exc
+    return validate_root(fallback)
+
+def _read_cross_file(
+    path: Path,
+    *,
+    expected_uid: int,
+    max_bytes: int,
+) -> bytes | None:
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ReleaseError("cross-process observer file cannot be inspected") from exc
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != expected_uid
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_size < 0
+        or before.st_size > max_bytes
+    ):
+        raise ReleaseError("cross-process observer file is unsafe or oversized")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ReleaseError("cross-process observer file cannot be opened") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+            or opened.st_uid != expected_uid
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_size != before.st_size
+        ):
+            raise ReleaseError("cross-process observer file changed during open")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) > max_bytes or len(content) != opened.st_size:
+            raise ReleaseError("cross-process observer file changed during read")
+        return content
+    finally:
+        os.close(descriptor)
+
+
+def _read_cross_json(
+    path: Path,
+    *,
+    expected_uid: int,
+    max_bytes: int,
+) -> dict[str, object] | None:
+    content = _read_cross_file(path, expected_uid=expected_uid, max_bytes=max_bytes)
+    if content is None:
+        return None
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("cross-process observer JSON is invalid") from exc
+    if not isinstance(payload, dict) or canonical_json_bytes(payload) != content:
+        raise ReleaseError("cross-process observer JSON is not canonical")
+    return payload
+
+
+def _cross_file_contract(path: Path, kind: str) -> tuple[re.Pattern[str], int]:
+    """Return the closed filename grammar and content bound for one kind."""
+
+    if kind == _PROCESS_CROSS_FILE_STATE:
+        pattern = _PROCESS_CROSS_STATE_NAME
+        max_bytes = _PROCESS_CROSS_MAX_STATE_BYTES
+    elif kind == _PROCESS_CROSS_FILE_RESULT:
+        pattern = _PROCESS_CROSS_RESULT_NAME
+        max_bytes = _PROCESS_CROSS_MAX_RESULT_BYTES
+    else:
+        raise ReleaseError("cross-process observer file kind is invalid")
+    if pattern.fullmatch(path.name) is None:
+        raise ReleaseError("cross-process observer file kind does not match its name")
+    return pattern, max_bytes
+
+
+def _cross_file_metadata_authorized(metadata: os.stat_result, *, expected_uid: int) -> bool:
+    return bool(
+        not stat.S_ISLNK(metadata.st_mode)
+        and stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == expected_uid
+        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+        and metadata.st_size >= 0
+    )
+
+
+def _cross_file_identity_matches(
+    left: os.stat_result,
+    right: os.stat_result,
+) -> bool:
+    """Bind one pathname/open descriptor to an unchanged direct file."""
+
+    return bool(
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_uid == right.st_uid
+        and left.st_gid == right.st_gid
+        and left.st_nlink == right.st_nlink
+        and stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode)
+        and stat.S_IMODE(left.st_mode) == stat.S_IMODE(right.st_mode)
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_ctime_ns == right.st_ctime_ns
+    )
+
+
+def _unlink_cross_file(
+    path: Path,
+    *,
+    expected_uid: int,
+    kind: str,
+) -> None:
+    """Remove exactly one state/result file with kind-bounded I/O.
+
+    Small files are read only through their exact protocol bound to prove stable
+    length. Oversized malformed files are never consumed: metadata and pathname
+    identity are sufficient authority for discarding an unusable protocol file.
+    The mandatory closed ``kind`` prevents a state path from silently inheriting
+    the much larger result-file read budget.
+    """
+
+    _pattern, max_bytes = _cross_file_contract(path, kind)
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ReleaseError("cross-process observer file cannot be inspected") from exc
+    if not _cross_file_metadata_authorized(before, expected_uid=expected_uid):
+        raise ReleaseError("cross-process observer file is unsafe for removal")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ReleaseError("cross-process observer file cannot be opened for removal") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not _cross_file_metadata_authorized(opened, expected_uid=expected_uid)
+            or not _cross_file_identity_matches(before, opened)
+        ):
+            raise ReleaseError("cross-process observer file changed during removal open")
+
+        if opened.st_size <= max_bytes:
+            remaining = int(opened.st_size)
+            read_bytes = 0
+            while remaining > 0:
+                chunk = os.read(descriptor, min(65536, remaining))
+                if not chunk:
+                    break
+                read_bytes += len(chunk)
+                remaining -= len(chunk)
+            if read_bytes != opened.st_size:
+                raise ReleaseError("cross-process observer file changed during removal read")
+
+        after_open = os.fstat(descriptor)
+        if (
+            not _cross_file_metadata_authorized(after_open, expected_uid=expected_uid)
+            or not _cross_file_identity_matches(opened, after_open)
+        ):
+            raise ReleaseError("cross-process observer file changed before removal")
+        try:
+            observed = path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ReleaseError(
+                "cross-process observer file cannot be revalidated for removal"
+            ) from exc
+        if (
+            not _cross_file_metadata_authorized(observed, expected_uid=expected_uid)
+            or not _cross_file_identity_matches(after_open, observed)
+        ):
+            raise ReleaseError("cross-process observer file pathname changed before removal")
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ReleaseError("cross-process observer file cannot be removed") from exc
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _cross_process_lock(
+    root: Path,
+    *,
+    expected_uid: int,
+    wait_seconds: float | None = None,
+) -> Iterator[Path]:
+    """Acquire the one bounded registry lock for short protocol transitions.
+
+    Older source revisions created one ``flight-<key>.lock`` inode per key.
+    Those files are deliberately left inert for the rest of the boot: unlinking
+    an inode that already has waiters can split the mutual-exclusion domain.
+    New source creates and uses only ``registry.lock``.
+    """
+
+    lock_path = root / _PROCESS_CROSS_REGISTRY_LOCK_NAME
+    timeout = _PROCESS_CROSS_LOCK_WAIT_SECONDS if wait_seconds is None else float(
+        wait_seconds
+    )
+    if not 0.0 <= timeout <= _PROCESS_CROSS_LOCK_MAX_WAIT_SECONDS:
+        raise ReleaseError("cross-process observer lock wait is invalid")
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise ReleaseError(
+            "cross-process observer registry lock cannot be opened"
+        ) from exc
+    acquired = False
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != expected_uid
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ReleaseError("cross-process observer registry lock is unsafe")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise ReleaseError(
+                        "cross-process observer registry lock failed"
+                    ) from exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ReleaseError(
+                        "cross-process observer registry lock timed out"
+                    ) from exc
+                time.sleep(min(_PROCESS_CROSS_LOCK_POLL_SECONDS, remaining))
+        # Recheck the pathname after acquiring the descriptor. This rejects a
+        # same-user pathname replacement between open and lock acquisition.
+        try:
+            observed = lock_path.lstat()
+            locked = os.fstat(descriptor)
+        except OSError as exc:
+            raise ReleaseError(
+                "cross-process observer registry lock cannot be revalidated"
+            ) from exc
+        if (
+            observed.st_dev != locked.st_dev
+            or observed.st_ino != locked.st_ino
+            or observed.st_uid != expected_uid
+            or observed.st_nlink != 1
+            or stat.S_IMODE(observed.st_mode) != 0o600
+            or not stat.S_ISREG(observed.st_mode)
+        ):
+            raise ReleaseError(
+                "cross-process observer registry lock changed during acquisition"
+            )
+        yield lock_path
+    finally:
+        try:
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+def _cross_state_fields() -> frozenset[str]:
+    return frozenset(
+        {
+            "schema",
+            "key_sha256",
+            "nonce",
+            "result_name",
+            "leader_pid",
+            "leader_start_ticks",
+            "boot_id",
+            "started_monotonic_ns",
+            "phase",
+            "published_monotonic_ns",
+        }
+    )
+
+
+def _validate_cross_state(
+    payload: Mapping[str, object],
+    *,
+    key_sha256: str,
+    current_boot_id: str,
+    now_ns: int,
+) -> str:
+    if set(payload) != _cross_state_fields():
+        raise ReleaseError("cross-process flight state has unexpected fields")
+    nonce = payload.get("nonce")
+    result_name = payload.get("result_name")
+    leader_pid = payload.get("leader_pid")
+    leader_start_ticks = payload.get("leader_start_ticks")
+    started_ns = payload.get("started_monotonic_ns")
+    phase = payload.get("phase")
+    published_ns = payload.get("published_monotonic_ns")
+    if (
+        payload.get("schema") != _PROCESS_CROSS_STATE_SCHEMA
+        or payload.get("key_sha256") != key_sha256
+        or not isinstance(nonce, str)
+        or re.fullmatch(r"[0-9a-f]{32}", nonce) is None
+        or result_name != f"result-{key_sha256}-{nonce}.json"
+        or not isinstance(leader_pid, int)
+        or isinstance(leader_pid, bool)
+        or leader_pid <= 0
+        or not isinstance(leader_start_ticks, int)
+        or isinstance(leader_start_ticks, bool)
+        or leader_start_ticks < 0
+        or payload.get("boot_id") != current_boot_id
+        or not isinstance(started_ns, int)
+        or isinstance(started_ns, bool)
+        or started_ns < 0
+        or phase not in {"running", "published"}
+        or not isinstance(published_ns, int)
+        or isinstance(published_ns, bool)
+        or published_ns < 0
+    ):
+        raise ReleaseError("cross-process flight state is invalid")
+    if phase == "running":
+        if published_ns != 0:
+            raise ReleaseError("running cross-process flight has publication time")
+        age = now_ns - started_ns
+        active = (
+            0 <= age <= _PROCESS_CROSS_MAX_AGE_NS
+            and _process_start_time(leader_pid) == leader_start_ticks
+        )
+        return "running" if active else "stale"
+    publication_age = now_ns - published_ns
+    flight_duration = published_ns - started_ns
+    if (
+        published_ns < started_ns
+        or not 0 <= publication_age <= _PROCESS_CROSS_LATE_JOIN_TTL_NS
+        or not 0 <= flight_duration <= _PROCESS_CROSS_MAX_AGE_NS
+    ):
+        return "stale"
+    return "published"
+
+
+def _cross_result_payload(
+    admission: _ProcessCrossAdmission,
+    result: _ProcessObserverTransportResult,
+) -> dict[str, object]:
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,95}", result.result_code) is None:
+        raise ReleaseError("cross-process observer result code is invalid")
+    stdout = bytes(result.stdout)
+    if len(stdout) > _PROCESS_OBSERVER_STDOUT_BYTES:
+        raise ReleaseError("cross-process observer stdout is oversized")
+    start_ticks = _process_start_time(os.getpid())
+    if start_ticks is None:
+        raise ReleaseError("cross-process observer publisher identity is unavailable")
+    return {
+        "schema": _PROCESS_CROSS_RESULT_SCHEMA,
+        "key_sha256": admission.key_sha256,
+        "nonce": admission.nonce,
+        "result_code": result.result_code,
+        "stdout_base64": base64.b64encode(stdout).decode("ascii"),
+        "stdout_size": len(stdout),
+        "stdout_sha256": sha256_bytes(stdout),
+        "publisher_pid": os.getpid(),
+        "publisher_start_ticks": start_ticks,
+        "boot_id": admission.boot_id,
+        "published_monotonic_ns": time.monotonic_ns(),
+    }
+
+
+def _read_cross_result_details(
+    admission: _ProcessCrossAdmission,
+    *,
+    expected_uid: int,
+) -> tuple[_ProcessObserverTransportResult, int] | None:
+    payload = _read_cross_json(
+        admission.result_path,
+        expected_uid=expected_uid,
+        max_bytes=_PROCESS_CROSS_MAX_RESULT_BYTES,
+    )
+    if payload is None:
+        return None
+    expected_fields = {
+        "schema",
+        "key_sha256",
+        "nonce",
+        "result_code",
+        "stdout_base64",
+        "stdout_size",
+        "stdout_sha256",
+        "publisher_pid",
+        "publisher_start_ticks",
+        "boot_id",
+        "published_monotonic_ns",
+    }
+    result_code = payload.get("result_code")
+    encoded = payload.get("stdout_base64")
+    size = payload.get("stdout_size")
+    published_ns = payload.get("published_monotonic_ns")
+    if (
+        set(payload) != expected_fields
+        or payload.get("schema") != _PROCESS_CROSS_RESULT_SCHEMA
+        or payload.get("key_sha256") != admission.key_sha256
+        or payload.get("nonce") != admission.nonce
+        or not isinstance(result_code, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,95}", result_code) is None
+        or not isinstance(encoded, str)
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or size > _PROCESS_OBSERVER_STDOUT_BYTES
+        or not isinstance(payload.get("stdout_sha256"), str)
+        or payload.get("publisher_pid") != admission.leader_pid
+        or payload.get("publisher_start_ticks") != admission.leader_start_ticks
+        or payload.get("boot_id") != admission.boot_id
+        or not isinstance(published_ns, int)
+        or isinstance(published_ns, bool)
+        or published_ns < 0
+        or not (0 <= time.monotonic_ns() - published_ns <= _PROCESS_CROSS_RESULT_TTL_NS)
+    ):
+        raise ReleaseError("cross-process observer result receipt is invalid")
+    try:
+        stdout = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeError, ValueError) as exc:
+        raise ReleaseError("cross-process observer result encoding is invalid") from exc
+    if len(stdout) != size or sha256_bytes(stdout) != payload.get("stdout_sha256"):
+        raise ReleaseError("cross-process observer result digest is invalid")
+    return _ProcessObserverTransportResult(result_code, stdout), published_ns
+
+
+def _read_cross_result(
+    admission: _ProcessCrossAdmission,
+    *,
+    expected_uid: int,
+) -> _ProcessObserverTransportResult | None:
+    details = _read_cross_result_details(admission, expected_uid=expected_uid)
+    return None if details is None else details[0]
+
+
+def _cleanup_cross_results(
+    root: Path,
+    *,
+    expected_uid: int,
+    current_boot_id: str,
+) -> _ProcessCrossUsage:
+    """Retire stale files and return bounded protocol-storage usage.
+
+    This function runs while the one cross-process registry lock is held. Form
+    exactly one bounded directory snapshot so unrelated directory pollution
+    cannot turn the global critical section into unbounded work. The same
+    snapshot supplies cleanup, count and aggregate-byte accounting.
+    """
+
+    entries: list[Path] = []
+    try:
+        for index, path in enumerate(root.iterdir()):
+            if index >= _PROCESS_CROSS_MAX_DIRECTORY_ENTRIES:
+                raise ReleaseError(
+                    "cross-process observer runtime entry bound exceeded"
+                )
+            entries.append(path)
+    except OSError as exc:
+        raise ReleaseError("cross-process observer runtime cannot be listed") from exc
+    entries.sort(key=lambda path: path.name)
+
+    inspected = 0
+    now_ns = time.monotonic_ns()
+    for path in entries:
+        result_match = _PROCESS_CROSS_RESULT_NAME.fullmatch(path.name)
+        state_match = _PROCESS_CROSS_STATE_NAME.fullmatch(path.name)
+        if result_match is None and state_match is None:
+            continue
+        inspected += 1
+        if inspected > 2 * _PROCESS_CROSS_MAX_CLEANUP_ENTRIES:
+            break
+        if result_match is not None:
+            try:
+                payload = _read_cross_json(
+                    path,
+                    expected_uid=expected_uid,
+                    max_bytes=_PROCESS_CROSS_MAX_RESULT_BYTES,
+                )
+            except ReleaseError:
+                _unlink_cross_file(
+                    path,
+                    expected_uid=expected_uid,
+                    kind=_PROCESS_CROSS_FILE_RESULT,
+                )
+                continue
+            if payload is None:
+                continue
+            published = payload.get("published_monotonic_ns")
+            stale = (
+                payload.get("schema") != _PROCESS_CROSS_RESULT_SCHEMA
+                or payload.get("boot_id") != current_boot_id
+                or not isinstance(published, int)
+                or isinstance(published, bool)
+                or published < 0
+                or now_ns - published > _PROCESS_CROSS_RESULT_TTL_NS
+                or now_ns < published
+            )
+            if stale:
+                _unlink_cross_file(
+                    path,
+                    expected_uid=expected_uid,
+                    kind=_PROCESS_CROSS_FILE_RESULT,
+                )
+            continue
+        key_sha256 = str(state_match.group(1))
+        try:
+            state = _read_cross_json(
+                path,
+                expected_uid=expected_uid,
+                max_bytes=_PROCESS_CROSS_MAX_STATE_BYTES,
+            )
+            if state is None or _validate_cross_state(
+                state,
+                key_sha256=key_sha256,
+                current_boot_id=current_boot_id,
+                now_ns=now_ns,
+            ) == "stale":
+                _unlink_cross_file(
+                    path,
+                    expected_uid=expected_uid,
+                    kind=_PROCESS_CROSS_FILE_STATE,
+                )
+        except ReleaseError:
+            _unlink_cross_file(
+                path,
+                expected_uid=expected_uid,
+                kind=_PROCESS_CROSS_FILE_STATE,
+            )
+
+    remaining_directory_entries = 0
+    remaining_results = 0
+    remaining_states = 0
+    total_result_bytes = 0
+    for path in entries:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ReleaseError(
+                "cross-process observer protocol capacity cannot be inspected"
+            ) from exc
+        remaining_directory_entries += 1
+        is_result = _PROCESS_CROSS_RESULT_NAME.fullmatch(path.name) is not None
+        is_state = _PROCESS_CROSS_STATE_NAME.fullmatch(path.name) is not None
+        if not is_result and not is_state:
+            continue
+        max_bytes = (
+            _PROCESS_CROSS_MAX_RESULT_BYTES
+            if is_result
+            else _PROCESS_CROSS_MAX_STATE_BYTES
+        )
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != expected_uid
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size < 0
+            or metadata.st_size > max_bytes
+        ):
+            raise ReleaseError("cross-process observer protocol entry is unsafe")
+        if is_result:
+            remaining_results += 1
+            total_result_bytes += int(metadata.st_size)
+        else:
+            remaining_states += 1
+
+    usage = _ProcessCrossUsage(
+        remaining_directory_entries,
+        remaining_results,
+        remaining_states,
+        total_result_bytes,
+    )
+    if (
+        usage.result_count >= _PROCESS_CROSS_MAX_CLEANUP_ENTRIES
+        or usage.state_count >= _PROCESS_CROSS_MAX_CLEANUP_ENTRIES
+        or usage.total_result_bytes >= _PROCESS_CROSS_MAX_TOTAL_RESULT_BYTES
+    ):
+        raise ReleaseError("cross-process observer protocol capacity is exhausted")
+    return usage
+
+def _admit_cross_process_flight(
+    key: tuple[str, ...],
+    *,
+    expected_uid: int,
+    runtime_root: Path | None,
+    request_started_monotonic_ns: int | None = None,
+) -> _ProcessCrossAdmission:
+    root = _canonical_process_cross_root(expected_uid, runtime_root=runtime_root)
+    key_sha256 = sha256_bytes(canonical_json_bytes(key))
+    current_boot_id = _read_boot_id(Path("/proc"))
+    state_path = root / f"flight-{key_sha256}.json"
+    lock_path = root / _PROCESS_CROSS_REGISTRY_LOCK_NAME
+    request_observed_ns = time.monotonic_ns()
+    if request_started_monotonic_ns is None:
+        request_started_ns = request_observed_ns
+    elif (
+        not isinstance(request_started_monotonic_ns, int)
+        or isinstance(request_started_monotonic_ns, bool)
+    ):
+        raise ReleaseError("cross-process observer request start is invalid")
+    else:
+        request_started_ns = request_started_monotonic_ns
+    if not 0 <= request_observed_ns - request_started_ns <= _PROCESS_CROSS_MAX_AGE_NS:
+        raise ReleaseError("cross-process observer request start is invalid")
+    with _cross_process_lock(root, expected_uid=expected_uid):
+        _cleanup_cross_results(
+            root,
+            expected_uid=expected_uid,
+            current_boot_id=current_boot_id,
+        )
+        state = _read_cross_json(
+            state_path,
+            expected_uid=expected_uid,
+            max_bytes=_PROCESS_CROSS_MAX_STATE_BYTES,
+        )
+        if state is not None:
+            try:
+                # Another process may publish this state while we wait for the
+                # registry lock. A timestamp sampled before that wait can be
+                # older than the newly read state's start time, yielding a
+                # negative age and a duplicate leader. Validate only with a
+                # fresh sample taken after the authoritative state read.
+                state_observed_ns = time.monotonic_ns()
+                state_kind = _validate_cross_state(
+                    state,
+                    key_sha256=key_sha256,
+                    current_boot_id=current_boot_id,
+                    now_ns=state_observed_ns,
+                )
+            except ReleaseError:
+                _unlink_cross_file(
+                    state_path,
+                    expected_uid=expected_uid,
+                    kind=_PROCESS_CROSS_FILE_STATE,
+                )
+            else:
+                admission = _ProcessCrossAdmission(
+                    "follower",
+                    root,
+                    key_sha256,
+                    str(state["nonce"]),
+                    root / str(state["result_name"]),
+                    state_path,
+                    lock_path,
+                    current_boot_id,
+                    int(state["leader_pid"]),
+                    int(state["leader_start_ticks"]),
+                )
+                if state_kind == "running":
+                    # Publication stages state and makes the final result visible
+                    # under this same registry lock. A running flight therefore
+                    # has one authoritative leader; every caller joins it rather
+                    # than creating duplicate broker work.
+                    return admission
+                if state_kind == "published":
+                    try:
+                        details = _read_cross_result_details(
+                            admission,
+                            expected_uid=expected_uid,
+                        )
+                    except ReleaseError:
+                        details = None
+                    if details is not None:
+                        _observed, published_ns = details
+                        if request_started_ns <= published_ns:
+                            return admission
+                        # The new request is post-publication and must start a
+                        # fresh flight, but the old result remains available to
+                        # followers admitted before publication until result TTL.
+                    else:
+                        # Missing/tampered published results are retired so they
+                        # cannot force indefinite local fallback.
+                        try:
+                            _unlink_cross_file(
+                                admission.result_path,
+                                expected_uid=expected_uid,
+                                kind=_PROCESS_CROSS_FILE_RESULT,
+                            )
+                        except ReleaseError:
+                            pass
+                    _unlink_cross_file(
+                        state_path,
+                        expected_uid=expected_uid,
+                        kind=_PROCESS_CROSS_FILE_STATE,
+                    )
+                else:
+                    _unlink_cross_file(
+                        state_path,
+                        expected_uid=expected_uid,
+                        kind=_PROCESS_CROSS_FILE_STATE,
+                    )
+        nonce = uuid.uuid4().hex
+        result_path = root / f"result-{key_sha256}-{nonce}.json"
+        if _path_lexists(result_path):
+            raise ReleaseError("cross-process observer nonce collided")
+        leader_start_ticks = _process_start_time(os.getpid())
+        if leader_start_ticks is None:
+            raise ReleaseError("cross-process observer leader identity is unavailable")
+        leader_started_ns = time.monotonic_ns()
+        if not 0 <= leader_started_ns - request_started_ns <= _PROCESS_CROSS_MAX_AGE_NS:
+            raise ReleaseError("cross-process observer request start is invalid")
+        state_payload = {
+            "schema": _PROCESS_CROSS_STATE_SCHEMA,
+            "key_sha256": key_sha256,
+            "nonce": nonce,
+            "result_name": result_path.name,
+            "leader_pid": os.getpid(),
+            "leader_start_ticks": leader_start_ticks,
+            "boot_id": current_boot_id,
+            "started_monotonic_ns": leader_started_ns,
+            "phase": "running",
+            "published_monotonic_ns": 0,
+        }
+        _atomic_write_bytes(
+            state_path,
+            canonical_json_bytes(state_payload),
+            mode=0o600,
+        )
+        return _ProcessCrossAdmission(
+            "leader",
+            root,
+            key_sha256,
+            nonce,
+            result_path,
+            state_path,
+            lock_path,
+            current_boot_id,
+            os.getpid(),
+            leader_start_ticks,
+        )
+
+
+def _clear_matching_cross_state(
+    admission: _ProcessCrossAdmission,
+    *,
+    expected_uid: int,
+) -> None:
+    with _cross_process_lock(
+        admission.root,
+        expected_uid=expected_uid,
+    ):
+        state = _read_cross_json(
+            admission.state_path,
+            expected_uid=expected_uid,
+            max_bytes=_PROCESS_CROSS_MAX_STATE_BYTES,
+        )
+        if (
+            state is not None
+            and state.get("schema") == _PROCESS_CROSS_STATE_SCHEMA
+            and state.get("key_sha256") == admission.key_sha256
+            and state.get("nonce") == admission.nonce
+        ):
+            _unlink_cross_file(
+                admission.state_path,
+                expected_uid=expected_uid,
+                kind=_PROCESS_CROSS_FILE_STATE,
+            )
+
+
+def _cross_state_matches_admission(
+    state: Mapping[str, object],
+    admission: _ProcessCrossAdmission,
+) -> bool:
+    return bool(
+        state.get("schema") == _PROCESS_CROSS_STATE_SCHEMA
+        and state.get("key_sha256") == admission.key_sha256
+        and state.get("nonce") == admission.nonce
+        and state.get("result_name") == admission.result_path.name
+        and state.get("leader_pid") == admission.leader_pid
+        and state.get("leader_start_ticks") == admission.leader_start_ticks
+        and state.get("boot_id") == admission.boot_id
+    )
+
+
+def _validate_cross_publication_state(
+    admission: _ProcessCrossAdmission,
+    state: Mapping[str, object] | None,
+) -> dict[str, object]:
+    if admission.role != "leader" or admission.leader_pid != os.getpid():
+        raise ReleaseError("cross-process observer publication has no leader authority")
+    if state is None or not _cross_state_matches_admission(state, admission):
+        raise ReleaseError("cross-process observer state changed before publication")
+    if _validate_cross_state(
+        state,
+        key_sha256=admission.key_sha256,
+        current_boot_id=admission.boot_id,
+        now_ns=time.monotonic_ns(),
+    ) != "running":
+        raise ReleaseError("cross-process observer state is not running at publication")
+    if state.get("phase") != "running" or state.get("published_monotonic_ns") != 0:
+        raise ReleaseError("cross-process observer state changed before publication")
+    return dict(state)
+
+
+def _restore_cross_publication_state(
+    admission: _ProcessCrossAdmission,
+    *,
+    expected_uid: int,
+    original_state: Mapping[str, object],
+    published_monotonic_ns: int,
+) -> None:
+    """Remove a failed result and restore only this transaction's state."""
+
+    rollback_errors: list[str] = []
+    if _path_lexists(admission.result_path):
+        try:
+            _unlink_cross_file(
+                admission.result_path,
+                expected_uid=expected_uid,
+                kind=_PROCESS_CROSS_FILE_RESULT,
+            )
+        except Exception as exc:
+            rollback_errors.append(f"result: {exc}")
+    try:
+        current = _read_cross_json(
+            admission.state_path,
+            expected_uid=expected_uid,
+            max_bytes=_PROCESS_CROSS_MAX_STATE_BYTES,
+        )
+    except Exception as exc:
+        current = None
+        rollback_errors.append(f"state-read: {exc}")
+    if current is not None:
+        if current == dict(original_state):
+            pass
+        elif (
+            _cross_state_matches_admission(current, admission)
+            and current.get("phase") == "published"
+            and current.get("published_monotonic_ns") == published_monotonic_ns
+        ):
+            try:
+                _atomic_write_bytes(
+                    admission.state_path,
+                    canonical_json_bytes(dict(original_state)),
+                    mode=0o600,
+                )
+            except Exception as exc:
+                try:
+                    _unlink_cross_file(
+                        admission.state_path,
+                        expected_uid=expected_uid,
+                        kind=_PROCESS_CROSS_FILE_STATE,
+                    )
+                except Exception as unlink_exc:
+                    rollback_errors.append(
+                        f"state-restore: {exc}; state-remove: {unlink_exc}"
+                    )
+        else:
+            rollback_errors.append("state changed outside the publication transaction")
+    if rollback_errors:
+        raise ReleaseError(
+            "cross-process observer publication rollback was incomplete: "
+            + "; ".join(rollback_errors)
+        )
+
+
+def _publish_cross_result(
+    admission: _ProcessCrossAdmission,
+    result: _ProcessObserverTransportResult,
+    *,
+    expected_uid: int,
+) -> _ProcessObserverTransportResult:
+    """Commit one capacity-bound result at a single final-path linearization point.
+
+    Dispatch and result construction happen before this function. Under the
+    registry lock, state is staged as published and the complete final result is
+    then atomically made visible. Admissions cannot observe the intermediate
+    state, while existing followers cannot consume bytes before the final path
+    appears.
+    """
+
+    payload = _cross_result_payload(admission, result)
+    payload_bytes = canonical_json_bytes(payload)
+    candidate_size = len(payload_bytes)
+    if candidate_size <= 0 or candidate_size > _PROCESS_CROSS_MAX_RESULT_BYTES:
+        raise ReleaseError("cross-process observer result receipt is oversized")
+    published_ns = int(payload["published_monotonic_ns"])
+
+    with _cross_process_lock(admission.root, expected_uid=expected_uid):
+        usage = _cleanup_cross_results(
+            admission.root,
+            expected_uid=expected_uid,
+            current_boot_id=admission.boot_id,
+        )
+        if (
+            usage.directory_entries + 1 > _PROCESS_CROSS_MAX_DIRECTORY_ENTRIES
+            or usage.result_count + 1 >= _PROCESS_CROSS_MAX_CLEANUP_ENTRIES
+            or usage.total_result_bytes + candidate_size
+            >= _PROCESS_CROSS_MAX_TOTAL_RESULT_BYTES
+        ):
+            raise ReleaseError("cross-process observer protocol capacity is exhausted")
+        if _path_lexists(admission.result_path):
+            raise ReleaseError("cross-process observer result already exists")
+        original_state = _validate_cross_publication_state(
+            admission,
+            _read_cross_json(
+                admission.state_path,
+                expected_uid=expected_uid,
+                max_bytes=_PROCESS_CROSS_MAX_STATE_BYTES,
+            ),
+        )
+        updated = dict(original_state)
+        updated["phase"] = "published"
+        updated["published_monotonic_ns"] = published_ns
+        try:
+            _atomic_write_bytes(
+                admission.state_path,
+                canonical_json_bytes(updated),
+                mode=0o600,
+            )
+            # Final-path appearance is the commit point. Existing followers poll
+            # only this nonce-bound path; new admissions remain excluded by the
+            # registry lock until both files have been verified.
+            _atomic_write_bytes(
+                admission.result_path,
+                payload_bytes,
+                mode=0o600,
+            )
+            details = _read_cross_result_details(
+                admission,
+                expected_uid=expected_uid,
+            )
+            if details is None:
+                raise ReleaseError("cross-process observer result was not published")
+            observed, observed_published_ns = details
+            if observed_published_ns != published_ns:
+                raise ReleaseError("cross-process observer publication time changed")
+            return observed
+        except Exception as exc:
+            try:
+                _restore_cross_publication_state(
+                    admission,
+                    expected_uid=expected_uid,
+                    original_state=original_state,
+                    published_monotonic_ns=published_ns,
+                )
+            except Exception as rollback_exc:
+                raise ReleaseError(
+                    f"cross-process observer publication failed: {exc}; {rollback_exc}"
+                ) from exc
+            if isinstance(exc, ReleaseError):
+                raise
+            raise ReleaseError(
+                f"cross-process observer publication failed and was rolled back: {exc}"
+            ) from exc
+
+def _wait_cross_result(
+    admission: _ProcessCrossAdmission,
+    *,
+    expected_uid: int,
+) -> _ProcessObserverTransportResult:
+    deadline = time.monotonic() + _PROCESS_CROSS_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            observed = _read_cross_result(admission, expected_uid=expected_uid)
+        except ReleaseError:
+            return _ProcessObserverTransportResult("cross-process-result-invalid")
+        if observed is not None:
+            return observed
+        time.sleep(0.01)
+    return _ProcessObserverTransportResult("cross-process-follower-timeout")
+
+
+def _process_observer_cross_process_singleflight(
+    key: tuple[str, ...],
+    *,
+    expected_uid: int,
+    dispatch: Callable[[], _ProcessObserverTransportResult],
+    runtime_root: Path | None = None,
+    request_started_monotonic_ns: int | None = None,
+) -> _ProcessObserverTransportResult:
+    """Share one in-progress broker transport across same-user processes."""
+
+    try:
+        admission = _admit_cross_process_flight(
+            key,
+            expected_uid=expected_uid,
+            runtime_root=runtime_root,
+            request_started_monotonic_ns=request_started_monotonic_ns,
+        )
+    except (OSError, ReleaseError, RuntimeError, ValueError):
+        local = dispatch()
+        return _transport_with_cross_process(
+            local,
+            role="unavailable-local",
+            shared=False,
+            cross_result="unavailable-local",
+        )
+    if admission.role == "follower":
+        observed = _wait_cross_result(admission, expected_uid=expected_uid)
+        return _transport_with_cross_process(
+            observed,
+            role="follower",
+            shared=True,
+            cross_result=(
+                observed.result_code
+                if observed.result_code
+                in {"cross-process-follower-timeout", "cross-process-result-invalid"}
+                else "shared"
+            ),
+        )
+    try:
+        local = dispatch()
+        if not isinstance(local, _ProcessObserverTransportResult):
+            raise TypeError("cross-process observer dispatch returned an invalid result")
+    except BaseException:
+        try:
+            _publish_cross_result(
+                admission,
+                _ProcessObserverTransportResult("cross-process-leader-exception"),
+                expected_uid=expected_uid,
+            )
+        except Exception:
+            try:
+                _clear_matching_cross_state(admission, expected_uid=expected_uid)
+            except Exception:
+                pass
+        raise
+    try:
+        observed = _publish_cross_result(
+            admission,
+            local,
+            expected_uid=expected_uid,
+        )
+    except (OSError, ReleaseError, RuntimeError, ValueError):
+        try:
+            _clear_matching_cross_state(admission, expected_uid=expected_uid)
+        except Exception:
+            pass
+        return _transport_with_cross_process(
+            _ProcessObserverTransportResult("cross-process-publication-failed"),
+            role="leader",
+            shared=False,
+            cross_result="cross-process-publication-failed",
+        )
+    return _transport_with_cross_process(
+        observed,
+        role="leader",
+        shared=False,
+        cross_result="published",
+    )
+
+
+
+def _validate_process_observer_transport_result(
+    transport: _ProcessObserverTransportResult,
+    *,
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    expected_uid: int,
+    direct: Mapping[str, object],
+    source_module: Path,
+) -> tuple[dict[str, object] | None, str]:
+    """Validate raw broker bytes against one caller's fresh evidence."""
+
+    if transport.result_code != "broker-output-ready":
+        return None, transport.result_code
+    try:
+        payload = json.loads(transport.stdout.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None, "broker-output-invalid"
+    try:
+        current = state.get("current_release_id")
+        expected_state_sha256 = sha256_bytes(canonical_json_bytes(state))
+        observed_state = load_managed_state(layout)
+        if sha256_bytes(canonical_json_bytes(observed_state)) != expected_state_sha256:
+            raise ReleaseError("managed state changed before caller validation")
+        observed_activation = _verify_managed_activation(
+            layout,
+            observed_state,
+            verify_release=True,
+        )
+        if observed_activation.get("current_release_id") != current:
+            raise ReleaseError("managed activation changed before caller validation")
+        status = _validate_process_observer_receipt(
+            payload,
+            layout=layout,
+            state=state,
+            expected_uid=expected_uid,
+            direct=direct,
+            source_module=source_module,
+        )
+    except (OSError, ReleaseError, RuntimeError, ValueError):
+        return None, "broker-receipt-rejected"
+    return status, "accepted"
+
+
+def _scan_managed_gui_processes_via_user_manager(
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    *,
+    expected_uid: int,
+    direct: Mapping[str, object],
+    request_started_monotonic_ns: int | None = None,
+) -> tuple[dict[str, object] | None, str, dict[str, object]]:
+    """Return one caller-validated scan from a bounded shared transport."""
+
+    no_flight = {
+        "singleflight_role": "none",
+        "broker_shared": False,
+        "cross_process_role": "none",
+        "cross_process_shared": False,
+        "cross_process_result": "not-attempted",
+    }
+    try:
+        source_module = Path(__file__).resolve(strict=True)
+        key = _process_observer_flight_key(
+            layout,
+            state,
+            expected_uid=expected_uid,
+            direct=direct,
+            source_module=source_module,
+        )
+    except (OSError, ReleaseError, RuntimeError, ValueError):
+        return None, "broker-dispatch-failed", no_flight
+
+    def dispatch_share_safe() -> _ProcessObserverTransportResult:
+        raw = _dispatch_process_observer_transport(
+            layout,
+            state,
+            expected_uid=expected_uid,
+            source_module=source_module,
+        )
+        _status, code = _validate_process_observer_transport_result(
+            raw,
+            layout=layout,
+            state=state,
+            expected_uid=expected_uid,
+            direct=direct,
+            source_module=source_module,
+        )
+        if code != "accepted":
+            return _ProcessObserverTransportResult(code)
+        return raw
+
+    transport, flight_metadata = _process_observer_transport_singleflight(
+        key,
+        lambda: _process_observer_cross_process_singleflight(
+            key,
+            expected_uid=expected_uid,
+            dispatch=dispatch_share_safe,
+            request_started_monotonic_ns=request_started_monotonic_ns,
+        ),
+    )
+    flight_metadata = {
+        **flight_metadata,
+        "cross_process_role": transport.cross_process_role,
+        "cross_process_shared": transport.cross_process_shared,
+        "cross_process_result": transport.cross_process_result,
+    }
+    status, result_code = _validate_process_observer_transport_result(
+        transport,
+        layout=layout,
+        state=state,
+        expected_uid=expected_uid,
+        direct=direct,
+        source_module=source_module,
+    )
+    return status, result_code, flight_metadata
+
+def _canonical_real_proc_root(proc_root: Path) -> bool:
+    try:
+        return proc_root.resolve(strict=True) == Path("/proc").resolve(strict=True)
+    except OSError:
+        return False
+
+
+
+def _direct_process_scan_flight_key(
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    *,
+    proc_root: Path,
+    expected_uid: int,
+    source_module: Path,
+) -> tuple[str, ...]:
+    """Return the exact namespace/state key for one in-progress direct scan."""
+
+    try:
+        resolved_proc_root = proc_root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        resolved_proc_root = proc_root.absolute()
+    return (
+        "direct-process-scan",
+        str(layout.root),
+        str(layout.bin_dir),
+        str(expected_uid),
+        sha256_bytes(canonical_json_bytes(state)),
+        str(resolved_proc_root),
+        str(source_module),
+    )
+
+
+def _direct_scan_failure_status(
+    state: Mapping[str, object],
+    *,
+    expected_uid: int,
+    issue_code: str,
+) -> dict[str, object]:
+    """Return a schema-complete status that cannot authorize broker or mutation."""
+
+    current = state.get("current_release_id")
+    configured = isinstance(current, str) and bool(current)
+    posture, activation = _process_posture(complete=False, gui_count=0)
+    return {
+        "schema": _MANAGED_GUI_PROCESS_SCHEMA,
+        "managed_release_configured": configured,
+        "expected_uid": expected_uid,
+        "boot_id": "",
+        "expected_identity": {
+            "python_executable": "",
+            "bootstrap_path": "",
+            "argv_prefix_sha256": "",
+        },
+        "complete": False,
+        "posture": posture,
+        "gui_count": 0,
+        "processes": [],
+        "activation": activation,
+        "scanned_pid_count": 0,
+        "same_uid_pid_count": 0,
+        "ignored_process_count": 0,
+        "vanished_process_count": 0,
+        "raced_process_count": 0,
+        "issues": [{"code": issue_code, "count": 1}],
+    }
+
+
+def _scan_managed_gui_processes_singleflight(
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    *,
+    proc_root: Path,
+    expected_uid: int,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Share only an in-progress direct scan and parse a fresh result per caller."""
+
+    no_flight = {
+        "direct_singleflight_role": "none",
+        "direct_shared": False,
+        "direct_scan_result": "direct-scan-key-invalid",
+    }
+    try:
+        source_module = Path(__file__).resolve(strict=True)
+        key = _direct_process_scan_flight_key(
+            layout,
+            state,
+            proc_root=proc_root,
+            expected_uid=expected_uid,
+            source_module=source_module,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return (
+            _direct_scan_failure_status(
+                state,
+                expected_uid=expected_uid,
+                issue_code="direct-scan-key-invalid",
+            ),
+            no_flight,
+        )
+
+    def dispatch() -> _ProcessObserverTransportResult:
+        try:
+            status = _scan_managed_gui_processes(
+                layout,
+                state,
+                proc_root=proc_root,
+                expected_uid=expected_uid,
+            )
+            payload = canonical_json_bytes(status)
+        except Exception:
+            return _ProcessObserverTransportResult("direct-scan-failed")
+        return _ProcessObserverTransportResult("direct-scan-output-ready", payload)
+
+    transport, shared_metadata = _process_observer_transport_singleflight(
+        key,
+        dispatch,
+        wait_seconds=_PROCESS_DIRECT_SCAN_FOLLOWER_WAIT_SECONDS,
+        timeout_code="direct-singleflight-timeout",
+        invalid_code="direct-singleflight-invalid",
+        leader_exception_code="direct-leader-exception",
+    )
+    metadata = {
+        "direct_singleflight_role": shared_metadata["singleflight_role"],
+        "direct_shared": shared_metadata["broker_shared"],
+        "direct_scan_result": transport.result_code,
+    }
+    if transport.result_code != "direct-scan-output-ready":
+        return (
+            _direct_scan_failure_status(
+                state,
+                expected_uid=expected_uid,
+                issue_code=transport.result_code,
+            ),
+            metadata,
+        )
+    try:
+        payload = json.loads(transport.stdout.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        payload = None
+    configured = isinstance(state.get("current_release_id"), str) and bool(
+        state.get("current_release_id")
+    )
+    valid = (
+        isinstance(payload, Mapping)
+        and payload.get("schema") == _MANAGED_GUI_PROCESS_SCHEMA
+        and payload.get("managed_release_configured") is configured
+        and payload.get("expected_uid") == expected_uid
+        and isinstance(payload.get("complete"), bool)
+        and isinstance(payload.get("posture"), str)
+        and isinstance(payload.get("gui_count"), int)
+        and not isinstance(payload.get("gui_count"), bool)
+        and isinstance(payload.get("processes"), list)
+        and isinstance(payload.get("activation"), Mapping)
+        and isinstance(payload.get("issues"), list)
+        and "observer" not in payload
+        and not _receipt_contains_private_process_data(payload)
+    )
+    if not valid:
+        metadata["direct_scan_result"] = "direct-scan-output-invalid"
+        return (
+            _direct_scan_failure_status(
+                state,
+                expected_uid=expected_uid,
+                issue_code="direct-scan-output-invalid",
+            ),
+            metadata,
+        )
+    metadata["direct_scan_result"] = "accepted"
+    return dict(payload), metadata
+
+
+def _observe_managed_gui_processes(
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    *,
+    proc_root: Path,
+    expected_uid: int,
+    allow_user_manager_broker: bool,
+) -> dict[str, object]:
+    request_started_monotonic_ns = time.monotonic_ns()
+    direct, direct_metadata = _scan_managed_gui_processes_singleflight(
+        layout,
+        state,
+        proc_root=proc_root,
+        expected_uid=expected_uid,
+    )
+    direct_result = dict(direct)
+    direct_result["observer"] = {
+        "mode": "direct",
+        "direct_complete": bool(direct.get("complete")),
+        "broker_attempted": False,
+        "broker_result": "not-needed" if direct.get("complete") else "not-applicable",
+        "singleflight_role": "none",
+        "broker_shared": False,
+        **direct_metadata,
+    }
+    if direct_metadata.get("direct_scan_result") != "accepted":
+        return direct_result
+    if direct.get("complete"):
+        return direct_result
+    if (
+        not allow_user_manager_broker
+        or os.environ.get(_PROCESS_OBSERVER_ENV) == "1"
+        or not _canonical_real_proc_root(proc_root)
+    ):
+        return direct_result
+    broker, broker_result, flight_metadata = _scan_managed_gui_processes_via_user_manager(
+        layout,
+        state,
+        expected_uid=expected_uid,
+        direct=direct,
+        request_started_monotonic_ns=request_started_monotonic_ns,
+    )
+    if broker is None:
+        direct_result["observer"] = {
+            "mode": "direct",
+            "direct_complete": False,
+            "direct_posture": direct.get("posture"),
+            "direct_issues": direct.get("issues"),
+            "broker_attempted": True,
+            "broker_result": broker_result,
+            **flight_metadata,
+            **direct_metadata,
+        }
+        return direct_result
+    result = dict(broker)
+    result["observer"] = {
+        "mode": "systemd-user-manager",
+        "direct_complete": False,
+        "direct_posture": direct.get("posture"),
+        "direct_issues": direct.get("issues"),
+        "broker_attempted": True,
+        "broker_result": "accepted",
+        "stable_samples": 2,
+        **flight_metadata,
+        **direct_metadata,
+    }
+    return result
+
+
 def managed_gui_process_status(
     *,
     root: str | Path | None = None,
     bin_dir: str | Path | None = None,
     proc_root: str | Path = "/proc",
     expected_uid: int | None = None,
+    allow_user_manager_broker: bool = True,
 ) -> dict[str, object]:
     """Return a redaction-safe, read-only inventory of managed T1000 GUIs."""
 
@@ -3773,12 +5868,24 @@ def managed_gui_process_status(
             "vanished_process_count": 0,
             "raced_process_count": 0,
             "issues": [{"code": "managed-state-invalid", "count": 1}],
+            "observer": {
+                "mode": "direct",
+                "direct_complete": False,
+                "broker_attempted": False,
+                "broker_result": "not-applicable",
+                "singleflight_role": "none",
+                "broker_shared": False,
+                "direct_singleflight_role": "none",
+                "direct_shared": False,
+                "direct_scan_result": "managed-state-invalid",
+            },
         }
-    return _scan_managed_gui_processes(
+    return _observe_managed_gui_processes(
         layout,
         state,
         proc_root=Path(proc_root),
         expected_uid=os.getuid() if expected_uid is None else int(expected_uid),
+        allow_user_manager_broker=allow_user_manager_broker,
     )
 
 
@@ -3819,11 +5926,12 @@ def managed_release_status(
     # stopped or multiply launched GUI does not make immutable release files
     # corrupt; callers receive both facts and may apply a fail-closed activation
     # policy without shell substring matching.
-    payload["runtime_processes"] = _scan_managed_gui_processes(
+    payload["runtime_processes"] = _observe_managed_gui_processes(
         layout,
         state,
         proc_root=Path(proc_root),
         expected_uid=os.getuid() if expected_uid is None else int(expected_uid),
+        allow_user_manager_broker=True,
     )
     if state == _default_state():
         return payload

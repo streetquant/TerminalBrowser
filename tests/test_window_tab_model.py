@@ -1,10 +1,10 @@
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import TestCase
+from unittest import TestCase, mock
 
 from termdeck.command_render import directory_tab_name, normalise_directory
-from termdeck.gtk_app import TermDeckWindow
+from termdeck.gtk_app import TermDeckWindow, _private_resize_handler
 from termdeck.session_lifecycle import recently_closed_records
 from termdeck.session_store import SessionStore
 from termdeck.tmux_backend import TmuxError
@@ -27,6 +27,44 @@ class SideStub:
 
 
 class WindowTabModelTests(TestCase):
+    def test_private_resize_handler_captures_identity_without_store_access(self) -> None:
+        calls: list[tuple[int, str, str]] = []
+
+        class Backend:
+            @staticmethod
+            def propagate_terminal_resize(
+                pane_pid: int,
+                *,
+                codex_home: str,
+                auth_scope_id: str,
+            ):
+                calls.append((pane_pid, codex_home, auth_scope_id))
+                return "ok"
+
+        record = SimpleNamespace(
+            codex_home="/tmp/auth-test",
+            auth_scope_id="auth-test",
+        )
+        handler = _private_resize_handler(Backend(), record)
+        self.assertIsNotNone(handler)
+
+        # The callback executes later on PaneStreamController's worker. Mutate
+        # the stand-in row to prove the handler retained immutable strings and
+        # does not resolve any store or GTK object at callback time.
+        record.codex_home = "/tmp/auth-other"
+        record.auth_scope_id = "auth-other"
+        self.assertEqual(handler(4321, 120, 40), "ok")  # type: ignore[misc]
+        self.assertEqual(calls, [(4321, "/tmp/auth-test", "auth-test")])
+
+    def test_private_resize_handler_rejects_incomplete_identity(self) -> None:
+        backend = SimpleNamespace(propagate_terminal_resize=lambda *_args, **_kwargs: None)
+        self.assertIsNone(
+            _private_resize_handler(
+                backend,
+                SimpleNamespace(codex_home="", auth_scope_id="auth-test"),
+            )
+        )
+
     def test_stale_backend_pid_preserves_live_status_without_sampling(self) -> None:
         class Sampler:
             def snapshot(self, _pid):
@@ -83,6 +121,7 @@ class WindowTabModelTests(TestCase):
         self.assertTrue(all(call[2]["known_pid_resolved"] for call in calls[2:]))
         self.assertTrue(all(call[2]["restart_missing"] for call in calls[2:]))
         self.assertTrue(all(not call[2]["refresh_side"] for call in calls[2:]))
+        self.assertTrue(all(call[2]["retry_start_failure"] for call in calls[2:]))
         self.assertEqual(side.refresh_count, 1)
 
     def test_one_attach_exception_does_not_hide_later_tabs(self) -> None:
@@ -715,6 +754,234 @@ class WindowTabModelTests(TestCase):
                 self.assertTrue(unchanged.visible)  # type: ignore[union-attr]
                 self.assertEqual(unchanged.recovery_command, record.recovery_command)  # type: ignore[union-attr]
                 self.assertIn("archive missing", toasts[0][0])
+            finally:
+                store.close()
+
+    def test_first_new_tab_defers_payload_until_its_vte_grid_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            opened = []
+
+            class Backend:
+                def create_or_resume_at_grid(self, *_args, **_kwargs):
+                    self.fail("empty-window payload must wait for VTE allocation")
+
+                def pane_pid(self, _record):
+                    self.fail("empty-window payload has no pane before allocation")
+
+            backend = Backend()
+            backend.fail = self.fail
+            side = SideStub()
+            notebook = SimpleNamespace(
+                get_n_pages=lambda: 0,
+                get_current_page=lambda: -1,
+                get_nth_page=lambda _page: None,
+            )
+            window = SimpleNamespace(
+                app_context=SimpleNamespace(store=store, backend=backend),
+                window_id="win",
+                window_title="Win",
+                notebook=notebook,
+                open_session=lambda candidate, **kwargs: opened.append((candidate, kwargs)),
+                _remove_tab_widget=lambda _session_id: False,
+                side=side,
+            )
+            try:
+                record = TermDeckWindow.create_session(
+                    window,
+                    "first",
+                    "terminal",
+                    "codex --yolo",
+                    tmp,
+                )
+
+                self.assertEqual(len(opened), 1)
+                self.assertEqual(opened[0][0].id, record.id)
+                self.assertFalse(opened[0][1]["known_live"])
+                self.assertTrue(opened[0][1]["known_pid_resolved"])
+                self.assertTrue(opened[0][1]["rollback_new_record_on_failure"])
+                self.assertEqual(store.get(record.id).status, "new")  # type: ignore[union-attr]
+                self.assertEqual(side.refresh_count, 1)
+            finally:
+                store.close()
+
+    def test_deferred_start_callbacks_resolve_the_live_store_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            record = store.create("first", "terminal", "codex --yolo", tmp)
+            captured = {}
+            restored = []
+
+            class Backend:
+                history_limit = 1000
+
+                def attach_command(self, _record):
+                    return ["tmux", "attach"]
+
+                def create_or_resume_at_grid(self, _record, *, columns, rows):
+                    self.grid = (columns, rows)
+
+                def configure_interactive_session(self, _record):
+                    return None
+
+                def pane_pid(self, _record):
+                    return 4242
+
+                def restore_live_session(self, candidate):
+                    restored.append(candidate)
+                    return True
+
+            backend = Backend()
+
+            class FakeNotebook:
+                def get_n_pages(self):
+                    return 0
+
+                def append_page(self, _terminal, _label):
+                    return 0
+
+                def set_tab_reorderable(self, *_args):
+                    return None
+
+                def set_current_page(self, _page):
+                    return None
+
+            class FakeAttach:
+                def __init__(self, *_args, **kwargs):
+                    captured.update(kwargs)
+                    self.terminal = SimpleNamespace(grab_focus=lambda: None)
+
+                def show_all(self):
+                    return None
+
+            side = SideStub()
+            window = SimpleNamespace(
+                app_context=SimpleNamespace(
+                    store=store,
+                    backend=backend,
+                    theme=SimpleNamespace(scrollback_lines=1000),
+                    sampler=SimpleNamespace(snapshot=lambda _pid: None),
+                ),
+                window_id="win",
+                window_title="Win",
+                tabs={},
+                notebook=FakeNotebook(),
+                side=side,
+                observed_status=lambda candidate, pid: "running" if pid else candidate.status,
+                on_terminal_key_press=lambda *_args: None,
+                _restore_live_terminal=lambda candidate: backend.restore_live_session(candidate),
+                _scroll_terminal=lambda *_args: None,
+                _selection_history_for_terminal=lambda *_args: "",
+                _attach_client_should_retry=lambda *_args: False,
+                _on_auth_attach_stable=lambda *_args: None,
+                zoomed_font=lambda: None,
+                _build_tab_label=lambda _record: object(),
+            )
+            try:
+                with mock.patch("termdeck.gtk_app.AttachTerminal", FakeAttach):
+                    TermDeckWindow.open_session(
+                        window,
+                        record,
+                        known_live=False,
+                        known_pid_resolved=True,
+                    )
+
+                self.assertTrue(captured["prepare_target_handler"](132, 43))
+                self.assertEqual(backend.grid, (132, 43))
+                updated = store.get(record.id)
+                self.assertIsNotNone(updated)
+                self.assertEqual(updated.status, "running")  # type: ignore[union-attr]
+                self.assertEqual(updated.last_pid, 4242)  # type: ignore[union-attr]
+                self.assertTrue(captured["live_focus_handler"]())
+                self.assertEqual(restored[-1].status, "running")
+                self.assertEqual(restored[-1].last_pid, 4242)
+            finally:
+                store.close()
+
+    def test_async_first_tab_failure_rolls_back_row_and_partial_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            record = store.create("first", "terminal", "codex --yolo", tmp)
+            terminated = []
+            toasts = []
+            captured = {}
+
+            class Backend:
+                history_limit = 1000
+
+                def attach_command(self, _record):
+                    return ["tmux", "attach"]
+
+                def create_or_resume_at_grid(self, *_args, **_kwargs):
+                    return None
+
+                def terminate(self, candidate):
+                    terminated.append(candidate.id)
+
+            class FakeNotebook:
+                def get_n_pages(self):
+                    return 0
+
+                def append_page(self, _terminal, _label):
+                    return 0
+
+                def set_tab_reorderable(self, *_args):
+                    return None
+
+                def set_current_page(self, _page):
+                    return None
+
+            class FakeAttach:
+                def __init__(self, *_args, **kwargs):
+                    captured.update(kwargs)
+                    self.terminal = SimpleNamespace(grab_focus=lambda: None)
+
+                def show_all(self):
+                    return None
+
+            side = SideStub()
+            window = SimpleNamespace(
+                app_context=SimpleNamespace(
+                    store=store,
+                    backend=Backend(),
+                    theme=SimpleNamespace(scrollback_lines=1000),
+                    sampler=SimpleNamespace(snapshot=lambda _pid: None),
+                ),
+                window_id="win",
+                window_title="Win",
+                tabs={},
+                notebook=FakeNotebook(),
+                side=side,
+                observed_status=lambda _record, _pid: "running",
+                on_terminal_key_press=lambda *_args: None,
+                _restore_live_terminal=lambda *_args: True,
+                _scroll_terminal=lambda *_args: None,
+                _selection_history_for_terminal=lambda *_args: "",
+                _attach_client_should_retry=lambda *_args: False,
+                _on_auth_attach_stable=lambda *_args: None,
+                zoomed_font=lambda: None,
+                _build_tab_label=lambda _record: object(),
+                _remove_tab_widget=lambda session_id: window.tabs.pop(session_id, None),
+                show_toast=lambda message, **kwargs: toasts.append((message, kwargs)),
+            )
+            try:
+                with mock.patch("termdeck.gtk_app.AttachTerminal", FakeAttach), mock.patch(
+                    "termdeck.gtk_app.GLib.idle_add",
+                    side_effect=lambda callback, *args: callback(*args),
+                ):
+                    TermDeckWindow.open_session(
+                        window,
+                        record,
+                        known_live=False,
+                        known_pid_resolved=True,
+                        rollback_new_record_on_failure=True,
+                    )
+                    captured["prepare_target_error_handler"](RuntimeError("launch failed"))
+
+                self.assertIsNone(store.get(record.id))
+                self.assertEqual(terminated, [record.id])
+                self.assertNotIn(record.id, window.tabs)
+                self.assertIn("launch failed", toasts[-1][0])
             finally:
                 store.close()
 

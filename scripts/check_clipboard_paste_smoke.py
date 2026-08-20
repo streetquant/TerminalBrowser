@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -144,15 +145,42 @@ def main() -> int:
             # must be replayed into VTE, not lost to the old widget.
             key_marker = root / "unfocused-first-key.txt"
             ready_marker = root / "unfocused-ready"
+            key_reader = root / "read_one_key.py"
+            key_reader.write_text(
+                """from __future__ import annotations
+import os
+import sys
+import termios
+from pathlib import Path
+
+ready = Path(sys.argv[1])
+output = Path(sys.argv[2])
+fd = sys.stdin.fileno()
+original = termios.tcgetattr(fd)
+raw = termios.tcgetattr(fd)
+raw[3] &= ~(termios.ICANON | termios.ECHO)
+raw[6][termios.VMIN] = 1
+raw[6][termios.VTIME] = 0
+try:
+    termios.tcsetattr(fd, termios.TCSANOW, raw)
+    ready.touch()
+    output.write_bytes(os.read(fd, 1))
+finally:
+    termios.tcsetattr(fd, termios.TCSANOW, original)
+""",
+                encoding="utf-8",
+            )
             record = window.current_record()
             if record is None:
                 raise AssertionError("no current record was available for keyboard routing")
             _drain_gtk(Gtk, until=lambda: stream_ready(attach))
-            command = (
-                f": > {shlex.quote(str(ready_marker))}; "
-                f"stty -icanon -echo min 1 time 0; "
-                f"dd bs=1 count=1 of={shlex.quote(str(key_marker))} 2>/dev/null; "
-                "stty icanon echo"
+            command = shlex.join(
+                [
+                    sys.executable,
+                    str(key_reader),
+                    str(ready_marker),
+                    str(key_marker),
+                ]
             )
             app.backend.send_text(record, command)
             _drain_gtk(Gtk, until=ready_marker.exists)

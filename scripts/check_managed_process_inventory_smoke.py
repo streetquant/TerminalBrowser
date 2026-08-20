@@ -3,8 +3,10 @@
 
 The release gate must never infer GUI ownership from ``pgrep -f`` or mutable
 scheduler state.  This smoke exercises the source scanner against the configured
-managed release, proves it ignores its own CLI-shaped process, and independently
-rechecks every reported PID/start-time/UID/executable/cmdline-hash tuple.
+managed release and proves it ignores its own CLI-shaped process.  A direct
+observer independently rechecks every reported identity tuple; a restricted
+observer instead requires the authenticated two-sample systemd-user-manager
+receipt and verifies that two brokered calls agree exactly.
 """
 
 from __future__ import annotations
@@ -80,19 +82,47 @@ def main() -> int:
             raise AssertionError(
                 "managed process inventory is not bound to the current boot ID"
             )
+        observer = payload.get("observer")
+        if not isinstance(observer, dict):
+            raise AssertionError("managed process inventory has no observer receipt")
+        if observer.get("mode") == "direct":
+            if observer != {
+                "mode": "direct",
+                "direct_complete": True,
+                "broker_attempted": False,
+                "broker_result": "not-needed",
+            }:
+                raise AssertionError(f"invalid direct observer receipt: {observer!r}")
+        elif observer.get("mode") == "systemd-user-manager":
+            if (
+                observer.get("direct_complete") is not False
+                or observer.get("broker_attempted") is not True
+                or observer.get("broker_result") != "accepted"
+                or observer.get("stable_samples") != 2
+                or not observer.get("direct_issues")
+            ):
+                raise AssertionError(f"invalid broker observer receipt: {observer!r}")
+        else:
+            raise AssertionError(f"unknown process observer mode: {observer!r}")
     if first["processes"] != second["processes"]:
         raise AssertionError("managed GUI identity changed between stable scans")
+    if first["observer"]["mode"] != second["observer"]["mode"]:
+        raise AssertionError("managed GUI observer mode changed between stable scans")
 
     verified = []
-    for record in first["processes"]:
-        observed = _read_identity(int(record["pid"]), boot_id=observed_boot_id)
-        for key, value in observed.items():
-            if record[key] != value:
-                raise AssertionError(
-                    f"managed process {record['pid']} mismatch for {key}: "
-                    f"reported={record[key]!r}, observed={value!r}"
-                )
-        verified.append(observed)
+    independent_procfs_recheck = first["observer"]["mode"] == "direct"
+    if independent_procfs_recheck:
+        for record in first["processes"]:
+            observed = _read_identity(int(record["pid"]), boot_id=observed_boot_id)
+            for key, value in observed.items():
+                if record[key] != value:
+                    raise AssertionError(
+                        f"managed process {record['pid']} mismatch for {key}: "
+                        f"reported={record[key]!r}, observed={value!r}"
+                    )
+            verified.append(observed)
+    else:
+        verified = list(first["processes"])
 
     release = managed_release_status(verify=True)
     if release["ok"] is not True or release["verified"] is not True:
@@ -101,7 +131,9 @@ def main() -> int:
     if integrated["complete"] is not True:
         raise AssertionError(f"integrated process scan is incomplete: {integrated!r}")
     if integrated["processes"] != first["processes"]:
-        raise AssertionError("release status and direct scanner disagree on GUI identity")
+        raise AssertionError("release status and process scanner disagree on GUI identity")
+    if integrated["observer"]["mode"] != first["observer"]["mode"]:
+        raise AssertionError("release status and process scanner disagree on observer mode")
 
     encoded = json.dumps(first, sort_keys=True)
     for forbidden in ("--workspace", "--db", "cmdline\"", "argv\""):
@@ -120,6 +152,8 @@ def main() -> int:
                 "release_status_integrated": True,
                 "self_cli_ignored": True,
                 "private_argv_absent": True,
+                "observer": first["observer"],
+                "independent_procfs_recheck": independent_procfs_recheck,
                 "effective_uid": os.getuid(),
             },
             indent=2,

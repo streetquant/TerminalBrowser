@@ -23,6 +23,7 @@ import signal
 import subprocess
 import threading
 from collections import deque
+from dataclasses import dataclass
 from typing import Callable, Mapping
 
 from .tmux_control import ClientState, ControlEvent, ControlModeClient
@@ -59,7 +60,7 @@ _MODE_SEQUENCES = (
 )
 
 _PANE_STATE_FORMAT = (
-    "#{pane_id} #{alternate_on} #{pane_dead} #{cursor_x} #{cursor_y}"
+    "#{pane_id} #{pane_pid} #{alternate_on} #{pane_dead} #{cursor_x} #{cursor_y}"
     " #{cursor_flag} #{keypad_cursor_flag} #{wrap_flag} #{insert_flag}"
     " #{origin_flag} #{mouse_standard_flag} #{mouse_button_flag}"
     " #{mouse_all_flag} #{mouse_sgr_flag} #{history_size}"
@@ -67,6 +68,7 @@ _PANE_STATE_FORMAT = (
 
 _STATE_FIELDS = (
     "pane_id",
+    "pane_pid",
     "alternate_on",
     "pane_dead",
     "cursor_x",
@@ -291,6 +293,373 @@ def terminate_orphan_control_clients(
     return reaped
 
 
+class ResizeSignalTicket:
+    """One bounded completion barrier for setup-critical notification."""
+
+    __slots__ = (
+        "_event",
+        "_lock",
+        "_completed",
+        "_succeeded",
+        "_cancelled",
+        "_error",
+    )
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._completed = False
+        self._succeeded = False
+        self._cancelled = False
+        self._error = ""
+
+    def _finish(self, *, succeeded: bool, error: str = "") -> None:
+        with self._lock:
+            if self._completed:
+                return
+            self._completed = True
+            self._succeeded = bool(succeeded)
+            self._error = str(error or "")[-512:]
+        self._event.set()
+
+    def wait(self, timeout: float) -> bool:
+        """Wait a finite interval and report whether work was processed.
+
+        Completion and callback success are intentionally separate. Setup must
+        wait until the notification attempt finishes before authoritative
+        capture, but an optional callback exception must not strand a healthy
+        shell or non-Codex pane.
+        """
+
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            return False
+        if timeout < 0:
+            return False
+        return bool(self._event.wait(timeout))
+
+    def cancel(self, reason: str = "barrier cancelled") -> bool:
+        """Cancel not-yet-started work and release the waiter exactly once."""
+
+        with self._lock:
+            if self._completed:
+                return False
+            self._cancelled = True
+            self._completed = True
+            self._succeeded = False
+            self._error = str(reason or "barrier cancelled")[-512:]
+        self._event.set()
+        return True
+
+    @property
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+    @property
+    def completed(self) -> bool:
+        return self._event.is_set()
+
+    @property
+    def succeeded(self) -> bool:
+        with self._lock:
+            return self._completed and self._succeeded
+
+    @property
+    def error(self) -> str:
+        with self._lock:
+            return self._error
+
+
+@dataclass(frozen=True)
+class _ResizeSignalWork:
+    key: tuple[object, ...]
+    callback: Callable[[int, int, int], object]
+    pane_root_pid: int
+    columns: int
+    rows: int
+    ticket: ResizeSignalTicket | None
+
+
+class ResizeSignalDispatcher:
+    """One bounded, coalescing worker for containment resize notification.
+
+    Ordinary resize traffic uses latest-value coalescing per callback and pane
+    root. Setup repair uses unique tickets so nudge and final notifications
+    cannot be merged across the replay boundary. Only redaction-safe status is
+    retained; callback objects, return values, exception messages, and private
+    launch data never enter history.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_pending: int = 256,
+        history_limit: int = 64,
+        poll_seconds: float = 0.05,
+    ) -> None:
+        max_pending = int(max_pending)
+        history_limit = int(history_limit)
+        poll_seconds = float(poll_seconds)
+        if not 1 <= max_pending <= 4096:
+            raise ValueError("max_pending must be in [1, 4096]")
+        if not 1 <= history_limit <= 4096:
+            raise ValueError("history_limit must be in [1, 4096]")
+        if not 0.001 <= poll_seconds <= 1.0:
+            raise ValueError("poll_seconds must be in [0.001, 1.0]")
+        self._max_pending = max_pending
+        self._poll_seconds = poll_seconds
+        self._lock = threading.Lock()
+        self._queue: queue.PriorityQueue[
+            tuple[int, int, tuple[object, ...]]
+        ] = queue.PriorityQueue(maxsize=max_pending)
+        self._pending: dict[tuple[object, ...], _ResizeSignalWork] = {}
+        self._history: deque[dict[str, object]] = deque(maxlen=history_limit)
+        self._thread: threading.Thread | None = None
+        self._active: _ResizeSignalWork | None = None
+        self._stopped = False
+        self._sequence = 0
+        self._queue_sequence = 0
+
+    def _record_locked(
+        self,
+        work: _ResizeSignalWork,
+        *,
+        status: str,
+        error_type: str = "",
+    ) -> None:
+        self._history.append(
+            {
+                "pane_root_pid": work.pane_root_pid,
+                "columns": work.columns,
+                "rows": work.rows,
+                "barrier": work.ticket is not None,
+                "status": str(status)[:64],
+                "error_type": str(error_type)[:128],
+            }
+        )
+
+    def _ensure_worker_locked(self) -> None:
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            return
+        if self._stopped:
+            raise RuntimeError("resize signal dispatcher is stopped")
+        thread = threading.Thread(
+            target=self._worker_main,
+            name="termdeck-resize-signal",
+            daemon=True,
+        )
+        self._thread = thread
+        thread.start()
+
+    def _enqueue(self, work: _ResizeSignalWork, *, coalesce: bool) -> bool:
+        with self._lock:
+            if self._stopped:
+                if work.ticket is not None:
+                    work.ticket._finish(
+                        succeeded=False,
+                        error="dispatcher shutdown",
+                    )
+                self._record_locked(work, status="rejected", error_type="stopped")
+                return False
+            if coalesce and work.key in self._pending:
+                self._pending[work.key] = work
+                self._record_locked(work, status="coalesced")
+                return True
+            if len(self._pending) >= self._max_pending:
+                if work.ticket is not None:
+                    work.ticket._finish(
+                        succeeded=False,
+                        error="dispatcher capacity exhausted",
+                    )
+                self._record_locked(work, status="rejected", error_type="capacity")
+                return False
+            self._pending[work.key] = work
+            try:
+                # Setup barriers outrank ordinary resize notifications so a
+                # burst of background resizes cannot delay authoritative
+                # replay behind the entire latest-value backlog.
+                self._queue_sequence += 1
+                priority = 0 if work.ticket is not None else 1
+                self._queue.put_nowait(
+                    (priority, self._queue_sequence, work.key)
+                )
+                self._ensure_worker_locked()
+            except Exception as exc:
+                if self._pending.get(work.key) is work:
+                    self._pending.pop(work.key, None)
+                error_type = type(exc).__name__
+                if work.ticket is not None:
+                    work.ticket._finish(
+                        succeeded=False,
+                        error=f"{error_type}: dispatcher start failed",
+                    )
+                self._record_locked(
+                    work,
+                    status="rejected",
+                    error_type=error_type,
+                )
+                return False
+            self._record_locked(work, status="queued")
+            return True
+
+    def submit_latest(
+        self,
+        callback: Callable[[int, int, int], object],
+        *,
+        pane_root_pid: int,
+        columns: int,
+        rows: int,
+    ) -> bool:
+        """Submit one nonblocking latest-value notification."""
+
+        if not callable(callback):
+            return False
+        pane_root_pid = int(pane_root_pid)
+        columns = int(columns)
+        rows = int(rows)
+        if pane_root_pid <= 1 or columns < 2 or rows < 2:
+            return False
+        key = ("latest", id(callback), pane_root_pid)
+        return self._enqueue(
+            _ResizeSignalWork(
+                key,
+                callback,
+                pane_root_pid,
+                columns,
+                rows,
+                None,
+            ),
+            coalesce=True,
+        )
+
+    def submit_barrier(
+        self,
+        callback: Callable[[int, int, int], object],
+        *,
+        pane_root_pid: int,
+        columns: int,
+        rows: int,
+    ) -> ResizeSignalTicket | None:
+        """Submit one non-coalesced setup barrier and return its ticket."""
+
+        if not callable(callback):
+            return None
+        pane_root_pid = int(pane_root_pid)
+        columns = int(columns)
+        rows = int(rows)
+        if pane_root_pid <= 1 or columns < 2 or rows < 2:
+            return None
+        ticket = ResizeSignalTicket()
+        with self._lock:
+            self._sequence += 1
+            sequence = self._sequence
+        key = ("barrier", sequence)
+        work = _ResizeSignalWork(
+            key,
+            callback,
+            pane_root_pid,
+            columns,
+            rows,
+            ticket,
+        )
+        return ticket if self._enqueue(work, coalesce=False) else None
+
+    def _worker_main(self) -> None:
+        while True:
+            with self._lock:
+                if self._stopped:
+                    return
+            try:
+                _priority, _sequence, key = self._queue.get(
+                    timeout=self._poll_seconds
+                )
+            except queue.Empty:
+                continue
+            work: _ResizeSignalWork | None = None
+            try:
+                with self._lock:
+                    work = self._pending.pop(key, None)
+                    self._active = work
+                    stopped = self._stopped
+                if work is None:
+                    continue
+                if stopped:
+                    if work.ticket is not None:
+                        work.ticket.cancel("dispatcher shutdown")
+                    continue
+                if work.ticket is not None and work.ticket.cancelled:
+                    with self._lock:
+                        self._record_locked(work, status="cancelled")
+                    continue
+                try:
+                    work.callback(
+                        work.pane_root_pid,
+                        work.columns,
+                        work.rows,
+                    )
+                except Exception as exc:
+                    error_type = type(exc).__name__
+                    if work.ticket is not None:
+                        work.ticket._finish(
+                            succeeded=False,
+                            error=f"{error_type}: callback failed",
+                        )
+                    with self._lock:
+                        self._record_locked(
+                            work,
+                            status="failed",
+                            error_type=error_type,
+                        )
+                else:
+                    if work.ticket is not None:
+                        work.ticket._finish(succeeded=True)
+                    with self._lock:
+                        self._record_locked(work, status="completed")
+            finally:
+                with self._lock:
+                    self._active = None
+                self._queue.task_done()
+
+    def snapshot(self) -> dict[str, object]:
+        """Return bounded status without callbacks or private values."""
+
+        with self._lock:
+            thread = self._thread
+            return {
+                "stopped": self._stopped,
+                "thread_alive": bool(thread is not None and thread.is_alive()),
+                "pending": len(self._pending),
+                "active": self._active is not None,
+                "history": list(self._history),
+            }
+
+    def shutdown(self, timeout: float = 1.0) -> bool:
+        """Stop admission and release all pending ticket holders finitely."""
+
+        try:
+            timeout = max(0.0, float(timeout))
+        except (TypeError, ValueError):
+            timeout = 0.0
+        with self._lock:
+            self._stopped = True
+            pending = list(self._pending.values())
+            self._pending.clear()
+            active = self._active
+            thread = self._thread
+        for work in [*pending, *([active] if active is not None else [])]:
+            if work.ticket is not None:
+                work.ticket.cancel("dispatcher shutdown")
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+        return bool(thread is None or not thread.is_alive())
+
+
+_DEFAULT_RESIZE_SIGNAL_DISPATCHER = ResizeSignalDispatcher()
+
+
 class PaneStreamController:
     """Own one control-mode attachment and its pane's bidirectional stream.
 
@@ -309,6 +678,10 @@ class PaneStreamController:
         on_output: Callable[[bytes], None],
         on_pane_dead: Callable[[], None] | None = None,
         on_state_change: Callable[[ClientState], None] | None = None,
+        on_resize_applied: Callable[[int, int, int], object] | None = None,
+        resize_signal_dispatcher: ResizeSignalDispatcher | None = None,
+        resize_signal_timeout: float | None = None,
+        repair_on_setup: bool = True,
         history_lines: int = 2000,
         command_timeout: float = 5.0,
         client_factory: Callable[..., ControlModeClient] | None = None,
@@ -321,8 +694,26 @@ class PaneStreamController:
         self._on_output = on_output
         self._on_pane_dead = on_pane_dead
         self._on_state_change = on_state_change
+        self._on_resize_applied = on_resize_applied
+        self._resize_signal_dispatcher = (
+            resize_signal_dispatcher
+            if resize_signal_dispatcher is not None
+            else _DEFAULT_RESIZE_SIGNAL_DISPATCHER
+        )
+        self._repair_on_setup = bool(repair_on_setup)
         self._history_lines = max(0, int(history_lines))
         self._command_timeout = float(command_timeout)
+        self._resize_signal_timeout = min(
+            30.0,
+            max(
+                0.05,
+                float(
+                    self._command_timeout
+                    if resize_signal_timeout is None
+                    else resize_signal_timeout
+                ),
+            ),
+        )
 
         self._lock = threading.Lock()
         self._tasks: queue.Queue[tuple[str, object] | None] = queue.Queue()
@@ -332,6 +723,7 @@ class PaneStreamController:
         self._generation = 0
         self._ready = False
         self._pane_id: str | None = None
+        self._pane_root_pid: int | None = None
         self._pane_dead_reported = False
         self._replayed_history = False
         self._pending_output: list[bytes] = []
@@ -488,6 +880,8 @@ class PaneStreamController:
             if state is ClientState.CONNECTED:
                 self._generation += 1
                 self._ready = False
+                self._pane_id = None
+                self._pane_root_pid = None
                 self._pending_output.clear()
                 self._pending_output_bytes = 0
                 self._pending_output_overflowed = False
@@ -599,11 +993,66 @@ class PaneStreamController:
             )
             self._unsent_input_chunks = max(0, self._unsent_input_chunks - 1)
 
+    def _notify_resize_applied(
+        self,
+        *,
+        pane_root_pid: int | None,
+        columns: int,
+        rows: int,
+        wait: bool = False,
+    ) -> bool:
+        callback = self._on_resize_applied
+        if callback is None or pane_root_pid is None:
+            return True
+        dispatcher = self._resize_signal_dispatcher
+        if not wait:
+            # Ordinary live resize remains authoritative even when optional
+            # containment notification is temporarily at capacity.
+            return dispatcher.submit_latest(
+                callback,
+                pane_root_pid=int(pane_root_pid),
+                columns=int(columns),
+                rows=int(rows),
+            )
+        ticket = dispatcher.submit_barrier(
+            callback,
+            pane_root_pid=int(pane_root_pid),
+            columns=int(columns),
+            rows=int(rows),
+        )
+        # Setup requires the attempt to finish before capture, not a successful
+        # domain result. Optional callback exceptions are recorded and retried
+        # later but must never strand a healthy shell or non-Codex pane.
+        if ticket is None:
+            return False
+        completed = ticket.wait(self._resize_signal_timeout)
+        if not completed:
+            # A timed-out setup must not leave a stale queued grid to execute
+            # after a newer retry. Active callbacks are already bounded and
+            # cannot be preempted safely, but pending work observes cancellation.
+            ticket.cancel("resize notification timed out")
+        return completed
+
+    @staticmethod
+    def _setup_nudge_grid(columns: int, rows: int) -> tuple[int, int]:
+        if columns > 2:
+            return columns - 1, rows
+        if rows > 2:
+            return columns, rows - 1
+        return columns, rows
+
     def _run_resize(self) -> None:
         with self._lock:
             self._resize_queued = False
             columns, rows = self._size
-        self._command(f"refresh-client -C {columns}x{rows}")
+            pane_root_pid = self._pane_root_pid
+        result = self._command(f"refresh-client -C {columns}x{rows}")
+        if result.ok:
+            self._notify_resize_applied(
+                pane_root_pid=pane_root_pid,
+                columns=columns,
+                rows=rows,
+            )
 
     def _run_input(self, data: bytes) -> None:
         with self._lock:
@@ -665,33 +1114,119 @@ class PaneStreamController:
             if generation != self._generation or self._stopped:
                 return True
             columns, rows = self._size
-            # Establish a capture boundary. Everything before this point is
-            # represented by the authoritative tmux capture; only later live
-            # output needs buffering behind the setup commit.
-            self._pending_output.clear()
-            self._pending_output_bytes = 0
-            self._pending_output_overflowed = False
-
-        self._command(f"refresh-client -C {columns}x{rows}")
 
         target = self._target
         scope = f" -t {target}" if target else ""
-        state_reply = self._command(f"list-panes{scope} -F '{_PANE_STATE_FORMAT}'")
-        if not state_reply.ok or not state_reply.lines:
-            return False
-        fields = state_reply.lines[0].split()
-        if len(fields) != len(_STATE_FIELDS):
-            return False
-        pane_state = dict(zip(_STATE_FIELDS, fields))
-        pane_id = pane_state["pane_id"]
-        with self._lock:
-            self._pane_id = pane_id
 
-        # Session-scoped subscription (empty "what" field).  Pane-scoped
-        # subscriptions (name:%id:format) are accepted but never emit
-        # %subscription-changed on tmux 3.7, while the session scope fires
-        # reliably; each TermDeck session hosts a single pane, so the
-        # session's active-pane context is exactly our pane.
+        def read_pane_state() -> dict[str, str] | None:
+            reply = self._command(f"list-panes{scope} -F '{_PANE_STATE_FORMAT}'")
+            if not reply.ok or not reply.lines:
+                return None
+            fields = reply.lines[0].split()
+            if len(fields) != len(_STATE_FIELDS):
+                return None
+            state = dict(zip(_STATE_FIELDS, fields))
+            try:
+                pane_pid = int(state["pane_pid"])
+            except (KeyError, ValueError):
+                return None
+            if pane_pid <= 1:
+                return None
+            return state
+
+        repair_this_setup = self._on_resize_applied is not None and (
+            self._repair_on_setup or self._replayed_history
+        )
+        if not repair_this_setup:
+            # Preserve the historical one-resize/one-state-query transaction for
+            # generic controllers and for the first attach of an exact-grid new
+            # payload. Subsequent reconnects repair before replay.
+            with self._lock:
+                if generation != self._generation or self._stopped:
+                    return True
+                self._pending_output.clear()
+                self._pending_output_bytes = 0
+                self._pending_output_overflowed = False
+            final_resize = self._command(f"refresh-client -C {columns}x{rows}")
+            if not final_resize.ok:
+                return False
+            pane_state = read_pane_state()
+            if pane_state is None:
+                return False
+            pane_id = pane_state["pane_id"]
+            pane_root_pid = int(pane_state["pane_pid"])
+        else:
+            initial_state = read_pane_state()
+            if initial_state is None:
+                return False
+            pane_id = initial_state["pane_id"]
+            pane_root_pid = int(initial_state["pane_pid"])
+            with self._lock:
+                if generation != self._generation or self._stopped:
+                    return True
+                self._pane_id = pane_id
+                self._pane_root_pid = pane_root_pid
+
+            # A control-mode client has no PTY of its own. Repair a stale
+            # contained full-screen layout before replay is committed: nudge by
+            # one cell, propagate SIGWINCH across the bwrap session boundary,
+            # restore the exact VTE grid, and propagate once more.
+            nudge_columns, nudge_rows = self._setup_nudge_grid(columns, rows)
+            if (nudge_columns, nudge_rows) != (columns, rows):
+                nudge = self._command(
+                    f"refresh-client -C {nudge_columns}x{nudge_rows}"
+                )
+                if not nudge.ok:
+                    return False
+                if not self._notify_resize_applied(
+                    pane_root_pid=pane_root_pid,
+                    columns=nudge_columns,
+                    rows=nudge_rows,
+                    wait=True,
+                ):
+                    return False
+
+            final_resize = self._command(f"refresh-client -C {columns}x{rows}")
+            if not final_resize.ok:
+                return False
+            if not self._notify_resize_applied(
+                pane_root_pid=pane_root_pid,
+                columns=columns,
+                rows=rows,
+                wait=True,
+            ):
+                return False
+
+            # Redraw output generated by the nudge/final transition is already
+            # represented by the final authoritative tmux capture. Establish the
+            # incremental-output boundary only now.
+            with self._lock:
+                if generation != self._generation or self._stopped:
+                    return True
+                self._pending_output.clear()
+                self._pending_output_bytes = 0
+                self._pending_output_overflowed = False
+
+            pane_state = read_pane_state()
+            if pane_state is None:
+                return False
+            if (
+                pane_state["pane_id"] != pane_id
+                or int(pane_state["pane_pid"]) != pane_root_pid
+            ):
+                # A respawn raced the repair. Retry against one coherent
+                # replacement identity instead of committing mixed replay.
+                return False
+
+        with self._lock:
+            if generation != self._generation or self._stopped:
+                return True
+            self._pane_id = pane_id
+            self._pane_root_pid = pane_root_pid
+
+        # Session-scoped subscription (empty "what" field). Pane-scoped
+        # subscriptions never emit reliably on tmux 3.7; each managed session
+        # hosts one pane, so the active-pane context is exact.
         self._command(
             f"refresh-client -B '{_DEAD_SUBSCRIPTION}::" "#{pane_dead}'"
         )
@@ -704,8 +1239,6 @@ class PaneStreamController:
             if generation != self._generation or self._stopped:
                 return True
             if self._pending_output_overflowed:
-                # The incremental suffix is incomplete. Retry from a fresh
-                # capture instead of committing a terminal with missing bytes.
                 self._pending_output.clear()
                 self._pending_output_bytes = 0
                 self._pending_output_overflowed = False
@@ -727,8 +1260,6 @@ class PaneStreamController:
             finally:
                 self._release_unsent_input(data)
             if not sent:
-                # The pane is no longer accepting input. Release ownership of
-                # the untouched suffix rather than retrying it into a new task.
                 for remaining in pending_input[index + 1 :]:
                     self._release_unsent_input(remaining)
                 break

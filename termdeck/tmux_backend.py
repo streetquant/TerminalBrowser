@@ -44,6 +44,11 @@ from .history_control import (
     unhandled_scroll,
 )
 from .models import SessionRecord
+from .resize_signal import (
+    ResizeSignalResult,
+    private_launch_tuple_for_scope,
+    propagate_terminal_resize as _propagate_terminal_resize,
+)
 from .resources import (
     observe_recovery_metadata,
     process_tree,
@@ -596,13 +601,18 @@ class TmuxBackend:
         check: bool = True,
         *,
         timeout: float | None = None,
+        bypass_query_backoff: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         self.require_available()
         command = [self.executable, *args]
         limit = self.command_timeout if timeout is None else max(0.05, float(timeout))
         command_name = str(args[0]) if args else ""
         read_only_control = command_name in self._READ_ONLY_CONTROL_COMMANDS
-        if read_only_control and time.monotonic() < self._query_backoff_until:
+        if (
+            read_only_control
+            and not bypass_query_backoff
+            and time.monotonic() < self._query_backoff_until
+        ):
             detail = f"tmux query suppressed during control-plane backoff: {command_name or 'command'}"
             if check:
                 raise TmuxError(detail)
@@ -652,6 +662,17 @@ class TmuxBackend:
             check=False,
             timeout=self.query_timeout,
         )
+        if result.returncode == 124:
+            # Credential-writer admission remains fail closed, but one busy
+            # control-plane interval is not proof of presence or absence.
+            # Retry exactly once with the existing command timeout and bypass
+            # only the backoff created by the first bounded timeout.
+            result = self._run(
+                ["has-session", "-t", record.tmux_name],
+                check=False,
+                timeout=self.command_timeout,
+                bypass_query_backoff=True,
+            )
         if result.returncode == 0:
             return True
         if result.returncode == 1:
@@ -1190,7 +1211,56 @@ class TmuxBackend:
         finally:
             local.close()
 
+    @staticmethod
+    def _validated_initial_grid(columns: int, rows: int) -> tuple[int, int]:
+        """Return a safe tmux grid for a payload's very first terminal frame.
+
+        Full-screen TUIs render immediately after ``tmux new-session``. If
+        tmux starts them at its implicit 80x24 default and the GUI resizes the
+        pane a moment later, their splash screen is briefly composed from two
+        incompatible layouts. The GUI therefore supplies its settled VTE grid
+        before starting a missing payload. Headless callers keep the historical
+        ``create_or_resume`` path and tmux default.
+        """
+
+        try:
+            safe_columns = int(columns)
+            safe_rows = int(rows)
+        except (TypeError, ValueError) as exc:
+            raise TmuxError("initial terminal grid must contain integers") from exc
+        if isinstance(columns, bool) or isinstance(rows, bool):
+            raise TmuxError("initial terminal grid must contain integers")
+        if safe_columns < 2 or safe_rows < 2:
+            raise TmuxError("initial terminal grid must be at least 2x2")
+        # tmux stores dimensions in bounded integers; an explicit ceiling also
+        # prevents a corrupted GUI allocation from becoming an enormous pane.
+        if safe_columns > 1000 or safe_rows > 1000:
+            raise TmuxError("initial terminal grid is unreasonably large")
+        return safe_columns, safe_rows
+
     def create_or_resume(self, record: SessionRecord) -> None:
+        self._create_or_resume(record, initial_grid=None)
+
+    def create_or_resume_at_grid(
+        self,
+        record: SessionRecord,
+        *,
+        columns: int,
+        rows: int,
+    ) -> None:
+        """Create a missing payload at the GUI's settled terminal geometry."""
+
+        self._create_or_resume(
+            record,
+            initial_grid=self._validated_initial_grid(columns, rows),
+        )
+
+    def _create_or_resume(
+        self,
+        record: SessionRecord,
+        *,
+        initial_grid: tuple[int, int] | None,
+    ) -> None:
         if (getattr(record, "codex_home", None) or "").strip():
             with auth_transaction_lock(record):
                 if self._auth_session_exists(record):
@@ -1205,15 +1275,20 @@ class TmuxBackend:
                     return
                 lifetime_lease = _acquire_auth_lifetime_lease(record)
                 try:
-                    self._create_or_resume_unlocked(
-                        record,
-                        require_absent=True,
-                        lifetime_lease=lifetime_lease,
-                    )
+                    create_kwargs: dict[str, object] = {
+                        "require_absent": True,
+                        "lifetime_lease": lifetime_lease,
+                    }
+                    if initial_grid is not None:
+                        create_kwargs["initial_grid"] = initial_grid
+                    self._create_or_resume_unlocked(record, **create_kwargs)
                 finally:
                     lifetime_lease.release()
             return
-        self._create_or_resume_unlocked(record)
+        if initial_grid is None:
+            self._create_or_resume_unlocked(record)
+        else:
+            self._create_or_resume_unlocked(record, initial_grid=initial_grid)
 
     def _recover_exact_over_idle_placeholder(self, record: SessionRecord) -> None:
         """Replace one proven idle placeholder without removing its tmux pane.
@@ -1513,6 +1588,7 @@ class TmuxBackend:
         *,
         require_absent: bool = False,
         lifetime_lease: _AuthLifetimeLease | None = None,
+        initial_grid: tuple[int, int] | None = None,
     ) -> None:
         raw_codex_home = (getattr(record, "codex_home", None) or "").strip()
         if raw_codex_home:
@@ -1635,6 +1711,9 @@ class TmuxBackend:
             "-s",
             record.tmux_name,
         ]
+        if initial_grid is not None:
+            columns, rows = initial_grid
+            launch_args.extend(["-x", str(columns), "-y", str(rows)])
         if raw_codex_home:
             codex_home = Path(raw_codex_home).expanduser().resolve(strict=False)
             isolated_path = self._private_auth_path(codex_home)
@@ -2269,6 +2348,44 @@ class TmuxBackend:
             return int(pid_text)
         except ValueError:
             return None
+
+    @staticmethod
+    def propagate_terminal_resize(
+        pane_pid: int | None,
+        *,
+        codex_home: str | None = None,
+        auth_scope_id: str | None = None,
+    ) -> ResizeSignalResult:
+        """Forward one resize only to the private Codex bound to this row.
+
+        The process tree cannot appoint its own authentication identity. The
+        expected private tuple is derived from the durable TermDeck record and
+        must exactly match the unique witness discovered below the pane root.
+        Generic shells, legacy rows without a complete scope, and malformed
+        identities produce an honest no-op.
+        """
+
+        if pane_pid is None:
+            return ResizeSignalResult(
+                signalled=False,
+                reason="pane root PID is unavailable",
+                root_pid=0,
+            )
+        try:
+            expected_private_tuple = private_launch_tuple_for_scope(
+                str(codex_home or "").strip(),
+                str(auth_scope_id or "").strip(),
+            )
+        except ValueError:
+            return ResizeSignalResult(
+                signalled=False,
+                reason="persistent private Codex identity is unavailable",
+                root_pid=int(pane_pid),
+            )
+        return _propagate_terminal_resize(
+            int(pane_pid),
+            expected_private_tuple=expected_private_tuple,
+        )
 
     def is_codex_running(self, record: SessionRecord) -> bool:
         """Return true only when the live pane process tree proves Codex is running."""
