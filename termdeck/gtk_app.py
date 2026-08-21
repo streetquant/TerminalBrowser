@@ -22,7 +22,7 @@ import gi  # type: ignore
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("Vte", "2.91")
-from gi.repository import Gdk, GLib, Gtk, Pango, Vte  # type: ignore  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango, Vte  # type: ignore  # noqa: E402
 
 from .capacity import (
     MASTER_ROW_LIMIT,
@@ -7816,8 +7816,24 @@ class TermDeckApplication(Gtk.Application):
             application_id=_application_id_for_canonical_database(canonical_db_path),
             flags=0,
         )
+        quit_action = Gio.SimpleAction.new("quit-preserving-sessions", None)
+        quit_action.connect("activate", self._activate_quit_preserving_sessions)
+        self.add_action(quit_action)
         self.store = SessionStore(canonical_db_path)
         self.backend = TmuxBackend()
+        self._tmux_server_isolation = None
+        try:
+            self._tmux_server_isolation = self.backend.ensure_server_lifecycle_isolated()
+            if not self._tmux_server_isolation.ok:
+                print(
+                    f"T1000: {self._tmux_server_isolation.detail}",
+                    file=sys.stderr,
+                )
+        except TmuxError as exc:
+            print(
+                f"T1000: tmux server lifecycle isolation failed: {exc}",
+                file=sys.stderr,
+            )
         self.codex_auth = CodexAuthManager(account_source=self.store.account_source)
         self.theme = load_terminator_theme()
         try:
@@ -8706,6 +8722,11 @@ class TermDeckApplication(Gtk.Application):
             opened += 1
         return opened
 
+    def _activate_quit_preserving_sessions(self, _action, _parameter) -> None:
+        """Expose a D-Bus GApplication action for GUI-only release handoff."""
+
+        self.quit_preserving_sessions()
+
     def quit_preserving_sessions(self) -> bool:
         """Close every TermDeck window while leaving tmux sessions alive."""
 
@@ -8721,6 +8742,22 @@ class TermDeckApplication(Gtk.Application):
                     kind="warning",
                 )
             return False
+
+        try:
+            isolation = self.backend.ensure_server_lifecycle_isolated()
+        except TmuxError as exc:
+            detail = f"T1000 cannot close safely: {exc}"
+            print(detail, file=sys.stderr)
+            for window in self.windows:
+                window.show_toast(detail, kind="error")
+            return False
+        if not isolation.ok:
+            detail = f"T1000 cannot close safely: {isolation.detail}"
+            print(detail, file=sys.stderr)
+            for window in self.windows:
+                window.show_toast(detail, kind="error")
+            return False
+        self._tmux_server_isolation = isolation
 
         for window in list(self.windows):
             for tab in list(window.tabs.values()):

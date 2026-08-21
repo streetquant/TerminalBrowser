@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+## 0.2.16
+
+T1000 0.2.16 makes persistent terminal ownership independent of the GTK process that presents it. The tmux server is now an explicit lifecycle authority rather than an accidental descendant of whichever GUI process happened to create the first tab.
+
+### The tmux server has its own lifecycle
+
+When no server exists and the caller shares the tmux socket mount with user systemd, the first `tmux new-session` or `start-server` command runs inside a delegated transient scope. In a container or validation mount namespace, T1000 starts the client locally and moves the exact daemon PID into a delegated anchor before the operation returns. Closing, upgrading, or replacing T1000 therefore cannot remove terminal payloads through GUI service cleanup.
+
+Existing servers are handled without restart. T1000 reads the exact tmux server PID, binds it to `/proc/PID/stat` start time, creates a delegated `KillMode=process` anchor, moves only that PID through systemd's `AttachProcessesToUnit`, and then repeats the PID, start-time, cgroup, and unit-policy checks. PID reuse, an unavailable manager, an unsafe existing unit, attachment failure, or identity drift never becomes a destructive fallback.
+
+### GUI activation is now a first-class control operation
+
+The application exports a `quit-preserving-sessions` GApplication action. Release tooling can request orderly persistence and window closure over D-Bus instead of sending an unstructured process signal. The tmux authority remains alive while the old GUI exits and the verified replacement attaches.
+
+### Recovery remains conservative
+
+The generation-safe recovery rules introduced in the 0.2.15 source remain unchanged. Managed tabs use stable session targets rather than persisted `%pane` identifiers. A missing plain shell can start fresh only when it is a trusted configured system shell and carries no recovery metadata. Exact Codex and Claude identities may resume through their validated commands; incomplete or launcher-only agent state stays explicit and fail-closed.
+
+### Validation boundary
+
+The release contract includes focused lifecycle and PID-reuse tests, the complete existing test inventory, all GUI/VTE/tmux smokes, and a disposable real-systemd smoke that proves the first private tmux server enters an independent delegated scope and is fully removed during cleanup.
+
 ## 0.2.15
 
 T1000 0.2.15 repairs the Codex composer failure reported against the installed 0.2.14 runtime and closes the surrounding startup, containment-notification, validation, and release-evidence gaps without replacing the existing GTK/VTE/tmux architecture.

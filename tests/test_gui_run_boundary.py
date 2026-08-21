@@ -1,6 +1,8 @@
+import inspect
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import TestCase, mock
 
 from gi.repository import Gio
@@ -10,6 +12,50 @@ from termdeck.session_store import DEFAULT_DB_PATH
 
 
 class GuiRunBoundaryTest(TestCase):
+    def test_application_exports_quit_preserving_sessions_action(self) -> None:
+        source = inspect.getsource(gtk_app.TermDeckApplication.__init__)
+        self.assertIn("quit-preserving-sessions", source)
+        self.assertIn("Gio.SimpleAction", source)
+        app = mock.Mock()
+        gtk_app.TermDeckApplication._activate_quit_preserving_sessions(
+            app, None, None
+        )
+        app.quit_preserving_sessions.assert_called_once_with()
+
+    def test_quit_refuses_when_tmux_lifecycle_is_not_safe(self) -> None:
+        backend = mock.Mock()
+        backend.ensure_server_lifecycle_isolated.return_value = SimpleNamespace(
+            ok=False, detail="user systemd is unavailable"
+        )
+        app = SimpleNamespace(
+            windows=[],
+            backend=backend,
+            quit=mock.Mock(),
+            _tmux_server_isolation=None,
+        )
+
+        self.assertFalse(
+            gtk_app.TermDeckApplication.quit_preserving_sessions(app)
+        )
+        app.quit.assert_not_called()
+
+    def test_quit_revalidates_tmux_lifecycle_before_closing(self) -> None:
+        isolation = SimpleNamespace(ok=True, detail="safe")
+        backend = mock.Mock()
+        backend.ensure_server_lifecycle_isolated.return_value = isolation
+        app = SimpleNamespace(
+            windows=[],
+            backend=backend,
+            quit=mock.Mock(),
+            _tmux_server_isolation=None,
+        )
+
+        self.assertTrue(
+            gtk_app.TermDeckApplication.quit_preserving_sessions(app)
+        )
+        self.assertIs(app._tmux_server_isolation, isolation)
+        app.quit.assert_called_once_with()
+
     def test_application_identity_is_stable_and_scoped_to_the_database(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

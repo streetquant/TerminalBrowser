@@ -56,6 +56,12 @@ from .resources import (
     safe_claude_recovery_command,
     safe_codex_recovery_command,
 )
+from .tmux_server_lifecycle import (
+    TmuxServerIsolationError,
+    TmuxServerIsolationResult,
+    isolate_existing_tmux_server,
+    scoped_tmux_server_command,
+)
 
 
 class TmuxError(RuntimeError):
@@ -607,6 +613,23 @@ class TmuxBackend:
         command = [self.executable, *args]
         limit = self.command_timeout if timeout is None else max(0.05, float(timeout))
         command_name = str(args[0]) if args else ""
+        starts_server = command_name in {"new-session", "start-server"}
+        execution_command = command
+        if starts_server:
+            existing = None
+            try:
+                existing = isolate_existing_tmux_server(
+                    self.executable,
+                    query_timeout=self.query_timeout,
+                    timeout=self.command_timeout,
+                )
+            except TmuxServerIsolationError:
+                # This is only a fast-path probe.  Preserve the primary tmux
+                # command's own timeout/error contract, then require exact
+                # lifecycle isolation after any successful server start.
+                pass
+            if existing is None or not existing.server_present:
+                execution_command = scoped_tmux_server_command(command) or command
         read_only_control = command_name in self._READ_ONLY_CONTROL_COMMANDS
         if (
             read_only_control
@@ -619,7 +642,7 @@ class TmuxBackend:
             return subprocess.CompletedProcess(command, 124, "", detail)
         try:
             result = subprocess.run(
-                command,
+                execution_command,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -635,7 +658,29 @@ class TmuxBackend:
             return subprocess.CompletedProcess(command, 124, "", detail)
         if check and result.returncode != 0:
             raise TmuxError(result.stderr.strip() or "tmux command failed")
+        if result.returncode == 0 and starts_server:
+            try:
+                isolate_existing_tmux_server(
+                    self.executable,
+                    query_timeout=self.query_timeout,
+                    timeout=self.command_timeout,
+                )
+            except TmuxServerIsolationError as exc:
+                raise TmuxError(str(exc)) from exc
         return result
+
+    def ensure_server_lifecycle_isolated(self) -> TmuxServerIsolationResult:
+        """Keep an existing tmux server outside the GUI service cgroup."""
+
+        self.require_available()
+        try:
+            return isolate_existing_tmux_server(
+                self.executable,
+                query_timeout=self.query_timeout,
+                timeout=self.command_timeout,
+            )
+        except TmuxServerIsolationError as exc:
+            raise TmuxError(str(exc)) from exc
 
     def session_exists(self, record: SessionRecord) -> bool:
         if not self.available:

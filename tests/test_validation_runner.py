@@ -90,7 +90,7 @@ def test_actual_manifest_is_canonical_and_covers_exact_inventory() -> None:
     payload, raw, tests, smokes = runner.load_manifest(REPO_ROOT, MANIFEST)
     assert raw == runner.canonical_json_bytes(payload)
     assert len(tests) >= 100
-    assert len(smokes) == 21
+    assert len(smokes) == 22
     entries = {entry["path"]: entry for entry in payload["smokes"]}
     assert sorted(entries) == smokes
     managed = entries["scripts/check_managed_process_inventory_smoke.py"]
@@ -124,8 +124,8 @@ def test_profile_selection_is_closed_and_complete() -> None:
         discovered_tests=tests,
     )
     assert ci_tests == production_tests == tests
-    assert len(ci_smokes) == 20
-    assert len(production_smokes) == 21
+    assert len(ci_smokes) == 21
+    assert len(production_smokes) == 22
     assert all(entry["environment"] == "xvfb-dbus" for entry in ci_smokes)
     assert sum(entry["environment"] == "production-host" for entry in production_smokes) == 1
 

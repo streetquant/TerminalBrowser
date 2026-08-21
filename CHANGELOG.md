@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.16
+
+- Isolated the tmux server from the graphical application lifecycle. A first server now starts in its own delegated user-systemd scope when the socket mount is shared, or is moved immediately into a delegated anchor when mount namespaces differ, so stopping or replacing the GUI cannot terminate the server or its terminal payloads.
+- Added bounded migration for legacy live servers that inherited a GUI service cgroup. Migration binds to the exact tmux PID and Linux start time, creates a delegated process-only anchor, moves only that process through systemd's `AttachProcessesToUnit`, and revalidates PID, start time, cgroup, and unit policy before success.
+- Added a GApplication `quit-preserving-sessions` action for graceful, remotely triggered GUI-only release handoff. The action persists live session metadata and closes application windows without terminating tmux sessions.
+- Retained the 0.2.15 generation-safe recovery corrections: managed records cannot persist or obey stale server-local `%pane` IDs; trusted plain shells may be recreated only without recovery metadata; Codex, Claude, and non-exact agent state remain fail-closed.
+- Added failing-first unit coverage, PID-reuse and unavailable-systemd boundaries, a real disposable first-server scope-or-anchor smoke, and live no-op verification against an already anchored server.
+
 ## 0.2.15
 
 - Fixed Codex composer startup corruption at its root. GUI-owned and restored tmux payloads now start only after VTE has a settled character grid, and `new-session -x/-y`, the tmux pane/window, control-mode stream, and the payload's first full-screen frame share that exact geometry. Hidden and all-hidden workspace recipes use the same mapped-window grid.
