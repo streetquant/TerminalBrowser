@@ -9,8 +9,71 @@ import pytest
 from termdeck.tmux_server_lifecycle import (
     TmuxServerIsolationError,
     isolate_existing_tmux_server,
+    process_exit_requires_tmux_isolation,
     scoped_tmux_server_command,
 )
+
+
+def test_main_process_of_group_killing_service_requires_isolation():
+    properties = {
+        "Id": "t1000-gui.service",
+        "MainPID": "4321",
+        "ControlGroup": "/app.slice/t1000-gui.service",
+        "KillMode": "control-group",
+    }
+    with mock.patch(
+        "termdeck.tmux_server_lifecycle._process_cgroup",
+        return_value="0::/app.slice/t1000-gui.service",
+    ), mock.patch(
+        "termdeck.tmux_server_lifecycle._unit_properties",
+        return_value=properties,
+    ):
+        assert process_exit_requires_tmux_isolation(pid=4321)
+
+
+def test_child_of_service_main_process_may_exit_without_isolation():
+    properties = {
+        "Id": "validation.service",
+        "MainPID": "1111",
+        "ControlGroup": "/app.slice/validation.service",
+        "KillMode": "control-group",
+    }
+    with mock.patch(
+        "termdeck.tmux_server_lifecycle._process_cgroup",
+        return_value="0::/app.slice/validation.service",
+    ), mock.patch(
+        "termdeck.tmux_server_lifecycle._unit_properties",
+        return_value=properties,
+    ):
+        assert not process_exit_requires_tmux_isolation(pid=4321)
+
+
+def test_same_cgroup_parent_is_safe_fallback_without_user_manager():
+    with mock.patch(
+        "termdeck.tmux_server_lifecycle._process_cgroup",
+        return_value="0::/app.slice/validation.service",
+    ), mock.patch(
+        "termdeck.tmux_server_lifecycle._unit_properties",
+        return_value=None,
+    ), mock.patch(
+        "termdeck.tmux_server_lifecycle._has_same_cgroup_ancestor",
+        return_value=True,
+    ):
+        assert not process_exit_requires_tmux_isolation(pid=4321)
+
+
+def test_service_root_is_conservative_fallback_without_user_manager():
+    with mock.patch(
+        "termdeck.tmux_server_lifecycle._process_cgroup",
+        return_value="0::/app.slice/t1000-gui.service",
+    ), mock.patch(
+        "termdeck.tmux_server_lifecycle._unit_properties",
+        return_value=None,
+    ), mock.patch(
+        "termdeck.tmux_server_lifecycle._has_same_cgroup_ancestor",
+        return_value=False,
+    ):
+        assert process_exit_requires_tmux_isolation(pid=4321)
 
 
 def test_first_server_start_is_wrapped_in_a_delegated_user_scope():

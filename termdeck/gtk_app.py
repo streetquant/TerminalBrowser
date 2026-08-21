@@ -60,6 +60,7 @@ from .tmux_control import ClientState, ControlEvent, ControlModeClient
 from .command_render import default_shell, directory_tab_name, normalise_directory, render_command
 from .window_snapshot import build_window_snapshots
 from .terminator_config import load_terminator_theme
+from .tmux_server_lifecycle import process_exit_requires_tmux_isolation
 from .tmux_backend import (
     AuthActivationResult,
     AuthTransactionBusy,
@@ -8743,21 +8744,32 @@ class TermDeckApplication(Gtk.Application):
                 )
             return False
 
+        requires_isolation = process_exit_requires_tmux_isolation()
         try:
             isolation = self.backend.ensure_server_lifecycle_isolated()
         except TmuxError as exc:
-            detail = f"T1000 cannot close safely: {exc}"
+            if requires_isolation:
+                detail = f"T1000 cannot close safely: {exc}"
+                print(detail, file=sys.stderr)
+                for window in self.windows:
+                    window.show_toast(detail, kind="error")
+                return False
+            isolation = None
+        if isolation is not None and isolation.ok:
+            self._tmux_server_isolation = isolation
+        elif requires_isolation:
+            detail = (
+                "T1000 cannot close safely: "
+                + (
+                    isolation.detail
+                    if isolation is not None
+                    else "tmux server isolation could not be verified"
+                )
+            )
             print(detail, file=sys.stderr)
             for window in self.windows:
                 window.show_toast(detail, kind="error")
             return False
-        if not isolation.ok:
-            detail = f"T1000 cannot close safely: {isolation.detail}"
-            print(detail, file=sys.stderr)
-            for window in self.windows:
-                window.show_toast(detail, kind="error")
-            return False
-        self._tmux_server_isolation = isolation
 
         for window in list(self.windows):
             for tab in list(window.tabs.values()):

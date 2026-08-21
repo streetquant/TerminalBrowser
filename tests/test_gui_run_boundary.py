@@ -34,9 +34,13 @@ class GuiRunBoundaryTest(TestCase):
             _tmux_server_isolation=None,
         )
 
-        self.assertFalse(
-            gtk_app.TermDeckApplication.quit_preserving_sessions(app)
-        )
+        with mock.patch(
+            "termdeck.gtk_app.process_exit_requires_tmux_isolation",
+            return_value=True,
+        ):
+            self.assertFalse(
+                gtk_app.TermDeckApplication.quit_preserving_sessions(app)
+            )
         app.quit.assert_not_called()
 
     def test_quit_revalidates_tmux_lifecycle_before_closing(self) -> None:
@@ -50,10 +54,35 @@ class GuiRunBoundaryTest(TestCase):
             _tmux_server_isolation=None,
         )
 
-        self.assertTrue(
-            gtk_app.TermDeckApplication.quit_preserving_sessions(app)
-        )
+        with mock.patch(
+            "termdeck.gtk_app.process_exit_requires_tmux_isolation",
+            return_value=True,
+        ):
+            self.assertTrue(
+                gtk_app.TermDeckApplication.quit_preserving_sessions(app)
+            )
         self.assertIs(app._tmux_server_isolation, isolation)
+        app.quit.assert_called_once_with()
+
+    def test_non_main_child_quit_can_preserve_sessions_without_user_systemd(self) -> None:
+        backend = mock.Mock()
+        backend.ensure_server_lifecycle_isolated.return_value = SimpleNamespace(
+            ok=False, detail="user systemd is unavailable"
+        )
+        app = SimpleNamespace(
+            windows=[],
+            backend=backend,
+            quit=mock.Mock(),
+            _tmux_server_isolation=None,
+        )
+
+        with mock.patch(
+            "termdeck.gtk_app.process_exit_requires_tmux_isolation",
+            return_value=False,
+        ):
+            self.assertTrue(
+                gtk_app.TermDeckApplication.quit_preserving_sessions(app)
+            )
         app.quit.assert_called_once_with()
 
     def test_application_identity_is_stable_and_scoped_to_the_database(self) -> None:

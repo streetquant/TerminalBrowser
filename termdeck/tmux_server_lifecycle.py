@@ -235,6 +235,45 @@ def _process_cgroup(pid: int) -> str | None:
         return None
 
 
+def _unified_cgroup_path(cgroup: str | None) -> str | None:
+    if not cgroup:
+        return None
+    for line in cgroup.splitlines():
+        hierarchy, _controllers, path = line.split(":", 2)
+        if hierarchy == "0" and path:
+            return path.strip()
+    return None
+
+
+def _process_parent_pid(pid: int) -> int | None:
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError, UnicodeError):
+        return None
+    end = raw.rfind(")")
+    fields = raw[end + 2 :].split() if end >= 0 else []
+    try:
+        parent = int(fields[1])
+    except (IndexError, TypeError, ValueError):
+        return None
+    return parent if parent > 0 else None
+
+
+def _has_same_cgroup_ancestor(pid: int, cgroup_path: str) -> bool:
+    seen: set[int] = set()
+    current = int(pid)
+    while current > 1 and current not in seen:
+        seen.add(current)
+        parent = _process_parent_pid(current)
+        if parent is None or parent <= 1:
+            return False
+        parent_path = _unified_cgroup_path(_process_cgroup(parent))
+        if parent_path == cgroup_path:
+            return True
+        current = parent
+    return False
+
+
 def _unit_from_cgroup(cgroup: str | None) -> str | None:
     if not cgroup:
         return None
@@ -397,6 +436,46 @@ def _dedicated_unit_is_safe(unit: str | None, *, timeout: float) -> bool:
             unit,
         )
     return False
+
+
+def process_exit_requires_tmux_isolation(
+    *,
+    pid: int | None = None,
+    timeout: float = 0.5,
+) -> bool:
+    """Return whether this process exiting can stop a group-killing service.
+
+    A Gtk child inside a test runner or ordinary shell may exit without ending
+    the containing service.  A production GUI is the service ``MainPID``; when
+    that service uses ``KillMode=control-group`` or ``mixed``, its exit triggers
+    cleanup of every remaining process in the unit.  Exact systemd properties
+    are preferred.  If the user-manager bus is unavailable, a same-cgroup
+    ancestor proves this process is not the service root; absence of one is
+    treated conservatively as service ownership.
+    """
+
+    target = os.getpid() if pid is None else int(pid)
+    cgroup = _process_cgroup(target)
+    cgroup_path = _unified_cgroup_path(cgroup)
+    unit = _unit_from_cgroup(cgroup)
+    if not cgroup_path or not unit or not unit.endswith(".service"):
+        return False
+
+    properties = _unit_properties(unit, timeout=timeout)
+    if _properties_bind_unit(properties, unit):
+        try:
+            main_pid = int(properties.get("MainPID", "0"))
+        except (AttributeError, ValueError):
+            main_pid = 0
+        if main_pid > 0:
+            if main_pid != target:
+                return False
+            return properties.get("KillMode", "control-group") not in {
+                "process",
+                "none",
+            }
+
+    return not _has_same_cgroup_ancestor(target, cgroup_path)
 
 
 def isolate_existing_tmux_server(
