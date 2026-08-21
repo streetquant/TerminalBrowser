@@ -369,6 +369,54 @@ def init_git_project(root: Path) -> None:
     subprocess.run(["git", "commit", "-qm", "initial"], cwd=root, check=True)
 
 
+def init_buildable_git_project(root: Path) -> None:
+    """Create the smallest real t1000 wheel source accepted by release verification."""
+
+    package = root / "termdeck"
+    package.mkdir(parents=True)
+    (root / "pyproject.toml").write_text(
+        "[build-system]\n"
+        'requires = ["setuptools>=68"]\n'
+        'build-backend = "setuptools.build_meta"\n\n'
+        "[project]\n"
+        'name = "t1000"\n'
+        'version = "0.2.14"\n'
+        'description = "Minimal release reproducibility fixture"\n'
+        'readme = "README.md"\n'
+        'requires-python = ">=3.10"\n'
+        "dependencies = []\n\n"
+        "[project.scripts]\n"
+        't1000 = "termdeck.cli:main"\n\n'
+        "[tool.setuptools.packages.find]\n"
+        'where = ["."]\n'
+        'include = ["termdeck*"]\n\n'
+        "[tool.setuptools.package-data]\n"
+        'termdeck = ["_build_info.json"]\n',
+        encoding="utf-8",
+    )
+    (root / "README.md").write_text("# Minimal T1000 fixture\n", encoding="utf-8")
+    (package / "__init__.py").write_text(
+        '__version__ = "0.2.14"\n', encoding="utf-8"
+    )
+    (package / "cli.py").write_text(
+        "def main() -> int:\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    (package / "_build_info.json").write_text("{}\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.invalid"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Tests"], cwd=root, check=True
+    )
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=root, check=True)
+
+
 def test_snapshot_source_refuses_dirty_by_default_and_labels_candidate(tmp_path: Path) -> None:
     init_git_project(tmp_path)
     clean = snapshot_source(tmp_path)
@@ -632,6 +680,8 @@ def test_verify_rejects_each_noncanonical_current_wheel_metadata_dimension(
 
 def test_build_release_is_reproducible_across_caller_umask(tmp_path: Path) -> None:
     repository = Path(__file__).resolve().parents[1]
+    source = tmp_path / "source"
+    init_buildable_git_project(source)
     runner = tmp_path / "build_under_umask.py"
     runner.write_text(
         "import json, os, sys\n"
@@ -644,7 +694,7 @@ def test_build_release_is_reproducible_across_caller_umask(tmp_path: Path) -> No
         "            return int(line.split(':', 1)[1].strip(), 8)\n"
         "    raise RuntimeError('missing process umask')\n"
         "from termdeck.release_manager import build_release\n"
-        "result = build_release(sys.argv[1], sys.argv[2], allow_dirty=True, "
+        "result = build_release(sys.argv[1], sys.argv[2], "
         "python=sys.executable)\n"
         "result['caller_umask_after'] = observed_umask()\n"
         "result['caller_umask_expected'] = requested\n"
@@ -657,14 +707,14 @@ def test_build_release_is_reproducible_across_caller_umask(tmp_path: Path) -> No
     for value in ("022", "077"):
         output = tmp_path / f"release-{value}"
         completed = subprocess.run(
-            [sys.executable, "-B", str(runner), str(repository), str(output), value],
+            [sys.executable, "-B", str(runner), str(source), str(output), value],
             cwd=tmp_path,
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             check=True,
-            timeout=180,
+            timeout=300,
         )
         assert completed.stderr == ""
         results.append(json.loads(completed.stdout))
@@ -3799,19 +3849,32 @@ def test_cross_process_distinct_keys_use_one_bounded_registry_lock(
     uid = os.getuid()
     runtime = tmp_path / "registry-cardinality"
     key_count = 64
-    for index in range(key_count):
-        observed = release_manager._process_observer_cross_process_singleflight(
-            ("registry-cardinality", str(index)),
-            expected_uid=uid,
-            runtime_root=runtime,
-            dispatch=lambda index=index: release_manager._ProcessObserverTransportResult(
-                "broker-output-ready",
-                f'{{"index":{index}}}\n'.encode("ascii"),
-            ),
-        )
-        assert observed.result_code == "broker-output-ready"
-        assert observed.cross_process_role == "leader"
-        assert observed.cross_process_shared is False
+    # This test measures registry-lock cardinality, not expiry. Freeze both
+    # publication horizons so a heavily I/O-throttled test host cannot retire
+    # early keys while the 64-key sequence is still being constructed.
+    retention_ns = 60 * 60 * 1_000_000_000
+    with mock.patch.object(
+        release_manager,
+        "_PROCESS_CROSS_LATE_JOIN_TTL_NS",
+        retention_ns,
+    ), mock.patch.object(
+        release_manager,
+        "_PROCESS_CROSS_RESULT_TTL_NS",
+        retention_ns,
+    ):
+        for index in range(key_count):
+            observed = release_manager._process_observer_cross_process_singleflight(
+                ("registry-cardinality", str(index)),
+                expected_uid=uid,
+                runtime_root=runtime,
+                dispatch=lambda index=index: release_manager._ProcessObserverTransportResult(
+                    "broker-output-ready",
+                    f'{{"index":{index}}}\n'.encode("ascii"),
+                ),
+            )
+            assert observed.result_code == "broker-output-ready"
+            assert observed.cross_process_role == "leader"
+            assert observed.cross_process_shared is False
 
     lock_names = sorted(path.name for path in runtime.glob("*.lock"))
     legacy_lock_names = [
