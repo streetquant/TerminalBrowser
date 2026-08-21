@@ -199,6 +199,53 @@ class SessionStoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_reopen_clears_server_local_pane_ids_only_for_managed_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "sessions.sqlite3"
+            store = SessionStore(db)
+            try:
+                managed = store.create("managed", "ai", "codex", tmp)
+                adopted = store.create("adopted", "external", "bash", tmp)
+                store.conn.execute(
+                    "UPDATE sessions SET pane_target = ? WHERE id = ?",
+                    ("%161", managed.id),
+                )
+                store.update(adopted.id, external=True, pane_target="%9")
+                store.conn.commit()
+            finally:
+                store.close()
+
+            reopened = SessionStore(db)
+            try:
+                self.assertIsNone(reopened.get(managed.id).pane_target)  # type: ignore[union-attr]
+                self.assertEqual(reopened.get(adopted.id).pane_target, "%9")  # type: ignore[union-attr]
+                persisted = dict(
+                    reopened.conn.execute(
+                        "SELECT id, pane_target FROM sessions WHERE id IN (?, ?)",
+                        (managed.id, adopted.id),
+                    ).fetchall()
+                )
+                self.assertIsNone(persisted[managed.id])
+                self.assertEqual(persisted[adopted.id], "%9")
+
+                # A stale writer in the same server generation cannot appoint a
+                # durable managed pane ID through either the read or update path.
+                reopened.conn.execute(
+                    "UPDATE sessions SET pane_target = ? WHERE id = ?",
+                    ("%177", managed.id),
+                )
+                reopened.conn.commit()
+                self.assertIsNone(reopened.get(managed.id).pane_target)  # type: ignore[union-attr]
+                repaired = reopened.update(managed.id, pane_target="%178")
+                self.assertIsNone(repaired.pane_target)
+                raw_target = reopened.conn.execute(
+                    "SELECT pane_target FROM sessions WHERE id = ?",
+                    (managed.id,),
+                ).fetchone()[0]
+                self.assertIsNone(raw_target)
+            finally:
+                reopened.close()
+
     def test_window_restore_groups_visible_non_stopped_sessions_in_tab_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")

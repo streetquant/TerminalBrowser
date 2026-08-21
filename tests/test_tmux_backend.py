@@ -896,6 +896,80 @@ class TmuxBackendTests(unittest.TestCase):
         self.assertNotIn("dmtcp", run.call_args_list[0].args[0][-1].casefold())
         self.assertFalse(backend.checkpoints.available)
 
+    def test_recovery_pending_absolute_shell_without_recovery_state_restarts_fresh(self):
+        checkpoints = FakeCheckpointManager()
+        record = _record(command="/bin/bash", status="recovery-pending")
+        backend = TmuxBackend(executable="tmux", checkpoint_manager=checkpoints)
+        completed = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="", stderr=""
+        )
+
+        with mock.patch.object(
+            backend, "session_exists", return_value=False
+        ), mock.patch.object(backend, "_run", return_value=completed) as run:
+            backend.create_or_resume(record)
+
+        self.assertEqual(run.call_args_list[0].args[0][-1], "wrapped(/bin/bash)")
+        self.assertEqual(checkpoints.wrapped, [(record.id, "/bin/bash")])
+
+    def test_recovery_pending_unqualified_or_argument_shell_stays_closed(self):
+        checkpoints = FakeCheckpointManager()
+        backend = TmuxBackend(executable="tmux", checkpoint_manager=checkpoints)
+
+        for command in ("bash", "/bin/bash -l"):
+            record = _record(command=command, status="recovery-pending")
+            with self.subTest(command=command), mock.patch.object(
+                backend, "session_exists", return_value=False
+            ), self.assertRaisesRegex(
+                TmuxError,
+                "exact process recovery is unavailable",
+            ), mock.patch.object(backend, "_run") as run:
+                backend.create_or_resume(record)
+            run.assert_not_called()
+        self.assertEqual(checkpoints.wrapped, [])
+
+    def test_recovery_pending_impostor_absolute_shell_stays_closed(self):
+        checkpoints = FakeCheckpointManager()
+        backend = TmuxBackend(executable="tmux", checkpoint_manager=checkpoints)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            impostor = Path(tmp) / "bash"
+            impostor.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            impostor.chmod(0o755)
+            record = _record(command=str(impostor), status="recovery-pending")
+
+            with mock.patch.object(
+                backend, "session_exists", return_value=False
+            ), self.assertRaisesRegex(
+                TmuxError,
+                "exact process recovery is unavailable",
+            ), mock.patch.object(backend, "_run") as run:
+                backend.create_or_resume(record)
+
+        run.assert_not_called()
+        self.assertEqual(checkpoints.wrapped, [])
+
+    def test_recovery_pending_shell_with_nonexact_recovery_metadata_stays_closed(self):
+        checkpoints = FakeCheckpointManager()
+        record = _record(
+            command="/bin/bash",
+            recovery_command="codex --yolo",
+            recovery_cwd="/tmp",
+            status="recovery-pending",
+        )
+        backend = TmuxBackend(executable="tmux", checkpoint_manager=checkpoints)
+
+        with mock.patch.object(
+            backend, "session_exists", return_value=False
+        ), self.assertRaisesRegex(
+            TmuxError,
+            "exact process recovery is unavailable",
+        ), mock.patch.object(backend, "_run") as run:
+            backend.create_or_resume(record)
+
+        run.assert_not_called()
+        self.assertEqual(checkpoints.wrapped, [])
+
     def test_missing_process_tree_restores_checkpoint_without_command_replay(self):
         checkpoints = FakeCheckpointManager(restart_command="restart-image")
         record = _record(command="python worker.py", status="recovery-pending")
@@ -3660,6 +3734,52 @@ class TmuxBackendTests(unittest.TestCase):
         )
         backend = TmuxBackend(executable="tmux")
         self.assertEqual(backend.pane_target(record), "%7")
+
+    def test_managed_pane_target_ignores_stale_server_local_id(self):
+        record = _record(
+            id="td-managed",
+            name="managed",
+            tag="managed",
+            tmux_name="termdeck_managed",
+            pane_target="%161",
+            external=False,
+        )
+        backend = TmuxBackend(executable="tmux")
+
+        self.assertEqual(backend.pane_target(record), "termdeck_managed:0.0")
+
+    def test_managed_stale_pane_id_resolves_from_recreated_session(self):
+        managed = _record(
+            id="managed",
+            tmux_name="termdeck_managed",
+            pane_target="%161",
+            external=False,
+        )
+        adopted = _record(
+            id="adopted",
+            tmux_name="external_session",
+            pane_target="%9",
+            external=True,
+        )
+        backend = TmuxBackend(executable="tmux", pane_cache_ttl=60)
+        completed = subprocess.CompletedProcess(
+            args=["tmux"],
+            returncode=0,
+            stdout=(
+                "termdeck_managed\t0\t0\t%3\t111\t/tmp\t0\n"
+                "external_session\t1\t2\t%9\t222\t/tmp\t0\n"
+            ),
+            stderr="",
+        )
+
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which",
+            return_value="/usr/bin/tmux",
+        ), mock.patch.object(backend, "_run", return_value=completed) as run:
+            pids = backend.pane_pids([managed, adopted])
+
+        self.assertEqual(pids, {"managed": 111, "adopted": 222})
+        run.assert_called_once()
 
     def test_current_directory_reads_live_pane_path(self):
         import tempfile

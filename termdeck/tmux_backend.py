@@ -1693,10 +1693,23 @@ class TmuxBackend:
                 # command would create a different process state.
                 command = checkpoint_command
             elif recovery_pending:
-                raise TmuxError(
-                    "exact process recovery is unavailable; no Codex session UUID "
-                    "or validated process checkpoint was saved"
-                )
+                if self._recovery_pending_shell_can_start_fresh(
+                    record,
+                    original_command,
+                ):
+                    # A plain interactive shell has no conversation or process
+                    # state to impersonate.  Recreate only that proven shell in
+                    # its saved directory; agent launchers and rows carrying any
+                    # recovery metadata remain fail-closed below.
+                    command = self.checkpoints.wrap_launch_command(
+                        record,
+                        original_command,
+                    )
+                else:
+                    raise TmuxError(
+                        "exact process recovery is unavailable; no Codex session UUID "
+                        "or validated process checkpoint was saved"
+                    )
             else:
                 command = (
                     original_command
@@ -2261,8 +2274,20 @@ class TmuxBackend:
             return True
 
     def pane_target(self, record: SessionRecord) -> str:
+        """Return a stable target for managed rows and an adopted pane for external rows.
+
+        ``%pane_id`` values are scoped to one tmux server generation.  Persisted
+        managed rows survive server restarts, so replaying their old explicit ID
+        can address an unrelated pane or make a recreated live session look
+        missing.  Managed sessions are single-pane and are therefore addressed by
+        their durable session name; only adopted/external rows may retain a
+        server-local explicit pane target.
+        """
+
         explicit = getattr(record, "pane_target", None)
-        return explicit or f"{record.tmux_name}:0.0"
+        if bool(getattr(record, "external", False)) and explicit:
+            return explicit
+        return f"{record.tmux_name}:0.0"
 
     def current_directory(self, record: SessionRecord) -> str | None:
         """Return the active pane's live working directory when tmux can report it."""
@@ -4186,6 +4211,63 @@ class TmuxBackend:
             return self.apply_auth_change(record, plan, quiescence)
         finally:
             quiescence.release_lifetime_lease()
+
+    @classmethod
+    def _recovery_pending_shell_can_start_fresh(
+        cls,
+        record: SessionRecord,
+        command: str,
+    ) -> bool:
+        """Recognize the one recovery-pending state that is safe to recreate.
+
+        A single absolute executable naming a supported interactive shell has no
+        hidden conversation identity.  Any recovery command/directory, relative
+        lookup, argument, malformed quoting, or non-shell executable makes the
+        record ineligible so exact agent/checkpoint recovery remains fail-closed.
+        """
+
+        if (getattr(record, "recovery_command", None) or "").strip():
+            return False
+        if (getattr(record, "recovery_cwd", None) or "").strip():
+            return False
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            return False
+        if len(argv) != 1:
+            return False
+        shell_path = Path(argv[0])
+        if not shell_path.is_absolute():
+            return False
+        if shell_path.name.casefold().removeprefix("-") not in cls._SUPPORTED_IDLE_SHELLS:
+            return False
+        try:
+            resolved = shell_path.resolve(strict=True)
+            metadata = resolved.stat()
+            system_shell_owner = Path("/bin/sh").resolve(strict=True).stat().st_uid
+            configured_shells = {
+                Path(line).resolve(strict=True)
+                for line in Path("/etc/shells").read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                ).splitlines()
+                if line.strip().startswith("/")
+            }
+        except OSError:
+            return False
+        # Recovery may execute persisted data after a crash.  A user-writable
+        # impostor merely named ``bash`` is not a trusted system shell even when
+        # it is absolute and executable.  Compare ownership with the canonical
+        # system shell rather than numeric UID 0 so rootless validation
+        # namespaces (where root maps to overflow UID 65534) retain the same
+        # security decision as the host.
+        return (
+            resolved in configured_shells
+            and resolved.is_file()
+            and metadata.st_uid == system_shell_owner
+            and (metadata.st_mode & 0o022) == 0
+            and os.access(resolved, os.X_OK)
+        )
 
     @staticmethod
     def _is_codex_launch_command(command: str) -> bool:

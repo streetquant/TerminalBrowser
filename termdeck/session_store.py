@@ -178,6 +178,7 @@ class SessionStore:
         self._ensure_column("pending_account", "TEXT")
         self._ensure_column("auth_restart_required", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("auth_changed_at", "TEXT")
+        self._clear_managed_server_local_pane_targets()
         self._ensure_auth_scopes()
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_tag ON sessions(tag)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)")
@@ -201,6 +202,24 @@ class SessionStore:
         existing = {str(row[1]) for row in rows}
         if name not in existing:
             self.conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
+
+    def _clear_managed_server_local_pane_targets(self) -> int:
+        """Remove tmux-server-local pane IDs from durable managed records.
+
+        Explicit ``%pane`` targets are valid for adopted external sessions, but
+        tmux allocates new IDs after a server restart.  Managed rows are addressed
+        by their stable session name and must never carry an old generation's ID.
+        The migration is idempotent and intentionally leaves external rows intact.
+        """
+
+        cursor = self.conn.execute(
+            """
+            UPDATE sessions
+            SET pane_target = NULL
+            WHERE external = 0 AND pane_target IS NOT NULL
+            """
+        )
+        return max(0, int(cursor.rowcount))
 
     def _bootstrap_remembered_windows(self) -> int:
         """Add only currently open legacy windows to the independent registry.
@@ -401,6 +420,8 @@ class SessionStore:
                 record.codex_home,
                 account_source=self._account_source_override,
             )
+        if not bool(getattr(record, "external", False)) and record.pane_target is not None:
+            record = replace(record, pane_target=None)
         payload = dict(record.__dict__)
         payload["visible"] = 1 if record.visible else 0
         payload["pinned"] = 1 if getattr(record, "pinned", False) else 0
@@ -486,6 +507,8 @@ class SessionStore:
             data["pinned"] = bool(data["pinned"])
         if "external" in data:
             data["external"] = bool(data["external"])
+        if not bool(data.get("external", False)):
+            data["pane_target"] = None
         if "auth_restart_required" in data:
             data["auth_restart_required"] = bool(data["auth_restart_required"])
         updated = SessionRecord(**data)
@@ -841,7 +864,7 @@ class SessionStore:
             tab_index=int(row["tab_index"]),
             visible=bool(row["visible"]),
             pinned=bool(row["pinned"]),
-            pane_target=row["pane_target"],
+            pane_target=row["pane_target"] if bool(row["external"]) else None,
             external=bool(row["external"]),
             recovery_command=row["recovery_command"],
             recovery_cwd=row["recovery_cwd"],
