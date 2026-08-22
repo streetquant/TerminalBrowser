@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import tty
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -36,8 +37,14 @@ from .codex_auth import CodexAuthError, CodexAuthManager, CodexAuthState, CodexS
 from .command_palette import PaletteItem, build_palette_items, search_palette
 from .control_plan import ControlPlan, build_control_plan, render_control_plan_text
 from .frame_budget import FrameBudgetMonitor, hud_enabled, install_glib_probe
+from .gateway_models import (
+    GatewayModelStatus,
+    gateway_model_status as classify_gateway_model_status,
+    process_start_epoch,
+    record_uses_gateway_models,
+)
 from .health import HealthPolicy, classify_session, health_badge, should_pause_for_attention
-from .history_control import ScrollOutcome, unhandled_scroll
+from .history_control import ScrollDisposition, ScrollOutcome, unhandled_scroll
 from .liveness import merge_confirmed_pane_snapshot
 from .master_tasks import filter_rows
 from .models import SessionRecord, TerminalTheme
@@ -47,6 +54,11 @@ from .resources import ResourceSampler
 from .session_lifecycle import archive_records, hide_records, move_records, pin_records, recently_closed_records, rename_record, reopen_closed_records, unpin_records
 from .session_reconcile import reconcile_store
 from .session_search import search_sessions
+from .session_recipe import (
+    SessionRecipeError,
+    automatic_recovery_allowed,
+    recipe_from_record,
+)
 from .session_store import DEFAULT_DB_PATH, SessionStore, short_id, utc_now
 from .settings import AppSettings, SettingsError, save_terminal_options
 from .shortcuts import build_shortcut_map, index_from_key_name, shortcut_entries
@@ -100,6 +112,14 @@ _MAX_STREAM_OUTPUT_BUFFER_BYTES = 16 * 1024 * 1024
 _INPUT_REJECTED_MESSAGE = (
     b"\r\n\x1b[1;31m[T1000 input buffer full; this payload was not sent]\x1b[0m\r\n"
 )
+# Scrollbar drags can generate dozens of deltas. Two workers are enough to hide
+# tmux round-trip latency while a finite admission bound prevents a large tab
+# fleet from turning one drag into an unbounded executor queue.
+_HISTORY_SCROLL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="termdeck-history",
+)
+_HISTORY_SCROLL_ADMISSION = threading.BoundedSemaphore(value=8)
 
 
 def _usable_glib_source_id(source_id) -> bool:
@@ -286,6 +306,14 @@ def _show_in_sessions_pane(record: SessionRecord) -> bool:
     return bool(record.visible) and record.status.casefold() not in SIDE_PANE_HIDDEN_STATUSES
 
 
+def _install_notebook_end_action(notebook: Gtk.Notebook, widget: Gtk.Widget) -> None:
+    """Install a permanent tab-strip action outside notebook overflow."""
+
+    widget.set_no_show_all(False)
+    notebook.set_action_widget(widget, Gtk.PackType.END)
+    widget.show_all()
+
+
 # ---------------------------------------------------------------------------
 # Modifier-only key guard
 # ---------------------------------------------------------------------------
@@ -442,6 +470,7 @@ class AttachTerminal(Gtk.Box):
         selection_history_handler=None,
         attach_exit_handler=None,
         attach_stable_handler=None,
+        pane_dead_handler=None,
         scrollback_extent: int | None = None,
         font_override: str | None = None,
         child_environment: dict[str, str] | None = None,
@@ -482,6 +511,7 @@ class AttachTerminal(Gtk.Box):
         self._selection_history_handler = selection_history_handler
         self._attach_exit_handler = attach_exit_handler
         self._attach_stable_handler = attach_stable_handler
+        self._pane_dead_handler = pane_dead_handler
         # A GUI-owned missing tmux target is created only after VTE has a
         # settled allocation. This prevents full-screen TUIs such as Codex from
         # drawing their first splash at tmux's implicit 80x24 and then being
@@ -528,17 +558,42 @@ class AttachTerminal(Gtk.Box):
         self.terminal.set_margin_bottom(4)
         apply_theme(self.terminal, theme, font_override=font_override)
         self.terminal.set_scrollback_lines(self._scrollback_extent)
-        # Control-mode rendering: the pane stream feeds decoded pane bytes
-        # straight into VTE, so VTE's native scrollback is the single history
-        # owner. The persistent scrollbar binds directly to VTE's own
-        # adjustment — no proxy adjustment and no backend history worker.
+        # Normal terminal review and VTE text selection have different history
+        # owners.  The persistent scrollbar represents the application-aware
+        # tmux/Codex history controller; VTE's native adjustment is retained
+        # separately and is bound to the bar only while a real VTE selection is
+        # active.  Keeping the two coordinate systems distinct prevents both
+        # deep-drag blanking and false "live edge" detection.
         self.terminal_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         self.terminal_row.set_hexpand(True)
         self.terminal_row.set_vexpand(True)
         self.native_adjustment = self.terminal.get_vadjustment()
+        extent = float(max(100, int(scrollback_extent or theme.scrollback_lines)))
+        page_size = min(24.0, max(1.0, extent - 1.0))
+        self.history_adjustment = Gtk.Adjustment.new(
+            extent,
+            0.0,
+            extent + page_size,
+            3.0,
+            page_size,
+            page_size,
+        )
+        self._history_scrollbar_syncing = False
+        self._last_history_scrollbar_value = float(self.history_adjustment.get_value())
+        self._history_drag_last_requested = self._last_history_scrollbar_value
+        self._scrollbar_native_bound = False
+        self._history_request_lock = threading.Lock()
+        self._history_scroll_generation = 0
+        self._history_scroll_sequence = 0
+        self._history_last_applied_sequence = 0
+        self._pending_history_delta = 0
+        self._history_worker_active = False
+        self._history_worker_generation: int | None = None
+        self._pending_history_apply = None
+        self._history_apply_scheduled = False
         self.scrollbar = Gtk.Scrollbar.new(
             Gtk.Orientation.VERTICAL,
-            adjustment=self.native_adjustment,
+            adjustment=self.history_adjustment,
         )
         _style(self.scrollbar, "td-terminal-scrollbar")
         self.scrollbar.get_style_context().remove_class("overlay-indicator")
@@ -546,11 +601,15 @@ class AttachTerminal(Gtk.Box):
         self.scrollbar.set_hexpand(False)
         self.scrollbar.set_vexpand(True)
         self.scrollbar.set_opacity(1.0)
-        # With VTE as the real emulator, stock wheel handling (including the
-        # arrow-key fallback inside alternate-screen apps) is the desired
-        # behaviour of a modern terminal.
+        self.history_adjustment.connect(
+            "value-changed",
+            self._on_history_scrollbar_value_changed,
+        )
+        # Do not let VTE synthesize Up/Down fallback keys for an application
+        # history gesture. Alternate-screen applications that negotiate mouse
+        # reporting still receive their own wheel protocol through VTE.
         try:
-            self.terminal.set_enable_fallback_scrolling(True)
+            self.terminal.set_enable_fallback_scrolling(False)
         except Exception:
             pass
         self.terminal.set_scroll_on_output(False)
@@ -563,6 +622,7 @@ class AttachTerminal(Gtk.Box):
             selection_history_handler=selection_history_handler,
             attach_exit_handler=attach_exit_handler,
             attach_stable_handler=attach_stable_handler,
+            pane_dead_handler=pane_dead_handler,
         )
         # Select-to-copy: run *after* VTE handles the release so the selection exists.
         self.terminal.connect_after("button-release-event", self._on_button_release)
@@ -598,6 +658,7 @@ class AttachTerminal(Gtk.Box):
         selection_history_handler=None,
         attach_exit_handler=None,
         attach_stable_handler=None,
+        pane_dead_handler=None,
     ) -> None:
         """Retarget window-owned callbacks when this live widget is reparented."""
 
@@ -618,6 +679,8 @@ class AttachTerminal(Gtk.Box):
         self._selection_history_handler = selection_history_handler
         self._attach_exit_handler = attach_exit_handler
         self._attach_stable_handler = attach_stable_handler
+        if pane_dead_handler is not None:
+            self._pane_dead_handler = pane_dead_handler
 
     def apply_window_theme(self, theme: TerminalTheme, *, font_override: str) -> None:
         self.theme = theme
@@ -1060,6 +1123,15 @@ class AttachTerminal(Gtk.Box):
     def _apply_pane_dead(self, generation: int) -> bool:
         if generation != self._stream_generation or self._detached:
             return False
+        handler = getattr(self, "_pane_dead_handler", None)
+        if callable(handler):
+            try:
+                if handler():
+                    return False
+            except Exception:
+                # Recovery is best effort; retain truthful terminal-exit output
+                # when the owning window cannot schedule a replacement.
+                pass
         try:
             self.terminal.feed(b"\r\n\x1b[2m[process exited]\x1b[0m\r\n")
         except Exception:
@@ -1150,6 +1222,18 @@ class AttachTerminal(Gtk.Box):
             self._stream_recovery_scheduled = False
         self._input_rejection_reported = False
 
+    def defer_attach_for_target_replacement(self) -> bool:
+        """Atomically retire the old stream before its tmux target is replaced."""
+
+        if self._detached or self._terminally_stopped:
+            return False
+        if self._attach_restart_deferred:
+            return True
+        self._attach_restart_deferred = True
+        self._cancel_pending_connect()
+        self._teardown_stream()
+        return True
+
     def resolve_deferred_attach(self) -> bool:
         """Classify and resume one pane stream paused for an auth transition."""
 
@@ -1202,6 +1286,7 @@ class AttachTerminal(Gtk.Box):
         if self._detached:
             return
         self._detached = True
+        self._cancel_async_history_scroll()
         self._cancel_pending_connect()
         self._cleanup_clipboard_images()
         self._teardown_stream()
@@ -1227,6 +1312,13 @@ class AttachTerminal(Gtk.Box):
         """Paste PRIMARY selection into the shell as input (middle-click)."""
         self._paste_from_selection(Gdk.SELECTION_PRIMARY, prefer_last=True)
 
+    def _history_bottom_value(self) -> float:
+        adjustment = self.history_adjustment
+        return max(
+            float(adjustment.get_lower()),
+            float(adjustment.get_upper()) - float(adjustment.get_page_size()),
+        )
+
     def _native_bottom_value(self) -> float:
         adjustment = self.native_adjustment
         return max(
@@ -1234,8 +1326,67 @@ class AttachTerminal(Gtk.Box):
             float(adjustment.get_upper()) - float(adjustment.get_page_size()),
         )
 
+    def _bind_scrollbar_for_selection(self, active: bool) -> None:
+        """Expose VTE's adjustment only while a real VTE selection owns review."""
+
+        active = bool(active)
+        if active == self._scrollbar_native_bound:
+            return
+        try:
+            self.scrollbar.set_adjustment(
+                self.native_adjustment if active else self.history_adjustment
+            )
+        except Exception:
+            return
+        self._scrollbar_native_bound = active
+
+    def _set_history_scrollbar_value(self, value: float) -> None:
+        adjustment = self.history_adjustment
+        lower = float(adjustment.get_lower())
+        upper = self._history_bottom_value()
+        self._history_scrollbar_syncing = True
+        try:
+            adjustment.set_value(min(upper, max(lower, float(value))))
+            self._last_history_scrollbar_value = float(adjustment.get_value())
+            self._history_drag_last_requested = self._last_history_scrollbar_value
+        finally:
+            self._history_scrollbar_syncing = False
+
+    def _set_history_depth(self, depth: int, *, extent: int | None = None) -> None:
+        """Synchronize the proxy from backend/logical history depth evidence."""
+
+        clean_depth = max(0, int(depth))
+        adjustment = self.history_adjustment
+        page = max(1.0, float(adjustment.get_page_size()))
+        current_extent = max(0.0, float(adjustment.get_upper()) - page)
+        target_extent = max(
+            current_extent,
+            float(clean_depth),
+            float(max(0, int(extent))) if extent is not None else 0.0,
+        )
+        self._history_scrollbar_syncing = True
+        try:
+            if abs(target_extent - current_extent) > 0.5:
+                adjustment.set_upper(target_extent + page)
+            bottom = max(
+                float(adjustment.get_lower()),
+                float(adjustment.get_upper()) - float(adjustment.get_page_size()),
+            )
+            adjustment.set_value(
+                min(bottom, max(float(adjustment.get_lower()), bottom - clean_depth))
+            )
+            self._last_history_scrollbar_value = float(adjustment.get_value())
+            self._history_drag_last_requested = self._last_history_scrollbar_value
+        finally:
+            self._history_scrollbar_syncing = False
+
+    def _sync_history_from_outcome(self, outcome: ScrollOutcome) -> None:
+        if outcome.depth is None:
+            return
+        self._set_history_depth(outcome.depth, extent=outcome.extent)
+
     def _move_native_history(self, lines: int) -> None:
-        """Move VTE's retained normal-screen buffer by whole rows."""
+        """Move only VTE's retained normal-screen buffer for selection review."""
 
         adjustment = self.native_adjustment
         try:
@@ -1252,17 +1403,223 @@ class AttachTerminal(Gtk.Box):
             return
 
     def reset_scrollbar(self) -> None:
-        """Return the scrollbar to the live endpoint of VTE's history."""
+        """Reset the application-aware history proxy to its live endpoint."""
 
-        self.scroll_to_bottom()
+        self._set_history_depth(0)
 
     def scroll_to_bottom(self) -> None:
-        """Return VTE's viewport to live output."""
+        """Return both application history and VTE's viewport to live output."""
 
+        self.reset_scrollbar()
         try:
             self.native_adjustment.set_value(self._native_bottom_value())
         except Exception:
             pass
+
+    def _cancel_async_history_scroll(self) -> None:
+        """Invalidate queued/in-flight thumb work without killing backend commands."""
+
+        with self._history_request_lock:
+            self._history_scroll_generation += 1
+            self._pending_history_delta = 0
+            self._pending_history_apply = None
+            # An already-running worker remains marked active until it observes
+            # generation drift. This prevents a second worker from racing the
+            # same widget while the old backend call is still returning.
+            self._history_drag_last_requested = self._last_history_scrollbar_value
+
+    def _queue_history_scroll_delta(self, delta: int) -> None:
+        """Coalesce one thumb movement and keep tmux I/O off the GTK thread."""
+
+        clean_delta = int(delta)
+        if not clean_delta or self._detached:
+            return
+        admitted = False
+        with self._history_request_lock:
+            self._pending_history_delta += clean_delta
+            generation = self._history_scroll_generation
+            if self._history_worker_active:
+                return
+            admitted = _HISTORY_SCROLL_ADMISSION.acquire(blocking=False)
+            if admitted:
+                self._history_worker_active = True
+                self._history_worker_generation = generation
+            else:
+                # Fail fast under global storage pressure. The proxy is restored
+                # to its last applied value on GTK rather than growing an
+                # unbounded executor queue.
+                self._pending_history_delta = 0
+                self._history_drag_last_requested = self._last_history_scrollbar_value
+        if not admitted:
+            _schedule_glib_callback(self._restore_history_proxy_after_failed_drag)
+            return
+        try:
+            _HISTORY_SCROLL_EXECUTOR.submit(
+                self._history_scroll_worker,
+                generation,
+            )
+        except RuntimeError:
+            _HISTORY_SCROLL_ADMISSION.release()
+            with self._history_request_lock:
+                if self._history_worker_generation == generation:
+                    self._history_worker_active = False
+                    self._history_worker_generation = None
+                self._pending_history_delta = 0
+            _schedule_glib_callback(self._restore_history_proxy_after_failed_drag)
+
+    def _restore_history_proxy_after_failed_drag(self) -> bool:
+        self._set_history_scrollbar_value(self._last_history_scrollbar_value)
+        return False
+
+    def _publish_async_history_scroll_outcome(
+        self,
+        generation: int,
+        sequence: int,
+        attempted_delta: int,
+        outcome,
+    ) -> None:
+        """Keep at most one pending GTK completion per terminal widget."""
+
+        schedule = False
+        with self._history_request_lock:
+            if generation != self._history_scroll_generation or self._detached:
+                return
+            self._pending_history_apply = (
+                generation,
+                sequence,
+                attempted_delta,
+                outcome,
+            )
+            if not self._history_apply_scheduled:
+                self._history_apply_scheduled = True
+                schedule = True
+        if schedule:
+            _schedule_glib_callback(self._drain_async_history_scroll_outcome)
+
+    def _drain_async_history_scroll_outcome(self) -> bool:
+        with self._history_request_lock:
+            pending = self._pending_history_apply
+            self._pending_history_apply = None
+            self._history_apply_scheduled = False
+        if pending is None:
+            return False
+        generation, sequence, attempted_delta, outcome = pending
+        return self._apply_async_history_scroll_outcome(
+            generation,
+            sequence,
+            attempted_delta,
+            outcome,
+        )
+
+    def _history_scroll_worker(self, generation: int) -> None:
+        """Serialize one admitted widget's coalesced backend navigation burst."""
+
+        try:
+            while True:
+                with self._history_request_lock:
+                    if self._detached:
+                        self._history_worker_active = False
+                        self._history_worker_generation = None
+                        return
+                    if generation != self._history_scroll_generation:
+                        # Reuse the same admitted worker chain for the newest
+                        # generation instead of queuing a replacement future.
+                        generation = self._history_scroll_generation
+                        self._history_worker_generation = generation
+                    delta = int(self._pending_history_delta)
+                    self._pending_history_delta = 0
+                    if not delta:
+                        self._history_worker_active = False
+                        self._history_worker_generation = None
+                        return
+                    self._history_scroll_sequence += 1
+                    sequence = self._history_scroll_sequence
+
+                handler = getattr(self, "_scroll_handler", None)
+                if not callable(handler):
+                    outcome = None
+                else:
+                    try:
+                        outcome = handler(delta)
+                    except Exception:
+                        outcome = None
+
+                with self._history_request_lock:
+                    stale = generation != self._history_scroll_generation or self._detached
+                    terminal_outcome = (
+                        not isinstance(outcome, ScrollOutcome)
+                        or outcome.disposition is not ScrollDisposition.HANDLED
+                        or outcome.reached_live_edge
+                    )
+                    if stale:
+                        # Do not publish old-generation UI state. Loop once more
+                        # so this same admitted worker can absorb any new delta.
+                        continue
+                    if terminal_outcome:
+                        self._pending_history_delta = 0
+                        self._history_worker_active = False
+                        self._history_worker_generation = None
+
+                self._publish_async_history_scroll_outcome(
+                    generation,
+                    sequence,
+                    delta,
+                    outcome,
+                )
+                if terminal_outcome:
+                    return
+        finally:
+            _HISTORY_SCROLL_ADMISSION.release()
+
+    def _apply_async_history_scroll_outcome(
+        self,
+        generation: int,
+        sequence: int,
+        attempted_delta: int,
+        outcome,
+    ) -> bool:
+        """Apply a worker result only if it still belongs to this live widget."""
+
+        with self._history_request_lock:
+            if generation != self._history_scroll_generation or self._detached:
+                return False
+            if sequence <= self._history_last_applied_sequence:
+                return False
+            self._history_last_applied_sequence = sequence
+        if not isinstance(outcome, ScrollOutcome):
+            self._set_history_scrollbar_value(self._last_history_scrollbar_value)
+            return False
+        if outcome.disposition is ScrollDisposition.PASSTHROUGH:
+            # A physical wheel can be passed to a TUI; a scrollbar thumb cannot.
+            # Revert the proxy without synthesizing child input.
+            self._set_history_scrollbar_value(self._last_history_scrollbar_value)
+            if self._history_cursor_hidden:
+                self._set_history_cursor_hidden(False)
+            return False
+        if outcome.disposition is not ScrollDisposition.HANDLED:
+            if outcome.reached_live_edge:
+                self._set_history_depth(0)
+            else:
+                self._set_history_scrollbar_value(self._last_history_scrollbar_value)
+            return False
+        self._sync_history_from_outcome(outcome)
+        if outcome.reached_live_edge:
+            self.prepare_for_live_input()
+            return False
+        self._set_history_cursor_hidden(True)
+        self._arm_scroll_idle_resume()
+        return False
+
+    def _on_history_scrollbar_value_changed(self, adjustment) -> None:
+        if self._history_scrollbar_syncing or self._scrollbar_native_bound:
+            return
+        requested = float(adjustment.get_value())
+        previous_requested = float(self._history_drag_last_requested)
+        delta = int(round(requested - previous_requested))
+        self._history_drag_last_requested = requested
+        if not delta:
+            return
+        self._queue_history_scroll_delta(delta)
 
     def _feed_text(self, text: str) -> bool:
         """Paste text through VTE so bracketed-paste mode can prevent submit."""
@@ -1669,6 +2026,20 @@ class AttachTerminal(Gtk.Box):
             self._selection_pending = bool(self.terminal.get_has_selection())
         except Exception:
             self._selection_pending = False
+        # While VTE owns a real selection, expose exactly the native VTE
+        # adjustment so wheel/drag extension keeps one continuous selection.
+        # Invalidate queued/in-flight thumb results before rebinding: a backend
+        # command already inside tmux may finish, but no stale completion or
+        # follow-up navigation is allowed to mutate the new selection surface.
+        # Clearing the selection atomically rebinds the persistent bar to the
+        # application-aware tmux/Codex history proxy.
+        if self._selection_pending:
+            cancel = getattr(self, "_cancel_async_history_scroll", None)
+            if callable(cancel):
+                cancel()
+        bind_scrollbar = getattr(self, "_bind_scrollbar_for_selection", None)
+        if callable(bind_scrollbar):
+            bind_scrollbar(self._selection_pending)
         if self._selection_pending:
             self._queue_selection_copy(delay_ms=120)
 
@@ -1858,9 +2229,19 @@ class AttachTerminal(Gtk.Box):
     def _on_button_press(self, _terminal, event: Gdk.EventButton) -> bool:
         button = int(getattr(event, "button", 0) or 0)
         if button == 1:
-            # Let VTE see the complete press/drag/release gesture. Live
-            # viewport restoration happens on release only when no selection
-            # was created, so ordinary drag-to-copy is preserved.
+            # A backend history redraw that is already in flight cannot be
+            # cancelled at the tmux boundary. Do not let VTE establish a new
+            # selection underneath that redraw: invalidate pending UI work and
+            # consume this one press. The next press is accepted after the
+            # worker has observed the generation change and retired.
+            if bool(getattr(self, "_history_worker_active", False)):
+                cancel = getattr(self, "_cancel_async_history_scroll", None)
+                if callable(cancel):
+                    cancel()
+                return True
+            # Otherwise let VTE see the complete press/drag/release gesture.
+            # Live viewport restoration happens on release only when no
+            # selection was created, so ordinary drag-to-copy is preserved.
             return False
         # Middle-click paste from PRIMARY / last selection (classic terminal).
         if button == 2:
@@ -1872,13 +2253,12 @@ class AttachTerminal(Gtk.Box):
         return False
 
     def _on_terminal_scroll(self, terminal, event: Gdk.EventScroll) -> bool:
-        """Keep a held selection coherent while the wheel moves history.
+        """Route wheel input through exactly one canonical history owner.
 
-        With control-mode rendering VTE owns the one real scrollback buffer,
-        so plain wheel input uses VTE's stock handler, including negotiated
-        alternate-screen mouse protocols. Only an active text selection needs
-        help: its payload is snapshotted and a held drag is extended through
-        the scroll so redraws cannot destroy the selected range.
+        Normal review belongs to tmux/Codex and never consults VTE's viewport
+        for the live-edge decision.  A real VTE text selection is the sole
+        exception: it remains inside the retained VTE buffer so redraws cannot
+        destroy the selected range.
         """
 
         direction = getattr(event, "direction", None)
@@ -1888,36 +2268,74 @@ class AttachTerminal(Gtk.Box):
             Gdk.ScrollDirection.SMOOTH,
         }:
             return False
-        try:
-            has_selection = bool(self.terminal.get_has_selection())
-        except Exception:
-            has_selection = False
-        if not has_selection:
-            # No selection: VTE's default wheel handling is the stock,
-            # correct terminal behaviour.
-            return False
         if direction == Gdk.ScrollDirection.UP:
             delta = -3.0
         elif direction == Gdk.ScrollDirection.DOWN:
             delta = 3.0
         else:
+            # Match discrete wheel sensitivity while preserving smooth-event
+            # direction and sub-step accumulation semantics.
             delta = 3.0 * float(getattr(event, "delta_y", 0.0) or 0.0)
         line_delta = int(round(delta))
         if not line_delta and delta:
             line_delta = -1 if delta < 0 else 1
         if not line_delta:
             return True
-        self._snapshot_selection_before_history_scroll()
-        if self._native_scrollback_available():
-            if self._continue_selection_through_native_scroll(event, line_delta):
+
+        try:
+            has_selection = bool(self.terminal.get_has_selection())
+        except Exception:
+            has_selection = False
+        if has_selection:
+            bind_scrollbar = getattr(self, "_bind_scrollbar_for_selection", None)
+            if callable(bind_scrollbar):
+                bind_scrollbar(True)
+            self._snapshot_selection_before_history_scroll()
+            if self._native_scrollback_available():
+                if self._continue_selection_through_native_scroll(
+                    event, line_delta
+                ):
+                    return True
+                # Fallback scrolling is disabled globally so a non-selection
+                # wheel can never become synthetic Up/Down input in Codex or
+                # another TUI. Move the VTE adjustment explicitly here instead
+                # of relying on VTE's default wheel handler. A completed VTE
+                # selection remains anchored to buffer coordinates while the
+                # viewport moves, so this preserves the highlighted payload and
+                # never redraws tmux/Codex history.
+                self._move_native_history(line_delta)
                 return True
-            # A completed VTE selection remains anchored to buffer coordinates
-            # while the viewport moves, so moving the adjustment directly
-            # preserves the highlighted payload.
-            self._move_native_history(line_delta)
+            # In degraded VTE history, preserving the selection is safer than
+            # switching surfaces or redrawing an unrelated history owner.
             return True
-        # In degraded VTE history, preserving the selection is safer than
-        # letting a redraw destroy the highlighted payload.
+
+        bind_scrollbar = getattr(self, "_bind_scrollbar_for_selection", None)
+        if callable(bind_scrollbar):
+            bind_scrollbar(False)
+        handler = getattr(self, "_scroll_handler", None)
+        if not callable(handler):
+            return True
+        try:
+            outcome = handler(line_delta)
+        except Exception:
+            return True
+        if not isinstance(outcome, ScrollOutcome):
+            return True
+        if outcome.disposition is ScrollDisposition.PASSTHROUGH:
+            if self._history_cursor_hidden:
+                self._set_history_cursor_hidden(False)
+            return False
+        if outcome.disposition is not ScrollDisposition.HANDLED:
+            # Unknown backend state is not permission to navigate VTE's
+            # incidental redraw history. Consume the event and stay put.
+            return True
+
+        self._sync_history_from_outcome(outcome)
+        if outcome.reached_live_edge:
+            self.prepare_for_live_input()
+        else:
+            self._set_history_cursor_hidden(True)
+            self._arm_scroll_idle_resume()
         return True
 
     # ------------------------------------------------------------------ #
@@ -1966,12 +2384,13 @@ class AttachTerminal(Gtk.Box):
             # unsafe. Latch setup priority, but refuse input until a controller
             # owns the target; the next key can then be queued or delivered.
             return False
-        # The user is looking at this tab: jump the shared setup queue so a
-        # freshly started instance connects visible terminals first.
         try:
             controller.prioritize_setup()
         except Exception:
             pass
+        cancel_history = getattr(self, "_cancel_async_history_scroll", None)
+        if callable(cancel_history):
+            cancel_history()
         handler = self._live_focus_handler
         if callable(handler):
             try:
@@ -1979,11 +2398,17 @@ class AttachTerminal(Gtk.Box):
             except Exception:
                 return False
             if restored is False:
-                # A failed/unknown backend restore is not permission to
-                # deliver input into a possibly-open transcript.
+                # A failed/unknown backend restore is not permission to reset
+                # the proxy or deliver input into a possibly-open transcript.
                 return False
+        bind_scrollbar = getattr(self, "_bind_scrollbar_for_selection", None)
+        if callable(bind_scrollbar):
+            bind_scrollbar(False)
         self.scroll_to_bottom()
         self._set_history_cursor_hidden(False)
+        request_geometry_sync = getattr(self, "request_geometry_sync", None)
+        if callable(request_geometry_sync):
+            request_geometry_sync(delay_ms=0)
         return True
 
     def _on_button_release(self, _terminal, event: Gdk.EventButton) -> bool:
@@ -4324,6 +4749,17 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self._auth_environment_ready: dict[str, bool] = {}
         self._auth_completion_recovery_lock = threading.Lock()
         self._auth_completion_recoveries: list[tuple[object, ...]] = []
+        # Payload replacement is distinct from account-pointer state. It covers
+        # exact gateway-model refreshes and automatic dead-pane recovery while
+        # sharing the same no-loss attach protection contract.
+        self._payload_restart_generation: dict[str, int] = {}
+        self._payload_restart_inflight: set[str] = set()
+        self._payload_restart_backoff_until: dict[str, float] = {}
+        self._payload_restart_completion_lock = threading.Lock()
+        self._payload_restart_completions: list[tuple[object, ...]] = []
+        self._gateway_model_probe_session_id: str | None = None
+        self._gateway_model_probe_at = 0.0
+        self._gateway_model_status: GatewayModelStatus | None = None
         self._missing_session_replacements: set[str] = set()
         # A durable row can be visible in the side pane before its VTE client
         # is materialized (for example when one AttachTerminal construction
@@ -4413,6 +4849,24 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self._auth_combo = auth_combo
         header.pack_end(auth_combo)
 
+        gateway_models = _icon_button(
+            "Refresh models",
+            "view-refresh-symbolic",
+            "Gateway model inventory is not used by this tab",
+            self._on_gateway_models_refresh,
+            suggested=False,
+            show_label=False,
+        )
+        _style(gateway_models, "td-gateway-models", "td-header-icon")
+        gateway_models.set_valign(Gtk.Align.CENTER)
+        # Parent show_all must not reveal this control on ordinary shells or
+        # Codex tabs. _refresh_gateway_model_control owns its visibility.
+        gateway_models.set_no_show_all(True)
+        gateway_models.set_sensitive(False)
+        gateway_models.hide()
+        self._gateway_models_button = gateway_models
+        header.pack_end(gateway_models)
+
         overflow_header_actions = [
             ("Rename window", self.rename_window),
             ("New T1000 window", self.new_window),
@@ -4454,10 +4908,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.notebook.set_scrollable(True)
         self.notebook.connect("page-reordered", self._on_page_reordered)
         self.notebook.connect("switch-page", self._on_notebook_switch_page)
-        # Browser-style new-tab button floating just after the last tab
-        # (like Chrome/Firefox). It lives in the chrome overlay and is
-        # re-anchored on every strip re-layout; the headerbar + still
-        # covers the zero-tab state.
+        # GtkNotebook owns this end action independently of its scrollable tab
+        # pages. It therefore remains visible when the strip overflows, unlike
+        # the previous floating overlay that deliberately hid itself once the
+        # last tab scrolled out of view.
         strip_new_tab = _icon_button(
             "New tab",
             "list-add-symbolic",
@@ -4467,18 +4921,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             show_label=False,
         )
         _style(strip_new_tab, "td-new-tab", "td-tabstrip-new")
-        strip_new_tab.set_halign(Gtk.Align.START)
-        strip_new_tab.set_valign(Gtk.Align.START)
-        strip_new_tab.show_all()
-        strip_new_tab.set_no_show_all(True)
+        strip_new_tab.set_valign(Gtk.Align.CENTER)
         self._strip_new_tab = strip_new_tab
-        self._strip_new_tab_idle = 0
-        self.notebook.connect("size-allocate", lambda *_a: self._queue_strip_new_tab_position())
+        _install_notebook_end_action(self.notebook, strip_new_tab)
         self.notebook.connect("size-allocate", self._on_terminal_layout_size_allocate)
-        self.notebook.connect("map", lambda *_a: self._queue_strip_new_tab_position())
-        self.notebook.connect("page-added", lambda *_a: self._queue_strip_new_tab_position())
-        self.notebook.connect("page-removed", lambda *_a: self._queue_strip_new_tab_position())
-        self.notebook.connect("page-reordered", lambda *_a: self._queue_strip_new_tab_position())
         self.side = SidePane(self)
         self.side_position = app_context.settings.side_pane_position
         self._pack_side_pane()
@@ -4489,7 +4935,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         root.set_vexpand(True)
         root.add(self.paned)
         self._chrome_root = root
-        root.add_overlay(strip_new_tab)
         self.toast_revealer = Gtk.Revealer()
         self.toast_revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
         self.toast_revealer.set_transition_duration(_transition_duration_ms(app_context.settings, 160))
@@ -4517,6 +4962,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.side.refresh()
         self.restore_previous_tabs(records=restore_records)
         self._refresh_auth_selector()
+        self._refresh_gateway_model_control(force=True)
         GLib.timeout_add_seconds(2, self._poll_codex_auth_state)
         GLib.timeout_add_seconds(
             int(max(1, round(getattr(app_context.settings, "ui_refresh_interval_seconds", 5.0)))),
@@ -4709,53 +5155,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 lambda text: self.set_window_name(text),
             )
             return True
-        return False
-
-    def _queue_strip_new_tab_position(self) -> None:
-        """Coalesce re-anchoring of the floating new-tab button to idle."""
-        if getattr(self, "_strip_new_tab_idle", 0):
-            return
-        self._strip_new_tab_idle = GLib.idle_add(self._position_strip_new_tab)
-
-    def _position_strip_new_tab(self) -> bool:
-        """Park the + button just to the right of the last tab, like a browser."""
-        self._strip_new_tab_idle = 0
-        btn = getattr(self, "_strip_new_tab", None)
-        root = getattr(self, "_chrome_root", None)
-        if btn is None or root is None:
-            return False
-        pages = self.notebook.get_n_pages()
-        if pages <= 0:
-            btn.hide()
-            return False
-        last = self.notebook.get_nth_page(pages - 1)
-        tab_label = self.notebook.get_tab_label(last) if last is not None else None
-        if tab_label is None or not tab_label.get_mapped():
-            btn.hide()
-            return False
-        coords = tab_label.translate_coordinates(root, 0, 0)
-        if coords is None:
-            btn.hide()
-            return False
-        x, y = coords
-        alloc = tab_label.get_allocation()
-        # The label allocation excludes the tab's own CSS horizontal padding
-        # (8-14px per side), so x+width sits *inside* the tab. Clear the tab's
-        # right padding plus a gap so the + never overlaps the tab edge.
-        tab_right_pad = 16
-        gap = 8
-        btn_w = btn.get_allocated_width() or 30
-        btn_h = btn.get_allocated_height() or 30
-        left = x + alloc.width + tab_right_pad + gap
-        # If the strip has scrolled the last tab past the visible notebook
-        # width, fall back to the headerbar button rather than overlapping.
-        strip_right = self.notebook.get_allocated_width()
-        if left + btn_w > strip_right:
-            btn.hide()
-            return False
-        btn.set_margin_start(max(0, left))
-        btn.set_margin_top(max(0, y + (alloc.height - btn_h) // 2))
-        btn.show()
         return False
 
     def _build_tab_label(self, record: SessionRecord) -> Gtk.Box:
@@ -5449,7 +5848,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             self._restore_retry_ids = retry_ids
         restored = 0
         restore_records = sorted(records, key=lambda row: row.tab_index) if records is not None else self.app_context.store.restore_candidates(
-            limit=12,
             window_id=self.window_id,
         )
         remember_layout = records is None
@@ -5632,18 +6030,26 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 return False
             return True
 
-        has_recovery_metadata = bool(
-            (record.recovery_command or "").strip()
-            or (record.recovery_cwd or "").strip()
+        try:
+            durable_recipe = recipe_from_record(record)
+        except SessionRecipeError:
+            durable_recipe = None
+        explicit_recovery = bool((record.recovery_command or "").strip()) or bool(
+            durable_recipe is not None
+            and durable_recipe.origin in {"legacy-recovery", "native-resume"}
         )
-        managed_recovery = not record.external and (
-            record.status.casefold() not in {"missing", "stopped"}
-            or has_recovery_metadata
+        status = record.status.casefold()
+        managed_recovery = (
+            not record.external
+            and automatic_recovery_allowed(durable_recipe)
+            and status != "archived"
+            and (status != "stopped" or explicit_recovery)
         )
         if managed_recovery:
-            # ``recovery-pending`` makes create_or_resume fail closed unless it
-            # has an exact Codex UUID or a validated process checkpoint.  Use an
-            # ephemeral record so a failed attempt cannot mutate durable state.
+            # Use an ephemeral recovery state so a failed attempt cannot mutate
+            # durable layout/status. The backend validates and executes only the
+            # canonical recipe (or an optional stronger checkpoint/native resume)
+            # without knowing which application owns the terminal.
             recovery_record = (
                 record
                 if record.status.casefold() == "recovery-pending"
@@ -5686,7 +6092,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 self.open_session(recovery_record, known_live=True)
             except Exception as exc:
                 self.show_toast(
-                    f"Could not recover {record.name} exactly: {exc}",
+                    f"Could not recover {record.name}: {exc}",
                     kind="error",
                 )
                 self.side.refresh()
@@ -5748,7 +6154,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
         # Auth activation intentionally replaces the tmux session. Its attach
         # client may observe the brief gap between terminate and recreate.
-        if session_id in self._auth_switch_inflight:
+        if (
+            session_id in self._auth_switch_inflight
+            or session_id in getattr(self, "_payload_restart_inflight", set())
+        ):
             return None
         record = self.app_context.store.get(session_id)
         if record is None:
@@ -5789,6 +6198,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         """Release a no-loss auth-transition guard after a stable reattach."""
 
         getattr(self, "_auth_attach_protected", set()).discard(session_id)
+        refresh_models = getattr(self, "_refresh_gateway_model_control", None)
+        if callable(refresh_models):
+            refresh_models(force=True)
 
     def _finalize_missing_attach_target(self, session_id: str) -> bool:
         record = self.app_context.store.get(session_id)
@@ -6054,6 +6466,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             ),
             attach_exit_handler=lambda sid=record.id: self._attach_client_should_retry(sid),
             attach_stable_handler=lambda sid=record.id: self._on_auth_attach_stable(sid),
+            pane_dead_handler=lambda sid=record.id: self._on_live_payload_dead(sid),
             scrollback_extent=getattr(
                 self.app_context.backend,
                 "history_limit",
@@ -6449,7 +6862,372 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
     def _on_notebook_switch_page(self, _notebook, page, _page_num) -> None:
         GLib.idle_add(self._refresh_auth_selector)
+        refresh_models = getattr(self, "_refresh_gateway_model_control", None)
+        if callable(refresh_models):
+            GLib.idle_add(refresh_models, True)
         GLib.idle_add(self._prepare_switched_terminal, page)
+
+    def _refresh_gateway_model_control(self, force: bool = False) -> bool:
+        """Render model-cache freshness for the current gateway-backed tab."""
+
+        button = getattr(self, "_gateway_models_button", None)
+        if button is None:
+            return False
+        record = self.current_record()
+        if record is None or not record_uses_gateway_models(record):
+            button.set_sensitive(False)
+            button.hide()
+            button.get_style_context().remove_class("suggested-action")
+            self._gateway_model_probe_session_id = None
+            self._gateway_model_status = None
+            return False
+
+        button.show()
+        now = time.monotonic()
+        status = self._gateway_model_status
+        if (
+            force
+            or self._gateway_model_probe_session_id != record.id
+            or status is None
+            or now - float(getattr(self, "_gateway_model_probe_at", 0.0)) >= 10.0
+        ):
+            try:
+                status = classify_gateway_model_status(
+                    record,
+                    process_started_at=process_start_epoch(record.last_pid),
+                )
+            except Exception as exc:
+                status = GatewayModelStatus(
+                    applicable=True,
+                    available=False,
+                    stale=False,
+                    detail=str(exc),
+                )
+            self._gateway_model_probe_session_id = record.id
+            self._gateway_model_probe_at = now
+            self._gateway_model_status = status
+
+        busy = bool(
+            record.id in getattr(self, "_payload_restart_inflight", set())
+            or record.id in getattr(self, "_auth_switch_inflight", set())
+        )
+        context = button.get_style_context()
+        if busy:
+            button.set_sensitive(False)
+            button.set_tooltip_text(
+                f"{record.name}: model/session refresh is in progress"
+            )
+            context.remove_class("suggested-action")
+            return False
+        if status is None or not status.available:
+            button.set_sensitive(False)
+            detail = status.detail if status is not None else "model inventory unavailable"
+            button.set_tooltip_text(f"{record.name}: {detail}")
+            context.remove_class("suggested-action")
+            return False
+        if status.stale:
+            button.set_sensitive(True)
+            button.set_tooltip_text(
+                f"{status.model_count} gateway models are ready. Refresh this exact "
+                "conversation in the same tab to load them."
+            )
+            context.add_class("suggested-action")
+        else:
+            button.set_sensitive(False)
+            button.set_tooltip_text(
+                f"{status.model_count} gateway models are current in this tab"
+            )
+            context.remove_class("suggested-action")
+        return False
+
+    def _on_gateway_models_refresh(self, *_args) -> None:
+        record = self.current_record()
+        if record is None or not record_uses_gateway_models(record):
+            return
+        self._refresh_gateway_model_control(force=True)
+        status = getattr(self, "_gateway_model_status", None)
+        if status is None or not status.available:
+            self.show_toast(
+                f"Could not validate the gateway model inventory for {record.name}",
+                kind="error",
+            )
+            return
+        if not status.stale:
+            self.show_toast(
+                f"{record.name} already has all {status.model_count} gateway models",
+                kind="info",
+            )
+            return
+        if self._start_managed_payload_restart(
+            record,
+            exact_live=True,
+            reason="models",
+            model_count=status.model_count,
+        ):
+            self.show_toast(
+                f"Refreshing {record.name} in place to load {status.model_count} models…",
+                kind="info",
+            )
+            self._refresh_gateway_model_control(force=True)
+
+    def _on_live_payload_dead(self, session_id: str) -> bool:
+        """Immediately recover a crashed managed payload in its existing tab."""
+
+        if time.monotonic() < float(
+            getattr(self, "_payload_restart_backoff_until", {}).get(session_id, 0.0)
+        ):
+            return False
+        try:
+            record = self.app_context.store.get(session_id)
+        except Exception:
+            return False
+        if record is None or record.external:
+            return False
+        if session_id in getattr(self, "_auth_switch_inflight", set()):
+            return True
+        if session_id in getattr(self, "_payload_restart_inflight", set()):
+            return True
+        if record.status.casefold() in {"archived", "stopped", "terminated", "killed"}:
+            return False
+        try:
+            recipe = recipe_from_record(record)
+        except SessionRecipeError:
+            return False
+        if not automatic_recovery_allowed(recipe):
+            return False
+        return self._start_managed_payload_restart(
+            record,
+            exact_live=False,
+            reason="dead",
+            model_count=0,
+        )
+
+    def _start_managed_payload_restart(
+        self,
+        record: SessionRecord,
+        *,
+        exact_live: bool,
+        reason: str,
+        model_count: int,
+    ) -> bool:
+        """Start one no-loss server-side replacement and protected reattach."""
+
+        session_id = record.id
+        if (
+            session_id in self._auth_switch_inflight
+            or session_id in self._payload_restart_inflight
+        ):
+            return True
+        tab = self.tabs.get(session_id)
+        widget = getattr(tab, "widget", None) if tab is not None else None
+        defer = getattr(widget, "defer_attach_for_target_replacement", None)
+        if not callable(defer):
+            return False
+
+        generation = self._payload_restart_generation.get(session_id, 0) + 1
+        self._payload_restart_generation[session_id] = generation
+        self._payload_restart_inflight.add(session_id)
+        self._auth_attach_protected.add(session_id)
+        try:
+            deferred = bool(defer())
+        except Exception:
+            deferred = False
+        if not deferred:
+            self._payload_restart_inflight.discard(session_id)
+            self._auth_attach_protected.discard(session_id)
+            return False
+
+        def worker() -> None:
+            replacement_pid: int | None = None
+            replacement_action = "restarted"
+            replacement_command: str | None = None
+            replacement_cwd: str | None = None
+            clear_recovery = False
+            error = ""
+            try:
+                if exact_live:
+                    replacement_pid = self.app_context.backend.restart_exact_payload(record)
+                else:
+                    recovery = self.app_context.backend.recover_dead_payload(record)
+                    replacement_pid = recovery.pid
+                    replacement_action = recovery.action
+                    replacement_command = recovery.command
+                    replacement_cwd = recovery.cwd
+                    clear_recovery = recovery.clear_recovery
+            except Exception as exc:
+                error = str(exc)
+            payload = (
+                session_id,
+                generation,
+                replacement_pid,
+                error,
+                reason,
+                max(0, int(model_count)),
+                replacement_action,
+                replacement_command,
+                replacement_cwd,
+                clear_recovery,
+            )
+            scheduled, scheduling_error = _schedule_glib_callback(
+                self._complete_managed_payload_restart,
+                *payload,
+            )
+            if scheduled:
+                return
+            with self._payload_restart_completion_lock:
+                self._payload_restart_completions.append(payload)
+            print(
+                f"T1000: payload restart completion for {session_id} will retry "
+                f"on the UI poll: {scheduling_error}",
+                file=sys.stderr,
+            )
+
+        try:
+            threading.Thread(
+                target=worker,
+                name=f"termdeck-payload-{session_id}",
+                daemon=False,
+            ).start()
+        except Exception as exc:
+            self._payload_restart_inflight.discard(session_id)
+            self._auth_attach_protected.discard(session_id)
+            try:
+                widget.resolve_deferred_attach()
+            except Exception:
+                pass
+            self.show_toast(
+                f"Could not start recovery for {record.name}: {exc}",
+                kind="error",
+            )
+            self._refresh_gateway_model_control(force=True)
+            return False
+        return True
+
+    def _drain_payload_restart_completions(self) -> None:
+        with self._payload_restart_completion_lock:
+            pending = self._payload_restart_completions
+            self._payload_restart_completions = []
+        for payload in pending:
+            try:
+                self._complete_managed_payload_restart(*payload)
+            except Exception as exc:
+                print(
+                    f"T1000: payload restart completion failed: {exc}",
+                    file=sys.stderr,
+                )
+
+    def _complete_managed_payload_restart(
+        self,
+        session_id: str,
+        generation: int,
+        replacement_pid: int | None,
+        error: str,
+        reason: str,
+        model_count: int,
+        replacement_action: str = "restarted",
+        replacement_command: str | None = None,
+        replacement_cwd: str | None = None,
+        clear_recovery: bool = False,
+    ) -> bool:
+        if generation != self._payload_restart_generation.get(session_id):
+            return False
+        self._payload_restart_inflight.discard(session_id)
+        tab = self.tabs.get(session_id)
+        widget = getattr(tab, "widget", None) if tab is not None else None
+        record = self.app_context.store.get(session_id)
+        if record is None:
+            self._auth_attach_protected.discard(session_id)
+            return False
+
+        durable_error = ""
+        if replacement_pid is not None and not error:
+            try:
+                changes: dict[str, object] = {
+                    "status": "running",
+                    "last_pid": replacement_pid,
+                    "recovery_last_error": None,
+                    "last_opened_at": utc_now(),
+                }
+                if clear_recovery:
+                    if not replacement_command or not replacement_cwd:
+                        raise TmuxError(
+                            "shell bridge did not provide a durable command and directory"
+                        )
+                    changes.update(
+                        {
+                            "command": replacement_command,
+                            "cwd": replacement_cwd,
+                            "recovery_command": None,
+                            "recovery_cwd": None,
+                            "restart_policy": "on-failure",
+                        }
+                    )
+                record = self.app_context.store.update(session_id, **changes)
+                if tab is not None:
+                    tab.record = record
+            except Exception as exc:
+                durable_error = str(exc)
+            self._payload_restart_backoff_until.pop(session_id, None)
+            # Keep transition protection until the new control client proves
+            # stable, exactly as for an account-driven pane replacement.
+            self._auth_attach_protected.add(session_id)
+            resolver = getattr(self, "_resolve_auth_attach_gap", None)
+            if callable(resolver):
+                resolver(session_id)
+            else:
+                TermDeckWindow._resolve_auth_attach_gap(self, session_id)
+            if replacement_action == "shell":
+                message = f"{record.name} returned to an interactive shell in the same tab"
+            elif reason == "models":
+                message = f"{record.name} now has all {model_count} gateway models"
+            else:
+                message = f"Recovered {record.name} in the same tab"
+            if durable_error:
+                message += f" · state save warning: {durable_error}"
+            self.show_toast(
+                message,
+                kind="warning" if durable_error else "success",
+            )
+        else:
+            # Avoid a hot dead-pane loop. Reattach once so the VTE can publish
+            # truthful exit output; a second pane-dead callback during the
+            # bounded backoff declines automatic recovery.
+            self._payload_restart_backoff_until[session_id] = time.monotonic() + 15.0
+            self._auth_attach_protected.discard(session_id)
+            try:
+                self.app_context.store.update(
+                    session_id,
+                    status="recovery-pending",
+                    recovery_last_error=error or "payload restart failed",
+                    last_opened_at=utc_now(),
+                )
+            except Exception:
+                pass
+            resolver = getattr(self, "_resolve_auth_attach_gap", None)
+            if callable(resolver):
+                resolver(session_id)
+            else:
+                TermDeckWindow._resolve_auth_attach_gap(self, session_id)
+            detail = error or "payload restart failed"
+            self.show_toast(
+                f"Could not recover {record.name}: {detail}",
+                kind="error",
+            )
+        self._refresh_gateway_model_control(force=True)
+        try:
+            self.side.refresh()
+        except Exception:
+            pass
+        return False
+
+    def _codex_auth_manager(self) -> CodexAuthManager:
+        getter = getattr(self.app_context, "get_codex_auth_manager", None)
+        if callable(getter):
+            return getter()
+        manager = getattr(self.app_context, "codex_auth", None)
+        if manager is None:
+            raise CodexAuthError("optional Codex account integration is unavailable")
+        return manager
 
     def _sync_observed_auth_state(
         self,
@@ -6498,6 +7276,19 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 combo.set_tooltip_text(
                     "Recreate this terminal under T1000 before switching accounts; "
                     "a running external tmux environment cannot be retroactively isolated."
+                )
+                return
+            if state is None and (
+                not getattr(record, "auth_scope_id", None)
+                or not getattr(record, "codex_home", None)
+            ):
+                combo.append("__none__", "Accounts: optional")
+                combo.append("__enable__", "Enable private Codex account integration…")
+                combo.set_active_id("__none__")
+                combo.set_sensitive(True)
+                combo.set_tooltip_text(
+                    "This terminal is fully recoverable without Codex. Enable the "
+                    "optional private account integration only when you need it."
                 )
                 return
             if state is None:
@@ -6598,8 +7389,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         """Release one committed generation's guard and repair its attach/UI."""
 
         tab = self.tabs.get(session_id)
+        tab_widget = getattr(tab, "widget", None) if tab is not None else None
         if protect_attach or bool(
-            tab is not None and getattr(tab.widget, "_attach_restart_deferred", False)
+            tab_widget is not None
+            and getattr(tab_widget, "_attach_restart_deferred", False)
         ):
             protected = getattr(self, "_auth_attach_protected", None)
             if protected is None:
@@ -6626,6 +7419,16 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if record.external:
             self._render_auth_selector(record, None)
             return False
+        if (
+            hasattr(record, "auth_scope_id")
+            and hasattr(record, "codex_home")
+            and (
+                not getattr(record, "auth_scope_id", None)
+                or not getattr(record, "codex_home", None)
+            )
+        ):
+            self._render_auth_selector(record, None)
+            return False
         environment_ready = True
         check_environment = getattr(self.app_context.backend, "private_auth_environment_ready", None)
         if callable(check_environment):
@@ -6636,7 +7439,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self._auth_environment_ready[record.id] = environment_ready
         inflight = record.id in getattr(self, "_auth_switch_inflight", set())
         try:
-            state = self.app_context.codex_auth.state(record)
+            state = TermDeckWindow._codex_auth_manager(self).state(record)
             # The worker may already have changed the canonical pointer while
             # its matching SessionStore commit is still pending.  Rendering
             # that read-only state is useful, but synchronizing it here would
@@ -6658,15 +7461,29 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if not self._tab_directory_refresh_alive:
             return False
         self._drain_auth_completion_recoveries()
-        # Only account-transition attach clients receive this non-destructive
+        self._drain_payload_restart_completions()
+        self._refresh_gateway_model_control()
+        # Only managed target transitions receive this non-destructive
         # retry. Ordinary exited tabs retain the normal missing-session path.
         for session_id in tuple(getattr(self, "_auth_attach_protected", set())):
             TermDeckWindow._resolve_auth_attach_gap(self, session_id)
         record = self.current_record()
-        if record is None or record.external or record.id in self._auth_switch_inflight:
+        if (
+            record is None
+            or record.external
+            or (
+                hasattr(record, "auth_scope_id")
+                and hasattr(record, "codex_home")
+                and (
+                    not getattr(record, "auth_scope_id", None)
+                    or not getattr(record, "codex_home", None)
+                )
+            )
+            or record.id in self._auth_switch_inflight
+        ):
             return True
         try:
-            state = self.app_context.codex_auth.state(record)
+            state = TermDeckWindow._codex_auth_manager(self).state(record)
         except (CodexAuthError, OSError, ValueError):
             return True
         environment_ready = True
@@ -6693,6 +7510,27 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             return
         if record.id in self._auth_switch_inflight:
             return
+        if account_key == "__enable__":
+            combo.set_sensitive(False)
+            self.show_toast(
+                f"Enabling optional private account integration for {record.name}…",
+                kind="info",
+            )
+            try:
+                record = self.app_context.store.ensure_auth_scope(record.id)
+                tab = self.tabs.get(record.id)
+                if tab is not None:
+                    tab.record = record
+                TermDeckWindow._codex_auth_manager(self)
+            except (CodexAuthError, OSError, ValueError) as exc:
+                self.show_toast(
+                    f"Terminal recovery remains available; optional account integration "
+                    f"could not be enabled: {exc}",
+                    kind="error",
+                )
+            finally:
+                self._refresh_auth_selector()
+            return
         check_environment = getattr(self.app_context.backend, "private_auth_environment_ready", None)
         environment_ready = True
         if callable(check_environment):
@@ -6701,7 +7539,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             except (OSError, TmuxError):
                 environment_ready = False
         try:
-            state = self.app_context.codex_auth.state(record)
+            state = TermDeckWindow._codex_auth_manager(self).state(record)
         except (CodexAuthError, OSError, ValueError) as exc:
             self.show_toast(str(exc), kind="error")
             self._refresh_auth_selector()
@@ -6723,6 +7561,21 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         generation = self._auth_switch_generation.get(record.id, 0) + 1
         self._auth_switch_generation[record.id] = generation
         combo.set_sensitive(False)
+        attach_deferred = False
+        if tab is not None:
+            defer = getattr(
+                getattr(tab, "widget", None),
+                "defer_attach_for_target_replacement",
+                None,
+            )
+            if callable(defer):
+                self._auth_attach_protected.add(record.id)
+                try:
+                    attach_deferred = bool(defer())
+                except Exception:
+                    attach_deferred = False
+                if not attach_deferred:
+                    self._auth_attach_protected.discard(record.id)
         self.show_toast(f"Switching {record.name} to {account.label}…", kind="info")
 
         def _worker() -> None:
@@ -6737,10 +7590,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 # Another CLI or GUI may have completed while this worker was
                 # scheduled. Resolve and transact from the fresh canonical
                 # binding while holding the cross-process lock.
-                locked_state = self.app_context.codex_auth.state(record)
+                locked_state = TermDeckWindow._codex_auth_manager(self).state(record)
                 transaction = execute_auth_change(
                     self.app_context.backend,
-                    self.app_context.codex_auth,
+                    TermDeckWindow._codex_auth_manager(self),
                     record,
                     locked_state,
                     account_key,
@@ -6811,9 +7664,12 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                         tab.record = restored
                 except Exception as restore_exc:
                     restore_error = f"; could not restore pending state: {restore_exc}"
-                self._auth_switch_inflight.discard(record.id)
+                TermDeckWindow._finish_auth_switch_ui(
+                    self,
+                    record.id,
+                    protect_attach=attach_deferred,
+                )
                 combo.set_sensitive(True)
-                self._refresh_auth_selector()
             self.show_toast(
                 f"Account unchanged: could not start account switch worker: {exc}{restore_error}",
                 kind="error",
@@ -7728,25 +8584,33 @@ def application_id_for_database(db_path: str | Path | None = None) -> str:
 
 
 def payload_revival_candidates(records) -> "list[SessionRecord]":
-    """Order live managed sessions whose exact payload may need relaunching.
+    """Order managed sessions whose durable payload may need relaunching.
 
-    A host crash removes tmux and is handled by ``recovery-pending``.  A
-    payload crash inside a surviving session leaves only the launch command's
-    trailing fallback shell running, so reconcile keeps reporting ``running``
-    while the tab replays a finished Codex/Claude conversation.  Only rows
-    with the complete exact-recovery tuple qualify; every actual replacement
-    decision stays inside the backend's fail-closed placeholder recovery.
+    A canonical automatic recipe is the only restart authority. The backend
+    distinguishes an alive pane (no-op), a dead pane (in-place respawn), a
+    missing managed session (recreate), and optional stronger checkpoint/native
+    resume data. External, manual, never, stopped, archived, and corrupt rows
+    remain excluded.
     """
 
-    rows = [
-        record
-        for record in records
-        if not bool(getattr(record, "external", False))
-        and str(getattr(record, "status", "")).casefold() == "running"
-        and bool((getattr(record, "codex_home", None) or "").strip())
-        and bool((getattr(record, "recovery_command", None) or "").strip())
-        and bool((getattr(record, "recovery_cwd", None) or "").strip())
-    ]
+    rows = []
+    for record in records:
+        if bool(getattr(record, "external", False)):
+            continue
+        if str(getattr(record, "status", "")).casefold() not in {
+            "running",
+            "paused",
+            "missing",
+            "recovery-pending",
+            "start-error",
+        }:
+            continue
+        try:
+            recipe = recipe_from_record(record)
+        except SessionRecipeError:
+            continue
+        if automatic_recovery_allowed(recipe):
+            rows.append(record)
     rows.sort(
         key=lambda record: (
             not bool(getattr(record, "visible", True)),
@@ -7759,14 +8623,12 @@ def payload_revival_candidates(records) -> "list[SessionRecord]":
 
 
 def revive_dead_payload_sessions(backend, records, store=None) -> "tuple[int, int]":
-    """Relaunch exact-recovery payloads over proven idle placeholder shells.
+    """Relaunch dead or missing payloads through the generic durable contract.
 
-    Every record is probed through ``create_or_resume`` with an ephemeral
-    ``recovery-pending`` copy: that path verifies the pane still owns the
-    expected conversation (a cheap no-op when the payload is alive), respawns
-    only a verified idle fallback shell, and fails closed on running jobs,
-    different recovery UUIDs, or unverifiable process identity.  Returns
-    ``(revived, failed)`` where ``failed`` counts refused replacements.
+    ``create_or_resume`` is a no-op for a live payload, respawns a proven dead
+    pane in place, recreates a missing managed session from its digest-bound
+    recipe, and preserves optional native resume semantics. Returns
+    ``(revived, failed)``; no command is guessed here.
     """
 
     revived = 0
@@ -7784,9 +8646,9 @@ def revive_dead_payload_sessions(backend, records, store=None) -> "tuple[int, in
         try:
             backend.create_or_resume(probe)
         except Exception:
-            # The backend refused to replace this pane (live job, foreign
-            # conversation, missing private wrapper, ...). Leave the tab
-            # attached exactly as it is; never guess with send-keys.
+            # The backend refused an invalid/corrupt recipe, unavailable
+            # optional native integration, or unsafe external replacement. Leave
+            # the tab exactly as it is; never guess with send-keys.
             failed += 1
             continue
         try:
@@ -7835,7 +8697,10 @@ class TermDeckApplication(Gtk.Application):
                 f"T1000: tmux server lifecycle isolation failed: {exc}",
                 file=sys.stderr,
             )
-        self.codex_auth = CodexAuthManager(account_source=self.store.account_source)
+        # Optional account isolation is loaded only after the operator opts in
+        # for a terminal. Generic create/open/reconcile/recover paths neither
+        # provision CODEX_HOME nor require Codex/codex-auth to be installed.
+        self.codex_auth: CodexAuthManager | None = None
         self.theme = load_terminator_theme()
         try:
             self.settings = AppSettings.load()
@@ -7869,6 +8734,13 @@ class TermDeckApplication(Gtk.Application):
         # next polling tick; the periodic timers stay on as the reconcile net.
         self._tmux_events_client: ControlModeClient | None = None
         self._tmux_event_refresh_source: int | None = None
+
+    def get_codex_auth_manager(self) -> CodexAuthManager:
+        manager = self.codex_auth
+        if manager is None:
+            manager = CodexAuthManager(account_source=self.store.account_source)
+            self.codex_auth = manager
+        return manager
 
     def do_startup(self) -> None:
         Gtk.Application.do_startup(self)
@@ -8228,6 +9100,7 @@ class TermDeckApplication(Gtk.Application):
             return record
         if source is not None and session_id in (
             getattr(source, "_auth_switch_inflight", set())
+            | getattr(source, "_payload_restart_inflight", set())
             | getattr(source, "_auth_attach_protected", set())
         ):
             source.show_toast(
@@ -8262,6 +9135,7 @@ class TermDeckApplication(Gtk.Application):
                 selection_history_handler=lambda r=updated: destination._selection_history_for_terminal(r),
                 attach_exit_handler=lambda sid=session_id: destination._attach_client_should_retry(sid),
                 attach_stable_handler=lambda sid=session_id: destination._on_auth_attach_stable(sid),
+                pane_dead_handler=lambda sid=session_id: destination._on_live_payload_dead(sid),
             )
             tab.widget.apply_window_theme(
                 self.theme,
@@ -8987,6 +9861,7 @@ class TermDeckApplication(Gtk.Application):
             store_path = self.store.path
             auth_root = self.store.auth_root
             account_source = self.store.account_source
+            provision_auth_scopes = self.store.provision_auth_scopes
         except Exception:
             self._last_legacy_recovery_result = None
             return
@@ -9005,6 +9880,7 @@ class TermDeckApplication(Gtk.Application):
                     store_path,
                     auth_root=auth_root,
                     account_source=account_source,
+                    provision_auth_scopes=provision_auth_scopes,
                 )
                 result = repair_legacy_recovery(worker_store)
             except Exception:
@@ -9045,12 +9921,12 @@ class TermDeckApplication(Gtk.Application):
         return False
 
     def _schedule_payload_revival(self) -> None:
-        """Relaunch dead Codex/Claude payloads inside surviving tmux sessions.
+        """Relaunch dead or missing managed payloads from durable recipes.
 
         Reconcile cannot see a payload crash: the session and its fallback
         shell are alive, so the registry says ``running`` while the notebook
-        replays a conversation that ended days ago.  Probe every qualifying
-        row through the backend's fail-closed placeholder recovery on one
+        still exists after its payload exited. Probe every qualifying row
+        through the backend's generic recovery contract on one
         low-priority worker thread — serial on purpose, so a machine-wide
         restart cannot fan out dozens of heavyweight resume processes at
         once — and publish only a small summary back on the GTK context.
@@ -9070,10 +9946,12 @@ class TermDeckApplication(Gtk.Application):
             store_path = self.store.path
             auth_root = self.store.auth_root
             account_source = self.store.account_source
+            provision_auth_scopes = self.store.provision_auth_scopes
         except Exception:
             store_path = None
             auth_root = None
             account_source = None
+            provision_auth_scopes = False
 
         def worker() -> None:
             try:
@@ -9088,6 +9966,7 @@ class TermDeckApplication(Gtk.Application):
                         store_path,
                         auth_root=auth_root,
                         account_source=account_source,
+                        provision_auth_scopes=provision_auth_scopes,
                     )
                 except Exception:
                     worker_store = None

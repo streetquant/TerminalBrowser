@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+## 0.2.17
+
+T1000 0.2.17 repairs the three live regressions reported against the installed 0.2.9 runtime: model transitions could destroy the pane/stream handoff, the tab-strip `+` could disappear after overflow, and already-running `cc-go-ulw` processes could remain bound to an older gateway-model inventory. The release also completes the generic durable-recovery, killed-history, shell-return, and per-tab scrolling work that was present only in the newer source tree and had never reached the managed installation.
+
+### Model and account changes are protected pane transactions
+
+A target replacement now begins by disconnecting the old control-mode client and marking the tab transition-protected. The backend then mutates the tmux target while no VTE transport is still bound to the old process generation. Completion keeps protection until a newly connected stream remains stable; a failed mutation restores or reconnects the prior surface and records a bounded recovery error. The first key is therefore never delivered into a dead pane, and a model/account transition cannot leave a visually present but input-less tab.
+
+For `cc-go-ulw`, Claude Code memoizes `~/.claude/cache/gateway-models.json` inside each process. Updating the shared cache cannot update a process that started earlier. T1000 now validates the cache as a bounded regular file, canonicalizes and fingerprints its model IDs, compares the cache generation with the tab's observed process start, and shows a highlighted refresh control only when that exact tab is stale.
+
+The refresh itself is deliberately strict:
+
+1. the pane, PID, working directory, and exact `--resume UUID` are observed;
+2. terminal input is disabled and the exact process tree is frozen with PID/start-time receipts;
+3. the same evidence is collected again after quiescence and any private-scope lease;
+4. `respawn-pane -k` replaces only that pane with the exact saved resume command;
+5. the same pane ID, a new PID, the same UUID/directory, and a ready process tree are proved;
+6. input and the VTE control stream are restored.
+
+A mismatch fails before mutation. The production fleet contained 86 live gateway sessions at investigation time: 85 predated the validated 43-model cache and one was already current. T1000 does not restart those 85 processes automatically because screen capture cannot prove the absence of an unsent composer draft. Each stale tab receives the exact in-place refresh control, while a model-change crash is recovered automatically through the same protected handoff.
+
+### The new-tab control is outside tab overflow
+
+The old `+` was a floating overlay positioned after the last visible tab. Its own layout function hid it when the last tab scrolled outside the notebook allocation. The new control is a `GtkNotebook` end action, independent of the scrollable tab pages. A real GTK regression constrains a 30-tab notebook to a narrow window and proves the button remains visible, mapped, and attached to `Gtk.PackType.END`.
+
+### A tab outlives the application launched inside it
+
+New and recovered application commands run under a small terminal supervisor. A normal exit or Ctrl-C returns to the user's interactive shell in the same pane; other non-zero exits remain real failures and follow the durable restart policy. Pre-upgrade panes that do not have the supervisor receive a one-shot bridge when they die: `on-failure` exit 0/130 becomes a shell-only durable recipe, other failures resume the saved application, and `always` still restarts after every exit.
+
+The bridge changes neither the tmux pane ID nor the TermDeck tab. A real disposable tmux smoke proves that the old process is not relaunched, the shell accepts input, and the new recipe contains no agent recovery command.
+
+### Restoration and history are generic and durable
+
+Every managed tab now owns a canonical JSON launch recipe bound to a SHA-256 digest. The recipe contains only the command, absolute working directory, explicit environment overlay, restart policy, and origin. It does not require Codex, Claude, OpenCode, or any other agent parser. Legacy rows receive an additive backfill; malformed receipts stay explicit rather than being silently replaced.
+
+Killed and terminally exited tabs remain in durable history until explicit removal. Multi-window startup restores every visible tab rather than truncating each window at twelve. External adopted sessions, manual/never policies, corrupt receipts, missing directories, and optional private-account adapters retain fail-closed boundaries.
+
+### Per-tab scrolling is independent again
+
+The persistent scrollbar once again represents the application-aware tmux/TUI history owner, while VTE's native adjustment is used only for a real text selection. Backend evidence—not scrollbar geometry—decides whether the live edge has been reached. Thumb work is coalesced through a bounded executor, stale completions are generation-fenced, selection scrolling stays inside VTE, and switching tabs does not reset another tab's reading position.
+
+### Validation boundary
+
+The release contract includes the complete test inventory, every existing GTK/VTE/tmux smoke, a real generic recovery smoke, and a real exact gateway-model refresh smoke. The new smokes prove same-pane/new-PID exact resume, retained UUID and directory, post-refresh input echo, successful legacy exit to shell, no agent relaunch, explicit `always` semantics, tool-independent recovery, and cleanup of every disposable process and tmux server.
+
 ## 0.2.16
 
 T1000 0.2.16 makes persistent terminal ownership independent of the GTK process that presents it. The tmux server is now an explicit lifecycle authority rather than an accidental descendant of whichever GUI process happened to create the first tab.

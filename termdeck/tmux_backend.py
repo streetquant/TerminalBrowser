@@ -13,7 +13,7 @@ import stat as stat_module
 import subprocess
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Sequence
@@ -34,6 +34,11 @@ from .codex_config_scope import (
     migrate_quiescent_codex_configuration,
     prepare_private_bash_launch_command,
 )
+from .gateway_models import (
+    GatewayModelStatus,
+    gateway_model_status as classify_gateway_model_status,
+    process_start_epoch,
+)
 from .history_control import (
     BackendHistoryState,
     EdgeKnowledge,
@@ -44,6 +49,16 @@ from .history_control import (
     unhandled_scroll,
 )
 from .models import SessionRecord
+from .session_recipe import (
+    SessionRecipe,
+    SessionRecipeError,
+    automatic_recovery_allowed,
+    build_session_recipe,
+    encode_session_recipe,
+    recipe_from_record,
+    resolve_working_directory,
+    should_restart_recipe,
+)
 from .resize_signal import (
     ResizeSignalResult,
     private_launch_tuple_for_scope,
@@ -497,6 +512,36 @@ class _AuthPaneIdentity:
     pane_pid: int
     current_command: str
     current_path: str
+
+
+@dataclass(frozen=True)
+class _PaneLifecycle:
+    pane_id: str
+    dead: bool
+    exit_status: int | None
+    current_path: str
+
+
+@dataclass(frozen=True)
+class DeadPayloadRecoveryResult:
+    """One authoritative in-place response to a dead managed pane."""
+
+    action: str
+    pid: int
+    command: str | None = None
+    cwd: str | None = None
+    clear_recovery: bool = False
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class _LaunchSpec:
+    recipe: SessionRecipe
+    command: str
+    directory: Path
+    environment: tuple[tuple[str, str], ...]
+    checkpoint: bool = False
+    application_native_resume: bool = False
 
 
 class TmuxBackend:
@@ -1283,6 +1328,512 @@ class TmuxBackend:
             raise TmuxError("initial terminal grid is unreasonably large")
         return safe_columns, safe_rows
 
+    def _pane_lifecycle(self, record: SessionRecord) -> _PaneLifecycle | None:
+        """Return one authoritative pane lifecycle snapshot, or unknown.
+
+        A timeout or malformed response is not proof that a payload exited.
+        Callers therefore leave the pane untouched unless tmux explicitly says
+        ``pane_dead=1`` for the durable managed target.
+        """
+
+        result = self._run(
+            [
+                "display-message",
+                "-p",
+                "-t",
+                self.pane_target(record),
+                "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_current_path}",
+            ],
+            check=False,
+            timeout=self.query_timeout,
+        )
+        if result.returncode != 0:
+            return None
+        parts = result.stdout.rstrip("\n").split("\t", 3)
+        if len(parts) != 4 or not parts[0].startswith("%"):
+            return None
+        dead_text = parts[1].strip()
+        if dead_text not in {"0", "1"}:
+            return None
+        status_text = parts[2].strip()
+        exit_status: int | None = None
+        if status_text:
+            try:
+                exit_status = int(status_text)
+            except ValueError:
+                return None
+        return _PaneLifecycle(
+            pane_id=parts[0],
+            dead=dead_text == "1",
+            exit_status=exit_status,
+            current_path=self._normalise_pane_directory(parts[3].strip()) or "",
+        )
+
+    @staticmethod
+    def _durable_recipe(record: SessionRecord) -> SessionRecipe:
+        try:
+            recipe = recipe_from_record(record)
+        except SessionRecipeError as exc:
+            raise TmuxError(f"durable session recipe is invalid: {exc}") from exc
+        if recipe is None:
+            if getattr(record, "external", False):
+                raise TmuxError(
+                    "adopted external tmux session has no explicit managed recovery recipe"
+                )
+            raise TmuxError("managed terminal has no durable session recipe")
+        return recipe
+
+    @staticmethod
+    def _environment_args(environment: Sequence[tuple[str, str]]) -> list[str]:
+        args: list[str] = []
+        for key, value in environment:
+            args.extend(["-e", f"{key}={value}"])
+        return args
+
+    @classmethod
+    def _command_is_interactive_shell(cls, command: str) -> bool:
+        """Return whether *command* already leaves the pane at a shell prompt.
+
+        A direct shell (optionally with login/interactive flags) is already the
+        durable terminal payload. A shell executing ``-c`` is only a launcher
+        and must still receive the same post-application fallback as any other
+        command. Keeping this test syntax-based avoids naming any agent or TUI.
+        """
+
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            return False
+        if not argv:
+            return False
+        raw_executable = argv[0]
+        if os.path.sep in raw_executable and not raw_executable.startswith((os.path.sep, "./", "../")):
+            # Reject wrapper syntax such as ``wrapped(/bin/bash)``. A shell is
+            # direct only when argv[0] itself is a basename or path.
+            return False
+        executable = Path(raw_executable).name.casefold().removeprefix("-")
+        if executable not in cls._SUPPORTED_IDLE_SHELLS:
+            return False
+        for token in argv[1:]:
+            if token in {"-c", "--command"}:
+                return False
+            # Shells accept short-option clusters such as ``-lc``. Long
+            # options like ``--norc`` are not command-string launchers.
+            if token.startswith("-") and not token.startswith("--") and "c" in token[1:]:
+                return False
+        return True
+
+    @classmethod
+    def _command_is_direct_bash_shell(cls, command: str) -> bool:
+        """Return whether *command* is a direct interactive Bash invocation.
+
+        Private-account migration must not compare raw path spellings: on
+        merged-/usr systems ``/bin/bash`` and ``/usr/bin/bash`` are the same
+        executable, while a durable recipe may preserve either spelling.  A
+        direct Bash prompt is safe to replace with Termdeck's private rcfile;
+        Bash command-string launchers remain application payloads.
+        """
+
+        if not cls._command_is_interactive_shell(command):
+            return False
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            return False
+        return bool(argv) and Path(argv[0]).name.casefold().removeprefix("-") == "bash"
+
+    @classmethod
+    def _fallback_shell_command(cls, record: SessionRecord) -> str:
+        """Resolve an interactive shell without trusting nested tmux state."""
+
+        original = str(getattr(record, "command", "") or "").strip()
+        if cls._command_is_interactive_shell(original):
+            return original
+
+        candidates = [os.environ.get("SHELL", "")]
+        try:
+            candidates.append(pwd.getpwuid(os.geteuid()).pw_shell)
+        except (KeyError, OSError):
+            pass
+        candidates.extend(["/bin/bash", "/bin/sh"])
+        for candidate in candidates:
+            raw = str(candidate or "").strip()
+            if not raw:
+                continue
+            resolved = shutil.which(raw) if os.path.sep not in raw else raw
+            if not resolved:
+                continue
+            path = Path(resolved)
+            if path.name.casefold().removeprefix("-") not in cls._SUPPORTED_IDLE_SHELLS:
+                continue
+            try:
+                path = path.resolve(strict=True)
+            except OSError:
+                continue
+            if path.is_file() and os.access(path, os.X_OK):
+                return shlex.join([str(path), "-i"])
+        return "/bin/sh -i"
+
+    @staticmethod
+    def _with_interactive_shell_fallback(command: str, shell_command: str) -> str:
+        """Keep a successful/interactive application exit in the same pane.
+
+        The payload runs in a subshell so an application's own ``exec`` or
+        ``exit`` cannot replace the supervisor. Successful exits and an
+        operator Ctrl-C (130) return to an interactive shell. Other non-zero
+        exits remain real pane failures, preserving ``on-failure`` restart
+        semantics. Explicit Termdeck Kill removes the tmux session itself and
+        therefore cannot be intercepted by this wrapper.
+        """
+
+        return (
+            "(\n"
+            f"{command}\n"
+            ")\n"
+            "__termdeck_status=$?\n"
+            "if [ \"$__termdeck_status\" -eq 0 ] || [ \"$__termdeck_status\" -eq 130 ]; then\n"
+            "  printf '\\r\\n[T1000 application exited; interactive shell ready]\\r\\n' >&2\n"
+            f"  exec {shell_command}\n"
+            "fi\n"
+            "exit \"$__termdeck_status\""
+        )
+
+    def _launch_spec(self, record: SessionRecord) -> _LaunchSpec:
+        """Resolve a launch without requiring any external agent or tool.
+
+        Application-native resume commands and validated process checkpoints
+        remain higher-fidelity optional inputs. Otherwise the canonical recipe
+        is authoritative and is replayed as opaque user-owned shell syntax.
+        """
+
+        recipe = self._durable_recipe(record)
+        resolved = resolve_working_directory(recipe)
+        environment = recipe.environment_dict()
+        environment.update(resolved.environment)
+        launch_directory = resolved.path
+        command = recipe.command
+        fallback_shell_command = self._fallback_shell_command(record)
+        checkpoint = False
+        native_resume = False
+
+        raw_codex_home = (getattr(record, "codex_home", None) or "").strip()
+        # Native recognizers are an optional private-account adapter. Generic
+        # records never consult agent-specific syntax: their canonical recipe is
+        # opaque application-owned shell input.
+        codex_recovery = (
+            self._exact_codex_recovery(record) if raw_codex_home else None
+        )
+        if codex_recovery:
+            native_resume = True
+            command = codex_recovery
+            raw_recovery_cwd = (getattr(record, "recovery_cwd", None) or "").strip()
+            if raw_recovery_cwd:
+                native_recipe = SessionRecipe(
+                    command=codex_recovery,
+                    cwd=str(Path(raw_recovery_cwd).expanduser().resolve(strict=False)),
+                    restart_policy=recipe.restart_policy,
+                    origin="native-resume",
+                )
+                native_directory = resolve_working_directory(native_recipe)
+                launch_directory = native_directory.path
+                environment.update(native_directory.environment)
+        else:
+            checkpoint_command = self.checkpoints.restart_command(record)
+            if checkpoint_command:
+                checkpoint = True
+                command = checkpoint_command
+                launch_directory = self.checkpoints.session_dir(record)
+            elif (
+                recipe.origin in {"launch", "legacy-launch"}
+                and not self._is_codex_launch_command(recipe.command)
+            ):
+                # Legacy Codex sessions remain excluded from CRIU wrapping, but
+                # this is only a checkpoint compatibility optimization. Generic
+                # recipe replay neither needs nor invokes a Codex executable.
+                command = self.checkpoints.wrap_launch_command(record, recipe.command)
+            else:
+                native_resume = recipe.origin in {"legacy-recovery", "native-resume"}
+
+        if raw_codex_home:
+            try:
+                migrate_quiescent_codex_configuration(raw_codex_home)
+            except CodexConfigScopeError as exc:
+                raise TmuxError(
+                    f"could not migrate stopped private Codex configuration: {exc}"
+                ) from exc
+            try:
+                ensure_private_codex_state(raw_codex_home, require_complete=True)
+            except (CodexAuthError, CodexConfigScopeError) as exc:
+                raise TmuxError(str(exc)) from exc
+            if codex_recovery:
+                self._hydrate_private_codex_recovery(record, codex_recovery)
+            codex_home = Path(raw_codex_home).expanduser().resolve(strict=False)
+            isolated_path = self._private_auth_path(codex_home)
+            try:
+                fallback_argv = shlex.split(fallback_shell_command)
+            except ValueError:
+                fallback_argv = []
+            private_shell_command: str | None = None
+            if (
+                fallback_argv
+                and Path(fallback_argv[0]).name.casefold() == "bash"
+            ):
+                try:
+                    private_shell_command = prepare_private_bash_launch_command(
+                        codex_home,
+                        auth_scope_id=(getattr(record, "auth_scope_id", "") or ""),
+                        shell_path=fallback_argv[0],
+                    )
+                except CodexConfigScopeError as exc:
+                    raise TmuxError(
+                        f"private Bash environment could not be prepared: {exc}"
+                    ) from exc
+            if private_shell_command is not None:
+                fallback_shell_command = private_shell_command
+            if codex_recovery:
+                private_recovery = self._private_exact_codex_launch_command(
+                    record,
+                    codex_recovery,
+                    isolated_path,
+                )
+                suffix = command[len(codex_recovery) :]
+                command = private_recovery + suffix
+            elif (
+                private_shell_command is not None
+                and self._command_is_direct_bash_shell(command)
+            ):
+                command = private_shell_command
+            environment.update(
+                {
+                    "CODEX_HOME": str(codex_home),
+                    "TERMDECK_AUTH_SCOPE_ID": (
+                        getattr(record, "auth_scope_id", "") or ""
+                    ),
+                    "CODEX_TERMDECK_GATE_ROOT": str(auth_lifetime_gate_root(record)),
+                    "PATH": isolated_path,
+                }
+            )
+
+        if not self._command_is_interactive_shell(command):
+            command = self._with_interactive_shell_fallback(
+                command,
+                fallback_shell_command,
+            )
+
+        return _LaunchSpec(
+            recipe=recipe,
+            command=command,
+            directory=launch_directory,
+            environment=tuple(sorted(environment.items())),
+            checkpoint=checkpoint,
+            application_native_resume=native_resume,
+        )
+
+    def _respawn_dead_pane(
+        self,
+        record: SessionRecord,
+        lifecycle: _PaneLifecycle,
+        *,
+        lifetime_lease: _AuthLifetimeLease | None = None,
+    ) -> bool:
+        if not lifecycle.dead:
+            return False
+        recipe = self._durable_recipe(record)
+        status = record.status.casefold()
+        explicitly_starting = status == "new"
+        if status in {"stopped", "archived"}:
+            return False
+        if not explicitly_starting and not should_restart_recipe(
+            recipe,
+            session_missing=False,
+            exit_status=lifecycle.exit_status,
+        ):
+            return False
+        spec = self._launch_spec(record)
+        # Private launch wrappers acquire the same lifetime locks. The exited
+        # pane has no live writer; release immediately before atomic respawn
+        # while retaining the auth transaction lock around this mutation.
+        if lifetime_lease is not None:
+            lifetime_lease.release()
+        args = ["respawn-pane", "-k", "-t", lifecycle.pane_id]
+        args.extend(self._environment_args(spec.environment))
+        args.extend(["-c", str(spec.directory), spec.command])
+        self._run(args)
+        self._run(
+            ["set-option", "-t", record.tmux_name, "remain-on-exit", "on"],
+            check=False,
+        )
+        self.invalidate_cache()
+        return True
+
+    def _await_live_pane_pid(
+        self,
+        record: SessionRecord,
+        *,
+        pane_id: str,
+        timeout: float = 10.0,
+    ) -> int:
+        """Wait until the same tmux pane owns one live replacement process."""
+
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        last_detail = "replacement pane was not ready"
+        while True:
+            result = self._run(
+                [
+                    "display-message",
+                    "-p",
+                    "-t",
+                    self.pane_target(record),
+                    "#{pane_id}\t#{pane_pid}\t#{pane_dead}",
+                ],
+                check=False,
+                timeout=self.query_timeout,
+            )
+            if result.returncode == 0:
+                parts = result.stdout.rstrip("\n").split("\t", 2)
+                if len(parts) == 3:
+                    observed_pane, pid_text, dead_text = parts
+                    if observed_pane != pane_id:
+                        raise TmuxError(
+                            "replacement changed the durable tmux pane identity"
+                        )
+                    if dead_text.strip() in {"", "0"}:
+                        try:
+                            pid = int(pid_text)
+                        except ValueError:
+                            last_detail = "replacement pane reported an invalid pid"
+                        else:
+                            if pid > 0:
+                                self.invalidate_cache()
+                                return pid
+                    else:
+                        last_detail = "replacement pane is still dead"
+                else:
+                    last_detail = "replacement pane returned malformed identity"
+            else:
+                last_detail = result.stderr.strip() or "replacement pane query failed"
+            if time.monotonic() >= deadline:
+                raise TmuxError(last_detail)
+            time.sleep(0.025)
+
+    def _respawn_clean_exit_shell(
+        self,
+        record: SessionRecord,
+        lifecycle: _PaneLifecycle,
+        *,
+        lifetime_lease: _AuthLifetimeLease | None = None,
+    ) -> DeadPayloadRecoveryResult:
+        """Bridge one pre-supervisor successful payload exit to a durable shell."""
+
+        if not lifecycle.dead or lifecycle.exit_status not in {0, 130}:
+            raise TmuxError("clean-exit shell bridge requires a dead successful pane")
+        fallback_command = self._fallback_shell_command(record)
+        requested_cwd = lifecycle.current_path or record.cwd
+        recipe = build_session_recipe(
+            fallback_command,
+            requested_cwd,
+            restart_policy="on-failure",
+            origin="native-resume",
+        )
+        encoded, digest = encode_session_recipe(recipe)
+        shell_record = replace(
+            record,
+            command=fallback_command,
+            cwd=recipe.cwd,
+            status="new",
+            recovery_command=None,
+            recovery_cwd=None,
+            recovery_recipe=encoded,
+            recovery_recipe_sha256=digest,
+            restart_policy="on-failure",
+        )
+        spec = self._launch_spec(shell_record)
+        if lifetime_lease is not None:
+            lifetime_lease.release()
+        args = ["respawn-pane", "-k", "-t", lifecycle.pane_id]
+        args.extend(self._environment_args(spec.environment))
+        args.extend(["-c", str(spec.directory), spec.command])
+        self._run(args)
+        self._run(
+            ["set-option", "-t", record.tmux_name, "remain-on-exit", "on"],
+            check=False,
+        )
+        pid = self._await_live_pane_pid(record, pane_id=lifecycle.pane_id)
+        return DeadPayloadRecoveryResult(
+            action="shell",
+            pid=pid,
+            command=fallback_command,
+            cwd=str(spec.directory),
+            clear_recovery=True,
+            detail="successful application exit returned to an interactive shell",
+        )
+
+    def recover_dead_payload(self, record: SessionRecord) -> DeadPayloadRecoveryResult:
+        """Recover a dead pane according to exit status and durable policy.
+
+        ``on-failure`` preserves the terminal/application distinction: a normal
+        exit (0) or operator interrupt (130) becomes a shell in the same pane;
+        other failures resume the durable payload. ``always`` continues to
+        restart after every exit. Manual/never policies remain fail-closed.
+        """
+
+        if getattr(record, "external", False):
+            raise TmuxError("adopted external sessions cannot be recovered")
+        recipe = self._durable_recipe(record)
+        if not automatic_recovery_allowed(recipe):
+            raise TmuxError(
+                f"restart policy {recipe.restart_policy!r} does not authorize recovery"
+            )
+        raw_home = (getattr(record, "codex_home", None) or "").strip()
+        raw_scope = (getattr(record, "auth_scope_id", None) or "").strip()
+        if bool(raw_home) != bool(raw_scope):
+            raise TmuxError("optional private auth metadata is incomplete")
+
+        def lifecycle_or_raise() -> _PaneLifecycle:
+            lifecycle = self._pane_lifecycle(record)
+            if lifecycle is None or not lifecycle.dead:
+                raise TmuxError("managed pane is not authoritatively dead")
+            return lifecycle
+
+        if raw_home:
+            with auth_transaction_lock(record):
+                lifecycle = lifecycle_or_raise()
+                if (
+                    recipe.restart_policy == "on-failure"
+                    and lifecycle.exit_status in {0, 130}
+                ):
+                    lease = _acquire_auth_lifetime_lease(record)
+                    try:
+                        if self._pane_lifecycle(record) != lifecycle:
+                            raise TmuxError(
+                                "dead pane changed while the shell bridge was prepared"
+                            )
+                        return self._respawn_clean_exit_shell(
+                            record,
+                            lifecycle,
+                            lifetime_lease=lease,
+                        )
+                    finally:
+                        lease.release()
+        else:
+            lifecycle = lifecycle_or_raise()
+            if (
+                recipe.restart_policy == "on-failure"
+                and lifecycle.exit_status in {0, 130}
+            ):
+                return self._respawn_clean_exit_shell(record, lifecycle)
+
+        probe = replace(record, status="recovery-pending")
+        self.create_or_resume(probe)
+        pid = self.pane_pid(record)
+        if pid is None:
+            raise TmuxError("restarted payload has no live pane pid")
+        return DeadPayloadRecoveryResult(
+            action="restarted",
+            pid=pid,
+            detail="failed application payload resumed from its durable recipe",
+        )
+
     def create_or_resume(self, record: SessionRecord) -> None:
         self._create_or_resume(record, initial_grid=None)
 
@@ -1306,16 +1857,37 @@ class TmuxBackend:
         *,
         initial_grid: tuple[int, int] | None,
     ) -> None:
-        if (getattr(record, "codex_home", None) or "").strip():
+        raw_home = (getattr(record, "codex_home", None) or "").strip()
+        raw_scope = (getattr(record, "auth_scope_id", None) or "").strip()
+        if bool(raw_home) != bool(raw_scope):
+            raise TmuxError("optional private auth metadata is incomplete")
+        if raw_home:
             with auth_transaction_lock(record):
                 if self._auth_session_exists(record):
-                    if (
+                    lifecycle = self._pane_lifecycle(record)
+                    if lifecycle is not None and lifecycle.dead:
+                        lifetime_lease = _acquire_auth_lifetime_lease(record)
+                        try:
+                            self._respawn_dead_pane(
+                                record,
+                                lifecycle,
+                                lifetime_lease=lifetime_lease,
+                            )
+                        finally:
+                            lifetime_lease.release()
+                    elif (
                         record.status.casefold() == "recovery-pending"
                         and (
                             self._exact_codex_recovery(record) is not None
                             or self._exact_claude_recovery(record) is not None
                         )
                     ):
+                        # Preserve the legacy higher-fidelity placeholder repair
+                        # when a private live session has an exact native resume
+                        # target. An unavailable lifecycle snapshot is not proof
+                        # that the pane is dead, so this existing fail-closed path
+                        # remains authoritative unless tmux explicitly reports
+                        # pane_dead=1 above.
                         self._recover_exact_over_idle_placeholder(record)
                     return
                 lifetime_lease = _acquire_auth_lifetime_lease(record)
@@ -1330,10 +1902,194 @@ class TmuxBackend:
                 finally:
                     lifetime_lease.release()
             return
+
+        if self.session_exists(record):
+            lifecycle = self._pane_lifecycle(record)
+            if lifecycle is not None and lifecycle.dead:
+                self._respawn_dead_pane(record, lifecycle)
+            return
         if initial_grid is None:
             self._create_or_resume_unlocked(record)
         else:
             self._create_or_resume_unlocked(record, initial_grid=initial_grid)
+
+    def gateway_model_status(
+        self,
+        record: SessionRecord,
+        *,
+        cache_path: str | Path | None = None,
+    ) -> GatewayModelStatus:
+        """Compare one live gateway-model process with the validated cache."""
+
+        try:
+            pid = self.pane_pid(record)
+        except (OSError, TmuxError):
+            pid = None
+        return classify_gateway_model_status(
+            record,
+            process_started_at=process_start_epoch(pid),
+            cache_path=cache_path,
+        )
+
+    def restart_exact_payload(self, record: SessionRecord) -> int:
+        """Atomically re-exec one exact recovered payload in its existing pane.
+
+        This is the safe refresh primitive for process-local model inventories
+        and other launcher state. The current pane must still own exactly the
+        durable recovery command and directory recorded for this tab. Input is
+        disabled and the process tree is frozen before the final revalidation;
+        any mismatch fails before ``respawn-pane``. The tmux session, pane id,
+        Termdeck tab, window, and conversation UUID remain unchanged.
+        """
+
+        if getattr(record, "external", False):
+            raise TmuxError("adopted external sessions cannot be refreshed")
+        exact_recovery = self._exact_codex_recovery(record)
+        if exact_recovery is None:
+            exact_recovery = self._exact_claude_recovery(record)
+        if exact_recovery is None:
+            raise TmuxError("exact recovery command is unavailable")
+
+        raw_recovery_cwd = (getattr(record, "recovery_cwd", None) or "").strip()
+        recovery_cwd = Path(raw_recovery_cwd).expanduser()
+        if (
+            not raw_recovery_cwd
+            or not recovery_cwd.is_absolute()
+            or not recovery_cwd.is_dir()
+        ):
+            raise TmuxError(
+                "exact payload refresh requires an existing absolute recovery directory"
+            )
+        try:
+            recovery_cwd = recovery_cwd.resolve()
+        except OSError:
+            pass
+
+        lock = (
+            auth_transaction_lock(record)
+            if (getattr(record, "codex_home", None) or "").strip()
+            else nullcontext()
+        )
+        with lock:
+            return self._restart_exact_payload_unlocked(
+                record,
+                exact_recovery=exact_recovery,
+                recovery_cwd=recovery_cwd,
+            )
+
+    def _restart_exact_payload_unlocked(
+        self,
+        record: SessionRecord,
+        *,
+        exact_recovery: str,
+        recovery_cwd: Path,
+    ) -> int:
+        identity = self._inspect_auth_pane(record)
+        if identity is None:
+            raise TmuxError("exact payload pane could not be inspected")
+        if self._auth_process_identity(identity.pane_pid) is None:
+            raise TmuxError("exact payload process identity is unavailable")
+
+        def require_exact_binding() -> None:
+            try:
+                observed, observed_command, observed_cwd = observe_recovery_metadata(
+                    identity.pane_pid
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise TmuxError(
+                    f"exact payload recovery state could not be inspected: {exc}"
+                ) from exc
+            try:
+                cwd_matches = bool(
+                    observed_cwd
+                    and Path(observed_cwd).expanduser().resolve() == recovery_cwd
+                )
+            except OSError:
+                cwd_matches = observed_cwd == str(recovery_cwd)
+            if not observed or observed_command != exact_recovery or not cwd_matches:
+                raise TmuxError(
+                    "live pane owns a different exact recovery session; refusing to replace it"
+                )
+
+        require_exact_binding()
+        input_was_off = self._disable_auth_pane_input(identity.pane_id)
+        suspended: tuple[tuple[int, int, bool], ...] = ()
+        lifetime_lease: _AuthLifetimeLease | None = None
+        respawned = False
+        try:
+            suspended = self._suspend_auth_process_tree(
+                identity.pane_pid,
+                allow_running_root=True,
+            )
+            if self._inspect_auth_pane(record) != identity:
+                raise TmuxError(
+                    "live pane changed while exact payload refresh was being quiesced"
+                )
+            require_exact_binding()
+
+            if (getattr(record, "codex_home", None) or "").strip():
+                lifetime_lease = _acquire_auth_lifetime_lease(record)
+                if self._inspect_auth_pane(record) != identity:
+                    raise TmuxError(
+                        "live pane changed while its recovery scope was leased"
+                    )
+                require_exact_binding()
+
+            probe = replace(record, status="recovery-pending")
+            spec = self._launch_spec(probe)
+            if not spec.application_native_resume or exact_recovery not in spec.command:
+                raise TmuxError(
+                    "durable launch recipe did not resolve to the exact recovery command"
+                )
+
+            # The replacement launcher may need to acquire the same lifetime
+            # locks. Release immediately before the atomic pane mutation while
+            # the auth transaction lock still serializes this operation.
+            if lifetime_lease is not None:
+                lifetime_lease.release()
+                lifetime_lease = None
+            args = ["respawn-pane", "-k", "-t", identity.pane_id]
+            args.extend(self._environment_args(spec.environment))
+            args.extend(["-c", str(spec.directory), spec.command])
+            self._run(args)
+            respawned = True
+            self._run(
+                ["set-option", "-t", record.tmux_name, "remain-on-exit", "on"],
+                check=False,
+            )
+            self._kill_quiesced_auth_processes(suspended)
+            created, readiness_error = self._await_exact_pane_respawn_ready(
+                record,
+                previous=identity,
+                expected_recovery_command=exact_recovery,
+                expected_recovery_cwd=str(recovery_cwd),
+            )
+            if created is None or readiness_error:
+                raise TmuxError(
+                    readiness_error or "refreshed exact payload was not ready"
+                )
+            self._restore_auth_pane_input(identity.pane_id, input_was_off)
+            self.invalidate_cache()
+            return created.pane_pid
+        except Exception as exc:
+            rollback_error = ""
+            if not respawned:
+                try:
+                    self._resume_auth_processes(suspended)
+                except (OSError, TmuxError) as resume_exc:
+                    rollback_error = f"; old process could not be resumed: {resume_exc}"
+            try:
+                self._restore_auth_pane_input(identity.pane_id, input_was_off)
+            except (OSError, TmuxError) as input_exc:
+                rollback_error += f"; terminal input could not be restored: {input_exc}"
+            if isinstance(exc, TmuxError):
+                raise TmuxError(f"{exc}{rollback_error}") from exc
+            raise TmuxError(
+                f"exact payload could not be refreshed: {exc}{rollback_error}"
+            ) from exc
+        finally:
+            if lifetime_lease is not None:
+                lifetime_lease.release()
 
     def _recover_exact_over_idle_placeholder(self, record: SessionRecord) -> None:
         """Replace one proven idle placeholder without removing its tmux pane.
@@ -1605,9 +2361,12 @@ class TmuxBackend:
                     last_detail = "respawned pane retained the old shell process"
                 elif process_identity is None:
                     last_detail = "respawned pane process identity was unavailable"
-                elif not self._private_auth_process_tree_environment_ready(
-                    record,
-                    identity.pane_pid,
+                elif (
+                    bool((getattr(record, "codex_home", None) or "").strip())
+                    and not self._private_auth_process_tree_environment_ready(
+                        record,
+                        identity.pane_pid,
+                    )
                 ):
                     last_detail = "respawned pane did not inherit the private auth environment"
                 else:
@@ -1639,7 +2398,7 @@ class TmuxBackend:
         if raw_codex_home:
             if not _auth_transaction_is_held(record):
                 raise TmuxError(
-                    "private Codex launch requires the scope auth transaction lock"
+                    "private auth launch requires the scope auth transaction lock"
                 )
             if (
                 lifetime_lease is None
@@ -1648,119 +2407,34 @@ class TmuxBackend:
                     _auth_lifetime_lock_path(record),
                 )
             ):
-                raise TmuxError(
-                    "private Codex launch requires the scope lifetime lease"
-                )
+                raise TmuxError("private auth launch requires the scope lifetime lease")
             if self._auth_session_exists(record):
                 if not require_absent:
                     return
                 raise TmuxError(
-                    "another tmux session claimed this terminal name before auth recovery"
+                    "another tmux session claimed this terminal name before recovery"
                 )
-            if getattr(record, "external", False):
-                raise TmuxError(f"adopted tmux session not found: {record.tmux_name}")
-            try:
-                migrate_quiescent_codex_configuration(raw_codex_home)
-            except CodexConfigScopeError as exc:
-                raise TmuxError(
-                    f"could not migrate stopped private Codex configuration: {exc}"
-                ) from exc
         elif require_absent:
             if self._auth_session_exists(record):
                 raise TmuxError(
-                    "another tmux session claimed this terminal name before auth recovery"
+                    "another tmux session claimed this terminal name before recovery"
                 )
         elif self.session_exists(record):
             return
         if getattr(record, "external", False):
             raise TmuxError(f"adopted tmux session not found: {record.tmux_name}")
-        if raw_codex_home:
-            try:
-                ensure_private_codex_state(raw_codex_home, require_complete=True)
-            except CodexAuthError as exc:
-                raise TmuxError(str(exc)) from exc
-        launch_directory = Path(record.cwd).expanduser()
-        launch_directory.mkdir(parents=True, exist_ok=True)
-        original_command = record.command.strip() or os.environ.get("SHELL", "/bin/sh")
-        command = original_command
-        recovery_pending = record.status.casefold() == "recovery-pending"
-        # A lost process may resume only an exact UUID-bound Codex session.
-        # Launcher-only snapshots remain useful for observation/UI but are never
-        # executable recovery state.
-        codex_recovery = self._exact_codex_recovery(record)
-        claude_recovery = self._exact_claude_recovery(record)
-        if codex_recovery:
-            self._hydrate_private_codex_recovery(record, codex_recovery)
-            raw_recovery_cwd = (getattr(record, "recovery_cwd", None) or "").strip()
-            if raw_recovery_cwd:
-                recovery_directory = Path(raw_recovery_cwd).expanduser()
-                if recovery_directory.is_absolute() and recovery_directory.is_dir():
-                    try:
-                        launch_directory = recovery_directory.resolve()
-                    except OSError:
-                        launch_directory = recovery_directory
-            # A shell-backed tab should remain useful after the recovered TUI
-            # exits. Only append an exact, argument-free known shell; malformed
-            # or non-shell launch metadata cannot become shell syntax here.
-            try:
-                launch_argv = shlex.split(original_command)
-            except ValueError:
-                launch_argv = []
-            if (
-                len(launch_argv) == 1
-                and Path(launch_argv[0]).name.casefold() in self._SUPPORTED_IDLE_SHELLS
-            ):
-                command = f"{codex_recovery}; exec {shlex.join(launch_argv)}"
-            else:
-                command = codex_recovery
-            # Codex owns durable conversation state and uses SIGUSR2 itself.
-            # Never place either exact Codex recovery or its trailing shell under
-            # DMTCP: doing so steals signal 12 from Codex and can prevent startup.
-        elif claude_recovery:
-            raw_recovery_cwd = (getattr(record, "recovery_cwd", None) or "").strip()
-            if raw_recovery_cwd:
-                recovery_directory = Path(raw_recovery_cwd).expanduser()
-                if recovery_directory.is_absolute() and recovery_directory.is_dir():
-                    try:
-                        launch_directory = recovery_directory.resolve()
-                    except OSError:
-                        launch_directory = recovery_directory
-            command = claude_recovery
-            # Claude owns this UUID-bound transcript.  Replaying the canonical
-            # wrapper command is exact conversation recovery and must never be
-            # placed under DMTCP or rewritten as a new bare launcher.
-        else:
-            checkpoint_command = self.checkpoints.restart_command(record)
-            if checkpoint_command:
-                launch_directory = self.checkpoints.session_dir(record)
-                # Exact recovery is fail-closed. A stale or incompatible image
-                # must remain an explicit failed restore; replaying the launch
-                # command would create a different process state.
-                command = checkpoint_command
-            elif recovery_pending:
-                if self._recovery_pending_shell_can_start_fresh(
-                    record,
-                    original_command,
-                ):
-                    # A plain interactive shell has no conversation or process
-                    # state to impersonate.  Recreate only that proven shell in
-                    # its saved directory; agent launchers and rows carrying any
-                    # recovery metadata remain fail-closed below.
-                    command = self.checkpoints.wrap_launch_command(
-                        record,
-                        original_command,
-                    )
-                else:
-                    raise TmuxError(
-                        "exact process recovery is unavailable; no Codex session UUID "
-                        "or validated process checkpoint was saved"
-                    )
-            else:
-                command = (
-                    original_command
-                    if self._is_codex_launch_command(original_command)
-                    else self.checkpoints.wrap_launch_command(record, original_command)
-                )
+
+        recipe = self._durable_recipe(record)
+        status = record.status.casefold()
+        if status in {"stopped", "archived"}:
+            raise TmuxError("intentionally stopped or archived terminal will not auto-restart")
+        if status != "new" and not automatic_recovery_allowed(recipe):
+            raise TmuxError(
+                f"restart policy {recipe.restart_policy!r} does not authorize missing-session recovery"
+            )
+        spec = self._launch_spec(record)
+        launch_directory = spec.directory
+        command = spec.command
         # tmux accepts the command as one shell command argument, which preserves
         # normal shell syntax for commands such as "npm run dev" or "codex".
         launch_args = [
@@ -1772,56 +2446,7 @@ class TmuxBackend:
         if initial_grid is not None:
             columns, rows = initial_grid
             launch_args.extend(["-x", str(columns), "-y", str(rows)])
-        if raw_codex_home:
-            codex_home = Path(raw_codex_home).expanduser().resolve(strict=False)
-            isolated_path = self._private_auth_path(codex_home)
-            private_shell_command: str | None = None
-            try:
-                original_argv = shlex.split(original_command)
-            except ValueError:
-                original_argv = []
-            if (
-                len(original_argv) == 1
-                and Path(original_argv[0]).name.casefold() == "bash"
-            ):
-                try:
-                    private_shell_command = prepare_private_bash_launch_command(
-                        codex_home,
-                        auth_scope_id=(
-                            getattr(record, "auth_scope_id", "") or ""
-                        ),
-                        shell_path=original_argv[0],
-                    )
-                except CodexConfigScopeError as exc:
-                    raise TmuxError(
-                        f"private Bash environment could not be prepared: {exc}"
-                    ) from exc
-            if codex_recovery:
-                private_recovery = self._private_exact_codex_launch_command(
-                    record,
-                    codex_recovery,
-                    isolated_path,
-                )
-                suffix = command[len(codex_recovery) :]
-                if private_shell_command is not None and suffix == (
-                    f"; exec {shlex.join(original_argv)}"
-                ):
-                    suffix = f"; exec {private_shell_command}"
-                command = private_recovery + suffix
-            elif private_shell_command is not None and command == original_command:
-                command = private_shell_command
-            launch_args.extend(
-                [
-                    "-e",
-                    f"CODEX_HOME={codex_home}",
-                    "-e",
-                    f"TERMDECK_AUTH_SCOPE_ID={getattr(record, 'auth_scope_id', '') or ''}",
-                    "-e",
-                    f"CODEX_TERMDECK_GATE_ROOT={auth_lifetime_gate_root(record)}",
-                    "-e",
-                    f"PATH={isolated_path}",
-                ]
-            )
+        launch_args.extend(self._environment_args(spec.environment))
         launch_args.extend([
             "-c",
             str(launch_directory),
@@ -1922,27 +2547,28 @@ class TmuxBackend:
     def _query_scroll_context(
         self,
         target: str,
-    ) -> tuple[bool, bool, str] | None:
+    ) -> tuple[bool, bool, str, bool] | None:
         current = self._run(
             [
                 "display-message",
                 "-p",
                 "-t",
                 target,
-                "#{alternate_on}\t#{pane_in_mode}\t#{pane_current_command}",
+                "#{alternate_on}\t#{pane_in_mode}\t#{pane_current_command}\t#{mouse_any_flag}",
             ],
             check=False,
             timeout=self.query_timeout,
         )
         if current.returncode != 0:
             return None
-        fields = current.stdout.rstrip("\n").split("\t", 2)
-        if len(fields) != 3:
+        fields = current.stdout.rstrip("\n").split("\t", 3)
+        if len(fields) != 4:
             return None
         return (
             fields[0] == "1",
             fields[1] == "1",
             Path(fields[2].strip()).name.casefold(),
+            fields[3] == "1",
         )
 
     @staticmethod
@@ -1999,7 +2625,7 @@ class TmuxBackend:
         context = self._query_scroll_context(target)
         if context is None:
             return unhandled_scroll(amount, detail="tmux owner query failed")
-        alternate_on, pane_in_mode, command = context
+        alternate_on, pane_in_mode, command, mouse_reporting = context
         now = time.monotonic()
         if command == "codex" or command.startswith("codex-"):
             return BackendHistoryState(
@@ -2025,9 +2651,20 @@ class TmuxBackend:
                         detail="could not leave stale tmux copy mode",
                     )
             self._history_pop(record.id)
-            return passthrough_scroll(
-                amount,
-                detail=f"alternate-screen owner {command or 'unknown'}",
+            if mouse_reporting:
+                return passthrough_scroll(
+                    amount,
+                    detail=f"alternate-screen mouse owner {command or 'unknown'}",
+                )
+            return ScrollOutcome(
+                disposition=ScrollDisposition.UNHANDLED,
+                owner=HistoryOwner.CHILD_TUI,
+                edge=EdgeKnowledge.UNKNOWN,
+                requested_lines=amount,
+                detail=(
+                    f"alternate-screen owner {command or 'unknown'} has no mouse "
+                    "reporting; wheel input was consumed"
+                ),
             )
         return BackendHistoryState(
             owner=HistoryOwner.TMUX,
@@ -2072,7 +2709,7 @@ class TmuxBackend:
             # A failed tmux owner query is not evidence of the live edge. Copy
             # mode commands remain tmux-local, so preserve that tracked state.
             return replace(state, validated_at=now)
-        alternate_on, pane_in_mode, command = context
+        alternate_on, pane_in_mode, command, _mouse_reporting = context
         if state.owner is HistoryOwner.CODEX:
             if command == "codex" or command.startswith("codex-"):
                 return replace(state, command=command, validated_at=now)
@@ -2271,7 +2908,7 @@ class TmuxBackend:
                     # Unknown ownership is not permission to send the Codex
                     # transcript toggle or to release the user's first key.
                     return False
-                _alternate_on, _pane_in_mode, command = context
+                _alternate_on, _pane_in_mode, command, _mouse_reporting = context
                 if command == "codex" or command.startswith("codex-"):
                     commands = [
                         "send-keys",

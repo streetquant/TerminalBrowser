@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.2.17
+
+- Made model and account transitions no-loss pane transactions. TermDeck now retires the old control stream before any target mutation, keeps the tab protected until the replacement stream proves stable, and always ends in either a live reattached pane or an explicit recoverable error rather than a keypress-dead VTE surface.
+- Added exact in-place gateway-model refresh for `cc-go-ulw`: the live pane must still own the saved resume UUID and directory, input and the process tree are quiesced, the same pane is atomically respawned, and a new PID with the same exact conversation is proven before input returns. A highlighted header action appears only when the validated 43-model cache is newer than that tab's process.
+- Added automatic dead-payload recovery. Non-zero failures resume the durable application recipe; successful or Ctrl-C exits from pre-upgrade, unwrapped panes become an interactive shell in the same pane and are persisted as a shell-only recipe. New launches already include this shell supervisor, while explicit `always`, `manual`, and `never` policies retain their declared semantics.
+- Replaced the floating new-tab overlay with a real `GtkNotebook` end action. The `+` remains visible and reachable when dozens of tabs overflow a narrow window and can no longer hide itself because the last tab is off-screen.
+- Restored application-aware per-tab history ownership, bounded asynchronous scrollbar navigation, native selection extension, and backend-evidenced live-edge decisions without coupling one tab's reading position to another tab or to window selection.
+- Added tool-independent canonical launch recipes, digest verification, additive SQLite migration, unlimited multi-window restoration, durable killed-terminal history, generic non-Codex recovery, and fail-closed external/manual/corrupt boundaries.
+- Hardened gateway-model cache parsing against symlinks, partial or racing reads, inode/mtime replacement, malformed JSON, oversized fields, invalid timestamps, duplicate aliases, and non-canonical fingerprints.
+- Added failing-first unit, GTK overflow, account-ordering, private/non-private exact-restart, real disposable tmux, legacy clean-exit shell, input-echo, live model-census, and no-regression validation coverage. Existing live gateway tabs are not mass-restarted because captured output cannot prove that a composer has no unsent draft; each stale tab exposes its exact in-place refresh action instead.
+
 ## 0.2.16
 
 - Isolated the tmux server from the graphical application lifecycle. A first server now starts in its own delegated user-systemd scope when the socket mount is shared, or is moved immediately into a delegated anchor when mount namespaces differ, so stopping or replacing the GUI cannot terminate the server or its terminal payloads.

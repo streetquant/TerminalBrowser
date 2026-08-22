@@ -119,6 +119,10 @@ Path({str(probe)!r}).write_text(json.dumps({{
             window_title="Auth QA",
             visible=True,
         )
+        # Generic terminals are tool-independent by default. This smoke is
+        # specifically about the optional private Codex account adapter, so opt
+        # the fixture in explicitly before creating its legacy unscoped pane.
+        record = app.store.ensure_auth_scope(record.id)
         legacy_env = os.environ.copy()
         legacy_env.pop("CODEX_HOME", None)
         legacy_env.pop("TERMDECK_AUTH_SCOPE_ID", None)

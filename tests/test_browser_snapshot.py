@@ -111,7 +111,13 @@ class BrowserSnapshotTests(unittest.TestCase):
                 self.assertTrue(all(row.last_pid is None for row in imported))
                 self.assertIsNone(imported[0].selected_account)
                 self.assertEqual(imported[0].pending_account, "work")
-                self.assertNotEqual(imported[0].codex_home, existing.codex_home)
+                # Generic browser state stays tool-independent. A private
+                # Codex home is created only when the SessionStore explicitly
+                # enables account-scope provisioning.
+                self.assertIsNone(existing.codex_home)
+                self.assertIsNone(existing.auth_scope_id)
+                self.assertTrue(all(row.codex_home is None for row in imported))
+                self.assertTrue(all(row.auth_scope_id is None for row in imported))
             finally:
                 store.close()
 

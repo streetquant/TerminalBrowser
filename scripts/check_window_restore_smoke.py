@@ -233,10 +233,15 @@ def main() -> int:
                         )
                     )
 
+            # Generic terminal records do not create Codex state. This one
+            # smoke row explicitly opts into the optional private-account
+            # adapter because it is about exact Codex recovery.
+            records[0] = app.store.ensure_auth_scope(records[0].id)
+
             # This tab originally launched a shell, then ran Codex inside it.
-            # Populate the immutable private scope SessionStore created for the
-            # row; production recovery must see a complete native state DB and
-            # an executable wrapper before it is allowed to run the exact UUID.
+            # Populate the immutable private scope created for this row;
+            # production recovery must see a complete native state DB and an
+            # executable wrapper before it is allowed to run the exact UUID.
             raw_private_home = (records[0].codex_home or "").strip()
             if not raw_private_home or not records[0].auth_scope_id:
                 raise AssertionError("created recovery row has no private auth identity")

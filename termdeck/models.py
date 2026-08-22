@@ -65,6 +65,16 @@ class SessionRecord:
     pending_account: str | None = None
     auth_restart_required: bool = False
     auth_changed_at: str | None = None
+    # Generic, application-independent restart authority.  The JSON is
+    # canonical and bound to ``recovery_recipe_sha256``; legacy agent/account
+    # metadata remains optional compatibility data rather than a prerequisite
+    # for session recovery.
+    recovery_recipe: str | None = None
+    recovery_recipe_sha256: str | None = None
+    restart_policy: str = "on-failure"
+    recovery_attempts: int = 0
+    recovery_last_attempt_at: str | None = None
+    recovery_last_error: str | None = None
 
 
 @dataclass(frozen=True)

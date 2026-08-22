@@ -104,9 +104,14 @@ def main() -> int:
                 if name:
                     actions[name] = child
 
-            if set(actions) != {"New tab", "More actions"}:
+            if set(actions) != {"New tab", "Refresh models", "More actions"}:
                 raise AssertionError(
                     f"HeaderBar exposed unexpected actions: {sorted(actions)}"
+                )
+            refresh_models = actions["Refresh models"]
+            if refresh_models.get_visible() or refresh_models.get_sensitive():
+                raise AssertionError(
+                    "gateway-model refresh must remain hidden and inert on an ordinary tab"
                 )
             if actions["New tab"].get_tooltip_text() != "New tab · Ctrl+T · opens in the home directory":
                 raise AssertionError("New tab lost its home-directory tooltip")

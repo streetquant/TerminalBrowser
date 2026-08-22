@@ -91,8 +91,12 @@ def main() -> int:
                 raise AssertionError("terminal scrollbar is not placed on VTE's right edge")
             if attach.native_adjustment is not attach.terminal.get_vadjustment():
                 raise AssertionError("terminal lost its native VTE adjustment identity")
-            if attach.scrollbar.get_adjustment() is not attach.native_adjustment:
-                raise AssertionError("terminal scrollbar is not bound to VTE-native history")
+            if attach.history_adjustment is attach.native_adjustment:
+                raise AssertionError("application and VTE selection histories were conflated")
+            if attach.scrollbar.get_adjustment() is not attach.history_adjustment:
+                raise AssertionError(
+                    "terminal scrollbar is not bound to application-aware history"
+                )
             if not attach.scrollbar.get_visible():
                 raise AssertionError("terminal scrollbar is not visible")
             if not attach.scrollbar.get_style_context().has_class("td-terminal-scrollbar"):
@@ -123,7 +127,7 @@ def main() -> int:
                 )
             ):
                 raise AssertionError(
-                    f"terminal scrollbar exposes an incoherent native range: {scrollbar_range}"
+                    f"terminal scrollbar exposes an incoherent history range: {scrollbar_range}"
                 )
             if scrollbar_allocation.width < 14:
                 raise AssertionError(

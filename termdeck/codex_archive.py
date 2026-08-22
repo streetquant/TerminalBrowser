@@ -113,6 +113,18 @@ def _normalized_cwd(value: object) -> str | None:
     return os.path.normpath(str(path))
 
 
+def _cwd_identity(value: object) -> str | None:
+    """Resolve symlinked cwd spellings for matching without rewriting metadata."""
+
+    normalized = _normalized_cwd(value)
+    if normalized is None:
+        return None
+    try:
+        return os.path.normpath(str(Path(normalized).resolve(strict=False)))
+    except (OSError, RuntimeError):
+        return normalized
+
+
 def default_codex_archive_root() -> Path:
     configured = os.environ.get("CODEX_HOME")
     home = Path(configured).expanduser() if configured else Path.home() / ".codex"
@@ -253,7 +265,9 @@ def plan_legacy_recovery(
     }
     by_cwd: dict[str, list[ArchivedCodexSession]] = {}
     for row in archive:
-        by_cwd.setdefault(row.cwd, []).append(row)
+        identity = _cwd_identity(row.cwd)
+        if identity is not None:
+            by_cwd.setdefault(identity, []).append(row)
     for rows in by_cwd.values():
         rows.sort(key=lambda row: row.modified_at, reverse=True)
 
@@ -277,7 +291,8 @@ def plan_legacy_recovery(
     decisions: list[LegacyRecoveryDecision] = []
     for record in targets:
         cwd = _normalized_cwd(record.cwd) or record.cwd
-        all_candidates = by_cwd.get(cwd, [])
+        cwd_identity = _cwd_identity(cwd) or cwd
+        all_candidates = by_cwd.get(cwd_identity, [])
         candidates = [row for row in all_candidates if row.session_id not in occupied]
         launcher_evidence = _launcher_only_codex(record.recovery_command)
         chosen: ArchivedCodexSession | None = None

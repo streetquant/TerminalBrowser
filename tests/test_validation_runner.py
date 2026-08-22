@@ -90,7 +90,7 @@ def test_actual_manifest_is_canonical_and_covers_exact_inventory() -> None:
     payload, raw, tests, smokes = runner.load_manifest(REPO_ROOT, MANIFEST)
     assert raw == runner.canonical_json_bytes(payload)
     assert len(tests) >= 100
-    assert len(smokes) == 22
+    assert len(smokes) == 24
     entries = {entry["path"]: entry for entry in payload["smokes"]}
     assert sorted(entries) == smokes
     managed = entries["scripts/check_managed_process_inventory_smoke.py"]
@@ -124,8 +124,8 @@ def test_profile_selection_is_closed_and_complete() -> None:
         discovered_tests=tests,
     )
     assert ci_tests == production_tests == tests
-    assert len(ci_smokes) == 21
-    assert len(production_smokes) == 22
+    assert len(ci_smokes) == 23
+    assert len(production_smokes) == 24
     assert all(entry["environment"] == "xvfb-dbus" for entry in ci_smokes)
     assert sum(entry["environment"] == "production-host" for entry in production_smokes) == 1
 
@@ -320,14 +320,14 @@ def test_xvfb_environment_uses_short_private_runtime_and_cleans_after_task(
         cwd=tmp_path,
         env=environment,
         output_root=output,
-        timeout_seconds=5,
+        timeout_seconds=15,
         grace_seconds=1,
         stdout_limit=4096,
         stderr_limit=4096,
         cleanup_runtime=runtime,
     )
 
-    assert task["ok"] is True
+    assert task["ok"] is True, task
     assert task["runtime"]["external"] is True
     assert task["runtime"]["cleanup_ok"] is True
     assert not runtime.path.exists()

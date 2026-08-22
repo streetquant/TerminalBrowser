@@ -2,22 +2,22 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import sqlite3
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .codex_auth import (
-    default_account_source,
-    new_auth_scope_id,
-    prepare_auth_scope,
-    read_auth_state,
-)
 from .models import SessionRecord
+from .session_recipe import (
+    DEFAULT_RESTART_POLICY,
+    SessionRecipeError,
+    parse_session_recipe,
+    record_recipe_fields,
+    recovery_command_specificity,
+)
 
 APP_DIR = Path.home() / ".local" / "share" / "termdeck"
 DEFAULT_DB_PATH = APP_DIR / "sessions.sqlite3"
@@ -25,19 +25,6 @@ DEFAULT_AUTH_ROOT = APP_DIR / "terminal-auth"
 
 _SAFE = re.compile(r"[^a-zA-Z0-9_]+")
 
-
-def _has_exact_codex_resume(command: str | None) -> bool:
-    if not command:
-        return False
-    try:
-        parts = shlex.split(command)
-        index = parts.index("resume")
-        if Path(parts[0]).name.casefold() != "codex" or index + 2 != len(parts):
-            return False
-        uuid.UUID(parts[index + 1])
-    except (ValueError, IndexError):
-        return False
-    return True
 
 
 def utc_now() -> str:
@@ -66,6 +53,7 @@ class SessionStore:
         *,
         auth_root: str | Path | None = None,
         account_source: str | Path | None = None,
+        provision_auth_scopes: bool | None = None,
     ):
         self.path = Path(path).expanduser() if path else DEFAULT_DB_PATH
         self.auth_root = (
@@ -73,20 +61,31 @@ class SessionStore:
             if auth_root is not None
             else (DEFAULT_AUTH_ROOT if path is None else self.path.parent / "terminal-auth")
         )
-        # Keep creation and observation on the same effective canonical
-        # catalogue.  prepare_auth_scope already defaults to ~/.codex; storing
-        # that resolved default here prevents the immediately-following state
-        # read from treating an inherited selection as unverifiable.
+        # Account isolation is an optional integration, not a prerequisite for
+        # creating, opening, or recovering a terminal.  Explicit auth paths keep
+        # the historical opt-in behavior for account-specific callers/tests; the
+        # normal GUI/store path remains completely tool-agnostic.
         self._account_source_override = (
             Path(account_source).expanduser()
             if account_source is not None
             else None
         )
-        self.account_source = self._account_source_override or default_account_source()
+        configured_source = os.environ.get("TERMDECK_CODEX_ACCOUNT_SOURCE", "").strip()
+        self.account_source = self._account_source_override or (
+            Path(configured_source).expanduser()
+            if configured_source
+            else Path.home() / ".codex"
+        )
+        self.provision_auth_scopes = (
+            bool(auth_root is not None or account_source is not None)
+            if provision_auth_scopes is None
+            else bool(provision_auth_scopes)
+        )
         if self.path != Path(":memory:"):
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.auth_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.auth_root.chmod(0o700)
+        if self.provision_auth_scopes:
+            self.auth_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.auth_root.chmod(0o700)
         # Keep the GUI responsive if a second TermDeck/CLI process briefly
         # holds the registry, and avoid a full fsync for every tab-state update.
         self.conn = sqlite3.connect(str(self.path), timeout=1.0)
@@ -141,7 +140,13 @@ class SessionStore:
                 selected_account TEXT,
                 pending_account TEXT,
                 auth_restart_required INTEGER NOT NULL DEFAULT 0,
-                auth_changed_at TEXT
+                auth_changed_at TEXT,
+                recovery_recipe TEXT,
+                recovery_recipe_sha256 TEXT,
+                restart_policy TEXT NOT NULL DEFAULT 'on-failure',
+                recovery_attempts INTEGER NOT NULL DEFAULT 0,
+                recovery_last_attempt_at TEXT,
+                recovery_last_error TEXT
             )
             """
         )
@@ -178,8 +183,19 @@ class SessionStore:
         self._ensure_column("pending_account", "TEXT")
         self._ensure_column("auth_restart_required", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("auth_changed_at", "TEXT")
+        self._ensure_column("recovery_recipe", "TEXT")
+        self._ensure_column("recovery_recipe_sha256", "TEXT")
+        self._ensure_column(
+            "restart_policy",
+            "TEXT NOT NULL DEFAULT 'on-failure'",
+        )
+        self._ensure_column("recovery_attempts", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("recovery_last_attempt_at", "TEXT")
+        self._ensure_column("recovery_last_error", "TEXT")
         self._clear_managed_server_local_pane_targets()
-        self._ensure_auth_scopes()
+        self._backfill_recovery_recipes()
+        if self.provision_auth_scopes:
+            self._ensure_auth_scopes()
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_tag ON sessions(tag)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_window ON sessions(window_id, tab_index)")
@@ -312,11 +328,19 @@ class SessionStore:
         return True
 
     def _new_auth_scope(self) -> tuple[str, str, str | None]:
+        # Keep the optional account integration out of SessionStore's import and
+        # normal initialization path.  A missing third-party executable does not
+        # affect the generic session registry.
+        from .codex_auth import (
+            new_auth_scope_id,
+            prepare_auth_scope,
+            read_auth_state,
+        )
+
+        self.auth_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.auth_root.chmod(0o700)
         scope_id = new_auth_scope_id()
         codex_home = self.auth_root / scope_id
-        # None preserves the normal desktop state-database discovery fallback;
-        # account catalogue preparation still resolves the same canonical
-        # default internally.
         prepare_auth_scope(
             codex_home,
             account_source=self._account_source_override,
@@ -328,7 +352,11 @@ class SessionStore:
         return scope_id, str(codex_home), inherited_account
 
     def _ensure_auth_scopes(self) -> None:
-        rows = self.conn.execute("SELECT id, auth_scope_id, codex_home FROM sessions").fetchall()
+        from .codex_auth import prepare_auth_scope
+
+        rows = self.conn.execute(
+            "SELECT id, auth_scope_id, codex_home FROM sessions"
+        ).fetchall()
         for row in rows:
             scope_id = str(row["auth_scope_id"] or "").strip()
             codex_home = str(row["codex_home"] or "").strip()
@@ -348,6 +376,124 @@ class SessionStore:
                     account_source=self._account_source_override,
                 )
 
+    def ensure_auth_scope(self, session_id: str) -> SessionRecord:
+        """Provision the optional private account environment for one terminal."""
+
+        current = self.get(session_id)
+        if current is None:
+            raise KeyError(session_id)
+        if current.external:
+            raise ValueError("external tmux sessions cannot receive a private auth scope")
+        if current.auth_scope_id and current.codex_home:
+            return current
+        scope_id, codex_home, inherited_account = self._new_auth_scope()
+        self.conn.execute(
+            """
+            UPDATE sessions
+            SET auth_scope_id = ?, codex_home = ?, selected_account = ?,
+                auth_restart_required = 0
+            WHERE id = ? AND (auth_scope_id IS NULL OR auth_scope_id = '')
+              AND (codex_home IS NULL OR codex_home = '')
+            """,
+            (scope_id, codex_home, inherited_account, session_id),
+        )
+        self.conn.commit()
+        refreshed = self.get(session_id)
+        if refreshed is None:
+            raise KeyError(session_id)
+        # A concurrent same-user provisioner may have won; its immutable scope
+        # is authoritative.  Remove only our unused empty scope when possible.
+        if refreshed.auth_scope_id != scope_id:
+            try:
+                import shutil
+
+                shutil.rmtree(codex_home)
+            except OSError:
+                pass
+        return refreshed
+
+    @staticmethod
+    def _recipe_values_for_record(record: SessionRecord) -> tuple[str | None, str | None, str]:
+        encoded = getattr(record, "recovery_recipe", None)
+        digest = getattr(record, "recovery_recipe_sha256", None)
+        if encoded is not None or digest is not None:
+            if encoded is None or digest is None:
+                raise SessionRecipeError("session recipe and digest must be stored together")
+            recipe = parse_session_recipe(encoded, digest)
+            return encoded, digest, recipe.restart_policy
+        if bool(getattr(record, "external", False)):
+            return None, None, "never"
+        return record_recipe_fields(
+            command=record.command,
+            cwd=record.cwd,
+            recovery_command=record.recovery_command,
+            recovery_cwd=record.recovery_cwd,
+            restart_policy=(
+                getattr(record, "restart_policy", DEFAULT_RESTART_POLICY)
+                or DEFAULT_RESTART_POLICY
+            ),
+            origin=(
+                "legacy-recovery"
+                if (record.recovery_command or "").strip()
+                else "launch"
+            ),
+        )
+
+    def _record_with_recovery_recipe(self, record: SessionRecord) -> SessionRecord:
+        encoded, digest, policy = self._recipe_values_for_record(record)
+        return replace(
+            record,
+            recovery_recipe=encoded,
+            recovery_recipe_sha256=digest,
+            restart_policy=policy,
+            recovery_attempts=max(0, int(getattr(record, "recovery_attempts", 0))),
+        )
+
+    def _backfill_recovery_recipes(self) -> int:
+        rows = self.conn.execute("SELECT * FROM sessions").fetchall()
+        updates: list[tuple[str | None, str | None, str, str]] = []
+        for row in rows:
+            record = self._row_to_record(row)
+            try:
+                encoded, digest, policy = self._recipe_values_for_record(record)
+            except SessionRecipeError:
+                # Preserve a malformed pre-existing receipt for diagnostics; do
+                # not silently replace its authority with mutable legacy fields.
+                if row["recovery_recipe"] is not None or row["recovery_recipe_sha256"] is not None:
+                    continue
+                encoded = digest = None
+                policy = "never"
+            if (
+                row["recovery_recipe"],
+                row["recovery_recipe_sha256"],
+                str(row["restart_policy"] or DEFAULT_RESTART_POLICY),
+            ) != (encoded, digest, policy):
+                updates.append((encoded, digest, policy, str(row["id"])))
+        if not updates:
+            return 0
+        self.conn.executemany(
+            """
+            UPDATE sessions
+            SET recovery_recipe = ?, recovery_recipe_sha256 = ?, restart_policy = ?
+            WHERE id = ?
+            """,
+            updates,
+        )
+        return len(updates)
+
+    def ensure_recovery_recipe(self, session_id: str) -> SessionRecord:
+        current = self.get(session_id)
+        if current is None:
+            raise KeyError(session_id)
+        prepared = self._record_with_recovery_recipe(current)
+        if prepared == current:
+            return current
+        self.upsert(prepared)
+        refreshed = self.get(session_id)
+        if refreshed is None:
+            raise KeyError(session_id)
+        return refreshed
+
     def create(
         self,
         name: str,
@@ -360,14 +506,26 @@ class SessionStore:
         tab_index: int = 0,
         visible: bool = True,
         pinned: bool = False,
+        environment: Mapping[str, str] | None = None,
+        restart_policy: str = DEFAULT_RESTART_POLICY,
     ) -> SessionRecord:
         sid = short_id("td")
-        auth_scope_id, codex_home, inherited_account = self._new_auth_scope()
-        cwd = str(Path(cwd or os.getcwd()).expanduser())
+        if self.provision_auth_scopes:
+            auth_scope_id, codex_home, inherited_account = self._new_auth_scope()
+        else:
+            auth_scope_id = codex_home = inherited_account = None
+        cwd = str(Path(cwd or os.getcwd()).expanduser().resolve(strict=False))
         now = utc_now()
         safe_tag = tmux_safe_name(tag or "default")
         safe_name = tmux_safe_name(name or command or "shell")
         tmux_name = tmux_safe_name(f"termdeck_{safe_tag}_{safe_name}_{sid.replace('-', '_')}")
+        recipe_json, recipe_sha256, clean_restart_policy = record_recipe_fields(
+            command=command or os.environ.get("SHELL", "/bin/sh"),
+            cwd=cwd,
+            environment=environment,
+            restart_policy=restart_policy,
+            origin="launch",
+        )
         record = SessionRecord(
             id=sid,
             name=name or command or "shell",
@@ -394,6 +552,12 @@ class SessionStore:
             pending_account=None,
             auth_restart_required=False,
             auth_changed_at=None,
+            recovery_recipe=recipe_json,
+            recovery_recipe_sha256=recipe_sha256,
+            restart_policy=clean_restart_policy,
+            recovery_attempts=0,
+            recovery_last_attempt_at=None,
+            recovery_last_error=None,
         )
         self.upsert(record)
         return record
@@ -406,7 +570,14 @@ class SessionStore:
                 auth_scope_id=existing.auth_scope_id,
                 codex_home=existing.codex_home,
             )
-        elif not record.auth_scope_id or not record.codex_home:
+        elif record.auth_scope_id and record.codex_home:
+            from .codex_auth import prepare_auth_scope
+
+            prepare_auth_scope(
+                record.codex_home,
+                account_source=self._account_source_override,
+            )
+        elif self.provision_auth_scopes:
             auth_scope_id, codex_home, inherited_account = self._new_auth_scope()
             record = replace(
                 record,
@@ -416,10 +587,8 @@ class SessionStore:
                 auth_restart_required=False,
             )
         else:
-            prepare_auth_scope(
-                record.codex_home,
-                account_source=self._account_source_override,
-            )
+            record = replace(record, auth_scope_id=None, codex_home=None)
+        record = self._record_with_recovery_recipe(record)
         if not bool(getattr(record, "external", False)) and record.pane_target is not None:
             record = replace(record, pane_target=None)
         payload = dict(record.__dict__)
@@ -427,19 +596,24 @@ class SessionStore:
         payload["pinned"] = 1 if getattr(record, "pinned", False) else 0
         payload["external"] = 1 if getattr(record, "external", False) else 0
         payload["auth_restart_required"] = 1 if getattr(record, "auth_restart_required", False) else 0
+        payload["recovery_attempts"] = max(0, int(getattr(record, "recovery_attempts", 0)))
         self.conn.execute(
             """
             INSERT INTO sessions (
                 id, name, tag, command, cwd, tmux_name, created_at, last_opened_at,
                 status, last_pid, window_id, window_title, tab_index, visible, pane_target, external, pinned,
                 recovery_command, recovery_cwd, auth_scope_id, codex_home, selected_account,
-                pending_account, auth_restart_required, auth_changed_at
+                pending_account, auth_restart_required, auth_changed_at,
+                recovery_recipe, recovery_recipe_sha256, restart_policy, recovery_attempts,
+                recovery_last_attempt_at, recovery_last_error
             )
             VALUES (
                 :id, :name, :tag, :command, :cwd, :tmux_name, :created_at, :last_opened_at,
                 :status, :last_pid, :window_id, :window_title, :tab_index, :visible, :pane_target, :external, :pinned,
                 :recovery_command, :recovery_cwd, :auth_scope_id, :codex_home, :selected_account,
-                :pending_account, :auth_restart_required, :auth_changed_at
+                :pending_account, :auth_restart_required, :auth_changed_at,
+                :recovery_recipe, :recovery_recipe_sha256, :restart_policy, :recovery_attempts,
+                :recovery_last_attempt_at, :recovery_last_error
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -462,7 +636,13 @@ class SessionStore:
                 selected_account = excluded.selected_account,
                 pending_account = excluded.pending_account,
                 auth_restart_required = excluded.auth_restart_required,
-                auth_changed_at = excluded.auth_changed_at
+                auth_changed_at = excluded.auth_changed_at,
+                recovery_recipe = excluded.recovery_recipe,
+                recovery_recipe_sha256 = excluded.recovery_recipe_sha256,
+                restart_policy = excluded.restart_policy,
+                recovery_attempts = excluded.recovery_attempts,
+                recovery_last_attempt_at = excluded.recovery_last_attempt_at,
+                recovery_last_error = excluded.recovery_last_error
             """,
             payload,
         )
@@ -497,6 +677,19 @@ class SessionStore:
                 raise ValueError(f"{field} is immutable for terminal {session_id}")
         data: dict[str, Any] = dict(current.__dict__)
         data.update(changes)
+        recipe_inputs = {
+            "command",
+            "cwd",
+            "recovery_command",
+            "recovery_cwd",
+            "restart_policy",
+        }
+        if recipe_inputs.intersection(changes) and not {
+            "recovery_recipe",
+            "recovery_recipe_sha256",
+        }.intersection(changes):
+            data["recovery_recipe"] = None
+            data["recovery_recipe_sha256"] = None
         if "last_opened_at" not in changes:
             data["last_opened_at"] = utc_now()
         if "visible" in data:
@@ -511,7 +704,9 @@ class SessionStore:
             data["pane_target"] = None
         if "auth_restart_required" in data:
             data["auth_restart_required"] = bool(data["auth_restart_required"])
-        updated = SessionRecord(**data)
+        if "recovery_attempts" in data:
+            data["recovery_attempts"] = max(0, int(data["recovery_attempts"]))
+        updated = self._record_with_recovery_recipe(SessionRecord(**data))
         self.upsert(updated)
         return updated
 
@@ -573,14 +768,13 @@ class SessionStore:
         for session_id, command, cwd in requested:
             previous_command, previous_cwd = existing.get(session_id, (None, None))
             if (
-                _has_exact_codex_resume(previous_command)
-                and command is not None
-                and not _has_exact_codex_resume(command)
+                command is not None
+                and recovery_command_specificity(previous_command)
+                > recovery_command_specificity(command)
             ):
-                # A launcher-only observation is weaker than the exact UUID
-                # already persisted. Preserve the exact command until a new
-                # exact UUID is observed or the process tree proves Codex ended
-                # by reporting command=None.
+                # Preserve any application's more-specific opaque resume target
+                # over a weaker bare-launcher observation. A positive None
+                # observation still clears metadata after the process ended.
                 rows.append((session_id, previous_command, previous_cwd))
             else:
                 rows.append((session_id, command, cwd))
@@ -597,8 +791,38 @@ class SessionStore:
                 for session_id, command, cwd in rows
             ],
         )
+        changed = max(0, self.conn.total_changes - before)
+        if changed:
+            refresh_rows = self.conn.execute(
+                f"SELECT * FROM sessions WHERE id IN ({placeholders}) AND external = 0",
+                identifiers,
+            ).fetchall()
+            recipe_updates = []
+            for row in refresh_rows:
+                record = replace(
+                    self._row_to_record(row),
+                    recovery_recipe=None,
+                    recovery_recipe_sha256=None,
+                )
+                prepared = self._record_with_recovery_recipe(record)
+                recipe_updates.append(
+                    (
+                        prepared.recovery_recipe,
+                        prepared.recovery_recipe_sha256,
+                        prepared.restart_policy,
+                        prepared.id,
+                    )
+                )
+            self.conn.executemany(
+                """
+                UPDATE sessions
+                SET recovery_recipe = ?, recovery_recipe_sha256 = ?, restart_policy = ?
+                WHERE id = ?
+                """,
+                recipe_updates,
+            )
         self.conn.commit()
-        return max(0, self.conn.total_changes - before)
+        return changed
 
     def get(self, session_id: str) -> SessionRecord | None:
         row = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
@@ -739,17 +963,25 @@ class SessionStore:
         ).fetchall()
         return [self._row_to_record(row) for row in rows]
 
-    def restore_candidates(self, limit: int = 12, *, window_id: str | None = None) -> list[SessionRecord]:
-        """Return sessions that should be reattached on app/window startup.
+    def restore_candidates(
+        self,
+        limit: int | None = None,
+        *,
+        window_id: str | None = None,
+    ) -> list[SessionRecord]:
+        """Return every visible restorable tab, optionally bounded by callers.
 
-        When ``window_id`` is set, only that named window's visible tabs are
-        returned. A previous global fallback (any visible tab from any window)
-        reassigned foreign tabs into the empty window on Restore and collapsed
-        multi-window layouts down to a single window after relaunch.
+        Browser restoration must never silently discard tab 13 or later. The
+        unbounded default is therefore authoritative for GUI/startup recovery;
+        bounded callers may still request a positive prefix for previews or
+        diagnostics. When ``window_id`` is set, rows remain scoped to that
+        logical window so restore cannot steal tabs from another window.
         """
 
-        clean_limit = max(1, int(limit))
         rows = self.list(visible_only=True, window_id=window_id, include_stopped=False)
+        if limit is None:
+            return rows
+        clean_limit = max(1, int(limit))
         return rows[:clean_limit]
 
     def rename_window(self, window_id: str, title: str) -> int:
@@ -874,4 +1106,10 @@ class SessionStore:
             pending_account=row["pending_account"],
             auth_restart_required=bool(row["auth_restart_required"]),
             auth_changed_at=row["auth_changed_at"],
+            recovery_recipe=row["recovery_recipe"],
+            recovery_recipe_sha256=row["recovery_recipe_sha256"],
+            restart_policy=str(row["restart_policy"] or DEFAULT_RESTART_POLICY),
+            recovery_attempts=max(0, int(row["recovery_attempts"] or 0)),
+            recovery_last_attempt_at=row["recovery_last_attempt_at"],
+            recovery_last_error=row["recovery_last_error"],
         )

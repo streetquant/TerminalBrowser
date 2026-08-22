@@ -58,15 +58,26 @@ def persist_live_sessions(
     *,
     records: Sequence[SessionRecord] | None = None,
 ) -> PersistenceResult:
-    """Persist exact Codex IDs, then checkpoint every other live process tree.
+    """Persist generic recipes, optional native resume metadata, and checkpoints.
 
-    The ordering is essential. A final unbounded observation writes each primary
-    Codex UUID before checkpoint selection; the subsequent refreshed records let
-    the backend use deterministic ``codex resume <UUID>`` instead of a memory
-    checkpoint or a new/random Codex session.
+    Every managed terminal first receives a canonical command/cwd/environment
+    recipe that can recreate it without knowing the owning application. A final
+    bounded process observation may then enrich that baseline with an opaque
+    application-native resume command, and an exact process checkpoint remains
+    an optional higher-fidelity layer. None of these steps requires Codex,
+    Claude, CodexPro, or any other agent executable.
     """
 
     selected = list(records) if records is not None else persistence_candidates(store)
+    prepared: list[SessionRecord] = []
+    for record in selected:
+        try:
+            prepared.append(store.ensure_recovery_recipe(record.id))
+        except Exception:
+            current = store.get(record.id)
+            if current is not None:
+                prepared.append(current)
+    selected = prepared
     metadata_updates = 0
     observe = getattr(backend, "recovery_metadata", None)
     if selected and callable(observe):
@@ -79,9 +90,10 @@ def persist_live_sessions(
         except Exception:
             observed = {}
         # Shutdown observation races with desktop/session teardown. A readable
-        # shell after Codex has already received SIGTERM is not evidence that a
-        # previously persisted UUID is obsolete. Final persistence may add or
-        # replace resumable metadata, but it must never erase durable exact state.
+        # fallback shell after an application has received SIGTERM is not proof
+        # that a previously persisted native resume target is obsolete. Final
+        # persistence may add or strengthen opaque resume metadata, but it never
+        # erases the canonical generic recipe.
         updates = [
             (session_id, command, cwd)
             for session_id, (command, cwd) in observed.items()

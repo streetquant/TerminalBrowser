@@ -1107,3 +1107,50 @@ def test_tmux_mutation_is_not_suppressed_by_query_backoff() -> None:
 
     assert result.returncode == 0
     run.assert_called_once()
+
+
+def test_target_replacement_defers_stream_before_backend_mutation() -> None:
+    events: list[object] = []
+    attach = SimpleNamespace(
+        _detached=False,
+        _terminally_stopped=False,
+        _attach_restart_deferred=False,
+        _cancel_pending_connect=lambda: events.append("cancel-connect"),
+        _teardown_stream=lambda: events.append("teardown"),
+    )
+
+    assert AttachTerminal.defer_attach_for_target_replacement(attach) is True
+    assert attach._attach_restart_deferred is True
+    assert events == ["cancel-connect", "teardown"]
+
+    # Idempotence is required because both the initiating UI action and a late
+    # control-client disconnect can observe the same replacement generation.
+    assert AttachTerminal.defer_attach_for_target_replacement(attach) is True
+    assert events == ["cancel-connect", "teardown"]
+
+
+def test_pane_death_uses_recovery_handler_instead_of_leaving_dead_input_surface() -> None:
+    terminal = mock.Mock()
+    attach = SimpleNamespace(
+        _stream_generation=4,
+        _detached=False,
+        terminal=terminal,
+        _pane_dead_handler=lambda: True,
+    )
+
+    assert AttachTerminal._apply_pane_dead(attach, 4) is False
+    terminal.feed.assert_not_called()
+
+
+def test_unrecoverable_pane_death_still_surfaces_terminal_exit() -> None:
+    terminal = mock.Mock()
+    attach = SimpleNamespace(
+        _stream_generation=4,
+        _detached=False,
+        terminal=terminal,
+        _pane_dead_handler=lambda: False,
+    )
+
+    assert AttachTerminal._apply_pane_dead(attach, 4) is False
+    terminal.feed.assert_called_once()
+    assert b"process exited" in terminal.feed.call_args.args[0]

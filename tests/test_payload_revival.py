@@ -1,8 +1,7 @@
-"""Startup revival of dead Codex/Claude payloads inside surviving tmux panes.
+"""Startup revival of dead or missing managed terminal payloads.
 
-A payload crash leaves the launch command's trailing fallback shell running,
-so the registry keeps saying ``running`` while the tab replays a finished
-conversation.  These tests pin the sweep's candidate selection and its
+A canonical generic recipe—not an agent name, account directory, or conversation
+format—is the restart authority. These tests pin candidate selection and the
 fail-closed delegation to ``create_or_resume``.
 """
 
@@ -72,19 +71,33 @@ class FakeStore:
 
 
 class PayloadRevivalCandidateTests(unittest.TestCase):
-    def test_candidates_require_full_recovery_tuple(self):
+    def test_candidates_require_valid_automatic_generic_recipe(self):
         good = make_record("good")
+        manual = make_record("manual", restart_policy="manual")
+        corrupt = make_record(
+            "corrupt",
+            recovery_recipe="{}",
+            recovery_recipe_sha256="0" * 64,
+        )
         rows = payload_revival_candidates(
             [
                 good,
                 make_record("external", external=True),
                 make_record("stopped", status="stopped"),
+                make_record("archived", status="archived"),
+                # Optional account/native-resume metadata is not required; the
+                # original command/cwd still form a generic legacy recipe.
                 make_record("no-home", codex_home=""),
                 make_record("no-cmd", recovery_command=None),
                 make_record("no-cwd", recovery_cwd="  "),
+                manual,
+                corrupt,
             ]
         )
-        self.assertEqual([record.id for record in rows], ["good"])
+        self.assertEqual(
+            [record.id for record in rows],
+            ["good", "no-cmd", "no-cwd", "no-home"],
+        )
 
     def test_candidates_order_visible_tabs_first(self):
         hidden = make_record("hidden", visible=False, tab_index=0)

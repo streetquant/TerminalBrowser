@@ -47,6 +47,35 @@ class SessionStoreLayoutTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_unbounded_restore_keeps_all_eighty_five_generic_tabs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                created = []
+                for index in range(85):
+                    record = store.create(
+                        f"generic-{index:02d}",
+                        "generic",
+                        f"generic-tui --resume durable-{index:02d}",
+                        tmp,
+                        window_id="win-generic",
+                        window_title="Generic tools",
+                        tab_index=index,
+                    )
+                    created.append(store.update(record.id, status="running"))
+
+                restored = store.restore_candidates(window_id="win-generic")
+
+                self.assertEqual([row.id for row in restored], [row.id for row in created])
+                self.assertEqual(len(restored), 85)
+                self.assertTrue(all(row.recovery_recipe for row in restored))
+                self.assertTrue(all(row.recovery_recipe_sha256 for row in restored))
+                self.assertTrue(all(row.codex_home is None for row in restored))
+                self.assertTrue(all(row.auth_scope_id is None for row in restored))
+                self.assertEqual(len(store.restore_candidates(limit=12, window_id="win-generic")), 12)
+            finally:
+                store.close()
+
     def test_remembered_window_survives_when_all_tabs_are_stopped_and_hidden(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "sessions.sqlite3"

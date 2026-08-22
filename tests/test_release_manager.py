@@ -63,6 +63,17 @@ DIST_INFO = f"t1000-{VERSION}.dist-info"
 WHEEL_NAME = f"t1000-{VERSION}-py3-none-any.whl"
 BOOT_ID = "11111111-2222-4333-8444-555555555555"
 
+# Synchronization-only test horizons must remain bounded but cannot assume an
+# otherwise healthy worker is scheduled within one or two seconds on a host
+# experiencing sustained kernel I/O pressure. Tests that intentionally verify
+# production timeout behavior patch the production timeout to milliseconds and
+# are not governed by these values.
+_TEST_CONCURRENCY_START_TIMEOUT_SECONDS = 120.0
+_TEST_CONCURRENCY_RELEASE_TIMEOUT_SECONDS = 120.0
+_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS = 180.0
+_TEST_CONCURRENCY_BARRIER_TIMEOUT_SECONDS = 120.0
+_TEST_CONCURRENCY_SETTLE_SECONDS = 2.0
+
 
 def build_info(seed: str, *, version: str = VERSION) -> dict[str, object]:
     info: dict[str, object] = {
@@ -2844,7 +2855,7 @@ def test_process_observer_singleflight_coalesces_only_inflight_requests() -> Non
         with counter_lock:
             dispatch_count += 1
         entered.set()
-        assert release.wait(2.0)
+        assert release.wait(_TEST_CONCURRENCY_RELEASE_TIMEOUT_SECONDS)
         return release_manager._ProcessObserverTransportResult(
             "broker-output-ready",
             b"{}\n",
@@ -2858,7 +2869,7 @@ def test_process_observer_singleflight_coalesces_only_inflight_requests() -> Non
             key,
             dispatch,
         )
-        assert entered.wait(1.0)
+        assert entered.wait(_TEST_CONCURRENCY_START_TIMEOUT_SECONDS)
         followers = [
             executor.submit(
                 release_manager._process_observer_transport_singleflight,
@@ -2867,14 +2878,14 @@ def test_process_observer_singleflight_coalesces_only_inflight_requests() -> Non
             )
             for _ in range(15)
         ]
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + _TEST_CONCURRENCY_START_TIMEOUT_SECONDS
         while not all(future.running() for future in followers):
             assert time.monotonic() < deadline
             time.sleep(0.001)
-        time.sleep(0.05)
+        time.sleep(_TEST_CONCURRENCY_SETTLE_SECONDS)
         release.set()
-        results = [leader.result(timeout=2.0)] + [
-            future.result(timeout=2.0) for future in followers
+        results = [leader.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS)] + [
+            future.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS) for future in followers
         ]
 
     assert dispatch_count == 1
@@ -2915,7 +2926,7 @@ def test_process_observer_singleflight_does_not_merge_different_keys() -> None:
     def dispatch(label: str) -> release_manager._ProcessObserverTransportResult:
         with counter_lock:
             calls.append(label)
-        barrier.wait(timeout=2.0)
+        barrier.wait(timeout=_TEST_CONCURRENCY_BARRIER_TIMEOUT_SECONDS)
         return release_manager._ProcessObserverTransportResult(
             "broker-output-ready",
             label.encode("ascii"),
@@ -2932,7 +2943,7 @@ def test_process_observer_singleflight_does_not_merge_different_keys() -> None:
             ("two",),
             lambda: dispatch("two"),
         )
-        results = (first.result(timeout=3.0), second.result(timeout=3.0))
+        results = (first.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS), second.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS))
     assert sorted(calls) == ["one", "two"]
     assert all(
         metadata == {"singleflight_role": "leader", "broker_shared": False}
@@ -2974,7 +2985,7 @@ def test_process_observer_singleflight_leader_exception_releases_followers() -> 
 
     def dispatch() -> release_manager._ProcessObserverTransportResult:
         entered.set()
-        assert release.wait(2.0)
+        assert release.wait(_TEST_CONCURRENCY_RELEASE_TIMEOUT_SECONDS)
         raise RuntimeError("unexpected observer failure")
 
     with release_manager._PROCESS_OBSERVER_FLIGHT_LOCK:
@@ -2985,7 +2996,7 @@ def test_process_observer_singleflight_leader_exception_releases_followers() -> 
             key,
             dispatch,
         )
-        assert entered.wait(1.0)
+        assert entered.wait(_TEST_CONCURRENCY_START_TIMEOUT_SECONDS)
         followers = [
             executor.submit(
                 release_manager._process_observer_transport_singleflight,
@@ -2994,15 +3005,15 @@ def test_process_observer_singleflight_leader_exception_releases_followers() -> 
             )
             for _ in range(4)
         ]
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + _TEST_CONCURRENCY_START_TIMEOUT_SECONDS
         while not all(future.running() for future in followers):
             assert time.monotonic() < deadline
             time.sleep(0.001)
-        time.sleep(0.05)
+        time.sleep(_TEST_CONCURRENCY_SETTLE_SECONDS)
         release.set()
         with pytest.raises(RuntimeError, match="unexpected observer failure"):
-            leader.result(timeout=2.0)
-        follower_results = [future.result(timeout=2.0) for future in followers]
+            leader.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS)
+        follower_results = [future.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS) for future in followers]
 
     assert all(
         result.result_code == "broker-leader-exception"
@@ -3075,7 +3086,7 @@ def test_shared_process_observer_transport_keeps_caller_specific_validation(
         with counter_lock:
             dispatch_count += 1
         entered.set()
-        assert release.wait(2.0)
+        assert release.wait(_TEST_CONCURRENCY_RELEASE_TIMEOUT_SECONDS)
         return transport
 
     def validate(payload_value, **kwargs):
@@ -3105,7 +3116,7 @@ def test_shared_process_observer_transport_keeps_caller_specific_validation(
                 expected_uid=uid,
                 direct=direct_empty,
             )
-            assert entered.wait(1.0)
+            assert entered.wait(_TEST_CONCURRENCY_START_TIMEOUT_SECONDS)
             follower = executor.submit(
                 release_manager._scan_managed_gui_processes_via_user_manager,
                 layout,
@@ -3113,13 +3124,13 @@ def test_shared_process_observer_transport_keeps_caller_specific_validation(
                 expected_uid=uid,
                 direct=direct_subset,
             )
-            deadline = time.monotonic() + 1.0
+            deadline = time.monotonic() + _TEST_CONCURRENCY_START_TIMEOUT_SECONDS
             while not follower.running():
                 assert time.monotonic() < deadline
                 time.sleep(0.001)
-            time.sleep(0.05)
+            time.sleep(_TEST_CONCURRENCY_SETTLE_SECONDS)
             release.set()
-            results = (leader.result(timeout=2.0), follower.result(timeout=2.0))
+            results = (leader.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS), follower.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS))
 
     assert dispatch_count == 1
     # The leader validates its empty direct subset before publication and again
@@ -3273,7 +3284,7 @@ def test_direct_process_scan_singleflight_coalesces_and_reparses(
         with counter_lock:
             calls += 1
         entered.set()
-        assert release.wait(2.0)
+        assert release.wait(_TEST_CONCURRENCY_RELEASE_TIMEOUT_SECONDS)
         return copy.deepcopy(status)
 
     def call():
@@ -3293,16 +3304,16 @@ def test_direct_process_scan_singleflight_coalesces_and_reparses(
     ):
         with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
             leader = executor.submit(call)
-            assert entered.wait(1.0)
+            assert entered.wait(_TEST_CONCURRENCY_START_TIMEOUT_SECONDS)
             followers = [executor.submit(call) for _ in range(15)]
-            deadline = time.monotonic() + 1.0
+            deadline = time.monotonic() + _TEST_CONCURRENCY_START_TIMEOUT_SECONDS
             while not all(future.running() for future in followers):
                 assert time.monotonic() < deadline
                 time.sleep(0.001)
-            time.sleep(0.05)
+            time.sleep(_TEST_CONCURRENCY_SETTLE_SECONDS)
             release.set()
-            results = [leader.result(timeout=2.0)] + [
-                future.result(timeout=2.0) for future in followers
+            results = [leader.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS)] + [
+                future.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS) for future in followers
             ]
 
     assert calls == 1
@@ -3359,7 +3370,7 @@ def test_direct_process_scan_singleflight_does_not_merge_different_keys(
         label = str(proc_root)
         with lock:
             calls.append(label)
-        barrier.wait(timeout=2.0)
+        barrier.wait(timeout=_TEST_CONCURRENCY_BARRIER_TIMEOUT_SECONDS)
         return release_manager._direct_scan_failure_status(
             state,
             expected_uid=uid,
@@ -3382,7 +3393,7 @@ def test_direct_process_scan_singleflight_does_not_merge_different_keys(
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             first = executor.submit(call, proc_root)
             second = executor.submit(call, other_proc)
-            results = (first.result(timeout=3.0), second.result(timeout=3.0))
+            results = (first.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS), second.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS))
     assert sorted(calls) == sorted([str(proc_root), str(other_proc)])
     assert all(
         metadata == {
@@ -3953,7 +3964,11 @@ def test_cross_process_registry_lock_is_released_before_different_key_dispatch(
     def dispatch(label: str) -> release_manager._ProcessObserverTransportResult:
         with entered_lock:
             entered.append(label)
-        barrier.wait(timeout=2.0)
+        # The falsifier is whether both distinct-key dispatches can enter before
+        # either one returns, not whether a saturated filesystem schedules both
+        # worker threads within two seconds. A retained registry lock still
+        # forces this bounded barrier to fail.
+        barrier.wait(timeout=_TEST_CONCURRENCY_BARRIER_TIMEOUT_SECONDS)
         return release_manager._ProcessObserverTransportResult(
             "broker-output-ready",
             label.encode("ascii") + b"\n",
@@ -3974,7 +3989,7 @@ def test_cross_process_registry_lock_is_released_before_different_key_dispatch(
             runtime_root=runtime,
             dispatch=lambda: dispatch("two"),
         )
-        results = (first.result(timeout=3.0), second.result(timeout=3.0))
+        results = (first.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS), second.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS))
 
     assert sorted(entered) == ["one", "two"]
     assert all(result.cross_process_role == "leader" for result in results)
@@ -4331,7 +4346,7 @@ def test_cross_process_leader_exception_publishes_and_wakes_followers(
 
     def leader_dispatch() -> release_manager._ProcessObserverTransportResult:
         entered.set()
-        assert release.wait(2.0)
+        assert release.wait(_TEST_CONCURRENCY_RELEASE_TIMEOUT_SECONDS)
         raise RuntimeError("unexpected broker failure")
 
     follower_dispatch = mock.Mock(
@@ -4345,7 +4360,7 @@ def test_cross_process_leader_exception_publishes_and_wakes_followers(
             dispatch=leader_dispatch,
             runtime_root=runtime,
         )
-        assert entered.wait(1.0)
+        assert entered.wait(_TEST_CONCURRENCY_START_TIMEOUT_SECONDS)
         follower = executor.submit(
             release_manager._process_observer_cross_process_singleflight,
             key,
@@ -4353,15 +4368,15 @@ def test_cross_process_leader_exception_publishes_and_wakes_followers(
             dispatch=follower_dispatch,
             runtime_root=runtime,
         )
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + _TEST_CONCURRENCY_START_TIMEOUT_SECONDS
         while not follower.running():
             assert time.monotonic() < deadline
             time.sleep(0.001)
-        time.sleep(0.05)
+        time.sleep(_TEST_CONCURRENCY_SETTLE_SECONDS)
         release.set()
         with pytest.raises(RuntimeError, match="unexpected broker failure"):
-            leader.result(timeout=2.0)
-        follower_result = follower.result(timeout=2.0)
+            leader.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS)
+        follower_result = follower.result(timeout=_TEST_CONCURRENCY_RESULT_TIMEOUT_SECONDS)
     follower_dispatch.assert_not_called()
     assert follower_result.result_code == "cross-process-leader-exception"
     assert follower_result.cross_process_role == "follower"

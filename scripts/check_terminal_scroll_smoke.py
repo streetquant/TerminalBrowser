@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Verify native VTE scrollback and alternate-screen wheel routing.
+"""Verify application-aware history, VTE selection, and TUI wheel routing.
 
-TermDeck's control-mode renderer has one client-side terminal model: VTE. The
-first pane replay seeds VTE's normal-screen scrollback, the visible scrollbar is
-bound to that native adjustment, and plain wheel events are deliberately left to
-VTE. Alternate-screen applications therefore receive VTE's normal fallback keys
-or their negotiated mouse protocol; TermDeck never enters tmux copy mode or
-maintains a second history-depth model.
+The persistent scrollbar owns Termdeck's tmux/TUI history model. VTE's native
+adjustment remains separate and is exposed only while a real text selection owns
+the viewport. Wheel navigation must be incremental, must never leak shell arrow
+keys into ordinary shells or composers. Alternate-screen applications that
+negotiate mouse reporting retain that protocol; no-mouse TUIs receive neither
+synthetic arrows nor an unrelated tmux history surface.
 """
 
 from __future__ import annotations
@@ -281,65 +281,63 @@ sys.stdout.flush()
             fallback_record = records["alternate-fallback"]
             native_record = records["native-mouse"]
 
-            # Normal-screen history is replayed into VTE once and thereafter
-            # belongs to VTE's native adjustment and visible scrollbar.
+            # The persistent bar owns application-aware tmux history. VTE's
+            # adjustment remains available for selection review only.
             _drain(Gtk, until=shell_ready.exists)
             window._focus_session(shell_record.id)
             shell_attach = window.tabs[shell_record.id].widget
             shell_terminal = shell_attach.terminal
-            shell_adjustment = shell_attach.native_adjustment
+            shell_history = shell_attach.history_adjustment
+            shell_native = shell_attach.native_adjustment
             _drain(
                 Gtk,
                 until=lambda: (
                     window.current_session_id() == shell_record.id
                     and shell_terminal.get_mapped()
                     and getattr(shell_attach.controller, "_ready", False)
-                    and _adjustment_state(shell_adjustment)["bottom"]
-                    > _adjustment_state(shell_adjustment)["lower"] + 100
                 ),
             )
+            if shell_attach.scrollbar.get_adjustment() is not shell_history:
+                raise AssertionError(
+                    "shell scrollbar is not bound to application-aware history"
+                )
+            if shell_history is shell_native:
+                raise AssertionError("application history was conflated with VTE selection")
             shell_attach.scroll_to_bottom()
             _drain(
                 Gtk,
-                until=lambda: _adjustment_state(shell_adjustment)["value"]
-                >= _adjustment_state(shell_adjustment)["bottom"] - 0.5,
+                until=lambda: _adjustment_state(shell_history)["value"]
+                >= _adjustment_state(shell_history)["bottom"] - 0.5,
             )
-            if shell_attach.scrollbar.get_adjustment() is not shell_adjustment:
-                raise AssertionError("shell scrollbar is not bound to VTE's native history")
-            before = _adjustment_state(shell_adjustment)
+            before = _adjustment_state(shell_history)
+            shell_bytes_before_down = shell_input.read_bytes() if shell_input.exists() else b""
+
             _wheel_up(shell_terminal, clicks=3)
             _drain(
                 Gtk,
-                until=lambda: _adjustment_state(shell_adjustment)["value"]
+                until=lambda: _adjustment_state(shell_history)["value"]
                 < before["value"] - 2,
             )
-            after_up = _adjustment_state(shell_adjustment)
-            if _pane_modes(app, shell_record)[1] != 0:
-                raise AssertionError("normal VTE wheel unexpectedly entered tmux copy mode")
-            shell_bytes_before_down = shell_input.read_bytes() if shell_input.exists() else b""
+            after_up = _adjustment_state(shell_history)
+            if _pane_modes(app, shell_record)[1] != 1:
+                raise AssertionError(
+                    "application-aware shell history did not enter its tmux-owned review surface"
+                )
 
-            # Model a deep native scrollbar drag, then verify one wheel-down is
-            # incremental rather than throwing the viewport to the live edge.
-            deep_target = max(after_up["lower"], after_up["bottom"] - 60.0)
-            shell_adjustment.set_value(deep_target)
-            _drain(
-                Gtk,
-                until=lambda: abs(_adjustment_state(shell_adjustment)["value"] - deep_target)
-                < 0.75,
-            )
-            deep = _adjustment_state(shell_adjustment)
+            # One down step from history is incremental; it must not throw the
+            # viewport back to the composer/live edge.
             _wheel_down(shell_terminal)
             _drain(
                 Gtk,
-                until=lambda: _adjustment_state(shell_adjustment)["value"]
-                > deep["value"] + 0.5,
+                until=lambda: _adjustment_state(shell_history)["value"]
+                > after_up["value"] + 0.5,
             )
-            after_down = _adjustment_state(shell_adjustment)
-            down_delta = after_down["value"] - deep["value"]
+            after_down = _adjustment_state(shell_history)
+            down_delta = after_down["value"] - after_up["value"]
             if down_delta > 10.0 or after_down["value"] >= after_down["bottom"] - 0.5:
                 raise AssertionError(
-                    "one native wheel-down jumped to the live edge: "
-                    f"deep={deep}, after={after_down}"
+                    "one application-history wheel-down jumped to the live edge: "
+                    f"before={after_up}, after={after_down}"
                 )
             shell_bytes_after_down = shell_input.read_bytes() if shell_input.exists() else b""
             wheel_bytes = shell_bytes_after_down[len(shell_bytes_before_down) :]
@@ -353,14 +351,17 @@ sys.stdout.flush()
             )
             _drain(
                 Gtk,
-                until=lambda: _adjustment_state(shell_adjustment)["value"]
-                >= _adjustment_state(shell_adjustment)["bottom"] - 0.5,
+                until=lambda: _adjustment_state(shell_history)["value"]
+                >= _adjustment_state(shell_history)["bottom"] - 0.5,
             )
-            shell_final = _adjustment_state(shell_adjustment)
+            shell_final = _adjustment_state(shell_history)
+            if _pane_modes(app, shell_record)[1] != 0:
+                raise AssertionError("live terminal input did not leave tmux history review")
 
-            # A no-mouse alternate-screen app receives VTE's fallback arrows.
-            # TermDeck does not open tmux copy mode or maintain a parallel
-            # application-history model.
+            # A no-mouse alternate-screen app must not receive synthetic
+            # Up/Down keys from a physical wheel. Those keys can mutate a TUI
+            # composer or selector. Termdeck also must not open tmux copy mode
+            # over the application's alternate screen.
             _drain(Gtk, until=fallback_ready.exists)
             window._focus_session(fallback_record.id)
             fallback_attach = window.tabs[fallback_record.id].widget
@@ -374,10 +375,16 @@ sys.stdout.flush()
                     and _pane_modes(app, fallback_record)[0] == 1
                 ),
             )
+            fallback_before_wheel = list(_events(fallback_events))
             _wheel_up(fallback_terminal)
-            _drain(Gtk, until=lambda: _events(fallback_events).count("up") >= 1)
             _wheel_down(fallback_terminal)
-            _drain(Gtk, until=lambda: _events(fallback_events).count("down") >= 1)
+            _drain(Gtk)
+            fallback_after_wheel = list(_events(fallback_events))
+            if fallback_after_wheel != fallback_before_wheel:
+                raise AssertionError(
+                    "no-mouse alternate-screen wheel synthesized child input: "
+                    f"before={fallback_before_wheel}, after={fallback_after_wheel}"
+                )
             if _pane_modes(app, fallback_record)[1] != 0:
                 raise AssertionError("alternate fallback wheel entered tmux copy mode")
             subprocess.run(["xdotool", "key", "x"], check=True, timeout=5)
@@ -413,10 +420,9 @@ sys.stdout.flush()
                 json.dumps(
                     {
                         "ok": True,
-                        "history_owner": "vte-native-adjustment",
+                        "history_owner": "application-aware-history-proxy",
                         "shell_before": before,
                         "shell_after_up": after_up,
-                        "shell_deep": deep,
                         "shell_after_single_down": after_down,
                         "shell_single_down_delta": round(down_delta, 3),
                         "shell_final_live_edge": shell_final,

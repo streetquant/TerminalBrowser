@@ -6,6 +6,11 @@ from typing import Iterable, Protocol
 from .liveness import merge_confirmed_pane_snapshot
 from .models import ResourceSnapshot, SessionRecord
 from .resources import ResourceSampler
+from .session_recipe import (
+    SessionRecipeError,
+    automatic_recovery_allowed,
+    recipe_from_record,
+)
 from .session_store import SessionStore, utc_now
 from .tmux_backend import TmuxBackend, TmuxError
 
@@ -116,6 +121,15 @@ def _sample_many(
     return [sampler.snapshot(pid) for pid in root_pids]
 
 
+def _automatic_recovery_available(record: SessionRecord) -> bool:
+    if getattr(record, "external", False):
+        return False
+    try:
+        return automatic_recovery_allowed(recipe_from_record(record))
+    except SessionRecipeError:
+        return False
+
+
 def _desired_state(
     record: SessionRecord,
     *,
@@ -147,20 +161,37 @@ def _desired_state(
         return "new", visible, None, "not started yet"
 
     if before == "recovery-pending":
-        return "recovery-pending", visible, None, "exact recovery is still pending"
+        if _automatic_recovery_available(record):
+            return (
+                "recovery-pending",
+                visible,
+                None,
+                "durable generic recovery is still pending",
+            )
+        return (
+            "recovery-pending",
+            visible,
+            None,
+            "recovery is pending but no valid automatic recipe is available",
+        )
 
     if before == "stopped":
         return "stopped", visible, None, "already stopped"
 
     if (
         recover_missing
-        and not getattr(record, "external", False)
         and before in {"running", "paused", "missing", "remembered", "start-error"}
+        and _automatic_recovery_available(record)
     ):
         # A host crash removes tmux along with its child processes. Preserve a
-        # distinct recovery state so startup cannot confuse a lost process with
-        # a deliberately new tab and silently replay its launch command.
-        return "recovery-pending", visible, None, "missing managed session requires exact recovery"
+        # distinct recovery state and let the backend replay only the canonical,
+        # digest-bound generic recipe. No application/tool parser is required.
+        return (
+            "recovery-pending",
+            visible,
+            None,
+            "missing managed session has an authorized durable recovery recipe",
+        )
 
     # Browser-like recovery rule: if a remembered running/paused tab has lost
     # its hidden backend session, do not leave it looking restorable.
@@ -184,9 +215,11 @@ def reconcile_records(
     TermDeck's browser registry may survive longer than the actual tmux/process
     tree.  This function reconciles the registry with the live backend before a
     restore or when the user asks for a CLI health repair. When
-    ``recover_missing`` is enabled, missing managed sessions become restartable
-    ``new`` records without changing their visibility or layout. This function
-    never starts new processes and it never exposes backend commands.
+    ``recover_missing`` is enabled, missing managed sessions with a valid
+    automatic recipe become ``recovery-pending`` without changing visibility or
+    layout. This function never starts new processes and never exposes backend
+    commands. External, stopped, archived, manual, and corrupt recipes remain
+    fail-closed.
     """
 
     backend = backend or TmuxBackend()

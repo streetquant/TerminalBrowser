@@ -139,29 +139,31 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertNotIn("lambda: self.window.retag_sessions(records)", side)
         self.assertIn("lambda: self._kill_records(records)", side)
 
-    def test_terminal_history_is_owned_by_native_vte_scrollback(self) -> None:
+    def test_terminal_history_ownership_cannot_regress_to_native_vte_scrollbar(self) -> None:
         terminal = _section(GTK_APP, "class AttachTerminal", "class WindowOverview")
+        wheel = _section(terminal, "def _on_terminal_scroll", "# ------------------------------------------------------------------ #\n    # Scroll-idle auto-resume")
+        thumb = _section(terminal, "def _on_history_scrollbar_value_changed", "def _feed_text")
 
         self.assertIn("self.native_adjustment = self.terminal.get_vadjustment()", terminal)
-        self.assertIn("adjustment=self.native_adjustment,", terminal)
-        self.assertNotIn("self.history_adjustment", terminal)
+        self.assertIn("self.history_adjustment = Gtk.Adjustment.new(", terminal)
+        self.assertNotIn("self.history_adjustment = self.terminal.get_vadjustment()", terminal)
         self.assertNotIn("_scrollbar_at_live_edge", terminal)
         self.assertNotIn("def _move_scrollbar", terminal)
-        self.assertNotIn("_queue_history_scroll_delta", terminal)
         self.assertIn("def _move_native_history", terminal)
-        self.assertIn("self.terminal.set_enable_fallback_scrolling(True)", terminal)
-        self.assertIn("self.terminal.set_scroll_on_output(False)", terminal)
-        self.assertIn("self.terminal.set_scroll_on_keystroke(True)", terminal)
+        self.assertIn("outcome.reached_live_edge", wheel)
+        self.assertNotIn("get_vadjustment", wheel)
+        self.assertIn("self._queue_history_scroll_delta(delta)", thumb)
+        self.assertNotIn("self._scroll_handler(", thumb)
 
-    def test_terminal_wheel_defers_to_vte_unless_a_selection_is_held(self) -> None:
+    def test_terminal_history_live_edge_is_backend_evidence_not_scrollbar_geometry(self) -> None:
         terminal = _section(GTK_APP, "class AttachTerminal", "class WindowOverview")
         wheel = _section(terminal, "def _on_terminal_scroll", "# ------------------------------------------------------------------ #\n    # Scroll-idle auto-resume")
 
-        self.assertIn("if not has_selection:", wheel)
-        self.assertIn("self._move_native_history(line_delta)", wheel)
-        self.assertNotIn("reached_live_edge", wheel)
+        self.assertIn("if outcome.reached_live_edge:", wheel)
+        self.assertIn("self.prepare_for_live_input()", wheel)
+        self.assertNotIn("line_delta > 0 and", wheel)
         self.assertNotIn("_history_bottom_value()", wheel)
-        self.assertNotIn("prepare_for_live_input", wheel)
+        self.assertNotIn("_native_bottom_value()", wheel)
 
     def test_heavy_search_filters_debounce_refresh_work(self) -> None:
         self.assertIn("def _connect_debounced_refresh", GTK_APP)

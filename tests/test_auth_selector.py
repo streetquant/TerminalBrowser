@@ -678,3 +678,86 @@ def test_quit_is_deferred_while_any_auth_switch_is_inflight() -> None:
     assert TermDeckApplication.quit_preserving_sessions(app) is False
     assert quit_calls == []
     assert messages == ["T1000 will stay open until the Codex account switch finishes"]
+
+
+def test_account_switch_defers_stream_before_any_backend_mutation() -> None:
+    state = _state(selected="alpha")
+    record = SimpleNamespace(
+        id="ordered-switch",
+        name="Ordered switch",
+        external=False,
+        selected_account="alpha",
+        pending_account=None,
+        auth_restart_required=False,
+    )
+    events: list[str] = []
+
+    class Store:
+        def update(self, session_id, **changes):
+            assert session_id == record.id
+            for key, value in changes.items():
+                setattr(record, key, value)
+            return record
+
+    class ImmediateThread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+
+        def start(self) -> None:
+            self.target()
+
+    class TransactionLock:
+        def __enter__(self):
+            events.append("lock")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("unlock")
+
+    widget = SimpleNamespace(
+        defer_attach_for_target_replacement=lambda: events.append("defer") or True,
+    )
+    combo = ComboStub()
+    combo.active_id = "beta"
+    transaction = AuthTransactionResult(
+        True,
+        switch_result=CodexSwitchResult(True, _state(selected="beta")),
+        activation=AuthActivationResult(True, False),
+    )
+    manager = SimpleNamespace(state=lambda _record: state)
+    backend = SimpleNamespace(private_auth_environment_ready=lambda _record: True)
+    window = SimpleNamespace(
+        _auth_combo_updating=False,
+        _auth_switch_inflight=set(),
+        _auth_switch_generation={},
+        _auth_attach_protected=set(),
+        app_context=SimpleNamespace(backend=backend, codex_auth=manager, store=Store()),
+        tabs={record.id: SimpleNamespace(record=record, widget=widget)},
+        current_record=lambda: record,
+        show_toast=lambda *_args, **_kwargs: None,
+        _complete_auth_switch=lambda *_args: False,
+    )
+
+    def execute(*args):
+        events.append("execute")
+        return transaction
+
+    with mock.patch(
+        "termdeck.gtk_app.auth_transaction_lock",
+        return_value=TransactionLock(),
+    ), mock.patch(
+        "termdeck.gtk_app.execute_auth_change",
+        side_effect=execute,
+    ), mock.patch(
+        "termdeck.gtk_app.threading.Thread",
+        ImmediateThread,
+    ), mock.patch(
+        "termdeck.gtk_app._schedule_glib_callback",
+        return_value=(True, ""),
+    ):
+        TermDeckWindow._on_auth_account_changed(window, combo)
+
+    assert events == ["defer", "lock", "execute"]
+    assert window._auth_attach_protected == {record.id}
+    assert window._auth_switch_inflight == {record.id}
+    assert record.pending_account == "beta"

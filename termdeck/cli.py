@@ -10,9 +10,22 @@ from pathlib import Path
 
 from . import __version__
 from .activity import activity_to_dicts, filter_activities, render_activity_table, scan_activities, sort_activities
-from .codex_auth import CodexAuthError, CodexAuthManager
 from .browser_snapshot import BrowserSnapshotError, browser_snapshot_json, import_browser_snapshot, load_snapshot, restore_plan
 from .build_info import BuildIdentityError, release_status
+
+
+# Stable injectable lazy factory. Generic CLI commands never import the optional
+# Codex account integration; tests/embedders can replace this symbol explicitly.
+CodexAuthManager = None
+
+
+def _codex_auth_manager_class():
+    injected = globals().get("CodexAuthManager")
+    if injected is not None:
+        return injected
+    from .codex_auth import CodexAuthManager as manager_class
+
+    return manager_class
 from .command_palette import build_palette_items, search_palette, serialise_palette_items
 from .capture_search import render_output_search_table, search_session_output
 from .control_plan import build_control_plan
@@ -1488,8 +1501,14 @@ def _persist_auth_update_with_retry(
 
 
 def cmd_auth(args: argparse.Namespace) -> int:
-    """Inspect or switch the private Codex account for exactly one terminal."""
+    """Opt into, inspect, or switch one terminal's private Codex account."""
 
+    # Account integration is deliberately loaded only for this optional command.
+    # Every other CLI path, including create/list/reconcile/recover, remains
+    # independent of Codex and codex-auth.
+    from .codex_auth import CodexAuthError
+
+    manager_class = _codex_auth_manager_class()
     store = SessionStore(args.db)
     try:
         records = _select_records(store, [args.selector])
@@ -1518,7 +1537,11 @@ def cmd_auth(args: argparse.Namespace) -> int:
                 }
             )
             return 2
-        manager = CodexAuthManager(account_source=store.account_source)
+        # The generic terminal registry creates no account directory. Explicitly
+        # invoking ``auth`` is the opt-in boundary that provisions one immutable
+        # private scope while leaving the durable session recipe unchanged.
+        record = store.ensure_auth_scope(record.id)
+        manager = manager_class(account_source=store.account_source)
         requested = (getattr(args, "switch_account", None) or "").strip()
         activation = None
         transaction_ok = True
@@ -1596,7 +1619,7 @@ def cmd_auth(args: argparse.Namespace) -> int:
             )
         _print_json(payload)
         return 0 if transaction_ok else 1
-    except CodexAuthError as exc:
+    except (CodexAuthError, OSError, ValueError) as exc:
         _print_json({"action": "auth", "ok": False, "error": str(exc)})
         return 1
     finally:
