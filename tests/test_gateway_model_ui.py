@@ -272,6 +272,64 @@ def test_successful_restart_persists_pid_and_resolves_protected_attach(tmp_path:
     assert "43 gateway models" in messages[-1][0]
 
 
+def test_false_dead_completion_repairs_live_status_without_claiming_restart(tmp_path: Path) -> None:
+    record = SessionRecord(
+        **{
+            **_record(tmp_path, record_id="false-dead").__dict__,
+            "status": "recovery-pending",
+            "last_pid": 321,
+            "recovery_last_error": "managed pane is not authoritatively dead",
+        }
+    )
+    updated = SessionRecord(
+        **{
+            **record.__dict__,
+            "status": "running",
+            "recovery_last_error": None,
+        }
+    )
+    updates = []
+    resolved = []
+    messages = []
+    window = SimpleNamespace(
+        _payload_restart_generation={record.id: 4},
+        _payload_restart_inflight={record.id},
+        _payload_restart_backoff_until={record.id: 999.0},
+        _auth_attach_protected={record.id},
+        tabs={record.id: SimpleNamespace(record=record, widget=object())},
+        app_context=SimpleNamespace(
+            store=SimpleNamespace(
+                get=lambda _sid: record,
+                update=lambda _sid, **changes: updates.append(changes) or updated,
+            )
+        ),
+        _resolve_auth_attach_gap=lambda sid: resolved.append(sid),
+        _refresh_gateway_model_control=lambda force=False: None,
+        show_toast=lambda message, **kwargs: messages.append((message, kwargs)),
+        side=SimpleNamespace(refresh=lambda: None),
+    )
+
+    TermDeckWindow._complete_managed_payload_restart(
+        window,
+        record.id,
+        4,
+        321,
+        "",
+        "dead",
+        0,
+        "alive",
+    )
+
+    assert updates[0]["status"] == "running"
+    assert updates[0]["last_pid"] == 321
+    assert updates[0]["recovery_last_error"] is None
+    assert window.tabs[record.id].record is updated
+    assert resolved == [record.id]
+    assert record.id not in window._payload_restart_backoff_until
+    assert "remained live" in messages[-1][0]
+    assert "Recovered" not in messages[-1][0]
+
+
 def test_failed_restart_sets_backoff_and_reconnects_once(tmp_path: Path) -> None:
     record = _record(tmp_path)
     updates = []

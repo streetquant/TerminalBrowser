@@ -163,52 +163,69 @@ class TerminalFocusRoutingTest(TestCase):
         self.assertTrue(handled)
         self.assertEqual(routed, [event])
 
-    def test_plain_ctrl_l_is_content_preserving_noop(self) -> None:
-        event = SimpleNamespace(
-            keyval=gtk_app.Gdk.KEY_l,
-            state=gtk_app.Gdk.ModifierType.CONTROL_MASK,
+    def test_focused_terminal_ctrl_l_is_not_consumed_by_termdeck(self) -> None:
+        calls = []
+        record = SimpleNamespace(id="live")
+        attach = SimpleNamespace(
+            terminal=SimpleNamespace(get_has_selection=lambda: False),
+            copy_clipboard=lambda: calls.append("copy"),
+            paste_clipboard=lambda: calls.append("paste"),
+            prepare_for_live_input=lambda: calls.append("restore") or True,
+            history_proxy_active=lambda: False,
         )
-
-        self.assertTrue(TermDeckWindow._is_plain_ctrl_l_event(event))
-        self.assertFalse(
-            TermDeckWindow._is_plain_ctrl_l_event(
-                SimpleNamespace(
-                    keyval=gtk_app.Gdk.KEY_l,
-                    state=gtk_app.Gdk.ModifierType.CONTROL_MASK
-                    | gtk_app.Gdk.ModifierType.SHIFT_MASK,
-                )
-            )
-        )
-        self.assertFalse(
-            TermDeckWindow._is_plain_ctrl_l_event(
-                SimpleNamespace(
-                    keyval=gtk_app.Gdk.KEY_l,
-                    state=gtk_app.Gdk.ModifierType.CONTROL_MASK
-                    | gtk_app.Gdk.ModifierType.MOD1_MASK,
-                )
-            )
-        )
-
-    def test_terminal_handler_consumes_plain_ctrl_l_before_vte(self) -> None:
         window = SimpleNamespace(
             keymap=KeyMapStub(),
             handle_zoom_event=lambda _event: False,
-            _current_attach_terminal=lambda: self.fail("Ctrl+L must be consumed before VTE routing"),
+            _current_attach_terminal=lambda: attach,
+            _is_copy_event=lambda _event: False,
+            _is_plain_ctrl_c_event=lambda _event: False,
+            _terminal_has_selection=lambda _attach: False,
+            _is_paste_event=lambda _event: False,
+            current_record=lambda: record,
+            app_context=SimpleNamespace(
+                backend=SimpleNamespace(scroll_view_active=lambda _record: False)
+            ),
         )
         event = SimpleNamespace(
             keyval=gtk_app.Gdk.KEY_l,
             state=gtk_app.Gdk.ModifierType.CONTROL_MASK,
         )
 
-        handled = TermDeckWindow.on_terminal_key_press(window, None, event)
+        handled = TermDeckWindow.on_terminal_key_press(window, attach.terminal, event)
+
+        self.assertFalse(handled)
+        self.assertEqual(calls, [])
+
+    def test_chrome_focused_ctrl_l_is_delivered_as_form_feed(self) -> None:
+        terminal = TerminalStub()
+        delivered = []
+        attach = SimpleNamespace(
+            terminal=terminal,
+            prepare_for_live_input=lambda: True,
+            feed_key_event=lambda event: delivered.append(AttachTerminal._key_event_bytes(event)) or True,
+        )
+        window = SimpleNamespace(
+            _current_attach_terminal=lambda: attach,
+            get_focus=lambda: object(),
+            _is_text_input_focus=lambda _focus: False,
+            on_terminal_key_press=lambda *_args: False,
+        )
+        event = SimpleNamespace(
+            keyval=gtk_app.Gdk.KEY_l,
+            state=gtk_app.Gdk.ModifierType.CONTROL_MASK,
+        )
+
+        handled = TermDeckWindow._route_unhandled_key_to_terminal(window, event)
 
         self.assertTrue(handled)
+        self.assertEqual(delivered, [b"\x0c"])
 
     def test_first_key_encoder_handles_text_control_and_navigation_keys(self) -> None:
         cases = [
             (gtk_app.Gdk.KEY_x, 0, b"x"),
             (gtk_app.Gdk.KEY_X, gtk_app.Gdk.ModifierType.SHIFT_MASK, b"X"),
             (gtk_app.Gdk.KEY_d, gtk_app.Gdk.ModifierType.CONTROL_MASK, b"\x04"),
+            (gtk_app.Gdk.KEY_l, gtk_app.Gdk.ModifierType.CONTROL_MASK, b"\x0c"),
             (gtk_app.Gdk.KEY_x, gtk_app.Gdk.ModifierType.MOD1_MASK, b"\x1bx"),
             (gtk_app.Gdk.KEY_Return, 0, b"\r"),
             (gtk_app.Gdk.KEY_Left, 0, b"\x1b[D"),

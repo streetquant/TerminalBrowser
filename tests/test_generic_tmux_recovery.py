@@ -62,6 +62,52 @@ class GenericTmuxRecoveryTests(unittest.TestCase):
             ),
         )
 
+    def test_lifecycle_snapshot_binds_live_pid_to_same_tmux_reply(self) -> None:
+        record = _record(status="running")
+        backend = TmuxBackend(executable="tmux")
+        reply = subprocess.CompletedProcess(
+            ["tmux"],
+            0,
+            "%42\t0\t\t321\t/tmp\n",
+            "",
+        )
+        with mock.patch.object(backend, "_run", return_value=reply) as run:
+            lifecycle = backend._pane_lifecycle(record)
+
+        self.assertEqual(
+            lifecycle,
+            _PaneLifecycle("%42", False, None, "/tmp", 321),
+        )
+        self.assertIn("#{pane_pid}", run.call_args.args[0][-1])
+
+    def test_authoritative_live_pid_never_uses_cached_pane_map(self) -> None:
+        record = _record(status="recovery-pending")
+        backend = TmuxBackend(executable="tmux")
+        lifecycle = _PaneLifecycle("%42", False, None, "/tmp", 321)
+        with mock.patch.object(
+            backend, "_pane_lifecycle", return_value=lifecycle
+        ) as query, mock.patch.object(backend, "pane_pid") as cached:
+            self.assertEqual(backend.authoritative_live_pane_pid(record), 321)
+
+        query.assert_called_once_with(record)
+        cached.assert_not_called()
+
+    def test_lifecycle_snapshot_rejects_live_pane_without_safe_pid(self) -> None:
+        record = _record(status="running")
+        backend = TmuxBackend(executable="tmux")
+        for pid_text in ("", "0", "1", "not-a-pid"):
+            with self.subTest(pid=pid_text), mock.patch.object(
+                backend,
+                "_run",
+                return_value=subprocess.CompletedProcess(
+                    ["tmux"],
+                    0,
+                    f"%42\t0\t\t{pid_text}\t/tmp\n",
+                    "",
+                ),
+            ):
+                self.assertIsNone(backend._pane_lifecycle(record))
+
     def test_missing_arbitrary_command_replays_generic_recipe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             record = _record(command="python worker.py --queue alpha", cwd=tmp)

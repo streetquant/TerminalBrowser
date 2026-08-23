@@ -56,6 +56,7 @@ def state_line(history_size: int = 0, **overrides: str) -> str:
         "mouse_button_flag": "0",
         "mouse_all_flag": "0",
         "mouse_sgr_flag": "0",
+        "bracket_paste_flag": "0",
         "history_size": str(history_size),
     }
     values.update(overrides)
@@ -234,7 +235,7 @@ class PaneStreamControllerTests(unittest.TestCase):
         wait_until(lambda: outputs)
 
         replay = b"".join(outputs)
-        for mode in (1000, 1002, 1003, 1006):
+        for mode in (1000, 1002, 1003, 1006, 2004):
             self.assertIn(f"\x1b[?{mode}l".encode(), replay)
             self.assertNotIn(f"\x1b[?{mode}h".encode(), replay)
         self.assertIn(b"\x1b[4l", replay)
@@ -251,6 +252,7 @@ class PaneStreamControllerTests(unittest.TestCase):
             mouse_button_flag="1",
             mouse_all_flag="1",
             mouse_sgr_flag="1",
+            bracket_paste_flag="1",
         )
         client.script("list-panes", CommandResult(True, (active,), None))
         client.script("capture-pane", CommandResult(True, ("tui",), None))
@@ -267,6 +269,7 @@ class PaneStreamControllerTests(unittest.TestCase):
             b"\x1b[?1002h",
             b"\x1b[?1003h",
             b"\x1b[?1006h",
+            b"\x1b[?2004h",
         ):
             self.assertIn(sequence, replay)
 

@@ -81,6 +81,65 @@ class VteLoopbackInputRegressionTest(unittest.TestCase):
             terminal.detach()
             window.destroy()
 
+    def test_replayed_bracketed_paste_mode_wraps_multiline_composer_text(self) -> None:
+        ready, _argv = Gtk.init_check([])
+        if not ready:
+            self.skipTest("GTK display is unavailable")
+
+        class RecordingController:
+            def __init__(self) -> None:
+                self.sent = bytearray()
+
+            def send_bytes(self, data: bytes) -> bool:
+                self.sent.extend(data)
+                return True
+
+            def resize(self, *, columns: int, rows: int) -> None:
+                pass
+
+            def stop(self) -> None:
+                pass
+
+        terminal = AttachTerminal(["true"], "/tmp", TerminalTheme())
+        terminal._attach_restart_deferred = True
+        window = Gtk.Window()
+        try:
+            window.add(terminal)
+            window.resize(800, 500)
+            window.show_all()
+            terminal._ensure_loopback_pty()
+            controller = RecordingController()
+            terminal.controller = controller
+
+            # PaneStream replay must restore DECSET 2004 before clipboard text
+            # is delivered. VTE then wraps embedded newlines as one composer
+            # paste instead of emitting an unprotected submit key.
+            terminal.terminal.feed(b"\x1b[?2004h")
+            for _index in range(20):
+                while Gtk.events_pending():
+                    Gtk.main_iteration_do(False)
+                time.sleep(0.005)
+            terminal.terminal.paste_text("draft line\nsecond line")
+            deadline = time.monotonic() + 3.0
+            # VTE canonicalizes pasted newlines to CR, but DECSET 2004 keeps
+            # that CR inside one protected paste transaction.
+            expected = b"\x1b[200~draft line\rsecond line\x1b[201~"
+            while time.monotonic() < deadline:
+                while Gtk.events_pending():
+                    Gtk.main_iteration_do(False)
+                if expected in bytes(controller.sent):
+                    break
+                time.sleep(0.01)
+
+            payload = bytes(controller.sent)
+            self.assertIn(expected, payload)
+            self.assertNotIn(b"\x1b[201~\r", payload)
+            self.assertEqual(payload.count(b"\x1b[200~"), 1)
+            self.assertEqual(payload.count(b"\x1b[201~"), 1)
+        finally:
+            terminal.detach()
+            window.destroy()
+
 
 if __name__ == "__main__":
     unittest.main()

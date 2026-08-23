@@ -41,6 +41,7 @@ from .gateway_models import (
 )
 from .history_control import (
     BackendHistoryState,
+    ChildInputProtocol,
     EdgeKnowledge,
     HistoryOwner,
     ScrollDisposition,
@@ -520,6 +521,10 @@ class _PaneLifecycle:
     dead: bool
     exit_status: int | None
     current_path: str
+    # Captured by the same tmux display-message as pane_id/dead/path. Keeping
+    # this optional preserves historical dead-pane fixtures while live callers
+    # can reject cached or cross-generation PID evidence.
+    pane_pid: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1342,15 +1347,15 @@ class TmuxBackend:
                 "-p",
                 "-t",
                 self.pane_target(record),
-                "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_current_path}",
+                "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}\t#{pane_current_path}",
             ],
             check=False,
             timeout=self.query_timeout,
         )
         if result.returncode != 0:
             return None
-        parts = result.stdout.rstrip("\n").split("\t", 3)
-        if len(parts) != 4 or not parts[0].startswith("%"):
+        parts = result.stdout.rstrip("\n").split("\t", 4)
+        if len(parts) != 5 or not parts[0].startswith("%"):
             return None
         dead_text = parts[1].strip()
         if dead_text not in {"0", "1"}:
@@ -1362,12 +1367,42 @@ class TmuxBackend:
                 exit_status = int(status_text)
             except ValueError:
                 return None
+        pid_text = parts[3].strip()
+        pane_pid: int | None = None
+        if pid_text:
+            try:
+                candidate_pid = int(pid_text)
+            except ValueError:
+                return None
+            if candidate_pid > 1:
+                pane_pid = candidate_pid
+            elif dead_text == "0":
+                # A live pane without a safe process identity is not an
+                # authoritative live payload snapshot.
+                return None
+        elif dead_text == "0":
+            return None
         return _PaneLifecycle(
             pane_id=parts[0],
             dead=dead_text == "1",
             exit_status=exit_status,
-            current_path=self._normalise_pane_directory(parts[3].strip()) or "",
+            current_path=self._normalise_pane_directory(parts[4].strip()) or "",
+            pane_pid=pane_pid,
         )
+
+    def authoritative_live_pane_pid(self, record: SessionRecord) -> int | None:
+        """Return a live pane PID from one uncached tmux lifecycle snapshot.
+
+        Registry repair must never treat ``last_pid`` or the short-lived pane
+        cache as proof that a red/missing row is actually live. Missing, dead,
+        malformed, and temporarily unqueryable targets all return ``None``.
+        """
+
+        lifecycle = self._pane_lifecycle(record)
+        if lifecycle is None or lifecycle.dead:
+            return None
+        pid = lifecycle.pane_pid
+        return pid if pid is not None and pid > 1 else None
 
     @staticmethod
     def _durable_recipe(record: SessionRecord) -> SessionRecipe:
@@ -1789,15 +1824,38 @@ class TmuxBackend:
         if bool(raw_home) != bool(raw_scope):
             raise TmuxError("optional private auth metadata is incomplete")
 
-        def lifecycle_or_raise() -> _PaneLifecycle:
+        def lifecycle_or_result() -> _PaneLifecycle | DeadPayloadRecoveryResult:
             lifecycle = self._pane_lifecycle(record)
-            if lifecycle is None or not lifecycle.dead:
-                raise TmuxError("managed pane is not authoritatively dead")
-            return lifecycle
+            if lifecycle is None:
+                raise TmuxError("managed pane lifecycle could not be verified")
+            if lifecycle.dead:
+                return lifecycle
+            pid = lifecycle.pane_pid
+            if pid is None or pid <= 1:
+                raise TmuxError("live managed pane has no authoritative pid")
+            # Bind the no-op result to two same-query lifecycle snapshots. A
+            # cached pane map is deliberately absent here: a target may retain
+            # its pane id while a respawn changes its process identity.
+            confirmed = self._pane_lifecycle(record)
+            if (
+                confirmed is None
+                or confirmed.dead
+                or confirmed.pane_id != lifecycle.pane_id
+                or confirmed.pane_pid != pid
+            ):
+                raise TmuxError("managed pane changed while live state was verified")
+            return DeadPayloadRecoveryResult(
+                action="alive",
+                pid=pid,
+                detail="managed payload is already live; no replacement was performed",
+            )
 
         if raw_home:
             with auth_transaction_lock(record):
-                lifecycle = lifecycle_or_raise()
+                observed = lifecycle_or_result()
+                if isinstance(observed, DeadPayloadRecoveryResult):
+                    return observed
+                lifecycle = observed
                 if (
                     recipe.restart_policy == "on-failure"
                     and lifecycle.exit_status in {0, 130}
@@ -1816,7 +1874,10 @@ class TmuxBackend:
                     finally:
                         lease.release()
         else:
-            lifecycle = lifecycle_or_raise()
+            observed = lifecycle_or_result()
+            if isinstance(observed, DeadPayloadRecoveryResult):
+                return observed
+            lifecycle = observed
             if (
                 recipe.restart_policy == "on-failure"
                 and lifecycle.exit_status in {0, 130}
@@ -2547,28 +2608,29 @@ class TmuxBackend:
     def _query_scroll_context(
         self,
         target: str,
-    ) -> tuple[bool, bool, str, bool] | None:
+    ) -> tuple[bool, bool, str, bool, bool] | None:
         current = self._run(
             [
                 "display-message",
                 "-p",
                 "-t",
                 target,
-                "#{alternate_on}\t#{pane_in_mode}\t#{pane_current_command}\t#{mouse_any_flag}",
+                "#{alternate_on}\t#{pane_in_mode}\t#{pane_current_command}\t#{mouse_any_flag}\t#{mouse_sgr_flag}",
             ],
             check=False,
             timeout=self.query_timeout,
         )
         if current.returncode != 0:
             return None
-        fields = current.stdout.rstrip("\n").split("\t", 3)
-        if len(fields) != 4:
+        fields = current.stdout.rstrip("\n").split("\t", 4)
+        if len(fields) != 5:
             return None
         return (
             fields[0] == "1",
             fields[1] == "1",
             Path(fields[2].strip()).name.casefold(),
             fields[3] == "1",
+            fields[4] == "1",
         )
 
     @staticmethod
@@ -2610,22 +2672,16 @@ class TmuxBackend:
         record: SessionRecord,
         target: str,
         amount: int,
+        *,
+        context: tuple[bool, bool, str, bool, bool] | None = None,
     ) -> BackendHistoryState | ScrollOutcome:
         """Classify a live pane without ever treating VTE as history authority."""
 
-        if amount > 0:
-            # Down from the live edge is a no-op. In particular, do not open a
-            # Codex transcript only to immediately close it.
-            return unhandled_scroll(
-                amount,
-                detail="already at live edge",
-                edge=EdgeKnowledge.LIVE_EXACT,
-                depth=0,
-            )
-        context = self._query_scroll_context(target)
         if context is None:
-            return unhandled_scroll(amount, detail="tmux owner query failed")
-        alternate_on, pane_in_mode, command, mouse_reporting = context
+            context = self._query_scroll_context(target)
+            if context is None:
+                return unhandled_scroll(amount, detail="tmux owner query failed")
+        alternate_on, pane_in_mode, command, mouse_reporting, mouse_sgr = context
         now = time.monotonic()
         if command == "codex" or command.startswith("codex-"):
             return BackendHistoryState(
@@ -2655,6 +2711,11 @@ class TmuxBackend:
                 return passthrough_scroll(
                     amount,
                     detail=f"alternate-screen mouse owner {command or 'unknown'}",
+                    protocol=(
+                        ChildInputProtocol.SGR_MOUSE
+                        if mouse_sgr
+                        else ChildInputProtocol.LEGACY_MOUSE
+                    ),
                 )
             return ScrollOutcome(
                 disposition=ScrollDisposition.UNHANDLED,
@@ -2665,6 +2726,16 @@ class TmuxBackend:
                     f"alternate-screen owner {command or 'unknown'} has no mouse "
                     "reporting; wheel input was consumed"
                 ),
+            )
+        if amount > 0:
+            # Primary-screen down from the live edge is a no-op. Querying the
+            # pane first is essential: a mouse-aware alternate-screen TUI owns
+            # both wheel directions and must receive the downward gesture.
+            return unhandled_scroll(
+                amount,
+                detail="already at live edge",
+                edge=EdgeKnowledge.LIVE_EXACT,
+                depth=0,
             )
         return BackendHistoryState(
             owner=HistoryOwner.TMUX,
@@ -2709,19 +2780,25 @@ class TmuxBackend:
             # A failed tmux owner query is not evidence of the live edge. Copy
             # mode commands remain tmux-local, so preserve that tracked state.
             return replace(state, validated_at=now)
-        alternate_on, pane_in_mode, command, _mouse_reporting = context
+        alternate_on, pane_in_mode, command, _mouse_reporting, _mouse_sgr = context
         if state.owner is HistoryOwner.CODEX:
             if command == "codex" or command.startswith("codex-"):
                 return replace(state, command=command, validated_at=now)
             self._history_pop(record.id)
-            return self._classify_scroll_owner(record, target, amount)
+            return self._classify_scroll_owner(
+                record, target, amount, context=context
+            )
         if state.owner is HistoryOwner.TMUX:
             if not alternate_on and pane_in_mode:
                 return replace(state, command=command, validated_at=now)
             self._history_pop(record.id)
-            return self._classify_scroll_owner(record, target, amount)
+            return self._classify_scroll_owner(
+                record, target, amount, context=context
+            )
         self._history_pop(record.id)
-        return self._classify_scroll_owner(record, target, amount)
+        return self._classify_scroll_owner(
+            record, target, amount, context=context
+        )
 
     def scroll_session(self, record: SessionRecord, lines: int) -> ScrollOutcome:
         """Route one scroll through its canonical owner and return edge proof.
@@ -2908,7 +2985,7 @@ class TmuxBackend:
                     # Unknown ownership is not permission to send the Codex
                     # transcript toggle or to release the user's first key.
                     return False
-                _alternate_on, _pane_in_mode, command, _mouse_reporting = context
+                _alternate_on, _pane_in_mode, command, _mouse_reporting, _mouse_sgr = context
                 if command == "codex" or command.startswith("codex-"):
                     commands = [
                         "send-keys",

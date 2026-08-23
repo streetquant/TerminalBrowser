@@ -12,6 +12,13 @@ class ScrollDisposition(Enum):
     PASSTHROUGH = "passthrough"
 
 
+class ChildInputProtocol(Enum):
+    """Byte protocol negotiated by a child-owned alternate-screen TUI."""
+
+    SGR_MOUSE = "sgr-mouse"
+    LEGACY_MOUSE = "legacy-mouse"
+
+
 class HistoryOwner(Enum):
     """Canonical owner of the history surface currently being reviewed."""
 
@@ -75,7 +82,17 @@ class ScrollOutcome:
     depth: int | None = None
     extent: int | None = None
     managed_open: bool = False
+    child_input_protocol: ChildInputProtocol | None = None
     detail: str = ""
+
+    def __post_init__(self) -> None:
+        if self.child_input_protocol is not None and not (
+            self.disposition is ScrollDisposition.PASSTHROUGH
+            and self.owner is HistoryOwner.CHILD_TUI
+        ):
+            raise ValueError(
+                "a child input protocol is valid only for child-TUI passthrough"
+            )
 
     def __bool__(self) -> bool:  # pragma: no cover - exercised by guard test
         raise TypeError("ScrollOutcome must not be used as a boolean")
@@ -109,11 +126,17 @@ def unhandled_scroll(
     )
 
 
-def passthrough_scroll(lines: int, *, detail: str = "") -> ScrollOutcome:
+def passthrough_scroll(
+    lines: int,
+    *,
+    detail: str = "",
+    protocol: ChildInputProtocol | None = None,
+) -> ScrollOutcome:
     return ScrollOutcome(
         disposition=ScrollDisposition.PASSTHROUGH,
         owner=HistoryOwner.CHILD_TUI,
         edge=EdgeKnowledge.UNKNOWN,
         requested_lines=int(lines),
+        child_input_protocol=protocol,
         detail=detail,
     )

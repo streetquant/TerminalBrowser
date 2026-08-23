@@ -16,6 +16,7 @@ from termdeck.codex_auth import prepare_auth_scope
 from termdeck.codex_config_scope import CodexConfigScopeError
 from termdeck.history_control import (
     BackendHistoryState,
+    ChildInputProtocol,
     EdgeKnowledge,
     HistoryOwner,
     ScrollDisposition,
@@ -3220,26 +3221,30 @@ class TmuxBackendTests(unittest.TestCase):
             [100, 101, 102, 103],
         )
 
-    def test_scroll_down_at_live_bottom_does_not_enter_history(self):
+    def test_scroll_down_at_primary_screen_live_bottom_does_not_enter_history(self):
         record = _record()
         backend = TmuxBackend(executable="tmux")
+        context = subprocess.CompletedProcess(
+            args=["tmux"], returncode=0, stdout="0\t0\tbash\t0\t0\n", stderr=""
+        )
 
         with mock.patch(
             "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
-        ), mock.patch.object(backend, "_run") as run:
+        ), mock.patch.object(backend, "_run", return_value=context) as run:
             outcome = backend.scroll_session(record, 3)
 
         self.assertIs(outcome.disposition, ScrollDisposition.UNHANDLED)
         self.assertIs(outcome.edge, EdgeKnowledge.LIVE_EXACT)
         self.assertEqual(outcome.depth, 0)
         self.assertFalse(backend.scroll_view_active(record))
-        run.assert_not_called()
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0][0], "display-message")
 
     def test_scroll_codex_opens_transcript_before_navigating(self):
         record = _record()
         backend = TmuxBackend(executable="tmux")
         command = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="1\t0\tcodex\t0\n", stderr=""
+            args=["tmux"], returncode=0, stdout="1\t0\tcodex\t0\t0\n", stderr=""
         )
         completed = subprocess.CompletedProcess(
             args=["tmux"], returncode=0, stdout="", stderr=""
@@ -3289,7 +3294,7 @@ class TmuxBackendTests(unittest.TestCase):
         record = _record()
         backend = TmuxBackend(executable="tmux")
         command = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="0\t0\tbash\t0\n", stderr=""
+            args=["tmux"], returncode=0, stdout="0\t0\tbash\t0\t0\n", stderr=""
         )
         scrolled = subprocess.CompletedProcess(
             args=["tmux"], returncode=0, stdout="1\t3\t120\n", stderr=""
@@ -3344,7 +3349,7 @@ class TmuxBackendTests(unittest.TestCase):
             validated_at=time.monotonic(),
         )
         context = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="1\t0\tcodex\t0\n", stderr=""
+            args=["tmux"], returncode=0, stdout="1\t0\tcodex\t0\t0\n", stderr=""
         )
         completed = subprocess.CompletedProcess(
             args=["tmux"], returncode=0, stdout="", stderr=""
@@ -3381,7 +3386,7 @@ class TmuxBackendTests(unittest.TestCase):
             validated_at=time.monotonic(),
         )
         context = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="1\t0\tcodex\t0\n", stderr=""
+            args=["tmux"], returncode=0, stdout="1\t0\tcodex\t0\t0\n", stderr=""
         )
         completed = subprocess.CompletedProcess(
             args=["tmux"], returncode=0, stdout="", stderr=""
@@ -3434,7 +3439,7 @@ class TmuxBackendTests(unittest.TestCase):
             validated_at=time.monotonic(),
         )
         shell = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="0\t0\tbash\t0\n", stderr=""
+            args=["tmux"], returncode=0, stdout="0\t0\tbash\t0\t0\n", stderr=""
         )
         with mock.patch(
             "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
@@ -3515,23 +3520,49 @@ class TmuxBackendTests(unittest.TestCase):
         record = _record()
         backend = TmuxBackend(executable="tmux")
         for command_name in ("2.1.226", "grok", "unknown-tui"):
-            with self.subTest(command=command_name):
-                state = subprocess.CompletedProcess(
-                    args=["tmux"],
-                    returncode=0,
-                    stdout=f"1\t0\t{command_name}\t1\n",
-                    stderr="",
-                )
-                with mock.patch(
-                    "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
-                ), mock.patch.object(backend, "_run", return_value=state) as run:
-                    outcome = backend.scroll_session(record, -3)
+            for lines in (-3, 3):
+                with self.subTest(command=command_name, lines=lines):
+                    state = subprocess.CompletedProcess(
+                        args=["tmux"],
+                        returncode=0,
+                        stdout=f"1\t0\t{command_name}\t1\t1\n",
+                        stderr="",
+                    )
+                    with mock.patch(
+                        "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+                    ), mock.patch.object(backend, "_run", return_value=state) as run:
+                        outcome = backend.scroll_session(record, lines)
 
-                self.assertIs(outcome.disposition, ScrollDisposition.PASSTHROUGH)
-                self.assertIs(outcome.owner, HistoryOwner.CHILD_TUI)
-                self.assertIs(outcome.edge, EdgeKnowledge.UNKNOWN)
-                self.assertFalse(backend.scroll_view_active(record))
-                run.assert_called_once()
+                    self.assertIs(outcome.disposition, ScrollDisposition.PASSTHROUGH)
+                    self.assertIs(outcome.owner, HistoryOwner.CHILD_TUI)
+                    self.assertIs(outcome.edge, EdgeKnowledge.UNKNOWN)
+                    self.assertIs(
+                        outcome.child_input_protocol,
+                        ChildInputProtocol.SGR_MOUSE,
+                    )
+                    self.assertFalse(backend.scroll_view_active(record))
+                    run.assert_called_once()
+
+    def test_scroll_legacy_mouse_owner_reports_exact_child_protocol(self):
+        record = _record()
+        backend = TmuxBackend(executable="tmux")
+        state = subprocess.CompletedProcess(
+            args=["tmux"],
+            returncode=0,
+            stdout="1\t0\tlegacy-tui\t1\t0\n",
+            stderr="",
+        )
+        with mock.patch(
+            "termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"
+        ), mock.patch.object(backend, "_run", return_value=state):
+            outcome = backend.scroll_session(record, -3)
+
+        self.assertIs(outcome.disposition, ScrollDisposition.PASSTHROUGH)
+        self.assertIs(outcome.owner, HistoryOwner.CHILD_TUI)
+        self.assertIs(
+            outcome.child_input_protocol,
+            ChildInputProtocol.LEGACY_MOUSE,
+        )
 
     def test_scroll_no_mouse_alternate_screen_consumes_wheel_without_synthetic_keys(self):
         record = _record()
@@ -3539,7 +3570,7 @@ class TmuxBackendTests(unittest.TestCase):
         state = subprocess.CompletedProcess(
             args=["tmux"],
             returncode=0,
-            stdout="1\t0\tunknown-tui\t0\n",
+            stdout="1\t0\tunknown-tui\t0\t0\n",
             stderr="",
         )
         with mock.patch(
@@ -3558,7 +3589,7 @@ class TmuxBackendTests(unittest.TestCase):
         record = _record()
         backend = TmuxBackend(executable="tmux")
         state = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="1\t1\t2.1.226\t1\n", stderr=""
+            args=["tmux"], returncode=0, stdout="1\t1\t2.1.226\t1\t1\n", stderr=""
         )
         restored = subprocess.CompletedProcess(
             args=["tmux"], returncode=0, stdout="", stderr=""
@@ -3590,7 +3621,7 @@ class TmuxBackendTests(unittest.TestCase):
             validated_at=time.monotonic(),
         )
         context = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="1\t0\tcodex\t0\n", stderr=""
+            args=["tmux"], returncode=0, stdout="1\t0\tcodex\t0\t0\n", stderr=""
         )
         completed = subprocess.CompletedProcess(
             args=["tmux"], returncode=0, stdout="", stderr=""
@@ -3701,7 +3732,7 @@ class TmuxBackendTests(unittest.TestCase):
             validated_at=time.monotonic(),
         )
         context = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="1\t0\tcodex\t0\n", stderr=""
+            args=["tmux"], returncode=0, stdout="1\t0\tcodex\t0\t0\n", stderr=""
         )
         completed = subprocess.CompletedProcess(args=["tmux"], returncode=0, stdout="", stderr="")
         with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
@@ -3725,7 +3756,7 @@ class TmuxBackendTests(unittest.TestCase):
         )
         backend._scroll_views[record.id] = state
         context = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="1\t0\tcodex\t0\n", stderr=""
+            args=["tmux"], returncode=0, stdout="1\t0\tcodex\t0\t0\n", stderr=""
         )
         failed = subprocess.CompletedProcess(args=["tmux"], returncode=1, stdout="", stderr="failed")
         with mock.patch("termdeck.tmux_backend.shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
@@ -3771,7 +3802,7 @@ class TmuxBackendTests(unittest.TestCase):
             validated_at=time.monotonic(),
         )
         shell = subprocess.CompletedProcess(
-            args=["tmux"], returncode=0, stdout="0\t0\tbash\t0\n", stderr=""
+            args=["tmux"], returncode=0, stdout="0\t0\tbash\t0\t0\n", stderr=""
         )
         completed = subprocess.CompletedProcess(
             args=["tmux"], returncode=0, stdout="", stderr=""

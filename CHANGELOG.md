@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.2.18
+
+- Restored exactly-once terminal input for OpenCode and other full-screen TUIs. Focused VTE keystrokes are no longer replayed through the parent window, printable text cannot acquire a synthetic Enter, and plain `Ctrl+L` is again application-owned.
+- Repaired alternate-screen scrolling in both directions. Mouse-aware TUIs receive their negotiated SGR wheel protocol from physical wheel events and from the persistent per-tab scrollbar; a downward gesture can no longer be mistaken for a primary-screen live-edge no-op.
+- Made the child-owned scrollbar deterministic and thread-safe. Its virtual depth now follows accepted application scroll input, returns to the live edge, and never calls the GTK-owned SQLite connection from the bounded history worker.
+- Preserved complete composer state across attach, replay, resize, scroll, tab switch, and GUI handoff. Pane replay restores tmux-supported bracketed-paste mode, keeps multiline paste inside one protected transaction, and no longer requests the unsupported empty `focus_flag` format that could strand stream setup in retries.
+- Corrected false red recovery state without replacing live payloads. A stale pane-dead notification now revalidates the same live pane and PID as a no-op, while startup reconciliation converts contradictory `recovery-pending`, `missing`, or `start-error` rows back to `running` and clears stale errors.
+- Preserved all existing session semantics: clean payload exit still returns to a shell in the same tab, explicit Kill remains terminal, killed history survives until Remove, generic non-Codex recipes remain digest-bound, and existing OpenCode model selections are never rewritten or mass-refreshed.
+- Added failing-first unit and real GTK/VTE/tmux coverage for auto-submit, `Ctrl+L`, wheel up/down, scrollbar drag and return-to-bottom, bracketed paste, complete composer redraw, false pane-dead events, live status repair, and the SQLite worker-thread boundary.
+
 ## 0.2.17
 
 - Made model and account transitions no-loss pane transactions. TermDeck now retires the old control stream before any target mutation, keeps the tab protected until the replacement stream proves stable, and always ends in either a live reattached pane or an explicit recoverable error rather than a keypress-dead VTE surface.

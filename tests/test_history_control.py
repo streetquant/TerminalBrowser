@@ -4,6 +4,7 @@ from unittest import TestCase
 
 from termdeck.history_control import (
     BackendHistoryState,
+    ChildInputProtocol,
     EdgeKnowledge,
     HistoryOwner,
     ScrollDisposition,
@@ -54,6 +55,16 @@ class HistoryControlTests(TestCase):
         self.assertFalse(unknown.reached_live_edge)
         self.assertTrue(live.reached_live_edge)
 
+    def test_child_protocol_is_rejected_outside_passthrough(self) -> None:
+        with self.assertRaisesRegex(ValueError, "child input protocol"):
+            ScrollOutcome(
+                disposition=ScrollDisposition.HANDLED,
+                owner=HistoryOwner.CHILD_TUI,
+                edge=EdgeKnowledge.UNKNOWN,
+                requested_lines=-3,
+                child_input_protocol=ChildInputProtocol.SGR_MOUSE,
+            )
+
     def test_backend_state_rejects_invalid_live_and_managed_combinations(self) -> None:
         with self.assertRaisesRegex(ValueError, "live history state"):
             BackendHistoryState(owner=HistoryOwner.LIVE, depth=1)
@@ -70,9 +81,14 @@ class HistoryControlTests(TestCase):
         self.assertFalse(outcome.reached_live_edge)
 
     def test_passthrough_never_claims_a_live_edge(self) -> None:
-        outcome = passthrough_scroll(-3, detail="child owns scrolling")
+        outcome = passthrough_scroll(
+            -3,
+            detail="child owns scrolling",
+            protocol=ChildInputProtocol.SGR_MOUSE,
+        )
 
         self.assertIs(outcome.disposition, ScrollDisposition.PASSTHROUGH)
         self.assertIs(outcome.owner, HistoryOwner.CHILD_TUI)
         self.assertIs(outcome.edge, EdgeKnowledge.UNKNOWN)
         self.assertFalse(outcome.reached_live_edge)
+        self.assertIs(outcome.child_input_protocol, ChildInputProtocol.SGR_MOUSE)

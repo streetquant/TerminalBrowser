@@ -48,11 +48,16 @@ class FakeBackend:
         self.fail_ids = set(fail_ids)
         self.pid_error_ids = set(pid_error_ids)
         self.probes = []
+        self.authoritative_probes = []
 
     def pane_pid(self, record):
         if record.id in self.pid_error_ids:
             raise TmuxError("pane lookup failed")
         return self.pids.get(record.id)
+
+    def authoritative_live_pane_pid(self, record):
+        self.authoritative_probes.append(record.id)
+        return self.pane_pid(record)
 
     def create_or_resume(self, record):
         self.probes.append((record.id, record.status))
@@ -113,10 +118,8 @@ class ReviveDeadPayloadTests(unittest.TestCase):
         alive = make_record("alive")
         backend = FakeBackend(pids={"dead": 100, "alive": 200}, respawn_ids={"dead"})
         store = FakeStore()
-        revived, failed = revive_dead_payload_sessions(
-            backend, [dead, alive], store=store
-        )
-        self.assertEqual((revived, failed), (1, 0))
+        summary = revive_dead_payload_sessions(backend, [dead, alive], store=store)
+        self.assertEqual((summary.revived, summary.repaired, summary.failed), (1, 0, 0))
         self.assertEqual(
             backend.probes,
             [("dead", "recovery-pending"), ("alive", "recovery-pending")],
@@ -132,8 +135,63 @@ class ReviveDeadPayloadTests(unittest.TestCase):
         alive = make_record("alive")
         backend = FakeBackend(pids={"alive": 321})
         store = FakeStore()
-        revived, failed = revive_dead_payload_sessions(backend, [alive], store=store)
-        self.assertEqual((revived, failed), (0, 0))
+        summary = revive_dead_payload_sessions(backend, [alive], store=store)
+        self.assertEqual((summary.revived, summary.repaired, summary.failed), (0, 0, 0))
+        self.assertEqual(store.updates, [])
+
+    def test_live_recovery_pending_row_is_repaired_without_replacing_payload(self):
+        pending = make_record(
+            "pending-live",
+            status="recovery-pending",
+            last_pid=321,
+            recovery_last_error="managed pane is not authoritatively dead",
+        )
+        backend = FakeBackend(pids={pending.id: 321})
+        store = FakeStore()
+
+        summary = revive_dead_payload_sessions(backend, [pending], store=store)
+
+        self.assertEqual((summary.revived, summary.repaired, summary.failed), (0, 1, 0))
+        self.assertEqual(backend.probes, [(pending.id, "recovery-pending")])
+        self.assertEqual(backend.authoritative_probes, [pending.id, pending.id])
+        self.assertEqual(
+            store.updates,
+            [
+                (
+                    pending.id,
+                    {
+                        "status": "running",
+                        "last_pid": 321,
+                        "recovery_last_error": None,
+                        "last_opened_at": store.updates[0][1]["last_opened_at"],
+                    },
+                )
+            ],
+        )
+
+    def test_contradictory_row_is_not_repaired_from_stale_cached_pid(self):
+        pending = make_record(
+            "stale-cache",
+            status="recovery-pending",
+            last_pid=321,
+            recovery_last_error="stale",
+        )
+
+        class StaleCacheBackend(FakeBackend):
+            def pane_pid(self, record):
+                return 321
+
+            def authoritative_live_pane_pid(self, record):
+                self.authoritative_probes.append(record.id)
+                return None
+
+        backend = StaleCacheBackend()
+        store = FakeStore()
+
+        summary = revive_dead_payload_sessions(backend, [pending], store=store)
+
+        self.assertEqual((summary.revived, summary.repaired, summary.failed), (0, 0, 0))
+        self.assertEqual(backend.authoritative_probes, [pending.id, pending.id])
         self.assertEqual(store.updates, [])
 
     def test_refused_replacement_counts_failed_and_continues(self):
@@ -144,22 +202,22 @@ class ReviveDeadPayloadTests(unittest.TestCase):
             respawn_ids={"dead"},
             fail_ids={"refused"},
         )
-        revived, failed = revive_dead_payload_sessions(backend, [refused, dead])
-        self.assertEqual((revived, failed), (1, 1))
+        summary = revive_dead_payload_sessions(backend, [refused, dead])
+        self.assertEqual((summary.revived, summary.repaired, summary.failed), (1, 0, 1))
 
     def test_pane_pid_errors_are_tolerated(self):
         record = make_record("flaky")
         backend = FakeBackend(pid_error_ids={"flaky"})
         store = FakeStore()
-        revived, failed = revive_dead_payload_sessions(backend, [record], store=store)
-        self.assertEqual((revived, failed), (0, 0))
+        summary = revive_dead_payload_sessions(backend, [record], store=store)
+        self.assertEqual((summary.revived, summary.repaired, summary.failed), (0, 0, 0))
         self.assertEqual(store.updates, [])
 
     def test_existing_recovery_pending_record_probed_as_is(self):
         pending = make_record("pending", status="recovery-pending")
         backend = FakeBackend(pids={"pending": 7}, respawn_ids={"pending"})
-        revived, failed = revive_dead_payload_sessions(backend, [pending])
-        self.assertEqual((revived, failed), (1, 0))
+        summary = revive_dead_payload_sessions(backend, [pending])
+        self.assertEqual((summary.revived, summary.repaired, summary.failed), (1, 0, 0))
         self.assertEqual(backend.probes, [("pending", "recovery-pending")])
 
 

@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+## 0.2.18
+
+T1000 0.2.18 closes the complete OpenCode composer, scrolling, keyboard, and false-recovery incident without changing the selected model in any existing tab or replacing any payload that is already live.
+
+### Input belongs to the focused terminal exactly once
+
+The parent GTK window previously retained a fallback route for keys pressed while window chrome owned focus. Under a focused VTE, that fallback could observe an event that the terminal had already received, duplicate a printable byte, or make the next control byte look like an immediate submit. The routing boundary is now explicit: browser-style T1000 actions are handled by T1000, while ordinary printable, editing, navigation, and application shortcuts stay on the native GTK-to-VTE input path exactly once.
+
+Plain `Ctrl+L` is no longer reserved as a T1000 no-op. It reaches the focused shell or TUI as form-feed, allowing OpenCode to redraw its complete composer frame. Clipboard text still enters through VTE so an application that negotiated bracketed paste receives one protected `CSI 200~ … CSI 201~` transaction. Embedded newline normalization may be CR or LF according to VTE, but it cannot escape the closing wrapper or synthesize a submit afterward.
+
+### The application owns alternate-screen scrolling
+
+T1000 now classifies the pane before deciding that downward movement is already at the live edge. A mouse-aware alternate-screen application owns both wheel directions. Physical wheel events continue through VTE, and persistent-scrollbar movements are encoded as bounded SGR wheel events through the existing control-mode input transport. The scrollbar tracks a virtual application-history depth, moves incrementally, and returns to the live endpoint rather than reverting or remaining stuck.
+
+The scrollbar worker no longer resolves a current session row through `SessionStore`. SQLite connections are owned by the GTK thread; using one from the bounded history worker could fail silently and revert every thumb movement. The worker captures only the immutable session identity needed by tmux, while live PID/status updates remain on GTK-owned paths.
+
+### Replay preserves a complete composer
+
+Pane replay now restores every relevant mode that tmux 3.7b can report, including bracketed paste. Investigation also found that `#{focus_flag}` is not a tmux format on the production version and expands to an empty field. Treating it as a required state column made otherwise healthy stream setup fail its field-count check and retry indefinitely. The unsupported field has been removed; focus-reporting remains application/tmux-owned rather than inferred from nonexistent metadata.
+
+A real alternate-screen composer smoke now proves, before and after `Ctrl+L`, that the tmux capture and VTE surface both contain the top border, editable body, bottom border, and terminal-bottom marker. It also proves physical wheel up/down, persistent scrollbar up/down, zero tmux copy-mode entry, ordinary text without auto-submit, and protected multiline paste.
+
+### A live pane cannot remain falsely red
+
+A delayed or duplicate pane-dead notification may arrive after the target is already live. The recovery backend now revalidates one stable live pane ID and authoritative PID and returns an explicit `alive` no-op result. It does not respawn, send keys, change the command, or claim that a recovery occurred.
+
+Startup reconciliation separately repairs durable rows whose status contradicts their proven live PID. `recovery-pending`, `missing`, and `start-error` rows become `running`, retain their pane/process identity, and clear stale recovery errors. Paused rows remain paused, ordinary running no-ops do not generate writes, and genuinely missing sessions remain explicit recovery work.
+
+### Existing sessions and model choices remain unchanged
+
+This release does not mass-restart OpenCode, Claude, Codex, or gateway-backed tabs. It does not replace direct `opencode` commands, add `opencode/x-preview-f-free` to tabs that did not already select it, or alter any manually selected model. Existing exact gateway refresh remains an explicit per-tab action with the same pane, resume UUID, working directory, and input-restoration proofs.
+
+The surrounding 0.2.17 contracts remain intact: a clean application exit returns to an interactive shell in the same tab, explicit Kill remains terminal, killed-terminal history remains until Remove, all visible windows restore, and arbitrary non-Codex commands use digest-bound generic recipes without depending on an agent parser.
+
+### Validation boundary
+
+Promotion requires the complete test inventory, every GTK/VTE/tmux smoke, deterministic real-tmux key and scrollbar evidence, false-red repair tests, production-profile validation on the exact clean commit, reproducible double-build, strict wheel/manifest verification, managed installation with the previous immutable release retained, GUI-only handoff, and live post-install comparison proving that tmux server, session, pane, payload, command, model selection, authentication, working-directory, and recovery identities were not lost.
+
 ## 0.2.17
 
 T1000 0.2.17 repairs the three live regressions reported against the installed 0.2.9 runtime: model transitions could destroy the pane/stream handoff, the tab-strip `+` could disappear after overflow, and already-running `cc-go-ulw` processes could remain bound to an older gateway-model inventory. The release also completes the generic durable-recovery, killed-history, shell-return, and per-tab scrolling work that was present only in the newer source tree and had never reached the managed installation.

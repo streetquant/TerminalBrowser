@@ -13,7 +13,7 @@ import threading
 import time
 import tty
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import gi  # type: ignore
@@ -44,7 +44,14 @@ from .gateway_models import (
     record_uses_gateway_models,
 )
 from .health import HealthPolicy, classify_session, health_badge, should_pause_for_attention
-from .history_control import ScrollDisposition, ScrollOutcome, unhandled_scroll
+from .history_control import (
+    ChildInputProtocol,
+    EdgeKnowledge,
+    HistoryOwner,
+    ScrollDisposition,
+    ScrollOutcome,
+    unhandled_scroll,
+)
 from .liveness import merge_confirmed_pane_snapshot
 from .master_tasks import filter_rows
 from .models import SessionRecord, TerminalTheme
@@ -591,6 +598,10 @@ class AttachTerminal(Gtk.Box):
         self._history_worker_generation: int | None = None
         self._pending_history_apply = None
         self._history_apply_scheduled = False
+        # Mouse-aware alternate-screen TUIs own their own transcript/history.
+        # The persistent bar therefore tracks a bounded virtual depth while its
+        # gestures are delivered as the child's negotiated SGR wheel protocol.
+        self._child_tui_history_depth = 0
         self.scrollbar = Gtk.Scrollbar.new(
             Gtk.Orientation.VERTICAL,
             adjustment=self.history_adjustment,
@@ -1312,6 +1323,93 @@ class AttachTerminal(Gtk.Box):
         """Paste PRIMARY selection into the shell as input (middle-click)."""
         self._paste_from_selection(Gdk.SELECTION_PRIMARY, prefer_last=True)
 
+    @staticmethod
+    def _sgr_mouse_scroll_bytes(
+        lines: int,
+        *,
+        columns: int,
+        rows: int,
+    ) -> bytes:
+        """Encode relative scrollbar movement as bounded SGR wheel presses."""
+
+        amount = int(lines)
+        if not amount:
+            return b""
+        clean_columns = max(1, int(columns))
+        clean_rows = max(1, int(rows))
+        x = max(1, clean_columns // 2)
+        y = max(1, clean_rows // 2)
+        button = 64 if amount < 0 else 65
+        # One physical wheel click maps to three logical history lines in the
+        # GTK path. Bound large thumb jumps so one drag cannot monopolize the
+        # input queue while still spanning the configured history extent.
+        clicks = min(4096, max(1, (abs(amount) + 2) // 3))
+        event = f"\x1b[<{button};{x};{y}M".encode("ascii")
+        return event * clicks
+
+    @staticmethod
+    def _legacy_mouse_scroll_bytes(
+        lines: int,
+        *,
+        columns: int,
+        rows: int,
+    ) -> bytes:
+        """Encode wheel presses using xterm's bounded legacy mouse protocol."""
+
+        amount = int(lines)
+        if not amount:
+            return b""
+        x = min(223, max(1, int(columns) // 2))
+        y = min(223, max(1, int(rows) // 2))
+        button = 64 if amount < 0 else 65
+        clicks = min(4096, max(1, (abs(amount) + 2) // 3))
+        event = b"\x1b[M" + bytes((32 + button, 32 + x, 32 + y))
+        return event * clicks
+
+    def _send_child_tui_scroll(
+        self,
+        lines: int,
+        *,
+        protocol: ChildInputProtocol | None,
+    ) -> bool:
+        """Deliver one scrollbar movement using the child's exact mouse protocol."""
+
+        controller = getattr(self, "controller", None)
+        if self._detached or controller is None:
+            return False
+        try:
+            columns, rows = self._last_allocated_grid
+        except (AttributeError, TypeError, ValueError):
+            columns, rows = (80, 24)
+        if int(columns) < 2 or int(rows) < 2:
+            columns, rows = (80, 24)
+        if protocol is ChildInputProtocol.SGR_MOUSE:
+            payload = AttachTerminal._sgr_mouse_scroll_bytes(
+                lines,
+                columns=int(columns),
+                rows=int(rows),
+            )
+        elif protocol is ChildInputProtocol.LEGACY_MOUSE:
+            payload = AttachTerminal._legacy_mouse_scroll_bytes(
+                lines,
+                columns=int(columns),
+                rows=int(rows),
+            )
+        else:
+            return False
+        if not payload:
+            return False
+        try:
+            return bool(controller.send_bytes(payload))
+        except Exception:
+            return False
+
+    def history_proxy_active(self) -> bool:
+        """Whether child-owned history is away from its virtual live edge."""
+
+        with self._history_request_lock:
+            return self._child_tui_history_depth > 0
+
     def _history_bottom_value(self) -> float:
         adjustment = self.history_adjustment
         return max(
@@ -1405,6 +1503,8 @@ class AttachTerminal(Gtk.Box):
     def reset_scrollbar(self) -> None:
         """Reset the application-aware history proxy to its live endpoint."""
 
+        with self._history_request_lock:
+            self._child_tui_history_depth = 0
         self._set_history_depth(0)
 
     def scroll_to_bottom(self) -> None:
@@ -1544,6 +1644,36 @@ class AttachTerminal(Gtk.Box):
                     except Exception:
                         outcome = None
 
+                if (
+                    isinstance(outcome, ScrollOutcome)
+                    and outcome.disposition is ScrollDisposition.PASSTHROUGH
+                    and outcome.owner is HistoryOwner.CHILD_TUI
+                ):
+                    accepted = self._send_child_tui_scroll(
+                        delta,
+                        protocol=outcome.child_input_protocol,
+                    )
+                    with self._history_request_lock:
+                        current_depth = max(0, int(self._child_tui_history_depth))
+                        next_depth = max(0, current_depth - int(delta))
+                        if accepted:
+                            self._child_tui_history_depth = next_depth
+                    if accepted:
+                        outcome = ScrollOutcome(
+                            disposition=ScrollDisposition.HANDLED,
+                            owner=HistoryOwner.CHILD_TUI,
+                            edge=EdgeKnowledge.UNKNOWN,
+                            requested_lines=int(delta),
+                            depth=next_depth,
+                            detail="child scrollbar wheel accepted",
+                        )
+                    else:
+                        outcome = unhandled_scroll(
+                            delta,
+                            detail="child scrollbar input transport rejected the wheel payload",
+                            depth=current_depth,
+                        )
+
                 with self._history_request_lock:
                     stale = generation != self._history_scroll_generation or self._detached
                     terminal_outcome = (
@@ -1601,6 +1731,12 @@ class AttachTerminal(Gtk.Box):
                 self._set_history_depth(0)
             else:
                 self._set_history_scrollbar_value(self._last_history_scrollbar_value)
+            return False
+        if outcome.owner is HistoryOwner.CHILD_TUI:
+            self._set_history_depth(max(0, int(outcome.depth or 0)))
+            # The application continues to own its live caret while reviewing
+            # its internal transcript; never paint a fake hidden cursor over it.
+            self._set_history_cursor_hidden(False)
             return False
         self._sync_history_from_outcome(outcome)
         if outcome.reached_live_edge:
@@ -6438,10 +6574,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             fallback: SessionRecord = record,
         ) -> SessionRecord:
             # Deferred startup replaces the provisional `new` row with its live
-            # PID/status after tmux is created. Input, scrolling, and selection
-            # callbacks must resolve that current row instead of retaining the
+            # PID/status after tmux is created. GTK-owned input and selection
+            # callbacks resolve that current row instead of retaining the
             # pre-launch snapshot; otherwise the first chrome-routed key can be
-            # consumed by a false "live restore failed" decision.
+            # consumed by a false "live restore failed" decision. The scrollbar
+            # worker deliberately does not call this SQLite-backed helper.
             return self.app_context.store.get(session_id) or fallback
 
         resize_handler = _private_resize_handler(
@@ -6457,8 +6594,12 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             live_focus_handler=lambda: self._restore_live_terminal(
                 current_callback_record()
             ),
-            scroll_handler=lambda lines: self._scroll_terminal(
-                current_callback_record(),
+            # Scrollbar drags execute on the bounded history worker. Capture
+            # this immutable row rather than calling SessionStore from that
+            # worker: sqlite connections are GTK-thread-owned, while id and
+            # tmux_name remain stable across deferred PID/status updates.
+            scroll_handler=lambda lines, scroll_record=record: self._scroll_terminal(
+                scroll_record,
                 lines,
             ),
             selection_history_handler=lambda: self._selection_history_for_terminal(
@@ -7176,7 +7317,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 resolver(session_id)
             else:
                 TermDeckWindow._resolve_auth_attach_gap(self, session_id)
-            if replacement_action == "shell":
+            if replacement_action == "alive":
+                message = f"{record.name} remained live; corrected its session status"
+            elif replacement_action == "shell":
                 message = f"{record.name} returned to an interactive shell in the same tab"
             elif reason == "models":
                 message = f"{record.name} now has all {model_count} gateway models"
@@ -8376,16 +8519,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         return ctrl and not shift and (keyval in {Gdk.KEY_c, Gdk.KEY_C} or name == "c")
 
     @staticmethod
-    def _is_plain_ctrl_l_event(event: Gdk.EventKey) -> bool:
-        """Reserve plain Ctrl+L as a no-op so shell redraws cannot hide terminal contents."""
-        state = KeyMap._clean_state(event.state)
-        keyval = Gdk.keyval_to_lower(event.keyval)
-        name = (Gdk.keyval_name(keyval) or "").lower()
-        return state == int(Gdk.ModifierType.CONTROL_MASK) and (
-            keyval in {Gdk.KEY_l, Gdk.KEY_L} or name == "l"
-        )
-
-    @staticmethod
     def _terminal_has_selection(attach) -> bool:
         try:
             return bool(attach.terminal.get_has_selection())
@@ -8417,11 +8550,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         # Capture zoom / clipboard before VTE treats the chord as input.
         if self.handle_zoom_event(event):
             return True
-        # Plain Ctrl+L is normally forwarded as form-feed (0x0c), which shells
-        # interpret as clear/redraw. Keep the current terminal contents visible
-        # by consuming only that exact chord; modified Ctrl+L bindings still work.
-        if TermDeckWindow._is_plain_ctrl_l_event(event):
-            return True
         attach = self._current_attach_terminal()
         if attach is None:
             return False
@@ -8436,7 +8564,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             record = record_getter() if callable(record_getter) else None
             backend = getattr(getattr(self, "app_context", None), "backend", None)
             active = getattr(backend, "scroll_view_active", None)
-            if record is not None and callable(active) and active(record):
+            proxy_active = getattr(attach, "history_proxy_active", None)
+            reviewing = bool(callable(proxy_active) and proxy_active())
+            if record is not None and callable(active):
+                reviewing = reviewing or bool(active(record))
+            if reviewing:
                 if not attach.prepare_for_live_input():
                     # Never paste into a transcript/copy-mode surface whose
                     # live restoration could not be acknowledged.
@@ -8447,7 +8579,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         record = record_getter() if callable(record_getter) else None
         backend = getattr(getattr(self, "app_context", None), "backend", None)
         active = getattr(backend, "scroll_view_active", None)
-        if record is not None and callable(active) and active(record):
+        proxy_active = getattr(attach, "history_proxy_active", None)
+        reviewing = bool(callable(proxy_active) and proxy_active())
+        if record is not None and callable(active):
+            reviewing = reviewing or bool(active(record))
+        if reviewing:
             # Do NOT snap back to live when the user presses a bare modifier
             # key (Ctrl, Alt, Super/Win, Shift, …). Modifier-only events carry
             # no child input and therefore do not interrupt history review.
@@ -8583,6 +8719,15 @@ def application_id_for_database(db_path: str | Path | None = None) -> str:
     return _application_id_for_canonical_database(canonical_database_path(db_path))
 
 
+@dataclass(frozen=True)
+class PayloadRevivalSummary:
+    """Durable startup-revival outcomes without conflating repair and restart."""
+
+    revived: int = 0
+    repaired: int = 0
+    failed: int = 0
+
+
 def payload_revival_candidates(records) -> "list[SessionRecord]":
     """Order managed sessions whose durable payload may need relaunching.
 
@@ -8622,25 +8767,45 @@ def payload_revival_candidates(records) -> "list[SessionRecord]":
     return rows
 
 
-def revive_dead_payload_sessions(backend, records, store=None) -> "tuple[int, int]":
-    """Relaunch dead or missing payloads through the generic durable contract.
+def revive_dead_payload_sessions(
+    backend,
+    records,
+    store=None,
+) -> PayloadRevivalSummary:
+    """Relaunch dead/missing payloads and repair false-red live registry rows.
 
     ``create_or_resume`` is a no-op for a live payload, respawns a proven dead
     pane in place, recreates a missing managed session from its digest-bound
-    recipe, and preserves optional native resume semantics. Returns
-    ``(revived, failed)``; no command is guessed here.
+    recipe, and preserves optional native resume semantics. A row persisted as
+    ``recovery-pending``/``missing``/``start-error`` but proven live is repaired
+    to ``running`` without replacing its pane or process. No command is guessed.
     """
 
     revived = 0
+    repaired = 0
     failed = 0
     for record in records:
-        probe = (
-            record
-            if str(getattr(record, "status", "")).casefold() == "recovery-pending"
-            else replace(record, status="recovery-pending")
+        status = str(getattr(record, "status", "")).casefold()
+        probe = record if status == "recovery-pending" else replace(
+            record,
+            status="recovery-pending",
         )
+        repairable_status = status in {
+            "recovery-pending",
+            "missing",
+            "start-error",
+        }
+        stale_error = status == "running" and bool(
+            getattr(record, "recovery_last_error", None)
+        )
+        # Only contradictory durable rows pay for uncached lifecycle probes.
+        # Ordinary running/paused revival retains the existing batched pane map,
+        # while a status repair must never rely on a stale cached/registry PID.
+        pid_lookup = getattr(backend, "authoritative_live_pane_pid", None)
+        if not (repairable_status or stale_error) or not callable(pid_lookup):
+            pid_lookup = backend.pane_pid
         try:
-            before_pid = backend.pane_pid(record)
+            before_pid = pid_lookup(record)
         except (OSError, TmuxError):
             before_pid = None
         try:
@@ -8652,11 +8817,28 @@ def revive_dead_payload_sessions(backend, records, store=None) -> "tuple[int, in
             failed += 1
             continue
         try:
-            after_pid = backend.pane_pid(record)
+            after_pid = pid_lookup(record)
         except (OSError, TmuxError):
             after_pid = None
-        if after_pid is None or after_pid == before_pid:
-            # The payload was already alive; nothing was replaced.
+        if after_pid is None:
+            continue
+        if after_pid == before_pid:
+            # No pane/process identity changed. Correct only registry states that
+            # contradict this authoritative live PID; paused live rows remain
+            # paused, and ordinary running no-ops do not generate writes.
+            if store is not None and (repairable_status or stale_error):
+                try:
+                    store.update(
+                        record.id,
+                        status="running",
+                        last_pid=after_pid,
+                        recovery_last_error=None,
+                        last_opened_at=utc_now(),
+                    )
+                except Exception:
+                    failed += 1
+                else:
+                    repaired += 1
             continue
         revived += 1
         if store is not None:
@@ -8665,11 +8847,16 @@ def revive_dead_payload_sessions(backend, records, store=None) -> "tuple[int, in
                     record.id,
                     status="running",
                     last_pid=after_pid,
+                    recovery_last_error=None,
                     last_opened_at=utc_now(),
                 )
             except Exception:
-                pass
-    return revived, failed
+                failed += 1
+    return PayloadRevivalSummary(
+        revived=revived,
+        repaired=repaired,
+        failed=failed,
+    )
 
 
 class TermDeckApplication(Gtk.Application):
@@ -9971,7 +10158,7 @@ class TermDeckApplication(Gtk.Application):
                 except Exception:
                     worker_store = None
             try:
-                revived, failed = revive_dead_payload_sessions(
+                summary = revive_dead_payload_sessions(
                     self.backend,
                     candidates,
                     store=worker_store,
@@ -9982,7 +10169,7 @@ class TermDeckApplication(Gtk.Application):
                         worker_store.close()
                     except Exception:
                         pass
-            if not revived and not failed:
+            if not (summary.revived or summary.repaired or summary.failed):
                 return
 
             def publish() -> bool:
@@ -9997,20 +10184,26 @@ class TermDeckApplication(Gtk.Application):
                     else None
                 )
                 if callable(show_toast):
-                    if revived:
-                        message = (
-                            f"Relaunched {revived} coding session"
-                            f"{'s' if revived != 1 else ''} in place"
+                    parts: list[str] = []
+                    if summary.revived:
+                        parts.append(
+                            f"Relaunched {summary.revived} coding session"
+                            f"{'s' if summary.revived != 1 else ''} in place"
                         )
-                        if failed:
-                            message += f"; {failed} could not be replaced safely"
-                        show_toast(message, kind="warning" if failed else "success")
-                    else:
-                        show_toast(
-                            f"{failed} remembered session"
-                            f"{'s' if failed != 1 else ''} could not be relaunched safely",
-                            kind="warning",
+                    if summary.repaired:
+                        parts.append(
+                            f"corrected {summary.repaired} live session status"
+                            f"{'es' if summary.repaired != 1 else ''}"
                         )
+                    if summary.failed:
+                        parts.append(
+                            f"{summary.failed} remembered session"
+                            f"{'s' if summary.failed != 1 else ''} could not be repaired safely"
+                        )
+                    show_toast(
+                        "; ".join(parts),
+                        kind="warning" if summary.failed else "success",
+                    )
                 return False
 
             try:

@@ -151,6 +151,28 @@ def test_exact_live_payload_refresh_refuses_mismatched_conversation_before_mutat
     run.assert_not_called()
 
 
+def test_false_dead_notification_reports_live_payload_without_mutation(tmp_path: Path) -> None:
+    record = _record(str(tmp_path))
+    backend = TmuxBackend(executable="tmux")
+    alive = __import__("termdeck.tmux_backend", fromlist=["_PaneLifecycle"])._PaneLifecycle(
+        "%42", False, None, str(tmp_path), 321
+    )
+    with mock.patch.object(backend, "_pane_lifecycle", side_effect=[alive, alive]) as lifecycle, mock.patch.object(
+        backend, "pane_pid"
+    ) as pane_pid, mock.patch.object(backend, "create_or_resume") as create, mock.patch.object(
+        backend, "_respawn_clean_exit_shell"
+    ) as shell:
+        result = backend.recover_dead_payload(record)
+
+    assert result.action == "alive"
+    assert result.pid == 321
+    assert "already live" in result.detail
+    assert lifecycle.call_count == 2
+    pane_pid.assert_not_called()
+    create.assert_not_called()
+    shell.assert_not_called()
+
+
 def test_clean_exit_bridges_old_payload_to_shell_without_resuming_agent(tmp_path: Path) -> None:
     record = _record(str(tmp_path))
     backend = TmuxBackend(executable="tmux")

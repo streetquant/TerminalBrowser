@@ -57,13 +57,15 @@ _MODE_SEQUENCES = (
     ("mouse_button_flag", "1", b"\x1b[?1002h", b"\x1b[?1002l"),
     ("mouse_all_flag", "1", b"\x1b[?1003h", b"\x1b[?1003l"),
     ("mouse_sgr_flag", "1", b"\x1b[?1006h", b"\x1b[?1006l"),
+    ("bracket_paste_flag", "1", b"\x1b[?2004h", b"\x1b[?2004l"),
 )
 
 _PANE_STATE_FORMAT = (
     "#{pane_id} #{pane_pid} #{alternate_on} #{pane_dead} #{cursor_x} #{cursor_y}"
     " #{cursor_flag} #{keypad_cursor_flag} #{wrap_flag} #{insert_flag}"
     " #{origin_flag} #{mouse_standard_flag} #{mouse_button_flag}"
-    " #{mouse_all_flag} #{mouse_sgr_flag} #{history_size}"
+    " #{mouse_all_flag} #{mouse_sgr_flag}"
+    " #{bracket_paste_flag} #{history_size}"
 )
 
 _STATE_FIELDS = (
@@ -82,6 +84,7 @@ _STATE_FIELDS = (
     "mouse_button_flag",
     "mouse_all_flag",
     "mouse_sgr_flag",
+    "bracket_paste_flag",
     "history_size",
 )
 

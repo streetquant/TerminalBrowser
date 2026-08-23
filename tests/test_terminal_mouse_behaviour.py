@@ -6,6 +6,7 @@ from unittest import mock
 from termdeck.gtk_app import AttachTerminal, Gdk, Gtk, TermDeckWindow, Vte
 from termdeck.models import TerminalTheme
 from termdeck.history_control import (
+    ChildInputProtocol,
     EdgeKnowledge,
     HistoryOwner,
     ScrollDisposition,
@@ -185,6 +186,126 @@ class TerminalMouseBehaviourTest(TestCase):
                 )
             finally:
                 attach.destroy()
+
+    def test_child_tui_scrollbar_encodes_sgr_wheel_up_and_down(self) -> None:
+        up = AttachTerminal._sgr_mouse_scroll_bytes(-6, columns=113, rows=33)
+        down = AttachTerminal._sgr_mouse_scroll_bytes(3, columns=113, rows=33)
+
+        self.assertEqual(up, b"\x1b[<64;56;16M" * 2)
+        self.assertEqual(down, b"\x1b[<65;56;16M")
+
+    def test_child_tui_scrollbar_sends_sgr_through_existing_control_transport(self) -> None:
+        controller = SimpleNamespace(send_bytes=mock.Mock(return_value=True))
+        attach = SimpleNamespace(
+            controller=controller,
+            _detached=False,
+            _last_allocated_grid=(113, 33),
+        )
+
+        accepted = AttachTerminal._send_child_tui_scroll(
+            attach,
+            6,
+            protocol=ChildInputProtocol.SGR_MOUSE,
+        )
+
+        self.assertTrue(accepted)
+        controller.send_bytes.assert_called_once_with(b"\x1b[<65;56;16M" * 2)
+
+    def test_child_tui_scrollbar_preserves_legacy_mouse_protocol(self) -> None:
+        controller = SimpleNamespace(send_bytes=mock.Mock(return_value=True))
+        attach = SimpleNamespace(
+            controller=controller,
+            _detached=False,
+            _last_allocated_grid=(113, 33),
+        )
+
+        accepted = AttachTerminal._send_child_tui_scroll(
+            attach,
+            -6,
+            protocol=ChildInputProtocol.LEGACY_MOUSE,
+        )
+
+        self.assertTrue(accepted)
+        controller.send_bytes.assert_called_once_with(b"\x1b[M`X0" * 2)
+
+    def test_child_tui_scrollbar_completion_tracks_virtual_depth_in_both_directions(self) -> None:
+        calls = []
+        attach = SimpleNamespace(
+            _history_request_lock=__import__("threading").Lock(),
+            _history_scroll_generation=2,
+            _detached=False,
+            _history_last_applied_sequence=0,
+            _last_history_scrollbar_value=100.0,
+            _history_cursor_hidden=False,
+            _set_history_depth=lambda depth, extent=None: calls.append(("depth", depth, extent)),
+            _set_history_scrollbar_value=lambda value: calls.append(("value", value)),
+            _set_history_cursor_hidden=lambda hidden: calls.append(("cursor", hidden)),
+            _arm_scroll_idle_resume=lambda: calls.append("idle"),
+            prepare_for_live_input=lambda: calls.append("live") or True,
+        )
+        up = ScrollOutcome(
+            disposition=ScrollDisposition.HANDLED,
+            owner=HistoryOwner.CHILD_TUI,
+            edge=EdgeKnowledge.UNKNOWN,
+            requested_lines=-9,
+            depth=9,
+            detail="child scrollbar wheel accepted",
+        )
+        down = ScrollOutcome(
+            disposition=ScrollDisposition.HANDLED,
+            owner=HistoryOwner.CHILD_TUI,
+            edge=EdgeKnowledge.UNKNOWN,
+            requested_lines=6,
+            depth=3,
+            detail="child scrollbar wheel accepted",
+        )
+
+        AttachTerminal._apply_async_history_scroll_outcome(attach, 2, 1, -9, up)
+        AttachTerminal._apply_async_history_scroll_outcome(attach, 2, 2, 6, down)
+
+        self.assertEqual(calls, [("depth", 9, None), ("cursor", False), ("depth", 3, None), ("cursor", False)])
+        self.assertNotIn("live", calls)
+
+    def test_child_tui_passthrough_worker_converts_scrollbar_delta_to_owned_navigation(self) -> None:
+        published = []
+        lock = __import__("threading").Lock()
+        passthrough = ScrollOutcome(
+            disposition=ScrollDisposition.PASSTHROUGH,
+            owner=HistoryOwner.CHILD_TUI,
+            edge=EdgeKnowledge.UNKNOWN,
+            requested_lines=-6,
+            child_input_protocol=ChildInputProtocol.SGR_MOUSE,
+        )
+        attach = SimpleNamespace(
+            _detached=False,
+            _history_request_lock=lock,
+            _pending_history_delta=-6,
+            _history_scroll_generation=5,
+            _history_worker_active=True,
+            _history_worker_generation=5,
+            _history_scroll_sequence=0,
+            _pending_history_apply=None,
+            _history_apply_scheduled=False,
+            _child_tui_history_depth=0,
+            _scroll_handler=lambda delta: passthrough,
+            _send_child_tui_scroll=mock.Mock(return_value=True),
+            _publish_async_history_scroll_outcome=lambda generation, sequence, delta, outcome: published.append((generation, sequence, delta, outcome)),
+        )
+
+        with mock.patch("termdeck.gtk_app._HISTORY_SCROLL_ADMISSION.release") as release:
+            AttachTerminal._history_scroll_worker(attach, 5)
+
+        attach._send_child_tui_scroll.assert_called_once_with(
+            -6,
+            protocol=ChildInputProtocol.SGR_MOUSE,
+        )
+        self.assertEqual(len(published), 1)
+        outcome = published[0][3]
+        self.assertIs(outcome.disposition, ScrollDisposition.HANDLED)
+        self.assertIs(outcome.owner, HistoryOwner.CHILD_TUI)
+        self.assertEqual(outcome.depth, 6)
+        self.assertEqual(attach._child_tui_history_depth, 6)
+        release.assert_called_once_with()
 
     def test_dragging_history_scrollbar_queues_delta_without_backend_io_inline(self) -> None:
         calls = []

@@ -155,6 +155,22 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertIn("self._queue_history_scroll_delta(delta)", thumb)
         self.assertNotIn("self._scroll_handler(", thumb)
 
+    def test_history_worker_never_resolves_rows_through_gtk_owned_sqlite(self) -> None:
+        main_window = _section(GTK_APP, "class TermDeckWindow", "class TermDeckApplication")
+        open_session = _section(main_window, "    def open_session", "    def _focus_session")
+        scroll_binding = _section(
+            open_session,
+            "# Scrollbar drags execute on the bounded history worker",
+            "selection_history_handler=",
+        )
+
+        self.assertIn("scroll_record=record", scroll_binding)
+        self.assertIn("self._scroll_terminal(", scroll_binding)
+        self.assertIn("scroll_record", scroll_binding)
+        self.assertNotIn("current_callback_record", scroll_binding)
+        self.assertNotIn("app_context.store", scroll_binding)
+        self.assertIn("worker deliberately does not call this SQLite-backed helper", open_session)
+
     def test_terminal_history_live_edge_is_backend_evidence_not_scrollbar_geometry(self) -> None:
         terminal = _section(GTK_APP, "class AttachTerminal", "class WindowOverview")
         wheel = _section(terminal, "def _on_terminal_scroll", "# ------------------------------------------------------------------ #\n    # Scroll-idle auto-resume")
