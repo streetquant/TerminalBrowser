@@ -40,6 +40,8 @@ The surrounding 0.2.17 contracts remain intact: a clean application exit returns
 
 Promotion requires the complete test inventory, every GTK/VTE/tmux smoke, deterministic real-tmux key and scrollbar evidence, false-red repair tests, production-profile validation on the exact clean commit, reproducible double-build, strict wheel/manifest verification, managed installation with the previous immutable release retained, GUI-only handoff, and live post-install comparison proving that tmux server, session, pane, payload, command, model selection, authentication, working-directory, and recovery identities were not lost.
 
+The validation runner also drains child output before creating task metadata. A pytest process that exits while a descendant still inherits its pipe can no longer produce an empty receipt followed by a late-mutating output file; same-group writers are reaped, escaped writers fail closed, and the recorded size, digest, and parsed outcome refer to final bytes.
+
 ## 0.2.17
 
 T1000 0.2.17 repairs the three live regressions reported against the installed 0.2.9 runtime: model transitions could destroy the pane/stream handoff, the tab-strip `+` could disappear after overflow, and already-running `cc-go-ulw` processes could remain bound to an older gateway-model inventory. The release also completes the generic durable-recovery, killed-history, shell-return, and per-tab scrolling work that was present only in the newer source tree and had never reached the managed installation.

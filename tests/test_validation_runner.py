@@ -10,6 +10,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -275,6 +276,61 @@ def test_process_runner_bounds_output_and_kills_timeouts_without_limiting_data_f
     )
     assert data_writer["ok"] is True
     assert data_path.stat().st_size == 100000
+
+
+def test_process_runner_drains_short_output_before_receipt_when_descendant_holds_pipe(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+    descendant_pid_path = tmp_path / "descendant.pid"
+    command = (
+        "import pathlib,subprocess,sys;"
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);"
+        f"pathlib.Path({str(descendant_pid_path)!r}).write_text(str(child.pid));"
+        "print('1 passed',flush=True)"
+    )
+
+    started = time.monotonic()
+    task = runner.run_process(
+        task_id="inherited-output-pipe",
+        kind="test",
+        relative="inherited-output-pipe",
+        argv=[sys.executable, "-c", command],
+        cwd=tmp_path,
+        env=os.environ.copy(),
+        output_root=output,
+        timeout_seconds=10,
+        grace_seconds=1,
+        stdout_limit=4096,
+        stderr_limit=4096,
+    )
+    elapsed = time.monotonic() - started
+    stdout_path = output / task["stdout"]["path"]
+
+    assert task["ok"] is True, task
+    assert task["output_drain"] == {
+        "alive_readers": [],
+        "complete": True,
+        "errors": [],
+        "group_cleanup_required": True,
+    }
+    assert task["stdout"]["observed_size"] == len(b"1 passed\n")
+    assert task["stdout"]["size"] == len(b"1 passed\n")
+    assert not any(
+        thread.name.startswith("validation-inherited-output-pipe-")
+        for thread in runner.threading.enumerate()
+    )
+    assert stdout_path.read_bytes() == b"1 passed\n"
+    assert runner.parse_test_summary(stdout_path.read_text())["passed"] == 1
+    assert elapsed < 6.0
+
+    descendant_pid = int(descendant_pid_path.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(descendant_pid, 0)
+    captured = stdout_path.read_bytes()
+    time.sleep(0.25)
+    assert stdout_path.read_bytes() == captured
 
 
 def test_xvfb_environment_uses_short_private_runtime_and_cleans_after_task(

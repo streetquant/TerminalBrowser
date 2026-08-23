@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import select
 import shutil
 import signal
 import stat
@@ -996,36 +997,74 @@ def _task_environment(
     return env, runtime
 
 
+def _process_group_exists(pgid: int) -> bool:
+    if pgid <= 1:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _wait_for_process_group_exit(pgid: int, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while _process_group_exists(pgid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
 def _kill_process_group(process: subprocess.Popen[bytes], grace_seconds: float) -> None:
-    if process.poll() is not None:
-        return
+    """Terminate the isolated process group, including writers surviving its leader."""
+
+    pgid = process.pid
+    grace = max(0.05, float(grace_seconds))
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
-        return
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
     except OSError:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+    if process.poll() is None:
         try:
-            process.terminate()
-        except OSError:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
             pass
-    try:
-        process.wait(timeout=grace_seconds)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    except OSError:
+    _wait_for_process_group_exit(pgid, grace)
+
+    if _process_group_exists(pgid):
         try:
-            process.kill()
-        except OSError:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
             pass
-    try:
-        process.wait(timeout=grace_seconds)
-    except subprocess.TimeoutExpired:
-        pass
+        except OSError:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+        _wait_for_process_group_exit(pgid, grace)
+
+    if process.poll() is None:
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _drain_bounded_stream(
@@ -1034,27 +1073,71 @@ def _drain_bounded_stream(
     *,
     limit: int,
     overflow: threading.Event,
-    result: dict[str, int],
+    stop: threading.Event,
+    result: dict[str, object],
 ) -> None:
-    """Drain one child pipe while retaining at most ``limit`` bytes on disk."""
+    """Drain one child pipe without waiting for EOF before retaining short output."""
 
     observed = 0
-    with path.open("xb", buffering=0) as handle:
-        os.chmod(path, 0o600)
-        while True:
-            try:
-                chunk = stream.read(65536)
-            except OSError:
-                break
-            if not chunk:
-                break
-            observed += len(chunk)
-            remaining = max(0, limit - handle.tell())
-            if remaining:
-                handle.write(chunk[:remaining])
-            if observed > limit:
-                overflow.set()
-    result["observed_bytes"] = observed
+    completed = False
+    error = ""
+    stop_deadline: float | None = None
+    try:
+        descriptor = stream.fileno()
+        # BufferedReader.read(65536) may wait for EOF after a short write when a
+        # descendant inherits the pipe. Nonblocking os.read retains available
+        # bytes immediately, while select keeps the reader bounded and stoppable.
+        os.set_blocking(descriptor, False)
+        with path.open("xb", buffering=0) as handle:
+            os.chmod(path, 0o600)
+            while True:
+                if stop.is_set() and stop_deadline is None:
+                    stop_deadline = time.monotonic() + 0.25
+                if stop_deadline is not None and time.monotonic() >= stop_deadline:
+                    break
+                timeout = 0.0 if stop_deadline is not None else 0.1
+                try:
+                    readable, _, _ = select.select([descriptor], [], [], timeout)
+                except (OSError, ValueError) as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    break
+                if not readable:
+                    if stop_deadline is not None:
+                        break
+                    continue
+                try:
+                    chunk = os.read(descriptor, 65536)
+                except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    break
+                if not chunk:
+                    completed = True
+                    break
+                observed += len(chunk)
+                result["observed_bytes"] = observed
+                remaining = max(0, limit - handle.tell())
+                if remaining:
+                    handle.write(chunk[:remaining])
+                if observed > limit:
+                    overflow.set()
+    except BaseException as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        result["observed_bytes"] = observed
+        result["completed"] = completed
+        result["error"] = error
+
+
+def _join_output_readers(
+    readers: Sequence[threading.Thread], timeout_seconds: float
+) -> list[threading.Thread]:
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    for reader in readers:
+        remaining = max(0.0, deadline - time.monotonic())
+        reader.join(timeout=remaining)
+    return [reader for reader in readers if reader.is_alive()]
 
 
 def run_process(
@@ -1083,10 +1166,21 @@ def run_process(
     timed_out = False
     start_error = ""
     output_limit_exceeded = False
-    stdout_observed: dict[str, int] = {"observed_bytes": 0}
-    stderr_observed: dict[str, int] = {"observed_bytes": 0}
+    output_group_cleanup_required = False
+    stdout_observed: dict[str, object] = {
+        "observed_bytes": 0,
+        "completed": False,
+        "error": "",
+    }
+    stderr_observed: dict[str, object] = {
+        "observed_bytes": 0,
+        "completed": False,
+        "error": "",
+    }
     overflow = threading.Event()
+    stop_readers = threading.Event()
     readers: list[threading.Thread] = []
+    reader_names_alive: list[str] = []
     try:
         process = subprocess.Popen(
             list(argv),
@@ -1105,10 +1199,11 @@ def run_process(
                 kwargs={
                     "limit": stdout_limit,
                     "overflow": overflow,
+                    "stop": stop_readers,
                     "result": stdout_observed,
                 },
                 name=f"validation-{task_id}-stdout",
-                daemon=True,
+                daemon=False,
             ),
             threading.Thread(
                 target=_drain_bounded_stream,
@@ -1116,10 +1211,11 @@ def run_process(
                 kwargs={
                     "limit": stderr_limit,
                     "overflow": overflow,
+                    "stop": stop_readers,
                     "result": stderr_observed,
                 },
                 name=f"validation-{task_id}-stderr",
-                daemon=True,
+                daemon=False,
             ),
         ]
         for reader in readers:
@@ -1146,8 +1242,31 @@ def run_process(
             raise
         start_error = f"{type(exc).__name__}: {exc}"
     finally:
-        for reader in readers:
-            reader.join(timeout=max(1.0, float(grace_seconds)))
+        drain_grace = max(1.0, float(grace_seconds))
+        alive = _join_output_readers(readers, drain_grace)
+        if alive and process is not None:
+            output_group_cleanup_required = True
+            _kill_process_group(process, grace_seconds)
+            alive = _join_output_readers(alive, drain_grace)
+        stop_readers.set()
+        if alive:
+            alive = _join_output_readers(alive, drain_grace)
+        if alive and process is not None:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            alive = _join_output_readers(alive, drain_grace)
+        elif process is not None:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+        reader_names_alive = [reader.name for reader in alive]
         for path in (stdout_path, stderr_path):
             if not path.exists():
                 path.write_bytes(b"")
@@ -1157,11 +1276,24 @@ def run_process(
     stderr_size = stderr_path.stat().st_size
     returncode = None if process is None else process.returncode
     signal_number = -returncode if isinstance(returncode, int) and returncode < 0 else None
+    stdout_observed_size = int(stdout_observed.get("observed_bytes", 0) or 0)
+    stderr_observed_size = int(stderr_observed.get("observed_bytes", 0) or 0)
     output_limit_exceeded = bool(
         output_limit_exceeded
         or overflow.is_set()
-        or stdout_observed["observed_bytes"] > stdout_limit
-        or stderr_observed["observed_bytes"] > stderr_limit
+        or stdout_observed_size > stdout_limit
+        or stderr_observed_size > stderr_limit
+    )
+    output_drain_errors = [
+        str(error)
+        for error in (stdout_observed.get("error"), stderr_observed.get("error"))
+        if error
+    ]
+    output_drain_complete = bool(
+        not reader_names_alive
+        and stdout_observed.get("completed") is True
+        and stderr_observed.get("completed") is True
+        and not output_drain_errors
     )
     runtime_receipt = _cleanup_task_runtime(cleanup_runtime)
     ok = bool(
@@ -1169,6 +1301,7 @@ def run_process(
         and not timed_out
         and returncode == 0
         and not output_limit_exceeded
+        and output_drain_complete
         and stdout_size <= stdout_limit
         and stderr_size <= stderr_limit
         and runtime_receipt.get("cleanup_ok") is True
@@ -1180,6 +1313,12 @@ def run_process(
         "environment_class": "production-host" if kind == "smoke-host" else "isolated",
         "kind": kind,
         "ok": ok,
+        "output_drain": {
+            "alive_readers": reader_names_alive,
+            "complete": output_drain_complete,
+            "errors": output_drain_errors,
+            "group_cleanup_required": output_group_cleanup_required,
+        },
         "output_limit_exceeded": output_limit_exceeded,
         "path": relative,
         "returncode": returncode,
@@ -1188,13 +1327,13 @@ def run_process(
         "start_error": start_error,
         "started_ns": started_ns,
         "stderr": {
-            "observed_size": stderr_observed["observed_bytes"],
+            "observed_size": stderr_observed_size,
             "path": str(stderr_path.relative_to(output_root)),
             "sha256": sha256_file(stderr_path),
             "size": stderr_size,
         },
         "stdout": {
-            "observed_size": stdout_observed["observed_bytes"],
+            "observed_size": stdout_observed_size,
             "path": str(stdout_path.relative_to(output_root)),
             "sha256": sha256_file(stdout_path),
             "size": stdout_size,

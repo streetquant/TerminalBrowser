@@ -11,6 +11,7 @@
 - Corrected false red recovery state without replacing live payloads. A stale pane-dead notification now revalidates the same live pane and PID as a no-op, while startup reconciliation converts contradictory `recovery-pending`, `missing`, or `start-error` rows back to `running` and clears stale errors.
 - Preserved all existing session semantics: clean payload exit still returns to a shell in the same tab, explicit Kill remains terminal, killed history survives until Remove, generic non-Codex recipes remain digest-bound, and existing OpenCode model selections are never rewritten or mass-refreshed.
 - Added failing-first unit and real GTK/VTE/tmux coverage for auto-submit, `Ctrl+L`, wheel up/down, scrollbar drag and return-to-bottom, bracketed paste, complete composer redraw, false pane-dead events, live status repair, and the SQLite worker-thread boundary.
+- Hardened production validation receipts against inherited output descriptors. Short pytest output is drained before hashing, lingering same-group writers are terminated, escaped writers fail closed, and a published receipt can no longer precede or later diverge from its output artifact.
 
 ## 0.2.17
 
