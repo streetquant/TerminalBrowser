@@ -44,8 +44,17 @@ pub const MAX_CONNECTIONS: usize = 1_024;
 pub const MAX_RENDERED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TMUX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TMUX_ROWS: usize = MAX_DATABASE_ROWS * 4;
+pub const MAX_FRONTEND_ASSET_BYTES: usize = 64 * 1024;
 
-const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v1/app.css";
+const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v1/app.js";
+const APP_CSS: &[u8] = include_bytes!("../assets/app.css");
+const APP_JS: &[u8] = include_bytes!("../assets/app.js");
+const _: () = {
+    assert!(APP_CSS.len() <= MAX_FRONTEND_ASSET_BYTES);
+    assert!(APP_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+};
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; manifest-src 'none'; worker-src 'none'";
 const USAGE: &str = "TermDeck read-only web mirror\n\n\
 Usage: termdeck-web-server [options]\n\n\
 Options:\n\
@@ -481,6 +490,7 @@ impl RenderedSnapshot {
             let json = serde_json::to_vec(&WindowEnvelopeDto {
                 schema: "termdeck.window-snapshot.v1",
                 revision: snapshot.revision(),
+                revision_text: snapshot.revision().to_string(),
                 generated_at_unix_ms: snapshot.generated_at_unix_ms(),
                 window: window_dto(window),
             })?;
@@ -563,6 +573,8 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(homepage))
+        .route(FRONTEND_CSS_PATH, get(frontend_css))
+        .route(FRONTEND_JS_PATH, get(frontend_js))
         .route("/_termdeck/healthz", get(healthz))
         .route("/_termdeck/readyz", get(readyz))
         .route("/_termdeck/api/v1/snapshot", get(api_snapshot))
@@ -617,6 +629,14 @@ async fn security_headers(request: Request, next: Next) -> Response {
         HeaderValue::from_static("DENY"),
     );
     headers.insert(
+        HeaderName::from_static("cross-origin-opener-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
         HeaderName::from_static("referrer-policy"),
         HeaderValue::from_static("no-referrer"),
     );
@@ -638,6 +658,22 @@ async fn homepage(State(state): State<AppState>) -> Response {
             publication.homepage_html.clone(),
         )
     })
+}
+
+async fn frontend_css() -> Response {
+    text_response(
+        StatusCode::OK,
+        "text/css; charset=utf-8",
+        Bytes::from_static(APP_CSS),
+    )
+}
+
+async fn frontend_js() -> Response {
+    text_response(
+        StatusCode::OK,
+        "text/javascript; charset=utf-8",
+        Bytes::from_static(APP_JS),
+    )
 }
 
 async fn window_page(State(state): State<AppState>, AxumPath(slug): AxumPath<String>) -> Response {
@@ -830,6 +866,7 @@ struct HostDto<'a> {
     host_id: &'a str,
     owner_id: &'a str,
     revision: u64,
+    revision_text: String,
     generated_at_unix_ms: u64,
     total_panes: usize,
     windows: Vec<WindowDto<'a>>,
@@ -839,6 +876,7 @@ struct HostDto<'a> {
 struct WindowEnvelopeDto<'a> {
     schema: &'static str,
     revision: u64,
+    revision_text: String,
     generated_at_unix_ms: u64,
     window: WindowDto<'a>,
 }
@@ -877,6 +915,7 @@ fn host_dto(snapshot: &HostSnapshot) -> HostDto<'_> {
         host_id: snapshot.host_id().as_str(),
         owner_id: snapshot.owner_id().as_str(),
         revision: snapshot.revision(),
+        revision_text: snapshot.revision().to_string(),
         generated_at_unix_ms: snapshot.generated_at_unix_ms(),
         total_panes: snapshot.total_panes(),
         windows: snapshot.windows().iter().map(window_dto).collect(),
@@ -936,15 +975,17 @@ fn render_homepage(
     tmux_warning: Option<&str>,
 ) -> Result<String, ServerError> {
     let mut output = String::with_capacity(8_192 + snapshot.total_panes().saturating_mul(32));
-    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>TermDeck</title><style>");
-    output.push_str(STYLES);
-    output.push_str("</style></head><body><main><header><p class=\"eyebrow\">TermDeck host mirror</p><h1>Windows</h1><p class=\"subtle\">");
+    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>TermDeck</title><link rel=\"stylesheet\" href=\"");
+    output.push_str(FRONTEND_CSS_PATH);
+    output.push_str("\"><script defer src=\"");
+    output.push_str(FRONTEND_JS_PATH);
+    output.push_str("\"></script></head><body><main id=\"termdeck-app\" data-termdeck-page=\"home\"><header><p class=\"eyebrow\">TermDeck read-only host mirror</p><h1>Windows</h1><p class=\"subtle\">");
     output.push_str(&snapshot.windows().len().to_string());
     output.push_str(" windows · ");
     output.push_str(&snapshot.total_panes().to_string());
     output.push_str(" visible panes · revision ");
     output.push_str(&snapshot.revision().to_string());
-    output.push_str("</p></header>");
+    output.push_str("</p><p class=\"identity\">All browser sessions are viewers; this frontend has no mutation authority.</p></header>");
     if tmux_warning.is_some() {
         output.push_str("<div class=\"notice\">tmux inventory is temporarily unavailable; registry status is shown without claiming live-process certainty.</div>");
     }
@@ -963,11 +1004,18 @@ fn render_homepage(
         output.push_str(&window.panes().len().to_string());
         output.push_str(" panes · ");
         output.push_str(&running.to_string());
-        output.push_str(" running</span><code>");
+        output.push_str(" running</span><span class=\"identity\">Window ");
+        escape_html_into(&mut output, window.id().as_str());
+        output.push_str("</span><code>");
         output.push_str(window.route().path().as_str());
         output.push_str("</code></a>");
     }
-    output.push_str("</section><footer><a href=\"/_termdeck/api/v1/snapshot\">JSON snapshot</a></footer></main></body></html>");
+    if snapshot.windows().is_empty() {
+        output.push_str(
+            "<div class=\"empty\">No remembered TermDeck windows are currently available.</div>",
+        );
+    }
+    output.push_str("</section><noscript><div class=\"notice\">Automatic API refresh requires JavaScript; this server-rendered snapshot remains read-only.</div></noscript><footer class=\"footer-row\"><a href=\"/_termdeck/api/v1/snapshot\">Versioned JSON</a><p class=\"refresh-state\">Server-rendered fallback · viewer-only browser session</p></footer></main></body></html>");
     ensure_response_bound(output.len())?;
     Ok(output)
 }
@@ -980,14 +1028,22 @@ fn render_window_page(
     let mut output = String::with_capacity(8_192 + window.panes().len().saturating_mul(512));
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
     escape_html_into(&mut output, window.name());
-    output.push_str(" · TermDeck</title><style>");
-    output.push_str(STYLES);
-    output.push_str("</style></head><body><main><nav><a href=\"/\">← All windows</a></nav><header><p class=\"eyebrow\">TermDeck window</p><h1>");
+    output.push_str(" · TermDeck</title><link rel=\"stylesheet\" href=\"");
+    output.push_str(FRONTEND_CSS_PATH);
+    output.push_str("\"><script defer src=\"");
+    output.push_str(FRONTEND_JS_PATH);
+    output.push_str("\"></script></head><body><main id=\"termdeck-app\" data-termdeck-page=\"window\" data-termdeck-slug=\"");
+    escape_html_into(&mut output, window.route().slug());
+    output.push_str("\"><nav><a href=\"/\">← All windows</a></nav><header><p class=\"eyebrow\">TermDeck read-only window</p><h1>");
     escape_html_into(&mut output, window.name());
     output.push_str("</h1><p class=\"subtle\">");
     output.push_str(&window.panes().len().to_string());
     output.push_str(" visible panes · revision ");
     output.push_str(&snapshot.revision().to_string());
+    output.push_str("</p><p class=\"identity\">Window ");
+    escape_html_into(&mut output, window.id().as_str());
+    output.push_str(" · ");
+    output.push_str(window.route().path().as_str());
     output.push_str("</p></header>");
     if tmux_warning.is_some() {
         output.push_str("<div class=\"notice\">Live tmux observation is degraded; no process state has been changed.</div>");
@@ -999,29 +1055,37 @@ fn render_window_page(
         );
     }
     for pane in window.panes() {
-        output.push_str("<article class=\"pane\"><div><h2>");
+        output.push_str("<article class=\"pane\"><div class=\"pane-main\"><h2>");
         escape_html_into(&mut output, pane.title());
         output.push_str("</h2><p class=\"path\">");
         escape_html_into(&mut output, pane.cwd());
-        output.push_str("</p></div><span class=\"status status-");
+        output.push_str("</p><p class=\"identity\">Pane ");
+        escape_html_into(&mut output, pane.id().as_str());
+        if let Some(session_id) = pane.session_id() {
+            output.push_str(" · session ");
+            escape_html_into(&mut output, session_id.as_str());
+        }
+        output.push_str("</p></div><div class=\"pane-aside\"><span class=\"status status-");
         output.push_str(pane_status_name(pane.status()));
         output.push_str("\">");
         output.push_str(pane_status_name(pane.status()));
-        output.push_str("</span></article>");
+        output.push_str("</span><span class=\"mode\">Viewer · read-only</span>");
+        if pane.controller().is_some() {
+            output.push_str("<span class=\"controller-active\">Controller active</span>");
+        }
+        output.push_str("</div></article>");
     }
-    output.push_str("</section><footer><a href=\"/_termdeck/api/v1/windows/");
+    output.push_str("</section><noscript><div class=\"notice\">Automatic API refresh requires JavaScript; this server-rendered snapshot remains read-only.</div></noscript><footer class=\"footer-row\"><a href=\"/_termdeck/api/v1/windows/");
     output.push_str(window.route().slug());
-    output.push_str("\">Window JSON</a></footer></main></body></html>");
+    output.push_str("\">Versioned JSON</a><p class=\"refresh-state\">Server-rendered fallback · viewer-only browser session</p></footer></main></body></html>");
     ensure_response_bound(output.len())?;
     Ok(output)
 }
 
 fn render_not_found_page(slug: &str) -> String {
     let mut output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Not found · TermDeck</title><style>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Not found · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v1/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored TermDeck window owns this route",
     );
-    output.push_str(STYLES);
-    output.push_str("</style></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored TermDeck window owns this route");
     if !slug.is_empty() {
         output.push_str(": <code>/");
         escape_html_into(&mut output, slug);
@@ -1053,10 +1117,6 @@ fn ensure_response_bound(actual: usize) -> Result<(), ServerError> {
     }
     Ok(())
 }
-
-const STYLES: &str = r#"
-:root{color-scheme:dark;font-family:Inter,ui-sans-serif,system-ui,sans-serif;background:#090c12;color:#e8edf7}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#171d2b 0,#090c12 45%);min-height:100vh}main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:48px 0 72px}a{color:#b8c8ff;text-decoration:none}a:hover{text-decoration:underline}header{margin:24px 0 32px}.eyebrow{color:#8fa2d8;text-transform:uppercase;letter-spacing:.16em;font-size:.74rem;font-weight:700}h1{font-size:clamp(2rem,5vw,4rem);line-height:1;margin:.15em 0}.subtle,.card-meta,.path{color:#9ba7bd}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}.card,.pane,.empty,.notice{border:1px solid #293247;background:rgba(17,22,33,.86);border-radius:14px}.card{display:flex;min-height:150px;padding:20px;flex-direction:column;gap:10px;transition:transform .12s ease,border-color .12s ease}.card:hover{transform:translateY(-2px);border-color:#778bc5;text-decoration:none}.card-title{font-size:1.25rem;font-weight:700;color:#f4f7ff}.card code{margin-top:auto;color:#8294c7}.panes{display:grid;gap:10px}.pane{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:17px 20px}.pane h2{font-size:1rem;margin:0 0 5px}.path{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.82rem;margin:0;overflow-wrap:anywhere}.status{border-radius:999px;padding:5px 10px;font-size:.72rem;font-weight:700;background:#283044;color:#c9d2e8}.status-running{background:#173e30;color:#9be5bd}.status-paused{background:#493a18;color:#f5d68a}.status-missing,.status-dead,.status-start-error{background:#4b252c;color:#ffb5c1}.notice{padding:13px 16px;margin:0 0 20px;color:#f0d398}.empty{padding:30px;color:#9ba7bd}nav{margin-bottom:28px}footer{margin-top:32px;padding-top:20px;border-top:1px solid #232b3c}@media(max-width:600px){main{padding-top:24px}.pane{align-items:flex-start;flex-direction:column}.status{align-self:flex-start}}
-"#;
 
 #[derive(Debug)]
 struct TmuxCandidate {
@@ -1209,7 +1269,8 @@ fn duration_ms(duration: Duration) -> Result<u64, ServerError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, CONTENT_SECURITY_POLICY, CacheAvailability, ConfigAction, RenderedSnapshot,
+        APP_CSS, APP_JS, AppState, CONTENT_SECURITY_POLICY, CacheAvailability, ConfigAction,
+        FRONTEND_CSS_PATH, FRONTEND_JS_PATH, MAX_FRONTEND_ASSET_BYTES, RenderedSnapshot,
         ServerConfig, ServerError, SnapshotCache, build_router, unix_ms,
     };
     use axum::body::{Body, to_bytes};
@@ -1242,6 +1303,10 @@ mod tests {
     }
 
     fn test_snapshot(generated_at_unix_ms: u64) -> HostSnapshot {
+        test_snapshot_with_revision(generated_at_unix_ms, 42)
+    }
+
+    fn test_snapshot_with_revision(generated_at_unix_ms: u64, revision: u64) -> HostSnapshot {
         let window_id = id(WindowId::new("window-random"));
         let route = match WindowRoute::restored(window_id.clone(), "random") {
             Ok(value) => value,
@@ -1267,7 +1332,7 @@ mod tests {
         match HostSnapshot::new(
             id(HostId::new("host-test")),
             id(OwnerId::new("owner-test")),
-            42,
+            revision,
             generated_at_unix_ms,
             vec![window],
         ) {
@@ -1344,6 +1409,18 @@ mod tests {
             );
             assert_eq!(
                 home.headers()
+                    .get("cross-origin-opener-policy")
+                    .and_then(|value| value.to_str().ok()),
+                Some("same-origin")
+            );
+            assert_eq!(
+                home.headers()
+                    .get("cross-origin-resource-policy")
+                    .and_then(|value| value.to_str().ok()),
+                Some("same-origin")
+            );
+            assert_eq!(
+                home.headers()
                     .get(header::CACHE_CONTROL)
                     .and_then(|value| value.to_str().ok()),
                 Some("no-store, max-age=0")
@@ -1357,6 +1434,12 @@ mod tests {
             let home_text = body_text(home).await;
             assert!(home_text.contains("href=\"/random\""));
             assert!(home_text.contains("Random &amp; Research"));
+            assert!(home_text.contains("id=\"termdeck-app\""));
+            assert!(home_text.contains("data-termdeck-page=\"home\""));
+            assert!(home_text.contains(FRONTEND_CSS_PATH));
+            assert!(home_text.contains(FRONTEND_JS_PATH));
+            assert!(home_text.contains("All browser sessions are viewers"));
+            assert!(!home_text.contains("<style>"));
 
             let window = match router
                 .oneshot(request(Method::GET, "/random", "localhost:7391"))
@@ -1369,7 +1452,108 @@ mod tests {
             let window_text = body_text(window).await;
             assert!(window_text.contains("Shell &lt;unsafe&gt;"));
             assert!(window_text.contains("/tmp/&amp;work"));
+            assert!(window_text.contains("data-termdeck-page=\"window\""));
+            assert!(window_text.contains("data-termdeck-slug=\"random\""));
+            assert!(window_text.contains("Pane session-one"));
+            assert!(window_text.contains("Viewer · read-only"));
+            assert!(!window_text.contains("<style>"));
         });
+    }
+
+    #[test]
+    fn frontend_assets_are_bounded_api_driven_and_sink_safe() {
+        runtime().block_on(async {
+            assert!(APP_CSS.len() <= MAX_FRONTEND_ASSET_BYTES);
+            assert!(APP_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+            assert!(CONTENT_SECURITY_POLICY.contains("script-src 'self'"));
+            assert!(CONTENT_SECURITY_POLICY.contains("style-src 'self'"));
+            assert!(CONTENT_SECURITY_POLICY.contains("connect-src 'self'"));
+            assert!(!CONTENT_SECURITY_POLICY.contains("unsafe-inline"));
+
+            let router = build_router(state(30_000, unix_ms()));
+            let css = match router
+                .clone()
+                .oneshot(request(Method::GET, FRONTEND_CSS_PATH, "127.0.0.1"))
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => match error {},
+            };
+            assert_eq!(css.status(), StatusCode::OK);
+            assert_eq!(
+                css.headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/css; charset=utf-8")
+            );
+            let css_text = body_text(css).await;
+            assert_eq!(css_text.as_bytes(), APP_CSS);
+
+            let javascript = match router
+                .oneshot(request(Method::GET, FRONTEND_JS_PATH, "localhost:7391"))
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => match error {},
+            };
+            assert_eq!(javascript.status(), StatusCode::OK);
+            assert_eq!(
+                javascript
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/javascript; charset=utf-8")
+            );
+            let script = body_text(javascript).await;
+            assert_eq!(script.as_bytes(), APP_JS);
+            assert!(script.contains("/_termdeck/api/v1/snapshot"));
+            assert!(script.contains("/_termdeck/api/v1/windows/"));
+            assert!(script.contains("textContent"));
+            assert!(script.contains("replaceChildren"));
+            assert!(script.contains("Viewer · read-only"));
+            assert!(script.contains("AbortController"));
+            assert!(script.contains("revision_text"));
+            for forbidden in [
+                "innerHTML",
+                "outerHTML",
+                "insertAdjacentHTML",
+                "document.write",
+                "eval(",
+                "new Function",
+                "localStorage",
+                "sessionStorage",
+            ] {
+                assert!(
+                    !script.contains(forbidden),
+                    "forbidden frontend sink: {forbidden}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn revision_text_preserves_full_u64_for_javascript_clients() {
+        let rendered =
+            match RenderedSnapshot::new(test_snapshot_with_revision(unix_ms(), u64::MAX), None) {
+                Ok(value) => value,
+                Err(error) => panic!("could not render maximum revision: {error}"),
+            };
+        let host = match std::str::from_utf8(rendered.full_json.as_ref()) {
+            Ok(value) => value,
+            Err(error) => panic!("host JSON was not UTF-8: {error}"),
+        };
+        assert!(host.contains("\"revision\":18446744073709551615"));
+        assert!(host.contains("\"revision_text\":\"18446744073709551615\""));
+        let window = match rendered.windows.get("random") {
+            Some(value) => value,
+            None => panic!("missing rendered window"),
+        };
+        let window_json = match std::str::from_utf8(window.json.as_ref()) {
+            Ok(value) => value,
+            Err(error) => panic!("window JSON was not UTF-8: {error}"),
+        };
+        assert!(window_json.contains("\"revision\":18446744073709551615"));
+        assert!(window_json.contains("\"revision_text\":\"18446744073709551615\""));
     }
 
     #[test]
@@ -1391,7 +1575,25 @@ mod tests {
             assert_eq!(snapshot.status(), StatusCode::OK);
             let text = body_text(snapshot).await;
             assert!(text.contains("\"schema\":\"termdeck.host-snapshot.v1\""));
+            assert!(text.contains("\"revision_text\":\"42\""));
             assert!(text.contains("\"path\":\"/random\""));
+            for forbidden in [
+                "\"command\"",
+                "\"last_pid\"",
+                "\"recovery_command\"",
+                "\"recovery_cwd\"",
+                "\"auth_scope_id\"",
+                "\"codex_home\"",
+                "\"selected_account\"",
+                "\"pending_account\"",
+                "\"recovery_recipe\"",
+                "\"lease_id\"",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "sensitive API field: {forbidden}"
+                );
+            }
 
             let missing = match router
                 .clone()

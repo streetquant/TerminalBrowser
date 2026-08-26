@@ -16,6 +16,26 @@ from typing import Final
 
 COMMAND_TIMEOUT_SECONDS: Final = 360
 MAX_CAPTURE_BYTES: Final = 8 * 1024 * 1024
+MAX_FRONTEND_ASSET_BYTES: Final = 64 * 1024
+FRONTEND_EXPECTED_TEXT: Final = (
+    "/_termdeck/api/v1/snapshot",
+    "/_termdeck/api/v1/windows/",
+    "textContent",
+    "replaceChildren",
+    "Viewer · read-only",
+    "AbortController",
+    "revision_text",
+)
+FRONTEND_FORBIDDEN_TEXT: Final = (
+    "innerHTML",
+    "outerHTML",
+    "insertAdjacentHTML",
+    "document.write",
+    "eval(",
+    "new Function",
+    "localStorage",
+    "sessionStorage",
+)
 EXPECTED_PACKAGES: Final = {
     "termdeck-web-core",
     "termdeck-web-server",
@@ -33,6 +53,44 @@ def _bounded(data: bytes, *, stream: str) -> bytes:
             f"{stream} exceeded {MAX_CAPTURE_BYTES} bytes: {len(data)}"
         )
     return data
+
+
+def _validate_frontend_assets(
+    javascript_path: Path,
+    stylesheet_path: Path,
+) -> dict[str, object]:
+    javascript_bytes = javascript_path.read_bytes()
+    stylesheet_bytes = stylesheet_path.read_bytes()
+    if len(javascript_bytes) > MAX_FRONTEND_ASSET_BYTES:
+        raise RuntimeError(
+            f"frontend JavaScript exceeds {MAX_FRONTEND_ASSET_BYTES} bytes: "
+            f"{len(javascript_bytes)}"
+        )
+    if len(stylesheet_bytes) > MAX_FRONTEND_ASSET_BYTES:
+        raise RuntimeError(
+            f"frontend stylesheet exceeds {MAX_FRONTEND_ASSET_BYTES} bytes: "
+            f"{len(stylesheet_bytes)}"
+        )
+    try:
+        javascript = javascript_bytes.decode("utf-8")
+        stylesheet_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("frontend assets must be UTF-8") from exc
+    missing = [value for value in FRONTEND_EXPECTED_TEXT if value not in javascript]
+    forbidden = [value for value in FRONTEND_FORBIDDEN_TEXT if value in javascript]
+    if missing:
+        raise RuntimeError(f"frontend JavaScript is missing required contracts: {missing}")
+    if forbidden:
+        raise RuntimeError(f"frontend JavaScript uses forbidden browser sinks: {forbidden}")
+    if "http://" in javascript or "https://" in javascript:
+        raise RuntimeError("frontend JavaScript must not contain an external origin")
+    return {
+        "javascript_bytes": len(javascript_bytes),
+        "javascript_sha256": _sha256(javascript_bytes),
+        "stylesheet_bytes": len(stylesheet_bytes),
+        "stylesheet_sha256": _sha256(stylesheet_bytes),
+        "node_runtime_required": False,
+    }
 
 
 def _run(
@@ -91,10 +149,16 @@ def main() -> int:
         web_root / "crates" / "termdeck-web-core" / "src" / "lib.rs",
         web_root / "crates" / "termdeck-web-state" / "src" / "lib.rs",
         web_root / "crates" / "termdeck-web-server" / "src" / "lib.rs",
+        web_root / "crates" / "termdeck-web-server" / "assets" / "app.css",
+        web_root / "crates" / "termdeck-web-server" / "assets" / "app.js",
     ]
     missing = [str(path.relative_to(root)) for path in required if not path.is_file()]
     if missing:
         raise RuntimeError(f"required TermDeck web files are missing: {missing}")
+    frontend = _validate_frontend_assets(
+        web_root / "crates" / "termdeck-web-server" / "assets" / "app.js",
+        web_root / "crates" / "termdeck-web-server" / "assets" / "app.css",
+    )
 
     with tempfile.TemporaryDirectory(prefix="t1000-web-validation-") as raw_temp:
         temporary = Path(raw_temp)
@@ -109,6 +173,14 @@ def main() -> int:
                 "RUSTFLAGS": "-D warnings",
             }
         )
+        metadata_command = [
+            cargo,
+            "metadata",
+            "--locked",
+            "--no-deps",
+            "--format-version",
+            "1",
+        ]
         commands = [
             [cargo, "fmt", "--all", "--", "--check"],
             [cargo, "test", "--workspace", "--locked"],
@@ -128,14 +200,36 @@ def main() -> int:
                 "-D",
                 "clippy::expect_used",
             ],
-            [cargo, "metadata", "--locked", "--no-deps", "--format-version", "1"],
+            metadata_command,
         ]
         receipts = [
             _run(command, cwd=web_root, environment=environment)
             for command in commands
         ]
+        node = shutil.which("node")
+        if node is not None:
+            receipts.append(
+                _run(
+                    [
+                        node,
+                        "--check",
+                        str(
+                            web_root
+                            / "crates"
+                            / "termdeck-web-server"
+                            / "assets"
+                            / "app.js"
+                        ),
+                    ],
+                    cwd=root,
+                    environment=environment,
+                )
+            )
+            frontend["syntax_check"] = "node --check"
+        else:
+            frontend["syntax_check"] = "static and Rust-embedded checks only"
         metadata_result = subprocess.run(
-            commands[-1],
+            metadata_command,
             cwd=web_root,
             env=environment,
             check=True,
@@ -157,6 +251,7 @@ def main() -> int:
             "ok": True,
             "packages": sorted(packages),
             "commands": receipts,
+            "frontend": frontend,
             "source_sha256": source_hashes,
         }
         print(json.dumps(payload, sort_keys=True))

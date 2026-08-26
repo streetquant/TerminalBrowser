@@ -1,6 +1,6 @@
 # TermDeck web host
 
-This directory contains the Rust-first replacement path for TermDeck's graphical frontend. The current implementation is the first regression-safe vertical slice: a strict read-only mirror of the existing TermDeck registry and tmux state, exposed through a bounded loopback HTTP server and a minimal no-JavaScript browser view.
+This directory contains the Rust-first replacement path for TermDeck's graphical frontend. The current implementation combines a strict read-only mirror of the existing TermDeck registry and tmux state with a bounded loopback HTTP server and a progressively enhanced browser frontend. Server-rendered HTML remains the no-JavaScript fallback; a small embedded vanilla-JavaScript client refreshes the same view from the versioned same-origin APIs without acquiring mutation authority.
 
 It does **not** replace or control the installed GTK application yet. The existing T1000 0.2.19 runtime remains authoritative until later slices prove authenticated control, terminal-byte parity, action parity, installation, rollback, and live cutover.
 
@@ -27,7 +27,12 @@ The current server:
 - overlays liveness and current working directory from one hard-coded read-only `tmux list-panes` command;
 - preserves TermDeck's stable `session:window.pane` target rather than substituting tmux's ephemeral `%pane-id`;
 - pre-renders immutable HTML and JSON buffers once per refresh;
-- uses a bounded request semaphore and bounded response, tmux-output, database-row, timeout, and stale-state limits;
+- embeds one bounded CSS asset and one bounded vanilla-JavaScript asset in the Rust binary, with no Node.js production runtime;
+- uses server-rendered HTML as the resilient fallback while the client validates and renders only the versioned same-origin API schemas;
+- preserves the existing numeric API revision for compatibility and also publishes an exact decimal `revision_text`, avoiding JavaScript's integer precision limit for full `u64` revisions;
+- writes dynamic browser text through DOM text nodes rather than HTML sinks and displays pane-local viewer mode without exposing credentials or controller capabilities;
+- refreshes visible pages on a bounded interval, slows hidden-page polling, aborts timed-out requests, and keeps the last safe server-rendered state during client/network failure;
+- uses a bounded request semaphore and bounded response, asset, tmux-output, database-row, timeout, and stale-state limits;
 - refuses non-loopback binding until authenticated-device transport exists;
 - accepts only `GET` and `HEAD` behavior;
 - validates loopback `Host` and `Origin` authority;
@@ -37,6 +42,8 @@ The current server:
 
 The live Max verification used 9 windows and 149 visible panes, checked all 149 mirrored live pane identities against the installed release, served 64 concurrent viewers, consumed 6,648 KiB RSS with two threads, and left the SQLite bytes, complete tmux pane inventory, and installed semantic snapshot unchanged.
 
+The enhanced frontend was additionally executed in real headless Chromium against the live homepage and a direct window URL. Both pages completed their API-driven refresh with zero browser stderr. A 128-request mixed homepage/asset/API load measured 8.088 ms median, 23.539 ms p95, and 37.475 ms maximum loopback latency; the host used 7,100 KiB RSS and two threads, with the same exact state-invariance result.
+
 ## Routes
 
 | Route | Purpose |
@@ -45,6 +52,8 @@ The live Max verification used 9 windows and 149 visible panes, checked all 149 
 | `/<window-slug>` | Direct browser view for one window |
 | `/_termdeck/api/v1/snapshot` | Versioned full host snapshot JSON |
 | `/_termdeck/api/v1/windows/<window-slug>` | Versioned one-window snapshot JSON |
+| `/_termdeck/assets/v1/app.css` | Embedded bounded browser stylesheet |
+| `/_termdeck/assets/v1/app.js` | Embedded bounded API-driven browser renderer |
 | `/_termdeck/healthz` | Process liveness |
 | `/_termdeck/readyz` | Fresh-state readiness |
 
@@ -69,9 +78,9 @@ The server intentionally rejects `0.0.0.0`, LAN addresses, and public addresses.
 
 - `termdeck-web-core`: dependency-free IDs, immutable snapshots, stable route allocation, and generation-safe pane leases.
 - `termdeck-web-state`: strict read-only SQLite projection and optional read-only tmux inventory overlay.
-- `termdeck-web-server`: current-thread Tokio/Axum HTTP server, immutable rendering cache, security middleware, and minimal browser pages.
+- `termdeck-web-server`: current-thread Tokio/Axum HTTP server, immutable rendering cache, security middleware, server-rendered fallbacks, and embedded bounded browser assets.
 
-No crate uses unsafe Rust. The production runtime has no Node.js, Electron, GTK, VTE, or Python server dependency.
+No crate uses unsafe Rust. The production runtime has no Node.js, Electron, GTK, VTE, or Python server dependency. Node.js is used only as an optional validation-time JavaScript parser when it is already available; the Rust tests and static asset contract remain authoritative without it.
 
 ## Verification
 
@@ -89,9 +98,10 @@ RUSTFLAGS="-D warnings" cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- \
   -D warnings -D clippy::all -D clippy::unwrap_used -D clippy::expect_used
 cargo metadata --locked --no-deps --format-version 1
+node --check crates/termdeck-web-server/assets/app.js  # when Node is available
 ```
 
-The smoke is registered in `scripts/validation_manifest.json` for both CI and production profiles.
+The gate always enforces the asset byte budgets, UTF-8 encoding, same-origin API references, expected safe DOM operations, and absence of dangerous HTML/evaluation/storage sinks. The smoke is registered in `scripts/validation_manifest.json` for both CI and production profiles.
 
 ## Deliberately not implemented yet
 
