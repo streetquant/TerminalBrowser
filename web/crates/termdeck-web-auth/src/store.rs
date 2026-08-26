@@ -19,7 +19,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 pub const AUTH_DATABASE_FILENAME: &str = "termdeck-web-auth-v1.sqlite3";
 pub const MAX_AUTH_DATABASE_BYTES: u64 = 128 * 1024 * 1024;
-const AUTH_SCHEMA_VERSION: i64 = 1;
+const LEGACY_AUTH_SCHEMA_VERSION: i64 = 1;
+const AUTH_SCHEMA_VERSION: i64 = 2;
 const AUTH_APPLICATION_ID: i64 = 0x5444_5741;
 const MAX_LABEL_BYTES: usize = 128;
 const MAX_AUDIT_KIND_BYTES: usize = 48;
@@ -41,7 +42,8 @@ CREATE TABLE auth_metadata (
     schema_version INTEGER NOT NULL,
     host_id TEXT NOT NULL,
     owner_id TEXT NOT NULL,
-    created_at_ms INTEGER NOT NULL
+    created_at_ms INTEGER NOT NULL,
+    last_observed_at_ms INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 CREATE TABLE devices (
     device_id TEXT PRIMARY KEY,
@@ -145,7 +147,7 @@ macro_rules! auth_id {
                 Ok(Self(random_public_id($prefix)?))
             }
 
-            fn from_database(value: String) -> Result<Self, AuthError> {
+            pub fn parse(value: &str) -> Result<Self, AuthError> {
                 let expected = $prefix.len() + 32;
                 if value.len() != expected
                     || !value.starts_with($prefix)
@@ -153,9 +155,14 @@ macro_rules! auth_id {
                         .iter()
                         .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
                 {
-                    return Err(AuthError::CorruptDatabase("invalid stored identifier"));
+                    return Err(AuthError::InvalidIdentifier);
                 }
-                Ok(Self(value))
+                Ok(Self(value.to_owned()))
+            }
+
+            fn from_database(value: String) -> Result<Self, AuthError> {
+                Self::parse(&value)
+                    .map_err(|_| AuthError::CorruptDatabase("invalid stored identifier"))
             }
 
             pub fn as_str(&self) -> &str {
@@ -226,6 +233,7 @@ impl AuthenticatedSession {
 pub struct SessionContext {
     session_id: AuthSessionId,
     device_id: AuthenticatedDeviceId,
+    device_label: String,
     created_at_ms: u64,
     expires_at_ms: u64,
 }
@@ -239,12 +247,42 @@ impl SessionContext {
         &self.device_id
     }
 
+    pub fn device_label(&self) -> &str {
+        self.device_label.as_str()
+    }
+
     pub fn created_at_ms(&self) -> u64 {
         self.created_at_ms
     }
 
     pub fn expires_at_ms(&self) -> u64 {
         self.expires_at_ms
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceRecord {
+    device_id: AuthenticatedDeviceId,
+    label: String,
+    created_at_ms: u64,
+    revoked_at_ms: Option<u64>,
+}
+
+impl DeviceRecord {
+    pub fn device_id(&self) -> &AuthenticatedDeviceId {
+        &self.device_id
+    }
+
+    pub fn label(&self) -> &str {
+        self.label.as_str()
+    }
+
+    pub fn created_at_ms(&self) -> u64 {
+        self.created_at_ms
+    }
+
+    pub fn revoked_at_ms(&self) -> Option<u64> {
+        self.revoked_at_ms
     }
 }
 
@@ -299,14 +337,17 @@ impl AuthStore {
             initialize_schema(&connection, &host_id, &owner_id, created_at_ms)?;
             sync_directory(secure_directory)?;
         }
+        migrate_schema_if_needed(&connection, &host_id, &owner_id, limits)?;
         validate_schema(&connection, &host_id, &owner_id, limits)?;
-        Ok(Self {
+        let store = Self {
             database_path,
             host_id,
             owner_id,
             limits,
             connection: Mutex::new(connection),
-        })
+        };
+        let _observed_at_ms = store.observe_time(created_at_ms)?;
+        Ok(store)
     }
 
     pub fn database_path(&self) -> &Path {
@@ -321,6 +362,15 @@ impl AuthStore {
         &self.owner_id
     }
 
+    pub fn observe_time(&self, candidate_ms: u64) -> Result<u64, AuthError> {
+        validate_timestamp(candidate_ms)?;
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let observed_at_ms = observe_time_transaction(&transaction, candidate_ms)?;
+        transaction.commit()?;
+        Ok(observed_at_ms)
+    }
+
     pub fn create_invitation(
         &self,
         device_label: &str,
@@ -328,12 +378,13 @@ impl AuthStore {
         ttl_ms: u64,
     ) -> Result<PairingInvitation, AuthError> {
         validate_label(device_label)?;
-        let expires_at_ms = checked_expiry(now_ms, ttl_ms, self.limits.max_invitation_ttl_ms)?;
         let invitation_id = InvitationId::generate()?;
         let secret = SecretToken::generate(SecretKind::Invitation)?;
         let digest = secret.digest();
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let expires_at_ms = checked_expiry(now_ms, ttl_ms, self.limits.max_invitation_ttl_ms)?;
         prune_expired_auth_state(&transaction, now_ms)?;
         enforce_capacity(
             &transaction,
@@ -377,7 +428,6 @@ impl AuthStore {
         session_ttl_ms: u64,
     ) -> Result<AuthenticatedSession, AuthError> {
         let invitation_digest = credential_digest(SecretKind::Invitation, invitation_secret)?;
-        let expires_at_ms = checked_expiry(now_ms, session_ttl_ms, self.limits.max_session_ttl_ms)?;
         let device_id = AuthenticatedDeviceId::generate()?;
         let session_id = AuthSessionId::generate()?;
         let session_secret = SecretToken::generate(SecretKind::Session)?;
@@ -386,6 +436,8 @@ impl AuthStore {
         let csrf_digest = csrf_secret.digest();
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let expires_at_ms = checked_expiry(now_ms, session_ttl_ms, self.limits.max_session_ttl_ms)?;
         let invitation = transaction
             .query_row(
                 "SELECT invitation_id, device_label, expires_at_ms, consumed_at_ms
@@ -403,11 +455,14 @@ impl AuthStore {
             .optional()?;
         let Some((stored_invitation_id, device_label, stored_expiry, consumed_at)) = invitation
         else {
+            transaction.commit()?;
             return Err(AuthError::Unauthenticated);
         };
         let invitation_id = InvitationId::from_database(stored_invitation_id)?;
         validate_label(&device_label)?;
         if consumed_at.is_some() || stored_expiry <= db_timestamp(now_ms)? {
+            prune_expired_auth_state(&transaction, now_ms)?;
+            transaction.commit()?;
             return Err(AuthError::InvitationUnavailable);
         }
         prune_expired_auth_state(&transaction, now_ms)?;
@@ -474,10 +529,12 @@ impl AuthStore {
         now_ms: u64,
     ) -> Result<SessionContext, AuthError> {
         let digest = credential_digest(SecretKind::Session, session_secret)?;
-        let connection = self.lock_connection()?;
-        let row = connection
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let row = transaction
             .query_row(
-                "SELECT s.session_id, s.device_id, s.created_at_ms, s.expires_at_ms
+                "SELECT s.session_id, s.device_id, d.label, s.created_at_ms, s.expires_at_ms
                  FROM auth_sessions AS s
                  JOIN devices AS d ON d.device_id = s.device_id
                  WHERE s.secret_hash = ?1
@@ -489,18 +546,22 @@ impl AuthStore {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((session_id, device_id, created_at_ms, expires_at_ms)) = row else {
+        transaction.commit()?;
+        let Some((session_id, device_id, device_label, created_at_ms, expires_at_ms)) = row else {
             return Err(AuthError::Unauthenticated);
         };
+        validate_label(&device_label)?;
         Ok(SessionContext {
             session_id: AuthSessionId::from_database(session_id)?,
             device_id: AuthenticatedDeviceId::from_database(device_id)?,
+            device_label,
             created_at_ms: host_timestamp(created_at_ms)?,
             expires_at_ms: host_timestamp(expires_at_ms)?,
         })
@@ -513,8 +574,10 @@ impl AuthStore {
         now_ms: u64,
     ) -> Result<(), AuthError> {
         let digest = credential_digest(SecretKind::Csrf, csrf_secret)?;
-        let connection = self.lock_connection()?;
-        let valid = connection
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let valid = transaction
             .query_row(
                 "SELECT 1
                  FROM auth_sessions AS s
@@ -532,6 +595,7 @@ impl AuthStore {
                 |_row| Ok(()),
             )
             .optional()?;
+        transaction.commit()?;
         valid.ok_or(AuthError::CsrfMismatch)
     }
 
@@ -542,7 +606,6 @@ impl AuthStore {
         ttl_ms: u64,
     ) -> Result<AuthenticatedSession, AuthError> {
         let old_digest = credential_digest(SecretKind::Session, old_session_secret)?;
-        let expires_at_ms = checked_expiry(now_ms, ttl_ms, self.limits.max_session_ttl_ms)?;
         let new_session_id = AuthSessionId::generate()?;
         let new_session_secret = SecretToken::generate(SecretKind::Session)?;
         let new_csrf_secret = SecretToken::generate(SecretKind::Csrf)?;
@@ -550,6 +613,8 @@ impl AuthStore {
         let new_csrf_digest = new_csrf_secret.digest();
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let expires_at_ms = checked_expiry(now_ms, ttl_ms, self.limits.max_session_ttl_ms)?;
         let old = transaction
             .query_row(
                 "SELECT s.session_id, s.device_id
@@ -564,6 +629,7 @@ impl AuthStore {
             )
             .optional()?;
         let Some((old_session_id, device_id)) = old else {
+            transaction.commit()?;
             return Err(AuthError::Unauthenticated);
         };
         let old_session_id = AuthSessionId::from_database(old_session_id)?;
@@ -620,9 +686,9 @@ impl AuthStore {
         session_id: &AuthSessionId,
         now_ms: u64,
     ) -> Result<bool, AuthError> {
-        validate_timestamp(now_ms)?;
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_ms = observe_time_transaction(&transaction, now_ms)?;
         let device_id = transaction
             .query_row(
                 "SELECT device_id FROM auth_sessions WHERE session_id = ?1",
@@ -658,9 +724,9 @@ impl AuthStore {
         device_id: &AuthenticatedDeviceId,
         now_ms: u64,
     ) -> Result<bool, AuthError> {
-        validate_timestamp(now_ms)?;
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_ms = observe_time_transaction(&transaction, now_ms)?;
         let changed = transaction.execute(
             "UPDATE devices SET revoked_at_ms = ?1
              WHERE device_id = ?2 AND revoked_at_ms IS NULL",
@@ -684,6 +750,34 @@ impl AuthStore {
         }
         transaction.commit()?;
         Ok(changed == 1)
+    }
+
+    pub fn devices(&self) -> Result<Vec<DeviceRecord>, AuthError> {
+        let connection = self.lock_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT device_id, label, created_at_ms, revoked_at_ms
+             FROM devices ORDER BY created_at_ms ASC, device_id ASC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![db_count(self.limits.max_devices)?], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (device_id, label, created_at_ms, revoked_at_ms) = row?;
+            validate_label(&label)?;
+            records.push(DeviceRecord {
+                device_id: AuthenticatedDeviceId::from_database(device_id)?,
+                label,
+                created_at_ms: host_timestamp(created_at_ms)?,
+                revoked_at_ms: revoked_at_ms.map(host_timestamp).transpose()?,
+            });
+        }
+        Ok(records)
     }
 
     pub fn audit_records(&self, maximum: usize) -> Result<Vec<AuditRecord>, AuthError> {
@@ -984,8 +1078,9 @@ fn initialize_schema(
         connection.execute_batch(SCHEMA)?;
         connection.execute(
             "INSERT INTO auth_metadata (
-                singleton, schema_version, host_id, owner_id, created_at_ms
-             ) VALUES (1, ?1, ?2, ?3, ?4)",
+                singleton, schema_version, host_id, owner_id, created_at_ms,
+                last_observed_at_ms
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?4)",
             params![
                 AUTH_SCHEMA_VERSION,
                 host_id.as_str(),
@@ -1009,12 +1104,92 @@ fn initialize_schema(
     }
 }
 
+fn migrate_schema_if_needed(
+    connection: &Connection,
+    host_id: &HostId,
+    owner_id: &OwnerId,
+    limits: AuthLimits,
+) -> Result<(), AuthError> {
+    let application_id: i64 =
+        connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if application_id == AUTH_APPLICATION_ID && user_version == AUTH_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if application_id != AUTH_APPLICATION_ID || user_version != LEGACY_AUTH_SCHEMA_VERSION {
+        return Err(AuthError::CorruptDatabase(
+            "unsupported auth schema identity",
+        ));
+    }
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| {
+        validate_schema_version(
+            connection,
+            host_id,
+            owner_id,
+            limits,
+            LEGACY_AUTH_SCHEMA_VERSION,
+        )?;
+        let last_observed_at_ms = latest_materialized_observed_at_ms(connection)?;
+        connection.execute_batch(
+            "ALTER TABLE auth_metadata
+             ADD COLUMN last_observed_at_ms INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        let changed = connection.execute(
+            "UPDATE auth_metadata
+             SET schema_version = ?1, last_observed_at_ms = ?2
+             WHERE singleton = 1 AND schema_version = ?3",
+            params![
+                AUTH_SCHEMA_VERSION,
+                db_timestamp(last_observed_at_ms)?,
+                LEGACY_AUTH_SCHEMA_VERSION,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(AuthError::CorruptDatabase(
+                "legacy auth metadata could not be migrated",
+            ));
+        }
+        connection.pragma_update(None, "user_version", AUTH_SCHEMA_VERSION)?;
+        validate_schema_version(connection, host_id, owner_id, limits, AUTH_SCHEMA_VERSION)?;
+        Ok::<(), AuthError>(())
+    })();
+    match result {
+        Ok(()) => {
+            connection.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _rollback = connection.execute_batch("ROLLBACK;");
+            Err(error)
+        }
+    }
+}
+
 fn validate_schema(
     connection: &Connection,
     host_id: &HostId,
     owner_id: &OwnerId,
     limits: AuthLimits,
 ) -> Result<(), AuthError> {
+    validate_schema_version(connection, host_id, owner_id, limits, AUTH_SCHEMA_VERSION)
+}
+
+fn validate_schema_version(
+    connection: &Connection,
+    host_id: &HostId,
+    owner_id: &OwnerId,
+    limits: AuthLimits,
+    expected_version: i64,
+) -> Result<(), AuthError> {
+    if !matches!(
+        expected_version,
+        LEGACY_AUTH_SCHEMA_VERSION | AUTH_SCHEMA_VERSION
+    ) {
+        return Err(AuthError::CorruptDatabase(
+            "unsupported auth schema version",
+        ));
+    }
     let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         return Err(AuthError::CorruptDatabase("SQLite quick_check failed"));
@@ -1022,12 +1197,12 @@ fn validate_schema(
     let application_id: i64 =
         connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
     let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if application_id != AUTH_APPLICATION_ID || user_version != AUTH_SCHEMA_VERSION {
+    if application_id != AUTH_APPLICATION_ID || user_version != expected_version {
         return Err(AuthError::CorruptDatabase(
             "unsupported auth schema identity",
         ));
     }
-    let invalid_metadata: i64 = connection.query_row(
+    let invalid_metadata_query = if expected_version == AUTH_SCHEMA_VERSION {
         "SELECT
              (SELECT COUNT(*) FROM auth_metadata) != 1
              OR EXISTS (
@@ -1037,8 +1212,23 @@ fn validate_schema(
                     OR length(CAST(host_id AS BLOB)) NOT BETWEEN 1 AND ?2
                     OR length(CAST(owner_id AS BLOB)) NOT BETWEEN 1 AND ?2
                     OR created_at_ms < 0
-             )",
-        params![AUTH_SCHEMA_VERSION, db_count(MAX_OPAQUE_ID_BYTES)?],
+                    OR last_observed_at_ms < created_at_ms
+             )"
+    } else {
+        "SELECT
+             (SELECT COUNT(*) FROM auth_metadata) != 1
+             OR EXISTS (
+                 SELECT 1 FROM auth_metadata
+                 WHERE singleton != 1
+                    OR schema_version != ?1
+                    OR length(CAST(host_id AS BLOB)) NOT BETWEEN 1 AND ?2
+                    OR length(CAST(owner_id AS BLOB)) NOT BETWEEN 1 AND ?2
+                    OR created_at_ms < 0
+             )"
+    };
+    let invalid_metadata: i64 = connection.query_row(
+        invalid_metadata_query,
+        params![expected_version, db_count(MAX_OPAQUE_ID_BYTES)?],
         |row| row.get(0),
     )?;
     if invalid_metadata != 0 {
@@ -1061,7 +1251,7 @@ fn validate_schema(
     let Some((schema_version, stored_host, stored_owner)) = metadata else {
         return Err(AuthError::CorruptDatabase("missing auth metadata"));
     };
-    if schema_version != AUTH_SCHEMA_VERSION {
+    if schema_version != expected_version {
         return Err(AuthError::CorruptDatabase(
             "unsupported auth schema version",
         ));
@@ -1087,7 +1277,7 @@ fn validate_schema(
         return Err(AuthError::CorruptDatabase("unexpected auth views"));
     }
     validate_strict_tables(connection, &expected_tables)?;
-    validate_table_definitions(connection)?;
+    validate_table_definitions(connection, expected_version)?;
     if !schema_objects(connection, "index")?.is_empty() {
         return Err(AuthError::CorruptDatabase("unexpected auth indexes"));
     }
@@ -1102,16 +1292,29 @@ fn validate_schema(
     }
     validate_trigger_definitions(connection)?;
     validate_foreign_keys(connection)?;
+    let metadata_columns_v1 = [
+        ("singleton", "INTEGER", 1),
+        ("schema_version", "INTEGER", 0),
+        ("host_id", "TEXT", 0),
+        ("owner_id", "TEXT", 0),
+        ("created_at_ms", "INTEGER", 0),
+    ];
+    let metadata_columns_v2 = [
+        ("singleton", "INTEGER", 1),
+        ("schema_version", "INTEGER", 0),
+        ("host_id", "TEXT", 0),
+        ("owner_id", "TEXT", 0),
+        ("created_at_ms", "INTEGER", 0),
+        ("last_observed_at_ms", "INTEGER", 0),
+    ];
     validate_table_columns(
         connection,
         "auth_metadata",
-        &[
-            ("singleton", "INTEGER", 1),
-            ("schema_version", "INTEGER", 0),
-            ("host_id", "TEXT", 0),
-            ("owner_id", "TEXT", 0),
-            ("created_at_ms", "INTEGER", 0),
-        ],
+        if expected_version == AUTH_SCHEMA_VERSION {
+            &metadata_columns_v2
+        } else {
+            &metadata_columns_v1
+        },
     )?;
     validate_table_columns(
         connection,
@@ -1176,6 +1379,42 @@ fn validate_schema(
     validate_stored_row_bounds(connection)?;
     validate_stored_identifiers(connection)?;
     let _verified_events = verify_audit_chain_connection(connection, limits.max_audit_events)?;
+    if expected_version == AUTH_SCHEMA_VERSION {
+        validate_persistent_time_floor(connection)?;
+    }
+    Ok(())
+}
+
+fn latest_materialized_observed_at_ms(connection: &Connection) -> Result<u64, AuthError> {
+    let value: i64 = connection.query_row(
+        "SELECT MAX(observed_at_ms) FROM (
+             SELECT created_at_ms AS observed_at_ms FROM auth_metadata
+             UNION ALL SELECT created_at_ms FROM devices
+             UNION ALL SELECT revoked_at_ms FROM devices WHERE revoked_at_ms IS NOT NULL
+             UNION ALL SELECT created_at_ms FROM invitations
+             UNION ALL SELECT consumed_at_ms FROM invitations WHERE consumed_at_ms IS NOT NULL
+             UNION ALL SELECT created_at_ms FROM auth_sessions
+             UNION ALL SELECT revoked_at_ms FROM auth_sessions WHERE revoked_at_ms IS NOT NULL
+             UNION ALL SELECT occurred_at_ms FROM audit_events
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    host_timestamp(value)
+}
+
+fn validate_persistent_time_floor(connection: &Connection) -> Result<(), AuthError> {
+    let last_observed: i64 = connection.query_row(
+        "SELECT last_observed_at_ms FROM auth_metadata WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let last_observed = host_timestamp(last_observed)?;
+    if last_observed < latest_materialized_observed_at_ms(connection)? {
+        return Err(AuthError::CorruptDatabase(
+            "authentication time fence is behind persisted events",
+        ));
+    }
     Ok(())
 }
 
@@ -1460,7 +1699,28 @@ fn normalize_schema_sql(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn validate_table_definitions(connection: &Connection) -> Result<(), AuthError> {
+fn validate_table_definitions(
+    connection: &Connection,
+    expected_version: i64,
+) -> Result<(), AuthError> {
+    let metadata_definition = if expected_version == AUTH_SCHEMA_VERSION {
+        "CREATE TABLE auth_metadata (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            schema_version INTEGER NOT NULL,
+            host_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            last_observed_at_ms INTEGER NOT NULL DEFAULT 0
+         ) STRICT"
+    } else {
+        "CREATE TABLE auth_metadata (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            schema_version INTEGER NOT NULL,
+            host_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+         ) STRICT"
+    };
     let expected = BTreeSet::from([
         (
             "audit_events".to_owned(),
@@ -1480,15 +1740,7 @@ fn validate_table_definitions(connection: &Connection) -> Result<(), AuthError> 
         ),
         (
             "auth_metadata".to_owned(),
-            normalize_schema_sql(
-                "CREATE TABLE auth_metadata (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    schema_version INTEGER NOT NULL,
-                    host_id TEXT NOT NULL,
-                    owner_id TEXT NOT NULL,
-                    created_at_ms INTEGER NOT NULL
-                 ) STRICT",
-            ),
+            normalize_schema_sql(metadata_definition),
         ),
         (
             "auth_sessions".to_owned(),
@@ -1840,6 +2092,33 @@ fn credential_digest(kind: SecretKind, value: &str) -> Result<[u8; 32], AuthErro
     digest_validated_secret(kind, value).map_err(|_error| AuthError::Unauthenticated)
 }
 
+fn observe_time_transaction(
+    transaction: &Transaction<'_>,
+    candidate_ms: u64,
+) -> Result<u64, AuthError> {
+    validate_timestamp(candidate_ms)?;
+    let stored: i64 = transaction.query_row(
+        "SELECT last_observed_at_ms FROM auth_metadata WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let stored = host_timestamp(stored)?;
+    let observed_at_ms = stored.max(candidate_ms);
+    if observed_at_ms > stored {
+        let changed = transaction.execute(
+            "UPDATE auth_metadata SET last_observed_at_ms = ?1
+             WHERE singleton = 1 AND last_observed_at_ms = ?2",
+            params![db_timestamp(observed_at_ms)?, db_timestamp(stored)?],
+        )?;
+        if changed != 1 {
+            return Err(AuthError::CorruptDatabase(
+                "authentication time fence could not advance",
+            ));
+        }
+    }
+    Ok(observed_at_ms)
+}
+
 fn checked_expiry(now_ms: u64, ttl_ms: u64, maximum_ttl_ms: u64) -> Result<u64, AuthError> {
     validate_timestamp(now_ms)?;
     if ttl_ms == 0 || ttl_ms > maximum_ttl_ms {
@@ -1961,6 +2240,7 @@ pub enum AuthError {
     InsecurePath(&'static str),
     InvalidAuditLimit,
     InvalidAuditText,
+    InvalidIdentifier,
     InvalidLabel,
     InvalidLimits,
     InvalidTime,
@@ -1987,6 +2267,7 @@ impl fmt::Display for AuthError {
             Self::InsecurePath(detail) => write!(formatter, "insecure auth path: {detail}"),
             Self::InvalidAuditLimit => formatter.write_str("invalid audit query limit"),
             Self::InvalidAuditText => formatter.write_str("invalid audit record text"),
+            Self::InvalidIdentifier => formatter.write_str("invalid authentication identifier"),
             Self::InvalidLabel => formatter.write_str("invalid device label"),
             Self::InvalidLimits => formatter.write_str("invalid authentication limits"),
             Self::InvalidTime => formatter.write_str("invalid authentication timestamp or TTL"),
@@ -2680,10 +2961,12 @@ mod tests {
                  schema_version INTEGER,
                  host_id TEXT,
                  owner_id TEXT,
-                 created_at_ms INTEGER
+                 created_at_ms INTEGER,
+                 last_observed_at_ms INTEGER DEFAULT 0
              ) STRICT;
              INSERT INTO auth_metadata_weakened
-             SELECT singleton, schema_version, host_id, owner_id, created_at_ms
+             SELECT singleton, schema_version, host_id, owner_id, created_at_ms,
+                    last_observed_at_ms
              FROM auth_metadata;
              DROP TABLE auth_metadata;
              ALTER TABLE auth_metadata_weakened RENAME TO auth_metadata;",

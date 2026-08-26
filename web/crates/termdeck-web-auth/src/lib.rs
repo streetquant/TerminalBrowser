@@ -21,6 +21,6 @@ pub use secret::{
 };
 pub use store::{
     AUTH_DATABASE_FILENAME, AuditEventId, AuditRecord, AuthError, AuthLimits, AuthSessionId,
-    AuthStore, AuthenticatedDeviceId, AuthenticatedSession, InvitationId, MAX_AUTH_DATABASE_BYTES,
-    PairingInvitation, SessionContext,
+    AuthStore, AuthenticatedDeviceId, AuthenticatedSession, DeviceRecord, InvitationId,
+    MAX_AUTH_DATABASE_BYTES, PairingInvitation, SessionContext,
 };

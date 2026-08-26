@@ -508,10 +508,12 @@ dependencies = [
  "axum",
  "serde",
  "serde_json",
+ "termdeck-web-auth",
  "termdeck-web-core",
  "termdeck-web-state",
  "tokio",
  "tower",
+ "zeroize",
 ]
 
 [[package]]

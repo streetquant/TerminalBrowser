@@ -66,6 +66,36 @@ impl BoundedRateLimiter {
         })
     }
 
+    pub fn check(
+        &mut self,
+        scope: &str,
+        subject_digest: [u8; 32],
+        now_ms: u64,
+    ) -> Result<RateDecision, RateLimitError> {
+        validate_scope(scope)?;
+        self.remove_expired(now_ms);
+        let key = RateKey {
+            scope: scope.to_owned(),
+            subject_digest,
+        };
+        let Some(entry) = self.entries.get(&key) else {
+            return Ok(RateDecision::Allowed {
+                remaining: self.config.attempts_per_window,
+            });
+        };
+        if entry.blocked_until_ms > now_ms {
+            return Ok(RateDecision::Blocked {
+                retry_after_ms: entry.blocked_until_ms.saturating_sub(now_ms),
+            });
+        }
+        Ok(RateDecision::Allowed {
+            remaining: self
+                .config
+                .attempts_per_window
+                .saturating_sub(entry.attempts),
+        })
+    }
+
     pub fn record_failure(
         &mut self,
         scope: &str,

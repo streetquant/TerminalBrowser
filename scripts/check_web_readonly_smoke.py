@@ -20,6 +20,7 @@ MAX_CAPTURE_BYTES: Final = 8 * 1024 * 1024
 MAX_FRONTEND_ASSET_BYTES: Final = 64 * 1024
 MAX_AUTH_SOURCE_FILE_BYTES: Final = 256 * 1024
 MAX_AUTH_SOURCE_TOTAL_BYTES: Final = 768 * 1024
+MAX_AUTH_HTTP_SOURCE_BYTES: Final = 512 * 1024
 EXPECTED_PACKAGES: Final = {
     "termdeck-web-auth",
     "termdeck-web-core",
@@ -93,6 +94,40 @@ AUTH_FORBIDDEN_PRODUCTION_TEXT: Final = (
     "unsafe {",
     "unsafe fn",
 )
+AUTH_HTTP_EXPECTED_TEXT: Final = (
+    "--allow-insecure-loopback-auth",
+    "termdeck_session",
+    "termdeck_csrf",
+    "SameSite=Strict",
+    "HttpOnly",
+    "x-termdeck-csrf",
+    "sec-fetch-site",
+    "AuthStore::open_or_create",
+    "redeem_invitation",
+    "verify_csrf",
+    "revoke_session",
+    "revoke_device",
+    "PAIRING_PATH",
+    "SESSION_PATH",
+    "LOGOUT_PATH",
+    "DEVICES_PATH",
+    "NonLoopbackRequiresAuthentication",
+)
+AUTH_HTTP_FORBIDDEN_PRODUCTION_TEXT: Final = (
+    '"send-keys"',
+    '"new-session"',
+    '"split-window"',
+    '"kill-pane"',
+    '"capture-pane"',
+    "ControllerRegistry",
+    "ControllerLease",
+    "Command::new",
+    "tokio::process",
+    "rusqlite::",
+    "ReadOnlyStateMirror",
+    "TmuxInventory",
+)
+EXPECTED_AUTH_CONSUMERS: Final = ["termdeck-web-server"]
 
 
 def _sha256(data: bytes) -> str:
@@ -251,10 +286,62 @@ def _validate_auth_foundation(auth_root: Path) -> dict[str, object]:
     }
 
 
+def _validate_authenticated_http(server_root: Path) -> dict[str, object]:
+    manifest_path = server_root / "Cargo.toml"
+    library_path = server_root / "src" / "lib.rs"
+    auth_path = server_root / "src" / "auth_http.rs"
+    manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    dependencies = set(manifest.get("dependencies", {}))
+    if "termdeck-web-auth" not in dependencies:
+        raise RuntimeError("web server does not declare the authentication foundation")
+    library_bytes = library_path.read_bytes()
+    auth_bytes = auth_path.read_bytes()
+    total = len(library_bytes) + len(auth_bytes)
+    if total > MAX_AUTH_HTTP_SOURCE_BYTES:
+        raise RuntimeError(
+            f"authenticated HTTP source exceeds {MAX_AUTH_HTTP_SOURCE_BYTES} bytes: {total}"
+        )
+    try:
+        library = library_bytes.decode("utf-8")
+        auth_source = auth_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("authenticated HTTP source must be UTF-8") from exc
+    combined = library + "\n" + auth_source
+    missing = [value for value in AUTH_HTTP_EXPECTED_TEXT if value not in combined]
+    production_auth = auth_source.split("#[cfg(test)]", 1)[0]
+    forbidden = [
+        value for value in AUTH_HTTP_FORBIDDEN_PRODUCTION_TEXT if value in production_auth
+    ]
+    if missing:
+        raise RuntimeError(f"authenticated HTTP contracts are missing: {missing}")
+    if forbidden:
+        raise RuntimeError(
+            "authenticated HTTP acquired forbidden terminal or database authority: "
+            f"{forbidden}"
+        )
+    if "if !config.listen.ip().is_loopback()" not in library:
+        raise RuntimeError("authenticated HTTP no longer refuses non-loopback binding")
+    return {
+        "enabled_by_default": False,
+        "explicit_insecure_loopback_opt_in": True,
+        "non_loopback_authority": False,
+        "controller_authority": False,
+        "terminal_authority": False,
+        "tmux_mutation_authority": False,
+        "existing_registry_write_authority": False,
+        "source_bytes": total,
+        "source_sha256": {
+            str(library_path.relative_to(server_root.parents[2])): _sha256(library_bytes),
+            str(auth_path.relative_to(server_root.parents[2])): _sha256(auth_bytes),
+        },
+    }
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     web_root = root / "web"
     auth_root = web_root / "crates" / "termdeck-web-auth"
+    server_root = web_root / "crates" / "termdeck-web-server"
     cargo = shutil.which("cargo")
     if cargo is None:
         raise RuntimeError("cargo is required for the TermDeck web validation gate")
@@ -269,9 +356,11 @@ def main() -> int:
         auth_root / "src" / "store.rs",
         web_root / "crates" / "termdeck-web-core" / "src" / "lib.rs",
         web_root / "crates" / "termdeck-web-state" / "src" / "lib.rs",
-        web_root / "crates" / "termdeck-web-server" / "src" / "lib.rs",
-        web_root / "crates" / "termdeck-web-server" / "assets" / "app.css",
-        web_root / "crates" / "termdeck-web-server" / "assets" / "app.js",
+        server_root / "Cargo.toml",
+        server_root / "src" / "lib.rs",
+        server_root / "src" / "auth_http.rs",
+        server_root / "assets" / "app.css",
+        server_root / "assets" / "app.js",
     ]
     missing = [str(path.relative_to(root)) for path in required if not path.is_file()]
     if missing:
@@ -282,6 +371,7 @@ def main() -> int:
         web_root / "crates" / "termdeck-web-server" / "assets" / "app.css",
     )
     authentication = _validate_auth_foundation(auth_root)
+    authenticated_http = _validate_authenticated_http(server_root)
 
     with tempfile.TemporaryDirectory(prefix="t1000-web-validation-") as raw_temp:
         temporary = Path(raw_temp)
@@ -396,20 +486,21 @@ def main() -> int:
                 for dependency in item.get("dependencies", [])
             )
         )
-        if consumers:
+        if consumers != EXPECTED_AUTH_CONSUMERS:
             raise RuntimeError(
-                "authentication foundation was integrated before its HTTP gate: "
-                f"{consumers}"
+                "authentication consumer boundary changed: "
+                f"observed={consumers} expected={EXPECTED_AUTH_CONSUMERS}"
             )
         authentication["library_only"] = True
         authentication["integrated_consumers"] = consumers
 
         payload = {
-            "schema": "t1000.web-readonly-smoke.v2",
+            "schema": "t1000.web-readonly-smoke.v3",
             "ok": True,
             "packages": sorted(packages),
             "commands": receipts,
             "authentication": authentication,
+            "authenticated_http": authenticated_http,
             "frontend": frontend,
             "source_sha256": {
                 str(path.relative_to(root)): _sha256(path.read_bytes())
