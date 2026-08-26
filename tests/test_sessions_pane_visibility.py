@@ -44,6 +44,21 @@ class SessionsPaneVisibilityTest(TestCase):
 
         self.assertFalse(_show_in_sessions_pane(record))
 
+
+    def test_open_terminal_tab_remains_visible_after_child_payload_stops(self) -> None:
+        record = make_record("stopped", visible=True)
+
+        self.assertTrue(
+            _show_in_sessions_pane(record, open_session_ids={record.id})
+        )
+
+    def test_archived_row_remains_hidden_even_if_a_stale_widget_id_exists(self) -> None:
+        record = make_record("archived", visible=True)
+
+        self.assertFalse(
+            _show_in_sessions_pane(record, open_session_ids={record.id})
+        )
+
     def test_hidden_status_set_documents_kill_aliases(self) -> None:
         self.assertGreaterEqual(SIDE_PANE_HIDDEN_STATUSES, {"stopped", "killed", "dead", "terminated"})
 

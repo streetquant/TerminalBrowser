@@ -116,8 +116,21 @@ def main() -> int:
                 ),
             )
             side_x, _side_y = _translated_origin(first.side, first)
-            side_children = first.side.get_children()
-            content_x = min(_translated_origin(child, first)[0] for child in side_children)
+            side_children = [
+                child
+                for child in first.side.get_children()
+                if child.get_visible()
+            ]
+            if not side_children:
+                raise AssertionError("Tabs pane has no visible content children")
+            # These widgets are direct GtkBox children of ``first.side``.  GTK
+            # may legitimately return ``None`` when translating a no-window
+            # child all the way to an ApplicationWindow during a resize frame;
+            # its allocation remains authoritative in the parent coordinate
+            # space and still catches left-edge clipping deterministically.
+            content_x = side_x + min(
+                int(child.get_allocation().x) for child in side_children
+            )
             side_min_width, side_natural_width = first.side.get_preferred_width()
             side_allocated_width = first.side.get_allocated_width()
             side_split = first.paned.get_position()

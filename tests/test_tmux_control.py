@@ -598,7 +598,9 @@ class ControlModeClientTests(unittest.TestCase):
         self.assertTrue(transport.killed)
         self.assertTrue(transport.stdin.closed)
         self.assertTrue(transport.stdout.closed)
-        self.assertEqual(transport.wait_calls, [0.75, 0.75])
+        # TERM gets a short grace period; after KILL, the distinct bounded reap
+        # window tolerates scheduler delay without returning a live or zombie child.
+        self.assertEqual(transport.wait_calls, [0.75, 5.0])
         self.assertEqual(transport.poll(), 0)
 
     def test_real_subprocess_transport_is_reaped_and_pipes_are_closed(self) -> None:

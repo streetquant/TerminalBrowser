@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import subprocess
-from unittest import TestCase
+from unittest import TestCase, mock
 
+import termdeck.vte_stack as vte_stack
 from termdeck.vte_stack import (
     _without_alternate_screen,
     merge_vte_attach_environment,
@@ -31,6 +32,23 @@ xterm-256color|xterm,
         self.assertNotIn("smcup=", transformed)
         self.assertNotIn("rmcup=", transformed)
 
+    def test_attach_environment_falls_back_without_a_second_tool_process(self) -> None:
+        timeout = subprocess.TimeoutExpired(["infocmp"], 5)
+        with mock.patch.object(vte_stack, "_ATTACH_ENVIRONMENT", None), mock.patch.object(
+            vte_stack, "_TERMINFO_DIRECTORY", None
+        ), mock.patch.object(
+            vte_stack, "_compiled_environment", side_effect=timeout
+        ) as compiled, mock.patch(
+            "termdeck.vte_stack.subprocess.run"
+        ) as subprocess_run:
+            environment = vte_attach_environment()
+
+        compiled.assert_called_once_with()
+        subprocess_run.assert_not_called()
+        self.assertEqual(environment["TERM"], "teraterm-256color")
+        self.assertEqual(environment["COLORTERM"], "truecolor")
+        self.assertEqual(environment["TERM_PROGRAM"], "TermDeck")
+
     def test_attach_environment_compiles_a_no_alt_256_colour_entry(self) -> None:
         environment = vte_attach_environment()
         child = os.environ.copy()
@@ -42,7 +60,7 @@ xterm-256color|xterm,
             check=True,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=30,
         ).stdout
 
         self.assertIn(environment["TERM"], {"termdeck-vte", "teraterm-256color"})

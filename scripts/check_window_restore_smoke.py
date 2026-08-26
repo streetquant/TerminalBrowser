@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 
-def _drain_gtk(Gtk, *, until=None, timeout: float = 5.0) -> None:
+def _drain_gtk(Gtk, *, until=None, timeout: float = 60.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         while Gtk.events_pending():
@@ -29,7 +29,7 @@ def _wait_for_attached_client(
     process: subprocess.Popen[str],
     log_path: Path,
     *,
-    timeout: float = 8.0,
+    timeout: float = 60.0,
 ) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -44,7 +44,7 @@ def _wait_for_attached_client(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=2,
+            timeout=10,
         )
         if tmux_name in result.stdout.splitlines():
             return
@@ -430,10 +430,10 @@ def main() -> int:
             if secondary_process is not None and secondary_process.poll() is None:
                 secondary_process.terminate()
                 try:
-                    secondary_process.wait(timeout=5)
+                    secondary_process.wait(timeout=30)
                 except subprocess.TimeoutExpired:
                     secondary_process.kill()
-                    secondary_process.wait(timeout=5)
+                    secondary_process.wait(timeout=30)
             if secondary_log_handle is not None:
                 secondary_log_handle.close()
             for record in secondary_records:

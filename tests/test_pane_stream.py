@@ -659,6 +659,46 @@ class PaneStreamControllerTests(unittest.TestCase):
         self.assertIn(b"ready$", b"".join(outputs))
 
 
+    def test_full_screen_replay_paints_rows_without_wrap_and_restores_absolute_cursor_last(self) -> None:
+        controller, client, outputs = self.make_controller()
+        state = state_line(
+            0,
+            alternate_on="0",
+            cursor_x="7",
+            cursor_y="1",
+            cursor_flag="1",
+            wrap_flag="1",
+            insert_flag="1",
+            origin_flag="1",
+            bracket_paste_flag="1",
+        )
+        client.script("list-panes", CommandResult(True, (state,), None))
+        client.script(
+            "capture-pane",
+            CommandResult(
+                True,
+                (
+                    control_reply_line(b"\x1b[48;5;236m" + b"A" * 80),
+                    control_reply_line(b"\x1b[48;5;237m" + b"B" * 80),
+                ),
+                None,
+            ),
+        )
+
+        controller.start(columns=80, rows=24)
+        client.connect()
+        wait_until(lambda: outputs)
+        replay = b"".join(outputs)
+
+        paint_prefix = b"\x1b[0m\x1b[?6l\x1b[4l\x1b[?7l"
+        self.assertIn(paint_prefix, replay)
+        self.assertGreaterEqual(replay.count(b"\x1b[0m\r\x1b[2K"), 2)
+        absolute_cursor = b"\x1b[2;8H"
+        self.assertIn(absolute_cursor, replay)
+        self.assertLess(replay.rfind(b"\x1b[?6h"), replay.rfind(absolute_cursor))
+        self.assertLess(replay.rfind(b"\x1b[?7h"), replay.rfind(absolute_cursor))
+        self.assertTrue(replay.endswith(b"\x1b[?25h"), replay[-80:])
+
 
 class StreamSetupGateTests(unittest.TestCase):
     def test_limit_bounds_concurrent_holders(self) -> None:
@@ -844,6 +884,7 @@ class OrphanControlClientSweepTests(unittest.TestCase):
             proc_root=str(root), kill=failing_kill
         )
         self.assertEqual(count, 0)
+
 
 
 class TransportParentDeathTests(unittest.TestCase):

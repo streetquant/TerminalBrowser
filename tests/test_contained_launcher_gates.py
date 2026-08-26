@@ -425,34 +425,35 @@ def test_mass_launches_do_not_form_a_serial_startup_convoy() -> None:
         assert any("continuing without the optional delay" in stderr for _stdout, stderr, _returncode in results)
 
 
-def test_stuck_startup_pace_holder_fails_open_after_bounded_wait() -> None:
+def test_startup_pace_uses_bounded_flock_wait_and_fails_open() -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp) / "gates"
+        directory = Path(tmp)
+        root = directory / "gates"
+        fake_bin = directory / "bin"
+        log = directory / "flock-argv"
         root.mkdir(mode=0o700)
-        lock_path = root / "startup.0.lock"
-        holder = subprocess.Popen(
-            [
-                "bash",
-                "-c",
-                'exec 9>"$1"; flock 9; printf "ready\\n"; sleep 5',
-                "gate-holder",
-                str(lock_path),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
+        fake_bin.mkdir(mode=0o700)
+        fake_flock = fake_bin / "flock"
+        fake_flock.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" > \"$FLOCK_LOG\"\n"
+            "exit 1\n",
+            encoding="utf-8",
         )
-        try:
-            assert _readline_with_timeout(holder) == "ready"
-            started = time.monotonic()
-            result = _run_pace(root)
-            elapsed = time.monotonic() - started
-        finally:
-            holder.terminate()
-            holder.wait(timeout=5)
+        fake_flock.chmod(0o755)
+
+        result = _run_pace(
+            root,
+            PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            FLOCK_LOG=str(log),
+        )
 
         assert result.returncode == 0
-        assert elapsed < 1
         assert "continuing without the optional delay" in result.stderr
+        arguments = shlex.split(log.read_text(encoding="utf-8").strip())
+        assert arguments[:2] == ["-w", "0.05"]
+        assert len(arguments) == 3
+        assert arguments[2].isdigit()
 
 
 def test_future_startup_timestamp_is_ignored_and_replaced() -> None:

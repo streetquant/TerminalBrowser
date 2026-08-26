@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Verify application-aware history, VTE selection, and TUI wheel routing.
+"""Verify real VTE scrolling, alternate-screen routing, and composer replay.
 
-The persistent scrollbar owns Termdeck's tmux/TUI history model. VTE's native
-adjustment remains separate and is exposed only while a real text selection owns
-the viewport. Wheel navigation must be incremental, must never leak shell arrow
-keys into ordinary shells or composers. Alternate-screen applications that
-negotiate mouse reporting retain that protocol in both directions, including the
-persistent scrollbar. Replayed focus/bracketed-paste modes must preserve composer
-input, Ctrl+L redraw, and a complete bottom-of-screen frame; no-mouse TUIs receive
-neither synthetic arrows nor an unrelated tmux history surface.
+Normal-screen history uses VTE's native adjustment so the persistent scrollbar,
+wheel events, selected text, and visible pixels cannot diverge. Alternate-screen
+applications without native scrollback retain the application-aware proxy and
+negotiated mouse protocol. The smoke verifies actual pixel changes for wheel and
+scrollbar movement, exact initial-vs-redraw composer pixels, Ctrl+L delivery, and
+composer input/paste without implicit submission.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -85,6 +85,119 @@ def _adjustment_state(adjustment) -> dict[str, float]:
         "value": value,
         "bottom": max(lower, upper - page_size),
     }
+
+
+
+def _widget_pixel_capture(widget) -> tuple[int, int, int, int, bytes]:
+    from termdeck.gtk_app import Gdk
+
+    window = widget.get_window()
+    allocation = widget.get_allocation()
+    width = max(1, int(allocation.width))
+    height = max(1, int(allocation.height))
+    if window is None or width < 2 or height < 2:
+        raise RuntimeError("terminal has no drawable viewport")
+    if bool(widget.get_has_window()):
+        x = y = 0
+    else:
+        x = int(allocation.x)
+        y = int(allocation.y)
+    pixbuf = Gdk.pixbuf_get_from_window(window, x, y, width, height)
+    if pixbuf is None:
+        raise RuntimeError("terminal viewport could not be captured")
+    return (
+        int(pixbuf.get_width()),
+        int(pixbuf.get_height()),
+        int(pixbuf.get_rowstride()),
+        int(pixbuf.get_n_channels()),
+        bytes(pixbuf.get_pixels()),
+    )
+
+
+def _pixel_capture_hash(capture: tuple[int, int, int, int, bytes]) -> str:
+    width, height, rowstride, channels, pixels = capture
+    payload = b"|".join(
+        (
+            str(width).encode(),
+            str(height).encode(),
+            str(rowstride).encode(),
+            str(channels).encode(),
+            pixels,
+        )
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _widget_pixel_hash(widget) -> str:
+    return _pixel_capture_hash(_widget_pixel_capture(widget))
+
+
+def _pixel_diff_summary(
+    before: tuple[int, int, int, int, bytes],
+    after: tuple[int, int, int, int, bytes],
+) -> dict[str, object]:
+    before_meta = before[:4]
+    after_meta = after[:4]
+    if before_meta != after_meta:
+        return {"before_meta": before_meta, "after_meta": after_meta}
+    width, height, rowstride, channels = before_meta
+    before_pixels = before[4]
+    after_pixels = after[4]
+    changed = 0
+    left = width
+    top = height
+    right = -1
+    bottom = -1
+    for y in range(height):
+        row = y * rowstride
+        for x in range(width):
+            offset = row + x * channels
+            if before_pixels[offset : offset + channels] == after_pixels[offset : offset + channels]:
+                continue
+            changed += 1
+            left = min(left, x)
+            top = min(top, y)
+            right = max(right, x)
+            bottom = max(bottom, y)
+    return {
+        "changed_pixels": changed,
+        "total_pixels": width * height,
+        "changed_fraction": changed / max(1, width * height),
+        "bounding_box": None if changed == 0 else [left, top, right, bottom],
+    }
+
+
+def _stable_widget_pixel_capture(
+    Gtk,
+    widget,
+    *,
+    timeout: float = 3.0,
+    required_identical_samples: int = 3,
+) -> tuple[int, int, int, int, bytes]:
+    """Return pixels only after GTK has painted the same terminal frame repeatedly."""
+
+    deadline = time.monotonic() + timeout
+    previous_hash = ""
+    identical = 0
+    latest = None
+    while time.monotonic() < deadline:
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+        latest = _widget_pixel_capture(widget)
+        current_hash = _pixel_capture_hash(latest)
+        if current_hash == previous_hash:
+            identical += 1
+        else:
+            previous_hash = current_hash
+            identical = 1
+        if identical >= max(2, int(required_identical_samples)):
+            return latest
+        time.sleep(0.03)
+    if latest is None:
+        raise RuntimeError("terminal viewport never became drawable")
+    raise RuntimeError(
+        "terminal pixels did not settle into repeated identical frames before timeout"
+    )
 
 
 def _pane_modes(app, record) -> tuple[int, int]:
@@ -161,9 +274,15 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="termdeck-scroll-") as tmp:
         root = Path(tmp)
         home = root / "home"
-        tmux_tmp = root / "tmux"
+        # tmux Unix-domain socket paths are bounded (typically 108 bytes). The
+        # CodexPro test TMPDIR is intentionally nested beneath the repository,
+        # so placing TMUX_TMPDIR under ``root`` can make every launch fail with
+        # ENAMETOOLONG before the UI is exercised. Keep only the socket root in
+        # a short, private /tmp directory while all test artifacts remain under
+        # the workspace-local temporary root.
+        tmux_tmp = Path(tempfile.mkdtemp(prefix="tds-", dir="/tmp"))
         home.mkdir()
-        tmux_tmp.mkdir(mode=0o700)
+        tmux_tmp.chmod(0o700)
         os.environ["HOME"] = str(home)
         os.environ["TMUX_TMPDIR"] = str(tmux_tmp)
         os.environ["NO_AT_BRIDGE"] = "1"
@@ -377,13 +496,66 @@ sys.stdout.flush()
             fallback_record = records["alternate-fallback"]
             native_record = records["native-mouse"]
 
-            # The persistent bar owns application-aware tmux history. VTE's
-            # adjustment remains available for selection review only.
-            _drain(Gtk, until=shell_ready.exists)
+            # Normal-screen history is a single VTE-owned viewport. The bar,
+            # physical wheel, selected text, and rendered pixels must all move
+            # together without entering tmux copy mode or injecting arrow keys.
             window._focus_session(shell_record.id)
+            try:
+                _drain(Gtk, until=shell_ready.exists)
+            except RuntimeError:
+                shell_tab = window.tabs.get(shell_record.id)
+                shell_widget = getattr(shell_tab, "widget", None)
+                controller = getattr(shell_widget, "controller", None)
+                try:
+                    session_exists = bool(app.backend.session_exists(shell_record))
+                except Exception as exc:
+                    session_exists = f"error: {type(exc).__name__}: {exc}"
+                try:
+                    pane_pid = app.backend.pane_pid(shell_record)
+                except Exception as exc:
+                    pane_pid = f"error: {type(exc).__name__}: {exc}"
+                print(
+                    json.dumps(
+                        {
+                            "current_session": window.current_session_id(),
+                            "window_tab_ids": sorted(window.tabs),
+                            "window_tab_names": sorted(
+                                str(getattr(tab.record, "name", ""))
+                                for tab in window.tabs.values()
+                            ),
+                            "store_records": sorted(
+                                (
+                                    record.id,
+                                    record.name,
+                                    record.status,
+                                    record.recovery_last_error,
+                                )
+                                for record in app.store.list()
+                            ),
+                            "record_status": shell_record.status,
+                            "recipe_launch_errors": list(
+                                getattr(window, "_recipe_hidden_launch_errors", ())
+                            ),
+                            "session_exists": session_exists,
+                            "pane_pid": pane_pid,
+                            "tab_present": shell_tab is not None,
+                            "widget_present": shell_widget is not None,
+                            "attach_restart_deferred": getattr(
+                                shell_widget, "_attach_restart_deferred", None
+                            ),
+                            "controller_present": controller is not None,
+                            "controller_ready": getattr(controller, "_ready", None),
+                            "controller_state": str(getattr(controller, "state", None)),
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                raise
             shell_attach = window.tabs[shell_record.id].widget
             shell_terminal = shell_attach.terminal
-            shell_history = shell_attach.history_adjustment
+            shell_proxy = shell_attach.history_adjustment
             shell_native = shell_attach.native_adjustment
             _drain(
                 Gtk,
@@ -391,54 +563,86 @@ sys.stdout.flush()
                     window.current_session_id() == shell_record.id
                     and shell_terminal.get_mapped()
                     and getattr(shell_attach.controller, "_ready", False)
+                    and _adjustment_state(shell_native)["bottom"] > 100.0
                 ),
             )
-            if shell_attach.scrollbar.get_adjustment() is not shell_history:
-                raise AssertionError(
-                    "shell scrollbar is not bound to application-aware history"
-                )
-            if shell_history is shell_native:
-                raise AssertionError("application history was conflated with VTE selection")
+            if shell_attach.scrollbar.get_adjustment() is not shell_native:
+                raise AssertionError("normal-screen scrollbar is not bound to VTE's viewport")
+            if shell_proxy is shell_native:
+                raise AssertionError("alternate-screen proxy was conflated with VTE history")
             shell_attach.scroll_to_bottom()
             _drain(
                 Gtk,
-                until=lambda: _adjustment_state(shell_history)["value"]
-                >= _adjustment_state(shell_history)["bottom"] - 0.5,
+                until=lambda: _adjustment_state(shell_native)["value"]
+                >= _adjustment_state(shell_native)["bottom"] - 0.5,
             )
-            before = _adjustment_state(shell_history)
+            before = _adjustment_state(shell_native)
+            before_pixels = _widget_pixel_hash(shell_terminal)
             shell_bytes_before_down = shell_input.read_bytes() if shell_input.exists() else b""
 
             _wheel_up(shell_terminal, clicks=3)
             _drain(
                 Gtk,
-                until=lambda: _adjustment_state(shell_history)["value"]
-                < before["value"] - 2,
+                until=lambda: (
+                    _adjustment_state(shell_native)["value"] < before["value"] - 2
+                    and _widget_pixel_hash(shell_terminal) != before_pixels
+                ),
             )
-            after_up = _adjustment_state(shell_history)
-            if _pane_modes(app, shell_record)[1] != 1:
-                raise AssertionError(
-                    "application-aware shell history did not enter its tmux-owned review surface"
-                )
+            after_up = _adjustment_state(shell_native)
+            after_up_pixels = _widget_pixel_hash(shell_terminal)
+            if _pane_modes(app, shell_record)[1] != 0:
+                raise AssertionError("normal VTE scrolling unexpectedly entered tmux copy mode")
 
-            # One down step from history is incremental; it must not throw the
-            # viewport back to the composer/live edge.
+            # One down step is incremental and changes the actual visible frame;
+            # it must not throw the viewport directly to the live edge.
             _wheel_down(shell_terminal)
             _drain(
                 Gtk,
-                until=lambda: _adjustment_state(shell_history)["value"]
-                > after_up["value"] + 0.5,
+                until=lambda: (
+                    _adjustment_state(shell_native)["value"] > after_up["value"] + 0.5
+                    and _widget_pixel_hash(shell_terminal) != after_up_pixels
+                ),
             )
-            after_down = _adjustment_state(shell_history)
+            after_down = _adjustment_state(shell_native)
+            after_down_pixels = _widget_pixel_hash(shell_terminal)
             down_delta = after_down["value"] - after_up["value"]
             if down_delta > 10.0 or after_down["value"] >= after_down["bottom"] - 0.5:
                 raise AssertionError(
-                    "one application-history wheel-down jumped to the live edge: "
+                    "one native wheel-down jumped to the live edge: "
                     f"before={after_up}, after={after_down}"
                 )
             shell_bytes_after_down = shell_input.read_bytes() if shell_input.exists() else b""
             wheel_bytes = shell_bytes_after_down[len(shell_bytes_before_down) :]
             if b"\x1b[A" in wheel_bytes or b"\x1b[B" in wheel_bytes:
                 raise AssertionError("normal-screen wheel leaked arrow keys into the shell")
+
+            # Drive the exact adjustment used by the visible Gtk.Scrollbar and
+            # prove that both thumb movement directions alter terminal pixels.
+            scrollbar_up_target = max(
+                after_down["lower"],
+                after_down["value"] - 18.0,
+            )
+            shell_attach.scrollbar.get_adjustment().set_value(scrollbar_up_target)
+            _drain(
+                Gtk,
+                until=lambda: (
+                    _adjustment_state(shell_native)["value"] <= scrollbar_up_target + 0.5
+                    and _widget_pixel_hash(shell_terminal) != after_down_pixels
+                ),
+            )
+            scrollbar_up = _adjustment_state(shell_native)
+            scrollbar_up_pixels = _widget_pixel_hash(shell_terminal)
+            shell_attach.scrollbar.get_adjustment().set_value(before["bottom"])
+            _drain(
+                Gtk,
+                until=lambda: (
+                    _adjustment_state(shell_native)["value"]
+                    >= _adjustment_state(shell_native)["bottom"] - 0.5
+                    and _widget_pixel_hash(shell_terminal) != scrollbar_up_pixels
+                ),
+            )
+            scrollbar_down = _adjustment_state(shell_native)
+            scrollbar_down_pixels = _widget_pixel_hash(shell_terminal)
 
             subprocess.run(["xdotool", "key", "x"], check=True, timeout=5)
             _drain(
@@ -447,12 +651,12 @@ sys.stdout.flush()
             )
             _drain(
                 Gtk,
-                until=lambda: _adjustment_state(shell_history)["value"]
-                >= _adjustment_state(shell_history)["bottom"] - 0.5,
+                until=lambda: _adjustment_state(shell_native)["value"]
+                >= _adjustment_state(shell_native)["bottom"] - 0.5,
             )
-            shell_final = _adjustment_state(shell_history)
+            shell_final = _adjustment_state(shell_native)
             if _pane_modes(app, shell_record)[1] != 0:
-                raise AssertionError("live terminal input did not leave tmux history review")
+                raise AssertionError("live terminal input entered or retained tmux copy mode")
 
             # A no-mouse alternate-screen app must not receive synthetic
             # Up/Down keys from a physical wheel. Those keys can mutate a TUI
@@ -550,6 +754,118 @@ sys.stdout.flush()
             native_initial_modes = _pane_input_modes(app, native_record)
             native_initial_tmux_frame = _pane_capture(app, native_record)
             native_initial_vte_frame = native_terminal.get_text_format(Vte.Format.TEXT)
+            native_terminal.set_cursor_blink_mode(Vte.CursorBlinkMode.OFF)
+            _drain(Gtk)
+            native_initial_pixel_capture = _stable_widget_pixel_capture(
+                Gtk, native_terminal
+            )
+            native_initial_pixel_hash = _pixel_capture_hash(
+                native_initial_pixel_capture
+            )
+
+            # Opening the real Tabs pane resizes the live VTE.  The frame shown
+            # immediately after that resize must be byte/pixel-equivalent to the
+            # application's own Ctrl+L redraw at the *same* geometry.  This is
+            # the user-reported failure mode that produced overlapping composer
+            # rows and stale background rectangles when the sidebar was pulled.
+            sidebar_identity_before = app.backend._inspect_auth_pane(native_record)
+            window.toggle_tabs_pane()
+
+            def _sidebar_resize_ready() -> bool:
+                tmux_frame = _pane_capture(app, native_record)
+                vte_frame = native_terminal.get_text_format(Vte.Format.TEXT)
+                columns = max(0, int(native_terminal.get_column_count()))
+                rows = max(0, int(native_terminal.get_row_count()))
+                size_marker = f"T1000_NATIVE_FRAME_BEGIN {columns}x{rows}"
+                return bool(
+                    window.tabs_pane_visible
+                    and window.side.get_visible()
+                    and not window._terminal_layout_sync_source_id
+                    and not native_attach._resize_sync_source_id
+                    and columns >= 2
+                    and rows >= 2
+                    and size_marker in tmux_frame
+                    and size_marker in vte_frame
+                    and _complete_composer(tmux_frame)
+                    and _complete_composer(vte_frame)
+                )
+
+            _drain(Gtk, until=_sidebar_resize_ready)
+            sidebar_open_tmux_frame = _pane_capture(app, native_record)
+            sidebar_open_vte_frame = native_terminal.get_text_format(Vte.Format.TEXT)
+            # Keep focus/cursor state identical on both sides of the pixel
+            # comparison; otherwise only the focused caret differs even when
+            # the terminal frame itself is correct.
+            native_terminal.grab_focus()
+            _drain(Gtk)
+            sidebar_open_pixel_capture = _stable_widget_pixel_capture(
+                Gtk, native_terminal
+            )
+            sidebar_open_pixel_hash = _pixel_capture_hash(
+                sidebar_open_pixel_capture
+            )
+            native_terminal.grab_focus()
+            _drain(Gtk)
+            sidebar_native_bytes = native_input.read_bytes()
+            subprocess.run(["xdotool", "key", "ctrl+l"], check=True, timeout=5)
+            _drain(
+                Gtk,
+                until=lambda: b"\x0c"
+                in native_input.read_bytes()[len(sidebar_native_bytes) :]
+                and _complete_composer(_pane_capture(app, native_record))
+                and _complete_composer(
+                    native_terminal.get_text_format(Vte.Format.TEXT)
+                ),
+            )
+            sidebar_redraw_pixel_capture = _stable_widget_pixel_capture(
+                Gtk, native_terminal
+            )
+            sidebar_redraw_pixel_hash = _pixel_capture_hash(
+                sidebar_redraw_pixel_capture
+            )
+            if sidebar_redraw_pixel_hash != sidebar_open_pixel_hash:
+                raise AssertionError(
+                    "Tabs-pane resize frame differs from the application's direct redraw: "
+                    + json.dumps(
+                        {
+                            "resize": sidebar_open_pixel_hash,
+                            "redraw": sidebar_redraw_pixel_hash,
+                            "pixel_diff": _pixel_diff_summary(
+                                sidebar_open_pixel_capture,
+                                sidebar_redraw_pixel_capture,
+                            ),
+                            "tmux_complete": _complete_composer(
+                                sidebar_open_tmux_frame
+                            ),
+                            "vte_complete": _complete_composer(
+                                sidebar_open_vte_frame
+                            ),
+                        },
+                        sort_keys=True,
+                    )
+                )
+            sidebar_identity_after = app.backend._inspect_auth_pane(native_record)
+            if (
+                sidebar_identity_before is None
+                or sidebar_identity_after is None
+                or sidebar_identity_after.pane_id != sidebar_identity_before.pane_id
+            ):
+                raise AssertionError("Tabs-pane resize changed the live tmux pane identity")
+            if _pane_input_modes(app, native_record) != expected_native_modes:
+                raise AssertionError("Tabs-pane resize lost negotiated terminal modes")
+            window.toggle_tabs_pane()
+            _drain(
+                Gtk,
+                until=lambda: bool(
+                    not window.tabs_pane_visible
+                    and not window.side.get_visible()
+                    and _complete_composer(_pane_capture(app, native_record))
+                    and _complete_composer(
+                        native_terminal.get_text_format(Vte.Format.TEXT)
+                    )
+                ),
+            )
+
             native_attach.scroll_to_bottom()
             _drain(
                 Gtk,
@@ -689,6 +1005,28 @@ sys.stdout.flush()
             ctrl_l_slice = native_input.read_bytes()[len(native_bytes) :]
             native_after_ctrl_l_tmux = _pane_capture(app, native_record)
             native_after_ctrl_l_vte = native_terminal.get_text_format(Vte.Format.TEXT)
+            _drain(Gtk)
+            native_after_ctrl_l_pixel_capture = _stable_widget_pixel_capture(
+                Gtk, native_terminal
+            )
+            native_after_ctrl_l_pixel_hash = _pixel_capture_hash(
+                native_after_ctrl_l_pixel_capture
+            )
+            if native_after_ctrl_l_pixel_hash != native_initial_pixel_hash:
+                raise AssertionError(
+                    "initial replay pixels differ from the application's direct Ctrl+L redraw: "
+                    + json.dumps(
+                        {
+                            "initial": native_initial_pixel_hash,
+                            "redraw": native_after_ctrl_l_pixel_hash,
+                            "pixel_diff": _pixel_diff_summary(
+                                native_initial_pixel_capture,
+                                native_after_ctrl_l_pixel_capture,
+                            ),
+                        },
+                        sort_keys=True,
+                    )
+                )
 
             # Ordinary composer text must remain unsubmitted. No CR/Enter may be
             # synthesized merely because the user typed into the focused VTE.
@@ -760,11 +1098,15 @@ sys.stdout.flush()
                 json.dumps(
                     {
                         "ok": True,
-                        "history_owner": "application-aware-history-proxy",
+                        "history_owner": "native-vte-normal-screen-and-proxy-alternate-screen",
                         "shell_before": before,
                         "shell_after_up": after_up,
                         "shell_after_single_down": after_down,
                         "shell_single_down_delta": round(down_delta, 3),
+                        "shell_scrollbar_after_up": scrollbar_up,
+                        "shell_scrollbar_after_down": scrollbar_down,
+                        "shell_wheel_pixels_changed": before_pixels != after_up_pixels != after_down_pixels,
+                        "shell_scrollbar_pixels_changed": after_down_pixels != scrollbar_up_pixels != scrollbar_down_pixels,
                         "shell_final_live_edge": shell_final,
                         "shell_tmux_copy_mode": _pane_modes(app, shell_record)[1],
                         "shell_first_key": "x",
@@ -800,6 +1142,26 @@ sys.stdout.flush()
                         "native_complete_vte_frame_after_ctrl_l": _complete_composer(
                             native_after_ctrl_l_vte
                         ),
+                        "native_initial_redraw_pixels_identical": (
+                            native_initial_pixel_hash == native_after_ctrl_l_pixel_hash
+                        ),
+                        "sidebar_resize_frame_complete": bool(
+                            _complete_composer(sidebar_open_tmux_frame)
+                            and _complete_composer(sidebar_open_vte_frame)
+                        ),
+                        "sidebar_resize_redraw_pixels_identical": (
+                            sidebar_open_pixel_hash == sidebar_redraw_pixel_hash
+                        ),
+                        "sidebar_resize_preserved_tmux_pane": (
+                            sidebar_identity_before is not None
+                            and sidebar_identity_after is not None
+                            and sidebar_identity_before.pane_id
+                            == sidebar_identity_after.pane_id
+                        ),
+                        "sidebar_resize_preserved_terminal_modes": (
+                            _pane_input_modes(app, native_record)
+                            == expected_native_modes
+                        ),
                     },
                     indent=2,
                     sort_keys=True,
@@ -819,6 +1181,7 @@ sys.stdout.flush()
                     pass
             app.store.close()
             app.quit()
+            shutil.rmtree(tmux_tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

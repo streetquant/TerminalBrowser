@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.2.19
+
+- Made terminal history use one truthful viewport. Ordinary wheel, trackpad, selection autoscroll, Page Up/Page Down, and the persistent scrollbar now move VTE's visible normal-screen content; alternate-screen TUIs receive their negotiated mouse protocol without a thumb-only pseudo-scroll.
+- Rebuilt tmux replay as a deterministic frame transaction. Captured rows are cleared and style-reset independently with wrapping disabled, application modes and the cursor are restored last, and opening or closing the Tabs pane waits for the settled VTE/tmux grid, eliminating stale rectangles and overlapping Codex composers.
+- Kept open terminal tabs visible when their Codex child exits. Tabs-pane membership and counts now follow the notebook/tmux pane rather than transient foreground-process sampling, while hidden, archived, and explicitly removed records retain their existing semantics.
+- Made Codex profile switching an atomic same-pane handoff for running sessions. The exact conversation UUID, pane, cwd, model, and tab survive the switch; failed activation restores the previous account and payload instead of leaving a partial selection or a “next launch” state.
+- Unified authentication around the canonical system-wide Codex account source. Private per-tab scopes keep only their selection boundary, observe external token/profile replacement through canonical fingerprints, and apply it immediately through the same verified handoff without stale credential copies.
+- Removed the second synchronous terminfo inspection from the loaded-host fallback path so temporary `infocmp`/`tic` starvation cannot prevent a terminal from opening.
+- Made exact recovery observation preserve the canonical `codex-opencode` model and fail closed when Codex has closed its rollout descriptor. Only one owner-only, non-symlinked CLI rollout matching the process cwd and bounded start window is accepted; multiple candidates remain explicitly recoverable instead of selecting the nearest timestamp.
+- Added real GTK/VTE/tmux regressions for sidebar-open pixel equivalence to direct `Ctrl+L`, stable pane identity and modes, scrolling pixels, hidden-start sidebar mapping, open-tab lifecycle, immediate auth switching, exact conversation continuity, rollback, and external canonical-token ingestion.
+
 ## 0.2.18
 
 - Restored exactly-once terminal input for OpenCode and other full-screen TUIs. Focused VTE keystrokes are no longer replayed through the parent window, printable text cannot acquire a synthetic Enter, and plain `Ctrl+L` is again application-owned.

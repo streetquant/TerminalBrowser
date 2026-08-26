@@ -4350,6 +4350,44 @@ def _canonical_process_cross_root(
             raise ReleaseError("cross-process observer runtime is unsafe")
         return root
 
+    def validate_runtime_base(runtime: Path) -> Path:
+        if not runtime.is_absolute():
+            raise ReleaseError("cross-process observer runtime base is not absolute")
+        normalized = Path(os.path.abspath(os.fspath(runtime)))
+        try:
+            resolved = normalized.resolve(strict=True)
+            metadata = normalized.lstat()
+        except OSError as exc:
+            raise ReleaseError("cross-process observer runtime base is unavailable") from exc
+        if (
+            resolved != normalized
+            or stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != expected_uid
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ReleaseError("cross-process observer runtime base is unsafe")
+        return normalized
+
+    def create_under_runtime(
+        runtime: Path,
+        *,
+        allow_unavailable: bool,
+    ) -> Path | None:
+        base = validate_runtime_base(runtime)
+        root = base / _PROCESS_CROSS_ROOT_NAME
+        try:
+            root.mkdir(mode=0o700, parents=False, exist_ok=True)
+        except OSError as exc:
+            if (
+                allow_unavailable
+                and exc.errno in {errno.EROFS, errno.EACCES, errno.EPERM}
+                and not _path_lexists(root)
+            ):
+                return None
+            raise ReleaseError("cross-process observer runtime cannot be created") from exc
+        return validate_root(root)
+
     if runtime_root is not None:
         root = Path(runtime_root).absolute()
         try:
@@ -4358,28 +4396,21 @@ def _canonical_process_cross_root(
             raise ReleaseError("cross-process observer runtime cannot be created") from exc
         return validate_root(root)
 
-    runtime = Path("/run/user") / str(expected_uid)
-    try:
-        runtime_metadata = runtime.lstat()
-    except OSError as exc:
-        raise ReleaseError("canonical user runtime directory is unavailable") from exc
-    if (
-        stat.S_ISLNK(runtime_metadata.st_mode)
-        or not stat.S_ISDIR(runtime_metadata.st_mode)
-        or runtime_metadata.st_uid != expected_uid
-        or stat.S_IMODE(runtime_metadata.st_mode) != 0o700
-    ):
-        raise ReleaseError("canonical user runtime directory is unsafe")
-    canonical = runtime / _PROCESS_CROSS_ROOT_NAME
-    try:
-        canonical.mkdir(mode=0o700, parents=False, exist_ok=True)
-    except OSError as exc:
-        if exc.errno not in {errno.EROFS, errno.EACCES, errno.EPERM}:
-            raise ReleaseError("canonical observer runtime cannot be created") from exc
-    else:
-        return validate_root(canonical)
-    if _path_lexists(canonical):
-        return validate_root(canonical)
+    configured_runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if configured_runtime:
+        configured = create_under_runtime(
+            Path(configured_runtime),
+            allow_unavailable=True,
+        )
+        if configured is not None:
+            return configured
+
+    canonical = create_under_runtime(
+        Path("/run/user") / str(expected_uid),
+        allow_unavailable=True,
+    )
+    if canonical is not None:
+        return canonical
 
     temporary = Path("/tmp")
     try:
@@ -4409,6 +4440,7 @@ def _canonical_process_cross_root(
     except OSError as exc:
         raise ReleaseError("containment observer runtime cannot be created") from exc
     return validate_root(fallback)
+
 
 def _read_cross_file(
     path: Path,

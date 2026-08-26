@@ -985,6 +985,9 @@ def _task_environment(
                     "PYTHONPYCACHEPREFIX": str(pycache),
                     "TMPDIR": str(temporary),
                     "XDG_CACHE_HOME": str(cache),
+                    "XDG_RUNTIME_DIR": str(
+                        runtime.path if runtime is not None else temporary
+                    ),
                 }
             )
     except BaseException as exc:

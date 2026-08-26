@@ -41,9 +41,12 @@ class TabsPaneVisibilityTests(unittest.TestCase):
         window = SimpleNamespace(
             tabs_pane_visible=False,
             side=side,
-            _pack_side_pane=lambda: events.append(("layout", "repacked")),
             app_context=app_context,
             show_toast=lambda message, **kwargs: events.append(("toast", message, kwargs)),
+        )
+        window._apply_side_pane_visibility = lambda: (
+            side.set_visible(window.tabs_pane_visible),
+            events.append(("layout", "stable")),
         )
 
         TermDeckWindow.set_tabs_pane_visible(window, True)
@@ -54,7 +57,7 @@ class TabsPaneVisibilityTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                ("layout", "repacked"),
+                ("layout", "stable"),
                 ("persist", True),
                 ("toast", "Tabs pane shown", {"kind": "info"}),
             ],
@@ -69,9 +72,12 @@ class TabsPaneVisibilityTests(unittest.TestCase):
         window = SimpleNamespace(
             tabs_pane_visible=True,
             side=side,
-            _pack_side_pane=lambda: events.append(("layout", "repacked")),
             app_context=app_context,
             show_toast=lambda message, **kwargs: events.append(("toast", message, kwargs)),
+        )
+        window._apply_side_pane_visibility = lambda: (
+            side.set_visible(window.tabs_pane_visible),
+            events.append(("layout", "stable")),
         )
 
         TermDeckWindow.set_tabs_pane_visible(window, False, persist=False)
@@ -82,7 +88,7 @@ class TabsPaneVisibilityTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                ("layout", "repacked"),
+                ("layout", "stable"),
                 ("toast", "Tabs pane hidden", {"kind": "info"}),
             ],
         )
@@ -136,6 +142,35 @@ class TabsPaneVisibilityTests(unittest.TestCase):
                 rows = _tabs_pane_records(store, "win-a")
 
                 self.assertEqual([row.id for row in rows], [mine.id])
+            finally:
+                store.close()
+
+
+    def test_open_notebook_tab_is_not_dropped_when_codex_child_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                record = store.create(
+                    "codex-shell",
+                    "terminal",
+                    "bash",
+                    tmp,
+                    window_id="win-a",
+                    window_title="A",
+                    tab_index=0,
+                    visible=True,
+                )
+                store.update(record.id, status="stopped", last_pid=None)
+
+                hidden = _tabs_pane_records(store, "win-a")
+                open_rows = _tabs_pane_records(
+                    store,
+                    "win-a",
+                    open_session_ids={record.id},
+                )
+
+                self.assertEqual(hidden, [])
+                self.assertEqual([row.id for row in open_rows], [record.id])
             finally:
                 store.close()
 

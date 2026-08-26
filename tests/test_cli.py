@@ -325,7 +325,7 @@ class CliTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_auth_switch_reports_activation_failure_without_losing_selected_account(self):
+    def test_auth_switch_activation_failure_restores_previous_unselected_account(self):
         import tempfile
         from unittest import mock
         from termdeck.codex_auth import CodexAccount, CodexAuthState, CodexSwitchResult
@@ -379,6 +379,7 @@ class CliTests(unittest.TestCase):
             manager = mock.Mock()
             manager.state.return_value = previous
             manager.switch.return_value = CodexSwitchResult(True, selected)
+            manager.restore.return_value = CodexSwitchResult(True, previous)
             args = argparse.Namespace(db=db_path, selector=record.id, switch_account="work")
             buffer = io.StringIO()
             with mock.patch.dict(
@@ -392,13 +393,14 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 1)
             payload = json.loads(buffer.getvalue())
             self.assertFalse(payload["ok"])
-            self.assertEqual(payload["selected_account"], "work")
+            self.assertIsNone(payload["selected_account"])
             self.assertTrue(payload["auth_restart_required"])
             self.assertIn("could not be captured exactly", payload["error"])
+            manager.restore.assert_called_once_with(record, None)
             store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
             try:
                 saved = store.get(record.id)
-                self.assertEqual(saved.selected_account, "work")
+                self.assertIsNone(saved.selected_account)
                 self.assertTrue(saved.auth_restart_required)
             finally:
                 store.close()
@@ -650,6 +652,7 @@ class CliTests(unittest.TestCase):
             manager = mock.Mock()
             manager.state.return_value = previous
             manager.switch.return_value = CodexSwitchResult(True, selected)
+            manager.restore.return_value = CodexSwitchResult(True, previous)
             args = argparse.Namespace(db=db_path, selector=record.id, switch_account="work")
             buffer = io.StringIO()
             with mock.patch.dict(
@@ -661,11 +664,11 @@ class CliTests(unittest.TestCase):
                 code = cmd_auth(args)
 
             self.assertEqual(code, 1)
-            manager.restore.assert_not_called()
+            manager.restore.assert_called_once_with(record, "personal-key")
             store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
             try:
                 saved = store.get(record.id)
-                self.assertEqual(saved.selected_account, "work")
+                self.assertEqual(saved.selected_account, "personal")
                 self.assertTrue(saved.auth_restart_required)
                 self.assertEqual(saved.command, "/bin/bash")
                 self.assertEqual(saved.cwd, new_cwd)
@@ -742,6 +745,7 @@ class CliTests(unittest.TestCase):
             manager = mock.Mock()
             manager.state.return_value = previous
             manager.switch.return_value = CodexSwitchResult(True, selected)
+            manager.restore.return_value = CodexSwitchResult(True, previous)
             args = argparse.Namespace(db=db_path, selector=record.id, switch_account="work")
             with mock.patch.dict(
                 "os.environ",
@@ -752,11 +756,11 @@ class CliTests(unittest.TestCase):
                 code = cmd_auth(args)
 
             self.assertEqual(code, 1)
-            manager.restore.assert_not_called()
+            manager.restore.assert_called_once_with(record, "personal-key")
             store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
             try:
                 saved = store.get(record.id)
-                self.assertEqual(saved.selected_account, "work")
+                self.assertEqual(saved.selected_account, "personal")
                 self.assertEqual(saved.command, "codex")
                 self.assertEqual(saved.cwd, tmp)
                 self.assertEqual(saved.recovery_command, recovery)

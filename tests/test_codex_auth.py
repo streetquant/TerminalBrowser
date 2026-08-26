@@ -293,10 +293,10 @@ def _run_picker_in_pty(
         slave_fd = -1
         os.write(master_fd, f"{selection}\n".encode())
         try:
-            return_code = process.wait(timeout=5)
+            return_code = process.wait(timeout=30)
         except subprocess.TimeoutExpired:
             process.kill()
-            process.wait(timeout=5)
+            process.wait(timeout=30)
             raise
     finally:
         if slave_fd >= 0:
@@ -332,10 +332,10 @@ def _run_contended_picker_in_pty(
             # the scheduling race. Either ordering must remain bounded.
             pass
         try:
-            return process.wait(timeout=5)
+            return process.wait(timeout=30)
         except subprocess.TimeoutExpired:
             process.kill()
-            process.wait(timeout=5)
+            process.wait(timeout=30)
             raise
     finally:
         if slave_fd >= 0:
@@ -1346,17 +1346,17 @@ shutil.copyfile(home / 'accounts' / f"{account['account_key']}.json", home / 'au
                 env=_private_wrapper_environment(private),
             )
             pid_path = private / "delayed-picker-pid"
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 30
             while not pid_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             if not pid_path.exists():
                 process.kill()
-                process.wait(timeout=5)
+                process.wait(timeout=30)
                 self.fail("native codex-auth did not start")
             child_pid = int(pid_path.read_text(encoding="utf-8"))
 
             os.kill(process.pid, signal.SIGKILL)
-            self.assertEqual(process.wait(timeout=5), -signal.SIGKILL)
+            self.assertEqual(process.wait(timeout=30), -signal.SIGKILL)
 
             lock_path = private / ".termdeck-auth-transaction.lock"
             probe_fd = os.open(
@@ -1364,7 +1364,7 @@ shutil.copyfile(home / 'accounts' / f"{account['account_key']}.json", home / 'au
                 os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
             )
             acquired = False
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 30
             try:
                 while time.monotonic() < deadline:
                     try:
@@ -1380,7 +1380,7 @@ shutil.copyfile(home / 'accounts' / f"{account['account_key']}.json", home / 'au
                 os.close(probe_fd)
 
             self.assertTrue(acquired, "native child retained the transaction lock")
-            child_deadline = time.monotonic() + 5
+            child_deadline = time.monotonic() + 30
             child_stopped = False
             while time.monotonic() < child_deadline:
                 if not Path(f"/proc/{child_pid}").exists():

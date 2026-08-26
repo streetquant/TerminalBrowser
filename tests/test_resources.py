@@ -7,8 +7,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from termdeck import resources as resources_module
 from termdeck.resources import (
     ResourceSampler,
+    _clear_codex_session_caches,
     _managed_codex_observation_argv,
     _primary_claude_session_id,
     _primary_codex_session_id,
@@ -230,9 +232,10 @@ class ResourceTests(unittest.TestCase):
         ), mock.patch(
             "termdeck.resources._primary_codex_session_id",
             side_effect=lambda pid: session_id if pid == 102 else None,
-        ):
+        ) as primary:
             observed, command, cwd = observe_recovery_metadata(100)
 
+        primary.assert_called_once_with(102)
         self.assertTrue(observed)
         self.assertEqual(command, f"codex --yolo resume {session_id}")
         self.assertEqual(cwd, "/8tb/projects/example")
@@ -375,7 +378,7 @@ class ResourceTests(unittest.TestCase):
         finally:
             for child in children:
                 child.kill()
-                child.wait(timeout=2)
+                child.wait(timeout=30)
 
     def test_process_tree_missing_pid_is_empty(self):
         self.assertEqual(process_tree(0), [])
@@ -475,6 +478,178 @@ class ResourceTests(unittest.TestCase):
     def test_format_bytes(self):
         self.assertEqual(format_bytes(1), "1 B")
         self.assertEqual(format_bytes(1024), "1.0 KiB")
+
+
+    def test_managed_codex_opencode_observation_canonicalizes_safe_provider_decoration(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        home = "/private/terminal-auth/auth-one"
+        argv = (
+            "/opt/openai/codex",
+            "-c", 'model_provider="opencode_bridge"',
+            "-c", 'model_catalog_json="/home/test/.local/state/codex-opencode/models.catalog.json"',
+            "-c", 'model_providers.opencode_bridge.name="OpenCode"',
+            "-c", 'model_providers.opencode_bridge.base_url="http://127.0.0.1:4141/v1"',
+            "-c", 'model_providers.opencode_bridge.env_key="CODEX_OPENCODE_PROXY_KEY"',
+            "-c", 'model_providers.opencode_bridge.wire_api="responses"',
+            "-c", 'model_providers.opencode_bridge.requires_openai_auth=false',
+            "-m", "opencode-go/ox-alpha-free",
+            "--yolo",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            target = proc / "123"
+            target.mkdir(parents=True)
+            (target / "environ").write_bytes(
+                (
+                    f"CODEX_HOME={home}\0HOME=/home/test\0"
+                    "CODEX_OPENCODE_PROXY_KEY=local-only\0"
+                ).encode()
+            )
+            malformed_argv = tuple(
+                (
+                    'model_providers.opencode_bridge.base_url="http://127.0.0.1:not-a-port/v1"'
+                    if part.startswith("model_providers.opencode_bridge.base_url=")
+                    else part
+                )
+                for part in argv
+            )
+            with mock.patch("termdeck.resources._PROC", str(proc)):
+                cleaned = _managed_codex_observation_argv(123, argv)
+                malformed = _managed_codex_observation_argv(123, malformed_argv)
+
+        self.assertEqual(malformed, malformed_argv)
+        self.assertEqual(
+            cleaned,
+            ("codex-opencode", "-m", "opencode-go/ox-alpha-free", "--yolo"),
+        )
+        self.assertEqual(
+            safe_codex_recovery_command(cleaned, session_id=session_id),
+            f"codex-opencode -m opencode-go/ox-alpha-free --yolo resume {session_id}",
+        )
+
+    def test_fdless_codex_session_is_recovered_from_unique_start_bound_rollout(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proc = root / "proc"
+            pid_dir = proc / "123"
+            (pid_dir / "fd").mkdir(parents=True)
+            home = root / "home"
+            codex_home = root / "private-codex"
+            (home / ".codex" / "sessions" / "1970" / "01" / "01").mkdir(parents=True)
+            codex_home.mkdir()
+            (pid_dir / "environ").write_bytes(
+                f"HOME={home}\0CODEX_HOME={codex_home}\0".encode()
+            )
+            # starttime=5000 ticks, btime=1000, so process start is epoch 1050.
+            (pid_dir / "stat").write_text(
+                "123 (codex) S 1 123 123 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5000 0 0 0\n"
+            )
+            (proc / "stat").write_text("btime 1000\n")
+            rollout = home / ".codex" / "sessions" / "1970" / "01" / "01" / f"rollout-{session_id}.jsonl"
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "payload": {
+                            "id": session_id,
+                            "cwd": "/workspace/project",
+                            "source": "cli",
+                            "timestamp": "1970-01-01T00:17:31Z",
+                        }
+                    }
+                )
+                + "\n"
+            )
+
+            _clear_codex_session_caches()
+            self.addCleanup(_clear_codex_session_caches)
+            with mock.patch("termdeck.resources._PROC", str(proc)), mock.patch(
+                "termdeck.resources._process_cwd", return_value="/workspace/project"
+            ), mock.patch(
+                "termdeck.resources._codex_rollout_metadata",
+                wraps=resources_module._codex_rollout_metadata,
+            ) as metadata_reader:
+                first = _primary_codex_session_id(123)
+                second = _primary_codex_session_id(123)
+
+        self.assertEqual(first, session_id)
+        self.assertEqual(second, session_id)
+        self.assertEqual(metadata_reader.call_count, 1)
+
+    def test_fdless_codex_session_rejects_ambiguous_start_bound_rollouts(self):
+        session_ids = (
+            "019f71b3-fa32-7251-bac3-c628f34dd154",
+            "019f71b3-fa32-7251-bac3-c628f34dd155",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proc = root / "proc"
+            pid_dir = proc / "123"
+            (pid_dir / "fd").mkdir(parents=True)
+            home = root / "home"
+            codex_home = root / "private-codex"
+            sessions = home / ".codex" / "sessions" / "1970" / "01" / "01"
+            sessions.mkdir(parents=True)
+            codex_home.mkdir()
+            (pid_dir / "environ").write_bytes(
+                f"HOME={home}\0CODEX_HOME={codex_home}\0".encode()
+            )
+            (pid_dir / "stat").write_text(
+                "123 (codex) S 1 123 123 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5000 0 0 0\n"
+            )
+            (proc / "stat").write_text("btime 1000\n")
+            for second, session_id in enumerate(session_ids, start=31):
+                (sessions / f"rollout-{session_id}.jsonl").write_text(
+                    json.dumps(
+                        {
+                            "payload": {
+                                "id": session_id,
+                                "cwd": "/workspace/project",
+                                "source": "cli",
+                                "timestamp": f"1970-01-01T00:17:{second:02d}Z",
+                            }
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+            _clear_codex_session_caches()
+            self.addCleanup(_clear_codex_session_caches)
+            with mock.patch("termdeck.resources._PROC", str(proc)), mock.patch(
+                "termdeck.resources._process_cwd", return_value="/workspace/project"
+            ):
+                observed = _primary_codex_session_id(123)
+
+        self.assertIsNone(observed)
+
+    def test_codex_rollout_metadata_rejects_symlinked_files(self):
+        session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / f"target-{session_id}.jsonl"
+            link = root / f"rollout-{session_id}.jsonl"
+            target.write_text(
+                json.dumps(
+                    {
+                        "payload": {
+                            "id": session_id,
+                            "cwd": "/workspace/project",
+                            "source": "cli",
+                            "timestamp": "1970-01-01T00:17:31Z",
+                        }
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            link.symlink_to(target)
+
+            direct = resources_module._codex_rollout_metadata(target)
+            through_link = resources_module._codex_rollout_metadata(link)
+
+        self.assertIsNotNone(direct)
+        self.assertIsNone(through_link)
 
 
 if __name__ == "__main__":

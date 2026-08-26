@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
+import stat
+import threading
 import time
 import uuid
 from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import urlsplit
 
 from .models import ResourceSnapshot
 
@@ -20,6 +25,28 @@ _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 _CHILDREN_CACHE_TTL = 0.75
 _children_cache: tuple[float, dict[int, list[int]]] | None = None
 _children_file_supported: bool | None = None
+
+# Exact Codex recovery discovery is called from UI account switching.  Most
+# pane trees contain many wrappers and helper processes but only one Codex
+# process.  Cache the bounded rollout metadata by directory identity and the
+# final process result by kernel start identity so repeated selector polls stay
+# interactive without trusting a reused PID.
+_CODEX_SESSION_CACHE_TTL = 2.0
+_CODEX_ROLLOUT_DIRECTORY_CACHE_LIMIT = 32
+_codex_session_cache_lock = threading.Lock()
+_codex_session_cache: dict[tuple[str, int, int, str], tuple[float, str | None]] = {}
+_codex_rollout_directory_cache: dict[
+    str,
+    tuple[int, int, float, tuple[tuple[str, str | None, float | None], ...]],
+] = {}
+
+
+def _clear_codex_session_caches() -> None:
+    """Clear bounded recovery-discovery caches (primarily for deterministic tests)."""
+
+    with _codex_session_cache_lock:
+        _codex_session_cache.clear()
+        _codex_rollout_directory_cache.clear()
 
 # Automatic crash replay must stay narrower than ordinary user-entered shell
 # commands. These flags do not carry prompts, paths, config values, tokens, or
@@ -35,6 +62,18 @@ _CODEX_RESTART_FLAGS = frozenset(
         "--search",
         "--strict-config",
         "--yolo",
+    }
+)
+_OPEN_CODE_MODEL_RE = re.compile(r"^(?:opencode|opencode-go)/[A-Za-z0-9._:+-]+$")
+_OPEN_CODE_CONFIG_KEYS = frozenset(
+    {
+        "model_provider",
+        "model_catalog_json",
+        "model_providers.opencode_bridge.name",
+        "model_providers.opencode_bridge.base_url",
+        "model_providers.opencode_bridge.env_key",
+        "model_providers.opencode_bridge.wire_api",
+        "model_providers.opencode_bridge.requires_openai_auth",
     }
 )
 
@@ -64,44 +103,170 @@ def _process_argv(pid: int) -> tuple[str, ...] | None:
     )
 
 
+def _process_environment(pid: int) -> dict[str, str] | None:
+    """Read one bounded process environment without exposing secret values."""
+
+    try:
+        with open(f"{_PROC}/{pid}/environ", "rb") as handle:
+            raw = handle.read(1024 * 1024 + 1)
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+    if len(raw) > 1024 * 1024:
+        return None
+    environment: dict[str, str] = {}
+    for entry in raw.split(b"\0"):
+        if not entry or b"=" not in entry:
+            continue
+        key, value = entry.split(b"=", 1)
+        decoded_key = os.fsdecode(key)
+        if decoded_key and decoded_key not in environment:
+            environment[decoded_key] = os.fsdecode(value)
+    return environment
+
+
+def _unquote_config_value(value: str) -> str:
+    clean = str(value)
+    if len(clean) >= 2 and clean[0] == clean[-1] and clean[0] in {"'", '"'}:
+        return clean[1:-1]
+    return clean
+
+
+def _canonical_opencode_observation(
+    argv: tuple[str, ...],
+    environment: dict[str, str],
+) -> tuple[str, ...] | None:
+    """Recognize only the exact local codex-opencode provider decoration."""
+
+    if not argv or Path(argv[0]).name.casefold() != "codex":
+        return None
+    if not environment.get("CODEX_OPENCODE_PROXY_KEY"):
+        return None
+    home = environment.get("HOME", "")
+    if not home or not Path(home).is_absolute():
+        return None
+    state_home = environment.get("XDG_STATE_HOME") or str(Path(home) / ".local" / "state")
+    expected_catalog = os.path.normpath(
+        str(Path(state_home) / "codex-opencode" / "models.catalog.json")
+    )
+
+    configs: dict[str, str] = {}
+    model: str | None = None
+    launch_args: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = str(argv[index])
+        if token in {"-c", "--config"}:
+            if index + 1 >= len(argv):
+                return None
+            raw = str(argv[index + 1])
+            if "=" not in raw:
+                return None
+            key, value = raw.split("=", 1)
+            value = _unquote_config_value(value)
+            if key == "sqlite_home":
+                codex_home = environment.get("CODEX_HOME", "")
+                if not codex_home or os.path.normpath(value) != os.path.normpath(codex_home):
+                    return None
+            elif key in _OPEN_CODE_CONFIG_KEYS and key not in configs:
+                configs[key] = value
+            else:
+                return None
+            index += 2
+            continue
+        if token in {"-m", "--model"}:
+            if index + 1 >= len(argv) or model is not None:
+                return None
+            model = str(argv[index + 1])
+            index += 2
+            continue
+        if token.startswith("--model="):
+            if model is not None:
+                return None
+            model = token.partition("=")[2]
+            index += 1
+            continue
+        if token == "--sandbox":
+            if index + 1 >= len(argv) or argv[index + 1] != "workspace-write":
+                return None
+            launch_args.extend((token, "workspace-write"))
+            index += 2
+            continue
+        if token == "--dangerously-bypass-hook-trust":
+            index += 1
+            continue
+        if token in _CODEX_RESTART_FLAGS:
+            launch_args.append(token)
+            index += 1
+            continue
+        if token == "resume":
+            if index + 1 >= len(argv) or index + 2 != len(argv):
+                return None
+            session_id = _canonical_codex_session_id(argv[index + 1])
+            if session_id is None:
+                return None
+            launch_args.extend(("resume", session_id))
+            index += 2
+            continue
+        return None
+
+    if model is None or not _OPEN_CODE_MODEL_RE.fullmatch(model):
+        return None
+    if set(configs) != _OPEN_CODE_CONFIG_KEYS:
+        return None
+    if configs["model_provider"] != "opencode_bridge":
+        return None
+    if os.path.normpath(configs["model_catalog_json"]) != expected_catalog:
+        return None
+    if configs["model_providers.opencode_bridge.name"] != "OpenCode":
+        return None
+    if configs["model_providers.opencode_bridge.env_key"] != "CODEX_OPENCODE_PROXY_KEY":
+        return None
+    if configs["model_providers.opencode_bridge.wire_api"] != "responses":
+        return None
+    if configs["model_providers.opencode_bridge.requires_openai_auth"].casefold() != "false":
+        return None
+    try:
+        endpoint = urlsplit(configs["model_providers.opencode_bridge.base_url"])
+        endpoint_port = endpoint.port
+    except ValueError:
+        return None
+    if (
+        endpoint.scheme != "http"
+        or endpoint.hostname != "127.0.0.1"
+        or endpoint.username is not None
+        or endpoint.password is not None
+        or endpoint_port is None
+        or not 1 <= endpoint_port <= 65535
+        or endpoint.path.rstrip("/") != "/v1"
+        or endpoint.query
+        or endpoint.fragment
+    ):
+        return None
+    return ("codex-opencode", "-m", model, *launch_args)
+
+
 def _managed_codex_observation_argv(
     pid: int,
     argv: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """Remove only TermDeck's verified private-state launch decoration.
+    """Remove only verified TermDeck or codex-opencode launch decoration."""
 
-    The private wrapper prepends ``-c sqlite_home=...`` and unattended exact
-    recovery adds the hook-trust flag.  Neither belongs in durable user launch
-    metadata.  Arbitrary config values still fail closed: the override is
-    removed only when it points exactly at this process's absolute CODEX_HOME.
-    """
+    environment = _process_environment(pid)
+    if environment is None:
+        return argv
+    opencode = _canonical_opencode_observation(argv, environment)
+    if opencode is not None:
+        return opencode
 
     if len(argv) < 3 or argv[1] not in {"-c", "--config"}:
         return argv
-    try:
-        with open(f"{_PROC}/{pid}/environ", "rb") as handle:
-            raw_environment = handle.read(1024 * 1024 + 1)
-    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
-        return argv
-    if len(raw_environment) > 1024 * 1024:
-        return argv
-    codex_home = ""
-    for entry in raw_environment.split(b"\0"):
-        if entry.startswith(b"CODEX_HOME="):
-            codex_home = os.fsdecode(entry.split(b"=", 1)[1])
-            break
+    codex_home = environment.get("CODEX_HOME", "")
     if not codex_home or not Path(codex_home).is_absolute():
         return argv
     raw_value = argv[2]
     if not raw_value.startswith("sqlite_home="):
         return argv
-    configured = raw_value.split("=", 1)[1]
-    if (
-        len(configured) >= 2
-        and configured[0] == configured[-1]
-        and configured[0] in {"'", '"'}
-    ):
-        configured = configured[1:-1]
+    configured = _unquote_config_value(raw_value.split("=", 1)[1])
     if os.path.normpath(configured) != os.path.normpath(codex_home):
         return argv
     cleaned = [argv[0], *argv[3:]]
@@ -133,13 +298,138 @@ def _canonical_codex_session_id(value: object) -> str | None:
         return None
 
 
-def _primary_codex_session_id(pid: int) -> str | None:
-    """Find the primary Codex TUI session UUID held open by one process.
+def _codex_rollout_metadata(path: Path) -> tuple[str, str | None, float | None] | None:
+    """Read one bounded metadata record from an owner-only regular rollout."""
 
-    A Codex process can own rollout files for its primary conversation and for
-    several spawned subagents. The primary rollout metadata uses ``source``
-    ``"cli"``; subagent metadata uses a structured source object. Reading only
-    the bounded first JSONL record avoids inspecting prompts or transcript data.
+    descriptor = -1
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            return None
+        with os.fdopen(
+            descriptor,
+            "r",
+            encoding="utf-8",
+            errors="replace",
+            closefd=True,
+        ) as handle:
+            descriptor = -1
+            first_line = handle.readline(65537)
+        if not first_line or len(first_line) > 65536:
+            return None
+        record = json.loads(first_line)
+        payload = record.get("payload", {}) if isinstance(record, dict) else {}
+        if not isinstance(payload, dict) or payload.get("source") != "cli":
+            return None
+        session_id = _canonical_codex_session_id(payload.get("id"))
+        if session_id is None or not path.name.endswith(f"{session_id}.jsonl"):
+            return None
+        timestamp = payload.get("timestamp") or record.get("timestamp")
+        observed_at: float | None = None
+        if isinstance(timestamp, str) and timestamp.strip():
+            clean = timestamp.strip().replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(clean)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            observed_at = parsed.timestamp()
+        cwd = payload.get("cwd")
+        return session_id, str(cwd) if isinstance(cwd, str) else None, observed_at
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _process_start_epoch(pid: int) -> float | None:
+    stat = _parse_stat(pid)
+    if not stat:
+        return None
+    boot = _read_text(f"{_PROC}/stat")
+    if boot is None:
+        return None
+    boot_time: int | None = None
+    for line in boot.splitlines():
+        if line.startswith("btime "):
+            try:
+                boot_time = int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+            break
+    if boot_time is None:
+        return None
+    try:
+        return float(boot_time) + (int(stat["starttime"]) / float(_CLK_TCK))
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _cached_codex_rollout_metadata(
+    directory: Path,
+) -> tuple[tuple[str, str | None, float | None], ...]:
+    """Return one bounded, short-lived regular-directory rollout index."""
+
+    try:
+        directory_metadata = directory.lstat()
+    except OSError:
+        return ()
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or directory_metadata.st_uid != os.geteuid()
+    ):
+        return ()
+    key = str(directory)
+    now = time.monotonic()
+    with _codex_session_cache_lock:
+        cached = _codex_rollout_directory_cache.get(key)
+        if (
+            cached is not None
+            and cached[:2]
+            == (directory_metadata.st_mtime_ns, directory_metadata.st_ino)
+            and now - cached[2] <= _CODEX_SESSION_CACHE_TTL
+        ):
+            return cached[3]
+    try:
+        paths = sorted(directory.glob("*.jsonl"))
+    except OSError:
+        return ()
+    if len(paths) > 4096:
+        return ()
+    rows = tuple(
+        metadata
+        for path in paths
+        if (metadata := _codex_rollout_metadata(path)) is not None
+    )
+    with _codex_session_cache_lock:
+        if len(_codex_rollout_directory_cache) >= _CODEX_ROLLOUT_DIRECTORY_CACHE_LIMIT:
+            # Insertion order is deterministic on supported Python versions.
+            _codex_rollout_directory_cache.pop(next(iter(_codex_rollout_directory_cache)), None)
+        _codex_rollout_directory_cache[key] = (
+            directory_metadata.st_mtime_ns,
+            directory_metadata.st_ino,
+            now,
+            rows,
+        )
+    return rows
+
+
+def _primary_codex_session_id(pid: int) -> str | None:
+    """Find one process-bound primary Codex TUI session UUID.
+
+    Open rollout descriptors are authoritative. Some Codex builds close that
+    descriptor after startup, so a bounded fallback uses a directory metadata
+    index shared by every pane poll and requires a unique CLI rollout with the
+    same cwd and a creation timestamp within five minutes of the kernel process
+    start.  Final results are cached only by PID *and* kernel start identity.
     """
 
     proc_cwd = _process_cwd(pid)
@@ -147,44 +437,95 @@ def _primary_codex_session_id(pid: int) -> str | None:
     try:
         fd_names = os.listdir(f"{_PROC}/{pid}/fd")
     except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
-        return None
+        fd_names = []
 
     for fd_name in fd_names:
         try:
-            target = os.readlink(f"{_PROC}/{pid}/fd/{fd_name}")
+            target = Path(os.readlink(f"{_PROC}/{pid}/fd/{fd_name}"))
         except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
             continue
-        if "/sessions/" not in target or not target.endswith(".jsonl"):
+        if "/sessions/" not in str(target) or target.suffix != ".jsonl":
             continue
+        metadata = _codex_rollout_metadata(target)
+        if metadata is None:
+            continue
+        session_id, metadata_cwd, _created_at = metadata
+        rank = 0 if proc_cwd and metadata_cwd == proc_cwd else 1
         try:
-            with open(target, "r", encoding="utf-8", errors="replace") as handle:
-                first_line = handle.readline(65537)
-            if not first_line or len(first_line) > 65536:
-                continue
-            payload = json.loads(first_line).get("payload", {})
-            if not isinstance(payload, dict) or payload.get("source") != "cli":
-                continue
-            session_id = _canonical_codex_session_id(payload.get("id"))
-            if session_id is None:
-                continue
-            metadata_cwd = payload.get("cwd")
-            rank = 0 if proc_cwd and metadata_cwd == proc_cwd else 1
-            try:
-                modified_ns = os.stat(target).st_mtime_ns
-            except OSError:
-                modified_ns = 0
-            candidates.append((rank, -modified_ns, session_id))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            continue
+            modified_ns = target.stat().st_mtime_ns
+        except OSError:
+            modified_ns = 0
+        candidates.append((rank, -modified_ns, session_id))
 
-    if not candidates:
+    if candidates:
+        candidates.sort()
+        return candidates[0][2]
+
+    stat = _parse_stat(pid)
+    try:
+        start_ticks = int(stat["starttime"]) if stat else 0
+    except (KeyError, TypeError, ValueError):
+        start_ticks = 0
+    if start_ticks <= 0 or not proc_cwd:
         return None
-    candidates.sort()
-    best_rank = candidates[0][0]
-    best = [row for row in candidates if row[0] == best_rank]
-    # The newest primary rollout is deterministic if a process briefly retains
-    # more than one primary descriptor during a resume transition.
-    return best[0][2]
+    cache_key = (str(_PROC), int(pid), start_ticks, proc_cwd)
+    now = time.monotonic()
+    with _codex_session_cache_lock:
+        cached = _codex_session_cache.get(cache_key)
+        if cached is not None and now - cached[0] <= _CODEX_SESSION_CACHE_TTL:
+            return cached[1]
+
+    environment = _process_environment(pid)
+    started_at = _process_start_epoch(pid)
+    result: str | None = None
+    if environment is not None and started_at is not None:
+        roots: list[Path] = []
+        for raw_root in (
+            environment.get("CODEX_HOME"),
+            str(Path(environment.get("HOME", "")) / ".codex")
+            if environment.get("HOME")
+            else None,
+        ):
+            if not raw_root:
+                continue
+            root = Path(raw_root).expanduser()
+            if not root.is_absolute():
+                continue
+            sessions = root / "sessions"
+            try:
+                identity = sessions.resolve(strict=False)
+            except OSError:
+                identity = sessions
+            if identity not in roots:
+                roots.append(identity)
+
+        start_day = datetime.fromtimestamp(started_at, tz=timezone.utc)
+        disk_candidates: list[tuple[float, str]] = []
+        for root in roots:
+            for day_offset in (-1, 0, 1):
+                day = start_day + timedelta(days=day_offset)
+                directory = root / day.strftime("%Y") / day.strftime("%m") / day.strftime("%d")
+                for session_id, metadata_cwd, created_at in _cached_codex_rollout_metadata(directory):
+                    if metadata_cwd != proc_cwd or created_at is None:
+                        continue
+                    delta = abs(created_at - started_at)
+                    if delta <= 300.0:
+                        disk_candidates.append((delta, session_id))
+        if disk_candidates:
+            # Cwd and a five-minute start window are evidence, not identity.
+            # Multiple distinct conversations inside that boundary are
+            # underdetermined, so never guess by choosing the nearest timestamp.
+            candidates = {session_id for _delta, session_id in disk_candidates}
+            result = next(iter(candidates)) if len(candidates) == 1 else None
+
+    with _codex_session_cache_lock:
+        if len(_codex_session_cache) > 2048:
+            cutoff = now - _CODEX_SESSION_CACHE_TTL
+            for key, value in tuple(_codex_session_cache.items()):
+                if value[0] < cutoff:
+                    _codex_session_cache.pop(key, None)
+        _codex_session_cache[cache_key] = (now, result)
+    return result
 
 
 def safe_codex_recovery_command(
@@ -192,16 +533,24 @@ def safe_codex_recovery_command(
     *,
     session_id: str | None = None,
 ) -> str | None:
-    """Return a canonical restart-safe Codex command, or reject the argv.
+    """Return one canonical restart-safe Codex/codex-opencode command."""
 
-    Only value-free launch flags and one exact UUID are persisted. Positional
-    prompts, names, config overrides, paths, remote addresses, and unknown
-    options are rejected rather than replayed with changed or unsafe semantics.
-    """
-
-    if not argv or Path(str(argv[0])).name.casefold() != "codex":
+    if not argv:
+        return None
+    executable = Path(str(argv[0])).name.casefold()
+    if executable not in {"codex", "codex-opencode"}:
         return None
     args = [str(part) for part in argv[1:]]
+    command: list[str] = [executable]
+    if executable == "codex-opencode":
+        if len(args) < 2 or args[0] not in {"-m", "--model"}:
+            return None
+        model = args[1]
+        if not _OPEN_CODE_MODEL_RE.fullmatch(model):
+            return None
+        command.extend(("-m", model))
+        args = args[2:]
+
     resume_id: str | None = None
     if "resume" in args:
         resume_index = args.index("resume")
@@ -215,16 +564,28 @@ def safe_codex_recovery_command(
     else:
         launch_flags = args
 
-    if any(part not in _CODEX_RESTART_FLAGS for part in launch_flags):
-        return None
+    normalized_flags: list[str] = []
+    index = 0
+    while index < len(launch_flags):
+        flag = launch_flags[index]
+        if flag == "--sandbox":
+            if index + 1 >= len(launch_flags) or launch_flags[index + 1] != "workspace-write":
+                return None
+            normalized_flags.extend((flag, "workspace-write"))
+            index += 2
+            continue
+        if flag not in _CODEX_RESTART_FLAGS:
+            return None
+        normalized_flags.append(flag)
+        index += 1
 
     observed_id = _canonical_codex_session_id(session_id) if session_id else None
     if resume_id and observed_id and resume_id != observed_id:
         return None
     exact_id = resume_id or observed_id
-    command = ["codex", *launch_flags]
+    command.extend(normalized_flags)
     if exact_id:
-        command.extend(["resume", exact_id])
+        command.extend(("resume", exact_id))
     return shlex.join(command)
 
 
@@ -339,9 +700,15 @@ def observe_recovery_metadata(
         if argv is None:
             continue
         observed = True
-        session_id = _primary_codex_session_id(pid)
+        managed_argv = _managed_codex_observation_argv(pid, argv)
+        managed_name = Path(managed_argv[0]).name.casefold() if managed_argv else ""
+        session_id = (
+            _primary_codex_session_id(pid)
+            if managed_name in {"codex", "codex-opencode"}
+            else None
+        )
         command = safe_codex_recovery_command(
-            _managed_codex_observation_argv(pid, argv),
+            managed_argv,
             session_id=session_id,
         )
         if command is not None:

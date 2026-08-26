@@ -479,6 +479,20 @@ class AuthQuiesceResult:
     suspended_processes: tuple[tuple[int, int, bool], ...] = ()
     input_pane_id: str | None = None
     input_was_off: bool = False
+    gated_respawn: bool = False
+    recovered_payload: bool = False
+    current_pid: int | None = None
+    gate_path: str | None = None
+    replacement_record: SessionRecord | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    launch_spec: _LaunchSpec | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
     detail: str = ""
     lifetime_lease: _AuthLifetimeLease | None = field(
         default=None,
@@ -800,14 +814,21 @@ class TmuxBackend:
         identity = self._auth_process_identity(pane.pane_pid)
         if identity is None:
             return False
-        return self._private_auth_process_environment_ready(
-            record,
-            pane.pane_pid,
-            identity[1],
-        ) or self._private_managed_bash_environment_ready(
-            record,
-            pane.pane_pid,
-            identity[1],
+        return (
+            self._private_auth_process_environment_ready(
+                record,
+                pane.pane_pid,
+                identity[1],
+            )
+            or self._private_managed_bash_environment_ready(
+                record,
+                pane.pane_pid,
+                identity[1],
+            )
+            or self._private_auth_process_tree_environment_ready(
+                record,
+                pane.pane_pid,
+            )
         )
 
     @classmethod
@@ -831,6 +852,33 @@ class TmuxBackend:
                 record,
                 pid,
                 identity[1],
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _private_auth_process_tree_scope_ready(
+        cls,
+        record: SessionRecord,
+        root_pid: int,
+    ) -> bool:
+        """Verify the gated handoff shell inherited the exact private scope.
+
+        Before the owner-only gate opens, the placeholder is an absolute
+        ``/bin/bash --noprofile --norc`` process rather than the generated
+        private interactive shell or Codex writer.  It cannot consume the
+        credential yet, so the safe readiness contract is the exact
+        CODEX_HOME/scope/lifetime-gate tuple; private-bin precedence is checked
+        again on the resumed payload after the gate opens.
+        """
+
+        for pid in process_tree(root_pid):
+            identity = cls._auth_process_identity(pid)
+            if identity is not None and cls._private_auth_process_environment_ready(
+                record,
+                pid,
+                identity[1],
+                require_private_path=False,
             ):
                 return True
         return False
@@ -3508,7 +3556,7 @@ class TmuxBackend:
         if not live:
             return AuthActivationPlan(
                 True,
-                detail="terminal is stopped; the next Codex launch will use the selected account",
+                detail="selected account is active for this stopped terminal",
             )
 
         identity = self._inspect_auth_pane(record)
@@ -3542,32 +3590,40 @@ class TmuxBackend:
             pane_current_path=identity.current_path,
         )
 
-        try:
-            observed, recovery_command, recovery_cwd = observe_recovery_metadata(
-                identity.pane_pid
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            return AuthActivationPlan(
-                False,
-                **base,
-                detail=f"could not inspect Codex recovery state before the account change: {exc}",
-            )
-        if observed and recovery_command:
-            candidate = replace(
-                record,
-                recovery_command=recovery_command,
-                recovery_cwd=recovery_cwd,
-            )
-            exact_recovery = self._exact_codex_recovery(candidate)
-            if exact_recovery is not None:
-                return AuthActivationPlan(
-                    True,
-                    restart=True,
-                    recovery_command=exact_recovery,
-                    recovery_cwd=recovery_cwd,
-                    **base,
-                    detail="exact Codex recovery is ready for private-auth activation",
+        observed = False
+        recovery_command: str | None = None
+        recovery_cwd: str | None = None
+        inspection_error = ""
+        # Codex may rotate its rollout descriptor during a redraw or tool handoff.
+        # Retry the now-indexed lookup briefly instead of falling into a manual
+        # "next launch" path that contradicts seamless account switching.
+        for attempt in range(3):
+            try:
+                observed, recovery_command, recovery_cwd = observe_recovery_metadata(
+                    identity.pane_pid
                 )
+                inspection_error = ""
+            except (OSError, RuntimeError, ValueError) as exc:
+                observed, recovery_command, recovery_cwd = False, None, None
+                inspection_error = str(exc)
+            if observed and recovery_command:
+                candidate = replace(
+                    record,
+                    recovery_command=recovery_command,
+                    recovery_cwd=recovery_cwd,
+                )
+                exact_recovery = self._exact_codex_recovery(candidate)
+                if exact_recovery is not None:
+                    return AuthActivationPlan(
+                        True,
+                        restart=True,
+                        recovery_command=exact_recovery,
+                        recovery_cwd=recovery_cwd,
+                        **base,
+                        detail="exact Codex conversation is ready for seamless account handoff",
+                    )
+            if attempt < 2:
+                time.sleep(0.025 * (attempt + 1))
 
         codex_state = process_tree_contains_codex(identity.pane_pid)
         current_name = Path(identity.current_command).name.casefold().removeprefix("-")
@@ -3576,17 +3632,21 @@ class TmuxBackend:
             or current_name == "codex"
             or current_name.startswith("codex-")
         ):
+            suffix = f": {inspection_error}" if inspection_error else ""
             return AuthActivationPlan(
                 False,
                 **base,
-                detail="running Codex session could not be captured exactly; exit Codex once and relaunch it",
+                detail=(
+                    "running Codex conversation could not be bound to an exact seamless "
+                    f"resume identity; retry the account selection{suffix}"
+                ),
             )
 
         if environment_ready:
             return AuthActivationPlan(
                 True,
                 **base,
-                detail="no running Codex process; the next Codex launch will use the selected account",
+                detail="selected account is active; this private terminal is ready",
             )
         replacement_command = self._idle_shell_executable(identity.current_command)
         if replacement_command is None:
@@ -3960,12 +4020,182 @@ class TmuxBackend:
         if errors:
             raise TmuxError("; ".join(errors))
 
+    @classmethod
+    def _snapshot_auth_process_tree(
+        cls,
+        root_pid: int,
+    ) -> tuple[tuple[int, int, bool], ...]:
+        """Capture a stable process identity set without sending any signal."""
+
+        for _attempt in range(4):
+            before = process_tree(root_pid)
+            if not before or root_pid not in before:
+                raise TmuxError("live auth process tree disappeared before handoff")
+            rows: list[tuple[int, int, bool]] = []
+            complete = True
+            for pid in before:
+                identity = cls._auth_process_identity(pid)
+                if identity is None:
+                    complete = False
+                    break
+                state, start_time = identity
+                rows.append((pid, start_time, state in {"T", "t"}))
+            after = process_tree(root_pid)
+            if complete and before == after:
+                return tuple(rows)
+            time.sleep(0.01)
+        raise TmuxError("live auth process tree changed while preparing seamless handoff")
+
+    @staticmethod
+    def _auth_switch_gate_path(record: SessionRecord) -> Path:
+        raw_home = (getattr(record, "codex_home", None) or "").strip()
+        if not raw_home:
+            raise TmuxError("terminal has no private Codex auth home")
+        root = Path(raw_home).expanduser().resolve(strict=False) / ".termdeck-auth-switch-gates"
+        _ensure_auth_lifetime_root(root)
+        return root / (
+            f"gate-{os.getpid()}-{threading.get_ident()}-{time.monotonic_ns()}"
+        )
+
+    @staticmethod
+    def _open_auth_switch_gate(path: Path) -> None:
+        """Open one owner-only, no-follow, one-shot launch gate."""
+
+        try:
+            nofollow = getattr(os, "O_NOFOLLOW", None)
+            if nofollow is None:
+                raise TmuxError("this platform cannot open the Codex handoff gate safely")
+            fd = os.open(
+                path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | nofollow,
+                0o600,
+            )
+        except FileExistsError:
+            metadata = path.lstat()
+            if (
+                not stat_module.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat_module.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_nlink != 1
+            ):
+                raise TmuxError("Codex handoff gate already exists with unsafe metadata")
+            return
+        except TmuxError:
+            raise
+        except OSError as exc:
+            raise TmuxError(f"could not open the Codex handoff gate: {exc}") from exc
+        else:
+            os.close(fd)
+
+    @staticmethod
+    def _cleanup_auth_switch_gate(path: Path | None) -> None:
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _gated_auth_launch_command(spec: _LaunchSpec, gate_path: Path) -> str:
+        gate = shlex.quote(str(gate_path))
+        payload = shlex.quote(spec.command)
+        script = (
+            "set -eu\n"
+            f"while [ ! -e {gate} ]; do sleep 0.02; done\n"
+            f"rm -f -- {gate}\n"
+            f"exec /bin/bash --noprofile --norc -c {payload}"
+        )
+        return shlex.join(["/bin/bash", "--noprofile", "--norc", "-c", script])
+
+    @staticmethod
+    def _auth_replacement_record(
+        record: SessionRecord,
+        plan: AuthActivationPlan,
+    ) -> SessionRecord:
+        if plan.recovery_command is not None:
+            return replace(
+                record,
+                recovery_command=plan.recovery_command,
+                recovery_cwd=plan.recovery_cwd,
+                status="running",
+            )
+        if not plan.replacement_command or not plan.replacement_cwd:
+            raise TmuxError("account handoff plan has no replacement payload")
+        return replace(
+            record,
+            command=plan.replacement_command,
+            cwd=plan.replacement_cwd,
+            recovery_command=None,
+            recovery_cwd=None,
+            status="running",
+        )
+
+    def _respawn_auth_pane_gated(
+        self,
+        record: SessionRecord,
+        plan: AuthActivationPlan,
+        spec: _LaunchSpec,
+        gate_path: Path,
+    ) -> None:
+        if plan.pane_id is None:
+            raise TmuxError("account handoff lost the stable tmux pane id")
+        command = self._gated_auth_launch_command(spec, gate_path)
+        args = ["respawn-pane", "-k", "-t", plan.pane_id]
+        args.extend(self._environment_args(spec.environment))
+        args.extend(["-c", str(spec.directory), command])
+        result = self._run(args, check=False, timeout=15.0)
+        if result.returncode != 0:
+            raise TmuxError(result.stderr.strip() or "could not replace the pane in place")
+        self._run(
+            ["set-option", "-t", record.tmux_name, "remain-on-exit", "on"],
+            check=False,
+        )
+        self.invalidate_cache()
+
+    def _resume_gated_auth_handoff(
+        self,
+        record: SessionRecord,
+        plan: AuthActivationPlan,
+        *,
+        gate_path: Path,
+        input_was_off: bool,
+        timeout: float = 15.0,
+    ) -> tuple[_AuthPaneIdentity | None, str]:
+        self._open_auth_switch_gate(gate_path)
+        identity, detail = self._await_auth_recreation_ready(
+            record,
+            previous_session_created=plan.session_created,
+            previous_pane_id=plan.pane_id,
+            previous_pane_pid=plan.pane_pid,
+            previous_pane_start_time=plan.pane_start_time,
+            expected_recovery_command=plan.recovery_command,
+            expected_recovery_cwd=plan.recovery_cwd,
+            timeout=timeout,
+        )
+        if plan.pane_id is not None:
+            self._restore_auth_pane_input(plan.pane_id, input_was_off)
+        self._cleanup_auth_switch_gate(gate_path)
+        return identity, detail
+
     def quiesce_auth_change(
         self,
         record: SessionRecord,
         plan: AuthActivationPlan,
     ) -> AuthQuiesceResult:
-        """Stop the bound old writer before any private auth pointer changes."""
+        """Prepare an atomic account handoff without pausing or deleting the tab.
+
+        Restartable Codex sessions are replaced *in the same tmux pane* by a
+        private-environment launcher blocked on an owner-only gate.  The old
+        process tree is gone before the canonical auth pointer changes; opening
+        the gate after that change resumes the exact conversation.  Idle private
+        shells need only a short input fence because no Codex process consumes
+        auth while the pointer changes.
+        """
 
         token = self._auth_plan_token(plan)
         if not plan.ok:
@@ -3993,15 +4223,6 @@ class TmuxBackend:
                 )
             try:
                 lifetime_lease = _acquire_auth_lifetime_lease(record)
-                # A TermDeck start that won the tmux-name race but is waiting
-                # for this lease is visible here and invalidates the receipt.
-                if self._auth_session_exists(record):
-                    lifetime_lease.release()
-                    return AuthQuiesceResult(
-                        False,
-                        plan_token=token,
-                        detail="terminal started while its auth scope was being leased; no credential was changed",
-                    )
             except (OSError, TmuxError) as exc:
                 return AuthQuiesceResult(
                     False,
@@ -4011,7 +4232,7 @@ class TmuxBackend:
             return AuthQuiesceResult(
                 True,
                 plan_token=token,
-                detail=plan.detail,
+                detail="selected account is active for this terminal",
                 lifetime_lease=lifetime_lease,
             )
 
@@ -4021,302 +4242,14 @@ class TmuxBackend:
                 False,
                 live=True,
                 plan_token=token,
-                detail="live tmux pane changed after auth preflight; no process was stopped",
+                detail="live tmux pane changed after auth preflight; no process was changed",
             )
-
-        if plan.restart:
-            if plan.recovery_command is not None:
-                try:
-                    observed, recovery_command, recovery_cwd = observe_recovery_metadata(
-                        plan.pane_pid or 0
-                    )
-                except (OSError, RuntimeError, ValueError):
-                    observed, recovery_command, recovery_cwd = False, None, None
-                if (
-                    not observed
-                    or recovery_command != plan.recovery_command
-                    or recovery_cwd != plan.recovery_cwd
-                ):
-                    return AuthQuiesceResult(
-                        False,
-                        live=True,
-                        plan_token=token,
-                        detail=(
-                            "exact Codex recovery identity changed after auth preflight; "
-                            "no process was stopped"
-                        ),
-                    )
-            elif plan.pane_pid is None or not self._process_tree_is_idle_shell(plan.pane_pid):
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    plan_token=token,
-                    detail=(
-                        "legacy shell started a foreground or background job after auth preflight; "
-                        "no process was stopped"
-                    ),
-                )
-            assert plan.pane_pid is not None
-            assert plan.pane_id is not None
-            try:
-                input_was_off = self._disable_auth_pane_input(plan.pane_id)
-            except (OSError, TmuxError) as exc:
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    plan_token=token,
-                    detail=f"could not block terminal input before account switching: {exc}",
-                )
-            try:
-                suspended = self._suspend_auth_process_tree(
-                    plan.pane_pid,
-                    allow_running_root=True,
-                )
-            except _AuthProcessesMayRemainStopped as exc:
-                try:
-                    self._restore_auth_pane_input(plan.pane_id, input_was_off)
-                except (OSError, TmuxError) as input_exc:
-                    return AuthQuiesceResult(
-                        False,
-                        live=True,
-                        suspended=True,
-                        plan_token=token,
-                        suspended_processes=exc.processes,
-                        input_pane_id=plan.pane_id,
-                        input_was_off=input_was_off,
-                        detail=(
-                            f"could not safely quiesce the old terminal: {exc}; "
-                            f"terminal input could not be restored: {input_exc}"
-                        ),
-                    )
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    suspended=True,
-                    plan_token=token,
-                    suspended_processes=exc.processes,
-                    detail=f"could not safely quiesce the old terminal: {exc}",
-                )
-            except (OSError, TmuxError) as exc:
-                try:
-                    self._restore_auth_pane_input(plan.pane_id, input_was_off)
-                except (OSError, TmuxError) as input_exc:
-                    return AuthQuiesceResult(
-                        False,
-                        live=True,
-                        suspended=True,
-                        plan_token=token,
-                        input_pane_id=plan.pane_id,
-                        input_was_off=input_was_off,
-                        detail=(
-                            f"could not pause the old terminal before account switching: {exc}; "
-                            f"terminal input could not be restored: {input_exc}"
-                        ),
-                    )
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    plan_token=token,
-                    detail=f"could not pause the old terminal before account switching: {exc}",
-                )
-            if plan.recovery_command is None and (
-                len(suspended) != 1 or suspended[0][0] != plan.pane_pid
-            ):
-                try:
-                    self._restore_quiesced_auth_pane(
-                        plan.pane_id,
-                        input_was_off,
-                        suspended,
-                    )
-                except (OSError, TmuxError) as exc:
-                    return AuthQuiesceResult(
-                        False,
-                        live=True,
-                        suspended=True,
-                        plan_token=token,
-                        suspended_processes=suspended,
-                        input_pane_id=plan.pane_id,
-                        input_was_off=input_was_off,
-                        detail=(
-                            "legacy shell started a job while being quiesced and "
-                            f"could not be fully resumed: {exc}"
-                        ),
-                    )
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    plan_token=token,
-                    detail=(
-                        "legacy shell started a foreground or background job while "
-                        "being quiesced; no credential was changed"
-                    ),
-                )
-            try:
-                still_bound = self._identity_matches_plan(
-                    self._inspect_auth_pane(record),
-                    plan,
-                )
-            except (OSError, TmuxError):
-                still_bound = False
-            if not still_bound:
-                try:
-                    self._restore_quiesced_auth_pane(
-                        plan.pane_id,
-                        input_was_off,
-                        suspended,
-                    )
-                except (OSError, TmuxError) as exc:
-                    return AuthQuiesceResult(
-                        False,
-                        live=True,
-                        suspended=True,
-                        plan_token=token,
-                        suspended_processes=suspended,
-                        input_pane_id=plan.pane_id,
-                        input_was_off=input_was_off,
-                        detail=(
-                            "live tmux pane changed while being paused and could not "
-                            f"be fully resumed: {exc}"
-                        ),
-                    )
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    plan_token=token,
-                    detail="live tmux pane changed while being paused; no credential was changed",
-                )
-            recovery_still_bound = True
-            if plan.recovery_command is not None:
-                try:
-                    observed, recovery_command, recovery_cwd = observe_recovery_metadata(
-                        plan.pane_pid
-                    )
-                except (OSError, RuntimeError, ValueError):
-                    observed, recovery_command, recovery_cwd = False, None, None
-                recovery_still_bound = bool(
-                    observed
-                    and recovery_command == plan.recovery_command
-                    and recovery_cwd == plan.recovery_cwd
-                )
-            else:
-                recovery_still_bound = self._process_tree_is_idle_shell(plan.pane_pid)
-            if not recovery_still_bound:
-                try:
-                    self._restore_quiesced_auth_pane(
-                        plan.pane_id,
-                        input_was_off,
-                        suspended,
-                    )
-                except (OSError, TmuxError) as exc:
-                    return AuthQuiesceResult(
-                        False,
-                        live=True,
-                        suspended=True,
-                        plan_token=token,
-                        suspended_processes=suspended,
-                        input_pane_id=plan.pane_id,
-                        input_was_off=input_was_off,
-                        detail=(
-                            "terminal recovery identity changed while input was blocked "
-                            f"and the pane could not be fully restored: {exc}"
-                        ),
-                    )
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    plan_token=token,
-                    detail=(
-                        "terminal recovery identity changed while input was blocked; "
-                        "no credential was changed"
-                    ),
-                )
-            try:
-                self._terminate_auth_session(record)
-            except (OSError, TmuxError) as exc:
-                try:
-                    terminated = not self.session_exists(record)
-                except (OSError, TmuxError):
-                    terminated = False
-                if not terminated:
-                    try:
-                        self._restore_quiesced_auth_pane(
-                            plan.pane_id,
-                            input_was_off,
-                            suspended,
-                        )
-                    except (OSError, TmuxError) as resume_exc:
-                        return AuthQuiesceResult(
-                            False,
-                            live=True,
-                            suspended=True,
-                            plan_token=token,
-                            suspended_processes=suspended,
-                            input_pane_id=plan.pane_id,
-                            input_was_off=input_was_off,
-                            detail=(
-                                "old terminal could not be removed or fully resumed: "
-                                f"{exc}; {resume_exc}"
-                            ),
-                        )
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    terminated=terminated,
-                    suspended=terminated,
-                    plan_token=token,
-                    suspended_processes=suspended if terminated else (),
-                    detail=f"could not quiesce the old terminal before changing accounts: {exc}",
-                )
-            try:
-                self._kill_quiesced_auth_processes(suspended)
-            except (OSError, TmuxError) as exc:
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    terminated=True,
-                    suspended=True,
-                    plan_token=token,
-                    suspended_processes=suspended,
-                    detail=(
-                        "old terminal was removed but its auth process did not exit; "
-                        f"credential pointer was not changed: {exc}"
-                    ),
-                )
-            try:
-                lifetime_lease = _acquire_auth_lifetime_lease(record)
-            except (OSError, TmuxError) as exc:
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    terminated=True,
-                    plan_token=token,
-                    detail=(
-                        "old terminal stopped, but another process still owns its auth scope; "
-                        f"credential pointer was not changed: {exc}"
-                    ),
-                )
-            return AuthQuiesceResult(
-                True,
-                live=True,
-                terminated=True,
-                plan_token=token,
-                detail="old terminal stopped before the private account pointer changed",
-                lifetime_lease=lifetime_lease,
-            )
-
-        if plan.pane_pid is None or process_tree_contains_codex(plan.pane_pid) is not False:
+        if plan.pane_id is None or plan.pane_pid is None:
             return AuthQuiesceResult(
                 False,
                 live=True,
                 plan_token=token,
-                detail="live process tree changed after auth preflight; no process was stopped",
-            )
-        if plan.pane_id is None:
-            return AuthQuiesceResult(
-                False,
-                live=True,
-                plan_token=token,
-                detail="live tmux pane lost its stable pane id before account switching",
+                detail="live terminal lost its stable pane identity",
             )
         try:
             input_was_off = self._disable_auth_pane_input(plan.pane_id)
@@ -4325,199 +4258,144 @@ class TmuxBackend:
                 False,
                 live=True,
                 plan_token=token,
-                detail=f"could not block terminal input before account switching: {exc}",
+                detail=f"could not fence terminal input for account switching: {exc}",
             )
-        try:
-            suspended = self._suspend_auth_process_tree(
-                plan.pane_pid,
-                allow_running_root=True,
-            )
-        except _AuthProcessesMayRemainStopped as exc:
+
+        if not plan.restart:
             try:
-                self._restore_auth_pane_input(plan.pane_id, input_was_off)
-            except (OSError, TmuxError) as input_exc:
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    suspended=True,
-                    plan_token=token,
-                    suspended_processes=exc.processes,
-                    input_pane_id=plan.pane_id,
-                    input_was_off=input_was_off,
-                    detail=(
-                        f"could not safely restore the live terminal after quiescence failed: {exc}; "
-                        f"terminal input could not be restored: {input_exc}"
-                    ),
-                )
+                if not self._identity_matches_plan(self._inspect_auth_pane(record), plan):
+                    raise TmuxError("live tmux pane changed while input was fenced")
+                if process_tree_contains_codex(plan.pane_pid) is not False:
+                    raise TmuxError("a Codex process appeared during account handoff")
+                if not self._private_auth_process_tree_environment_ready(record, plan.pane_pid):
+                    raise TmuxError("terminal no longer has its private auth environment")
+            except (OSError, TmuxError) as exc:
+                try:
+                    self._restore_auth_pane_input(plan.pane_id, input_was_off)
+                except (OSError, TmuxError) as restore_exc:
+                    return AuthQuiesceResult(
+                        False,
+                        live=True,
+                        plan_token=token,
+                        input_pane_id=plan.pane_id,
+                        input_was_off=input_was_off,
+                        detail=f"{exc}; terminal input could not be restored: {restore_exc}",
+                    )
+                return AuthQuiesceResult(False, live=True, plan_token=token, detail=str(exc))
             return AuthQuiesceResult(
-                False,
-                live=True,
-                suspended=True,
-                plan_token=token,
-                suspended_processes=exc.processes,
-                detail=f"could not safely restore the live terminal after quiescence failed: {exc}",
-            )
-        except (OSError, TmuxError) as exc:
-            try:
-                self._restore_auth_pane_input(plan.pane_id, input_was_off)
-            except (OSError, TmuxError) as input_exc:
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    suspended=True,
-                    plan_token=token,
-                    input_pane_id=plan.pane_id,
-                    input_was_off=input_was_off,
-                    detail=(
-                        f"could not pause the live terminal for account switching: {exc}; "
-                        f"terminal input could not be restored: {input_exc}"
-                    ),
-                )
-            return AuthQuiesceResult(
-                False,
+                True,
                 live=True,
                 plan_token=token,
-                detail=f"could not pause the live terminal for account switching: {exc}",
+                input_pane_id=plan.pane_id,
+                input_was_off=input_was_off,
+                detail="selected account is active; terminal remains ready",
             )
+
+        gate_path: Path | None = None
+        replacement_record: SessionRecord | None = None
+        launch_spec: _LaunchSpec | None = None
+        old_processes: tuple[tuple[int, int, bool], ...] = ()
+        respawned = False
         try:
-            identity_matches = self._identity_matches_plan(
-                self._inspect_auth_pane(record),
+            if plan.recovery_command is not None:
+                observed, recovery_command, recovery_cwd = observe_recovery_metadata(
+                    plan.pane_pid
+                )
+                if (
+                    not observed
+                    or recovery_command != plan.recovery_command
+                    or recovery_cwd != plan.recovery_cwd
+                ):
+                    raise TmuxError("exact Codex recovery identity changed after preflight")
+            elif not self._process_tree_is_idle_shell(plan.pane_pid):
+                raise TmuxError("idle shell started a job after account preflight")
+
+            old_processes = self._snapshot_auth_process_tree(plan.pane_pid)
+            replacement_record = self._auth_replacement_record(record, plan)
+            launch_spec = self._launch_spec(replacement_record)
+            gate_path = self._auth_switch_gate_path(record)
+            self._respawn_auth_pane_gated(
+                replacement_record,
                 plan,
+                launch_spec,
+                gate_path,
             )
-            inspection_error = ""
-        except (OSError, TmuxError) as exc:
-            identity_matches = False
-            inspection_error = f": {exc}"
-        if not identity_matches:
-            try:
-                self._restore_quiesced_auth_pane(
-                    plan.pane_id,
-                    input_was_off,
-                    suspended,
-                )
-            except (OSError, TmuxError) as exc:
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    suspended=True,
-                    plan_token=token,
-                    suspended_processes=suspended,
-                    input_pane_id=plan.pane_id,
-                    input_was_off=input_was_off,
-                    detail=(
-                        "live tmux pane changed while it was being quiesced and "
-                        f"could not be fully resumed: {exc}"
-                    ),
-                )
-            return AuthQuiesceResult(
-                False,
-                live=True,
-                plan_token=token,
-                detail=f"live tmux pane changed while it was being quiesced{inspection_error}",
+            respawned = True
+            placeholder, detail = self._await_auth_recreation_ready(
+                replacement_record,
+                previous_session_created=plan.session_created,
+                previous_pane_id=plan.pane_id,
+                previous_pane_pid=plan.pane_pid,
+                previous_pane_start_time=plan.pane_start_time,
+                expected_recovery_command=None,
+                expected_recovery_cwd=None,
+                timeout=4.0,
             )
-        # The tree is now stable and stopped. Reject a Codex child that raced
-        # the preflight, then join the launcher lease so no out-of-tree owner
-        # can write while the pointer is replaced.
-        if plan.pane_pid is None or process_tree_contains_codex(plan.pane_pid) is not False:
-            try:
-                self._restore_quiesced_auth_pane(
-                    plan.pane_id,
-                    input_was_off,
-                    suspended,
-                )
-            except (OSError, TmuxError) as exc:
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    suspended=True,
-                    plan_token=token,
-                    suspended_processes=suspended,
-                    input_pane_id=plan.pane_id,
-                    input_was_off=input_was_off,
-                    detail=f"a Codex process appeared during quiescence and the terminal could not be fully resumed: {exc}",
-                )
-            return AuthQuiesceResult(
-                False,
-                live=True,
-                plan_token=token,
-                detail="a Codex process appeared while the terminal was being paused; no credential was changed",
-            )
-        try:
+            if placeholder is None or detail:
+                raise TmuxError(detail or "in-place auth handoff launcher was not ready")
+            self._kill_quiesced_auth_processes(old_processes)
             lifetime_lease = _acquire_auth_lifetime_lease(record)
         except (OSError, TmuxError) as exc:
+            recovery_error = ""
+            recovered_identity: _AuthPaneIdentity | None = None
+            recovered_payload = False
+            if respawned and gate_path is not None and replacement_record is not None:
+                try:
+                    self._open_auth_switch_gate(gate_path)
+                    recovered_identity, recovery_detail = self._await_auth_recreation_ready(
+                        replacement_record,
+                        previous_session_created=plan.session_created,
+                        previous_pane_id=plan.pane_id,
+                        previous_pane_pid=plan.pane_pid,
+                        previous_pane_start_time=plan.pane_start_time,
+                        expected_recovery_command=plan.recovery_command,
+                        expected_recovery_cwd=plan.recovery_cwd,
+                        timeout=8.0,
+                    )
+                    if recovered_identity is None or recovery_detail:
+                        recovery_error = (
+                            "; old account handoff recovery failed: "
+                            + (recovery_detail or "exact previous payload was not ready")
+                        )
+                    else:
+                        recovered_payload = True
+                except (OSError, TmuxError) as recover_exc:
+                    recovery_error = f"; old account handoff recovery failed: {recover_exc}"
             try:
-                self._restore_quiesced_auth_pane(
-                    plan.pane_id,
-                    input_was_off,
-                    suspended,
-                )
-            except (OSError, TmuxError) as resume_exc:
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    suspended=True,
-                    plan_token=token,
-                    suspended_processes=suspended,
-                    input_pane_id=plan.pane_id,
-                    input_was_off=input_was_off,
-                    detail=(
-                        "another process owns the auth scope and the terminal could not be fully resumed: "
-                        f"{exc}; {resume_exc}"
-                    ),
-                )
+                self._restore_auth_pane_input(plan.pane_id, input_was_off)
+            except (OSError, TmuxError) as input_exc:
+                recovered_payload = False
+                recovery_error += f"; terminal input could not be restored: {input_exc}"
+            self._cleanup_auth_switch_gate(gate_path)
             return AuthQuiesceResult(
                 False,
                 live=True,
                 plan_token=token,
-                detail=f"another process owns the auth scope; no credential was changed: {exc}",
-            )
-        try:
-            lease_still_bound = self._identity_matches_plan(
-                self._inspect_auth_pane(record),
-                plan,
-            ) and process_tree_contains_codex(plan.pane_pid) is False
-        except (OSError, TmuxError):
-            lease_still_bound = False
-        if not lease_still_bound:
-            lifetime_lease.release()
-            try:
-                self._restore_quiesced_auth_pane(
-                    plan.pane_id,
-                    input_was_off,
-                    suspended,
-                )
-            except (OSError, TmuxError) as exc:
-                return AuthQuiesceResult(
-                    False,
-                    live=True,
-                    suspended=True,
-                    plan_token=token,
-                    suspended_processes=suspended,
-                    input_pane_id=plan.pane_id,
-                    input_was_off=input_was_off,
-                    detail=(
-                        "live terminal changed while its auth scope was leased and "
-                        f"could not be fully restored: {exc}"
-                    ),
-                )
-            return AuthQuiesceResult(
-                False,
-                live=True,
-                plan_token=token,
-                detail=(
-                    "live terminal changed while its auth scope was leased; "
-                    "no credential was changed"
+                input_pane_id=plan.pane_id,
+                input_was_off=input_was_off,
+                gated_respawn=respawned,
+                recovered_payload=recovered_payload,
+                current_pid=(
+                    recovered_identity.pane_pid
+                    if recovered_payload and recovered_identity is not None
+                    else None
                 ),
+                detail=f"seamless account handoff could not be prepared: {exc}{recovery_error}",
             )
+
         return AuthQuiesceResult(
             True,
             live=True,
-            suspended=True,
             plan_token=token,
-            suspended_processes=suspended,
+            suspended_processes=old_processes,
             input_pane_id=plan.pane_id,
             input_was_off=input_was_off,
-            detail="live terminal paused before the private account pointer changed",
+            gated_respawn=True,
+            current_pid=placeholder.pane_pid,
+            gate_path=str(gate_path),
+            replacement_record=replacement_record,
+            launch_spec=launch_spec,
+            detail="exact Codex session is ready for in-place account handoff",
             lifetime_lease=lifetime_lease,
         )
 
@@ -4527,6 +4405,28 @@ class TmuxBackend:
         quiescence: AuthQuiesceResult,
         detail: str,
     ) -> AuthActivationResult:
+        if quiescence.gated_respawn:
+            return AuthActivationResult(
+                False,
+                False,
+                recovery_command=plan.recovery_command,
+                recovery_cwd=plan.recovery_cwd,
+                pid=(
+                    quiescence.current_pid
+                    if quiescence.recovered_payload
+                    else None
+                ),
+                status=(
+                    "running"
+                    if quiescence.recovered_payload
+                    else "recovery-pending"
+                ),
+                detail=detail,
+                preserve_selected_account=True,
+                command=plan.replacement_command,
+                cwd=plan.replacement_cwd,
+                clear_recovery=plan.recovery_command is None,
+            )
         if quiescence.terminated:
             return AuthActivationResult(
                 False,
@@ -4552,6 +4452,8 @@ class TmuxBackend:
         return AuthActivationResult(
             False,
             False,
+            pid=plan.pane_pid if plan.live else None,
+            status="running" if plan.live else None,
             detail=detail,
             preserve_selected_account=True,
         )
@@ -4658,14 +4560,20 @@ class TmuxBackend:
                     )
                     or (
                         expected_recovery_command is None
-                        and self._private_managed_bash_environment_ready(
-                            record,
-                            identity.pane_pid,
-                            process_identity[1],
+                        and (
+                            self._private_auth_process_tree_scope_ready(
+                                record,
+                                identity.pane_pid,
+                            )
+                            or self._private_managed_bash_environment_ready(
+                                record,
+                                identity.pane_pid,
+                                process_identity[1],
+                            )
                         )
                     )
                 ):
-                    last_detail = "fresh pane process did not inherit the private auth environment"
+                    last_detail = "private auth handoff launcher did not become ready"
                 elif expected_recovery_command is None:
                     return identity, ""
                 else:
@@ -4706,7 +4614,7 @@ class TmuxBackend:
         plan: AuthActivationPlan,
         quiescence: AuthQuiesceResult,
     ) -> AuthActivationResult:
-        """Recreate or resume a terminal after its auth pointer was switched."""
+        """Activate the selected account while preserving tmux pane identity."""
 
         if not plan.ok or not quiescence.ok or quiescence.plan_token != self._auth_plan_token(plan):
             return AuthActivationResult(
@@ -4714,7 +4622,8 @@ class TmuxBackend:
                 False,
                 detail="auth activation requires a matching successful quiescence receipt",
             )
-        if (
+        lease_required = not plan.live or plan.restart
+        if lease_required and (
             not quiescence.lifetime_lease_ready
             or quiescence.lifetime_lease is None
             or not quiescence.lifetime_lease.matches(
@@ -4731,8 +4640,9 @@ class TmuxBackend:
             return self._blocked_auth_activation(
                 plan,
                 quiescence,
-                "terminal auth scope changed after quiescence; terminal remains stopped",
+                "terminal auth scope changed after quiescence",
             )
+
         if not plan.live:
             try:
                 live = self._auth_session_exists(record)
@@ -4746,209 +4656,247 @@ class TmuxBackend:
                 return self._blocked_auth_activation(
                     plan,
                     quiescence,
-                    "terminal started during the account transaction; selected account was retained",
+                    "terminal started during the account transaction",
                 )
             quiescence.release_lifetime_lease()
-            return AuthActivationResult(True, False, status="stopped", detail=plan.detail)
+            return AuthActivationResult(
+                True,
+                False,
+                status="stopped",
+                detail="selected account is active for this terminal",
+                preserve_selected_account=True,
+            )
 
-        if not plan.restart:
-            if not quiescence.suspended or quiescence.terminated:
-                return self._blocked_auth_activation(
-                    plan,
-                    quiescence,
-                    "live terminal was not safely suspended for account activation",
-                )
-            if not self._identity_matches_plan(self._inspect_auth_pane(record), plan):
-                return self._blocked_auth_activation(
-                    plan,
-                    quiescence,
-                    "live tmux pane changed while the account pointer was switched",
-                )
+        if quiescence.gated_respawn:
+            replacement = quiescence.replacement_record
+            gate_path = Path(quiescence.gate_path) if quiescence.gate_path else None
             if (
-                plan.pane_pid is None
-                or plan.pane_start_time is None
-                or not self._private_auth_process_environment_ready(
-                    record,
-                    plan.pane_pid,
-                    plan.pane_start_time,
-                )
+                replacement is None
+                or quiescence.launch_spec is None
+                or gate_path is None
+                or quiescence.input_pane_id != plan.pane_id
+                or plan.pane_id is None
             ):
                 return self._blocked_auth_activation(
                     plan,
                     quiescence,
-                    "paused terminal no longer verifies its private Codex auth environment",
+                    "in-place Codex handoff receipt is incomplete",
                 )
-            quiescence.release_lifetime_lease()
+            identity: _AuthPaneIdentity | None = None
+            readiness_error = ""
             try:
-                if quiescence.input_pane_id is None:
-                    raise TmuxError("auth quiescence lost the terminal input receipt")
-                self._restore_quiesced_auth_pane(
-                    quiescence.input_pane_id,
-                    quiescence.input_was_off,
-                    quiescence.suspended_processes,
+                # Open while still holding the old writer's lifetime lease. The
+                # private launcher blocks on that same lease until this method
+                # releases it, closing the pointer-change/launch race.
+                self._open_auth_switch_gate(gate_path)
+                quiescence.release_lifetime_lease()
+                identity, readiness_error = self._await_auth_recreation_ready(
+                    replacement,
+                    previous_session_created=plan.session_created,
+                    previous_pane_id=plan.pane_id,
+                    previous_pane_pid=plan.pane_pid,
+                    previous_pane_start_time=plan.pane_start_time,
+                    expected_recovery_command=plan.recovery_command,
+                    expected_recovery_cwd=plan.recovery_cwd,
+                    timeout=15.0,
                 )
             except (OSError, TmuxError) as exc:
-                return self._blocked_auth_activation(
-                    plan,
-                    quiescence,
-                    f"could not resume the terminal after account switching: {exc}",
-                )
-            root_was_stopped = next(
-                (
-                    was_stopped
-                    for pid, _start_time, was_stopped in quiescence.suspended_processes
-                    if pid == plan.pane_pid
-                ),
-                False,
-            )
-            return AuthActivationResult(
-                True,
-                False,
-                pid=plan.pane_pid,
-                status="paused" if root_was_stopped else "running",
-                detail=plan.detail,
-                preserve_selected_account=True,
-            )
-
-        if not quiescence.terminated or quiescence.suspended:
-            return self._blocked_auth_activation(
-                plan,
-                quiescence,
-                "restartable terminal was not stopped before account activation",
-            )
-        if plan.recovery_command is not None:
-            resumed = replace(
-                record,
-                recovery_command=plan.recovery_command,
-                recovery_cwd=plan.recovery_cwd,
-                status="running",
-            )
-            failure_status = "recovery-pending"
-            failure_detail = "could not resume Codex after the account change"
-        else:
-            if not plan.replacement_command or not plan.replacement_cwd:
-                return self._blocked_auth_activation(
-                    plan,
-                    quiescence,
-                    "legacy terminal migration plan is incomplete",
-                )
-            resumed = replace(
-                record,
-                command=plan.replacement_command,
-                cwd=plan.replacement_cwd,
-                recovery_command=None,
-                recovery_cwd=None,
-                status="running",
-            )
-            failure_status = "stopped"
-            failure_detail = "could not recreate the idle shell after the account change"
-
-        created_identity: _AuthPaneIdentity | None = None
-        try:
-            # Keep the old scope lease through configuration migration and
-            # tmux session creation. Release it only once the new launcher is
-            # present and ready to take over the exact same lock path.
-            self._create_or_resume_unlocked(
-                resumed,
-                require_absent=True,
-                lifetime_lease=quiescence.lifetime_lease,
-            )
-            quiescence.release_lifetime_lease()
-            created_identity, readiness_error = self._await_auth_recreation_ready(
-                resumed,
-                previous_session_created=plan.session_created,
-                previous_pane_id=plan.pane_id,
-                previous_pane_pid=plan.pane_pid,
-                previous_pane_start_time=plan.pane_start_time,
-                expected_recovery_command=plan.recovery_command,
-                expected_recovery_cwd=plan.recovery_cwd,
-            )
-            if created_identity is None or readiness_error:
-                cleaned, cleanup_error = self._cleanup_failed_auth_recreation(
-                    resumed,
-                    created_identity,
-                )
-                status = failure_status if cleaned else "recovery-pending"
-                detail = readiness_error or "recreated terminal was not ready"
-                if cleanup_error:
-                    detail = f"{detail}; {cleanup_error}"
+                readiness_error = str(exc)
+            input_error = ""
+            try:
+                self._restore_auth_pane_input(plan.pane_id, quiescence.input_was_off)
+            except (OSError, TmuxError) as exc:
+                input_error = str(exc)
+            self._cleanup_auth_switch_gate(gate_path)
+            if identity is None or readiness_error or input_error:
+                detail = readiness_error or "resumed Codex process was not ready"
+                if input_error:
+                    detail = f"{detail}; terminal input could not be restored: {input_error}"
+                # An observed pane PID is not enough to call the payload live:
+                # readiness_error means exact recovery was not proven, while an
+                # input error leaves the terminal unusable. Persist the durable
+                # recovery recipe, but fail closed on status and PID so startup
+                # or an explicit reopen can retry the exact conversation.
                 return AuthActivationResult(
                     False,
                     False,
                     recovery_command=plan.recovery_command,
                     recovery_cwd=plan.recovery_cwd,
-                    pid=created_identity.pane_pid if created_identity and not cleaned else None,
-                    status=status,
+                    pid=None,
+                    status="recovery-pending",
                     detail=detail,
                     preserve_selected_account=True,
                     command=plan.replacement_command,
                     cwd=plan.replacement_cwd,
                     clear_recovery=plan.recovery_command is None,
                 )
-            pid = created_identity.pane_pid
+            pid = identity.pane_pid
             status = "running"
             if record.status.casefold() == "paused":
-                paused_pid = self.pause(resumed)
+                paused_pid = self.pause(replacement)
                 if paused_pid != pid:
-                    raise TmuxError("recreated terminal could not be paused safely")
+                    return AuthActivationResult(
+                        False,
+                        False,
+                        recovery_command=plan.recovery_command,
+                        recovery_cwd=plan.recovery_cwd,
+                        pid=pid,
+                        status="running",
+                        detail="resumed Codex process could not restore the paused state",
+                        preserve_selected_account=True,
+                        command=plan.replacement_command,
+                        cwd=plan.replacement_cwd,
+                        clear_recovery=plan.recovery_command is None,
+                    )
                 status = "paused"
-        except (OSError, TmuxError) as exc:
-            cleanup_error = ""
-            if created_identity is None:
-                try:
-                    candidate = self._inspect_auth_pane(resumed)
-                except (OSError, TmuxError):
-                    candidate = None
-                if (
-                    candidate is not None
-                    and candidate.session_created != plan.session_created
-                ):
-                    created_identity = candidate
-            if created_identity is not None:
-                cleaned, cleanup_error = self._cleanup_failed_auth_recreation(
-                    resumed,
-                    created_identity,
-                )
-            else:
-                cleaned = False
-            detail = f"{failure_detail}: {exc}"
-            if cleanup_error:
-                detail = f"{detail}; {cleanup_error}"
             return AuthActivationResult(
-                False,
-                False,
+                True,
+                True,
                 recovery_command=plan.recovery_command,
                 recovery_cwd=plan.recovery_cwd,
-                pid=created_identity.pane_pid if created_identity and not cleaned else None,
-                status=(
-                    "recovery-pending"
-                    if created_identity is not None and not cleaned
-                    else failure_status
-                ),
-                detail=detail,
+                pid=pid,
+                status=status,
+                detail="selected account is active; exact Codex conversation resumed in place",
                 preserve_selected_account=True,
                 command=plan.replacement_command,
                 cwd=plan.replacement_cwd,
                 clear_recovery=plan.recovery_command is None,
             )
-        detail = (
-            "Codex restarted in this tab with the selected account"
-            if plan.recovery_command is not None
-            else "terminal restarted once with private Codex auth"
-        )
+
+        if plan.restart:
+            return self._blocked_auth_activation(
+                plan,
+                quiescence,
+                "restartable Codex handoff did not preserve the tmux pane",
+            )
+        if quiescence.input_pane_id != plan.pane_id or plan.pane_id is None:
+            return self._blocked_auth_activation(
+                plan,
+                quiescence,
+                "live terminal input-fence receipt is incomplete",
+            )
+        try:
+            if not self._identity_matches_plan(self._inspect_auth_pane(record), plan):
+                raise TmuxError("live tmux pane changed during account activation")
+            if plan.pane_pid is None or process_tree_contains_codex(plan.pane_pid) is not False:
+                raise TmuxError("a Codex process appeared during idle-shell account activation")
+            if not self._private_auth_process_tree_environment_ready(record, plan.pane_pid):
+                raise TmuxError("terminal no longer verifies its private auth environment")
+            self._restore_auth_pane_input(plan.pane_id, quiescence.input_was_off)
+        except (OSError, TmuxError) as exc:
+            return self._blocked_auth_activation(plan, quiescence, str(exc))
         return AuthActivationResult(
             True,
-            True,
-            recovery_command=plan.recovery_command,
-            recovery_cwd=plan.recovery_cwd,
-            pid=pid,
-            status=status,
-            detail=detail,
+            False,
+            pid=plan.pane_pid,
+            status=record.status,
+            detail="selected account is active; terminal remained ready",
             preserve_selected_account=True,
-            command=plan.replacement_command,
-            cwd=plan.replacement_cwd,
-            clear_recovery=plan.recovery_command is None,
         )
+
+    def rollback_auth_change(
+        self,
+        record: SessionRecord,
+        plan: AuthActivationPlan,
+        quiescence: AuthQuiesceResult,
+    ) -> AuthActivationResult:
+        """Resume the exact payload under a restored previous account pointer."""
+
+        if not quiescence.gated_respawn:
+            return self.apply_auth_change(record, plan, quiescence)
+        replacement = quiescence.replacement_record
+        if replacement is None or plan.pane_id is None:
+            return self._blocked_auth_activation(
+                plan,
+                quiescence,
+                "previous account was restored but the handoff receipt is incomplete",
+            )
+        current = self._inspect_auth_pane(record)
+        previous_session_created = current.session_created if current else plan.session_created
+        previous_pane_id = current.pane_id if current else plan.pane_id
+        previous_pane_pid = current.pane_pid if current else plan.pane_pid
+        current_process = (
+            self._auth_process_identity(current.pane_pid) if current is not None else None
+        )
+        previous_start = current_process[1] if current_process is not None else plan.pane_start_time
+        old_processes: tuple[tuple[int, int, bool], ...] = ()
+        if current is not None:
+            try:
+                old_processes = self._snapshot_auth_process_tree(current.pane_pid)
+            except (OSError, TmuxError):
+                old_processes = ()
+        gate_path: Path | None = None
+        try:
+            spec = self._launch_spec(replacement)
+            gate_path = self._auth_switch_gate_path(record)
+            rollback_plan = replace(
+                plan,
+                session_created=previous_session_created,
+                pane_id=previous_pane_id,
+                pane_pid=previous_pane_pid,
+                pane_start_time=previous_start,
+            )
+            self._respawn_auth_pane_gated(replacement, rollback_plan, spec, gate_path)
+            placeholder, detail = self._await_auth_recreation_ready(
+                replacement,
+                previous_session_created=previous_session_created,
+                previous_pane_id=previous_pane_id,
+                previous_pane_pid=previous_pane_pid,
+                previous_pane_start_time=previous_start,
+                expected_recovery_command=None,
+                expected_recovery_cwd=None,
+                timeout=4.0,
+            )
+            if placeholder is None or detail:
+                raise TmuxError(detail or "previous-account handoff launcher was not ready")
+            if old_processes:
+                self._kill_quiesced_auth_processes(old_processes)
+            self._open_auth_switch_gate(gate_path)
+            identity, detail = self._await_auth_recreation_ready(
+                replacement,
+                previous_session_created=previous_session_created,
+                previous_pane_id=previous_pane_id,
+                previous_pane_pid=previous_pane_pid,
+                previous_pane_start_time=previous_start,
+                expected_recovery_command=plan.recovery_command,
+                expected_recovery_cwd=plan.recovery_cwd,
+                timeout=15.0,
+            )
+            if identity is None or detail:
+                raise TmuxError(detail or "previous account payload did not resume")
+            self._restore_auth_pane_input(plan.pane_id, quiescence.input_was_off)
+            return AuthActivationResult(
+                True,
+                True,
+                recovery_command=plan.recovery_command,
+                recovery_cwd=plan.recovery_cwd,
+                pid=identity.pane_pid,
+                status="running",
+                detail="previous account restored; exact Codex conversation resumed in place",
+                preserve_selected_account=True,
+                command=plan.replacement_command,
+                cwd=plan.replacement_cwd,
+                clear_recovery=plan.recovery_command is None,
+            )
+        except (OSError, TmuxError) as exc:
+            try:
+                self._restore_auth_pane_input(plan.pane_id, quiescence.input_was_off)
+            except (OSError, TmuxError):
+                pass
+            return AuthActivationResult(
+                False,
+                False,
+                recovery_command=plan.recovery_command,
+                recovery_cwd=plan.recovery_cwd,
+                status="recovery-pending",
+                detail=f"previous account restored, but exact Codex recovery failed: {exc}",
+                preserve_selected_account=True,
+                command=plan.replacement_command,
+                cwd=plan.replacement_cwd,
+                clear_recovery=plan.recovery_command is None,
+            )
+        finally:
+            self._cleanup_auth_switch_gate(gate_path)
 
     def activate_auth_change(self, record: SessionRecord) -> AuthActivationResult:
         """Revalidate, quiesce, and reactivate without changing credentials."""
@@ -4960,7 +4908,7 @@ class TmuxBackend:
         quiescence = self.quiesce_auth_change(record, plan)
         try:
             if not quiescence.ok:
-                if quiescence.terminated or quiescence.suspended:
+                if quiescence.terminated or quiescence.suspended or quiescence.gated_respawn:
                     return self._blocked_auth_activation(
                         plan,
                         quiescence,
@@ -5221,14 +5169,7 @@ def execute_auth_change(
     previous_state: CodexAuthState,
     account_query: str,
 ) -> AuthTransactionResult:
-    """Run one fail-closed account transaction for both GTK and the CLI.
-
-    The old process is made unable to write before ``manager.switch`` can
-    migrate or replace any pointer.  A failed switch restores the exact old
-    account while the process remains quiesced, then recreates/resumes it.  If
-    that restoration cannot be verified, no process is started against an
-    uncertain credential binding.
-    """
+    """Run one atomic, recoverable account transaction for GTK and the CLI."""
 
     if (
         isinstance(backend, TmuxBackend)
@@ -5248,7 +5189,7 @@ def execute_auth_change(
     if lifecycle is None:
         return AuthTransactionResult(
             False,
-            error="terminal backend lacks the safe Codex auth quiescence lifecycle",
+            error="terminal backend lacks the safe Codex auth handoff lifecycle",
         )
     planner, quiescer, applier = lifecycle
     try:
@@ -5263,17 +5204,18 @@ def execute_auth_change(
     try:
         quiescence = quiescer(record, plan)
     except Exception as exc:
-        return AuthTransactionResult(False, error=f"Codex auth quiescence failed: {exc}")
+        return AuthTransactionResult(False, error=f"Codex auth handoff failed: {exc}")
     if not bool(getattr(quiescence, "ok", False)):
-        if bool(getattr(quiescence, "terminated", False)) or bool(
-            getattr(quiescence, "suspended", False)
+        if any(
+            bool(getattr(quiescence, name, False))
+            for name in ("terminated", "suspended", "gated_respawn")
         ):
             activation = TmuxBackend._blocked_auth_activation(
                 plan,
                 quiescence,
                 str(
                     getattr(quiescence, "detail", "")
-                    or "terminal could not be restored after auth quiescence failed"
+                    or "terminal could not be restored after auth handoff failed"
                 ),
             )
             return AuthTransactionResult(
@@ -5286,12 +5228,56 @@ def execute_auth_change(
             False,
             error=str(
                 getattr(quiescence, "detail", "")
-                or "old terminal could not be quiesced before account switching"
+                or "terminal could not be prepared for account switching"
             ),
         )
 
+    def _restore_previous_binding() -> tuple[
+        CodexSwitchResult | None,
+        str,
+        str,
+    ]:
+        try:
+            restored = manager.restore(record, previous_state.selected_account_key)
+        except Exception as exc:
+            restored = None
+            restore_error = str(exc) or exc.__class__.__name__
+        else:
+            if restored.ok and (
+                restored.state.selected_account_key != previous_state.selected_account_key
+                or not restored.state.canonical_binding_ready
+            ):
+                restore_error = "previous canonical Codex account binding was not verified"
+            else:
+                restore_error = restored.error if not restored.ok else ""
+        if restored is not None and restore_error:
+            restored = CodexSwitchResult(False, restored.state, restore_error)
+        observation_error = ""
+        if restored is None or not restored.ok:
+            try:
+                observed = manager.state(record)
+            except Exception as exc:
+                observed = replace(
+                    previous_state,
+                    selected_account=None,
+                    selected_account_key=None,
+                    fingerprint=f"unverified:{previous_state.fingerprint}",
+                    canonical_binding_ready=False,
+                )
+                observation_error = str(exc) or exc.__class__.__name__
+            if restored is None or restored.state != observed:
+                restored = CodexSwitchResult(
+                    False,
+                    observed,
+                    restore_error or "previous Codex account restore was not verified",
+                )
+        return restored, restore_error, observation_error
+
     try:
-        if isinstance(backend, TmuxBackend):
+        lease_required = isinstance(backend, TmuxBackend) and (
+            not plan.live or plan.restart
+        )
+        if lease_required:
             lease = getattr(quiescence, "lifetime_lease", None)
             if (
                 not isinstance(lease, _AuthLifetimeLease)
@@ -5305,7 +5291,7 @@ def execute_auth_change(
                 activation = TmuxBackend._blocked_auth_activation(
                     plan,
                     quiescence,
-                    "Codex auth quiescence lease changed before account selection",
+                    "Codex auth lifetime lease changed before account selection",
                 )
                 return AuthTransactionResult(
                     False,
@@ -5313,6 +5299,7 @@ def execute_auth_change(
                     activation=activation,
                     error=activation.detail,
                 )
+
         switch_error = ""
         switched: CodexSwitchResult | None = None
         try:
@@ -5323,7 +5310,10 @@ def execute_auth_change(
                 switched.state.selected_account_key != account.account_key
                 or not switched.state.canonical_binding_ready
             ):
-                switch_error = "private Codex account switch did not verify the requested canonical binding"
+                switch_error = (
+                    "private Codex account switch did not verify the requested "
+                    "canonical binding"
+                )
         except Exception as exc:
             switch_error = str(exc) or exc.__class__.__name__
 
@@ -5342,63 +5332,67 @@ def execute_auth_change(
                     switch_result=switched,
                     activation=activation,
                 )
+
+            # A process may have started with the requested token before a late
+            # readiness check failed. Restore the old canonical pointer and
+            # force one same-pane exact recovery under it.
+            restored, restore_error, observation_error = _restore_previous_binding()
+            if restored is None or not restored.ok:
+                detail = activation.detail or "selected account could not be activated"
+                detail = (
+                    f"{detail}; previous account restore failed: "
+                    f"{restore_error or 'not verified'}"
+                )
+                if observation_error:
+                    detail += f"; current private account could not be inspected: {observation_error}"
+                return AuthTransactionResult(
+                    False,
+                    switch_result=restored or switched,
+                    activation=activation,
+                    error=detail,
+                )
+            rollback_fn = getattr(backend, "rollback_auth_change", None)
+            try:
+                rollback = (
+                    rollback_fn(record, plan, quiescence)
+                    if callable(rollback_fn)
+                    else applier(record, plan, quiescence)
+                )
+            except Exception as exc:
+                rollback = TmuxBackend._blocked_auth_activation(
+                    plan,
+                    quiescence,
+                    f"previous account was restored but terminal recovery failed: {exc}",
+                )
+            detail = activation.detail or "selected account could not be activated"
+            if not rollback.ok:
+                detail += (
+                    "; previous account restored, but exact terminal recovery failed: "
+                    f"{rollback.detail}"
+                )
             return AuthTransactionResult(
                 False,
-                switch_result=switched,
-                activation=activation,
-                error=activation.detail or "selected account could not be activated",
+                switch_result=restored,
+                activation=rollback,
+                error=detail,
+                rolled_back=True,
             )
 
-        # The writer remains stopped here. Restore and verify the exact old pointer
-        # before allowing that process to exist again.
-        try:
-            restored = manager.restore(record, previous_state.selected_account_key)
-        except Exception as exc:
-            restored = None
-            restore_error = str(exc) or exc.__class__.__name__
-        else:
-            if restored.ok and (
-                restored.state.selected_account_key != previous_state.selected_account_key
-                or not restored.state.canonical_binding_ready
-            ):
-                restore_error = "previous canonical Codex account binding was not verified"
-            else:
-                restore_error = restored.error if not restored.ok else ""
-        if restored is not None and restore_error:
-            restored = CodexSwitchResult(False, restored.state, restore_error)
+        # No requested pointer was accepted. Restore and verify the exact old
+        # binding while the gated launcher is still blocked, then open it.
+        restored, restore_error, observation_error = _restore_previous_binding()
         if restored is None or not restored.ok:
-        # A restore exception may happen after the pointer was partly replaced.
-        # Observe it again read-only; if even that is impossible, persist an
-        # explicitly unselected/unverified state instead of falsely claiming
-        # that either the old or requested account is active.
-            try:
-                observed = manager.state(record)
-            except Exception as exc:
-                observed = replace(
-                    previous_state,
-                    selected_account=None,
-                    selected_account_key=None,
-                    fingerprint=f"unverified:{previous_state.fingerprint}",
-                    canonical_binding_ready=False,
-                )
-                observation_error = str(exc) or exc.__class__.__name__
-            else:
-                observation_error = ""
-            if restored is None or restored.state != observed:
-                restored = CodexSwitchResult(
-                    False,
-                    observed,
-                    restore_error or "previous Codex account restore was not verified",
-                )
             activation = TmuxBackend._blocked_auth_activation(
                 plan,
                 quiescence,
-                "previous Codex account could not be verified; terminal remains stopped",
+                "previous Codex account could not be verified; terminal remains fenced",
             )
             detail = switch_error or "private Codex account switch failed"
-            detail = f"{detail}; previous account restore failed: {restore_error or 'not verified'}"
+            detail += (
+                f"; previous account restore failed: {restore_error or 'not verified'}"
+            )
             if observation_error:
-                detail = f"{detail}; current private account could not be inspected: {observation_error}"
+                detail += f"; current private account could not be inspected: {observation_error}"
             return AuthTransactionResult(
                 False,
                 switch_result=restored,
@@ -5412,11 +5406,14 @@ def execute_auth_change(
             activation = TmuxBackend._blocked_auth_activation(
                 plan,
                 quiescence,
-                f"previous account was restored but the terminal could not restart: {exc}",
+                f"previous account was restored but the terminal could not resume: {exc}",
             )
         detail = switch_error or "private Codex account switch failed"
         if not activation.ok:
-            detail = f"{detail}; previous account restored, but terminal recovery failed: {activation.detail}"
+            detail += (
+                "; previous account restored, but terminal recovery failed: "
+                f"{activation.detail}"
+            )
         return AuthTransactionResult(
             False,
             switch_result=restored,
@@ -5425,8 +5422,6 @@ def execute_auth_change(
             rolled_back=True,
         )
     finally:
-        # Every normal applier releases at its explicit process handoff. This
-        # finalizer covers injected/custom backends and all exceptional exits.
         release = getattr(quiescence, "release_lifetime_lease", None)
         if callable(release):
             release()

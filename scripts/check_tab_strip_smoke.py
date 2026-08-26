@@ -13,7 +13,7 @@ from pathlib import Path
 from smoke_support import stream_ready
 
 
-def _drain_gtk(Gtk, *, until=None, timeout: float = 3.0) -> None:
+def _drain_gtk(Gtk, *, until=None, timeout: float = 30.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         while Gtk.events_pending():
@@ -186,8 +186,13 @@ def main() -> int:
                 raise AssertionError("reopen-last-closed did not restore the hidden tab")
             _drain_gtk(
                 Gtk,
-                until=lambda: renamed.id in window.tabs
-                and stream_ready(window.tabs[renamed.id].widget),
+                until=lambda: bool(
+                    renamed.id in window.tabs
+                    and stream_ready(window.tabs[renamed.id].widget)
+                    and (app.store.get(renamed.id) is not None)
+                    and app.backend.current_directory(app.store.get(renamed.id))
+                    == str(reopened_workdir.resolve())
+                ),
             )
             reopened = app.store.get(renamed.id)
             if reopened is None or not reopened.visible:

@@ -1317,74 +1317,79 @@ class PaneStreamController:
         return list(reply.byte_lines)
 
     def _build_replay(self, pane_state: dict[str, str], rows: int) -> bytes | None:
-        """Reconstruct scrollback, screen, cursor, and modes for a fresh VTE.
+        """Reconstruct scrollback and one deterministic visible terminal frame.
 
-        First attach seeds VTE's normal-screen scrollback from tmux history;
-        reconnects repaint only the visible screen so history is not
-        duplicated.  All content is emitted through the same byte channel the
-        live stream uses, so ordering with %output is preserved by the ready
-        gate in ``_run_setup``.  Returns ``None`` when a capture command
-        fails so the caller retries the whole setup.
+        Captured rows may be exactly the terminal width and may carry background
+        SGR state. Feeding them with autowrap enabled lets the right margin wrap
+        into the next row, while an unterminated background style makes adjacent
+        rows appear as overlapping rectangles. Replay therefore paints in a
+        temporary reset/origin-off/insert-off/wrap-off state, erases and resets
+        each row independently, restores application modes, positions the cursor
+        absolutely, and restores cursor visibility last.
         """
 
         pane_id = pane_state["pane_id"]
         alternate = pane_state.get("alternate_on") == "1"
-        parts: list[bytes] = []
-
         first_attach = not self._replayed_history
+        parts: list[bytes] = [b"\x1b[0m\x1b[?6l\x1b[4l\x1b[?7l\x1b[?25l"]
+
+        def painted_rows(lines: list[bytes], *, final_newline: bool) -> bytes:
+            painted: list[bytes] = []
+            for index, line in enumerate(lines):
+                painted.extend((b"\x1b[0m\r\x1b[2K", line, b"\x1b[0m"))
+                if final_newline or index + 1 < len(lines):
+                    painted.append(b"\r\n")
+            return b"".join(painted)
 
         try:
             history_size = max(0, int(pane_state.get("history_size", "0")))
         except ValueError:
             history_size = 0
         if first_attach and self._history_lines and history_size:
-            # With an empty history tmux clamps "-E -1" onto the visible
-            # screen, which would repeat the first visible row below.
             history = self._capture(
                 pane_id,
                 f"-J -S -{min(self._history_lines, history_size)} -E -1",
             )
             if history is None:
                 return None
-            text = b"\r\n".join(line.rstrip() for line in history).rstrip()
-            if text:
-                parts.append(text + b"\r\n")
-        elif not first_attach:
-            # Reconnect: repaint over whatever the widget last showed.
-            parts.append(b"\x1b[?1049l" if not alternate else b"")
+            history = [line.rstrip() for line in history]
+            if any(history):
+                parts.append(painted_rows(history, final_newline=True))
 
         if alternate:
             parts.append(b"\x1b[?1049h")
-        parts.append(b"\x1b[2J\x1b[H" if (alternate or not first_attach) else b"")
+        elif not first_attach:
+            parts.append(b"\x1b[?1049l")
+        # CSI 2J clears only the visible display; already-seeded normal-screen
+        # scrollback remains available to VTE's native adjustment.
+        parts.append(b"\x1b[2J\x1b[H")
 
         visible = self._capture(pane_id, "-N")
         if visible is None:
             return None
-        while len(visible) > rows:
-            visible.pop()
+        if len(visible) > rows:
+            visible = visible[:rows]
         if visible:
-            parts.append(b"\r\n".join(visible))
+            parts.append(painted_rows(visible, final_newline=False))
 
-        # Cursor: after feeding, the caret rests at the end of the last fed
-        # row.  Walk it to tmux's reported position.
         try:
             cursor_x = max(0, int(pane_state.get("cursor_x", "0")))
-            cursor_y = max(0, int(pane_state.get("cursor_y", "0")))
+            cursor_y = max(0, min(max(0, rows - 1), int(pane_state.get("cursor_y", "0"))))
         except ValueError:
             cursor_x, cursor_y = 0, 0
-        fed_rows = max(1, len(visible))
-        up_moves = max(0, min(fed_rows - 1, (fed_rows - 1) - cursor_y))
-        parts.append(b"\r")
-        if up_moves:
-            parts.append(f"\x1b[{up_moves}A".encode("ascii"))
-        if cursor_x:
-            parts.append(f"\x1b[{cursor_x}C".encode("ascii"))
 
+        # Restore every negotiated mode except cursor visibility. Origin is
+        # restored before the final absolute CUP; the default full-screen scroll
+        # region makes tmux's coordinates stable in either origin state.
         for field, active_value, set_seq, reset_seq in _MODE_SEQUENCES:
+            if field == "cursor_flag":
+                continue
             value = pane_state.get(field)
             if value == active_value and set_seq:
                 parts.append(set_seq)
             elif value != active_value and reset_seq:
                 parts.append(reset_seq)
-
+        parts.append(f"\x1b[{cursor_y + 1};{cursor_x + 1}H".encode("ascii"))
+        cursor_visible = pane_state.get("cursor_flag") == "1"
+        parts.append(b"\x1b[?25h" if cursor_visible else b"\x1b[?25l")
         return b"".join(part for part in parts if part)

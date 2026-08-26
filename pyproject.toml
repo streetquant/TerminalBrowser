@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "t1000"
-version = "0.2.18"
+version = "0.2.19"
 description = "The terminal manager that never breaks down — named after the T-1000 from Terminator 2."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -139,19 +139,21 @@ class UserReportedUiRegressionTests(unittest.TestCase):
         self.assertNotIn("lambda: self.window.retag_sessions(records)", side)
         self.assertIn("lambda: self._kill_records(records)", side)
 
-    def test_terminal_history_ownership_cannot_regress_to_native_vte_scrollbar(self) -> None:
+    def test_normal_history_cannot_regress_to_a_thumb_only_proxy(self) -> None:
         terminal = _section(GTK_APP, "class AttachTerminal", "class WindowOverview")
         wheel = _section(terminal, "def _on_terminal_scroll", "# ------------------------------------------------------------------ #\n    # Scroll-idle auto-resume")
         thumb = _section(terminal, "def _on_history_scrollbar_value_changed", "def _feed_text")
 
         self.assertIn("self.native_adjustment = self.terminal.get_vadjustment()", terminal)
+        self.assertIn("adjustment=self.native_adjustment", terminal)
         self.assertIn("self.history_adjustment = Gtk.Adjustment.new(", terminal)
         self.assertNotIn("self.history_adjustment = self.terminal.get_vadjustment()", terminal)
-        self.assertNotIn("_scrollbar_at_live_edge", terminal)
-        self.assertNotIn("def _move_scrollbar", terminal)
-        self.assertIn("def _move_native_history", terminal)
+        self.assertIn("use_native = bool(active) or self._native_scrollback_available()", terminal)
+        self.assertIn("if callable(native_available) and native_available():", wheel)
+        self.assertIn("self._move_native_history(line_delta)", wheel)
         self.assertIn("outcome.reached_live_edge", wheel)
         self.assertNotIn("get_vadjustment", wheel)
+        # The proxy remains valid only for alternate-screen child-owned history.
         self.assertIn("self._queue_history_scroll_delta(delta)", thumb)
         self.assertNotIn("self._scroll_handler(", thumb)
 

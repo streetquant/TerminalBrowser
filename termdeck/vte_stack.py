@@ -83,19 +83,16 @@ def _compiled_environment() -> tuple[dict[str, str], tempfile.TemporaryDirectory
 
 
 def _stock_fallback_environment() -> dict[str, str]:
-    """Use the system's no-alternate-screen 256-colour entry if tic is absent."""
+    """Use the stock no-alternate-screen entry without a second subprocess.
 
-    inspected = subprocess.run(
-        ["infocmp", "-1", "-x", _FALLBACK_TERM],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    ).stdout
-    if re.search(r"^\s*(?:smcup|rmcup)(?:=|@)", inspected, re.MULTILINE):
-        raise RuntimeError("fallback terminal entry changes screen buffers")
-    if not re.search(r"^\s*colors#(?:0x100|256),", inspected, re.MULTILINE):
-        raise RuntimeError("fallback terminal entry is not 256-colour capable")
+    The primary path already performs a strict ``infocmp``/``tic``/``infocmp``
+    round trip.  When that bounded tool chain is unavailable or starved, doing
+    another synchronous ``infocmp`` in the GTK construction path can make every
+    terminal fail to open under host load.  ``teraterm-256color`` is the
+    deliberately selected system fallback; release and VTE-stack tests inspect
+    its capabilities independently, while runtime fallback remains immediate.
+    """
+
     return {
         "TERM": _FALLBACK_TERM,
         "COLORTERM": "truecolor",

@@ -598,7 +598,12 @@ class ControlModeClient:
                         except Exception:
                             pass
                 try:
-                    transport.wait(timeout=0.75)
+                    # SIGKILL is terminal, but a saturated host can delay both
+                    # scheduling the child and reporting its wait status well
+                    # beyond the short TERM grace. Keep teardown bounded while
+                    # giving the mandatory reap a distinct, production-safe
+                    # deadline instead of returning with a live/zombie child.
+                    transport.wait(timeout=5.0)
                 except Exception:
                     pass
         finally:

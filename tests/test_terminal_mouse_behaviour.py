@@ -149,7 +149,7 @@ class TerminalMouseBehaviourTest(TestCase):
             for widget in widgets:
                 widget.request_geometry_sync.assert_called_once_with(delay_ms=80)
 
-    def test_terminal_has_application_history_scrollbar_and_native_selection_adjustment(self) -> None:
+    def test_terminal_scrollbar_defaults_to_native_viewport_and_retains_proxy_adjustment(self) -> None:
         ready, _argv = Gtk.init_check([])
         if not ready:
             self.skipTest("GTK display is unavailable")
@@ -170,7 +170,7 @@ class TerminalMouseBehaviourTest(TestCase):
                     [attach.terminal, attach.scrollbar],
                 )
                 self.assertIs(attach.native_adjustment, attach.terminal.get_vadjustment())
-                self.assertIs(attach.scrollbar.get_adjustment(), attach.history_adjustment)
+                self.assertIs(attach.scrollbar.get_adjustment(), attach.native_adjustment)
                 self.assertIsNot(attach.history_adjustment, attach.native_adjustment)
                 self.assertGreater(
                     attach.history_adjustment.get_upper(),
@@ -1527,6 +1527,43 @@ class TerminalMouseBehaviourTest(TestCase):
 
         self.assertFalse(handled)
         self.assertEqual(calls, [])
+
+
+    def test_terminal_scrollbar_defaults_to_native_vte_history_without_selection(self) -> None:
+        ready, _argv = Gtk.init_check([])
+        if not ready:
+            self.skipTest("GTK display is unavailable")
+        with mock.patch("termdeck.gtk_app.GLib.timeout_add", return_value=1), mock.patch(
+            "termdeck.gtk_app.GLib.source_remove"
+        ):
+            attach = AttachTerminal(["true"], "/tmp", TerminalTheme())
+        try:
+            self.assertIs(attach.scrollbar.get_adjustment(), attach.native_adjustment)
+            self.assertTrue(attach._scrollbar_native_bound)
+        finally:
+            attach.destroy()
+
+    def test_no_selection_wheel_moves_native_vte_history_without_backend_redraw(self) -> None:
+        calls = []
+        terminal = SimpleNamespace(get_has_selection=lambda: False)
+        attach = SimpleNamespace(
+            terminal=terminal,
+            _native_scrollback_available=lambda: True,
+            _bind_scrollbar_for_selection=lambda active: calls.append(("bind-native", active)),
+            _move_native_history=lambda lines: calls.append(("native", lines)),
+            _scroll_handler=lambda lines: calls.append(("backend", lines)) or _handled_outcome(lines),
+            _history_cursor_hidden=True,
+            _set_history_cursor_hidden=lambda hidden: calls.append(("cursor", hidden)),
+        )
+
+        handled = AttachTerminal._on_terminal_scroll(
+            attach,
+            terminal,
+            SimpleNamespace(direction=Gdk.ScrollDirection.UP, delta_y=0.0),
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(calls, [("bind-native", True), ("native", -3), ("cursor", False)])
 
 
 if __name__ == "__main__":

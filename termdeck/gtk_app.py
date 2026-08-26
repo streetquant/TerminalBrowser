@@ -309,8 +309,25 @@ def _partition_master_rows(records, rows):
     )
 
 
-def _show_in_sessions_pane(record: SessionRecord) -> bool:
-    return bool(record.visible) and record.status.casefold() not in SIDE_PANE_HIDDEN_STATUSES
+def _show_in_sessions_pane(
+    record: SessionRecord,
+    *,
+    open_session_ids: frozenset[str] | set[str] = frozenset(),
+) -> bool:
+    """Return whether one durable terminal belongs in the current Tabs pane.
+
+    Child payload state is not terminal-tab membership.  A Codex process may
+    exit and leave the tmux pane/notebook tab alive; while that exact tab is
+    still open, keep its card visible even if a sampler briefly records
+    ``stopped`` or ``missing``.  Explicitly archived rows remain hidden.
+    """
+
+    if not bool(record.visible):
+        return False
+    status = record.status.casefold()
+    if record.id in open_session_ids:
+        return status != "archived"
+    return status not in SIDE_PANE_HIDDEN_STATUSES
 
 
 def _install_notebook_end_action(notebook: Gtk.Notebook, widget: Gtk.Widget) -> None:
@@ -348,7 +365,13 @@ def _is_modifier_only_keyval(keyval: int) -> bool:
     return keyval in _MODIFIER_ONLY_KEYVALS
 
 
-def _tabs_pane_records(store, window_id: str, query: str = "") -> list[SessionRecord]:
+def _tabs_pane_records(
+    store,
+    window_id: str,
+    query: str = "",
+    *,
+    open_session_ids: frozenset[str] | set[str] = frozenset(),
+) -> list[SessionRecord]:
     """Return registry rows that belong in one window's Tabs pane.
 
     The shared SQLite store holds every named window. The side pane must only
@@ -359,7 +382,7 @@ def _tabs_pane_records(store, window_id: str, query: str = "") -> list[SessionRe
     return [
         record
         for record in store.list(window_id=window_id)
-        if _show_in_sessions_pane(record)
+        if _show_in_sessions_pane(record, open_session_ids=open_session_ids)
         and (
             not needle
             or needle in f"{record.name} {record.tag} {record.id} {record.command}".lower()
@@ -565,12 +588,12 @@ class AttachTerminal(Gtk.Box):
         self.terminal.set_margin_bottom(4)
         apply_theme(self.terminal, theme, font_override=font_override)
         self.terminal.set_scrollback_lines(self._scrollback_extent)
-        # Normal terminal review and VTE text selection have different history
-        # owners.  The persistent scrollbar represents the application-aware
-        # tmux/Codex history controller; VTE's native adjustment is retained
-        # separately and is bound to the bar only while a real VTE selection is
-        # active.  Keeping the two coordinate systems distinct prevents both
-        # deep-drag blanking and false "live edge" detection.
+        # VTE is the authoritative viewport whenever it owns normal-screen
+        # scrollback.  This is the path used by ordinary terminals and it keeps
+        # the scrollbar thumb, wheel events, selected text, and the pixels on
+        # screen in one coordinate system.  The separate history adjustment is
+        # retained only for child-owned alternate-screen transcripts that have
+        # no native VTE scrollback to expose.
         self.terminal_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         self.terminal_row.set_hexpand(True)
         self.terminal_row.set_vexpand(True)
@@ -588,7 +611,7 @@ class AttachTerminal(Gtk.Box):
         self._history_scrollbar_syncing = False
         self._last_history_scrollbar_value = float(self.history_adjustment.get_value())
         self._history_drag_last_requested = self._last_history_scrollbar_value
-        self._scrollbar_native_bound = False
+        self._scrollbar_native_bound = True
         self._history_request_lock = threading.Lock()
         self._history_scroll_generation = 0
         self._history_scroll_sequence = 0
@@ -604,7 +627,7 @@ class AttachTerminal(Gtk.Box):
         self._child_tui_history_depth = 0
         self.scrollbar = Gtk.Scrollbar.new(
             Gtk.Orientation.VERTICAL,
-            adjustment=self.history_adjustment,
+            adjustment=self.native_adjustment,
         )
         _style(self.scrollbar, "td-terminal-scrollbar")
         self.scrollbar.get_style_context().remove_class("overlay-indicator")
@@ -615,6 +638,10 @@ class AttachTerminal(Gtk.Box):
         self.history_adjustment.connect(
             "value-changed",
             self._on_history_scrollbar_value_changed,
+        )
+        self._native_adjustment_changed_handler = self.native_adjustment.connect(
+            "changed",
+            self._on_native_adjustment_changed,
         )
         # Do not let VTE synthesize Up/Down fallback keys for an application
         # history gesture. Alternate-screen applications that negotiate mouse
@@ -1424,19 +1451,35 @@ class AttachTerminal(Gtk.Box):
             float(adjustment.get_upper()) - float(adjustment.get_page_size()),
         )
 
-    def _bind_scrollbar_for_selection(self, active: bool) -> None:
-        """Expose VTE's adjustment only while a real VTE selection owns review."""
+    def _on_native_adjustment_changed(self, *_args) -> None:
+        """Rebind as soon as VTE acquires real normal-screen scrollback."""
 
-        active = bool(active)
-        if active == self._scrollbar_native_bound:
+        selected = False
+        try:
+            selected = bool(self.terminal.get_has_selection())
+        except Exception:
+            pass
+        self._bind_scrollbar_for_selection(selected)
+
+    def _bind_scrollbar_for_selection(self, active: bool) -> None:
+        """Bind the bar to the viewport that can actually move visible content.
+
+        A selection always requires VTE's native adjustment.  Without a
+        selection, normal-screen scrollback still belongs to VTE; the proxy is
+        used only when VTE has no retained history and the child application
+        owns an alternate-screen transcript.
+        """
+
+        use_native = bool(active) or self._native_scrollback_available()
+        if use_native == self._scrollbar_native_bound:
             return
         try:
             self.scrollbar.set_adjustment(
-                self.native_adjustment if active else self.history_adjustment
+                self.native_adjustment if use_native else self.history_adjustment
             )
         except Exception:
             return
-        self._scrollbar_native_bound = active
+        self._scrollbar_native_bound = use_native
 
     def _set_history_scrollbar_value(self, value: float) -> None:
         adjustment = self.history_adjustment
@@ -2391,10 +2434,10 @@ class AttachTerminal(Gtk.Box):
     def _on_terminal_scroll(self, terminal, event: Gdk.EventScroll) -> bool:
         """Route wheel input through exactly one canonical history owner.
 
-        Normal review belongs to tmux/Codex and never consults VTE's viewport
-        for the live-edge decision.  A real VTE text selection is the sole
-        exception: it remains inside the retained VTE buffer so redraws cannot
-        destroy the selected range.
+        Normal-screen review belongs to VTE whenever native scrollback is
+        available.  Only an alternate-screen child with no native history uses
+        the application-aware backend/proxy path.  A real VTE text selection
+        always remains inside the retained VTE buffer.
         """
 
         direction = getattr(event, "direction", None)
@@ -2446,6 +2489,14 @@ class AttachTerminal(Gtk.Box):
             return True
 
         bind_scrollbar = getattr(self, "_bind_scrollbar_for_selection", None)
+        native_available = getattr(self, "_native_scrollback_available", None)
+        if callable(native_available) and native_available():
+            if callable(bind_scrollbar):
+                bind_scrollbar(True)
+            self._move_native_history(line_delta)
+            if self._history_cursor_hidden:
+                self._set_history_cursor_hidden(False)
+            return True
         if callable(bind_scrollbar):
             bind_scrollbar(False)
         handler = getattr(self, "_scroll_handler", None)
@@ -3905,6 +3956,7 @@ class SidePane(Gtk.Box):
             self.window.app_context.store,
             self.window.window_id,
             query,
+            open_session_ids=set(self.window.tabs),
         )
         captain = self._stored_captain()
         self._update_captain_hint(captain)
@@ -4883,6 +4935,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self._auth_attach_protected: set[str] = set()
         self._auth_fingerprints: dict[str, str] = {}
         self._auth_environment_ready: dict[str, bool] = {}
+        self._auth_external_refresh_retry_at: dict[str, float] = {}
+        self._auth_poll_cursor = 0
         self._auth_completion_recovery_lock = threading.Lock()
         self._auth_completion_recoveries: list[tuple[object, ...]] = []
         # Payload replacement is distinct from account-pointer state. It covers
@@ -5062,6 +5116,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         _install_notebook_end_action(self.notebook, strip_new_tab)
         self.notebook.connect("size-allocate", self._on_terminal_layout_size_allocate)
         self.side = SidePane(self)
+        # Keep the sidebar parented for the lifetime of the window. ``show_all``
+        # must not resurrect a hidden pane, and an ordinary toggle must never
+        # unmap/remap the notebook's live VTE descendants.
+        self.side.set_no_show_all(True)
         self.side_position = app_context.settings.side_pane_position
         self._pack_side_pane()
 
@@ -5092,7 +5150,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.connect("size-allocate", self._on_terminal_layout_size_allocate)
         self.connect("map", self._on_map_recover_offscreen)
         self.show_all()
-        self.side.set_visible(self.tabs_pane_visible)
+        self._apply_side_pane_visibility()
         if self.tabs_pane_visible:
             self._queue_side_pane_layout_repack()
         self.side.refresh()
@@ -5726,10 +5784,11 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         notify: bool = True,
     ) -> None:
         self.tabs_pane_visible = bool(visible)
-        self.side.set_visible(self.tabs_pane_visible)
-        repack = getattr(self, "_pack_side_pane", None)
-        if callable(repack):
-            repack()
+        apply_visibility = getattr(self, "_apply_side_pane_visibility", None)
+        if callable(apply_visibility):
+            apply_visibility()
+        else:
+            self.side.set_visible(self.tabs_pane_visible)
         if self.tabs_pane_visible:
             self.side.refresh()
             queue_repack = getattr(self, "_queue_side_pane_layout_repack", None)
@@ -6509,6 +6568,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 status=self.observed_status(current, new_pid),
                 last_pid=new_pid,
                 auth_restart_required=False,
+                recovery_last_error=None,
             )
             tab = self.tabs.get(session_id)
             if tab is not None:
@@ -6547,6 +6607,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                             status=failure_status,
                             last_pid=None,
                             visible=True,
+                            recovery_last_error=str(exc),
                         )
                     except KeyError:
                         pass
@@ -7380,13 +7441,21 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if state.selected_account == record.selected_account:
             return record
         pending = record.pending_account
-        if state.selected_account is not None or record.selected_account is not None:
+        selected_aliases = {
+            value
+            for value in (state.selected_account, state.selected_account_key)
+            if value
+        }
+        # A read-only poll of the still-active old account must never erase the
+        # user's newly selected pending account. Clear pending only after the
+        # canonical pointer actually resolves to that exact key/label.
+        if pending and pending in selected_aliases:
             pending = None
         updated = self.app_context.store.update(
             record.id,
             selected_account=state.selected_account,
             pending_account=pending,
-            auth_restart_required=True,
+            auth_restart_required=bool(pending) or record.auth_restart_required,
             auth_changed_at=utc_now(),
         )
         tab = self.tabs.get(record.id)
@@ -7454,22 +7523,55 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             else:
                 none_label = "Codex: choose account · upgrades terminal"
             combo.append("__none__", none_label)
+            account_keys = {account.account_key for account in state.accounts}
+            pending_key = next(
+                (
+                    account.account_key
+                    for account in state.accounts
+                    if pending and pending in {account.account_key, account.label}
+                ),
+                None,
+            )
             for account in state.accounts:
-                if account.active and not canonical_binding_ready:
+                if pending_key == account.account_key:
+                    suffix = " · pending"
+                elif account.active and not canonical_binding_ready:
                     suffix = " · repair"
                 elif account.active and record.auth_restart_required:
-                    suffix = " · restart"
+                    suffix = " · retrying"
                 else:
                     suffix = ""
                 combo.append(account.account_key, f"{account.label}{suffix}")
-            combo.set_active_id(
-                (state.selected_account_key or "__none__")
-                if environment_ready and canonical_binding_ready
-                else "__none__"
-            )
+            if pending_key in account_keys:
+                active_account = pending_key
+            elif (
+                canonical_binding_ready
+                and state.selected_account_key in account_keys
+                and (
+                    environment_ready
+                    or getattr(record, "selected_account", None)
+                    == state.selected_account
+                )
+            ):
+                # Once a completed transaction is durable, keep its account
+                # selected while the private process environment settles. A
+                # legacy terminal with no durable per-tab selection stays on
+                # the neutral row so reselecting the canonical account emits
+                # ``changed`` and performs the required private-scope upgrade.
+                active_account = state.selected_account_key
+            else:
+                # Keep the neutral repair row for a stale same-account binding;
+                # selecting the same account must still emit ``changed``.
+                active_account = "__none__"
+            combo.set_active_id(active_account)
             switchable = bool(state.accounts) and state.codex_auth_available and record.id not in self._auth_switch_inflight
             combo.set_sensitive(switchable)
-            if not canonical_binding_ready and state.selected_account:
+            if pending:
+                tooltip = (
+                    f"T1000 is switching this terminal to {pending} now while preserving "
+                    "the tmux tab and exact Codex conversation."
+                )
+            elif not canonical_binding_ready and state.selected_account:
                 tooltip = (
                     f"Reselect {state.selected_account} to bind this terminal directly to "
                     "the canonical saved account before Codex starts."
@@ -7481,8 +7583,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 )
             elif record.auth_restart_required and state.selected_account:
                 tooltip = (
-                    f"Saved account: {state.selected_account}. Restart the running Codex process "
-                    "when its current turn is finished."
+                    f"Saved account: {state.selected_account}. T1000 will retry the exact "
+                    "same-pane Codex handoff automatically; no manual restart is required."
                 )
             elif state.accounts:
                 tooltip = "Switch the saved account only for this terminal's private CODEX_HOME"
@@ -7589,7 +7691,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             # bypass the transaction lock's durable commit boundary.
             if not inflight:
                 record = self._sync_observed_auth_state(record, state)
-                self._auth_fingerprints[record.id] = state.fingerprint
+                self._auth_fingerprints.setdefault(record.id, state.fingerprint)
             self._render_auth_selector(record, state, environment_ready=environment_ready)
         except (CodexAuthError, OSError, ValueError) as exc:
             self._render_auth_selector(
@@ -7600,48 +7702,132 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             )
         return False
 
+    def _managed_auth_records_for_poll(self, *, limit: int = 16) -> list[SessionRecord]:
+        """Return a fair bounded slice of every open managed terminal."""
+
+        current = self.current_record()
+        rows: list[SessionRecord] = []
+        seen: set[str] = set()
+        if current is not None:
+            rows.append(current)
+            seen.add(current.id)
+        for session_id, tab in self.tabs.items():
+            if session_id in seen:
+                continue
+            record = getattr(tab, "record", None)
+            if record is None:
+                try:
+                    record = self.app_context.store.get(session_id)
+                except Exception:
+                    record = None
+            if record is None:
+                continue
+            rows.append(record)
+            seen.add(session_id)
+        if len(rows) <= max(1, limit):
+            return rows
+        head = rows[:1]
+        tail = rows[1:]
+        cursor = self._auth_poll_cursor % len(tail)
+        rotated = tail[cursor:] + tail[:cursor]
+        take = max(0, int(limit) - len(head))
+        self._auth_poll_cursor = (cursor + take) % len(tail)
+        return head + rotated[:take]
+
     def _poll_codex_auth_state(self) -> bool:
         if not self._tab_directory_refresh_alive:
             return False
         self._drain_auth_completion_recoveries()
         self._drain_payload_restart_completions()
         self._refresh_gateway_model_control()
-        # Only managed target transitions receive this non-destructive
-        # retry. Ordinary exited tabs retain the normal missing-session path.
         for session_id in tuple(getattr(self, "_auth_attach_protected", set())):
             TermDeckWindow._resolve_auth_attach_gap(self, session_id)
-        record = self.current_record()
-        if (
-            record is None
-            or record.external
-            or (
-                hasattr(record, "auth_scope_id")
-                and hasattr(record, "codex_home")
-                and (
-                    not getattr(record, "auth_scope_id", None)
-                    or not getattr(record, "codex_home", None)
-                )
-            )
-            or record.id in self._auth_switch_inflight
-        ):
-            return True
+
+        current = self.current_record()
+        current_id = current.id if current is not None else None
+        now = time.monotonic()
         try:
-            state = TermDeckWindow._codex_auth_manager(self).state(record)
+            manager = TermDeckWindow._codex_auth_manager(self)
         except (CodexAuthError, OSError, ValueError):
             return True
-        environment_ready = True
-        check_environment = getattr(self.app_context.backend, "private_auth_environment_ready", None)
-        if callable(check_environment):
+
+        for record in self._managed_auth_records_for_poll():
+            if (
+                record.external
+                or not getattr(record, "auth_scope_id", None)
+                or not getattr(record, "codex_home", None)
+                or record.id in self._auth_switch_inflight
+            ):
+                continue
             try:
-                environment_ready = bool(check_environment(record))
-            except (OSError, TmuxError):
-                environment_ready = False
-        if (
-            self._auth_fingerprints.get(record.id) != state.fingerprint
-            or state.selected_account != record.selected_account
-            or self._auth_environment_ready.get(record.id) != environment_ready
-        ):
-            self._refresh_auth_selector()
+                state = manager.state(record)
+            except (CodexAuthError, OSError, ValueError):
+                continue
+            previous_fingerprint = self._auth_fingerprints.get(record.id)
+            if previous_fingerprint is None:
+                self._auth_fingerprints[record.id] = state.fingerprint
+            fingerprint_changed = bool(
+                previous_fingerprint is not None
+                and previous_fingerprint != state.fingerprint
+            )
+            activation_retry = bool(getattr(record, "auth_restart_required", False))
+            if fingerprint_changed or activation_retry:
+                retry_map = getattr(self, "_auth_external_refresh_retry_at", None)
+                if not isinstance(retry_map, dict):
+                    retry_map = {}
+                    self._auth_external_refresh_retry_at = retry_map
+                retry_at = retry_map.get(record.id, 0.0)
+                if (
+                    now >= retry_at
+                    and state.selected_account_key
+                    and state.canonical_binding_ready
+                ):
+                    # Credential files are canonical system-wide links. A new
+                    # fingerprint means the token/profile changed outside
+                    # T1000; auth_restart_required means a previous same-pane
+                    # activation needs a bounded automatic retry. In both cases
+                    # resume the exact conversation under the current token.
+                    retry_map[record.id] = now + 10.0
+                    begin_switch = getattr(self, "_begin_auth_switch", None)
+                    if not callable(begin_switch):
+                        begin_switch = lambda target, key, **kwargs: TermDeckWindow._begin_auth_switch(
+                            self, target, key, **kwargs
+                        )
+                    if begin_switch(
+                        record,
+                        state.selected_account_key,
+                        source="external",
+                        force=True,
+                    ):
+                        return True
+                elif fingerprint_changed and state.selected_account_key is None:
+                    try:
+                        updated = self._sync_observed_auth_state(record, state)
+                    except Exception:
+                        updated = record
+                    tab = self.tabs.get(record.id)
+                    if tab is not None:
+                        tab.record = updated
+                    self._auth_fingerprints[record.id] = state.fingerprint
+
+            if record.id == current_id:
+                environment_ready = True
+                check_environment = getattr(
+                    self.app_context.backend,
+                    "private_auth_environment_ready",
+                    None,
+                )
+                if callable(check_environment):
+                    try:
+                        environment_ready = bool(check_environment(record))
+                    except (OSError, TmuxError):
+                        environment_ready = False
+                if (
+                    previous_fingerprint != state.fingerprint
+                    or state.selected_account != record.selected_account
+                    or self._auth_environment_ready.get(record.id) != environment_ready
+                ):
+                    self._refresh_auth_selector()
         return True
 
     def _on_auth_account_changed(self, combo: Gtk.ComboBoxText) -> None:
@@ -7650,8 +7836,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         record = self.current_record()
         account_key = combo.get_active_id()
         if record is None or record.external or not account_key or account_key == "__none__":
-            return
-        if record.id in self._auth_switch_inflight:
             return
         if account_key == "__enable__":
             combo.set_sensitive(False)
@@ -7667,14 +7851,38 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 TermDeckWindow._codex_auth_manager(self)
             except (CodexAuthError, OSError, ValueError) as exc:
                 self.show_toast(
-                    f"Terminal recovery remains available; optional account integration "
+                    "Terminal recovery remains available; optional account integration "
                     f"could not be enabled: {exc}",
                     kind="error",
                 )
             finally:
                 self._refresh_auth_selector()
             return
-        check_environment = getattr(self.app_context.backend, "private_auth_environment_ready", None)
+        begin_switch = getattr(self, "_begin_auth_switch", None)
+        if callable(begin_switch):
+            begin_switch(record, account_key, source="manual")
+        else:
+            TermDeckWindow._begin_auth_switch(
+                self, record, account_key, source="manual"
+            )
+
+    def _begin_auth_switch(
+        self,
+        record: SessionRecord,
+        account_key: str,
+        *,
+        source: str,
+        force: bool = False,
+    ) -> bool:
+        """Start one guarded same-pane auth transaction for any open tab."""
+
+        if record.id in self._auth_switch_inflight:
+            return False
+        check_environment = getattr(
+            self.app_context.backend,
+            "private_auth_environment_ready",
+            None,
+        )
         environment_ready = True
         if callable(check_environment):
             try:
@@ -7682,28 +7890,48 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             except (OSError, TmuxError):
                 environment_ready = False
         try:
-            state = TermDeckWindow._codex_auth_manager(self).state(record)
+            manager = TermDeckWindow._codex_auth_manager(self)
+            state = manager.state(record)
         except (CodexAuthError, OSError, ValueError) as exc:
-            self.show_toast(str(exc), kind="error")
-            self._refresh_auth_selector()
-            return
-        account = next((row for row in state.accounts if row.account_key == account_key), None)
-        if account is None or (
-            environment_ready
+            if source == "manual":
+                self.show_toast(str(exc), kind="error")
+                self._refresh_auth_selector()
+            return False
+        account = next(
+            (row for row in state.accounts if row.account_key == account_key),
+            None,
+        )
+        if account is None:
+            return False
+        if (
+            not force
+            and environment_ready
             and state.selected_account_key == account_key
-            and bool(getattr(state, "canonical_binding_ready", True))
+            and state.canonical_binding_ready
             and not bool(getattr(record, "auth_restart_required", False))
         ):
-            return
+            return False
+
         previous_pending_account = record.pending_account
-        record = self.app_context.store.update(record.id, pending_account=account.label)
+        try:
+            record = self.app_context.store.update(
+                record.id,
+                pending_account=account.label,
+            )
+        except Exception as exc:
+            if source == "manual":
+                self.show_toast(f"Could not start account switch: {exc}", kind="error")
+            return False
         tab = self.tabs.get(record.id)
         if tab is not None:
             tab.record = record
         self._auth_switch_inflight.add(record.id)
         generation = self._auth_switch_generation.get(record.id, 0) + 1
         self._auth_switch_generation[record.id] = generation
-        combo.set_sensitive(False)
+        combo = getattr(self, "_auth_combo", None)
+        if combo is not None and self.current_record() is not None and self.current_record().id == record.id:
+            combo.set_sensitive(False)
+
         attach_deferred = False
         if tab is not None:
             defer = getattr(
@@ -7719,7 +7947,16 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                     attach_deferred = False
                 if not attach_deferred:
                     self._auth_attach_protected.discard(record.id)
-        self.show_toast(f"Switching {record.name} to {account.label}…", kind="info")
+        if source == "manual":
+            self.show_toast(
+                f"Switching {record.name} to {account.label}…",
+                kind="info",
+            )
+        else:
+            self.show_toast(
+                f"Refreshing {record.name} after a system-wide Codex auth change…",
+                kind="info",
+            )
 
         def _worker() -> None:
             result: CodexSwitchResult | None = None
@@ -7730,13 +7967,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 candidate_lock = auth_transaction_lock(record)
                 candidate_lock.__enter__()
                 transaction_lock = candidate_lock
-                # Another CLI or GUI may have completed while this worker was
-                # scheduled. Resolve and transact from the fresh canonical
-                # binding while holding the cross-process lock.
-                locked_state = TermDeckWindow._codex_auth_manager(self).state(record)
+                locked_state = manager.state(record)
                 transaction = execute_auth_change(
                     self.app_context.backend,
-                    TermDeckWindow._codex_auth_manager(self),
+                    manager,
                     record,
                     locked_state,
                     account_key,
@@ -7756,18 +7990,16 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 activation,
                 error,
                 transaction_lock,
+                0,
             )
             if scheduled:
                 return
-
-            # No GTK callback was registered. The already-running two-second
-            # auth poll is the final handoff. Keep the matching scope lock and
-            # close/move guard with that payload: releasing either before the
-            # SessionStore commit would let a newer transaction race and make
-            # this result stale or disappear with a window close.
             recovery_error = (
                 f"{error}; " if error else ""
-            ) + f"UI completion handoff failed; recovering on the next auth poll · {scheduling_error}"
+            ) + (
+                "UI completion handoff failed; recovering on the next auth poll · "
+                f"{scheduling_error}"
+            )
             self._queue_auth_completion_recovery(
                 record.id,
                 generation,
@@ -7775,16 +8007,14 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 activation,
                 recovery_error,
                 transaction_lock,
+                0,
             )
             print(
                 f"T1000: {record.name} account completion remains protected and will "
-                f"retry on the auth poll: "
-                f"{scheduling_error}",
+                f"retry on the auth poll: {scheduling_error}",
                 file=sys.stderr,
             )
 
-        # Keep Python alive if an unexpected external shutdown bypasses GTK's
-        # close/quit guards while the backend is between terminate and recreate.
         try:
             threading.Thread(
                 target=_worker,
@@ -7792,9 +8022,6 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 daemon=False,
             ).start()
         except Exception as exc:
-            # No worker ran, so no canonical pointer or process state changed.
-            # Restore the pre-click durable/UI state synchronously instead of
-            # leaving a permanent pending badge and close/attach guard behind.
             restore_error = ""
             if generation == self._auth_switch_generation.get(record.id):
                 try:
@@ -7812,11 +8039,15 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                     record.id,
                     protect_attach=attach_deferred,
                 )
-                combo.set_sensitive(True)
+                if combo is not None:
+                    combo.set_sensitive(True)
             self.show_toast(
-                f"Account unchanged: could not start account switch worker: {exc}{restore_error}",
+                "Account unchanged: could not start account switch worker: "
+                f"{exc}{restore_error}",
                 kind="error",
             )
+            return False
+        return True
 
     def _persist_auth_transaction_result(
         self,
@@ -7969,7 +8200,17 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         _release_transaction_lock()
         try:
             if transaction_applied:
-                self._auth_fingerprints[session_id] = result.state.fingerprint
+                if activation_ok and not error:
+                    self._auth_fingerprints[session_id] = result.state.fingerprint
+                    retry_map = getattr(self, "_auth_external_refresh_retry_at", None)
+                    if isinstance(retry_map, dict):
+                        retry_map.pop(session_id, None)
+                elif error:
+                    retry_map = getattr(self, "_auth_external_refresh_retry_at", None)
+                    if not isinstance(retry_map, dict):
+                        retry_map = {}
+                        self._auth_external_refresh_retry_at = retry_map
+                    retry_map[session_id] = time.monotonic() + 10.0
                 tab = self.tabs.get(session_id)
                 if tab is not None:
                     tab.record = record
@@ -7982,13 +8223,13 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                     and activation.restarted
                     and activation.recovery_command is not None
                 ):
-                    message = f"{record.name}: {record.selected_account} active · Codex restarted in this tab"
+                    message = f"{record.name}: {record.selected_account} active · exact Codex conversation resumed in this tab"
                     kind = "success"
                 elif activation_ok and activation is not None and activation.restarted:
-                    message = f"{record.name}: {record.selected_account} active · terminal upgraded"
+                    message = f"{record.name}: {record.selected_account} active · terminal refreshed in place"
                     kind = "success"
                 elif activation_ok:
-                    message = f"{record.name}: {record.selected_account} active for the next Codex launch"
+                    message = f"{record.name}: {record.selected_account} active now"
                     kind = "success"
                 else:
                     detail = activation.detail if activation is not None else (error or "Codex restart did not complete")
@@ -8263,7 +8504,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
     def _repack_side_pane_after_style(self) -> bool:
         self._side_pane_layout_source_id = 0
-        self._pack_side_pane()
+        self._apply_side_pane_visibility()
         return False
 
     def _side_pane_layout_width(self) -> int:
@@ -8298,38 +8539,74 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         # Retain the historical 980px divider fallback for a 340px right pane.
         return 1320
 
+    def _apply_side_pane_visibility(self) -> None:
+        """Show or collapse the already-parented sidebar without remapping VTE.
+
+        Removing and re-adding the notebook makes GTK unmap every descendant.
+        A full-screen Codex/OpenCode TUI can redraw while that remap is only
+        partially allocated, leaving stale background cells and a torn
+        composer. Keep both GtkPaned children parented; only child visibility
+        and the divider position change during a normal toggle.
+        """
+
+        visible = bool(getattr(self, "tabs_pane_visible", True))
+        set_no_show_all = getattr(self.side, "set_no_show_all", None)
+        if callable(set_no_show_all):
+            set_no_show_all(True)
+        set_child_visible = getattr(self.side, "set_child_visible", None)
+        if callable(set_child_visible):
+            set_child_visible(visible)
+        try:
+            if visible:
+                # The pane is excluded from the window's initial ``show_all``
+                # so a hidden startup cannot flash it.  Reveal only this
+                # sidebar subtree here: every child must be mapped before its
+                # preferred width/allocation is measured, while the notebook
+                # and live VTE hierarchy remain untouched.
+                for child in self.side.get_children():
+                    child.show_all()
+                self.side.show()
+            else:
+                self.side.hide()
+        except Exception:
+            self.side.set_visible(visible)
+
+        available = TermDeckWindow._paned_layout_width(self)
+        if visible:
+            side_width = min(
+                max(1, TermDeckWindow._side_pane_layout_width(self)),
+                max(1, available - 1),
+            )
+            position = side_width if self.side_position == "left" else available - side_width
+        else:
+            position = 0 if self.side_position == "left" else available
+        try:
+            self.paned.set_position(max(0, int(position)))
+        except Exception:
+            pass
+
+        sync_geometry = getattr(self, "_queue_current_terminal_geometry_sync", None)
+        if callable(sync_geometry):
+            sync_geometry()
+
     def _pack_side_pane(self) -> None:
+        """Establish left/right child order; ordinary visibility never calls it."""
+
         for child in (self.notebook, self.side):
             try:
                 if child.get_parent() is self.paned:
                     self.paned.remove(child)
             except Exception:
                 pass
-        if not bool(getattr(self, "tabs_pane_visible", True)):
-            # Hiding a GtkPaned child does not reliably surrender its previous
-            # allocation. Unparent the pane so the notebook receives every
-            # available pixel instead of retaining a sidebar-sized dead strip.
-            self.paned.pack1(self.notebook, True, True)
-            self.paned.show_all()
-            self.side.set_visible(False)
-            sync_geometry = getattr(self, "_queue_current_terminal_geometry_sync", None)
-            if callable(sync_geometry):
-                sync_geometry()
-            return
-        side_width = TermDeckWindow._side_pane_layout_width(self)
         if self.side_position == "left":
             self.paned.pack1(self.side, False, True)
             self.paned.pack2(self.notebook, True, True)
-            self.paned.set_position(side_width)
         else:
             self.paned.pack1(self.notebook, True, True)
             self.paned.pack2(self.side, False, True)
-            available = TermDeckWindow._paned_layout_width(self)
-            self.paned.set_position(max(1, available - side_width))
-        self.paned.show_all()
-        sync_geometry = getattr(self, "_queue_current_terminal_geometry_sync", None)
-        if callable(sync_geometry):
-            sync_geometry()
+        self.notebook.show()
+        self.paned.show()
+        self._apply_side_pane_visibility()
 
     def set_side_pane_position(self, position: str, *, persist: bool = True) -> None:
         position = "left" if str(position).lower().startswith("left") else "right"

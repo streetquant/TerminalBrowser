@@ -60,6 +60,7 @@ def test_legacy_managed_terminal_shows_selectable_account_rows() -> None:
     record = SimpleNamespace(
         id="legacy",
         external=False,
+        selected_account=None,
         pending_account=None,
         auth_restart_required=False,
     )
@@ -81,6 +82,9 @@ def test_legacy_managed_terminal_shows_selectable_account_rows() -> None:
         ("alpha", "alpha"),
         ("beta", "beta"),
     ]
+    # No durable per-tab choice exists yet. Keep the neutral row active so
+    # selecting the canonical alpha account emits ``changed`` and upgrades the
+    # legacy terminal instead of becoming a silent same-row no-op.
     assert combo.active_id == "__none__"
     assert combo.sensitive is True
     assert "upgrade this managed terminal" in combo.tooltip
@@ -91,6 +95,7 @@ def test_stale_same_account_binding_is_rendered_as_a_reselectable_repair() -> No
     record = SimpleNamespace(
         id="legacy",
         external=False,
+        selected_account=None,
         pending_account=None,
         auth_restart_required=False,
     )
@@ -251,11 +256,16 @@ def test_thread_start_failure_restores_pending_state_and_clears_guard() -> None:
     combo.active_id = "beta"
     refreshes = []
     messages = []
-    tab = SimpleNamespace(record=record)
+    tab = SimpleNamespace(
+        record=record,
+        widget=SimpleNamespace(defer_attach_for_target_replacement=lambda: False),
+    )
     window = SimpleNamespace(
+        _auth_combo=combo,
         _auth_combo_updating=False,
         _auth_switch_inflight=set(),
         _auth_switch_generation={},
+        _auth_attach_protected=set(),
         app_context=SimpleNamespace(
             backend=SimpleNamespace(private_auth_environment_ready=lambda _record: True),
             codex_auth=SimpleNamespace(state=lambda _record: state),
@@ -761,3 +771,199 @@ def test_account_switch_defers_stream_before_any_backend_mutation() -> None:
     assert window._auth_attach_protected == {record.id}
     assert window._auth_switch_inflight == {record.id}
     assert record.pending_account == "beta"
+
+
+
+def test_pending_account_choice_stays_visibly_selected_during_switch() -> None:
+    combo = ComboStub()
+    record = SimpleNamespace(
+        id="pending",
+        external=False,
+        pending_account="beta",
+        auth_restart_required=False,
+    )
+    window = SimpleNamespace(
+        _auth_combo=combo,
+        _auth_combo_updating=False,
+        _auth_switch_inflight={record.id},
+    )
+
+    TermDeckWindow._render_auth_selector(
+        window,
+        record,
+        _state(selected="alpha", canonical_binding_ready=True),
+        environment_ready=True,
+    )
+
+    assert combo.active_id == "beta"
+    assert ("beta", "beta · pending") in combo.rows
+    assert combo.sensitive is False
+
+
+def test_completed_account_remains_selected_while_private_environment_is_upgraded() -> None:
+    combo = ComboStub()
+    record = SimpleNamespace(
+        id="upgrading",
+        external=False,
+        selected_account="beta",
+        pending_account=None,
+        auth_restart_required=False,
+    )
+    window = SimpleNamespace(
+        _auth_combo=combo,
+        _auth_combo_updating=False,
+        _auth_switch_inflight=set(),
+    )
+
+    TermDeckWindow._render_auth_selector(
+        window,
+        record,
+        _state(selected="beta", canonical_binding_ready=True),
+        environment_ready=False,
+    )
+
+    assert combo.active_id == "beta"
+
+
+
+def test_observed_old_account_does_not_erase_a_different_pending_choice() -> None:
+    record = SimpleNamespace(
+        id="pending-sync",
+        selected_account="alpha",
+        pending_account="beta",
+        auth_restart_required=True,
+    )
+    updates = []
+
+    class Store:
+        def update(self, session_id, **changes):
+            assert session_id == record.id
+            updates.append(changes)
+            for key, value in changes.items():
+                setattr(record, key, value)
+            return record
+
+    window = SimpleNamespace(
+        app_context=SimpleNamespace(store=Store()),
+        tabs={},
+    )
+
+    updated = TermDeckWindow._sync_observed_auth_state(window, record, _state(selected="alpha"))
+
+    assert updated.pending_account == "beta"
+    assert updated.auth_restart_required is True
+    assert updates == []
+
+
+def test_running_codex_switch_starts_seamless_worker_instead_of_queueing_next_launch() -> None:
+    state = _state(selected="alpha")
+    record = SimpleNamespace(
+        id="live-codex",
+        name="Live Codex",
+        external=False,
+        selected_account="alpha",
+        pending_account=None,
+        auth_restart_required=False,
+    )
+    updates = []
+
+    class Store:
+        def update(self, session_id, **changes):
+            assert session_id == record.id
+            updates.append(changes)
+            for key, value in changes.items():
+                setattr(record, key, value)
+            return record
+
+    combo = ComboStub()
+    combo.active_id = "beta"
+    messages = []
+    window = SimpleNamespace(
+        _auth_combo=combo,
+        _auth_combo_updating=False,
+        _auth_switch_inflight=set(),
+        _auth_switch_generation={},
+        _auth_attach_protected=set(),
+        app_context=SimpleNamespace(
+            backend=SimpleNamespace(private_auth_environment_ready=lambda _record: True),
+            codex_auth=SimpleNamespace(state=lambda _record: state),
+            store=Store(),
+        ),
+        tabs={},
+        current_record=lambda: record,
+        show_toast=lambda message, **_kwargs: messages.append(message),
+        _refresh_auth_selector=lambda: None,
+    )
+
+    with mock.patch("termdeck.gtk_app.threading.Thread") as thread:
+        assert TermDeckWindow._begin_auth_switch(
+            window, record, "beta", source="manual"
+        ) is True
+
+    thread.assert_called_once()
+    thread.return_value.start.assert_called_once_with()
+    assert window._auth_switch_inflight == {record.id}
+    assert combo.sensitive is False
+    assert record.pending_account == "beta"
+    assert updates == [{"pending_account": "beta"}]
+    assert any("Switching Live Codex to beta" in message for message in messages)
+    assert all("queued" not in message and "next Codex launch" not in message for message in messages)
+
+
+def test_failed_seamless_worker_completion_clears_pending_without_next_launch_state() -> None:
+    record = SimpleNamespace(
+        id="failed-completion",
+        name="Failed completion",
+        selected_account="alpha",
+        pending_account="beta",
+        auth_restart_required=False,
+        auth_changed_at=None,
+    )
+    updates = []
+    lock_events = []
+    messages = []
+
+    class Store:
+        def get(self, session_id):
+            return record if session_id == record.id else None
+
+        def update(self, session_id, **changes):
+            assert session_id == record.id
+            updates.append(changes)
+            for key, value in changes.items():
+                setattr(record, key, value)
+            return record
+
+    class TransactionLock:
+        def __exit__(self, *_args):
+            lock_events.append("exit")
+
+    window = SimpleNamespace(
+        _auth_switch_generation={record.id: 1},
+        _auth_switch_inflight={record.id},
+        _auth_attach_protected=set(),
+        _auth_fingerprints={},
+        _auth_external_refresh_retry_at={},
+        app_context=SimpleNamespace(store=Store()),
+        tabs={},
+        show_toast=lambda message, **_kwargs: messages.append(message),
+    )
+
+    with mock.patch.object(TermDeckWindow, "_finish_auth_switch_ui") as finish:
+        assert TermDeckWindow._complete_auth_switch(
+            window,
+            record.id,
+            1,
+            None,
+            None,
+            "seamless handoff failed",
+            TransactionLock(),
+        ) is False
+
+    assert record.pending_account is None
+    assert record.auth_restart_required is False
+    assert lock_events == ["exit"]
+    assert updates == [{"pending_account": None}]
+    assert any("Account unchanged: seamless handoff failed" in message for message in messages)
+    assert all("queued" not in message and "next Codex launch" not in message for message in messages)
+    finish.assert_called_once_with(window, record.id, protect_attach=False)
