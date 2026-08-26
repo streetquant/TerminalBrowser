@@ -44,6 +44,21 @@ The live Max verification used 9 windows and 149 visible panes, checked all 149 
 
 The enhanced frontend was additionally executed in real headless Chromium against the live homepage and a direct window URL. Both pages completed their API-driven refresh with zero browser stderr. A 128-request mixed homepage/asset/API load measured 8.088 ms median, 23.539 ms p95, and 37.475 ms maximum loopback latency; the host used 7,100 KiB RSS and two threads, with the same exact state-invariance result.
 
+## Authentication foundation
+
+`termdeck-web-auth` implements the security foundation for the next authenticated slice but is deliberately **not linked into the HTTP server yet**. Its boundary is:
+
+- a separate schema-versioned SQLite database that can never use `sessions.sqlite3` or its sidecar names;
+- absolute, traversal-free paths with non-symlink owner-controlled parents, exact `0700` directory and `0600` database permissions, hard-link rejection, and a 128 MiB file-plus-SQLite-page bound;
+- strict table, column, index, trigger-body and foreign-key contracts, SQLite integrity checks, and exact host/owner identity binding;
+- OS-CSPRNG one-time pairing invitations plus opaque device-session and CSRF capabilities;
+- persistence of domain-separated SHA-256 digests and non-secret metadata only—raw capabilities are zeroized and never written to SQLite, audit rows, logs, or debug output;
+- atomic invite consumption, session rotation, explicit logout, expiry, stale-row reclamation, device-wide revocation, and concurrent replay rejection;
+- hard-capped hashed-subject rate limiting and a bounded, immutable, monotonic hash chain for tamper evidence; the chain is not claimed to be a keyed authenticity proof against a malicious same-user database writer;
+- no HTTP, network, process, tmux, terminal, existing-registry, or controller-mutation authority.
+
+The later HTTP-authentication slice must explicitly integrate this crate and pass its own cookie, pairing, Origin, Fetch Metadata, CSRF, browser, LAN, and revocation gates before mirrored host state is exposed beyond the existing loopback read-only mode.
+
 ## Routes
 
 | Route | Purpose |
@@ -76,6 +91,7 @@ The server intentionally rejects `0.0.0.0`, LAN addresses, and public addresses.
 
 ## Crates
 
+- `termdeck-web-auth`: isolated owner/device invitation, session, CSRF, revocation, hard-capped rate-limit, audit, and secure SQLite foundation; intentionally not consumed by the server yet.
 - `termdeck-web-core`: dependency-free IDs, immutable snapshots, stable route allocation, and generation-safe pane leases.
 - `termdeck-web-state`: strict read-only SQLite projection and optional read-only tmux inventory overlay.
 - `termdeck-web-server`: current-thread Tokio/Axum HTTP server, immutable rendering cache, security middleware, server-rendered fallbacks, and embedded bounded browser assets.
@@ -97,19 +113,20 @@ cargo fmt --all -- --check
 RUSTFLAGS="-D warnings" cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- \
   -D warnings -D clippy::all -D clippy::unwrap_used -D clippy::expect_used
+cargo tree --workspace --locked
 cargo metadata --locked --no-deps --format-version 1
 node --check crates/termdeck-web-server/assets/app.js  # when Node is available
 ```
 
-The gate always enforces the asset byte budgets, UTF-8 encoding, same-origin API references, expected safe DOM operations, and absence of dangerous HTML/evaluation/storage sinks. The smoke is registered in `scripts/validation_manifest.json` for both CI and production profiles.
+The gate always enforces the asset byte budgets, UTF-8 encoding, same-origin API references, expected safe DOM operations, and absence of dangerous HTML/evaluation/storage sinks. It also pins the authentication crate's exact dependency set, library-only and unconsumed status, source-byte budget, CSPRNG/redaction/host-binding/strict-SQLite/resource-bound contracts, and absence of production HTTP, network, process, tmux, terminal-command, existing-registry, `SQLITE_OPEN_CREATE`, or premature server-consumer authority. The smoke is registered in `scripts/validation_manifest.json` for both CI and production profiles.
 
 ## Deliberately not implemented yet
 
 The following remain behind later security and parity gates:
 
 - persistent slug storage across daemon restarts and window renames;
-- owner-device enrollment and revocation;
-- WebAuthn/passkeys and secure browser sessions;
+- HTTP pairing, owner-device enrollment/revocation endpoints, and authenticated state-route protection;
+- WebAuthn/passkeys, secure cookies, session introspection, and browser session management;
 - LAN TLS and Cloudflare Access validation;
 - terminal byte/WebSocket streaming;
 - viewer-to-controller acquisition over HTTP/WebSocket;
