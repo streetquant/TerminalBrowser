@@ -1,0 +1,16 @@
+[package]
+name = "termdeck-web-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Strict read-only state adapter for the TermDeck web host"
+publish = false
+
+[dependencies]
+rusqlite.workspace = true
+termdeck-web-core = { path = "../termdeck-web-core" }
+
+[lints]
+workspace = true

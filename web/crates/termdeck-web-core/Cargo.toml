@@ -1,0 +1,15 @@
+[package]
+name = "termdeck-web-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Dependency-free domain core for the TermDeck web host"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

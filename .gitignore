@@ -19,6 +19,7 @@ build/
 dist/
 *.egg-info/
 .eggs/
+web/target/
 
 # Local runtime state
 .termdeck/
