@@ -847,6 +847,7 @@ def main() -> None:
                 f"{origin}/random",
                 f"{origin}/random/t/td-fixture",
             }
+            page_one.locator("#terminal-xterm").click(position={"x": 30, "y": 30})
             wait_mine(page_one, True)
 
             textarea = page_one.locator("#terminal-xterm .xterm-helper-textarea")
@@ -952,29 +953,54 @@ def main() -> None:
                 for event in read_log(initial_log)
                 if event.get("kind") == "size"
             ]
+            canonical_size = run(
+                [
+                    "/usr/bin/tmux", "-L", socket_name, "display-message", "-p", "-t",
+                    initial_tmux, "#{pane_width}x#{pane_height}",
+                ],
+                env=environment,
+            ).stdout.strip()
             page_one.set_viewport_size({"width": 1024, "height": 640})
-            time.sleep(0.4)
+            page_one.wait_for_timeout(500)
+            compact_size = run(
+                [
+                    "/usr/bin/tmux", "-L", socket_name, "display-message", "-p", "-t",
+                    initial_tmux, "#{pane_width}x#{pane_height}",
+                ],
+                env=environment,
+            ).stdout.strip()
             page_one.set_viewport_size({"width": 1680, "height": 1050})
-            wait_until(
-                lambda: len(
-                    {
-                        (event.get("cols"), event.get("rows"))
-                        for event in read_log(initial_log)
-                        if event.get("kind") == "size"
-                    }
-                )
-                >= 2,
-                10,
-                "distinct terminal resize geometry",
-            )
+            page_one.wait_for_timeout(500)
+            large_size = run(
+                [
+                    "/usr/bin/tmux", "-L", socket_name, "display-message", "-p", "-t",
+                    initial_tmux, "#{pane_width}x#{pane_height}",
+                ],
+                env=environment,
+            ).stdout.strip()
             final_sizes = [
                 (event.get("cols"), event.get("rows"))
                 for event in read_log(initial_log)
                 if event.get("kind") == "size"
             ]
-            checks["resize_sigwinch"] = len(set(final_sizes)) > len(set(initial_sizes)) or len(set(final_sizes)) >= 2
-            if not checks["resize_sigwinch"]:
-                raise RuntimeError(f"terminal resize did not reach the fixture: {final_sizes}")
+            browser_grid = page_one.evaluate(
+                """() => {
+                  const terminal = document.querySelector('#terminal-xterm')?.termdeckTerminal?.terminal;
+                  return terminal ? `${terminal.cols}x${terminal.rows}` : null;
+                }"""
+            )
+            checks["browser_geometry_isolated"] = (
+                compact_size == canonical_size
+                and large_size == canonical_size
+                and browser_grid == canonical_size
+                and set(final_sizes) == set(initial_sizes)
+            )
+            if not checks["browser_geometry_isolated"]:
+                raise RuntimeError(
+                    f"browser viewport changed shared terminal geometry: canonical={canonical_size}, "
+                    f"compact={compact_size}, large={large_size}, browser={browser_grid}, "
+                    f"initial_events={initial_sizes}, final_events={final_sizes}"
+                )
 
             first_control = latest_control(page_one) or {}
             first_sequence = int(first_control.get("next_sequence", 1))
@@ -1037,7 +1063,7 @@ def main() -> None:
             page_two.locator("#terminal-xterm .xterm-helper-textarea").focus()
             page_two.locator("#terminal-xterm").click(position={"x": 20, "y": 20})
             wait_mine(page_two, True)
-            checks["automatic_takeover"] = True
+            checks["explicit_focus_takeover"] = True
             before_stale = input_bytes(initial_log)
             stale_marker = "STALE_WRITER_MUST_NOT_ARRIVE"
             send_manual_frame(page_one, first_sequence, stale_marker)
@@ -1051,7 +1077,7 @@ def main() -> None:
             wait_mine(page_one, True)
             page_one.locator("#terminal-xterm .xterm-helper-textarea").type("TAKEBACK_OK")
             wait_input(initial_log, b"TAKEBACK_OK")
-            checks["automatic_retake"] = True
+            checks["explicit_focus_retake"] = True
 
             socket_count = int(page_one.evaluate("() => window.__termdeckTestSockets.length"))
             page_one.evaluate(

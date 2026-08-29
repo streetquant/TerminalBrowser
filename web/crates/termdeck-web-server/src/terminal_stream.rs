@@ -32,7 +32,7 @@ const MAX_INITIAL_REPLAY_JOINED_CELLS: usize = 32 * 1024;
 const _: () = assert!(MAX_INITIAL_REPLAY_HISTORY_LINES <= 512);
 const CONTROL_REQUEST_CAPACITY: usize = 64;
 const OUTPUT_QUEUE_CAPACITY: usize = 32;
-const INPUT_CHUNK_BYTES: usize = 256;
+const INPUT_CHUNK_BYTES: usize = 4 * 1024;
 const MIN_COLUMNS: u16 = 2;
 const MAX_COLUMNS: u16 = 1_000;
 const MIN_ROWS: u16 = 2;
@@ -41,8 +41,8 @@ const INPUT_FRAME_TYPE: u8 = 1;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const CONTROL_MODE_ARGUMENT: &str = "-C";
 const CONTROL_FLAGS_VIEWER: &str = "active-pane,ignore-size,no-detach-on-destroy";
-const CONTROL_FLAGS_WRITER: &str = "active-pane,!ignore-size,no-detach-on-destroy";
-const PANE_STATE_FORMAT: &str = "#{pane_id}\t#{pane_pid}\t#{alternate_on}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{keypad_cursor_flag}\t#{wrap_flag}\t#{insert_flag}\t#{origin_flag}\t#{mouse_standard_flag}\t#{mouse_button_flag}\t#{mouse_all_flag}\t#{mouse_sgr_flag}\t#{bracket_paste_flag}\t#{history_size}";
+const CONTROL_FLAGS_WRITER: &str = "active-pane,ignore-size,no-detach-on-destroy";
+const PANE_STATE_FORMAT: &str = "#{pane_id}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{alternate_on}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{keypad_cursor_flag}\t#{wrap_flag}\t#{insert_flag}\t#{origin_flag}\t#{mouse_standard_flag}\t#{mouse_button_flag}\t#{mouse_all_flag}\t#{mouse_sgr_flag}\t#{bracket_paste_flag}\t#{history_size}";
 
 #[derive(Clone)]
 pub(crate) struct StreamPane {
@@ -122,15 +122,40 @@ enum ClientEvent {
     Resync { cols: u16, rows: u16 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct TerminalGeometry {
+    cols: u16,
+    rows: u16,
+}
+
+impl TerminalGeometry {
+    fn new(cols: u16, rows: u16) -> Result<Self, StreamError> {
+        validate_geometry(cols, rows)?;
+        Ok(Self { cols, rows })
+    }
+}
+
+struct ReplaySnapshot {
+    geometry: TerminalGeometry,
+    bytes: Vec<u8>,
+}
+
+enum ControlNotification {
+    Output(Vec<u8>),
+    LayoutChanged,
+}
+
 #[derive(Serialize)]
 struct ResetEvent {
     r#type: &'static str,
+    geometry: TerminalGeometry,
 }
 
 #[derive(Serialize)]
 struct ReadyEvent<'a> {
     r#type: &'static str,
     control: &'a TerminalControlView,
+    geometry: TerminalGeometry,
     terminal_asset_version: &'static str,
 }
 
@@ -144,6 +169,7 @@ struct ControlEvent<'a> {
 struct ResyncedEvent<'a> {
     r#type: &'static str,
     control: &'a TerminalControlView,
+    geometry: TerminalGeometry,
 }
 
 #[derive(Serialize)]
@@ -194,7 +220,7 @@ async fn run_terminal_socket_inner(
 ) -> Result<(), StreamError> {
     validate_termdeck_id(pane.pane_id.as_str())?;
     validate_tmux_target(pane.tmux_target.as_str())?;
-    let (columns, rows) = receive_hello(socket).await?;
+    let _viewport_geometry = receive_hello(socket).await?;
     let mut control_view = match terminal
         .acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), false)
         .await
@@ -212,19 +238,26 @@ async fn run_terminal_socket_inner(
         terminal.command_timeout(),
     )
     .await?;
-    let replay = control.initial_replay(columns, rows).await?;
-    send_json(socket, &ResetEvent { r#type: "reset" }).await?;
-    send_message(socket, Message::Binary(replay.into())).await?;
-    control
-        .set_writer_mode(control_view.mine, columns, rows)
-        .await?;
+    let replay = control.initial_replay().await?;
+    let mut geometry = replay.geometry;
+    send_json(
+        socket,
+        &ResetEvent {
+            r#type: "reset",
+            geometry,
+        },
+    )
+    .await?;
+    send_message(socket, Message::Binary(replay.bytes.into())).await?;
+    control.set_writer_mode(control_view.mine, geometry).await?;
     control.continue_output().await?;
     send_json(
         socket,
         &ReadyEvent {
             r#type: "ready",
             control: &control_view,
-            terminal_asset_version: "termdeck-xterm-v1",
+            geometry,
+            terminal_asset_version: "termdeck-xterm-v2",
         },
     )
     .await?;
@@ -232,16 +265,29 @@ async fn run_terminal_socket_inner(
     let (mut sender, mut receiver) = socket.split();
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut columns = columns;
-    let mut rows = rows;
 
     loop {
         tokio::select! {
-            output = control.output() => {
-                let Some(output) = output else {
+            notification = control.notification() => {
+                let Some(notification) = notification else {
                     return Err(StreamError::ControlClosed);
                 };
-                send_sink_message(&mut sender, Message::Binary(output.into())).await?;
+                match notification {
+                    ControlNotification::Output(output) => {
+                        send_sink_message(&mut sender, Message::Binary(output.into())).await?;
+                    }
+                    ControlNotification::LayoutChanged => {
+                        let observed = control.current_geometry().await?;
+                        if observed != geometry {
+                            geometry = send_sink_resync(
+                                &mut sender,
+                                &mut control,
+                                &control_view,
+                            )
+                            .await?;
+                        }
+                    }
+                }
             }
             message = receiver.next() => {
                 let Some(message) = message else {
@@ -254,7 +300,7 @@ async fn run_terminal_socket_inner(
                             control_view = terminal
                                 .acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), true)
                                 .await?;
-                            control.set_writer_mode(true, columns, rows).await?;
+                            control.set_writer_mode(true, geometry).await?;
                             send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view }).await?;
                         }
                         let decision = terminal
@@ -296,40 +342,26 @@ async fn run_terminal_socket_inner(
                                 if !control_view.mine {
                                     // Browser focus is the user's implicit control intent. A
                                     // remounted pane has a fresh WebSocket actor, so a
-                                    // non-forcing acquire would leave the visible terminal in
-                                    // viewer mode until the first keypress. Force the
-                                    // generation-safe takeover here; every input frame remains
-                                    // bound to the winning actor and stale writers are rejected
-                                    // after the controller epoch changes.
+                                    // generation-safe takeover is required before input.
                                     control_view = match terminal.acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), true).await {
                                         Ok(value) => value,
                                         Err(_error) => terminal.status(pane.pane_id.as_str(), actor.as_str(), unix_ms()).await?,
                                     };
-                                    control.set_writer_mode(control_view.mine, columns, rows).await?;
+                                    control.set_writer_mode(control_view.mine, geometry).await?;
                                     send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view }).await?;
                                 }
                             }
-                            ClientEvent::Resize { cols, rows: new_rows } => {
-                                validate_geometry(cols, new_rows)?;
-                                columns = cols;
-                                rows = new_rows;
-                                control.resize(columns, rows).await?;
+                            ClientEvent::Resize { cols, rows } => {
+                                // Browser viewport geometry is presentation-only. The shared
+                                // tmux PTY retains the canonical native-client geometry.
+                                validate_geometry(cols, rows)?;
                             }
-                            ClientEvent::Resync { cols, rows: new_rows } => {
-                                validate_geometry(cols, new_rows)?;
-                                columns = cols;
-                                rows = new_rows;
-                                let replay = control.initial_replay(columns, rows).await?;
-                                send_sink_json(&mut sender, &ResetEvent { r#type: "reset" }).await?;
-                                send_sink_message(&mut sender, Message::Binary(replay.into())).await?;
-                                control.set_writer_mode(control_view.mine, columns, rows).await?;
-                                control.continue_output().await?;
-                                send_sink_json(
+                            ClientEvent::Resync { cols, rows } => {
+                                validate_geometry(cols, rows)?;
+                                geometry = send_sink_resync(
                                     &mut sender,
-                                    &ResyncedEvent {
-                                        r#type: "resynced",
-                                        control: &control_view,
-                                    },
+                                    &mut control,
+                                    &control_view,
                                 )
                                 .await?;
                             }
@@ -351,7 +383,7 @@ async fn run_terminal_socket_inner(
                         Ok(value) => value,
                         Err(_error) => terminal.status(pane.pane_id.as_str(), actor.as_str(), unix_ms()).await?,
                     };
-                    control.set_writer_mode(control_view.mine, columns, rows).await?;
+                    control.set_writer_mode(control_view.mine, geometry).await?;
                     send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view }).await?;
                 }
             }
@@ -359,6 +391,40 @@ async fn run_terminal_socket_inner(
     }
     control.shutdown().await;
     Ok(())
+}
+
+async fn send_sink_resync<S>(
+    sender: &mut S,
+    control: &mut TmuxControl,
+    control_view: &TerminalControlView,
+) -> Result<TerminalGeometry, StreamError>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: fmt::Debug,
+{
+    let replay = control.initial_replay().await?;
+    let geometry = replay.geometry;
+    send_sink_json(
+        sender,
+        &ResetEvent {
+            r#type: "reset",
+            geometry,
+        },
+    )
+    .await?;
+    send_sink_message(sender, Message::Binary(replay.bytes.into())).await?;
+    control.set_writer_mode(control_view.mine, geometry).await?;
+    control.continue_output().await?;
+    send_sink_json(
+        sender,
+        &ResyncedEvent {
+            r#type: "resynced",
+            control: control_view,
+            geometry,
+        },
+    )
+    .await?;
+    Ok(geometry)
 }
 
 fn error_code(error: &StreamError) -> &'static str {
@@ -376,7 +442,7 @@ fn error_code(error: &StreamError) -> &'static str {
     }
 }
 
-async fn receive_hello(socket: &mut WebSocket) -> Result<(u16, u16), StreamError> {
+async fn receive_hello(socket: &mut WebSocket) -> Result<TerminalGeometry, StreamError> {
     let message = timeout(HELLO_TIMEOUT, socket.recv())
         .await
         .map_err(|_| StreamError::Timeout("client hello"))?
@@ -395,8 +461,7 @@ async fn receive_hello(socket: &mut WebSocket) -> Result<(u16, u16), StreamError
             "first frame must be hello JSON",
         ));
     };
-    validate_geometry(cols, rows)?;
-    Ok((cols, rows))
+    TerminalGeometry::new(cols, rows)
 }
 
 fn validate_geometry(columns: u16, rows: u16) -> Result<(), StreamError> {
@@ -460,7 +525,7 @@ where
 
 struct TmuxControl {
     request_tx: mpsc::Sender<CommandRequest>,
-    output_rx: mpsc::Receiver<Vec<u8>>,
+    output_rx: mpsc::Receiver<ControlNotification>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     actor: tokio::task::JoinHandle<()>,
     command_timeout: Duration,
@@ -548,7 +613,7 @@ impl TmuxControl {
         })
     }
 
-    async fn output(&mut self) -> Option<Vec<u8>> {
+    async fn notification(&mut self) -> Option<ControlNotification> {
         self.output_rx.recv().await
     }
 
@@ -576,24 +641,18 @@ impl TmuxControl {
     async fn set_writer_mode(
         &self,
         writer: bool,
-        columns: u16,
-        rows: u16,
+        geometry: TerminalGeometry,
     ) -> Result<(), StreamError> {
-        validate_geometry(columns, rows)?;
         let flags = if writer {
             CONTROL_FLAGS_WRITER
         } else {
             CONTROL_FLAGS_VIEWER
         };
-        self.command(format!("refresh-client -f {flags} -C {columns}x{rows}"))
-            .await?;
-        Ok(())
-    }
-
-    async fn resize(&self, columns: u16, rows: u16) -> Result<(), StreamError> {
-        validate_geometry(columns, rows)?;
-        self.command(format!("refresh-client -C {columns}x{rows}"))
-            .await?;
+        self.command(format!(
+            "refresh-client -f {flags} -C {}x{}",
+            geometry.cols, geometry.rows
+        ))
+        .await?;
         Ok(())
     }
 
@@ -615,14 +674,7 @@ impl TmuxControl {
         Ok(())
     }
 
-    async fn initial_replay(&mut self, columns: u16, rows: u16) -> Result<Vec<u8>, StreamError> {
-        validate_geometry(columns, rows)?;
-        let mut pause_command = refresh_pane_action(self.pane_id.as_str(), "pause")?;
-        use std::fmt::Write as _;
-        write!(&mut pause_command, " -C {columns}x{rows}")
-            .map_err(|_| StreamError::ControlProtocol("pane pause command formatting failed"))?;
-        self.command(pause_command).await?;
-        while self.output_rx.try_recv().is_ok() {}
+    async fn current_state(&self) -> Result<PaneState, StreamError> {
         let state_reply = self
             .command(format!(
                 "list-panes -t {} -F '{}'",
@@ -639,7 +691,20 @@ impl TmuxControl {
                 "pane identity changed during attach",
             ));
         }
-        let history_lines = initial_replay_history_lines(state.history_size, columns);
+        Ok(state)
+    }
+
+    async fn current_geometry(&self) -> Result<TerminalGeometry, StreamError> {
+        Ok(self.current_state().await?.geometry)
+    }
+
+    async fn initial_replay(&mut self) -> Result<ReplaySnapshot, StreamError> {
+        self.command(refresh_pane_action(self.pane_id.as_str(), "pause")?)
+            .await?;
+        while self.output_rx.try_recv().is_ok() {}
+        let state = self.current_state().await?;
+        let geometry = state.geometry;
+        let history_lines = initial_replay_history_lines(state.history_size, geometry.cols);
         let history_command = (history_lines > 0).then(|| {
             format!(
                 "capture-pane -epq -t {} -J -S -{} -E -1",
@@ -654,7 +719,8 @@ impl TmuxControl {
         };
         let visible_capture = self.command(format!("capture-pane -epq -t {} -N", self.pane_id));
         let (history, visible) = tokio::try_join!(history_capture, visible_capture)?;
-        build_replay(&state, rows, history.lines, visible.lines)
+        let bytes = build_replay(&state, geometry.rows, history.lines, visible.lines)?;
+        Ok(ReplaySnapshot { geometry, bytes })
     }
 
     async fn continue_output(&self) -> Result<(), StreamError> {
@@ -701,7 +767,7 @@ struct ControlActorContext {
     stdin: ChildStdin,
     stdout: ChildStdout,
     request_rx: mpsc::Receiver<CommandRequest>,
-    output_tx: mpsc::Sender<Vec<u8>>,
+    output_tx: mpsc::Sender<ControlNotification>,
     shutdown_rx: oneshot::Receiver<()>,
     ready_tx: oneshot::Sender<Result<(), StreamError>>,
     pane_id: String,
@@ -781,7 +847,7 @@ fn handle_control_line(
     ready_tx: &mut Option<oneshot::Sender<Result<(), StreamError>>>,
     pending: &mut VecDeque<oneshot::Sender<Result<ControlReply, StreamError>>>,
     active: &mut Option<ActiveBlock>,
-    output_tx: &mpsc::Sender<Vec<u8>>,
+    output_tx: &mpsc::Sender<ControlNotification>,
 ) -> Result<(), StreamError> {
     if let Some((kind, identity)) = parse_marker(line) {
         match kind {
@@ -840,9 +906,15 @@ fn handle_control_line(
         let bytes = decode_tmux_output(encoded);
         if !bytes.is_empty() {
             output_tx
-                .try_send(bytes)
+                .try_send(ControlNotification::Output(bytes))
                 .map_err(|_| StreamError::Backpressure)?;
         }
+        return Ok(());
+    }
+    if line.starts_with(b"%layout-change ") {
+        output_tx
+            .try_send(ControlNotification::LayoutChanged)
+            .map_err(|_| StreamError::Backpressure)?;
         return Ok(());
     }
     if line.starts_with(b"%pause ") || line.starts_with(b"%continue ") {
@@ -949,6 +1021,7 @@ fn decode_tmux_output(encoded: &[u8]) -> Vec<u8> {
 
 struct PaneState {
     pane_id: String,
+    geometry: TerminalGeometry,
     alternate: bool,
     cursor_x: u16,
     cursor_y: u16,
@@ -970,29 +1043,35 @@ impl PaneState {
         let value = std::str::from_utf8(line)
             .map_err(|_| StreamError::ControlProtocol("pane state was not ASCII"))?;
         let fields = value.split('\t').collect::<Vec<_>>();
-        if fields.len() != 17 {
+        if fields.len() != 19 {
             return Err(StreamError::ControlProtocol(
                 "pane state field count changed",
             ));
         }
         validate_tmux_pane_id(fields[0])?;
         let _pane_pid = parse_u32(fields[1], "pane pid")?;
+        let geometry = TerminalGeometry::new(
+            parse_u16(fields[2], "pane width")?,
+            parse_u16(fields[3], "pane height")?,
+        )?;
+        let _pane_dead = flag(fields[5])?;
         Ok(Self {
             pane_id: fields[0].to_owned(),
-            alternate: flag(fields[2])?,
-            cursor_x: parse_u16(fields[4], "cursor x")?,
-            cursor_y: parse_u16(fields[5], "cursor y")?,
-            cursor_visible: flag(fields[6])?,
-            keypad_cursor: flag(fields[7])?,
-            wrap: flag(fields[8])?,
-            insert: flag(fields[9])?,
-            origin: flag(fields[10])?,
-            mouse_standard: flag(fields[11])?,
-            mouse_button: flag(fields[12])?,
-            mouse_all: flag(fields[13])?,
-            mouse_sgr: flag(fields[14])?,
-            bracket_paste: flag(fields[15])?,
-            history_size: parse_u32(fields[16], "history size")?,
+            geometry,
+            alternate: flag(fields[4])?,
+            cursor_x: parse_u16(fields[6], "cursor x")?,
+            cursor_y: parse_u16(fields[7], "cursor y")?,
+            cursor_visible: flag(fields[8])?,
+            keypad_cursor: flag(fields[9])?,
+            wrap: flag(fields[10])?,
+            insert: flag(fields[11])?,
+            origin: flag(fields[12])?,
+            mouse_standard: flag(fields[13])?,
+            mouse_button: flag(fields[14])?,
+            mouse_all: flag(fields[15])?,
+            mouse_sgr: flag(fields[16])?,
+            bracket_paste: flag(fields[17])?,
+            history_size: parse_u32(fields[18], "history size")?,
         })
     }
 }
@@ -1218,8 +1297,9 @@ fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_MODE_ARGUMENT, MAX_INITIAL_REPLAY_JOINED_CELLS, PANE_STATE_FORMAT, PaneState,
-        StreamError, build_replay, decode_tmux_output, extended_output_payload,
+        CONTROL_FLAGS_VIEWER, CONTROL_FLAGS_WRITER, CONTROL_MODE_ARGUMENT,
+        MAX_INITIAL_REPLAY_JOINED_CELLS, PANE_STATE_FORMAT, PaneState, StreamError,
+        TerminalGeometry, build_replay, decode_tmux_output, extended_output_payload,
         initial_replay_history_lines, output_payload, parse_input_frame, parse_marker,
         refresh_pane_action, validate_geometry,
     };
@@ -1233,7 +1313,7 @@ mod tests {
                 .iter()
                 .filter(|byte| **byte == b'\t')
                 .count(),
-            16
+            18
         );
         assert!(
             !PANE_STATE_FORMAT
@@ -1242,9 +1322,17 @@ mod tests {
                 .any(|window| window == b"\\t")
         );
 
-        let state = PaneState::parse(b"%7\t123\t1\t0\t4\t5\t1\t0\t1\t0\t0\t1\t0\t0\t1\t1\t42")
-            .unwrap_or_else(|error| panic!("pane state: {error}"));
+        let state =
+            PaneState::parse(b"%7\t123\t120\t40\t1\t0\t4\t5\t1\t0\t1\t0\t0\t1\t0\t0\t1\t1\t42")
+                .unwrap_or_else(|error| panic!("pane state: {error}"));
         assert_eq!(state.pane_id, "%7");
+        assert_eq!(
+            state.geometry,
+            TerminalGeometry {
+                cols: 120,
+                rows: 40
+            }
+        );
         assert!(state.alternate);
         assert_eq!(state.cursor_x, 4);
         assert_eq!(state.cursor_y, 5);
@@ -1261,6 +1349,9 @@ mod tests {
         );
         assert!(refresh_pane_action("%7", "run-shell").is_err());
         assert_eq!(MAX_INITIAL_REPLAY_JOINED_CELLS, 32 * 1024);
+        assert!(CONTROL_FLAGS_VIEWER.contains("ignore-size"));
+        assert!(CONTROL_FLAGS_WRITER.contains("ignore-size"));
+        assert!(!CONTROL_FLAGS_WRITER.contains("!ignore-size"));
     }
 
     #[test]
@@ -1316,6 +1407,7 @@ mod tests {
     fn replay_restores_ansi_modes_and_cursor() {
         let state = PaneState {
             pane_id: "%1".to_owned(),
+            geometry: TerminalGeometry { cols: 80, rows: 24 },
             alternate: true,
             cursor_x: 4,
             cursor_y: 2,

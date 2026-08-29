@@ -608,7 +608,7 @@ def main() -> int:
         cookies_one = pair(origin, first_invitation)
         cookies_two = pair(origin, second_invitation)
 
-        with urllib.request.urlopen(f"{origin}/_termdeck/assets/v2/terminal.js", timeout=5) as response:
+        with urllib.request.urlopen(f"{origin}/_termdeck/assets/v3/terminal.js", timeout=5) as response:
             result["terminal_asset_cache_control"] = response.headers.get("Cache-Control")
         opener = urllib.request.build_opener()
         request = urllib.request.Request(f"{origin}/_termdeck/healthz")
@@ -789,18 +789,17 @@ def main() -> int:
                 "#{pane_width}x#{pane_height}",
             ).stdout.strip()
             page_one.set_viewport_size({"width": 1040, "height": 640})
-            wait_until(
-                lambda: tmux(
-                    socket_name,
-                    "display-message",
-                    "-p",
-                    "-t",
-                    tmux_target,
-                    "#{pane_width}x#{pane_height}",
-                ).stdout.strip()
-                != before_size,
-                timeout=10.0,
-            )
+            page_one.wait_for_timeout(500)
+            compact_size = tmux(
+                socket_name,
+                "display-message",
+                "-p",
+                "-t",
+                tmux_target,
+                "#{pane_width}x#{pane_height}",
+            ).stdout.strip()
+            page_one.set_viewport_size({"width": 1680, "height": 1050})
+            page_one.wait_for_timeout(500)
             after_size = tmux(
                 socket_name,
                 "display-message",
@@ -809,8 +808,30 @@ def main() -> int:
                 tmux_target,
                 "#{pane_width}x#{pane_height}",
             ).stdout.strip()
-            result["resize"] = {"before": before_size, "after": after_size}
-            type_command(page_one, "printf 'RESIZE_OK\\n'", "RESIZE_OK")
+            if compact_size != before_size or after_size != before_size:
+                raise RuntimeError(
+                    f"browser viewport changed canonical tmux geometry: "
+                    f"before={before_size}, compact={compact_size}, after={after_size}"
+                )
+            browser_grid = page_one.evaluate(
+                """() => {
+                  const terminal = document.querySelector('#terminal-xterm')?.termdeckTerminal?.terminal;
+                  return terminal ? `${terminal.cols}x${terminal.rows}` : null;
+                }"""
+            )
+            if browser_grid != before_size:
+                raise RuntimeError(
+                    f"browser xterm grid diverged from canonical tmux geometry: "
+                    f"tmux={before_size}, browser={browser_grid}"
+                )
+            result["resize"] = {
+                "canonical": before_size,
+                "after_compact_viewport": compact_size,
+                "after_large_viewport": after_size,
+                "browser_grid": browser_grid,
+                "isolated": True,
+            }
+            type_command(page_one, "printf 'RESIZE_ISOLATED_OK\n'", "RESIZE_ISOLATED_OK")
 
             result["takeover"] = {
                 "covered_by": "check_web_browser_e2e.py",

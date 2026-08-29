@@ -477,6 +477,8 @@
 
     const MAX_PENDING_BYTES = 1024 * 1024;
     const MAX_FRAME_BYTES = 32 * 1024;
+    const MAX_IN_FLIGHT_FRAMES = 64;
+    const INPUT_BATCH_MS = 3;
     const MAX_RECONNECT_MS = 5000;
     const MIN_COLUMNS = 2;
     const MAX_COLUMNS = 1000;
@@ -488,6 +490,7 @@
       value: terminalApi,
       writable: false,
     });
+
     let socket = null;
     let ready = false;
     let mine = false;
@@ -498,16 +501,17 @@
     let webglTimer = 0;
     let helloTimer = 0;
     let heartbeatTimer = 0;
+    let inputBatchTimer = 0;
     let lastPongAt = Date.now();
     let queuedBytes = 0;
     let queue = [];
-    let inFlight = null;
+    let inFlight = new Map();
+    let batchChunks = [];
+    let batchBytes = 0;
     let disposed = false;
     let outputGeneration = 0;
     let outputChain = Promise.resolve();
-    let helloGeometry = null;
-    let initialResyncComplete = false;
-    let resyncPending = false;
+    let canonicalGeometry = null;
 
     function setStatus(message, kind) {
       status.textContent = message;
@@ -530,8 +534,26 @@
       };
     }
 
-    function fitGeometry() {
-      return boundedGeometry(terminalApi.fit());
+    function requiredGeometry(value) {
+      if (
+        !isRecord(value)
+        || !Number.isInteger(value.cols)
+        || !Number.isInteger(value.rows)
+        || value.cols < MIN_COLUMNS
+        || value.cols > MAX_COLUMNS
+        || value.rows < MIN_ROWS
+        || value.rows > MAX_ROWS
+      ) {
+        throw new Error("Invalid canonical terminal geometry.");
+      }
+      return { cols: value.cols, rows: value.rows };
+    }
+
+    function fitViewport() {
+      if (canonicalGeometry) {
+        return terminalApi.fitGrid(canonicalGeometry.cols, canonicalGeometry.rows);
+      }
+      return terminalApi.fit();
     }
 
     function streamUrl() {
@@ -549,15 +571,31 @@
       }
     }
 
-    function applyControl(value) {
+    function remoteNextSequence(value) {
+      if (value.next_sequence === null || value.next_sequence === undefined) {
+        return null;
+      }
+      return nonNegativeInteger(value.next_sequence, "terminal input sequence");
+    }
+
+    function applyControl(value, synchronizeSequence = false) {
       if (!isRecord(value) || value.schema !== "termdeck.terminal-control.v1") {
         throw new Error("Invalid terminal control state.");
       }
+      const previouslyMine = mine;
       mine = value.mine === true;
-      if (value.next_sequence !== null && value.next_sequence !== undefined) {
-        nextSequence = nonNegativeInteger(value.next_sequence, "terminal input sequence");
-      } else if (!mine) {
+      const remoteNext = remoteNextSequence(value);
+      if (remoteNext !== null) {
+        if (synchronizeSequence || inFlight.size === 0) {
+          nextSequence = remoteNext;
+        } else {
+          nextSequence = Math.max(nextSequence, remoteNext);
+        }
+      } else if (!mine && synchronizeSequence) {
         nextSequence = 1;
+      }
+      if (previouslyMine && !mine && inFlight.size > 0) {
+        discardAmbiguousInput("Terminal control moved to another device while input was pending.");
       }
       if (value.indeterminate === true) {
         setStatus("Input state uncertain · reconnect required", "error");
@@ -577,44 +615,103 @@
       return frame;
     }
 
-    function discardAmbiguousInput() {
-      if (inFlight) {
-        queuedBytes = Math.max(0, queuedBytes - inFlight.bytes.length);
-        inFlight = null;
-        setOverlay("The connection changed while input was in flight. That input was not replayed automatically.");
+    function discardAmbiguousInput(message = "The connection changed while input was in flight.") {
+      if (inFlight.size === 0) {
+        return;
+      }
+      let droppedBytes = 0;
+      for (const frame of inFlight.values()) {
+        droppedBytes += frame.bytes.length;
+      }
+      queuedBytes = Math.max(0, queuedBytes - droppedBytes);
+      const droppedFrames = inFlight.size;
+      inFlight.clear();
+      setOverlay(`${message} ${droppedFrames} unacknowledged input frame${droppedFrames === 1 ? " was" : "s were"} not replayed automatically.`);
+    }
+
+    function sendAvailable() {
+      if (!ready || !socketOpen()) {
+        return;
+      }
+      while (queue.length > 0 && inFlight.size < MAX_IN_FLIGHT_FRAMES) {
+        if (!Number.isSafeInteger(nextSequence) || nextSequence < 1) {
+          throw new Error("Terminal input sequence is outside JavaScript's safe range.");
+        }
+        const frame = queue.shift();
+        frame.sequence = nextSequence;
+        nextSequence += 1;
+        inFlight.set(frame.sequence, frame);
+        socket.send(binaryFrame(frame.sequence, frame.bytes));
       }
     }
 
-    function sendNext() {
-      if (!ready || !socketOpen() || inFlight || queue.length === 0) {
+    function queueFrame(bytes) {
+      if (!(bytes instanceof Uint8Array) || bytes.length === 0) {
         return;
       }
-      inFlight = queue.shift();
-      inFlight.sequence = nextSequence;
-      socket.send(binaryFrame(inFlight.sequence, inFlight.bytes));
+      queue.push({ bytes, sequence: null });
+    }
+
+    function flushInputBatch(dispatch = true) {
+      window.clearTimeout(inputBatchTimer);
+      inputBatchTimer = 0;
+      if (batchBytes === 0) {
+        if (dispatch) {
+          sendAvailable();
+        }
+        return;
+      }
+      const combined = new Uint8Array(batchBytes);
+      let cursor = 0;
+      for (const chunk of batchChunks) {
+        combined.set(chunk, cursor);
+        cursor += chunk.length;
+      }
+      batchChunks = [];
+      batchBytes = 0;
+      for (let offset = 0; offset < combined.length; offset += MAX_FRAME_BYTES) {
+        queueFrame(combined.slice(offset, Math.min(combined.length, offset + MAX_FRAME_BYTES)));
+      }
+      if (dispatch) {
+        sendAvailable();
+      }
     }
 
     function enqueue(bytes) {
       if (!(bytes instanceof Uint8Array) || bytes.length === 0 || disposed) {
         return;
       }
+      if (queuedBytes + bytes.length > MAX_PENDING_BYTES) {
+        setOverlay("Terminal input queue is full. Wait for the remote terminal to catch up.");
+        return;
+      }
+      queuedBytes += bytes.length;
       for (let offset = 0; offset < bytes.length; offset += MAX_FRAME_BYTES) {
         const chunk = bytes.slice(offset, Math.min(bytes.length, offset + MAX_FRAME_BYTES));
-        if (queuedBytes + chunk.length > MAX_PENDING_BYTES) {
-          setOverlay("Terminal input queue is full. Wait for the remote terminal to catch up.");
-          return;
+        if (batchBytes > 0 && batchBytes + chunk.length > MAX_FRAME_BYTES) {
+          flushInputBatch(false);
         }
-        queue.push({ bytes: chunk, sequence: null });
-        queuedBytes += chunk.length;
+        batchChunks.push(chunk);
+        batchBytes += chunk.length;
+        if (batchBytes >= MAX_FRAME_BYTES) {
+          flushInputBatch(false);
+        }
       }
-      sendNext();
+      if (bytes.length >= 1024 || batchBytes >= 4096) {
+        flushInputBatch(true);
+      } else if (!inputBatchTimer) {
+        inputBatchTimer = window.setTimeout(() => flushInputBatch(true), INPUT_BATCH_MS);
+      }
     }
 
-    function queueTerminalReset() {
+    function queueTerminalReset(geometryValue) {
+      const geometry = requiredGeometry(geometryValue);
       outputGeneration += 1;
       const generation = outputGeneration;
       outputChain = outputChain.then(() => {
         if (!disposed && generation === outputGeneration) {
+          canonicalGeometry = geometry;
+          terminalApi.fitGrid(geometry.cols, geometry.rows);
           terminalApi.reset();
         }
       });
@@ -630,9 +727,7 @@
             resolve();
             return;
           }
-          terminalApi.write(bytes, () => {
-            resolve();
-          });
+          terminalApi.write(bytes, resolve);
         }),
       );
       return outputChain;
@@ -646,56 +741,25 @@
       });
     }
 
-    function replayGeometryImproved(current, initial) {
-      if (!current || !initial || current.rows <= initial.rows) {
-        return false;
-      }
-      const currentCells = current.cols * current.rows;
-      const initialCells = initial.cols * initial.rows;
-      return currentCells > initialCells;
-    }
-
-    function requestInitialResync(dimensions) {
-      if (resyncPending || initialResyncComplete || !socketOpen()) {
-        return false;
-      }
-      resyncPending = true;
-      ready = false;
-      setStatus("Synchronizing…", "reconnecting");
-      sendJson({ type: "resync", cols: dimensions.cols, rows: dimensions.rows });
-      window.clearTimeout(helloTimer);
-      helloTimer = window.setTimeout(() => {
-        if (resyncPending && socketOpen()) {
-          socket.close(4006, "terminal resync timeout");
-        }
-      }, 5000);
-      return true;
-    }
-
-    function finishReady(event, resynced = false) {
-      applyControl(event.control);
+    function finishReady(event) {
+      const geometry = requiredGeometry(event.geometry);
+      canonicalGeometry = geometry;
+      terminalApi.fitGrid(geometry.cols, geometry.rows);
+      applyControl(event.control, true);
       reconnectAttempt = 0;
       lastPongAt = Date.now();
       window.clearTimeout(helloTimer);
       setOverlay("");
-      if (resynced) {
-        initialResyncComplete = true;
-        resyncPending = false;
-      } else if (!initialResyncComplete && helloGeometry) {
-        const dimensions = fitGeometry();
-        if (
-          replayGeometryImproved(dimensions, helloGeometry)
-          && requestInitialResync(dimensions)
-        ) {
-          return;
-        }
-      }
       ready = true;
-      terminalApi.focus();
-      sendJson({ type: "focus" });
-      sendNext();
+      window.requestAnimationFrame(() => {
+        if (!disposed && document.visibilityState === "visible" && document.hasFocus()) {
+          terminalApi.focus();
+        }
+      });
+      flushInputBatch(false);
+      sendAvailable();
       window.clearTimeout(webglTimer);
-      webglTimer = window.setTimeout(() => terminalApi.activateWebgl(), 2000);
+      webglTimer = window.setTimeout(() => terminalApi.activateWebgl(), 1200);
     }
 
     function applyServerEvent(event) {
@@ -703,32 +767,37 @@
         throw new Error("Invalid terminal stream event.");
       }
       if (event.type === "reset") {
-        queueTerminalReset();
+        queueTerminalReset(event.geometry);
         return;
       }
-      if (event.type === "ready") {
+      if (event.type === "ready" || event.type === "resynced") {
         const generation = outputGeneration;
         afterTerminalOutput(generation, () => finishReady(event));
         return;
       }
-      if (event.type === "resynced") {
-        const generation = outputGeneration;
-        afterTerminalOutput(generation, () => finishReady(event, true));
-        return;
-      }
       if (event.type === "control") {
         applyControl(event.control);
+        sendAvailable();
         return;
       }
       if (event.type === "ack") {
         const sequence = nonNegativeInteger(event.sequence, "terminal acknowledgement");
-        if (!inFlight || inFlight.sequence !== sequence) {
+        const firstPending = inFlight.keys().next().value;
+        if (firstPending !== sequence) {
           throw new Error("Terminal acknowledgement was out of order.");
         }
-        queuedBytes = Math.max(0, queuedBytes - inFlight.bytes.length);
-        inFlight = null;
+        const frame = inFlight.get(sequence);
+        if (!frame) {
+          throw new Error("Terminal acknowledgement did not match an in-flight frame.");
+        }
+        const remoteNext = remoteNextSequence(event.control);
+        if (remoteNext !== null && remoteNext !== sequence + 1) {
+          throw new Error("Terminal acknowledgement sequence did not advance exactly once.");
+        }
+        inFlight.delete(sequence);
+        queuedBytes = Math.max(0, queuedBytes - frame.bytes.length);
         applyControl(event.control);
-        sendNext();
+        sendAvailable();
         return;
       }
       if (event.type === "pong") {
@@ -767,8 +836,7 @@
       ) {
         return;
       }
-      const dimensions = fitGeometry();
-      helloGeometry = dimensions;
+      const dimensions = boundedGeometry(terminalApi.fit());
       candidate.send(JSON.stringify({ type: "hello", cols: dimensions.cols, rows: dimensions.rows }));
       helloTimer = window.setTimeout(() => {
         if (candidate === socket && !ready) {
@@ -777,22 +845,11 @@
       }, 5000);
     }
 
-    function fitAndResize() {
+    function resizeViewport() {
       if (disposed) {
         return;
       }
-      const dimensions = fitGeometry();
-      if (ready && socketOpen()) {
-        if (
-          !initialResyncComplete
-          && helloGeometry
-          && replayGeometryImproved(dimensions, helloGeometry)
-          && requestInitialResync(dimensions)
-        ) {
-          return;
-        }
-        sendJson({ type: "resize", cols: dimensions.cols, rows: dimensions.rows });
-      }
+      fitViewport();
     }
 
     function connect() {
@@ -806,9 +863,6 @@
       window.clearTimeout(helloTimer);
       ready = false;
       mine = false;
-      helloGeometry = null;
-      initialResyncComplete = false;
-      resyncPending = false;
       setStatus("Connecting…", "connecting");
       const candidate = new WebSocket(streamUrl(), "termdeck.terminal.v1");
       candidate.binaryType = "arraybuffer";
@@ -841,11 +895,12 @@
         if (candidate !== socket) {
           return;
         }
+        flushInputBatch(false);
         socket = null;
         ready = false;
         mine = false;
         window.clearTimeout(helloTimer);
-          discardAmbiguousInput();
+        discardAmbiguousInput();
         scheduleReconnect();
       });
       candidate.addEventListener("error", () => {
@@ -854,20 +909,13 @@
     }
 
     terminalApi.onData(enqueue);
-    terminalApi.onResize((value) => {
-      if (ready && socketOpen()) {
-        const { cols, rows } = boundedGeometry(value);
-        sendJson({ type: "resize", cols, rows });
-      }
-    });
-    host.addEventListener("focusin", () => sendJson({ type: "focus" }));
     host.addEventListener("pointerdown", () => {
       terminalApi.focus();
       sendJson({ type: "focus" });
     });
     const observer = new ResizeObserver(() => {
       window.clearTimeout(resizeTimer);
-      resizeTimer = window.setTimeout(fitAndResize, 60);
+      resizeTimer = window.setTimeout(resizeViewport, 80);
     });
     observer.observe(host);
     const reconnectNow = () => {
@@ -900,11 +948,14 @@
         window.clearTimeout(resizeTimer);
         window.clearTimeout(webglTimer);
         window.clearTimeout(helloTimer);
-          window.clearInterval(heartbeatTimer);
+        window.clearTimeout(inputBatchTimer);
+        window.clearInterval(heartbeatTimer);
         window.removeEventListener("online", reconnectNow);
         queue = [];
+        batchChunks = [];
+        batchBytes = 0;
         queuedBytes = 0;
-        inFlight = null;
+        inFlight.clear();
         if (socket) {
           socket.close(1000, "terminal switched");
           socket = null;

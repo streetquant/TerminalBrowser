@@ -5,6 +5,9 @@ import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 
+const DEFAULT_FONT_SIZE = 13;
+const MIN_FONT_SIZE = 7;
+
 const DEFAULT_THEME = Object.freeze({
   background: "#0a0d13",
   foreground: "#dfe6f2",
@@ -54,7 +57,7 @@ export function createTerminal(element, options = {}) {
     fontFamily:
       options.fontFamily ||
       '"Cascadia Mono", "JetBrains Mono", "Iosevka Term", "SFMono-Regular", Consolas, "Liberation Mono", monospace',
-    fontSize: Number.isFinite(options.fontSize) ? options.fontSize : 13,
+    fontSize: Number.isFinite(options.fontSize) ? options.fontSize : DEFAULT_FONT_SIZE,
     fontWeight: "400",
     fontWeightBold: "700",
     letterSpacing: 0,
@@ -101,23 +104,62 @@ export function createTerminal(element, options = {}) {
       webglAddon = null;
     }
   };
-  const fit = () => {
+  const proposedDimensions = () => {
     const dimensions = fitAddon.proposeDimensions();
     if (
-      dimensions
-      && Number.isInteger(dimensions.cols)
-      && Number.isInteger(dimensions.rows)
-      && dimensions.cols >= 2
-      && dimensions.rows >= 2
+      !dimensions
+      || !Number.isInteger(dimensions.cols)
+      || !Number.isInteger(dimensions.rows)
+      || dimensions.cols < 2
+      || dimensions.rows < 2
     ) {
+      return null;
+    }
+    return dimensions;
+  };
+  const fit = () => {
+    const dimensions = proposedDimensions();
+    if (dimensions) {
       terminal.resize(dimensions.cols, dimensions.rows);
     }
     return { cols: terminal.cols, rows: terminal.rows };
+  };
+  const fitGrid = (columns, rows) => {
+    if (
+      !Number.isInteger(columns)
+      || !Number.isInteger(rows)
+      || columns < 2
+      || rows < 2
+    ) {
+      throw new TypeError("A canonical terminal grid is required.");
+    }
+    const maximum = Number.isFinite(options.fontSize)
+      ? Math.max(MIN_FONT_SIZE, Math.floor(options.fontSize))
+      : DEFAULT_FONT_SIZE;
+    let chosen = MIN_FONT_SIZE;
+    let fits = false;
+    for (let fontSize = maximum; fontSize >= MIN_FONT_SIZE; fontSize -= 1) {
+      terminal.options.fontSize = fontSize;
+      const proposed = proposedDimensions();
+      if (proposed && proposed.cols >= columns && proposed.rows >= rows) {
+        chosen = fontSize;
+        fits = true;
+        break;
+      }
+    }
+    terminal.options.fontSize = chosen;
+    terminal.resize(columns, rows);
+    element.dataset.termdeckColumns = String(columns);
+    element.dataset.termdeckRows = String(rows);
+    element.dataset.termdeckFontSize = String(chosen);
+    element.dataset.termdeckOverflow = fits ? "false" : "true";
+    return { cols: columns, rows, fontSize: chosen, fits };
   };
   const subscriptions = [];
   const api = {
     terminal,
     fit,
+    fitGrid,
     dimensions() {
       return { cols: terminal.cols, rows: terminal.rows };
     },
@@ -192,4 +234,4 @@ export function createTerminal(element, options = {}) {
   return api;
 }
 
-export const terminalAssetVersion = "termdeck-xterm-v1";
+export const terminalAssetVersion = "termdeck-xterm-v2";

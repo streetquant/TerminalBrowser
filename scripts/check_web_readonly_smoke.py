@@ -287,7 +287,7 @@ def _validate_frontend_assets(
         raise RuntimeError(f"frontend JavaScript uses forbidden or obsolete contracts: {forbidden}")
     if "http://" in javascript or "https://" in javascript:
         raise RuntimeError("application JavaScript must not contain an external origin")
-    if "TermDeckTerminal" not in terminal_javascript or "termdeck-xterm-v1" not in terminal_javascript:
+    if "TermDeckTerminal" not in terminal_javascript or "termdeck-xterm-v2" not in terminal_javascript:
         raise RuntimeError("terminal bundle is missing its bounded global wrapper")
     if "Bundled license information" not in terminal_javascript:
         raise RuntimeError("terminal bundle is missing bundled license information")

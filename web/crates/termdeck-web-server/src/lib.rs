@@ -80,10 +80,10 @@ pub const MAX_FRONTEND_ASSET_BYTES: usize = 64 * 1024;
 pub const MAX_TERMINAL_ASSET_BYTES: usize = 1024 * 1024;
 pub const MAX_HTTP_REQUEST_BYTES: usize = MAX_TERMINAL_INPUT_BYTES + 1_024;
 
-const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v2/app.css";
-const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v2/app.js";
-const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v2/terminal.css";
-const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v2/terminal.js";
+const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v3/app.css";
+const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v3/app.js";
+const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v3/terminal.css";
+const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v3/terminal.js";
 const APP_CSS: &[u8] = include_bytes!("../assets/app.css");
 const APP_JS: &[u8] = include_bytes!("../assets/app.js");
 const TERMINAL_CSS: &[u8] = include_bytes!("../assets/terminal.css");
@@ -2178,7 +2178,7 @@ fn password_page_response(status: StatusCode, page: PasswordPage, error: Option<
     let mut output = String::with_capacity(2_048);
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
     escape_html_into(&mut output, title);
-    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v2/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck owner authentication</p><h1>");
+    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v3/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck owner authentication</p><h1>");
     escape_html_into(&mut output, heading);
     output.push_str("</h1><p class=\"subtle\">");
     escape_html_into(&mut output, description);
@@ -2267,7 +2267,7 @@ fn password_error_response(error: HttpAuthError, page: PasswordPage) -> Response
     }
 }
 
-const PAIRING_PAGE_HTML: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Recovery pairing · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v2/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>";
+const PAIRING_PAGE_HTML: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Recovery pairing · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v3/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>";
 
 #[derive(Serialize)]
 struct SessionDto<'a> {
@@ -2910,7 +2910,7 @@ fn render_window_page(
 
 fn render_not_found_page(slug: &str) -> String {
     let mut output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Not found · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v2/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored TermDeck window owns this route",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Not found · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v3/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored TermDeck window owns this route",
     );
     if !slug.is_empty() {
         output.push_str(": <code>/");
@@ -4221,7 +4221,7 @@ mod auth_integration_tests {
                 .clone()
                 .oneshot(request(
                     Method::GET,
-                    "/_termdeck/assets/v2/app.css",
+                    "/_termdeck/assets/v3/app.css",
                     Body::empty(),
                 ))
                 .await

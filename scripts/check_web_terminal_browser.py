@@ -65,6 +65,34 @@ SOCKET_CAPTURE_INIT = r"""
 })();
 """
 
+ACK_DELAY_INIT = r"""
+(() => {
+  const nativeAddEventListener = WebSocket.prototype.addEventListener;
+  WebSocket.prototype.addEventListener = function(type, listener, options) {
+    if (type !== "message" || typeof listener !== "function") {
+      return nativeAddEventListener.call(this, type, listener, options);
+    }
+    const wrapped = function(event) {
+      let delay = 0;
+      if (typeof event.data === "string") {
+        try {
+          if (JSON.parse(event.data)?.type === "ack") delay = 120;
+        } catch (_ignored) {
+          // Non-JSON text frames remain immediate.
+        }
+      }
+      if (delay > 0) {
+        setTimeout(() => listener.call(this, event), delay);
+      } else {
+        listener.call(this, event);
+      }
+    };
+    return nativeAddEventListener.call(this, type, wrapped, options);
+  };
+})();
+"""
+
+
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -634,6 +662,7 @@ def main() -> int:
             context_one = browser.new_context(viewport={"width": 1440, "height": 900})
             context_two = browser.new_context(viewport={"width": 1280, "height": 800})
             context_one.add_init_script(SOCKET_CAPTURE_INIT)
+            context_one.add_init_script(ACK_DELAY_INIT)
             context_two.add_init_script(SOCKET_CAPTURE_INIT)
             context_one.add_cookies(cookies_one)
             context_two.add_cookies(cookies_two)
@@ -758,6 +787,124 @@ def main() -> int:
                     {"sequence": sequence, "text": text},
                 )
 
+            def assert_workspace_layout(
+                page: Page,
+                *,
+                width: int,
+                height: int,
+                label: str,
+            ) -> dict[str, Any]:
+                page.set_viewport_size({"width": width, "height": height})
+                page.wait_for_timeout(180)
+                payload = page.evaluate(
+                    r"""() => {
+                      const rect = selector => {
+                        const element = document.querySelector(selector);
+                        if (!element) return null;
+                        const value = element.getBoundingClientRect();
+                        return {
+                          left: value.left,
+                          top: value.top,
+                          right: value.right,
+                          bottom: value.bottom,
+                          width: value.width,
+                          height: value.height,
+                        };
+                      };
+                      const visible = selector => {
+                        const element = document.querySelector(selector);
+                        if (!element) return false;
+                        const style = getComputedStyle(element);
+                        return style.display !== 'none' && style.visibility !== 'hidden';
+                      };
+                      return {
+                        viewport: { width: innerWidth, height: innerHeight },
+                        documentScrollWidth: document.documentElement.scrollWidth,
+                        documentScrollHeight: document.documentElement.scrollHeight,
+                        bodyScrollWidth: document.body.scrollWidth,
+                        bodyScrollHeight: document.body.scrollHeight,
+                        main: rect('.workspace-main'),
+                        header: rect('.workspace-headerbar'),
+                        tabbar: rect('.workspace-tabbar'),
+                        shell: rect('.workspace-shell'),
+                        left: rect('.workspace-header-left'),
+                        title: rect('.workspace-title-group'),
+                        right: rect('.workspace-header-right'),
+                        newTab: rect('.workspace-new-tab'),
+                        actions: rect('.workspace-actions summary'),
+                        terminal: rect('#terminal-xterm'),
+                        statusVisible: visible('.workspace-status'),
+                        terminalStatusVisible: visible('.terminal-status'),
+                      };
+                    }"""
+                )
+                tolerance = 1.5
+                viewport = payload["viewport"]
+                violations: list[str] = []
+                if payload["documentScrollWidth"] > viewport["width"] + tolerance:
+                    violations.append(
+                        f"document horizontal overflow {payload['documentScrollWidth']} > {viewport['width']}"
+                    )
+                if payload["bodyScrollWidth"] > viewport["width"] + tolerance:
+                    violations.append(
+                        f"body horizontal overflow {payload['bodyScrollWidth']} > {viewport['width']}"
+                    )
+                if payload["documentScrollHeight"] > viewport["height"] + tolerance:
+                    violations.append(
+                        f"document vertical overflow {payload['documentScrollHeight']} > {viewport['height']}"
+                    )
+                for name in ("main", "header", "tabbar", "shell", "terminal"):
+                    value = payload.get(name)
+                    if not isinstance(value, dict):
+                        violations.append(f"{name} is missing")
+                        continue
+                    if value["left"] < -tolerance or value["top"] < -tolerance:
+                        violations.append(f"{name} starts outside viewport: {value}")
+                    if value["right"] > viewport["width"] + tolerance:
+                        violations.append(f"{name} exceeds viewport width: {value}")
+                    if value["bottom"] > viewport["height"] + tolerance:
+                        violations.append(f"{name} exceeds viewport height: {value}")
+                header = payload.get("header") or {}
+                tabbar = payload.get("tabbar") or {}
+                shell = payload.get("shell") or {}
+                if header and tabbar and header["bottom"] > tabbar["top"] + tolerance:
+                    violations.append(f"header overlaps tabbar: header={header}, tabbar={tabbar}")
+                if tabbar and shell and tabbar["bottom"] > shell["top"] + tolerance:
+                    violations.append(f"tabbar overlaps terminal shell: tabbar={tabbar}, shell={shell}")
+                if shell and shell.get("height", 0) < max(180, height * 0.55):
+                    violations.append(f"terminal shell is too short: {shell}")
+                for name in ("newTab", "actions"):
+                    value = payload.get(name)
+                    if not isinstance(value, dict) or not header:
+                        violations.append(f"{name} is missing")
+                    elif (
+                        value["left"] < header["left"] - tolerance
+                        or value["right"] > header["right"] + tolerance
+                        or value["top"] < header["top"] - tolerance
+                        or value["bottom"] > header["bottom"] + tolerance
+                    ):
+                        violations.append(f"{name} escapes header: {value}")
+                def overlaps(first: dict[str, float] | None, second: dict[str, float] | None) -> bool:
+                    if not first or not second:
+                        return False
+                    return not (
+                        first["right"] <= second["left"] + tolerance
+                        or second["right"] <= first["left"] + tolerance
+                        or first["bottom"] <= second["top"] + tolerance
+                        or second["bottom"] <= first["top"] + tolerance
+                    )
+                if overlaps(payload.get("left"), payload.get("title")):
+                    violations.append(
+                        f"left controls overlap title: left={payload.get('left')}, title={payload.get('title')}"
+                    )
+                if overlaps(payload.get("title"), payload.get("right")):
+                    violations.append(
+                        f"title overlaps right controls: title={payload.get('title')}, right={payload.get('right')}"
+                    )
+                if violations:
+                    raise AssertionError(f"workspace layout {label} failed: {violations}; payload={payload}")
+                return payload
+
             instrument(page_one, "one")
             instrument(page_two, "two")
 
@@ -792,6 +939,14 @@ def main() -> int:
                 timeout=10_000,
             )
             result["assertions"]["terminal_starts_without_window_api"] = True
+            result["layout"] = {
+                "desktop": assert_workspace_layout(page_one, width=1440, height=900, label="desktop"),
+                "compact": assert_workspace_layout(page_one, width=980, height=620, label="compact"),
+                "mobile": assert_workspace_layout(page_one, width=430, height=740, label="mobile"),
+            }
+            page_one.set_viewport_size({"width": 1440, "height": 900})
+            page_one.wait_for_timeout(180)
+            result["assertions"]["responsive_workspace_layout"] = True
 
             try:
                 page_one.wait_for_function(
@@ -846,6 +1001,35 @@ def main() -> int:
             wait_bytes(initial_raw, b"\t")
             result["assertions"]["keyboard_control_bytes"] = True
 
+            latency_text = "PIPELINED_" + ("abcdefghijklmnopqrstuvwxyz0123456789" * 5)
+            latency_offset = len(initial_raw.read_bytes())
+            latency_started = time.monotonic_ns()
+            page_one.keyboard.type(latency_text)
+            latency_dispatched = time.monotonic_ns()
+            wait_until(
+                lambda: latency_text.encode("utf-8") in initial_raw.read_bytes()[latency_offset:],
+                timeout=5,
+                detail="120ms-ack delayed typing burst",
+            )
+            latency_finished = time.monotonic_ns()
+            latency_total_ms = (latency_finished - latency_started) / 1_000_000
+            latency_after_dispatch_ms = (latency_finished - latency_dispatched) / 1_000_000
+            if latency_total_ms > 2000 or latency_after_dispatch_ms > 1500:
+                raise AssertionError(
+                    f"pipelined input exceeded latency budget: total={latency_total_ms:.1f} ms, "
+                    f"after-dispatch={latency_after_dispatch_ms:.1f} ms"
+                )
+            result["timings_ms"].update(
+                {
+                    "delayed_ack_ms": 120,
+                    "typing_burst_bytes": len(latency_text.encode("utf-8")),
+                    "typing_dispatch": round((latency_dispatched - latency_started) / 1_000_000, 3),
+                    "typing_visible_total": round(latency_total_ms, 3),
+                    "typing_visible_after_dispatch": round(latency_after_dispatch_ms, 3),
+                }
+            )
+            result["assertions"]["bounded_pipelined_input_latency"] = True
+
             paste_text = "PASTE_東京🙂"
             page_one.evaluate(
                 "text => document.querySelector('#terminal-xterm').termdeckTerminal.paste(text)",
@@ -889,26 +1073,45 @@ def main() -> int:
             result["assertions"]["mouse_protocol"] = True
 
             geometry_before = tmux_geometry(tmux, base_env, initial_tmux_name)
+            state_before_resize = terminal_state(page_one)
             page_one.set_viewport_size({"width": 980, "height": 620})
-            wait_until(
-                lambda: tmux_geometry(tmux, base_env, initial_tmux_name) != geometry_before,
-                timeout=8,
-                detail="smaller terminal geometry",
-            )
+            page_one.wait_for_timeout(500)
             geometry_small = tmux_geometry(tmux, base_env, initial_tmux_name)
+            state_small = terminal_state(page_one)
             page_one.set_viewport_size({"width": 1600, "height": 1000})
-            wait_until(
-                lambda: tmux_geometry(tmux, base_env, initial_tmux_name) not in {geometry_before, geometry_small},
-                timeout=8,
-                detail="larger terminal geometry",
-            )
+            page_one.wait_for_timeout(500)
             geometry_large = tmux_geometry(tmux, base_env, initial_tmux_name)
+            state_large = terminal_state(page_one)
+            if geometry_small != geometry_before or geometry_large != geometry_before:
+                raise AssertionError(
+                    f"browser viewport changed canonical tmux geometry: "
+                    f"initial={geometry_before}, small={geometry_small}, large={geometry_large}"
+                )
+            canonical = tuple(int(part) for part in geometry_before.split("x", 1))
+            for label, observed in (("initial", state_before_resize), ("small", state_small), ("large", state_large)):
+                if (observed.get("cols"), observed.get("rows")) != canonical:
+                    raise AssertionError(
+                        f"browser {label} viewport did not preserve canonical xterm grid: "
+                        f"expected={canonical}, observed={(observed.get('cols'), observed.get('rows'))}"
+                    )
+            viewport_fit = page_one.evaluate(
+                """() => {
+                  const host = document.querySelector('#terminal-xterm');
+                  return {
+                    fontSize: Number(host?.dataset.termdeckFontSize || 0),
+                    overflow: host?.dataset.termdeckOverflow,
+                    columns: Number(host?.dataset.termdeckColumns || 0),
+                    rows: Number(host?.dataset.termdeckRows || 0),
+                  };
+                }"""
+            )
             result["geometry"] = {
-                "initial": geometry_before,
-                "small": geometry_small,
-                "large": geometry_large,
+                "canonical": geometry_before,
+                "after_small_viewport": geometry_small,
+                "after_large_viewport": geometry_large,
+                "viewport_fit": viewport_fit,
             }
-            result["assertions"]["resize_propagation"] = True
+            result["assertions"]["browser_geometry_isolated_from_tmux"] = True
 
             wait_browser_condition(
                 page_one,
@@ -929,17 +1132,31 @@ def main() -> int:
                 detail="second-browser WebSocket ready control state",
             )
             second_before = latest_socket_control("two") or {}
-            if second_before.get("mine") is not True:
-                raise AssertionError(f"second browser did not automatically own the pane: {second_before!r}")
-            if int(second_before.get("epoch") or 0) <= int(first_view.get("epoch") or 0):
+            if second_before.get("mine") is not False:
                 raise AssertionError(
-                    f"opening the second browser did not advance controller epoch: "
+                    f"background browser unexpectedly stole terminal control: {second_before!r}"
+                )
+            if int(second_before.get("epoch") or 0) != int(first_view.get("epoch") or 0):
+                raise AssertionError(
+                    f"passive second-browser open changed controller epoch: "
                     f"first={first_view!r}, second={second_before!r}"
                 )
             box_two = page_two.locator("#terminal-xterm").bounding_box()
             if not box_two:
                 raise AssertionError("second terminal has no browser geometry")
             page_two.mouse.click(box_two["x"] + 100, box_two["y"] + 100)
+            wait_browser_condition(
+                page_two,
+                lambda: (latest_socket_control("two") or {}).get("mine") is True,
+                timeout=5,
+                detail="explicit second-browser focus takeover",
+            )
+            second_focused = latest_socket_control("two") or {}
+            if int(second_focused.get("epoch") or 0) <= int(first_view.get("epoch") or 0):
+                raise AssertionError(
+                    f"explicit second-browser focus did not advance controller epoch: "
+                    f"first={first_view!r}, focused={second_focused!r}"
+                )
             page_two.keyboard.type("TWO_TAKEOVER")
             page_two.keyboard.press("Enter")
             wait_bytes(initial_raw, b"TWO_TAKEOVER\r")
@@ -968,9 +1185,11 @@ def main() -> int:
             result["control"] = {
                 "first_initial_epoch": first_view.get("epoch"),
                 "first_stale_sequence": stale_sequence,
-                "second_auto_takeover_epoch": second_before.get("epoch"),
+                "second_passive_epoch": second_before.get("epoch"),
+                "second_focus_takeover_epoch": second_focused.get("epoch"),
                 "second_input_epoch": second_after.get("epoch"),
-                "automatic_takeover": True,
+                "passive_browser_does_not_steal": True,
+                "explicit_focus_takeover": True,
                 "stale_writer_rejected": True,
             }
             result["assertions"]["two_browser_takeover_and_stale_rejection"] = True
@@ -1006,6 +1225,10 @@ def main() -> int:
                 timeout=10_000,
             )
             page_two.locator("#terminal-xterm").click(position={"x": 120, "y": 120})
+            page_two.wait_for_function(
+                "() => document.activeElement?.classList?.contains('xterm-helper-textarea') === true",
+                timeout=3_000,
+            )
             page_two.keyboard.type("AFTER_SERVER_RESTART")
             page_two.keyboard.press("Enter")
             wait_bytes(initial_raw, b"AFTER_SERVER_RESTART\r")
