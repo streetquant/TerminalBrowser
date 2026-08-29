@@ -1,139 +1,152 @@
-# TermDeck web host
+# TermDeck web client
 
-This directory contains the Rust-first replacement path for TermDeck's graphical frontend. The current implementation combines a strict read-only mirror of the existing TermDeck registry and tmux state with a bounded HTTP server, stable direct window routes, an embedded browser frontend, and optional owner-device authentication.
+This directory contains the Rust-first browser client for TermDeck/T1000. It exposes the same persistent tmux-backed terminals over an authenticated HTTPS origin while preserving the installed GTK application as a rollback-compatible peer until final cutover is independently approved.
 
-It does **not** replace or control the installed GTK application yet. The existing T1000 0.2.19 runtime remains authoritative until later slices prove controller, terminal-byte, action, installation, rollback, and live-cutover parity.
+## Browser experience
 
-## Current product contract
+- `/` lists every remembered TermDeck window.
+- `/<window-slug>` is the complete browser workspace for one TermDeck window: a live tab strip, one active terminal, a **New Tab** action, and tab lifecycle controls.
+- `/<window-slug>/t/<pane-id>` is the stable deep link to one terminal. Selecting a tab updates this URL without losing the window shell.
+- The terminal is rendered by a pinned xterm.js bundle. ANSI colors, cursor movement, alternate-screen applications, Unicode, IME input, mouse protocols, bracketed paste, selection, links, search, scrollback, and browser resizing are handled by a real terminal emulator rather than a text capture.
+- Ordinary keyboard, paste, mouse, and resize events flow directly through an authenticated WebSocket. There is no separate send-text form and no synthetic Enter/Ctrl+C button panel.
+- Controller leases are an internal safety mechanism. Focusing a vacant pane acquires it automatically; the first input on a remotely controlled pane explicitly takes it over. Many devices may remain viewers, but stale connections cannot write.
+- New Tab creates a persisted T1000 session in the current window. The tab `×` behaves like native T1000 and hides the tab without stopping its process. Rename, pause, resume, pin, unpin, hide, and the separately confirmed **Kill process…** action use fixed `t1000` executable and argv contracts; no shell command interpolation is used.
 
-- One TermDeck host has one owner.
-- Every enrolled device belongs to that owner.
-- A device is a viewer for a pane whenever it does not hold that pane's controller lease. Viewer/controller is pane-local state, not a permanent device role.
-- Any number of devices may view a pane, while at most one may control it.
-- Pane authority is generation-, pane-, device-, lease-, epoch-, and expiry-bound. Stale and pre-restart capabilities fail closed.
-- `/` is the window homepage, and every mirrored window has a direct route such as `/random`.
-- Internal routes are reserved below `/_termdeck/`.
+## Transport and consistency model
 
-## Implemented boundary
+The browser opens a same-origin WebSocket with subprotocol:
 
-The current server:
-
-- opens `sessions.sqlite3` with SQLite `READ_ONLY` and verified `query_only` enforcement;
-- rejects symlink and non-regular database paths;
-- validates the rollback-compatible registry schema without creating or migrating it;
-- includes remembered empty windows and every visible, non-archived, non-stopped tab;
-- overlays liveness and current working directory from one hard-coded read-only `tmux list-panes` command;
-- preserves TermDeck's stable pane target instead of exposing tmux's ephemeral `%pane-id` as canonical identity;
-- pre-renders bounded immutable HTML and JSON buffers once per refresh;
-- embeds bounded CSS and vanilla JavaScript, with no Node.js production runtime;
-- preserves exact decimal `u64` revisions through `revision_text`;
-- writes dynamic browser content through safe DOM text operations rather than HTML sinks;
-- uses bounded request, response, asset, tmux-output, database-row, timeout, and stale-state limits;
-- serves only `GET` and `HEAD` in its unauthenticated read-only mode;
-- optionally protects state with one-time pairing, opaque sessions, CSRF, logout, device inventory, and revocation;
-- emits CSP, no-store, anti-framing, MIME-sniffing, referrer, and permissions headers;
-- serves a stale snapshot only inside the configured bounded recovery interval, then returns `503`.
-
-The Rust origin still refuses non-loopback binding. A TLS reverse proxy may expose it to the LAN while preserving the origin's loopback-only authority. Native LAN TLS remains a later product slice.
-
-## Owner-device authentication
-
-`termdeck-web-auth` is consumed only when the server is started with an explicit auth directory and `--allow-insecure-loopback-auth`. The default read-only mode does not open the auth store.
-
-The authentication boundary includes:
-
-- a separate schema-versioned SQLite database that cannot use the production registry path;
-- owner-only `0700` directory and `0600` database permissions, symlink and hard-link rejection, and a 128 MiB database bound;
-- exact host/owner binding, schema and trigger verification, foreign-key checks, integrity checks, row bounds, and audit-chain verification;
-- OS-CSPRNG one-time invitations plus opaque session and CSRF capabilities;
-- persistence of domain-separated digests only; raw capabilities are redacted and zeroized;
-- one-time invite consumption, expiry, rotation, logout, device-wide revocation, replay rejection, and bounded rate limiting;
-- host-only `SameSite=Strict` cookies, `HttpOnly` for the session cookie, and a browser-readable session-bound CSRF cookie;
-- exact same-origin mutation metadata and CSRF cookie/header verification.
-
-Authentication grants viewing only. It does not grant controller leases, terminal input, tmux mutation, process actions, or writes to `sessions.sqlite3`.
-
-## Routes
-
-| Route | Purpose |
-|---|---|
-| `/` | Homepage linking every remembered window |
-| `/<window-slug>` | Direct browser view for one window |
-| `/_termdeck/api/v1/snapshot` | Versioned full host snapshot JSON |
-| `/_termdeck/api/v1/windows/<window-slug>` | Versioned one-window snapshot JSON |
-| `/_termdeck/api/v1/session` | Current authenticated session metadata |
-| `/_termdeck/api/v1/logout` | CSRF-protected current-session revocation |
-| `/_termdeck/api/v1/devices` | Bounded owner-device inventory |
-| `/_termdeck/api/v1/devices/<device-id>/revoke` | CSRF-protected device-wide revocation |
-| `/_termdeck/pair` | One-time owner-device pairing form |
-| `/_termdeck/assets/v1/app.css` | Embedded stylesheet |
-| `/_termdeck/assets/v1/app.js` | Embedded API-driven browser renderer |
-| `/_termdeck/healthz` | Process liveness |
-| `/_termdeck/readyz` | Fresh-state readiness |
-
-## Running locally
-
-Build from this directory:
-
-```bash
-cargo build --release --locked -p termdeck-web-server
+```text
+termdeck.terminal.v1
 ```
 
-Create a one-time invitation:
+The Rust backend attaches a dedicated tmux control-mode client to the selected session. Initial connection uses a pause/capture/continue transaction:
 
-```bash
-AUTH_DIR="$HOME/.local/share/termdeck/web-auth"
+1. pause incremental pane output for that control client;
+2. set the exact browser grid;
+3. capture bounded scrollback, visible screen, terminal modes, alternate-screen state, and cursor position;
+4. send one deterministic ANSI replay to xterm.js;
+5. resume `%output`/`%extended-output` byte streaming.
 
-./target/release/termdeck-web-server \
-  --auth-dir "$AUTH_DIR" \
-  --host-id termdeck-local-host \
-  --owner-id termdeck-local-owner \
-  --create-invitation "My browser"
-```
+Client input is binary and monotonically sequenced. Only the exact current device/pane/generation/lease/epoch authority may commit a sequence. An exact immediately preceding duplicate is acknowledged without re-execution when its digest-bound receipt exists. Gaps, changed duplicates, stale leases, and indeterminate outcomes fail closed. Ambiguous in-flight input is never replayed automatically after reconnect.
 
-Start the authenticated loopback origin:
+Viewer output, tmux command bodies, replay bytes, pending input, WebSocket sends, request concurrency, action concurrency, process output, and timeouts all have explicit bounds. A slow browser is disconnected rather than allowed to block tmux or grow host memory without limit.
 
-```bash
-./target/release/termdeck-web-server \
-  --db "$HOME/.local/share/termdeck/sessions.sqlite3" \
-  --listen 127.0.0.1:7391 \
-  --auth-dir "$AUTH_DIR" \
-  --host-id termdeck-local-host \
-  --owner-id termdeck-local-owner \
-  --allow-insecure-loopback-auth
-```
+## Authentication and LAN exposure
 
-The `insecure` name is intentional: a plain-HTTP loopback origin cannot honestly set `Secure` cookies. A LAN deployment must terminate TLS at a reviewed same-host reverse proxy, add `Secure` to both auth cookies, and keep the Rust origin inaccessible except through loopback. Public and Cloudflare exposure remain blocked until the native secure-origin and remote-perimeter gates are complete.
+The current LAN deployment uses an HTTPS reverse proxy in front of the loopback Rust origin. Owner-password login creates opaque revocable device sessions with host-only `Secure`, `HttpOnly`, `SameSite=Strict` session cookies and a session-bound CSRF capability. Exact Host, Origin, Fetch Metadata, WebSocket subprotocol, and authenticated-session checks protect the browser surface.
+
+The Rust origin itself remains loopback-only. Cloudflare Tunnel support is a later staging gate and must authenticate the origin rather than exposing the loopback service directly.
 
 ## Crates
 
-- `termdeck-web-auth`: host/owner-bound invitations, sessions, CSRF, revocation, rate limiting, audit evidence, and secure SQLite state.
-- `termdeck-web-core`: dependency-free IDs, immutable snapshots, stable route allocation, and generation-safe pane leases.
-- `termdeck-web-state`: strict read-only registry projection and optional read-only tmux overlay.
-- `termdeck-web-server`: current-thread Tokio/Axum HTTP server, immutable render cache, security middleware, auth integration, and embedded assets.
+- `termdeck-web-auth`: owner password, opaque device sessions, CSRF, revocation, audit chain, and bounded rate limiting in a separate owner-only database.
+- `termdeck-web-core`: stable route allocation, immutable host/window/pane snapshots, and generation-safe one-controller-per-pane authority.
+- `termdeck-web-state`: strict registry projection plus bounded read-only tmux inventory.
+- `termdeck-web-server`: HTTP/JSON, authenticated WebSocket terminal streaming, xterm assets, fixed T1000 tab actions, cache and security middleware.
 
-No crate uses unsafe Rust. The production runtime has no Node.js, Electron, GTK, VTE, or Python server dependency.
+No crate uses unsafe Rust.
+
+## Frontend build
+
+The production runtime has no Node.js or Electron dependency. Node.js and esbuild are used only to create deterministic static assets embedded in the Rust binary.
+
+```bash
+cd web/frontend
+npm ci --ignore-scripts
+npm run build
+```
+
+Pinned package versions and integrity hashes live in `frontend/package-lock.json`. The generated `terminal-assets.json` binds the bundled JavaScript and CSS bytes. Third-party licenses are recorded in `THIRD_PARTY_NOTICES.md` and retained in the JavaScript bundle.
+
+## Build and run
+
+```bash
+cd web
+cargo build --release --locked -p termdeck-web-server
+./target/release/termdeck-web-server \
+  --db "$HOME/.local/share/termdeck/sessions.sqlite3" \
+  --listen 127.0.0.1:7391 \
+  --auth-dir "$HOME/.local/share/termdeck/web-auth" \
+  --allow-insecure-loopback-auth \
+  --tmux /usr/bin/tmux \
+  --t1000 "$HOME/.local/bin/t1000"
+```
+
+The explicit insecure-loopback flag describes the internal HTTP hop only. Browser-facing LAN operation must terminate TLS before forwarding to that loopback origin.
 
 ## Verification
 
-The authoritative source gate is:
+The authoritative source gate remains:
 
 ```bash
 python scripts/check_web_readonly_smoke.py
 ```
 
-It runs bounded temporary Cargo and target directories and performs formatting, warnings-denied workspace tests, strict Clippy, dependency-tree and metadata checks, optional JavaScript syntax validation, frontend sink checks, authentication dependency and authority checks, and an exact `termdeck-web-server` authentication-consumer boundary.
+Despite its historical filename, it now verifies the full authenticated client: Rust formatting/tests/Clippy, exact dependency boundaries, xterm bundle and license hashes, browser-only build output, authentication separation, WebSocket/control-mode contracts, input receipts, fixed T1000 argv, absence of obsolete manual-control UI, and absence of a production Node runtime.
 
-## Deliberately not implemented yet
+Before promotion, the release must also pass:
 
-The following remain behind later security and parity gates:
+- disposable real-tmux browser tests for ANSI/alternate-screen/Unicode, keyboard, paste, mouse, resize, reconnect, automatic control, and tab lifecycle operations;
+- cross-host HTTPS browser validation;
+- complete inherited T1000 production validation;
+- byte and semantic invariance checks for the production registry, tmux panes, payload processes, authentication state, cwd, and recovery state;
+- transactional binary/config installation and rollback evidence.
 
-- native LAN TLS and automatic certificate lifecycle;
-- WebAuthn/passkeys and richer browser device management;
-- Cloudflare Access and origin JWT validation;
-- authenticated per-pane controller HTTP/WebSocket transport;
-- terminal byte streaming, replay, geometry, input, paste, mouse, clipboard, history, and scrollbar parity;
-- management, process, account, workspace, diagnostic, release, and rollback actions;
-- GTK/Python runtime removal and production authority cutover.
+## Remaining cutover boundary
 
-No writable production-registry or tmux path may be introduced without failing-first coverage, adversarial review, complete inherited production validation, and a rehearsed rollback boundary.
+The web client may coexist with GTK while parity is being proven. Removing GTK/Python authority, enabling a public Cloudflare hostname, or changing the installed release remains prohibited until final staging demonstrates full action parity, performance budgets, secure origin handling, reboot persistence, rollback, and unchanged live-session semantics.
+
+## Full browser terminal verification
+
+The browser workspace mounts its initial server-rendered window snapshot immediately, then
+reconciles in the background. Versioned terminal assets use a short private cache so opening
+another tab does not download the xterm bundle again. Operator-facing controller controls are
+intentionally absent: focusing and typing in a terminal performs generation-safe automatic
+ownership transfer while every other authenticated browser remains a live viewer.
+
+Run the complete disposable Chromium proof without addressing the production tmux server:
+
+```bash
+python3 scripts/check_web_terminal_e2e.py \
+  --binary ./web/target/debug/termdeck-web-server \
+  --evidence-dir ./.ai-bridge/web-terminal-e2e
+```
+
+It proves ANSI and alternate-screen replay, Unicode, keyboard controls, paste, SGR mouse,
+resize, two-browser takeover and stale-frame rejection, reconnect/resynchronization, stable
+window/tab routes, and the New Tab lifecycle.
+
+For LAN deployment, keep the Rust server loopback-only and place a same-host HTTPS proxy in
+front of it. `deploy/caddy/termdeck-web.Caddyfile.example` is the audited Caddy configuration;
+Caddy forwards WebSocket upgrades automatically and the example fixes the upstream to HTTP/1.1.
+The Host and Origin rewrite is deliberate: the Rust service accepts only loopback authority,
+so the proxy must itself be local and the backend port must never be exposed to the LAN.
+Validate the real TLS and `wss://` path on disposable ports with:
+
+```bash
+python3 scripts/check_web_https_proxy.py \
+  --binary ./web/target/debug/termdeck-web-server \
+  --evidence-dir ./.ai-bridge/web-https-proxy
+```
+
+The release load profile is fixed at 120 deterministic HTTP shards and 25 fresh authenticated
+WebSocket process smokes. Every fixture uses a unique tmux socket, registry, authentication
+store, port, and server process:
+
+```bash
+python3 scripts/check_web_production_profile.py \
+  --binary ./web/target/release/termdeck-web-server \
+  --evidence-dir ./.ai-bridge/web-production-profile
+```
+
+## HTTPS LAN reverse proxy
+
+`deploy/caddy/termdeck-web.Caddyfile` is the portable Caddy TLS boundary. The current Max LAN deployment uses `deploy/nginx/termdeck-web.nginx.conf`: it binds `192.168.1.10:7443`, keeps the Rust service loopback-only, normalizes `Host` and `Origin`, and gives `/_termdeck/ws/` a dedicated HTTP/1.1 location with explicit `Upgrade`, `Connection`, and `Sec-WebSocket-Protocol` forwarding. Ordinary HTTP remains on a separate keep-alive path, while terminal streams disable buffering and receive one-hour read/send timeouts.
+
+Validate before any reload:
+
+```bash
+caddy validate --adapter caddyfile --config deploy/caddy/termdeck-web.Caddyfile
+nginx -t -p /8tb/projects/softwares/termdeck/.runtime/termdeck-lan/nginx/ -c "$PWD/deploy/nginx/termdeck-web.nginx.conf"
+```

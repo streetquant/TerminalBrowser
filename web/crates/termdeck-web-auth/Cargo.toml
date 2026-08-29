@@ -9,6 +9,7 @@ publish = false
 workspace = true
 
 [dependencies]
+argon2.workspace = true
 getrandom.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true

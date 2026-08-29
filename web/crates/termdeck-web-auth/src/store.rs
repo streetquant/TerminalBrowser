@@ -1,3 +1,4 @@
+use crate::password::VerifiedOwnerPassword;
 use crate::secret::{
     SecretError, SecretKind, SecretToken, digest_validated_secret, random_public_id,
 };
@@ -523,6 +524,72 @@ impl AuthStore {
         })
     }
 
+    pub fn create_password_session(
+        &self,
+        proof: &VerifiedOwnerPassword,
+        device_label: &str,
+        now_ms: u64,
+        session_ttl_ms: u64,
+    ) -> Result<AuthenticatedSession, AuthError> {
+        validate_label(device_label)?;
+        if !proof.authorizes(&self.host_id, &self.owner_id) {
+            return Err(AuthError::Unauthenticated);
+        }
+        let device_id = AuthenticatedDeviceId::generate()?;
+        let session_id = AuthSessionId::generate()?;
+        let session_secret = SecretToken::generate(SecretKind::Session)?;
+        let csrf_secret = SecretToken::generate(SecretKind::Csrf)?;
+        let session_digest = session_secret.digest();
+        let csrf_digest = csrf_secret.digest();
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let expires_at_ms = checked_expiry(now_ms, session_ttl_ms, self.limits.max_session_ttl_ms)?;
+        prune_expired_auth_state(&transaction, now_ms)?;
+        enforce_capacity(&transaction, "devices", self.limits.max_devices, "devices")?;
+        enforce_capacity(
+            &transaction,
+            "auth_sessions",
+            self.limits.max_sessions,
+            "sessions",
+        )?;
+        transaction.execute(
+            "INSERT INTO devices (device_id, label, created_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![device_id.as_str(), device_label, db_timestamp(now_ms)?],
+        )?;
+        transaction.execute(
+            "INSERT INTO auth_sessions (
+                session_id, secret_hash, csrf_hash, device_id, created_at_ms, expires_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_id.as_str(),
+                session_digest.as_slice(),
+                csrf_digest.as_slice(),
+                device_id.as_str(),
+                db_timestamp(now_ms)?,
+                db_timestamp(expires_at_ms)?,
+            ],
+        )?;
+        append_audit(
+            &transaction,
+            self.limits,
+            now_ms,
+            "password-login",
+            Some(device_id.as_str()),
+            Some(session_id.as_str()),
+            "device-and-session-created",
+        )?;
+        transaction.commit()?;
+        Ok(AuthenticatedSession {
+            session_id,
+            device_id,
+            session_secret,
+            csrf_secret,
+            expires_at_ms,
+        })
+    }
+
     pub fn authenticate(
         &self,
         session_secret: &str,
@@ -846,7 +913,7 @@ impl AuthStore {
     }
 }
 
-fn validate_secure_directory(directory: &Path) -> Result<(), AuthError> {
+pub(crate) fn validate_secure_directory(directory: &Path) -> Result<(), AuthError> {
     if !directory.is_absolute()
         || directory
             .components()
@@ -890,7 +957,7 @@ struct DatabaseIdentity {
     inode: u64,
 }
 
-fn sync_directory(directory: &Path) -> Result<(), AuthError> {
+pub(crate) fn sync_directory(directory: &Path) -> Result<(), AuthError> {
     let handle = fs::File::open(directory)?;
     handle.sync_all()?;
     Ok(())
@@ -977,7 +1044,7 @@ fn validate_database_file(path: &Path) -> Result<(), AuthError> {
 }
 
 #[cfg(unix)]
-fn effective_uid() -> Result<u32, AuthError> {
+pub(crate) fn effective_uid() -> Result<u32, AuthError> {
     let status = fs::read_to_string("/proc/self/status")?;
     let line = status
         .lines()

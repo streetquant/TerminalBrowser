@@ -1,0 +1,30 @@
+{
+    admin off
+}
+
+{$TERMDECK_HTTPS_ADDRESS:192.168.1.10:7443} {
+    tls internal
+    encode zstd gzip
+
+    reverse_proxy {$TERMDECK_UPSTREAM:127.0.0.1:7391} {
+        # The Rust server deliberately accepts only loopback authority. Normalize both
+        # Host and Origin so HTTPS POST and WebSocket upgrades remain same-origin after
+        # TLS termination instead of widening the server's trust boundary.
+        header_up Host {$TERMDECK_UPSTREAM:127.0.0.1:7391}
+        header_up Origin http://{$TERMDECK_UPSTREAM:127.0.0.1:7391}
+        header_up X-Forwarded-Proto https
+
+        transport http {
+            versions h1
+        }
+
+        # Disable response buffering for terminal frames and preserve immediate flushes.
+        flush_interval -1
+    }
+
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+    }
+}

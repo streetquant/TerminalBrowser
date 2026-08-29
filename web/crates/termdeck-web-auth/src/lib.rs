@@ -10,10 +10,15 @@
 //! `Debug`, zeroized on drop, and persisted only as domain-separated SHA-256
 //! digests.
 
+mod password;
 mod rate_limit;
 mod secret;
 mod store;
 
+pub use password::{
+    MAX_OWNER_PASSWORD_BYTES, MIN_OWNER_PASSWORD_BYTES, OWNER_PASSWORD_FILENAME,
+    OwnerPasswordStore, PasswordError, VerifiedOwnerPassword,
+};
 pub use rate_limit::{BoundedRateLimiter, RateDecision, RateLimitConfig, RateLimitError};
 pub use secret::{
     SecretError, SecretKind, SecretToken, digest_validated_secret, rate_subject_digest,

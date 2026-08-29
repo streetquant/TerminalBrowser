@@ -9,19 +9,24 @@
 //! mirrored state routes.
 
 mod auth_http;
+mod tab_actions;
+mod terminal_http;
+mod terminal_stream;
 
 use auth_http::{
-    DEVICES_PATH, HttpAuth, HttpAuthError, LOGOUT_PATH, MAX_AUTH_REQUEST_BYTES, PAIRING_PATH,
-    SESSION_PATH,
+    DEVICES_PATH, HttpAuth, HttpAuthError, LOGIN_PATH, LOGOUT_PATH, MAX_AUTH_REQUEST_BYTES,
+    PAIRING_PATH, SESSION_PATH, SETUP_PATH,
 };
+use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes};
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
@@ -32,10 +37,16 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use termdeck_web_auth::{AuthError, AuthLimits, AuthStore, AuthenticatedDeviceId, SessionContext};
+use tab_actions::{ExistingTabAction, TabActionError, TabActionService};
+use termdeck_web_auth::{
+    AuthError, AuthLimits, AuthStore, AuthenticatedDeviceId, AuthenticatedSession,
+    MAX_OWNER_PASSWORD_BYTES, MIN_OWNER_PASSWORD_BYTES, SessionContext,
+};
 use termdeck_web_core::{
     ControllerView, HostId, HostSnapshot, OwnerId, PaneSnapshot, PaneStatus, WindowSnapshot,
 };
+use terminal_http::{MAX_TERMINAL_INPUT_BYTES, TerminalError, TerminalKey, TerminalService};
+use terminal_stream::{StreamPane, run_terminal_socket};
 use zeroize::Zeroizing;
 
 #[cfg(unix)]
@@ -52,26 +63,38 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:7391";
 pub const DEFAULT_REFRESH_MS: u64 = 1_000;
 pub const DEFAULT_MAX_STALE_MS: u64 = 30_000;
 pub const DEFAULT_TMUX_TIMEOUT_MS: u64 = 750;
+pub const DEFAULT_TAB_ACTION_TIMEOUT_MS: u64 = 120_000;
+pub const MAX_TAB_ACTION_TIMEOUT_MS: u64 = 900_000;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
 pub const DEFAULT_INVITATION_TTL_MS: u64 = 10 * 60 * 1_000;
 pub const DEFAULT_SESSION_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 pub const MAX_CONNECTIONS: usize = 1_024;
+pub const MAX_PASSWORD_OPERATIONS: usize = 1;
+pub const MAX_DEVICE_LABEL_BYTES: usize = 128;
 pub const MAX_INVITATION_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 pub const MAX_SESSION_TTL_MS: u64 = 180 * 24 * 60 * 60 * 1_000;
 pub const MAX_RENDERED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TMUX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TMUX_ROWS: usize = MAX_DATABASE_ROWS * 4;
 pub const MAX_FRONTEND_ASSET_BYTES: usize = 64 * 1024;
+pub const MAX_TERMINAL_ASSET_BYTES: usize = 1024 * 1024;
+pub const MAX_HTTP_REQUEST_BYTES: usize = MAX_TERMINAL_INPUT_BYTES + 1_024;
 
-const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v1/app.css";
-const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v1/app.js";
+const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v2/app.css";
+const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v2/app.js";
+const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v2/terminal.css";
+const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v2/terminal.js";
 const APP_CSS: &[u8] = include_bytes!("../assets/app.css");
 const APP_JS: &[u8] = include_bytes!("../assets/app.js");
+const TERMINAL_CSS: &[u8] = include_bytes!("../assets/terminal.css");
+const TERMINAL_JS: &[u8] = include_bytes!("../assets/terminal.js");
 const _: () = {
     assert!(APP_CSS.len() <= MAX_FRONTEND_ASSET_BYTES);
     assert!(APP_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+    assert!(TERMINAL_CSS.len() <= MAX_TERMINAL_ASSET_BYTES);
+    assert!(TERMINAL_JS.len() <= MAX_TERMINAL_ASSET_BYTES);
 };
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; manifest-src 'none'; worker-src 'none'";
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; manifest-src 'none'; worker-src 'none'";
 const USAGE: &str = "TermDeck read-only web mirror\n\n\
 Usage: termdeck-web-server [options]\n\n\
 Options:\n\
@@ -82,6 +105,9 @@ Options:\n\
   --max-connections N      Concurrent request cap, 1..1024\n\
   --tmux PATH              tmux executable (default tmux)\n\
   --tmux-timeout-ms N      Read-only inventory timeout, 50..5000\n\
+  --t1000 PATH             Fixed T1000 executable for authenticated tab actions\n\
+  --tab-action-timeout-ms N\n\
+                           Tab action timeout, 1000..900000\n\
   --host-id ID             Opaque local host identity\n\
   --owner-id ID            Opaque single-owner identity\n\
   --auth-dir PATH          Separate owner-only authentication directory\n\
@@ -104,6 +130,8 @@ pub struct ServerConfig {
     max_connections: usize,
     tmux_executable: PathBuf,
     tmux_timeout: Duration,
+    t1000_executable: PathBuf,
+    tab_action_timeout: Duration,
     host_id: HostId,
     owner_id: OwnerId,
     auth_directory: Option<PathBuf>,
@@ -138,6 +166,8 @@ impl ServerConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             tmux_executable: PathBuf::from("tmux"),
             tmux_timeout: Duration::from_millis(DEFAULT_TMUX_TIMEOUT_MS),
+            t1000_executable: home.join(".local/bin/t1000"),
+            tab_action_timeout: Duration::from_millis(DEFAULT_TAB_ACTION_TIMEOUT_MS),
             host_id: HostId::new("termdeck-local-host")?,
             owner_id: OwnerId::new("termdeck-local-owner")?,
             auth_directory: None,
@@ -202,6 +232,23 @@ impl ServerConfig {
                         return Err(ServerError::InvalidRange("--tmux-timeout-ms", 50, 5_000));
                     }
                     config.tmux_timeout = Duration::from_millis(value);
+                }
+                "--t1000" => {
+                    config.t1000_executable = PathBuf::from(next_value(&mut arguments, "--t1000")?);
+                }
+                "--tab-action-timeout-ms" => {
+                    let value = parse_u64(
+                        &next_value(&mut arguments, "--tab-action-timeout-ms")?,
+                        "--tab-action-timeout-ms",
+                    )?;
+                    if !(1_000..=MAX_TAB_ACTION_TIMEOUT_MS).contains(&value) {
+                        return Err(ServerError::InvalidRange(
+                            "--tab-action-timeout-ms",
+                            1_000,
+                            MAX_TAB_ACTION_TIMEOUT_MS,
+                        ));
+                    }
+                    config.tab_action_timeout = Duration::from_millis(value);
                 }
                 "--host-id" => {
                     config.host_id = HostId::new(next_value(&mut arguments, "--host-id")?)?;
@@ -310,6 +357,7 @@ pub enum ServerError {
     HttpAuth(HttpAuthError),
     Io(std::io::Error),
     State(StateError),
+    TabAction(TabActionError),
     Json(serde_json::Error),
     Id(termdeck_web_core::IdError),
     Join(tokio::task::JoinError),
@@ -333,6 +381,7 @@ pub enum ServerError {
     TmuxTimeout,
     TmuxFailed(String),
     TmuxOutputTooLarge(usize),
+    Terminal(TerminalError),
     MalformedTmuxRow(String),
     TooManyTmuxRows(usize),
 }
@@ -344,6 +393,7 @@ impl fmt::Display for ServerError {
             Self::HttpAuth(error) => write!(formatter, "web authentication failed: {error}"),
             Self::Io(error) => write!(formatter, "web server I/O failed: {error}"),
             Self::State(error) => write!(formatter, "web state refresh failed: {error}"),
+            Self::TabAction(error) => write!(formatter, "web tab action failed: {error}"),
             Self::Json(error) => write!(formatter, "web JSON rendering failed: {error}"),
             Self::Id(error) => write!(formatter, "web identity failed: {error}"),
             Self::Join(error) => write!(formatter, "web refresh worker failed: {error}"),
@@ -390,6 +440,7 @@ impl fmt::Display for ServerError {
                 formatter,
                 "tmux inventory output is {actual} bytes; maximum is {MAX_TMUX_OUTPUT_BYTES}"
             ),
+            Self::Terminal(error) => write!(formatter, "terminal operation failed: {error}"),
             Self::MalformedTmuxRow(row) => write!(formatter, "malformed tmux inventory row: {row}"),
             Self::TooManyTmuxRows(actual) => write!(
                 formatter,
@@ -406,9 +457,11 @@ impl Error for ServerError {
             Self::HttpAuth(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::State(error) => Some(error),
+            Self::TabAction(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Id(error) => Some(error),
             Self::Join(error) => Some(error),
+            Self::Terminal(error) => Some(error),
             _ => None,
         }
     }
@@ -438,6 +491,12 @@ impl From<StateError> for ServerError {
     }
 }
 
+impl From<TabActionError> for ServerError {
+    fn from(error: TabActionError) -> Self {
+        Self::TabAction(error)
+    }
+}
+
 impl From<serde_json::Error> for ServerError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
@@ -453,6 +512,12 @@ impl From<termdeck_web_core::IdError> for ServerError {
 impl From<tokio::task::JoinError> for ServerError {
     fn from(error: tokio::task::JoinError) -> Self {
         Self::Join(error)
+    }
+}
+
+impl From<TerminalError> for ServerError {
+    fn from(error: TerminalError) -> Self {
+        Self::Terminal(error)
     }
 }
 
@@ -607,6 +672,7 @@ impl SnapshotCache {
 }
 
 struct RenderedSnapshot {
+    snapshot: Arc<HostSnapshot>,
     full_json: Bytes,
     homepage_html: Bytes,
     windows: BTreeMap<String, RenderedWindow>,
@@ -619,9 +685,10 @@ struct RenderedWindow {
 
 impl RenderedSnapshot {
     fn new(snapshot: HostSnapshot, tmux_warning: Option<String>) -> Result<Self, ServerError> {
-        let full_json = serde_json::to_vec(&host_dto(&snapshot))?;
+        let snapshot = Arc::new(snapshot);
+        let full_json = serde_json::to_vec(&host_dto(snapshot.as_ref()))?;
         ensure_response_bound(full_json.len())?;
-        let homepage_html = render_homepage(&snapshot, tmux_warning.as_deref())?;
+        let homepage_html = render_homepage(snapshot.as_ref(), tmux_warning.as_deref())?;
         let mut windows = BTreeMap::new();
         for window in snapshot.windows() {
             let json = serde_json::to_vec(&WindowEnvelopeDto {
@@ -632,7 +699,7 @@ impl RenderedSnapshot {
                 window: window_dto(window),
             })?;
             ensure_response_bound(json.len())?;
-            let html = render_window_page(&snapshot, window, tmux_warning.as_deref())?;
+            let html = render_window_page(snapshot.as_ref(), window, tmux_warning.as_deref())?;
             windows.insert(
                 window.route().slug().to_owned(),
                 RenderedWindow {
@@ -642,6 +709,7 @@ impl RenderedSnapshot {
             );
         }
         Ok(Self {
+            snapshot,
             full_json: Bytes::from(full_json),
             homepage_html: Bytes::from(homepage_html),
             windows,
@@ -653,7 +721,10 @@ impl RenderedSnapshot {
 struct AppState {
     cache: SnapshotCache,
     request_slots: Arc<Semaphore>,
+    password_slots: Arc<Semaphore>,
     auth: Option<Arc<HttpAuth>>,
+    terminal: Option<Arc<TerminalService>>,
+    tab_actions: Option<Arc<TabActionService>>,
 }
 
 #[derive(Serialize)]
@@ -737,6 +808,24 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
         }
         None => None,
     };
+    let terminal = if auth.is_some() {
+        Some(Arc::new(TerminalService::new(
+            config.owner_id.clone(),
+            config.tmux_executable.clone(),
+            config.tmux_timeout,
+        )?))
+    } else {
+        None
+    };
+    let tab_actions = if auth.is_some() {
+        Some(Arc::new(TabActionService::new(
+            config.t1000_executable.clone(),
+            config.database_path.clone(),
+            config.tab_action_timeout,
+        )?))
+    } else {
+        None
+    };
     let cache = SnapshotCache::new(config.max_stale)?;
     let engine = RefreshEngine {
         mirror: Arc::new(Mutex::new(mirror)),
@@ -748,7 +837,10 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
     let state = AppState {
         cache,
         request_slots: Arc::new(Semaphore::new(config.max_connections)),
+        password_slots: Arc::new(Semaphore::new(MAX_PASSWORD_OPERATIONS)),
         auth,
+        terminal,
+        tab_actions,
     };
     let application = build_router(state);
     let listener = TcpListener::bind(config.listen).await?;
@@ -807,8 +899,12 @@ fn build_router(state: AppState) -> Router {
         .route("/", get(homepage))
         .route(FRONTEND_CSS_PATH, get(frontend_css))
         .route(FRONTEND_JS_PATH, get(frontend_js))
+        .route(TERMINAL_CSS_PATH, get(terminal_css))
+        .route(TERMINAL_JS_PATH, get(terminal_js))
         .route("/_termdeck/healthz", get(healthz))
         .route("/_termdeck/readyz", get(readyz))
+        .route(SETUP_PATH, get(setup_page).post(setup_submit))
+        .route(LOGIN_PATH, get(login_page).post(login_submit))
         .route(PAIRING_PATH, get(pairing_page).post(pairing_submit))
         .route(SESSION_PATH, get(session_info))
         .route(LOGOUT_PATH, axum::routing::post(logout))
@@ -819,9 +915,46 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/_termdeck/api/v1/snapshot", get(api_snapshot))
         .route("/_termdeck/api/v1/windows/{slug}", get(api_window))
+        .route(
+            "/_termdeck/api/v1/windows/{slug}/tabs",
+            axum::routing::post(tab_create),
+        )
+        .route(
+            "/_termdeck/api/v1/windows/{slug}/panes/{pane_id}/tab",
+            axum::routing::post(tab_mutate),
+        )
+        .route(
+            "/_termdeck/api/v1/windows/{slug}/panes/{pane_id}/capture",
+            get(terminal_capture),
+        )
+        .route(
+            "/_termdeck/api/v1/windows/{slug}/panes/{pane_id}/control",
+            get(terminal_control_status).post(terminal_control_acquire),
+        )
+        .route(
+            "/_termdeck/api/v1/windows/{slug}/panes/{pane_id}/control/heartbeat",
+            axum::routing::post(terminal_control_heartbeat),
+        )
+        .route(
+            "/_termdeck/api/v1/windows/{slug}/panes/{pane_id}/control/release",
+            axum::routing::post(terminal_control_release),
+        )
+        .route(
+            "/_termdeck/api/v1/windows/{slug}/panes/{pane_id}/input/text",
+            axum::routing::post(terminal_input_text),
+        )
+        .route(
+            "/_termdeck/api/v1/windows/{slug}/panes/{pane_id}/input/key",
+            axum::routing::post(terminal_input_key),
+        )
+        .route(
+            "/_termdeck/ws/v1/windows/{slug}/panes/{pane_id}",
+            get(terminal_websocket),
+        )
+        .route("/{slug}/t/{pane_id}", get(terminal_page))
         .route("/{slug}", get(window_page))
         .fallback(not_found)
-        .layer(DefaultBodyLimit::max(MAX_AUTH_REQUEST_BYTES))
+        .layer(DefaultBodyLimit::max(MAX_HTTP_REQUEST_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), auth_gate))
         .layer(middleware::from_fn_with_state(state.clone(), request_gate))
         .layer(middleware::from_fn(security_headers))
@@ -891,13 +1024,21 @@ fn public_auth_route(path: &str) -> bool {
         path,
         FRONTEND_CSS_PATH
             | FRONTEND_JS_PATH
+            | TERMINAL_CSS_PATH
+            | TERMINAL_JS_PATH
             | "/_termdeck/healthz"
             | "/_termdeck/readyz"
+            | SETUP_PATH
+            | LOGIN_PATH
             | PAIRING_PATH
     )
 }
 
 async fn security_headers(request: Request, next: Next) -> Response {
+    let versioned_asset = matches!(
+        request.uri().path(),
+        FRONTEND_CSS_PATH | FRONTEND_JS_PATH | TERMINAL_CSS_PATH | TERMINAL_JS_PATH
+    );
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(
@@ -930,7 +1071,11 @@ async fn security_headers(request: Request, next: Next) -> Response {
     );
     headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store, max-age=0"),
+        if versioned_asset {
+            HeaderValue::from_static("public, max-age=86400, immutable")
+        } else {
+            HeaderValue::from_static("no-store, max-age=0")
+        },
     );
     response
 }
@@ -960,15 +1105,154 @@ async fn frontend_js() -> Response {
     )
 }
 
-async fn pairing_page(State(state): State<AppState>) -> Response {
-    if state.auth.is_none() {
-        return not_found_response(false);
-    }
+async fn terminal_css() -> Response {
     text_response(
         StatusCode::OK,
-        "text/html; charset=utf-8",
-        Bytes::from_static(PAIRING_PAGE_HTML.as_bytes()),
+        "text/css; charset=utf-8",
+        Bytes::from_static(TERMINAL_CSS),
     )
+}
+
+async fn terminal_js() -> Response {
+    text_response(
+        StatusCode::OK,
+        "text/javascript; charset=utf-8",
+        Bytes::from_static(TERMINAL_JS),
+    )
+}
+
+async fn setup_page(State(state): State<AppState>) -> Response {
+    let Some(auth) = state.auth.as_ref() else {
+        return not_found_response(false);
+    };
+    match auth.password_configured() {
+        Ok(true) => redirect_response(LOGIN_PATH),
+        Ok(false) => password_page_response(StatusCode::OK, PasswordPage::Setup, None),
+        Err(_error) => internal_error_response(),
+    }
+}
+
+async fn login_page(State(state): State<AppState>) -> Response {
+    let Some(auth) = state.auth.as_ref() else {
+        return not_found_response(false);
+    };
+    match auth.password_configured() {
+        Ok(true) => password_page_response(StatusCode::OK, PasswordPage::Login, None),
+        Ok(false) => redirect_response(SETUP_PATH),
+        Err(_error) => internal_error_response(),
+    }
+}
+
+async fn setup_submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    password_submit(state, headers, body, PasswordPage::Setup).await
+}
+
+async fn login_submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    password_submit(state, headers, body, PasswordPage::Login).await
+}
+
+async fn password_submit(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    page: PasswordPage,
+) -> Response {
+    let Some(auth) = state.auth.as_ref() else {
+        return not_found_response(false);
+    };
+    let configured = match auth.password_configured() {
+        Ok(value) => value,
+        Err(_error) => return internal_error_response(),
+    };
+    if page == PasswordPage::Setup && configured {
+        return redirect_response(LOGIN_PATH);
+    }
+    if page == PasswordPage::Login && !configured {
+        return redirect_response(SETUP_PATH);
+    }
+    if !form_content_type(&headers) {
+        return password_page_response(
+            StatusCode::BAD_REQUEST,
+            page,
+            Some("The submitted form was invalid."),
+        );
+    }
+    let form = match parse_password_form(&body, page) {
+        Ok(value) => value,
+        Err(()) => {
+            return password_page_response(
+                StatusCode::BAD_REQUEST,
+                page,
+                Some("Enter a valid password and device name."),
+            );
+        }
+    };
+    if page == PasswordPage::Setup
+        && form
+            .confirmation
+            .as_ref()
+            .is_none_or(|confirmation| confirmation.as_str() != form.password.as_str())
+    {
+        return password_page_response(
+            StatusCode::BAD_REQUEST,
+            page,
+            Some("The two passwords do not match."),
+        );
+    }
+    let permit = match Arc::clone(&state.password_slots).try_acquire_owned() {
+        Ok(value) => value,
+        Err(_) => return password_capacity_response(),
+    };
+    let operation_auth = Arc::clone(auth);
+    let cookie_auth = Arc::clone(auth);
+    let password = form.password;
+    let device_label = form.device_label;
+    let now_ms = unix_ms();
+    let operation = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        match page {
+            PasswordPage::Setup => {
+                operation_auth.setup_password(password.as_str(), device_label.as_str(), now_ms)
+            }
+            PasswordPage::Login => {
+                operation_auth.login_password(password.as_str(), device_label.as_str(), now_ms)
+            }
+        }
+    })
+    .await;
+    let session = match operation {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => return password_error_response(error, page),
+        Err(_error) => return internal_error_response(),
+    };
+    authenticated_session_redirect(cookie_auth.as_ref(), &session, "/")
+}
+
+fn authenticated_session_redirect(
+    auth: &HttpAuth,
+    session: &AuthenticatedSession,
+    location: &'static str,
+) -> Response {
+    let cookies = match auth.session_cookie_headers(session, unix_ms()) {
+        Ok(value) => value,
+        Err(_error) => return internal_error_response(),
+    };
+    let mut response = redirect_response(location);
+    for cookie in cookies {
+        response.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    response
+}
+
+async fn pairing_page(State(state): State<AppState>) -> Response {
+    let Some(auth) = state.auth.as_ref() else {
+        return not_found_response(false);
+    };
+    match auth.password_configured() {
+        Ok(true) => redirect_response(LOGIN_PATH),
+        Ok(false) => redirect_response(SETUP_PATH),
+        Err(_error) => internal_error_response(),
+    }
 }
 
 async fn pairing_submit(
@@ -1172,6 +1456,611 @@ async fn api_window(State(state): State<AppState>, AxumPath(slug): AxumPath<Stri
     .with_status_if_missing(&state.cache, &slug, true)
 }
 
+#[derive(Deserialize)]
+struct TerminalControlRequest {
+    #[serde(default)]
+    takeover: bool,
+}
+
+#[derive(Deserialize)]
+struct TerminalTextRequest {
+    sequence: u64,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct TerminalKeyRequest {
+    sequence: u64,
+    key: String,
+}
+
+#[derive(Clone)]
+struct ResolvedWindow {
+    id: String,
+    name: String,
+}
+
+#[derive(Clone)]
+struct ResolvedPane {
+    window_name: String,
+    session_id: Option<String>,
+    pane_title: String,
+    cwd: String,
+    tmux_target: String,
+}
+
+fn terminal_context(
+    state: &AppState,
+    context: Option<Extension<SessionContext>>,
+) -> Result<(Arc<TerminalService>, SessionContext), Box<Response>> {
+    let Some(terminal) = state.terminal.as_ref() else {
+        return Err(Box::new(not_found_response(true)));
+    };
+    let Some(Extension(context)) = context else {
+        return Err(Box::new(internal_error_response()));
+    };
+    Ok((Arc::clone(terminal), context))
+}
+
+fn controller_actor(context: &SessionContext) -> String {
+    format!(
+        "{}:{}",
+        context.device_id().as_str(),
+        context.session_id().as_str()
+    )
+}
+
+fn stream_controller_actor(context: &SessionContext) -> Result<String, Box<Response>> {
+    let mut nonce = [0_u8; 16];
+    if getrandom::fill(&mut nonce).is_err() {
+        return Err(Box::new(internal_error_response()));
+    }
+    let mut actor = controller_actor(context);
+    actor.push_str(":ws-");
+    for byte in nonce {
+        use std::fmt::Write as _;
+        if write!(&mut actor, "{byte:02x}").is_err() {
+            return Err(Box::new(internal_error_response()));
+        }
+    }
+    Ok(actor)
+}
+
+fn resolve_pane(
+    cache: &SnapshotCache,
+    slug: &str,
+    pane_id: &str,
+) -> Result<ResolvedPane, Box<Response>> {
+    let publication = match cache.availability(unix_ms()) {
+        CacheAvailability::Ready(value)
+        | CacheAvailability::Degraded {
+            snapshot: value, ..
+        } => value,
+        CacheAvailability::Expired => {
+            return Err(Box::new(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "snapshot-stale-expired",
+            )));
+        }
+        CacheAvailability::Unavailable => {
+            return Err(Box::new(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "snapshot-unavailable",
+            )));
+        }
+    };
+    let Some(window) = publication
+        .snapshot
+        .windows()
+        .iter()
+        .find(|window| window.route().slug() == slug)
+    else {
+        return Err(Box::new(json_error_response(
+            StatusCode::NOT_FOUND,
+            "window-not-found",
+        )));
+    };
+    let Some(pane) = window
+        .panes()
+        .iter()
+        .find(|pane| pane.id().as_str() == pane_id)
+    else {
+        return Err(Box::new(json_error_response(
+            StatusCode::NOT_FOUND,
+            "pane-not-found",
+        )));
+    };
+    let Some(tmux_target) = pane.tmux_target() else {
+        return Err(Box::new(json_error_response(
+            StatusCode::CONFLICT,
+            "pane-has-no-tmux-target",
+        )));
+    };
+    Ok(ResolvedPane {
+        window_name: window.name().to_owned(),
+        session_id: pane.session_id().map(|value| value.as_str().to_owned()),
+        pane_title: pane.title().to_owned(),
+        cwd: pane.cwd().to_owned(),
+        tmux_target: tmux_target.to_owned(),
+    })
+}
+
+fn resolve_window(cache: &SnapshotCache, slug: &str) -> Result<ResolvedWindow, Box<Response>> {
+    let publication = match cache.availability(unix_ms()) {
+        CacheAvailability::Ready(value)
+        | CacheAvailability::Degraded {
+            snapshot: value, ..
+        } => value,
+        CacheAvailability::Expired => {
+            return Err(Box::new(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "snapshot-stale-expired",
+            )));
+        }
+        CacheAvailability::Unavailable => {
+            return Err(Box::new(json_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "snapshot-unavailable",
+            )));
+        }
+    };
+    let Some(window) = publication
+        .snapshot
+        .windows()
+        .iter()
+        .find(|window| window.route().slug() == slug)
+    else {
+        return Err(Box::new(json_error_response(
+            StatusCode::NOT_FOUND,
+            "window-not-found",
+        )));
+    };
+    Ok(ResolvedWindow {
+        id: window.id().as_str().to_owned(),
+        name: window.name().to_owned(),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewTabRequest {
+    cwd: String,
+    name: Option<String>,
+    command: Option<String>,
+    #[serde(default)]
+    pinned: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TabMutationRequest {
+    action: String,
+    name: Option<String>,
+    confirmation: Option<String>,
+}
+
+fn tab_action_context(
+    state: &AppState,
+    context: Option<Extension<SessionContext>>,
+) -> Result<Arc<TabActionService>, Box<Response>> {
+    if context.is_none() {
+        return Err(Box::new(internal_error_response()));
+    }
+    let Some(actions) = state.tab_actions.as_ref() else {
+        return Err(Box::new(not_found_response(true)));
+    };
+    Ok(Arc::clone(actions))
+}
+
+async fn tab_create(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath(slug): AxumPath<String>,
+    Json(request): Json<NewTabRequest>,
+) -> Response {
+    let actions = match tab_action_context(&state, context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let window = match resolve_window(&state.cache, slug.as_str()) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    match actions
+        .create(
+            window.id.as_str(),
+            window.name.as_str(),
+            request.cwd.as_str(),
+            request.name.as_deref(),
+            request.command.as_deref(),
+            request.pinned,
+        )
+        .await
+    {
+        Ok(value) => json_response(StatusCode::CREATED, &value),
+        Err(error) => tab_action_error_response(error),
+    }
+}
+
+async fn tab_mutate(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath((slug, pane_id)): AxumPath<(String, String)>,
+    Json(request): Json<TabMutationRequest>,
+) -> Response {
+    let actions = match tab_action_context(&state, context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let pane = match resolve_pane(&state.cache, slug.as_str(), pane_id.as_str()) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let Some(session_id) = pane.session_id.as_deref() else {
+        return json_error_response(StatusCode::CONFLICT, "pane-has-no-session-identity");
+    };
+    if request.action == "rename" {
+        let Some(name) = request.name.as_deref() else {
+            return json_error_response(StatusCode::BAD_REQUEST, "tab-name-required");
+        };
+        return match actions.rename(session_id, name).await {
+            Ok(value) => json_response(StatusCode::OK, &value),
+            Err(error) => tab_action_error_response(error),
+        };
+    }
+    let action = match ExistingTabAction::parse(request.action.as_str()) {
+        Ok(value) => value,
+        Err(error) => return tab_action_error_response(error),
+    };
+    match actions
+        .existing(session_id, action, request.confirmation.as_deref())
+        .await
+    {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(error) => tab_action_error_response(error),
+    }
+}
+
+fn tab_action_error_response(error: TabActionError) -> Response {
+    let (status, code) = match error {
+        TabActionError::Busy => (StatusCode::SERVICE_UNAVAILABLE, "tab-action-busy"),
+        TabActionError::InvalidAction => (StatusCode::BAD_REQUEST, "tab-action-invalid"),
+        TabActionError::InvalidCommand => (StatusCode::BAD_REQUEST, "tab-command-invalid"),
+        TabActionError::InvalidConfirmation => (StatusCode::CONFLICT, "tab-confirmation-invalid"),
+        TabActionError::InvalidCwd => (StatusCode::BAD_REQUEST, "tab-cwd-invalid"),
+        TabActionError::InvalidIdentity => (StatusCode::BAD_REQUEST, "tab-identity-invalid"),
+        TabActionError::InvalidName => (StatusCode::BAD_REQUEST, "tab-name-invalid"),
+        TabActionError::InvalidPath(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "tab-service-invalid")
+        }
+        TabActionError::OutputTooLarge { .. } => {
+            (StatusCode::BAD_GATEWAY, "tab-action-output-too-large")
+        }
+        TabActionError::ProcessFailed { .. } => (StatusCode::CONFLICT, "tab-action-failed"),
+        TabActionError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "tab-action-timeout"),
+        TabActionError::Io(_) | TabActionError::Json(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "tab-action-internal")
+        }
+    };
+    let mut response = json_error_response(status, code);
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    response
+}
+
+async fn terminal_page(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath((slug, pane_id)): AxumPath<(String, String)>,
+) -> Response {
+    if terminal_context(&state, context).is_err() {
+        return not_found_response(false);
+    }
+    let pane = match resolve_pane(&state.cache, slug.as_str(), pane_id.as_str()) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let mut output = String::with_capacity(4_096);
+    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,interactive-widget=resizes-content\"><title>");
+    escape_html_into(&mut output, pane.pane_title.as_str());
+    output.push_str(" · TermDeck</title><link rel=\"stylesheet\" href=\"");
+    output.push_str(FRONTEND_CSS_PATH);
+    output.push_str("\"><link rel=\"stylesheet\" href=\"");
+    output.push_str(TERMINAL_CSS_PATH);
+    output.push_str("\"><script defer src=\"");
+    output.push_str(TERMINAL_JS_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(FRONTEND_JS_PATH);
+    output.push_str("\"></script></head><body class=\"terminal-page\"><main id=\"termdeck-app\" class=\"terminal-page-main\" data-termdeck-page=\"terminal\" data-termdeck-slug=\"");
+    escape_html_into(&mut output, slug.as_str());
+    output.push_str("\" data-termdeck-pane=\"");
+    escape_html_into(&mut output, pane_id.as_str());
+    output.push_str("\"><header class=\"terminal-page-header\"><nav><a href=\"/");
+    escape_html_into(&mut output, slug.as_str());
+    output.push_str("\">← ");
+    escape_html_into(&mut output, pane.window_name.as_str());
+    output.push_str("</a></nav><div class=\"terminal-page-identity\"><strong>");
+    escape_html_into(&mut output, pane.pane_title.as_str());
+    output.push_str("</strong><span class=\"path\">");
+    escape_html_into(&mut output, pane.cwd.as_str());
+    output.push_str("</span></div><span id=\"terminal-status\" class=\"terminal-status\" role=\"status\" aria-live=\"polite\">Connecting…</span></header><section id=\"terminal-shell\" class=\"xterm-shell\" aria-label=\"Interactive terminal\"><div id=\"terminal-xterm\" class=\"xterm-host\" data-termdeck-terminal=\"1\"></div><div id=\"terminal-overlay\" class=\"terminal-overlay\" hidden></div></section></main></body></html>");
+    if ensure_response_bound(output.len()).is_err() {
+        return internal_error_response();
+    }
+    text_response(
+        StatusCode::OK,
+        "text/html; charset=utf-8",
+        Bytes::from(output),
+    )
+}
+
+fn websocket_protocol_allowed(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|protocol| protocol.trim() == "termdeck.terminal.v1")
+        })
+}
+
+async fn terminal_websocket(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath((slug, pane_id)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    if !websocket_protocol_allowed(&headers) {
+        return json_error_response(StatusCode::BAD_REQUEST, "terminal-protocol-required");
+    }
+    let (terminal, context) = match terminal_context(&state, context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let pane = match resolve_pane(&state.cache, slug.as_str(), pane_id.as_str()) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let actor = match stream_controller_actor(&context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    websocket
+        .protocols(["termdeck.terminal.v1"])
+        .on_upgrade(move |socket| {
+            run_terminal_socket(
+                socket,
+                terminal,
+                StreamPane {
+                    pane_id,
+                    tmux_target: pane.tmux_target,
+                },
+                actor,
+            )
+        })
+}
+
+async fn terminal_capture(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath((slug, pane_id)): AxumPath<(String, String)>,
+) -> Response {
+    let (terminal, _context) = match terminal_context(&state, context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let pane = match resolve_pane(&state.cache, slug.as_str(), pane_id.as_str()) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    match terminal
+        .capture(pane_id.as_str(), pane.tmux_target.as_str())
+        .await
+    {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(error) => terminal_error_response(error),
+    }
+}
+
+async fn terminal_control_status(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath((slug, pane_id)): AxumPath<(String, String)>,
+) -> Response {
+    let (terminal, context) = match terminal_context(&state, context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    if let Err(response) = resolve_pane(&state.cache, slug.as_str(), pane_id.as_str()) {
+        return *response;
+    }
+    let actor = controller_actor(&context);
+    match terminal
+        .status(pane_id.as_str(), actor.as_str(), unix_ms())
+        .await
+    {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(error) => terminal_error_response(error),
+    }
+}
+
+async fn terminal_control_acquire(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath((slug, pane_id)): AxumPath<(String, String)>,
+    Json(request): Json<TerminalControlRequest>,
+) -> Response {
+    let (terminal, context) = match terminal_context(&state, context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    if let Err(response) = resolve_pane(&state.cache, slug.as_str(), pane_id.as_str()) {
+        return *response;
+    }
+    let actor = controller_actor(&context);
+    match terminal
+        .acquire(
+            pane_id.as_str(),
+            actor.as_str(),
+            unix_ms(),
+            request.takeover,
+        )
+        .await
+    {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(error) => terminal_error_response(error),
+    }
+}
+
+async fn terminal_control_heartbeat(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath((slug, pane_id)): AxumPath<(String, String)>,
+) -> Response {
+    let (terminal, context) = match terminal_context(&state, context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    if let Err(response) = resolve_pane(&state.cache, slug.as_str(), pane_id.as_str()) {
+        return *response;
+    }
+    let actor = controller_actor(&context);
+    match terminal
+        .heartbeat(pane_id.as_str(), actor.as_str(), unix_ms())
+        .await
+    {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(error) => terminal_error_response(error),
+    }
+}
+
+async fn terminal_control_release(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath((slug, pane_id)): AxumPath<(String, String)>,
+) -> Response {
+    let (terminal, context) = match terminal_context(&state, context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    if let Err(response) = resolve_pane(&state.cache, slug.as_str(), pane_id.as_str()) {
+        return *response;
+    }
+    let actor = controller_actor(&context);
+    match terminal
+        .release(pane_id.as_str(), actor.as_str(), unix_ms())
+        .await
+    {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(error) => terminal_error_response(error),
+    }
+}
+
+async fn terminal_input_text(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath((slug, pane_id)): AxumPath<(String, String)>,
+    Json(request): Json<TerminalTextRequest>,
+) -> Response {
+    let (terminal, context) = match terminal_context(&state, context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let pane = match resolve_pane(&state.cache, slug.as_str(), pane_id.as_str()) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let actor = controller_actor(&context);
+    match terminal
+        .send_text(
+            pane_id.as_str(),
+            actor.as_str(),
+            pane.tmux_target.as_str(),
+            request.sequence,
+            request.text.as_str(),
+            unix_ms(),
+        )
+        .await
+    {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(error) => terminal_error_response(error),
+    }
+}
+
+async fn terminal_input_key(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath((slug, pane_id)): AxumPath<(String, String)>,
+    Json(request): Json<TerminalKeyRequest>,
+) -> Response {
+    let (terminal, context) = match terminal_context(&state, context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let pane = match resolve_pane(&state.cache, slug.as_str(), pane_id.as_str()) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let key = match TerminalKey::parse(request.key.as_str()) {
+        Ok(value) => value,
+        Err(error) => return terminal_error_response(error),
+    };
+    let actor = controller_actor(&context);
+    match terminal
+        .send_key(
+            pane_id.as_str(),
+            actor.as_str(),
+            pane.tmux_target.as_str(),
+            request.sequence,
+            key,
+            unix_ms(),
+        )
+        .await
+    {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(error) => terminal_error_response(error),
+    }
+}
+
+fn terminal_error_response(error: TerminalError) -> Response {
+    match error {
+        TerminalError::Busy => {
+            let mut response =
+                json_error_response(StatusCode::SERVICE_UNAVAILABLE, "terminal-capacity-reached");
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            response
+        }
+        TerminalError::Control(termdeck_web_core::ControlError::PaneAlreadyControlled {
+            ..
+        }) => json_error_response(StatusCode::CONFLICT, "pane-already-controlled"),
+        TerminalError::Control(_)
+        | TerminalError::NotController
+        | TerminalError::InvalidSequence { .. }
+        | TerminalError::Indeterminate => {
+            json_error_response(StatusCode::CONFLICT, "controller-state-conflict")
+        }
+        TerminalError::Id(_) | TerminalError::InvalidKey | TerminalError::InputTooLarge { .. } => {
+            json_error_response(StatusCode::BAD_REQUEST, "invalid-terminal-request")
+        }
+        TerminalError::TmuxFailed(_) | TerminalError::TmuxTimeout => {
+            json_error_response(StatusCode::BAD_GATEWAY, "tmux-operation-failed")
+        }
+        TerminalError::OutputTooLarge { .. } => {
+            json_error_response(StatusCode::PAYLOAD_TOO_LARGE, "terminal-output-too-large")
+        }
+        TerminalError::Utf8(_) | TerminalError::Io(_) | TerminalError::SequenceOverflow => {
+            internal_error_response()
+        }
+    }
+}
+
 async fn healthz() -> Response {
     text_response(
         StatusCode::OK,
@@ -1200,7 +2089,185 @@ async fn not_found(method: Method) -> Response {
     not_found_response(false)
 }
 
-const PAIRING_PAGE_HTML: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Pair device · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v1/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck owner authentication</p><h1>Pair this device</h1><p class=\"subtle\">Paste the one-time invitation created locally on the TermDeck host.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Pairing invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair device</button></form></main></body></html>";
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PasswordPage {
+    Setup,
+    Login,
+}
+
+struct PasswordForm {
+    password: Zeroizing<String>,
+    confirmation: Option<Zeroizing<String>>,
+    device_label: String,
+}
+
+fn parse_password_form(body: &[u8], page: PasswordPage) -> Result<PasswordForm, ()> {
+    if body.is_empty() || body.len() > MAX_AUTH_REQUEST_BYTES {
+        return Err(());
+    }
+    let text = std::str::from_utf8(body).map_err(|_error| ())?;
+    let mut password: Option<Zeroizing<String>> = None;
+    let mut confirmation: Option<Zeroizing<String>> = None;
+    let mut device_label: Option<String> = None;
+    let mut fields = 0_usize;
+    for field in text.split('&') {
+        fields = fields.saturating_add(1);
+        if fields > 3 {
+            return Err(());
+        }
+        let (name, encoded) = field.split_once('=').ok_or(())?;
+        let value = percent_decode_form(encoded)?;
+        match name {
+            "password" if password.is_none() => password = Some(value),
+            "confirm" if page == PasswordPage::Setup && confirmation.is_none() => {
+                confirmation = Some(value);
+            }
+            "label" if device_label.is_none() => {
+                let label = value.as_str().trim();
+                if !label.is_empty() {
+                    if label.len() > MAX_DEVICE_LABEL_BYTES || label.chars().any(char::is_control) {
+                        return Err(());
+                    }
+                    device_label = Some(label.to_owned());
+                }
+            }
+            _ => return Err(()),
+        }
+    }
+    let password = password.ok_or(())?;
+    if password.len() > MAX_OWNER_PASSWORD_BYTES || password.chars().any(char::is_control) {
+        return Err(());
+    }
+    if page == PasswordPage::Setup && password.len() < MIN_OWNER_PASSWORD_BYTES {
+        return Err(());
+    }
+    if let Some(value) = confirmation.as_ref()
+        && (value.len() > MAX_OWNER_PASSWORD_BYTES || value.chars().any(char::is_control))
+    {
+        return Err(());
+    }
+    if page == PasswordPage::Setup && confirmation.is_none() {
+        return Err(());
+    }
+    Ok(PasswordForm {
+        password,
+        confirmation,
+        device_label: device_label.unwrap_or_else(|| String::from("Browser")),
+    })
+}
+
+fn password_page_response(status: StatusCode, page: PasswordPage, error: Option<&str>) -> Response {
+    let (title, heading, description, action, autocomplete, confirmation) = match page {
+        PasswordPage::Setup => (
+            "Set TermDeck password",
+            "Choose your TermDeck password",
+            "This password signs in every browser you authorize on your LAN.",
+            SETUP_PATH,
+            "new-password",
+            true,
+        ),
+        PasswordPage::Login => (
+            "Sign in to TermDeck",
+            "Sign in to TermDeck",
+            "Enter the owner password to open this browser session.",
+            LOGIN_PATH,
+            "current-password",
+            false,
+        ),
+    };
+    let mut output = String::with_capacity(2_048);
+    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
+    escape_html_into(&mut output, title);
+    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v2/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck owner authentication</p><h1>");
+    escape_html_into(&mut output, heading);
+    output.push_str("</h1><p class=\"subtle\">");
+    escape_html_into(&mut output, description);
+    output.push_str("</p>");
+    if let Some(error) = error {
+        output.push_str("<p role=\"alert\"><strong>");
+        escape_html_into(&mut output, error);
+        output.push_str("</strong></p>");
+    }
+    output.push_str("<form method=\"post\" action=\"");
+    escape_html_into(&mut output, action);
+    output.push_str("\" autocomplete=\"on\"><label>Password<input name=\"password\" type=\"password\" required autocomplete=\"");
+    escape_html_into(&mut output, autocomplete);
+    output.push_str("\" maxlength=\"");
+    output.push_str(MAX_OWNER_PASSWORD_BYTES.to_string().as_str());
+    output.push('"');
+    if page == PasswordPage::Setup {
+        output.push_str(" minlength=\"");
+        output.push_str(MIN_OWNER_PASSWORD_BYTES.to_string().as_str());
+        output.push('"');
+    }
+    output.push_str("></label>");
+    if confirmation {
+        output.push_str("<label>Confirm password<input name=\"confirm\" type=\"password\" required autocomplete=\"new-password\" minlength=\"");
+        output.push_str(MIN_OWNER_PASSWORD_BYTES.to_string().as_str());
+        output.push_str("\" maxlength=\"");
+        output.push_str(MAX_OWNER_PASSWORD_BYTES.to_string().as_str());
+        output.push_str("\"></label>");
+    }
+    output.push_str("<label>Device name<input name=\"label\" type=\"text\" autocomplete=\"username\" maxlength=\"");
+    output.push_str(MAX_DEVICE_LABEL_BYTES.to_string().as_str());
+    output.push_str("\" value=\"Browser\"></label><button type=\"submit\">");
+    output.push_str(if page == PasswordPage::Setup {
+        "Set password and open TermDeck"
+    } else {
+        "Sign in"
+    });
+    output.push_str("</button></form></main></body></html>");
+    text_response(status, "text/html; charset=utf-8", Bytes::from(output))
+}
+
+fn password_capacity_response() -> Response {
+    let mut response = json_error_response(StatusCode::SERVICE_UNAVAILABLE, "password-busy");
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+fn password_error_response(error: HttpAuthError, page: PasswordPage) -> Response {
+    if let Some(retry_after_ms) = error.retry_after_ms() {
+        let mut response = password_page_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            page,
+            Some("Too many attempts. Try again shortly."),
+        );
+        let seconds = retry_after_ms.div_ceil(1_000).max(1);
+        if let Ok(value) = HeaderValue::from_str(seconds.to_string().as_str()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
+    match error {
+        HttpAuthError::InvalidPassword => password_page_response(
+            StatusCode::BAD_REQUEST,
+            page,
+            Some("Use at least eight characters without control characters."),
+        ),
+        HttpAuthError::PasswordAlreadyConfigured => redirect_response(LOGIN_PATH),
+        HttpAuthError::Unauthenticated => password_page_response(
+            StatusCode::UNAUTHORIZED,
+            PasswordPage::Login,
+            Some("The password was not accepted."),
+        ),
+        HttpAuthError::RateLimited { .. } => password_capacity_response(),
+        HttpAuthError::Auth(_)
+        | HttpAuthError::CsrfRejected
+        | HttpAuthError::ExpiredSession
+        | HttpAuthError::InvalidConfiguration
+        | HttpAuthError::LockPoisoned
+        | HttpAuthError::MalformedCookie
+        | HttpAuthError::MalformedHeader
+        | HttpAuthError::Password(_)
+        | HttpAuthError::Rate(_)
+        | HttpAuthError::Secret(_) => internal_error_response(),
+    }
+}
+
+const PAIRING_PAGE_HTML: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Recovery pairing · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v2/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>";
 
 #[derive(Serialize)]
 struct SessionDto<'a> {
@@ -1351,7 +2418,10 @@ fn pairing_error_response(error: HttpAuthError) -> Response {
         }
         HttpAuthError::Auth(_)
         | HttpAuthError::InvalidConfiguration
+        | HttpAuthError::InvalidPassword
         | HttpAuthError::LockPoisoned
+        | HttpAuthError::Password(_)
+        | HttpAuthError::PasswordAlreadyConfigured
         | HttpAuthError::Rate(_)
         | HttpAuthError::Secret(_) => internal_error_response(),
     }
@@ -1377,7 +2447,10 @@ fn authentication_error_response(error: HttpAuthError, path: &str) -> Response {
         }
         HttpAuthError::Auth(_)
         | HttpAuthError::InvalidConfiguration
+        | HttpAuthError::InvalidPassword
         | HttpAuthError::LockPoisoned
+        | HttpAuthError::Password(_)
+        | HttpAuthError::PasswordAlreadyConfigured
         | HttpAuthError::Rate(_)
         | HttpAuthError::Secret(_) => internal_error_response(),
     }
@@ -1392,7 +2465,7 @@ fn unauthorized_response(path: &str) -> Response {
         );
         response
     } else {
-        redirect_response(PAIRING_PATH)
+        redirect_response(LOGIN_PATH)
     }
 }
 
@@ -1718,13 +2791,15 @@ fn render_homepage(
     output.push_str(FRONTEND_CSS_PATH);
     output.push_str("\"><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
-    output.push_str("\"></script></head><body><main id=\"termdeck-app\" data-termdeck-page=\"home\"><header><p class=\"eyebrow\">TermDeck read-only host mirror</p><h1>Windows</h1><p class=\"subtle\">");
+    output.push_str("\"></script></head><body><main id=\"termdeck-app\" data-termdeck-page=\"home\"><header><p class=\"eyebrow\">TermDeck host</p><h1>Windows</h1><p class=\"subtle\">");
     output.push_str(&snapshot.windows().len().to_string());
     output.push_str(" windows · ");
     output.push_str(&snapshot.total_panes().to_string());
     output.push_str(" visible panes · revision ");
     output.push_str(&snapshot.revision().to_string());
-    output.push_str("</p><p class=\"identity\">All browser sessions are viewers; this frontend has no mutation authority.</p></header>");
+    output.push_str(
+        "</p><p class=\"identity\">Open any window to work with its live terminals.</p></header>",
+    );
     if tmux_warning.is_some() {
         output.push_str("<div class=\"notice\">tmux inventory is temporarily unavailable; registry status is shown without claiming live-process certainty.</div>");
     }
@@ -1754,7 +2829,7 @@ fn render_homepage(
             "<div class=\"empty\">No remembered TermDeck windows are currently available.</div>",
         );
     }
-    output.push_str("</section><noscript><div class=\"notice\">Automatic API refresh requires JavaScript; this server-rendered snapshot remains read-only.</div></noscript><footer class=\"footer-row\"><a href=\"/_termdeck/api/v1/snapshot\">Versioned JSON</a><p class=\"refresh-state\">Server-rendered fallback · viewer-only browser session</p></footer></main></body></html>");
+    output.push_str("</section><noscript><div class=\"notice\">Window navigation remains available; live refresh and terminal control require JavaScript.</div></noscript><footer class=\"footer-row\"><a href=\"/_termdeck/api/v1/snapshot\">Versioned JSON</a><p class=\"refresh-state\">Server-rendered snapshot</p></footer></main></body></html>");
     ensure_response_bound(output.len())?;
     Ok(output)
 }
@@ -1769,11 +2844,22 @@ fn render_window_page(
     escape_html_into(&mut output, window.name());
     output.push_str(" · TermDeck</title><link rel=\"stylesheet\" href=\"");
     output.push_str(FRONTEND_CSS_PATH);
+    output.push_str("\"><link rel=\"stylesheet\" href=\"");
+    output.push_str(TERMINAL_CSS_PATH);
     output.push_str("\"><script defer src=\"");
+    output.push_str(TERMINAL_JS_PATH);
+    output.push_str("\"></script><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
     output.push_str("\"></script></head><body><main id=\"termdeck-app\" data-termdeck-page=\"window\" data-termdeck-slug=\"");
     escape_html_into(&mut output, window.route().slug());
-    output.push_str("\"><nav><a href=\"/\">← All windows</a></nav><header><p class=\"eyebrow\">TermDeck read-only window</p><h1>");
+    if let Some(initial_pane) = window
+        .active_pane_id()
+        .or_else(|| window.panes().first().map(PaneSnapshot::id))
+    {
+        output.push_str("\" data-termdeck-pane=\"");
+        escape_html_into(&mut output, initial_pane.as_str());
+    }
+    output.push_str("\"><nav><a href=\"/\">← All windows</a></nav><header><p class=\"eyebrow\">TermDeck window</p><h1>");
     escape_html_into(&mut output, window.name());
     output.push_str("</h1><p class=\"subtle\">");
     output.push_str(&window.panes().len().to_string());
@@ -1794,7 +2880,11 @@ fn render_window_page(
         );
     }
     for pane in window.panes() {
-        output.push_str("<article class=\"pane\"><div class=\"pane-main\"><h2>");
+        output.push_str("<a class=\"pane pane-link\" href=\"/");
+        output.push_str(window.route().slug());
+        output.push_str("/t/");
+        append_percent_encoded_path_segment(&mut output, pane.id().as_str());
+        output.push_str("\"><div class=\"pane-main\"><h2>");
         escape_html_into(&mut output, pane.title());
         output.push_str("</h2><p class=\"path\">");
         escape_html_into(&mut output, pane.cwd());
@@ -1808,22 +2898,19 @@ fn render_window_page(
         output.push_str(pane_status_name(pane.status()));
         output.push_str("\">");
         output.push_str(pane_status_name(pane.status()));
-        output.push_str("</span><span class=\"mode\">Viewer · read-only</span>");
-        if pane.controller().is_some() {
-            output.push_str("<span class=\"controller-active\">Controller active</span>");
-        }
-        output.push_str("</div></article>");
+        output.push_str("</span><span class=\"mode\">Open terminal</span>");
+        output.push_str("</div></a>");
     }
-    output.push_str("</section><noscript><div class=\"notice\">Automatic API refresh requires JavaScript; this server-rendered snapshot remains read-only.</div></noscript><footer class=\"footer-row\"><a href=\"/_termdeck/api/v1/windows/");
+    output.push_str("</section><noscript><div class=\"notice\">Pane navigation remains available; live refresh and terminal control require JavaScript.</div></noscript><footer class=\"footer-row\"><a href=\"/_termdeck/api/v1/windows/");
     output.push_str(window.route().slug());
-    output.push_str("\">Versioned JSON</a><p class=\"refresh-state\">Server-rendered fallback · viewer-only browser session</p></footer></main></body></html>");
+    output.push_str("\">Versioned JSON</a><p class=\"refresh-state\">Server-rendered snapshot</p></footer></main></body></html>");
     ensure_response_bound(output.len())?;
     Ok(output)
 }
 
 fn render_not_found_page(slug: &str) -> String {
     let mut output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Not found · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v1/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored TermDeck window owns this route",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Not found · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v2/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored TermDeck window owns this route",
     );
     if !slug.is_empty() {
         output.push_str(": <code>/");
@@ -1832,6 +2919,19 @@ fn render_not_found_page(slug: &str) -> String {
     }
     output.push_str(".</p><p><a href=\"/\">Return to all windows</a></p></main></body></html>");
     output
+}
+
+fn append_percent_encoded_path_segment(output: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            output.push(char::from(byte));
+        } else {
+            output.push('%');
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
 }
 
 fn escape_html_into(output: &mut String, value: &str) {
@@ -2009,8 +3109,9 @@ fn duration_ms(duration: Duration) -> Result<u64, ServerError> {
 mod tests {
     use super::{
         APP_CSS, APP_JS, AppState, CONTENT_SECURITY_POLICY, CacheAvailability, ConfigAction,
-        FRONTEND_CSS_PATH, FRONTEND_JS_PATH, MAX_FRONTEND_ASSET_BYTES, RenderedSnapshot,
-        ServerConfig, ServerError, SnapshotCache, build_router, unix_ms,
+        FRONTEND_CSS_PATH, FRONTEND_JS_PATH, MAX_FRONTEND_ASSET_BYTES, MAX_PASSWORD_OPERATIONS,
+        RenderedSnapshot, ServerConfig, ServerError, SnapshotCache, TERMINAL_JS_PATH, build_router,
+        unix_ms,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Method, Request, StatusCode, header};
@@ -2095,7 +3196,10 @@ mod tests {
         AppState {
             cache,
             request_slots: Arc::new(Semaphore::new(64)),
+            password_slots: Arc::new(Semaphore::new(MAX_PASSWORD_OPERATIONS)),
             auth: None,
+            terminal: None,
+            tab_actions: None,
         }
     }
 
@@ -2178,7 +3282,8 @@ mod tests {
             assert!(home_text.contains("data-termdeck-page=\"home\""));
             assert!(home_text.contains(FRONTEND_CSS_PATH));
             assert!(home_text.contains(FRONTEND_JS_PATH));
-            assert!(home_text.contains("All browser sessions are viewers"));
+            assert!(home_text.contains("Open any window to work with its live terminals."));
+            assert!(!home_text.contains("read-only host mirror"));
             assert!(!home_text.contains("<style>"));
 
             let window = match router
@@ -2195,7 +3300,9 @@ mod tests {
             assert!(window_text.contains("data-termdeck-page=\"window\""));
             assert!(window_text.contains("data-termdeck-slug=\"random\""));
             assert!(window_text.contains("Pane session-one"));
-            assert!(window_text.contains("Viewer · read-only"));
+            assert!(window_text.contains("href=\"/random/t/session-one\""));
+            assert!(window_text.contains("Open terminal"));
+            assert!(!window_text.contains("Viewer · read-only"));
             assert!(!window_text.contains("<style>"));
         });
     }
@@ -2206,9 +3313,10 @@ mod tests {
             assert!(APP_CSS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(APP_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(CONTENT_SECURITY_POLICY.contains("script-src 'self'"));
-            assert!(CONTENT_SECURITY_POLICY.contains("style-src 'self'"));
+            assert!(CONTENT_SECURITY_POLICY.contains("style-src 'self' 'unsafe-inline'"));
             assert!(CONTENT_SECURITY_POLICY.contains("connect-src 'self'"));
-            assert!(!CONTENT_SECURITY_POLICY.contains("unsafe-inline"));
+            assert!(!CONTENT_SECURITY_POLICY.contains("script-src 'self' 'unsafe-inline'"));
+            assert!(!CONTENT_SECURITY_POLICY.contains("unsafe-eval"));
 
             let router = build_router(state(30_000, unix_ms()));
             let css = match router
@@ -2225,6 +3333,12 @@ mod tests {
                     .get(header::CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok()),
                 Some("text/css; charset=utf-8")
+            );
+            assert_eq!(
+                css.headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("public, max-age=86400, immutable")
             );
             let css_text = body_text(css).await;
             assert_eq!(css_text.as_bytes(), APP_CSS);
@@ -2250,9 +3364,29 @@ mod tests {
             assert!(script.contains("/_termdeck/api/v1/windows/"));
             assert!(script.contains("textContent"));
             assert!(script.contains("replaceChildren"));
-            assert!(script.contains("Viewer · read-only"));
+            assert!(script.contains("Open terminal"));
+            assert!(script.contains("termdeck.terminal-control.v1"));
+            assert!(script.contains("/_termdeck/ws/v1/windows/"));
+            assert!(script.contains("new WebSocket"));
+            assert!(script.contains("termdeck.terminal.v1"));
+            assert!(script.contains("terminal-xterm"));
             assert!(script.contains("AbortController"));
             assert!(script.contains("revision_text"));
+            assert!(!script.contains("/control/release"));
+            assert!(!script.contains("/input/text"));
+            assert!(!script.contains("/input/key"));
+            assert!(!script.contains("Take control"));
+            assert!(!script.contains("Release control"));
+            assert!(!script.contains("Controller active"));
+            assert!(!script.contains("typing switches control"));
+            assert!(script.contains("Pane ${paneId} · connecting"));
+            assert!(script.contains("workspace-headerbar"));
+            assert!(script.contains("workspace-tab-close"));
+            assert!(script.contains("Hide tab"));
+            assert!(script.contains("Kill process…"));
+            assert!(!script.contains("workspace-terminal-header"));
+            assert!(!script.contains("Reconnecting in"));
+            assert!(!script.contains("terminal-composer"));
             for forbidden in [
                 "innerHTML",
                 "outerHTML",
@@ -2269,6 +3403,27 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn window_page_bootstraps_the_initial_terminal_before_api_refresh() {
+        let rendered = match RenderedSnapshot::new(test_snapshot(unix_ms()), None) {
+            Ok(value) => value,
+            Err(error) => panic!("could not render initial-pane snapshot: {error}"),
+        };
+        let window = match rendered.windows.get("random") {
+            Some(value) => value,
+            None => panic!("rendered random window was missing"),
+        };
+        let html = match std::str::from_utf8(window.html.as_ref()) {
+            Ok(value) => value,
+            Err(error) => panic!("window HTML was not UTF-8: {error}"),
+        };
+        assert!(html.contains("data-termdeck-page=\"window\""));
+        assert!(html.contains("data-termdeck-slug=\"random\""));
+        assert!(html.contains("data-termdeck-pane=\"session-one\""));
+        assert!(html.contains(TERMINAL_JS_PATH));
+        assert!(html.contains(FRONTEND_JS_PATH));
     }
 
     #[test]
@@ -2502,8 +3657,9 @@ mod tests {
 mod auth_integration_tests {
     use super::auth_http::CSRF_HEADER_NAME;
     use super::{
-        APP_CSS, AppState, ConfigAction, HttpAuth, PAIRING_PATH, RenderedSnapshot, ServerConfig,
-        ServerError, SnapshotCache, build_router, ensure_auth_directory, loopback_authority,
+        APP_CSS, AppState, ConfigAction, HttpAuth, LOGIN_PATH, MAX_PASSWORD_OPERATIONS,
+        PAIRING_PATH, RenderedSnapshot, SESSION_PATH, SETUP_PATH, ServerConfig, ServerError,
+        SnapshotCache, TERMINAL_JS_PATH, build_router, ensure_auth_directory, loopback_authority,
         parse_pairing_form, unix_ms,
     };
     use axum::body::{Body, to_bytes};
@@ -2514,7 +3670,9 @@ mod auth_integration_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
-    use termdeck_web_auth::{AuthLimits, AuthStore};
+    use termdeck_web_auth::{
+        AUTH_DATABASE_FILENAME, AuthLimits, AuthStore, OWNER_PASSWORD_FILENAME,
+    };
     use termdeck_web_core::{
         HostId, HostSnapshot, OwnerId, PaneId, PaneSnapshot, PaneStatus, SessionId, WindowId,
         WindowRoute, WindowSnapshot,
@@ -2528,6 +3686,7 @@ mod auth_integration_tests {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     const TEST_HOST: &str = "127.0.0.1:7391";
+    const TEST_AUTH_TTL_MS: u64 = 15 * 60_000;
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
     struct TestDirectory(PathBuf);
@@ -2625,13 +3784,13 @@ mod auth_integration_tests {
         let mut invitations = Vec::new();
         for label in labels {
             let invitation = store
-                .create_invitation(label, now_ms, 60_000)
+                .create_invitation(label, now_ms, TEST_AUTH_TTL_MS)
                 .unwrap_or_else(|error| panic!("could not create HTTP auth invitation: {error}"));
             invitations.push(Zeroizing::new(
                 invitation.secret().expose_secret().to_owned(),
             ));
         }
-        let auth = HttpAuth::new(store, 60_000, false)
+        let auth = HttpAuth::new(store, TEST_AUTH_TTL_MS, false)
             .unwrap_or_else(|error| panic!("could not create HTTP auth fixture: {error}"));
         let cache = SnapshotCache::new(Duration::from_millis(30_000))
             .unwrap_or_else(|error| panic!("could not create HTTP auth cache: {error}"));
@@ -2645,7 +3804,10 @@ mod auth_integration_tests {
             state: AppState {
                 cache,
                 request_slots: Arc::new(Semaphore::new(64)),
+                password_slots: Arc::new(Semaphore::new(MAX_PASSWORD_OPERATIONS)),
                 auth: Some(Arc::new(auth)),
+                terminal: None,
+                tab_actions: None,
             },
             invitations,
         }
@@ -2695,6 +3857,25 @@ mod auth_integration_tests {
     fn pairing_request(secret: &str) -> Request<Body> {
         let body = format!("invitation={secret}");
         let mut request = unsafe_request(Method::POST, PAIRING_PATH, Body::from(body), None, false);
+        request.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        request
+    }
+
+    fn password_request(
+        path: &str,
+        password: &str,
+        confirmation: Option<&str>,
+        label: &str,
+    ) -> Request<Body> {
+        let mut body = format!("password={password}&label={label}");
+        if let Some(confirmation) = confirmation {
+            body.push_str("&confirm=");
+            body.push_str(confirmation);
+        }
+        let mut request = unsafe_request(Method::POST, path, Body::from(body), None, false);
         request.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/x-www-form-urlencoded"),
@@ -2779,7 +3960,10 @@ mod auth_integration_tests {
             let router = build_router(AppState {
                 cache,
                 request_slots: Arc::new(Semaphore::new(64)),
+                password_slots: Arc::new(Semaphore::new(MAX_PASSWORD_OPERATIONS)),
                 auth: None,
+                terminal: None,
+                tab_actions: None,
             });
             let home = router
                 .clone()
@@ -2806,6 +3990,201 @@ mod auth_integration_tests {
     }
 
     #[test]
+    fn password_setup_login_logout_and_capacity_are_fail_closed() {
+        runtime().block_on(async {
+            let fixture = fixture(&[]);
+            let router = build_router(fixture.state.clone());
+            let password = "correct-password-123";
+
+            let unauthenticated_home = router
+                .clone()
+                .oneshot(request(Method::GET, "/", Body::empty()))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(unauthenticated_home.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                unauthenticated_home
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some(LOGIN_PATH)
+            );
+
+            let login_before_setup = router
+                .clone()
+                .oneshot(request(Method::GET, LOGIN_PATH, Body::empty()))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(login_before_setup.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                login_before_setup
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some(SETUP_PATH)
+            );
+
+            let setup_page = router
+                .clone()
+                .oneshot(request(Method::GET, SETUP_PATH, Body::empty()))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(setup_page.status(), StatusCode::OK);
+            let setup_text = body_text(setup_page).await;
+            assert!(setup_text.contains("Choose your TermDeck password"));
+            assert!(!setup_text.contains("invitation"));
+
+            let mismatch = router
+                .clone()
+                .oneshot(password_request(
+                    SETUP_PATH,
+                    password,
+                    Some("different-password"),
+                    "Laptop",
+                ))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+
+            let setup = router
+                .clone()
+                .oneshot(password_request(
+                    SETUP_PATH,
+                    password,
+                    Some(password),
+                    "Laptop",
+                ))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(setup.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                setup
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("/")
+            );
+            let first_session = cookies_from_response(&setup);
+
+            let password_path = fixture._directory.path().join(OWNER_PASSWORD_FILENAME);
+            let auth_path = fixture._directory.path().join(AUTH_DATABASE_FILENAME);
+            let password_bytes = fs::read(&password_path)
+                .unwrap_or_else(|error| panic!("could not read owner password record: {error}"));
+            let auth_bytes = fs::read(&auth_path)
+                .unwrap_or_else(|error| panic!("could not read authentication database: {error}"));
+            assert!(
+                !password_bytes
+                    .windows(password.len())
+                    .any(|window| window == password.as_bytes())
+            );
+            assert!(
+                !auth_bytes
+                    .windows(password.len())
+                    .any(|window| window == password.as_bytes())
+            );
+
+            let authenticated_snapshot = router
+                .clone()
+                .oneshot(authenticated_get(
+                    "/_termdeck/api/v1/snapshot",
+                    &first_session,
+                ))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(authenticated_snapshot.status(), StatusCode::OK);
+
+            let setup_after_configuration = router
+                .clone()
+                .oneshot(request(Method::GET, SETUP_PATH, Body::empty()))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(setup_after_configuration.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                setup_after_configuration
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some(LOGIN_PATH)
+            );
+
+            let pairing_after_configuration = router
+                .clone()
+                .oneshot(request(Method::GET, PAIRING_PATH, Body::empty()))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(pairing_after_configuration.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                pairing_after_configuration
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some(LOGIN_PATH)
+            );
+
+            let logout = router
+                .clone()
+                .oneshot(unsafe_request(
+                    Method::POST,
+                    "/_termdeck/api/v1/logout",
+                    Body::empty(),
+                    Some(&first_session),
+                    true,
+                ))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(logout.status(), StatusCode::OK);
+
+            let wrong_password = router
+                .clone()
+                .oneshot(password_request(
+                    LOGIN_PATH,
+                    "wrong-password",
+                    None,
+                    "Laptop2",
+                ))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(wrong_password.status(), StatusCode::UNAUTHORIZED);
+            assert!(
+                body_text(wrong_password)
+                    .await
+                    .contains("The password was not accepted")
+            );
+
+            let held = Arc::clone(&fixture.state.password_slots)
+                .acquire_owned()
+                .await
+                .unwrap_or_else(|error| panic!("could not hold password semaphore: {error}"));
+            let capacity = router
+                .clone()
+                .oneshot(password_request(LOGIN_PATH, password, None, "Laptop2"))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
+            drop(held);
+
+            let login = router
+                .clone()
+                .oneshot(password_request(LOGIN_PATH, password, None, "Laptop2"))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(login.status(), StatusCode::SEE_OTHER);
+            let second_session = cookies_from_response(&login);
+            let session = router
+                .clone()
+                .oneshot(authenticated_get(SESSION_PATH, &second_session))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(session.status(), StatusCode::OK);
+            assert!(
+                body_text(session)
+                    .await
+                    .contains("\"device_label\":\"Laptop2\"")
+            );
+        });
+    }
+
+    #[test]
     fn pairing_protects_state_and_logout_requires_exact_csrf_metadata() {
         runtime().block_on(async {
             let fixture = fixture(&["Laptop"]);
@@ -2821,7 +4200,7 @@ mod auth_integration_tests {
                     .headers()
                     .get(header::LOCATION)
                     .and_then(|value| value.to_str().ok()),
-                Some(PAIRING_PATH)
+                Some(LOGIN_PATH)
             );
             let unauthenticated_api = router
                 .clone()
@@ -2842,20 +4221,39 @@ mod auth_integration_tests {
                 .clone()
                 .oneshot(request(
                     Method::GET,
-                    "/_termdeck/assets/v1/app.css",
+                    "/_termdeck/assets/v2/app.css",
                     Body::empty(),
                 ))
                 .await
                 .unwrap_or_else(|error| match error {});
             assert_eq!(asset.status(), StatusCode::OK);
             assert_eq!(body_text(asset).await.as_bytes(), APP_CSS);
+            let terminal_asset = router
+                .clone()
+                .oneshot(request(Method::GET, TERMINAL_JS_PATH, Body::empty()))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(terminal_asset.status(), StatusCode::OK);
+            assert_eq!(
+                terminal_asset
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("public, max-age=86400, immutable")
+            );
             let pairing_page = router
                 .clone()
                 .oneshot(request(Method::GET, PAIRING_PATH, Body::empty()))
                 .await
                 .unwrap_or_else(|error| match error {});
-            assert_eq!(pairing_page.status(), StatusCode::OK);
-            assert!(body_text(pairing_page).await.contains("Pair this device"));
+            assert_eq!(pairing_page.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                pairing_page
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some(SETUP_PATH)
+            );
 
             let mut missing_metadata = request(
                 Method::POST,

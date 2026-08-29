@@ -4,12 +4,15 @@ use std::fmt;
 use std::sync::{Mutex, MutexGuard};
 use termdeck_web_auth::{
     AuthError, AuthSessionId, AuthStore, AuthenticatedDeviceId, AuthenticatedSession,
-    BoundedRateLimiter, DeviceRecord, RateDecision, RateLimitConfig, RateLimitError, SecretKind,
-    SessionContext, rate_subject_digest, validate_secret,
+    BoundedRateLimiter, DeviceRecord, OwnerPasswordStore, PasswordError, RateDecision,
+    RateLimitConfig, RateLimitError, SecretKind, SessionContext, VerifiedOwnerPassword,
+    rate_subject_digest, validate_secret,
 };
 use zeroize::Zeroizing;
 
 pub const PAIRING_PATH: &str = "/_termdeck/pair";
+pub const SETUP_PATH: &str = "/_termdeck/setup";
+pub const LOGIN_PATH: &str = "/_termdeck/login";
 pub const SESSION_PATH: &str = "/_termdeck/api/v1/session";
 pub const LOGOUT_PATH: &str = "/_termdeck/api/v1/logout";
 pub const DEVICES_PATH: &str = "/_termdeck/api/v1/devices";
@@ -22,6 +25,7 @@ const INSECURE_CSRF_COOKIE: &str = "termdeck_csrf";
 const SECURE_SESSION_COOKIE: &str = "__Host-termdeck_session";
 const SECURE_CSRF_COOKIE: &str = "__Host-termdeck_csrf";
 const PAIRING_RATE_SCOPE: &str = "pairing";
+const PASSWORD_RATE_SCOPE: &str = "password";
 const SESSION_RATE_SCOPE: &str = "session";
 const RATE_SUBJECT: &[u8] = b"loopback-owner";
 const DEFAULT_RATE_SUBJECTS: usize = 8;
@@ -31,6 +35,7 @@ const DEFAULT_RATE_BLOCK_MS: u64 = 5 * 60_000;
 
 pub struct HttpAuth {
     store: AuthStore,
+    password_store: OwnerPasswordStore,
     limiter: Mutex<BoundedRateLimiter>,
     session_ttl_ms: u64,
     secure_cookies: bool,
@@ -64,8 +69,19 @@ impl HttpAuth {
         if session_ttl_ms == 0 {
             return Err(HttpAuthError::InvalidConfiguration);
         }
+        let secure_directory = store
+            .database_path()
+            .parent()
+            .ok_or(HttpAuthError::InvalidConfiguration)?;
+        let password_store = OwnerPasswordStore::new(
+            secure_directory,
+            store.host_id().clone(),
+            store.owner_id().clone(),
+        )
+        .map_err(HttpAuthError::Password)?;
         Ok(Self {
             store,
+            password_store,
             limiter: Mutex::new(BoundedRateLimiter::new(rate_config)?),
             session_ttl_ms,
             secure_cookies,
@@ -83,10 +99,10 @@ impl HttpAuth {
         headers: &HeaderMap,
         wall_clock_ms: u64,
     ) -> Result<SessionContext, HttpAuthError> {
-        let now_ms = self.now_ms(wall_clock_ms)?;
-        self.check_rate(SESSION_RATE_SCOPE, now_ms)?;
         let session_secret = cookie_value(headers, self.session_cookie_name())?
             .ok_or(HttpAuthError::Unauthenticated)?;
+        let now_ms = self.now_ms(wall_clock_ms)?;
+        self.check_rate(SESSION_RATE_SCOPE, now_ms)?;
         if validate_secret(SecretKind::Session, session_secret.as_str()).is_err() {
             self.record_failure(SESSION_RATE_SCOPE, now_ms)?;
             return Err(HttpAuthError::Unauthenticated);
@@ -129,6 +145,64 @@ impl HttpAuth {
             }
             Err(error) => Err(HttpAuthError::Auth(error)),
         }
+    }
+
+    pub fn password_configured(&self) -> Result<bool, HttpAuthError> {
+        self.password_store
+            .is_configured()
+            .map_err(HttpAuthError::Password)
+    }
+
+    pub fn setup_password(
+        &self,
+        password: &str,
+        device_label: &str,
+        wall_clock_ms: u64,
+    ) -> Result<AuthenticatedSession, HttpAuthError> {
+        let now_ms = self.now_ms(wall_clock_ms)?;
+        self.check_rate(PASSWORD_RATE_SCOPE, now_ms)?;
+        let proof = match self.password_store.configure_once(password, now_ms) {
+            Ok(value) => value,
+            Err(PasswordError::AlreadyConfigured) => {
+                return Err(HttpAuthError::PasswordAlreadyConfigured);
+            }
+            Err(PasswordError::InvalidPassword) => return Err(HttpAuthError::InvalidPassword),
+            Err(error) => return Err(HttpAuthError::Password(error)),
+        };
+        let session = self
+            .store
+            .create_password_session(&proof, device_label, now_ms, self.session_ttl_ms)
+            .map_err(HttpAuthError::Auth)?;
+        self.clear_rate(PASSWORD_RATE_SCOPE)?;
+        Ok(session)
+    }
+
+    pub fn login_password(
+        &self,
+        password: &str,
+        device_label: &str,
+        wall_clock_ms: u64,
+    ) -> Result<AuthenticatedSession, HttpAuthError> {
+        let now_ms = self.now_ms(wall_clock_ms)?;
+        self.check_rate(PASSWORD_RATE_SCOPE, now_ms)?;
+        let proof: VerifiedOwnerPassword = match self.password_store.verify(password) {
+            Ok(value) => value,
+            Err(
+                PasswordError::InvalidPassword
+                | PasswordError::NotConfigured
+                | PasswordError::Unauthenticated,
+            ) => {
+                self.record_failure(PASSWORD_RATE_SCOPE, now_ms)?;
+                return Err(HttpAuthError::Unauthenticated);
+            }
+            Err(error) => return Err(HttpAuthError::Password(error)),
+        };
+        let session = self
+            .store
+            .create_password_session(&proof, device_label, now_ms, self.session_ttl_ms)
+            .map_err(HttpAuthError::Auth)?;
+        self.clear_rate(PASSWORD_RATE_SCOPE)?;
+        Ok(session)
     }
 
     pub fn verify_csrf(
@@ -358,9 +432,12 @@ pub enum HttpAuthError {
     CsrfRejected,
     ExpiredSession,
     InvalidConfiguration,
+    InvalidPassword,
     LockPoisoned,
     MalformedCookie,
     MalformedHeader,
+    Password(PasswordError),
+    PasswordAlreadyConfigured,
     Rate(RateLimitError),
     RateLimited { retry_after_ms: u64 },
     Secret(termdeck_web_auth::SecretError),
@@ -385,9 +462,14 @@ impl fmt::Display for HttpAuthError {
             Self::InvalidConfiguration => {
                 formatter.write_str("invalid HTTP authentication configuration")
             }
+            Self::InvalidPassword => formatter.write_str("invalid owner password"),
             Self::LockPoisoned => formatter.write_str("authentication rate limiter is unavailable"),
             Self::MalformedCookie => formatter.write_str("malformed authentication cookie"),
             Self::MalformedHeader => formatter.write_str("malformed authentication header"),
+            Self::Password(error) => write!(formatter, "owner password failed: {error}"),
+            Self::PasswordAlreadyConfigured => {
+                formatter.write_str("owner password is already configured")
+            }
             Self::Rate(error) => write!(formatter, "authentication rate limiter failed: {error}"),
             Self::RateLimited { .. } => formatter.write_str("authentication rate limit reached"),
             Self::Secret(error) => error.fmt(formatter),
@@ -400,6 +482,7 @@ impl Error for HttpAuthError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Auth(error) => Some(error),
+            Self::Password(error) => Some(error),
             Self::Rate(error) => Some(error),
             Self::Secret(error) => Some(error),
             _ => None,
@@ -508,6 +591,20 @@ mod tests {
         };
         headers.insert(header::COOKIE, value);
         headers
+    }
+
+    #[test]
+    fn missing_session_cookie_does_not_touch_the_authentication_database() {
+        let directory = TestDirectory::new("missing-cookie");
+        let auth = auth(&directory, false);
+        let database_path = auth.store.database_path().to_owned();
+        fs::remove_file(&database_path).unwrap_or_else(|error| {
+            panic!("could not remove test authentication database: {error}")
+        });
+        assert!(matches!(
+            auth.authenticate(&HeaderMap::new(), 2),
+            Err(HttpAuthError::Unauthenticated)
+        ));
     }
 
     #[test]

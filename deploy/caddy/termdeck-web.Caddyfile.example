@@ -1,0 +1,22 @@
+# TermDeck LAN HTTPS endpoint. Keep the Rust backend bound to loopback.
+# Replace 192.168.1.10 with this host's stable LAN address when necessary.
+https://192.168.1.10:7443 {
+    tls internal
+    encode zstd gzip
+
+    # Caddy performs WebSocket Upgrade/Connection forwarding automatically.
+    # Force HTTP/1.1 upstream because RFC 6455 WebSockets use the HTTP/1.1 upgrade.
+    reverse_proxy 127.0.0.1:7391 {
+        header_up Host 127.0.0.1:7391
+        header_up Origin http://127.0.0.1:7391
+        header_up X-Forwarded-Proto https
+        transport http {
+            versions h1
+        }
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+    }
+}
