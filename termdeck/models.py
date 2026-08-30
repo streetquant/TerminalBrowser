@@ -5,6 +5,18 @@ from pathlib import Path
 from typing import Mapping
 
 
+RECOVERY_INTENT_ACTIVE = "active"
+RECOVERY_INTENT_INACTIVE = "inactive"
+RECOVERY_INTENT_LEGACY = "legacy"
+RECOVERY_INTENTS = frozenset(
+    {
+        RECOVERY_INTENT_ACTIVE,
+        RECOVERY_INTENT_INACTIVE,
+        RECOVERY_INTENT_LEGACY,
+    }
+)
+
+
 # Signature "t1000 ink" 16-color set. Tuned for the chrome-matched dark
 # surface (#0a0d13): ANSI black is a visible slate instead of #000000 so
 # full-screen TUIs that print black/bright-black text stay readable, and
@@ -75,6 +87,10 @@ class SessionRecord:
     recovery_attempts: int = 0
     recovery_last_attempt_at: str | None = None
     recovery_last_error: str | None = None
+    # Durable lifecycle intent is separate from the observed runtime status.
+    # ``legacy`` is retained for ambiguous historical/start-error records and
+    # is never sufficient on its own to authorize cold-start recovery.
+    recovery_intent: str = RECOVERY_INTENT_LEGACY
 
 
 @dataclass(frozen=True)

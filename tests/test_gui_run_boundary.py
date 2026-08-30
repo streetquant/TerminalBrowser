@@ -125,6 +125,52 @@ class GuiRunBoundaryTest(TestCase):
         application.run.assert_called_once_with([sys.argv[0]])
         self.assertEqual(result, 23)
 
+    def test_primary_startup_migrates_only_a_missing_managed_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            managed_root = Path(tmp) / "runtime" / "t1000-managed"
+            target = managed_root.parent / "termdeck" / "sessions.sqlite3"
+            store = mock.Mock()
+            with mock.patch.dict(
+                "os.environ",
+                {"T1000_MANAGED_ROOT": str(managed_root)},
+                clear=False,
+            ), mock.patch.object(gtk_app, "DEFAULT_DB_PATH", target), mock.patch.object(
+                gtk_app, "migrate_legacy_database"
+            ) as migrate, mock.patch.object(
+                gtk_app, "SessionStore", return_value=store
+            ) as constructor, mock.patch.object(
+                gtk_app, "consume_pending_recovery_intents"
+            ) as consume:
+                result = gtk_app.open_primary_session_store(target)
+
+            self.assertIs(result, store)
+            migrate.assert_called_once_with(destination=target)
+            constructor.assert_called_once_with(target)
+            consume.assert_called_once_with(store)
+
+    def test_existing_managed_registry_never_rechecks_legacy_hdd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            managed_root = Path(tmp) / "runtime" / "t1000-managed"
+            target = managed_root.parent / "termdeck" / "sessions.sqlite3"
+            target.parent.mkdir(parents=True)
+            target.touch()
+            with mock.patch.dict(
+                "os.environ",
+                {"T1000_MANAGED_ROOT": str(managed_root)},
+                clear=False,
+            ), mock.patch.object(gtk_app, "DEFAULT_DB_PATH", target), mock.patch.object(
+                gtk_app, "migrate_legacy_database"
+            ) as migrate, mock.patch.object(
+                gtk_app, "SessionStore"
+            ) as constructor, mock.patch.object(
+                gtk_app, "consume_pending_recovery_intents"
+            ) as consume:
+                gtk_app.open_primary_session_store(target)
+
+            migrate.assert_not_called()
+            constructor.assert_called_once_with(target)
+            consume.assert_called_once()
+
 
 if __name__ == "__main__":
     import unittest

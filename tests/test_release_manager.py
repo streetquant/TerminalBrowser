@@ -455,6 +455,79 @@ def test_snapshot_source_rejects_tracked_symlink(tmp_path: Path) -> None:
         snapshot_source(tmp_path)
 
 
+def test_install_refuses_dirty_candidate_without_mutating_managed_root(
+    tmp_path: Path,
+) -> None:
+    info = build_info("d")
+    info.update(
+        {
+            "source_commit": "d" * 40 + "+dirty",
+            "build_mode": "dirty-candidate",
+        }
+    )
+    info["build_id"] = compute_build_id(info)
+    wheel = tmp_path / "candidate" / WHEEL_NAME
+    write_wheel(
+        wheel,
+        seed="d",
+        extra_members={"termdeck/_build_info.json": canonical_json_bytes(info)},
+    )
+    manifest_path = wheel.with_suffix(".release.json")
+    write_manifest(manifest_path, wheel, info)
+
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    verified = verify_wheel(wheel, manifest_path=manifest_path)
+    assert verified.build_info["build_mode"] == "dirty-candidate"
+    with pytest.raises(ReleaseError, match="production release"):
+        install_release(wheel, manifest_path, root=root, bin_dir=bin_dir)
+
+    assert not root.exists()
+    assert not bin_dir.exists()
+
+
+def test_install_refuses_development_artifact_without_mutating_managed_root(
+    tmp_path: Path,
+) -> None:
+    info: dict[str, object] = {
+        "schema": BUILD_INFO_SCHEMA,
+        "version": VERSION,
+        "source_commit": "development",
+        "source_tree_sha256": "",
+        "source_date_epoch": 0,
+        "build_mode": "development",
+        "build_id": "development",
+    }
+    wheel = tmp_path / "development" / WHEEL_NAME
+    write_wheel(
+        wheel,
+        seed="d",
+        extra_members={"termdeck/_build_info.json": canonical_json_bytes(info)},
+    )
+    wheel_hash = sha256_file(wheel)
+    manifest_path = wheel.with_suffix(".release.json")
+    manifest_path.write_bytes(
+        canonical_json_bytes(
+            {
+                "schema": RELEASE_MANIFEST_SCHEMA,
+                "release_id": "0" * 64,
+                "build_info": info,
+                "wheel": wheel.name,
+                "wheel_sha256": wheel_hash,
+                "wheel_size": wheel.stat().st_size,
+            }
+        )
+    )
+
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with pytest.raises(ReleaseError, match="development build"):
+        install_release(wheel, manifest_path, root=root, bin_dir=bin_dir)
+
+    assert not root.exists()
+    assert not bin_dir.exists()
+
+
 def test_snapshot_root_and_export_are_bound_to_the_original_bytes(tmp_path: Path) -> None:
     source = tmp_path / "source"
     init_git_project(source)

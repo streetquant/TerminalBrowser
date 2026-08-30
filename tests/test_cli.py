@@ -3,12 +3,50 @@ import contextlib
 import io
 import json
 import pathlib
+import tempfile
 import unittest
 
-from termdeck.cli import _persist_auth_update_with_retry, _select_records, build_parser, cmd_activity, cmd_archive, cmd_auth, cmd_auth_gc, cmd_budget_plan, cmd_capture, cmd_checkpoint, cmd_control_plan, cmd_diagnose_freeze, cmd_diagnostics, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_reconcile, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_sessions, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
+from termdeck.cli import _persist_auth_update_with_retry, _prepare_managed_session_database, _select_records, build_parser, cmd_activity, cmd_archive, cmd_auth, cmd_auth_gc, cmd_budget_plan, cmd_capture, cmd_checkpoint, cmd_control_plan, cmd_diagnose_freeze, cmd_diagnostics, cmd_gui, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_reconcile, cmd_recovery_intent, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_sessions, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
 
 
 class CliTests(unittest.TestCase):
+    def test_managed_cli_uses_legacy_registry_until_primary_gui_cutover(self):
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed_root = root / "managed" / "t1000-managed"
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir(parents=True)
+            legacy.touch()
+            args = argparse.Namespace(db=None, func=cmd_sessions)
+            with mock.patch.dict(
+                "os.environ",
+                {"T1000_MANAGED_ROOT": str(managed_root)},
+                clear=False,
+            ), mock.patch("termdeck.cli.legacy_state_dir", return_value=legacy.parent):
+                _prepare_managed_session_database(args)
+            self.assertEqual(args.db, legacy)
+
+    def test_managed_primary_gui_defers_database_cutover_to_startup(self):
+        from unittest import mock
+
+        args = argparse.Namespace(db=None, func=cmd_gui)
+        with mock.patch.dict(
+            "os.environ",
+            {"T1000_MANAGED_ROOT": "/ssd/t1000"},
+            clear=False,
+        ):
+            _prepare_managed_session_database(args)
+        self.assertIsNone(args.db)
+
+    def test_explicit_database_never_enters_managed_cutover(self):
+        explicit = pathlib.Path("/tmp/explicit.sqlite3")
+        args = argparse.Namespace(db=explicit, func=cmd_sessions)
+        _prepare_managed_session_database(args)
+        self.assertEqual(args.db, explicit)
+
     def test_auth_store_retry_keeps_retrying_until_commit(self):
         import sqlite3
         from unittest import mock
@@ -31,7 +69,7 @@ class CliTests(unittest.TestCase):
         subparsers = [action for action in parser._actions if isinstance(action, argparse._SubParsersAction)]
         self.assertEqual(len(subparsers), 1)
         choices = sorted(subparsers[0].choices)
-        self.assertEqual(choices, ['activity', 'adopt-tmux', 'archive', 'auth', 'auth-gc', 'budget-plan', 'capture', 'checkpoint', 'control-plan', 'diagnose-freeze', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-checkpoint-service', 'install-desktop', 'kill', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'quickstart', 'recently-closed', 'reconcile', 'release', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'terminator-workspace', 'uninstall-checkpoint-service', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
+        self.assertEqual(choices, ['activity', 'adopt-tmux', 'archive', 'auth', 'auth-gc', 'budget-plan', 'capture', 'checkpoint', 'control-plan', 'diagnose-freeze', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-checkpoint-service', 'install-desktop', 'kill', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'quickstart', 'recently-closed', 'reconcile', 'recovery-intent', 'recovery-qualification', 'release', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'terminator-workspace', 'uninstall-checkpoint-service', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
 
 
     def test_shortcuts_command_outputs_json_with_terminator_override(self):

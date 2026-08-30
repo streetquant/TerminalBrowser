@@ -31,4 +31,4 @@ where = ["."]
 include = ["termdeck*"]
 
 [tool.setuptools.package-data]
-termdeck = ["_build_info.json"]
+termdeck = ["_build_info.json", "data/*.desktop"]

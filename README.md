@@ -244,7 +244,7 @@ sudo t1000 install-checkpoint-service \
 
 The strict system service performs a final exact-UUID scan before the user manager and tmux scopes stop. Ordinary shells and jobs remain alive across TermDeck GUI restarts because tmux owns them, but their instruction-level memory is not generically restored after an operating-system reboot. Automatic DMTCP wrapping is disabled: real tmux PTYs exposed application-signal conflicts, fork-path failures, and indefinite drains on external network sockets. Long-running non-Codex work should use its own durable checkpoints and idempotent resume command. A missing uncheckpointed process fails closed as `recovery-pending`; TermDeck never silently reruns it from the beginning.
 
-For tabs saved by older TermDeck releases with only `codex --yolo`, startup performs a bounded metadata-only scan of Codex rollout files. It accepts only primary `source="cli"` UUIDs, matches exact project directories or a unique near-time session, and prevents one UUID from being resumed concurrently in multiple tabs. Unambiguous conversations resume exactly. When no trustworthy UUID exists and the saved command is a plain shell, TermDeck restores the tab and working directory as a shell while making no claim that the missing conversation was recovered.
+Foreground startup never scans the global Codex rollout archive. Tabs must carry a checkpointed primary conversation UUID before automatic recovery; older rows that contain only `codex --yolo` remain explicit recovery exceptions until a bounded maintenance operation can bind one exact `source="cli"` rollout. TermDeck never guesses a conversation, falls back to another workspace, or starts a replacement thread merely to make a pane look healthy.
 
 ## Keyboard shortcuts
 

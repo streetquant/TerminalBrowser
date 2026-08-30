@@ -1,16 +1,26 @@
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import os
 import re
 import sqlite3
+import stat
+import tempfile
 import uuid
 from collections.abc import Iterable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .models import SessionRecord
+from .models import (
+    RECOVERY_INTENT_ACTIVE,
+    RECOVERY_INTENT_INACTIVE,
+    RECOVERY_INTENT_LEGACY,
+    RECOVERY_INTENTS,
+    SessionRecord,
+)
 from .session_recipe import (
     DEFAULT_RESTART_POLICY,
     SessionRecipeError,
@@ -19,11 +29,117 @@ from .session_recipe import (
     recovery_command_specificity,
 )
 
-APP_DIR = Path.home() / ".local" / "share" / "termdeck"
-DEFAULT_DB_PATH = APP_DIR / "sessions.sqlite3"
-DEFAULT_AUTH_ROOT = APP_DIR / "terminal-auth"
+_LEGACY_APP_DIR = Path.home() / ".local" / "share" / "termdeck"
+
+
+def legacy_state_dir() -> Path:
+    return Path.home() / ".local" / "share" / "termdeck"
+
+
+def managed_state_dir(*, environ: Mapping[str, str] | None = None) -> Path:
+    """Return the mutable TermDeck state directory for the active launcher.
+
+    Managed T1000 launches place their root on the SSD fabric.  Keeping the
+    TermDeck directory beside that root makes the session registry and its
+    private auth scopes follow the managed state volume without moving the
+    user's legacy auth tree.
+    """
+
+    values = os.environ if environ is None else environ
+    raw_root = str(values.get("T1000_MANAGED_ROOT", "") or "").strip()
+    if not raw_root:
+        return _LEGACY_APP_DIR
+    root = Path(raw_root).expanduser()
+    if not root.is_absolute():
+        raise ValueError("T1000_MANAGED_ROOT must be an absolute path")
+    return root.parent / "termdeck"
+
+
+def default_db_path(*, environ: Mapping[str, str] | None = None) -> Path:
+    return managed_state_dir(environ=environ) / "sessions.sqlite3"
+
+
+def default_auth_root(*, environ: Mapping[str, str] | None = None) -> Path:
+    return managed_state_dir(environ=environ) / "terminal-auth"
+
+
+APP_DIR = managed_state_dir()
+DEFAULT_DB_PATH = default_db_path()
+DEFAULT_AUTH_ROOT = default_auth_root()
+
+
+class SessionDatabaseMigrationError(RuntimeError):
+    """Raised when a legacy session database cannot be migrated safely."""
+
+
+class SessionDatabaseMigrationInProgress(SessionDatabaseMigrationError):
+    """Raised when another primary process owns the migration transaction."""
+
+
+@dataclass(frozen=True)
+class SessionDatabaseMigration:
+    status: str
+    source: Path
+    destination: Path
+    source_sha256: str | None = None
+    destination_sha256: str | None = None
 
 _SAFE = re.compile(r"[^a-zA-Z0-9_]+")
+
+_ACTIVE_RECOVERY_STATUSES = frozenset(
+    {"running", "paused", "missing", "recovery-pending"}
+)
+_INACTIVE_RECOVERY_STATUSES = frozenset(
+    {"new", "remembered", "stopped", "archived"}
+)
+
+
+def normalise_recovery_intent(value: object) -> str:
+    """Return the canonical persisted recovery-intent value.
+
+    Unknown values become ``legacy`` so malformed historical state cannot
+    authorize a startup relaunch.  The spelling remains British to match the
+    existing TermDeck normalisation helpers.
+    """
+
+    if isinstance(value, bool):
+        return RECOVERY_INTENT_ACTIVE if value else RECOVERY_INTENT_INACTIVE
+    normalized = str(value or "").strip().casefold()
+    aliases = {
+        "active": RECOVERY_INTENT_ACTIVE,
+        "eligible": RECOVERY_INTENT_ACTIVE,
+        "recover": RECOVERY_INTENT_ACTIVE,
+        "recovery": RECOVERY_INTENT_ACTIVE,
+        "resume": RECOVERY_INTENT_ACTIVE,
+        "running": RECOVERY_INTENT_ACTIVE,
+        "true": RECOVERY_INTENT_ACTIVE,
+        "yes": RECOVERY_INTENT_ACTIVE,
+        "1": RECOVERY_INTENT_ACTIVE,
+        "inactive": RECOVERY_INTENT_INACTIVE,
+        "archived": RECOVERY_INTENT_INACTIVE,
+        "manual": RECOVERY_INTENT_INACTIVE,
+        "never": RECOVERY_INTENT_INACTIVE,
+        "stopped": RECOVERY_INTENT_INACTIVE,
+        "terminated": RECOVERY_INTENT_INACTIVE,
+        "false": RECOVERY_INTENT_INACTIVE,
+        "no": RECOVERY_INTENT_INACTIVE,
+        "0": RECOVERY_INTENT_INACTIVE,
+        "legacy": RECOVERY_INTENT_LEGACY,
+    }
+    return aliases.get(normalized, RECOVERY_INTENT_LEGACY)
+
+
+def recovery_intent_for_status(status: object) -> str:
+    """Infer safe compatibility intent for a status-only legacy row."""
+
+    normalized = str(status or "").strip().casefold()
+    if normalized in _ACTIVE_RECOVERY_STATUSES:
+        return RECOVERY_INTENT_ACTIVE
+    if normalized in _INACTIVE_RECOVERY_STATUSES:
+        return RECOVERY_INTENT_INACTIVE
+    # A start error does not prove that a task ever became active.  Keep it
+    # ambiguous until an explicit successful launch or recovery intent exists.
+    return RECOVERY_INTENT_LEGACY
 
 
 
@@ -46,6 +162,232 @@ def tmux_safe_name(name: str) -> str:
     return cleaned[:96]
 
 
+def _migration_file(path: str | Path, *, label: str) -> Path:
+    candidate = Path(path).expanduser()
+    if candidate == Path(":memory:"):
+        raise SessionDatabaseMigrationError(f"{label} cannot be an in-memory database")
+    try:
+        if candidate.is_symlink():
+            raise SessionDatabaseMigrationError(f"{label} must not be a symlink")
+        resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise SessionDatabaseMigrationError(f"cannot resolve {label}") from exc
+    if resolved.exists():
+        try:
+            mode = resolved.lstat().st_mode
+        except OSError as exc:
+            raise SessionDatabaseMigrationError(f"cannot inspect {label}") from exc
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise SessionDatabaseMigrationError(f"{label} must be a regular file")
+    return resolved
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _harden_regular_file(path: Path, mode: int) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise SessionDatabaseMigrationError(f"database sidecar is not a regular file: {path}")
+        os.fchmod(descriptor, mode)
+    finally:
+        os.close(descriptor)
+
+
+def _harden_database_permissions(path: Path) -> None:
+    _harden_regular_file(path, 0o600)
+    _harden_regular_file(path.with_name(f"{path.name}-wal"), 0o600)
+    _harden_regular_file(path.with_name(f"{path.name}-shm"), 0o600)
+
+
+def _is_managed_state_path(path: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(
+            managed_state_dir().resolve(strict=False)
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+def _check_sqlite_database(path: Path) -> None:
+    try:
+        connection = sqlite3.connect(
+            f"{path.as_uri()}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+    except (OSError, sqlite3.Error) as exc:
+        raise SessionDatabaseMigrationError(
+            f"{path} is not a readable SQLite database"
+        ) from exc
+    try:
+        result = connection.execute("PRAGMA quick_check").fetchone()
+        if not result or str(result[0]).casefold() != "ok":
+            detail = str(result[0]) if result else "no result"
+            raise SessionDatabaseMigrationError(
+                f"SQLite integrity check failed for {path}: {detail}"
+            )
+    except sqlite3.Error as exc:
+        raise SessionDatabaseMigrationError(
+            f"SQLite integrity check failed for {path}"
+        ) from exc
+    finally:
+        connection.close()
+
+
+def migrate_legacy_database(
+    destination: str | Path | None = None,
+    *,
+    legacy_path: str | Path | None = None,
+) -> SessionDatabaseMigration:
+    """Copy only the legacy SQLite registry into the managed SSD state.
+
+    Migration is explicit and never runs from ``SessionStore`` construction.
+    It does not inspect or copy ``terminal-auth`` or any other legacy state.
+    An existing destination is validated and left untouched, making retries
+    safe after interruption.
+    """
+
+    source = _migration_file(
+        legacy_path
+        if legacy_path is not None
+        else legacy_state_dir() / "sessions.sqlite3",
+        label="legacy session database",
+    )
+    target = _migration_file(
+        destination if destination is not None else default_db_path(),
+        label="managed session database",
+    )
+    if source == target:
+        if not source.exists():
+            return SessionDatabaseMigration("already_current", source, target)
+        _check_sqlite_database(source)
+        digest = _sha256_file(source)
+        return SessionDatabaseMigration("already_current", source, target, digest, digest)
+    if not source.exists():
+        return SessionDatabaseMigration("source_missing", source, target)
+
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target.parent.chmod(0o700)
+    lock_path = target.with_name(f".{target.name}.migration.lock")
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise SessionDatabaseMigrationError("cannot create migration lock") from exc
+    try:
+        os.fchmod(lock_fd, 0o600)
+        with os.fdopen(lock_fd, "r+b", closefd=True) as lock_handle:
+            try:
+                fcntl.flock(
+                    lock_handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError as exc:
+                raise SessionDatabaseMigrationInProgress(
+                    "MIGRATION_IN_PROGRESS: another primary T1000 process is "
+                    "publishing the managed session database"
+                ) from exc
+            if target.exists():
+                _check_sqlite_database(target)
+                _harden_database_permissions(target)
+                digest = _sha256_file(target)
+                return SessionDatabaseMigration(
+                    "destination_exists",
+                    source,
+                    target,
+                    destination_sha256=digest,
+                )
+            _check_sqlite_database(source)
+            source_digest = _sha256_file(source)
+            temporary_fd, temporary_name = tempfile.mkstemp(
+                prefix=f".{target.name}.migration-",
+                dir=target.parent,
+            )
+            temporary = Path(temporary_name)
+            try:
+                os.fchmod(temporary_fd, 0o600)
+                os.close(temporary_fd)
+                temporary_fd = -1
+                source_connection = sqlite3.connect(
+                    f"{source.as_uri()}?mode=ro",
+                    uri=True,
+                    timeout=5.0,
+                )
+                try:
+                    source_generation = int(
+                        source_connection.execute("PRAGMA data_version").fetchone()[0]
+                    )
+                    target_connection = sqlite3.connect(str(temporary), timeout=5.0)
+                    try:
+                        source_connection.backup(target_connection)
+                        target_connection.commit()
+                    finally:
+                        target_connection.close()
+                    if int(
+                        source_connection.execute("PRAGMA data_version").fetchone()[0]
+                    ) != source_generation:
+                        raise SessionDatabaseMigrationError(
+                            "legacy session database changed during migration; retry "
+                            "after the old T1000 writer exits"
+                        )
+                finally:
+                    source_connection.close()
+                _check_sqlite_database(temporary)
+                with temporary.open("rb") as handle:
+                    os.fsync(handle.fileno())
+                try:
+                    os.link(temporary, target)
+                except FileExistsError:
+                    _check_sqlite_database(target)
+                    _harden_database_permissions(target)
+                    digest = _sha256_file(target)
+                    return SessionDatabaseMigration(
+                        "destination_exists",
+                        source,
+                        target,
+                        source_sha256=source_digest,
+                        destination_sha256=digest,
+                    )
+                os.unlink(temporary)
+                directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                target_digest = _sha256_file(target)
+                return SessionDatabaseMigration(
+                    "migrated",
+                    source,
+                    target,
+                    source_sha256=source_digest,
+                    destination_sha256=target_digest,
+                )
+            except (OSError, sqlite3.Error) as exc:
+                raise SessionDatabaseMigrationError(
+                    f"legacy session database migration failed: {exc}"
+                ) from exc
+            finally:
+                if temporary_fd >= 0:
+                    os.close(temporary_fd)
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+    except OSError as exc:
+        raise SessionDatabaseMigrationError("cannot lock managed session database") from exc
+
+
 class SessionStore:
     def __init__(
         self,
@@ -55,11 +397,20 @@ class SessionStore:
         account_source: str | Path | None = None,
         provision_auth_scopes: bool | None = None,
     ):
-        self.path = Path(path).expanduser() if path else DEFAULT_DB_PATH
+        self.path = (
+            Path(path).expanduser()
+            if path is not None
+            else default_db_path()
+        )
+        self._managed_state = _is_managed_state_path(self.path)
         self.auth_root = (
             Path(auth_root).expanduser()
             if auth_root is not None
-            else (DEFAULT_AUTH_ROOT if path is None else self.path.parent / "terminal-auth")
+            else (
+                default_auth_root()
+                if path is None
+                else self.path.parent / "terminal-auth"
+            )
         )
         # Account isolation is an optional integration, not a prerequisite for
         # creating, opening, or recovering a terminal.  Explicit auth paths keep
@@ -83,6 +434,12 @@ class SessionStore:
         )
         if self.path != Path(":memory:"):
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self._managed_state:
+                managed_root = managed_state_dir()
+                managed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                managed_root.chmod(0o700)
+                self.path.parent.chmod(0o700)
+                _harden_database_permissions(self.path)
         if self.provision_auth_scopes:
             self.auth_root.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.auth_root.chmod(0o700)
@@ -92,6 +449,8 @@ class SessionStore:
         self.conn.row_factory = sqlite3.Row
         self._configure_connection()
         self._init_schema()
+        if self._managed_state:
+            _harden_database_permissions(self.path)
 
     def _configure_connection(self) -> None:
         self.conn.execute("PRAGMA busy_timeout = 1000")
@@ -146,7 +505,8 @@ class SessionStore:
                 restart_policy TEXT NOT NULL DEFAULT 'on-failure',
                 recovery_attempts INTEGER NOT NULL DEFAULT 0,
                 recovery_last_attempt_at TEXT,
-                recovery_last_error TEXT
+                recovery_last_error TEXT,
+                recovery_intent TEXT NOT NULL DEFAULT 'legacy'
             )
             """
         )
@@ -192,7 +552,12 @@ class SessionStore:
         self._ensure_column("recovery_attempts", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("recovery_last_attempt_at", "TEXT")
         self._ensure_column("recovery_last_error", "TEXT")
+        self._ensure_column(
+            "recovery_intent",
+            "TEXT NOT NULL DEFAULT 'legacy'",
+        )
         self._clear_managed_server_local_pane_targets()
+        self._backfill_recovery_intents()
         self._backfill_recovery_recipes()
         if self.provision_auth_scopes:
             self._ensure_auth_scopes()
@@ -212,6 +577,49 @@ class SessionStore:
         self._bootstrap_remembered_windows()
         self._cleanup_stale_window_captains()
         self.conn.commit()
+
+    def _backfill_recovery_intents(self) -> int:
+        """Convert status-only rows to an explicit safe recovery intent.
+
+        The migration only fills legacy/unknown values.  An explicit active or
+        inactive decision made by a newer writer is never overwritten while a
+        second process opens the database.
+        """
+
+        rows = self.conn.execute(
+            "SELECT id, status, recovery_intent FROM sessions"
+        ).fetchall()
+        updates: list[tuple[str, str]] = []
+        for row in rows:
+            current = normalise_recovery_intent(row["recovery_intent"])
+            raw = str(row["recovery_intent"] or "").strip().casefold()
+            if raw in {
+                RECOVERY_INTENT_ACTIVE,
+                RECOVERY_INTENT_INACTIVE,
+            }:
+                continue
+            inferred = recovery_intent_for_status(row["status"])
+            if current == inferred and raw == RECOVERY_INTENT_LEGACY and inferred == RECOVERY_INTENT_LEGACY:
+                # Ambiguous rows (notably start-error) intentionally remain
+                # legacy so startup cannot infer permission from status alone.
+                continue
+            updates.append((inferred, str(row["id"])))
+        if not updates:
+            return 0
+        before = self.conn.total_changes
+        self.conn.executemany(
+            """
+            UPDATE sessions
+            SET recovery_intent = ?
+            WHERE id = ?
+              AND lower(trim(COALESCE(recovery_intent, ''))) NOT IN (?, ?)
+            """,
+            [
+                (intent, session_id, RECOVERY_INTENT_ACTIVE, RECOVERY_INTENT_INACTIVE)
+                for intent, session_id in updates
+            ],
+        )
+        return max(0, int(self.conn.total_changes - before))
 
     def _ensure_column(self, name: str, ddl: str) -> None:
         rows = self.conn.execute("PRAGMA table_info(sessions)").fetchall()
@@ -449,6 +857,30 @@ class SessionStore:
             recovery_attempts=max(0, int(getattr(record, "recovery_attempts", 0))),
         )
 
+    @staticmethod
+    def _record_with_recovery_intent(
+        record: SessionRecord,
+        *,
+        existing: SessionRecord | None = None,
+        preserve_legacy: bool = False,
+    ) -> SessionRecord:
+        raw = normalise_recovery_intent(getattr(record, "recovery_intent", None))
+        if raw == RECOVERY_INTENT_LEGACY and not preserve_legacy:
+            if existing is not None:
+                existing_intent = normalise_recovery_intent(existing.recovery_intent)
+                if existing_intent in {
+                    RECOVERY_INTENT_ACTIVE,
+                    RECOVERY_INTENT_INACTIVE,
+                }:
+                    raw = existing_intent
+                else:
+                    raw = recovery_intent_for_status(record.status)
+            else:
+                raw = recovery_intent_for_status(record.status)
+        if bool(getattr(record, "external", False)) and raw == RECOVERY_INTENT_LEGACY:
+            raw = RECOVERY_INTENT_INACTIVE
+        return replace(record, recovery_intent=raw)
+
     def _backfill_recovery_recipes(self) -> int:
         rows = self.conn.execute("SELECT * FROM sessions").fetchall()
         updates: list[tuple[str | None, str | None, str, str]] = []
@@ -558,12 +990,18 @@ class SessionStore:
             recovery_attempts=0,
             recovery_last_attempt_at=None,
             recovery_last_error=None,
+            recovery_intent=RECOVERY_INTENT_INACTIVE,
         )
         self.upsert(record)
         return record
 
-    def upsert(self, record: SessionRecord) -> None:
+    def upsert(self, record: SessionRecord, *, preserve_legacy_intent: bool = False) -> None:
         existing = self.get(record.id)
+        record = self._record_with_recovery_intent(
+            record,
+            existing=existing,
+            preserve_legacy=preserve_legacy_intent,
+        )
         if existing is not None and existing.auth_scope_id and existing.codex_home:
             record = replace(
                 record,
@@ -605,7 +1043,7 @@ class SessionStore:
                 recovery_command, recovery_cwd, auth_scope_id, codex_home, selected_account,
                 pending_account, auth_restart_required, auth_changed_at,
                 recovery_recipe, recovery_recipe_sha256, restart_policy, recovery_attempts,
-                recovery_last_attempt_at, recovery_last_error
+                recovery_last_attempt_at, recovery_last_error, recovery_intent
             )
             VALUES (
                 :id, :name, :tag, :command, :cwd, :tmux_name, :created_at, :last_opened_at,
@@ -613,7 +1051,7 @@ class SessionStore:
                 :recovery_command, :recovery_cwd, :auth_scope_id, :codex_home, :selected_account,
                 :pending_account, :auth_restart_required, :auth_changed_at,
                 :recovery_recipe, :recovery_recipe_sha256, :restart_policy, :recovery_attempts,
-                :recovery_last_attempt_at, :recovery_last_error
+                :recovery_last_attempt_at, :recovery_last_error, :recovery_intent
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -642,7 +1080,8 @@ class SessionStore:
                 restart_policy = excluded.restart_policy,
                 recovery_attempts = excluded.recovery_attempts,
                 recovery_last_attempt_at = excluded.recovery_last_attempt_at,
-                recovery_last_error = excluded.recovery_last_error
+                recovery_last_error = excluded.recovery_last_error,
+                recovery_intent = excluded.recovery_intent
             """,
             payload,
         )
@@ -677,6 +1116,22 @@ class SessionStore:
                 raise ValueError(f"{field} is immutable for terminal {session_id}")
         data: dict[str, Any] = dict(current.__dict__)
         data.update(changes)
+        if "recovery_intent" in changes:
+            data["recovery_intent"] = normalise_recovery_intent(
+                changes["recovery_intent"]
+            )
+        elif "status" in changes:
+            status = str(data.get("status", "")).strip().casefold()
+            if status == "start-error":
+                # Preserve an already-proven active task across a failed
+                # restart; an initial launch remains ambiguous and fail-closed.
+                data["recovery_intent"] = (
+                    RECOVERY_INTENT_ACTIVE
+                    if current.recovery_intent == RECOVERY_INTENT_ACTIVE
+                    else RECOVERY_INTENT_LEGACY
+                )
+            else:
+                data["recovery_intent"] = recovery_intent_for_status(status)
         recipe_inputs = {
             "command",
             "cwd",
@@ -706,9 +1161,38 @@ class SessionStore:
             data["auth_restart_required"] = bool(data["auth_restart_required"])
         if "recovery_attempts" in data:
             data["recovery_attempts"] = max(0, int(data["recovery_attempts"]))
+        preserve_legacy_intent = (
+            "recovery_intent" in changes
+            or str(data.get("status", "")).strip().casefold() == "start-error"
+        )
         updated = self._record_with_recovery_recipe(SessionRecord(**data))
-        self.upsert(updated)
-        return updated
+        updated = self._record_with_recovery_intent(
+            updated,
+            existing=current,
+            preserve_legacy=preserve_legacy_intent,
+        )
+        self.upsert(
+            updated,
+            preserve_legacy_intent=preserve_legacy_intent,
+        )
+        return self.get(session_id) or updated
+
+    def set_recovery_intent(self, session_id: str, intent: object) -> SessionRecord:
+        """Persist an explicit lifecycle intent for one session."""
+
+        normalized = normalise_recovery_intent(intent)
+        if normalized not in RECOVERY_INTENTS:
+            raise ValueError(f"unsupported recovery intent: {intent!r}")
+        return self.update(
+            session_id,
+            recovery_intent=normalized,
+        )
+
+    def mark_recovery_active(self, session_id: str) -> SessionRecord:
+        return self.set_recovery_intent(session_id, RECOVERY_INTENT_ACTIVE)
+
+    def mark_recovery_inactive(self, session_id: str) -> SessionRecord:
+        return self.set_recovery_intent(session_id, RECOVERY_INTENT_INACTIVE)
 
     def update_runtime_states(
         self,
@@ -719,19 +1203,49 @@ class SessionStore:
         rows = list(updates)
         if not rows:
             return 0
-        self.conn.executemany(
-            """
-            UPDATE sessions
-            SET status = ?, visible = ?, last_pid = ?
-            WHERE id = ?
-            """,
-            [
-                (status, 1 if visible else 0, last_pid, session_id)
-                for session_id, status, visible, last_pid in rows
-            ],
-        )
+        changed = 0
+        active_statuses = _ACTIVE_RECOVERY_STATUSES | {"start-error"}
+        for session_id, status, visible, last_pid in rows:
+            if str(status).strip().casefold() in active_statuses:
+                cursor = self.conn.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?, visible = ?, last_pid = ?,
+                        recovery_intent = CASE
+                            WHEN recovery_intent = ? THEN recovery_intent
+                            ELSE ?
+                        END
+                    WHERE id = ?
+                      AND NOT (
+                          recovery_intent = ?
+                          AND status IN ('stopped', 'archived')
+                      )
+                    """,
+                    (
+                        status,
+                        1 if visible else 0,
+                        last_pid,
+                        RECOVERY_INTENT_INACTIVE,
+                        RECOVERY_INTENT_ACTIVE,
+                        session_id,
+                        RECOVERY_INTENT_INACTIVE,
+                    ),
+                )
+            else:
+                # A missing/stopped observation is not an explicit user stop.
+                # Never clear active intent here; the next startup can still
+                # recover the task from its durable recipe.
+                cursor = self.conn.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?, visible = ?, last_pid = ?
+                    WHERE id = ?
+                    """,
+                    (status, 1 if visible else 0, last_pid, session_id),
+                )
+            changed += max(0, int(cursor.rowcount))
         self.conn.commit()
-        return len(rows)
+        return changed
 
     def update_recovery_commands(
         self,
@@ -1112,4 +1626,5 @@ class SessionStore:
             recovery_attempts=max(0, int(row["recovery_attempts"] or 0)),
             recovery_last_attempt_at=row["recovery_last_attempt_at"],
             recovery_last_error=row["recovery_last_error"],
+            recovery_intent=normalise_recovery_intent(row["recovery_intent"]),
         )

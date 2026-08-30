@@ -1590,7 +1590,10 @@ class TmuxBackend:
         """
 
         recipe = self._durable_recipe(record)
-        resolved = resolve_working_directory(recipe)
+        try:
+            resolved = resolve_working_directory(recipe)
+        except SessionRecipeError as exc:
+            raise TmuxError(str(exc)) from exc
         environment = recipe.environment_dict()
         environment.update(resolved.environment)
         launch_directory = resolved.path
@@ -3231,6 +3234,36 @@ class TmuxBackend:
             # Process inspection is necessarily racy. A vanished or unreadable
             # tree is not sufficient evidence to appoint this tab as a captain.
             return False
+
+    def recovery_readiness(self, record: SessionRecord) -> dict[str, object]:
+        """Classify a managed Codex pane while its launcher is starting.
+
+        A tmux pane can survive a failed launcher as an ordinary shell.  Treat
+        that readable, childless shell as terminal failure so recovery does not
+        hold the bounded queue until its long deadline.  A launcher/helper
+        process remains pending, while a verified Codex descendant is ready.
+        Unreadable or otherwise ambiguous process state stays pending.
+        """
+
+        pane_pid = self.authoritative_live_pane_pid(record)
+        if pane_pid is None:
+            return {"state": "unknown"}
+        codex_state = process_tree_contains_codex(pane_pid)
+        if codex_state is True:
+            return {"state": "ready", "pid": pane_pid}
+        if codex_state is None:
+            return {"state": "pending", "pid": pane_pid}
+        try:
+            idle_shell = self._process_tree_is_idle_shell(pane_pid)
+        except (OSError, RuntimeError, ValueError):
+            return {"state": "pending", "pid": pane_pid}
+        if idle_shell:
+            return {
+                "state": "failed",
+                "pid": pane_pid,
+                "detail": "managed Codex launcher exited to an idle shell",
+            }
+        return {"state": "pending", "pid": pane_pid}
 
     def _load_pane_maps(
         self,

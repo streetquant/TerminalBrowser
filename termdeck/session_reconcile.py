@@ -4,7 +4,13 @@ from dataclasses import dataclass
 from typing import Iterable, Protocol
 
 from .liveness import merge_confirmed_pane_snapshot
-from .models import ResourceSnapshot, SessionRecord
+from .models import (
+    RECOVERY_INTENT_ACTIVE,
+    RECOVERY_INTENT_INACTIVE,
+    RECOVERY_INTENT_LEGACY,
+    ResourceSnapshot,
+    SessionRecord,
+)
 from .resources import ResourceSampler
 from .session_recipe import (
     SessionRecipeError,
@@ -13,6 +19,33 @@ from .session_recipe import (
 )
 from .session_store import SessionStore, utc_now
 from .tmux_backend import TmuxBackend, TmuxError
+
+
+# These are the only durable states that can represent work which was already
+# running before a cold restart.  ``new`` and ``remembered`` are deliberate
+# non-started states; treating either as a recovery candidate silently turns a
+# saved layout into a process launcher.
+_ACTIVE_RECOVERY_STATUSES = frozenset(
+    {"running", "paused", "missing", "recovery-pending", "start-error"}
+)
+_NEVER_STARTED_STATUSES = frozenset({"new", "remembered"})
+_TERMINAL_STATUSES = frozenset({"stopped", "archived"})
+_ACTIVE_INTENT_VALUES = frozenset(
+    {"active", "eligible", "recover", "recovery", "resume", "running", "true", "yes", "1"}
+)
+_INACTIVE_INTENT_VALUES = frozenset(
+    {
+        "archived",
+        "inactive",
+        "manual",
+        "never",
+        "stopped",
+        "terminated",
+        "false",
+        "no",
+        "0",
+    }
+)
 
 
 class BackendLike(Protocol):
@@ -130,6 +163,102 @@ def _automatic_recovery_available(record: SessionRecord) -> bool:
         return False
 
 
+def _durable_recovery_intent(record: SessionRecord) -> bool | None:
+    """Read an optional durable lifecycle intent without trusting free text.
+
+    Older registries do not have an intent column and therefore fall back to
+    their explicit status below.  Newer stores may expose the field as
+    ``recovery_intent`` (or one of the migration aliases) on the record.  An
+    unknown value is fail-closed; a missing value remains ``None`` so legacy
+    rows retain their status-based compatibility behavior.
+    """
+
+    missing = object()
+    for field in ("recovery_intent", "startup_recovery_intent", "active_intent"):
+        value = getattr(record, field, missing)
+        if value is missing or value is None:
+            continue
+        if isinstance(value, bool):
+            return value
+        normalized = str(value).strip().casefold()
+        if normalized == RECOVERY_INTENT_LEGACY:
+            return None
+        if normalized in _ACTIVE_INTENT_VALUES:
+            return True
+        if normalized in _INACTIVE_INTENT_VALUES:
+            return False
+        return False
+    return None
+
+
+def startup_recovery_allowed(record: SessionRecord) -> bool:
+    """Return whether a missing payload may be relaunched automatically.
+
+    This is intentionally stricter than ordinary live-tab reconciliation.  A
+    live manual tab may be reattached by the caller after a successful live
+    observation, but a cold startup must have both an active durable state and
+    an automatic recipe.  Explicit stops, never-started rows, external rows,
+    archived rows, and malformed/missing recipes are never relaunched.
+    """
+
+    if bool(getattr(record, "external", False)):
+        return False
+    status = str(getattr(record, "status", "")).strip().casefold()
+    if status == "archived" or status in _NEVER_STARTED_STATUSES:
+        return False
+    intent = _durable_recovery_intent(record)
+    if intent is False:
+        return False
+    if status == "stopped":
+        # A runtime reconciliation may have recorded a missing active pane as
+        # stopped.  Only an explicit active intent may turn that status back
+        # into a startup recovery candidate; an explicit stop remains inactive.
+        return intent is True and _automatic_recovery_available(record)
+    if status not in _ACTIVE_RECOVERY_STATUSES:
+        return False
+    # A start error can describe an initial launch that never became active.
+    # Only a durable active intent can distinguish it from a retryable crash.
+    if status == "start-error" and intent is not True:
+        return False
+    return _automatic_recovery_available(record)
+
+
+def startup_restore_candidates(
+    records: Iterable[SessionRecord],
+    *,
+    live_session_ids: Iterable[str] = (),
+) -> list[SessionRecord]:
+    """Select cold-start rows without turning layout records into processes.
+
+    ``live_session_ids`` comes only from the just-completed authoritative
+    reconciliation.  It permits reattaching an already-live manual tab while
+    still preventing a missing manual tab from being recreated.  All missing
+    rows use :func:`startup_recovery_allowed`.
+    """
+
+    live_ids = {str(session_id) for session_id in live_session_ids}
+    selected: list[SessionRecord] = []
+    for record in records:
+        if bool(getattr(record, "external", False)):
+            continue
+        status = str(getattr(record, "status", "")).strip().casefold()
+        if status == "archived" or status in _NEVER_STARTED_STATUSES:
+            continue
+        intent = _durable_recovery_intent(record)
+        if intent is False:
+            continue
+        if str(getattr(record, "id", "")) in live_ids:
+            # Reattachment is safe only for the live state proven by the
+            # reconciliation pass.  It is not a permission to recreate a
+            # missing manual/never-started row.
+            if status in {"running", "paused"}:
+                selected.append(record)
+            continue
+        if startup_recovery_allowed(record):
+            selected.append(record)
+    return selected
+
+
 def _desired_state(
     record: SessionRecord,
     *,
@@ -144,6 +273,24 @@ def _desired_state(
 
     if before == "archived":
         return record.status, visible, record.last_pid, "archived record skipped"
+
+    # An explicit stop wins over a stale tmux listing.  Reconciliation should
+    # never convert a user stop back to a running row merely because cleanup of
+    # the old pane was delayed.
+    if before == "stopped":
+        if recover_missing and startup_recovery_allowed(record):
+            return (
+                "recovery-pending",
+                visible,
+                None,
+                "stopped observation retains an explicit active recovery intent",
+            )
+        return "stopped", visible, None, "explicitly stopped record preserved"
+
+    # ``new`` and ``remembered`` are layout-only rows.  In startup mode they
+    # remain exactly that even if a stale backend name happens to exist.
+    if recover_missing and before in _NEVER_STARTED_STATUSES:
+        return record.status, visible, None, "not started record preserved"
 
     if live_session and snapshot.exists:
         status = "paused" if snapshot.state == "T" or (snapshot.state == "unknown" and before == "paused") else "running"
@@ -175,13 +322,10 @@ def _desired_state(
             "recovery is pending but no valid automatic recipe is available",
         )
 
-    if before == "stopped":
-        return "stopped", visible, None, "already stopped"
-
     if (
         recover_missing
-        and before in {"running", "paused", "missing", "remembered", "start-error"}
-        and _automatic_recovery_available(record)
+        and before in _ACTIVE_RECOVERY_STATUSES
+        and startup_recovery_allowed(record)
     ):
         # A host crash removes tmux along with its child processes. Preserve a
         # distinct recovery state and let the backend replay only the canonical,

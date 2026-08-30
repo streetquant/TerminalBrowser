@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from .models import SessionRecord
+from .models import RECOVERY_INTENT_INACTIVE, SessionRecord
 from .session_store import SessionStore, utc_now
 
 
@@ -113,6 +113,41 @@ def _clear_captain_for_record(store: SessionStore, record: SessionRecord) -> Non
     clear = getattr(store, "clear_window_captain", None)
     if callable(clear):
         clear(record.window_id, session_id=record.id)
+
+
+def stop_records(
+    store: SessionStore,
+    records: Iterable[SessionRecord],
+    *,
+    include_pinned: bool = False,
+) -> list[LifecycleResult]:
+    """Explicitly stop remembered sessions and disable cold-start recovery."""
+
+    results: list[LifecycleResult] = []
+    touched_windows: set[str] = set()
+    for record in records:
+        if record.pinned and not include_pinned:
+            results.append(_protected_result(record, "stop"))
+            continue
+        _clear_captain_for_record(store, record)
+        updated = store.update(
+            record.id,
+            status="stopped",
+            last_pid=None,
+            recovery_intent=RECOVERY_INTENT_INACTIVE,
+            last_opened_at=utc_now(),
+        )
+        touched_windows.add(record.window_id)
+        results.append(
+            LifecycleResult.from_record(
+                updated,
+                "stop",
+                detail="explicitly stopped; startup recovery disabled",
+            )
+        )
+    for window_id in touched_windows:
+        compact_window(store, window_id)
+    return results
 
 
 def hide_records(store: SessionStore, records: Iterable[SessionRecord], *, include_pinned: bool = False) -> list[LifecycleResult]:
@@ -246,7 +281,13 @@ def archive_records(store: SessionStore, records: Iterable[SessionRecord], *, in
             results.append(_protected_result(record, "archive"))
             continue
         _clear_captain_for_record(store, record)
-        updated = store.update(record.id, status="archived", visible=False, last_opened_at=utc_now())
+        updated = store.update(
+            record.id,
+            status="archived",
+            visible=False,
+            recovery_intent=RECOVERY_INTENT_INACTIVE,
+            last_opened_at=utc_now(),
+        )
         touched_windows.add(record.window_id)
         results.append(LifecycleResult.from_record(updated, "archive", detail="archived in registry; process state unchanged"))
     for window_id in touched_windows:

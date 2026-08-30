@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -62,18 +63,30 @@ class SessionRecipeTests(unittest.TestCase):
             )
             self.assertEqual(recipe.cwd, str(Path(tmp, "missing/project").resolve()))
 
-    def test_missing_cwd_recovers_from_nearest_existing_parent_without_creating_it(self) -> None:
+    def test_existing_symlink_cwd_keeps_the_logical_path_for_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real = root / "real"
+            logical = root / "logical"
+            real.mkdir()
+            logical.symlink_to(real, target_is_directory=True)
+            recipe = build_session_recipe("bash", logical)
+            expected = os.path.abspath(os.fspath(logical))
+            self.assertEqual(recipe.cwd, expected)
+            resolved = resolve_working_directory(recipe)
+            self.assertEqual(resolved.path, Path(expected))
+            self.assertEqual(resolved.original, expected)
+
+    def test_missing_cwd_fails_closed_without_parent_or_home_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "gone" / "project"
             recipe = build_session_recipe("python worker.py", missing)
-            resolved = resolve_working_directory(recipe)
-            self.assertTrue(resolved.degraded)
-            self.assertEqual(resolved.path, Path(tmp).resolve())
+            with self.assertRaisesRegex(
+                SessionRecipeError,
+                "working directory is unavailable",
+            ):
+                resolve_working_directory(recipe, home=tmp)
             self.assertFalse(missing.exists())
-            self.assertEqual(
-                resolved.environment["TERMDECK_RECOVERY_ORIGINAL_CWD"],
-                str(missing),
-            )
 
     def test_restart_policy_distinguishes_crash_normal_exit_and_manual(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

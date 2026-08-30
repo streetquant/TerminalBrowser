@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from termdeck.session_lifecycle import archive_records, compact_window, hide_records, move_records, pin_records, recently_closed_records, rename_record, reopen_closed_records, retag_records, show_records, unpin_records
+from termdeck.session_lifecycle import archive_records, compact_window, hide_records, move_records, pin_records, recently_closed_records, rename_record, reopen_closed_records, retag_records, show_records, stop_records, unpin_records
 from termdeck.session_store import SessionStore, utc_now
 
 
@@ -82,6 +82,28 @@ class SessionLifecycleTests(unittest.TestCase):
                 self.assertEqual(archived.status, "archived")  # type: ignore[union-attr]
                 self.assertFalse(archived.visible)  # type: ignore[union-attr]
                 self.assertEqual(archived.last_pid, 77)  # type: ignore[union-attr]
+            finally:
+                store.close()
+
+    def test_explicit_stop_and_archive_disable_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                running = store.create("running", "dev", "bash", tmp)
+                archived = store.create("archived", "dev", "bash", tmp)
+                store.update(running.id, status="running", last_pid=101)
+                store.update(archived.id, status="running", last_pid=202)
+
+                stopped_result = stop_records(store, [store.get(running.id)])  # type: ignore[list-item]
+                archive_records(store, [store.get(archived.id)])  # type: ignore[list-item]
+
+                self.assertTrue(stopped_result[0].ok)
+                stopped = store.get(running.id)
+                archived_row = store.get(archived.id)
+                self.assertEqual(stopped.status, "stopped")  # type: ignore[union-attr]
+                self.assertEqual(stopped.recovery_intent, "inactive")  # type: ignore[union-attr]
+                self.assertEqual(archived_row.status, "archived")  # type: ignore[union-attr]
+                self.assertEqual(archived_row.recovery_intent, "inactive")  # type: ignore[union-attr]
             finally:
                 store.close()
 

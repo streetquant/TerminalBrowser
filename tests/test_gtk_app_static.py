@@ -25,23 +25,36 @@ class GtkAppStaticTests(unittest.TestCase):
         for node in tree.body:
             if not isinstance(node, ast.ImportFrom) or not node.module or not node.level:
                 continue
-            if node.module in {"codex_archive", "codex_auth", "command_palette", "command_render", "shortcuts", "session_store", "models", "master_tasks", "health", "workspace_recipe", "control_plan", "session_lifecycle", "session_search"}:
+            if node.module in {"codex_archive", "codex_auth", "command_palette", "command_render", "shortcuts", "session_store", "models", "master_tasks", "health", "workspace_recipe", "control_plan", "session_lifecycle", "session_search", "recovery_intent"}:
                 module = importlib.import_module(f"termdeck.{node.module}")
                 for alias in node.names:
                     if alias.name == "*":
                         continue
                     self.assertTrue(hasattr(module, alias.name), f"{node.module}.{alias.name} is imported by gtk_app.py but missing")
 
-    def test_archive_recovery_runs_after_startup_reconciliation(self):
+    def test_startup_avoids_archive_scan_and_schedules_payload_revival(self):
         source = GTK_APP.read_text(encoding="utf-8")
         reconcile_call = source.index("reconcile_store(\n            self.store")
-        recovery_call = source.index("schedule_legacy_recovery =", reconcile_call)
+        activation_end = source.index("    def _schedule_legacy_recovery", reconcile_call)
+        activation_source = source[reconcile_call:activation_end]
+        self.assertNotIn("_schedule_legacy_recovery", activation_source)
+        revival_call = activation_source.index("payload_revival_timeout =")
         window_restore = source.index(
             'restore_groups = getattr(self.store, "windows_for_restore", None)',
-            recovery_call,
+            reconcile_call,
         )
-        self.assertLess(reconcile_call, recovery_call)
-        self.assertLess(recovery_call, window_restore)
+        self.assertLess(reconcile_call, reconcile_call + revival_call)
+        self.assertLess(reconcile_call + revival_call, window_restore)
+
+    def test_live_automatic_restore_uses_readiness_barrier_before_attach(self):
+        source = GTK_APP.read_text(encoding="utf-8")
+        restore_start = source.index("    def restore_previous_tabs")
+        restore_end = source.index("    def _schedule_restore_retry", restore_start)
+        restore_source = source[restore_start:restore_end]
+        self.assertIn("coordinator.submit(", restore_source)
+        self.assertIn("known_live=known_live", restore_source)
+        self.assertIn("known_pid=pids_by_id.get(record.id)", restore_source)
+        self.assertIn("if known_live is not True:", restore_source)
 
     def test_termdeck_window_has_no_duplicate_method_definitions(self):
         tree = ast.parse(GTK_APP.read_text(encoding="utf-8"))

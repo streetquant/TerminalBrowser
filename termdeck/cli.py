@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import shutil
 import sys
@@ -34,6 +35,7 @@ from .diagnostics import build_diagnostic_payload, write_diagnostic_bundle
 from .freeze_diagnostics import build_freeze_diagnostic_payload
 from .auth_scope_gc import plan_auth_scope_gc
 from .health import classify_session, health_badge, should_pause_for_attention
+from .models import RECOVERY_INTENT_INACTIVE
 from .persistence import persist_live_sessions, persistence_candidates
 from .quickstart import build_quickstart
 from .redaction import redact_text
@@ -52,7 +54,13 @@ from .session_lifecycle import archive_records, hide_records, lifecycle_payload,
 from .session_reconcile import reconcile_store
 from .session_launcher import create_new_session, launch_payload, resolve_launch_fields
 from .session_search import render_search_table, search_sessions
-from .session_store import DEFAULT_DB_PATH, SessionStore, utc_now
+from .session_store import (
+    DEFAULT_DB_PATH,
+    SessionStore,
+    default_db_path,
+    legacy_state_dir,
+    utc_now,
+)
 from .settings import sample_settings_json
 from .shutdown_service import (
     ShutdownServiceError,
@@ -378,6 +386,7 @@ def cmd_release_install(args: argparse.Namespace) -> int:
             bin_dir=getattr(args, "bin_dir", None),
             python=getattr(args, "python", None),
             lock_timeout=float(getattr(args, "lock_timeout", 15.0)),
+            production=True,
         )
     except (BuildIdentityError, ReleaseError, OSError, ValueError) as exc:
         return _print_release_error("release-install", exc)
@@ -450,14 +459,28 @@ def cmd_auth_gc(args: argparse.Namespace) -> int:
 
 
 def cmd_install_desktop(args: argparse.Namespace) -> int:
-    plan = build_install_plan(command=getattr(args, "command", None), data_home=getattr(args, "data_home", None))
-    payload = install_desktop(plan, dry_run=bool(getattr(args, "dry_run", False)), update_database=bool(getattr(args, "update_database", False)))
+    plan = build_install_plan(
+        command=getattr(args, "command", None),
+        data_home=getattr(args, "data_home", None),
+        config_home=getattr(args, "config_home", None),
+    )
+    payload = install_desktop(
+        plan,
+        dry_run=bool(getattr(args, "dry_run", False)),
+        update_database=bool(getattr(args, "update_database", False)),
+        install_autostart=bool(getattr(args, "autostart", False)),
+    )
     _print_json(payload)
-    return 0
+    return 0 if payload.get("ok") else 1
 
 
 def cmd_uninstall_desktop(args: argparse.Namespace) -> int:
-    payload = uninstall_desktop(data_home=getattr(args, "data_home", None), dry_run=bool(getattr(args, "dry_run", False)))
+    payload = uninstall_desktop(
+        data_home=getattr(args, "data_home", None),
+        config_home=getattr(args, "config_home", None),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        remove_autostart=bool(getattr(args, "autostart", False)),
+    )
     _print_json(payload)
     return 0
 
@@ -759,6 +782,7 @@ def _run_targeted_control(args: argparse.Namespace, action: str) -> int:
                         visible=False,
                         recovery_command=None,
                         recovery_cwd=None,
+                        recovery_intent=RECOVERY_INTENT_INACTIVE,
                     )
                     rows.append(_control_row(record, action, True, pid=record.last_pid, detail="marked stopped"))
             except TmuxError as exc:
@@ -1227,6 +1251,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             sampler=ResourceSampler(),
             dry_run=bool(getattr(args, "dry_run", False)),
             hide_missing=not bool(getattr(args, "keep_visible", False)),
+            recover_missing=bool(getattr(args, "recover_missing", False)),
             include_archived=bool(getattr(args, "all", False)),
             tag=getattr(args, "tag", None),
         )
@@ -1631,6 +1656,40 @@ def cmd_gui(args: argparse.Namespace) -> int:
     return run(db_path=args.db, workspace_path=getattr(args, "workspace", None))
 
 
+def cmd_recovery_intent(args: argparse.Namespace) -> int:
+    """Queue explicit recovery without opening a GUI or a terminal backend."""
+
+    from .recovery_intent import RecoveryIntentError, request_recovery_intent
+
+    try:
+        request = request_recovery_intent(
+            args.session_id,
+            name=args.name,
+            cwd=args.cwd,
+        )
+        payload = request.as_dict()
+        payload.update({"action": "recovery-intent", "ok": True})
+        _print_json(payload)
+        return 0
+    except (RecoveryIntentError, OSError, ValueError) as exc:
+        _print_json({"action": "recovery-intent", "ok": False, "error": str(exc)})
+        return 1
+
+
+def cmd_recovery_qualification(args: argparse.Namespace) -> int:
+    """Audit every remembered pane without opening a backend or mutating state."""
+
+    from .recovery_qualification import qualify_recovery
+
+    report = qualify_recovery(
+        getattr(args, "db", None),
+        rollout_root=getattr(args, "rollout_root", None),
+        max_rollout_files=getattr(args, "max_rollout_files", 4096),
+    )
+    _print_json(report.as_dict())
+    return 0 if report.ok else 2
+
+
 def _add_targeting_args(
     parser: argparse.ArgumentParser,
     *,
@@ -1660,6 +1719,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="check system dependencies")
     doctor.set_defaults(func=cmd_doctor)
+
+    recovery_intent = sub.add_parser(
+        "recovery-intent",
+        help="queue explicit recovery for the next managed primary startup without opening the GUI",
+    )
+    recovery_intent.add_argument("session_id")
+    recovery_intent.add_argument("--name", required=True)
+    recovery_intent.add_argument("--cwd", required=True)
+    recovery_intent.set_defaults(func=cmd_recovery_intent)
+
+    recovery_qualification = sub.add_parser(
+        "recovery-qualification",
+        help="audit all remembered panes for safe managed recovery without starting them",
+    )
+    recovery_qualification.add_argument("--db", type=Path, default=None)
+    recovery_qualification.add_argument(
+        "--rollout-root",
+        type=Path,
+        default=None,
+        help="optional Codex sessions root used for bounded exact-rollout inspection",
+    )
+    recovery_qualification.add_argument(
+        "--max-rollout-files",
+        type=int,
+        default=4096,
+        help="maximum rollout metadata files to inspect before reporting uncertainty",
+    )
+    recovery_qualification.set_defaults(func=cmd_recovery_qualification)
 
     diagnostics = sub.add_parser("diagnostics", help="create a redaction-safe diagnostic report or ZIP bundle")
     diagnostics.add_argument("--db", type=Path, default=None)
@@ -1771,12 +1858,16 @@ def build_parser() -> argparse.ArgumentParser:
     install_desktop_parser.add_argument("--dry-run", action="store_true", help="show the files that would be written")
     install_desktop_parser.add_argument("--command", default=None, help="override the executable used in the desktop launcher")
     install_desktop_parser.add_argument("--data-home", type=Path, default=None, help="override XDG data home for testing or portable installs")
+    install_desktop_parser.add_argument("--config-home", type=Path, default=None, help="override XDG config home for testing or portable installs")
+    install_desktop_parser.add_argument("--autostart", action="store_true", help="also install managed GUI autostart")
     install_desktop_parser.add_argument("--update-database", action="store_true", help="run update-desktop-database when available")
     install_desktop_parser.set_defaults(func=cmd_install_desktop)
 
     uninstall_desktop_parser = sub.add_parser("uninstall-desktop", help="remove the local desktop/app-menu launcher")
     uninstall_desktop_parser.add_argument("--dry-run", action="store_true")
     uninstall_desktop_parser.add_argument("--data-home", type=Path, default=None)
+    uninstall_desktop_parser.add_argument("--config-home", type=Path, default=None)
+    uninstall_desktop_parser.add_argument("--autostart", action="store_true", help="also remove managed GUI autostart")
     uninstall_desktop_parser.set_defaults(func=cmd_uninstall_desktop)
 
     install_checkpoint_service = sub.add_parser(
@@ -2037,6 +2128,11 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--all", action="store_true", help="include archived sessions in the report")
     reconcile.add_argument("--dry-run", action="store_true", help="show registry repairs without writing them")
     reconcile.add_argument("--keep-visible", action="store_true", help="do not hide tabs whose backend session has disappeared")
+    reconcile.add_argument(
+        "--recover-missing",
+        action="store_true",
+        help="preserve eligible previously-active rows for automatic startup recovery",
+    )
     reconcile.set_defaults(func=cmd_reconcile)
 
     checkpoint = sub.add_parser(
@@ -2154,6 +2250,29 @@ def _adopt_process_name(name: str = "t1000") -> None:
         pass
 
 
+def _prepare_managed_session_database(args: argparse.Namespace) -> None:
+    """Keep non-GUI commands on the legacy registry until primary cutover.
+
+    The GUI performs the one-time migration only after GApplication has made
+    it the primary instance.  Running a database copy from every CLI command
+    could fork registry history while an older desktop process was still
+    writing the legacy database.
+    """
+
+    if getattr(args, "db", None) is not None:
+        return
+    if not os.environ.get("T1000_MANAGED_ROOT", "").strip():
+        return
+    if getattr(args, "func", None) in {cmd_gui, cmd_recovery_intent}:
+        return
+    if not hasattr(args, "db"):
+        return
+    managed = default_db_path()
+    legacy = legacy_state_dir() / "sessions.sqlite3"
+    if not managed.exists() and legacy.is_file():
+        args.db = legacy
+
+
 def main(argv: list[str] | None = None) -> int:
     invoked_as = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else ""
     if invoked_as == "termdeck":
@@ -2165,6 +2284,7 @@ def main(argv: list[str] | None = None) -> int:
     _adopt_process_name()
     parser = build_parser()
     args = parser.parse_args(argv)
+    _prepare_managed_session_database(args)
     return int(args.func(args))
 
 

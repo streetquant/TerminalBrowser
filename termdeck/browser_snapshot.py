@@ -7,8 +7,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .models import SessionRecord
-from .session_store import SessionStore, short_id, tmux_safe_name
+from .models import (
+    RECOVERY_INTENT_INACTIVE,
+    RECOVERY_INTENT_LEGACY,
+    SessionRecord,
+)
+from .session_store import (
+    SessionStore,
+    normalise_recovery_intent,
+    recovery_intent_for_status,
+    short_id,
+    tmux_safe_name,
+)
 
 SNAPSHOT_SCHEMA_VERSION = 2
 SUPPORTED_SNAPSHOT_VERSIONS = {1, 2}
@@ -35,6 +45,7 @@ class SnapshotImportRow:
     requested_account: str | None
     created: bool
     planned: bool
+    recovery_intent: str = RECOVERY_INTENT_LEGACY
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -53,6 +64,7 @@ class SnapshotImportRow:
             "requested_account": self.requested_account,
             "created": self.created,
             "planned": self.planned,
+            "recovery_intent": self.recovery_intent,
         }
 
 
@@ -74,7 +86,7 @@ class SnapshotImportResult:
         }
 
 
-_SAFE_STATUS = {"new", "running", "paused", "stopped", "archived"}
+_SAFE_STATUS = {"new", "running", "paused", "stopped", "archived", "recovery-pending", "start-error"}
 _CWD_TOKEN = re.compile(r"^~|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 
 
@@ -93,6 +105,14 @@ def _normalise_status(status: Any, *, restart_stopped: bool = False) -> str:
     return value
 
 
+def _normalise_recovery_intent(value: Any, *, status: str) -> str:
+    if status in {"new", "remembered", "archived"}:
+        return RECOVERY_INTENT_INACTIVE
+    if value is None:
+        return recovery_intent_for_status(status)
+    return normalise_recovery_intent(value)
+
+
 def _record_to_tab(record: SessionRecord) -> dict[str, object]:
     return {
         "session_id": record.id,
@@ -108,6 +128,7 @@ def _record_to_tab(record: SessionRecord) -> dict[str, object]:
         "created_at": record.created_at,
         "last_opened_at": record.last_opened_at,
         "selected_account": record.selected_account,
+        "recovery_intent": record.recovery_intent,
     }
 
 
@@ -263,6 +284,8 @@ def parse_snapshot(data: Any) -> dict[str, Any]:
         for tab_index, raw_tab in enumerate(tabs):
             tab = _expect_dict(raw_tab, f"windows[{window_index}].tabs[{tab_index}]")
             command = _string(tab.get("command"), f"windows[{window_index}].tabs[{tab_index}].command")
+            raw_status = str(tab.get("status") or "new").strip().lower()
+            status = _normalise_status(tab.get("status"))
             parsed_tabs.append(
                 {
                     "original_id": _string(tab.get("session_id"), f"windows[{window_index}].tabs[{tab_index}].session_id", default=f"snapshot-{window_index + 1}-{tab_index + 1}"),
@@ -270,11 +293,19 @@ def parse_snapshot(data: Any) -> dict[str, Any]:
                     "tag": _string(tab.get("tag"), f"windows[{window_index}].tabs[{tab_index}].tag", default="default"),
                     "command": command,
                     "cwd": _normalise_cwd(tab.get("cwd"), f"windows[{window_index}].tabs[{tab_index}].cwd"),
-                    "status": _normalise_status(tab.get("status")),
+                    "status": status,
                     "visible": _bool(tab.get("visible"), f"windows[{window_index}].tabs[{tab_index}].visible", default=True),
                     "pinned": _bool(tab.get("pinned"), f"windows[{window_index}].tabs[{tab_index}].pinned", default=False),
                     "tab_index": _int(tab.get("tab_index"), f"windows[{window_index}].tabs[{tab_index}].tab_index", default=tab_index),
                     "selected_account": _optional_string(tab.get("selected_account"), f"windows[{window_index}].tabs[{tab_index}].selected_account"),
+                    "recovery_intent": _normalise_recovery_intent(
+                        tab.get("recovery_intent"),
+                        # Archived is represented as stopped in the import
+                        # layout for compatibility, but its explicit intent
+                        # must remain inactive rather than inheriting a
+                        # caller-supplied active value.
+                        status=("archived" if raw_status == "archived" else status),
+                    ),
                 }
             )
         parsed_windows.append({"window_id": window_id, "title": title, "tabs": parsed_tabs})
@@ -328,6 +359,12 @@ def import_browser_snapshot(
             if visible_only and not visible:
                 continue
             status = _normalise_status(tab["status"], restart_stopped=restart_stopped)
+            recovery_intent = _normalise_recovery_intent(
+                tab.get("recovery_intent"),
+                status=status,
+            )
+            if status == "new":
+                recovery_intent = RECOVERY_INTENT_INACTIVE
             tab_index = int(tab.get("tab_index", fallback_tab_index))
             if dry_run:
                 session_id = f"planned-{window_index + 1:02d}-{fallback_tab_index + 1:02d}"
@@ -352,6 +389,7 @@ def import_browser_snapshot(
                     selected_account=None,
                     pending_account=str(requested_account) if requested_account else None,
                     auth_restart_required=False,
+                    recovery_intent=recovery_intent,
                 )
                 session_id = record.id
                 created = True
@@ -372,6 +410,7 @@ def import_browser_snapshot(
                     requested_account=str(tab["selected_account"]) if tab.get("selected_account") else None,
                     created=created,
                     planned=dry_run,
+                    recovery_intent=recovery_intent,
                 )
             )
     return SnapshotImportResult(name=str(parsed["name"]), mode=clean_mode, dry_run=dry_run, count=len(rows), rows=tuple(rows))

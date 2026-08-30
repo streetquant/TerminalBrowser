@@ -1,9 +1,16 @@
 from pathlib import Path
 import tempfile
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 
 from termdeck.models import ResourceSnapshot, SessionRecord
-from termdeck.session_reconcile import reconcile_records, reconcile_store
+from termdeck.session_reconcile import (
+    reconcile_records,
+    reconcile_store,
+    startup_recovery_allowed,
+    startup_restore_candidates,
+)
 from termdeck.session_store import SessionStore
 
 
@@ -80,6 +87,139 @@ class StalePaneBackend(BatchBackend):
 
 
 class SessionReconcileTests(unittest.TestCase):
+    def test_startup_candidates_require_active_state_and_valid_recipe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                active = store.create("active", "dev", "bash", tmp)
+                paused = store.create("paused", "dev", "bash", tmp)
+                missing = store.create("missing", "dev", "bash", tmp)
+                pending = store.create("pending", "dev", "bash", tmp)
+                start_error = store.create("start-error", "dev", "bash", tmp)
+                never = store.create("never", "dev", "bash", tmp)
+                remembered = store.create("remembered", "dev", "bash", tmp)
+                stopped = store.create("stopped", "dev", "bash", tmp)
+                archived = store.create("archived", "dev", "bash", tmp)
+                external = store.create("external", "dev", "bash", tmp)
+                manual = store.create("manual", "dev", "bash", tmp, restart_policy="manual")
+                corrupt = store.create("corrupt", "dev", "bash", tmp)
+                for record, status in (
+                    (active, "running"),
+                    (paused, "paused"),
+                    (missing, "missing"),
+                    (pending, "recovery-pending"),
+                    (start_error, "start-error"),
+                    (never, "new"),
+                    (remembered, "remembered"),
+                    (stopped, "stopped"),
+                    (archived, "archived"),
+                    (external, "running"),
+                    (manual, "running"),
+                ):
+                    store.update(record.id, status=status, visible=True)
+                store.update(external.id, external=True)
+                corrupt = replace(
+                    corrupt,
+                    status="recovery-pending",
+                    recovery_recipe="{}",
+                    recovery_recipe_sha256="0" * 64,
+                )
+                records = [
+                    corrupt if record.id == corrupt.id else record
+                    for record in store.list(include_archived=True)
+                ]
+
+                selected = startup_restore_candidates(records)
+
+                self.assertEqual(
+                    {record.id for record in selected},
+                    {active.id, paused.id, missing.id, pending.id},
+                )
+                self.assertFalse(startup_recovery_allowed(start_error))
+                self.assertFalse(startup_recovery_allowed(never))
+                self.assertFalse(startup_recovery_allowed(remembered))
+                self.assertFalse(startup_recovery_allowed(stopped))
+                self.assertFalse(startup_recovery_allowed(external))
+                self.assertFalse(startup_recovery_allowed(manual))
+                self.assertFalse(startup_recovery_allowed(corrupt))
+            finally:
+                store.close()
+
+    def test_durable_intent_overrides_ambiguous_start_error_and_running_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                start_error = store.create("start-error", "dev", "bash", tmp)
+                running = store.create("running", "dev", "bash", tmp)
+                start_error = store.update(start_error.id, status="start-error")
+                running = store.update(running.id, status="running")
+                active_retry = SimpleNamespace(
+                    **{**start_error.__dict__, "recovery_intent": "active"}
+                )
+                explicit_stop = SimpleNamespace(
+                    **{**running.__dict__, "recovery_intent": "stopped"}
+                )
+
+                self.assertTrue(startup_recovery_allowed(active_retry))
+                self.assertFalse(startup_recovery_allowed(explicit_stop))
+            finally:
+                store.close()
+
+    def test_live_manual_tab_is_reattached_but_missing_manual_tab_is_not_restarted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                manual_live = store.create("manual-live", "dev", "bash", tmp, restart_policy="manual")
+                manual_missing = store.create("manual-missing", "dev", "bash", tmp, restart_policy="manual")
+                manual_live = store.update(manual_live.id, status="running")
+                manual_missing = store.update(manual_missing.id, status="running")
+
+                selected = startup_restore_candidates(
+                    [manual_live, manual_missing],
+                    live_session_ids=[manual_live.id],
+                )
+
+                self.assertEqual([record.id for record in selected], [manual_live.id])
+            finally:
+                store.close()
+
+    def test_explicit_stop_wins_over_stale_live_backend_observation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                stopped = store.create("stopped", "dev", "bash", tmp)
+                store.update(stopped.id, status="stopped", last_pid=None, visible=True)
+                result = reconcile_store(
+                    store,
+                    backend=FakeBackend({stopped.id: 321}),
+                    sampler=FakeSampler({321: ResourceSnapshot(pid=321, exists=True, state="S")}),
+                    recover_missing=True,
+                )
+
+                self.assertEqual(result.rows[0].after_status, "stopped")
+                self.assertEqual(result.rows[0].detail, "explicitly stopped record preserved")
+                self.assertIsNone(store.get(stopped.id).last_pid)  # type: ignore[union-attr]
+            finally:
+                store.close()
+
+    def test_never_started_rows_are_preserved_during_startup_reconciliation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                remembered = store.create("remembered", "dev", "bash", tmp)
+                store.update(remembered.id, status="remembered", visible=True)
+                result = reconcile_store(
+                    store,
+                    backend=FakeBackend({remembered.id: 123}),
+                    sampler=FakeSampler({123: ResourceSnapshot(pid=123, exists=True, state="S")}),
+                    recover_missing=True,
+                )
+
+                self.assertEqual(result.rows[0].after_status, "remembered")
+                self.assertEqual(result.changed, 0)
+            finally:
+                store.close()
+
     def test_stale_pane_snapshot_never_turns_sessions_missing(self):
         running = SessionRecord(
             id="running",

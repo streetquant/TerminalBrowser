@@ -174,6 +174,26 @@ def test_release_status_reports_development_without_inventing_release() -> None:
     assert status["build_info"]["build_id"] == "development"
 
 
+def test_release_status_rejects_dirty_candidate_as_managed_release(
+    tmp_path: Path,
+) -> None:
+    info = release_build_info("d", mode="dirty-candidate")
+    manifest_path = tmp_path / "candidate.release.json"
+    manifest_path.write_bytes(canonical_json_bytes(release_manifest(info)))
+
+    with mock.patch(
+        "termdeck.build_info.load_bundled_build_info", return_value=info
+    ), mock.patch(
+        "termdeck.build_info._inferred_manifest_path", return_value=manifest_path
+    ):
+        status = release_status(managed_root=tmp_path)
+
+    assert status["ok"] is False
+    assert status["posture"] == "dirty-candidate"
+    assert status["release_id"] is None
+    assert any("production release" in error for error in status["errors"])
+
+
 def test_release_status_verifies_managed_manifest_and_artifact(tmp_path: Path) -> None:
     info = release_build_info("b")
     wheel_bytes = b"verified-wheel"

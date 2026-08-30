@@ -15,6 +15,7 @@ import tty
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Callable
 
 import gi  # type: ignore
 
@@ -54,19 +55,33 @@ from .history_control import (
 )
 from .liveness import merge_confirmed_pane_snapshot
 from .master_tasks import filter_rows
-from .models import SessionRecord, TerminalTheme
+from .models import RECOVERY_INTENT_INACTIVE, SessionRecord, TerminalTheme
 from .persistence import PersistenceResult, persist_live_sessions
 from .redaction import redact_text
+from .recovery_coordinator import RecoveryCoordinator, RecoveryResult
+from .recovery_intent import consume_pending_recovery_intents
 from .resources import ResourceSampler
 from .session_lifecycle import archive_records, hide_records, move_records, pin_records, recently_closed_records, rename_record, reopen_closed_records, unpin_records
-from .session_reconcile import reconcile_store
+from .session_reconcile import (
+    ReconcileResult,
+    reconcile_store,
+    startup_recovery_allowed,
+    startup_restore_candidates,
+)
 from .session_search import search_sessions
 from .session_recipe import (
     SessionRecipeError,
     automatic_recovery_allowed,
     recipe_from_record,
 )
-from .session_store import DEFAULT_DB_PATH, SessionStore, short_id, utc_now
+from .session_store import (
+    DEFAULT_DB_PATH,
+    SessionDatabaseMigrationError,
+    SessionStore,
+    migrate_legacy_database,
+    short_id,
+    utc_now,
+)
 from .settings import AppSettings, SettingsError, save_terminal_options
 from .shortcuts import build_shortcut_map, index_from_key_name, shortcut_entries
 from .task_snapshot import build_task_snapshot
@@ -6066,16 +6081,107 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 pids_by_id = {}
                 pids_resolved = False
         failed_ids: set[str] = set()
+        coordinator = None
+        coordinator_unavailable = False
+        get_coordinator = getattr(self.app_context, "_get_recovery_coordinator", None)
+        if callable(get_coordinator):
+            try:
+                coordinator = get_coordinator()
+            except Exception:
+                coordinator_unavailable = True
         for record in restore_records:
             if record.id in self.tabs:
                 continue
+            known_live = live_by_id.get(record.id) if live_by_id is not None else None
+            if coordinator is not None:
+                try:
+                    eligible = startup_recovery_allowed(record)
+                except Exception:
+                    eligible = False
+                if eligible:
+                    def recovery_ready(
+                        result: RecoveryResult,
+                        session_id: str = record.id,
+                        fallback: SessionRecord = record,
+                    ) -> object:
+                        current = self.app_context.store.get(session_id) or fallback
+                        self._restore_retry_ids.discard(session_id)
+                        if session_id in self.tabs:
+                            return False
+                        try:
+                            self.open_session(
+                                current,
+                                restart_missing=False,
+                                remember_layout=remember_layout,
+                                known_live=True,
+                                known_pid=result.pid,
+                                known_pid_resolved=result.pid is not None,
+                                refresh_side=True,
+                                retry_start_failure=True,
+                            )
+                        except Exception as exc:
+                            self._restore_retry_ids.add(session_id)
+                            try:
+                                self.app_context.store.update(
+                                    session_id,
+                                    status="recovery-pending",
+                                    last_pid=None,
+                                    visible=bool(getattr(current, "visible", True)),
+                                    recovery_last_error=str(exc),
+                                )
+                            except Exception:
+                                pass
+                            schedule_retry = getattr(self, "_schedule_restore_retry", None)
+                            if callable(schedule_retry):
+                                schedule_retry()
+                        return False
+
+                    def recovery_failed(
+                        result: RecoveryResult,
+                        session_id: str = record.id,
+                    ) -> object:
+                        if session_id in self.tabs:
+                            self.side.refresh()
+                            return False
+                        self._restore_retry_ids.add(session_id)
+                        schedule_retry = getattr(self, "_schedule_restore_retry", None)
+                        if callable(schedule_retry):
+                            schedule_retry()
+                        self.side.refresh()
+                        return False
+
+                    try:
+                        submission = coordinator.submit(
+                            record,
+                            mode="restore",
+                            known_live=known_live,
+                            known_pid=pids_by_id.get(record.id),
+                            on_ready=recovery_ready,
+                            on_failed=recovery_failed,
+                        )
+                    except Exception:
+                        failed_ids.add(record.id)
+                        continue
+                    else:
+                        if known_live is not True:
+                            continue
+                        if submission.state not in {"live", "queued", "deduplicated"}:
+                            continue
+            elif coordinator_unavailable:
+                try:
+                    if startup_recovery_allowed(record):
+                        failed_ids.add(record.id)
+                        continue
+                except Exception:
+                    failed_ids.add(record.id)
+                    continue
             before = len(self.tabs)
             try:
                 self.open_session(
                     record,
                     restart_missing=True,
                     remember_layout=remember_layout,
-                    known_live=live_by_id.get(record.id) if live_by_id is not None else None,
+                    known_live=known_live,
                     known_pid=pids_by_id.get(record.id),
                     known_pid_resolved=pids_resolved,
                     refresh_side=False,
@@ -6324,6 +6430,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 status="stopped",
                 visible=False,
                 last_pid=None,
+                recovery_intent=RECOVERY_INTENT_INACTIVE,
             )
         except KeyError:
             # The replacement is already usable and the stale source was
@@ -6496,6 +6603,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 status="stopped",
                 last_pid=None,
                 visible=False,
+                recovery_intent=RECOVERY_INTENT_INACTIVE,
             )
             if refresh_side:
                 self.side.refresh()
@@ -7239,6 +7347,100 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             self._auth_attach_protected.discard(session_id)
             return False
 
+        if not exact_live:
+            get_coordinator = getattr(self.app_context, "_get_recovery_coordinator", None)
+            if not callable(get_coordinator):
+                self._payload_restart_inflight.discard(session_id)
+                self._auth_attach_protected.discard(session_id)
+                try:
+                    widget.resolve_deferred_attach()
+                except Exception:
+                    pass
+                self.show_toast(
+                    f"Could not start recovery for {record.name}: recovery coordinator is unavailable",
+                    kind="error",
+                )
+                self._refresh_gateway_model_control(force=True)
+                return False
+            try:
+                coordinator = get_coordinator()
+            except Exception as exc:
+                self._payload_restart_inflight.discard(session_id)
+                self._auth_attach_protected.discard(session_id)
+                try:
+                    widget.resolve_deferred_attach()
+                except Exception:
+                    pass
+                self.show_toast(
+                    f"Could not start recovery for {record.name}: {exc}",
+                    kind="error",
+                )
+                self._refresh_gateway_model_control(force=True)
+                return False
+
+            def publish_recovery(result: RecoveryResult) -> object:
+                error = "" if result.ready else (result.error or "")
+                payload = (
+                    session_id,
+                    generation,
+                    result.pid,
+                    error,
+                    reason,
+                    max(0, int(model_count)),
+                    result.action or "restarted",
+                    result.command,
+                    result.cwd,
+                    result.clear_recovery,
+                )
+                scheduled, scheduling_error = _schedule_glib_callback(
+                    self._complete_managed_payload_restart,
+                    *payload,
+                )
+                if scheduled:
+                    return False
+                with self._payload_restart_completion_lock:
+                    self._payload_restart_completions.append(payload)
+                print(
+                    f"T1000: payload restart completion for {session_id} will retry "
+                    f"on the UI poll: {scheduling_error}",
+                    file=sys.stderr,
+                )
+                return False
+
+            try:
+                submission = coordinator.submit(
+                    record,
+                    mode="payload",
+                    on_ready=publish_recovery,
+                    on_failed=publish_recovery,
+                )
+            except Exception as exc:
+                self._payload_restart_inflight.discard(session_id)
+                self._auth_attach_protected.discard(session_id)
+                try:
+                    widget.resolve_deferred_attach()
+                except Exception:
+                    pass
+                self.show_toast(
+                    f"Could not start recovery for {record.name}: {exc}",
+                    kind="error",
+                )
+                self._refresh_gateway_model_control(force=True)
+                return False
+            if submission.state not in {"queued", "deduplicated", "live"}:
+                # A rejected coordinator submission has no safe direct-open
+                # fallback. Its callback, when any, owns durable completion;
+                # this branch only handles the no-callback compatibility case.
+                if submission.state != "failed":
+                    self._payload_restart_inflight.discard(session_id)
+                    self._auth_attach_protected.discard(session_id)
+                    try:
+                        widget.resolve_deferred_attach()
+                    except Exception:
+                        pass
+                return False
+            return True
+
         def worker() -> None:
             replacement_pid: int | None = None
             replacement_action = "restarted"
@@ -7250,12 +7452,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 if exact_live:
                     replacement_pid = self.app_context.backend.restart_exact_payload(record)
                 else:
-                    recovery = self.app_context.backend.recover_dead_payload(record)
-                    replacement_pid = recovery.pid
-                    replacement_action = recovery.action
-                    replacement_command = recovery.command
-                    replacement_cwd = recovery.cwd
-                    clear_recovery = recovery.clear_recovery
+                    raise RuntimeError(
+                        "automatic payload recovery must use the recovery coordinator"
+                    )
             except Exception as exc:
                 error = str(exc)
             payload = (
@@ -7396,6 +7595,18 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             # Avoid a hot dead-pane loop. Reattach once so the VTE can publish
             # truthful exit output; a second pane-dead callback during the
             # bounded backoff declines automatic recovery.
+            try:
+                if not startup_recovery_allowed(record):
+                    self._auth_attach_protected.discard(session_id)
+                    resolver = getattr(self, "_resolve_auth_attach_gap", None)
+                    if callable(resolver):
+                        resolver(session_id)
+                    else:
+                        TermDeckWindow._resolve_auth_attach_gap(self, session_id)
+                    self.side.refresh()
+                    return False
+            except Exception:
+                pass
             self._payload_restart_backoff_until[session_id] = time.monotonic() + 15.0
             self._auth_attach_protected.discard(session_id)
             try:
@@ -8996,6 +9207,25 @@ def application_id_for_database(db_path: str | Path | None = None) -> str:
     return _application_id_for_canonical_database(canonical_database_path(db_path))
 
 
+def open_primary_session_store(db_path: Path) -> SessionStore:
+    """Open the registry only after this process becomes the GUI primary.
+
+    The fixed default GApplication identity first forwards a new activation to
+    any older TermDeck primary.  Only a genuinely new primary reaches startup,
+    so it is the sole process allowed to publish the one-time SSD copy.  Once
+    the managed database exists, later starts never touch the legacy HDD path.
+    """
+
+    default_path = DEFAULT_DB_PATH.expanduser().resolve(strict=False)
+    managed_launch = bool(os.environ.get("T1000_MANAGED_ROOT", "").strip())
+    if managed_launch and db_path == default_path and not db_path.exists():
+        migrate_legacy_database(destination=db_path)
+    store = SessionStore(db_path)
+    if managed_launch and db_path == default_path:
+        consume_pending_recovery_intents(store)
+    return store
+
+
 @dataclass(frozen=True)
 class PayloadRevivalSummary:
     """Durable startup-revival outcomes without conflating repair and restart."""
@@ -9017,21 +9247,7 @@ def payload_revival_candidates(records) -> "list[SessionRecord]":
 
     rows = []
     for record in records:
-        if bool(getattr(record, "external", False)):
-            continue
-        if str(getattr(record, "status", "")).casefold() not in {
-            "running",
-            "paused",
-            "missing",
-            "recovery-pending",
-            "start-error",
-        }:
-            continue
-        try:
-            recipe = recipe_from_record(record)
-        except SessionRecipeError:
-            continue
-        if automatic_recovery_allowed(recipe):
+        if startup_recovery_allowed(record):
             rows.append(record)
     rows.sort(
         key=lambda record: (
@@ -9146,7 +9362,9 @@ class TermDeckApplication(Gtk.Application):
         quit_action = Gio.SimpleAction.new("quit-preserving-sessions", None)
         quit_action.connect("activate", self._activate_quit_preserving_sessions)
         self.add_action(quit_action)
-        self.store = SessionStore(canonical_db_path)
+        self._database_path = canonical_db_path
+        self.store: SessionStore | None = None
+        self._startup_error: str | None = None
         self.backend = TmuxBackend()
         self._tmux_server_isolation = None
         try:
@@ -9188,6 +9406,7 @@ class TermDeckApplication(Gtk.Application):
         self._last_persistence_result: PersistenceResult | None = None
         self._legacy_recovery_checked = False
         self._last_legacy_recovery_result: LegacyRecoveryResult | None = None
+        self._payload_revival_lock = threading.Lock()
         self._payload_revival_started = False
         # Shared snapshot memo: multiple periodic table refreshers (window
         # overview, tab manager) reuse one tmux/proc sampling pass per tick
@@ -9200,6 +9419,8 @@ class TermDeckApplication(Gtk.Application):
         self._tmux_event_refresh_source: int | None = None
 
     def get_codex_auth_manager(self) -> CodexAuthManager:
+        if self.store is None:
+            raise RuntimeError("T1000 session registry is not initialized")
         manager = self.codex_auth
         if manager is None:
             manager = CodexAuthManager(account_source=self.store.account_source)
@@ -9208,6 +9429,16 @@ class TermDeckApplication(Gtk.Application):
 
     def do_startup(self) -> None:
         Gtk.Application.do_startup(self)
+        try:
+            self.store = open_primary_session_store(self._database_path)
+        except (OSError, ValueError, SessionDatabaseMigrationError) as exc:
+            self._startup_error = str(exc)
+            print(
+                f"T1000: managed session database startup failed: {exc}",
+                file=sys.stderr,
+            )
+            self.quit()
+            return
         try:
             self._chrome_css = apply_app_chrome(self.settings)
         except Exception:
@@ -9395,6 +9626,18 @@ class TermDeckApplication(Gtk.Application):
         return records, items
 
     def do_shutdown(self) -> None:
+        coordinator = getattr(self, "_recovery_coordinator", None)
+        if coordinator is not None:
+            self._recovery_coordinator = None
+            try:
+                coordinator.shutdown(wait=False)
+            except TypeError:
+                try:
+                    coordinator.shutdown()
+                except Exception:
+                    pass
+            except Exception:
+                pass
         client = self._tmux_events_client
         if client is not None:
             # Stop the reader before persistence so a wedged transport cannot
@@ -9405,7 +9648,8 @@ class TermDeckApplication(Gtk.Application):
             GLib.source_remove(self._tmux_event_refresh_source)
             self._tmux_event_refresh_source = None
         try:
-            self.persist_for_shutdown()
+            if self.store is not None:
+                self.persist_for_shutdown()
         except Exception:
             # Persistence failures are reported by the explicit CLI/service path;
             # never trap the desktop application in a failed shutdown sequence.
@@ -9686,6 +9930,7 @@ class TermDeckApplication(Gtk.Application):
                 last_pid=None,
                 recovery_command=None,
                 recovery_cwd=None,
+                recovery_intent=RECOVERY_INTENT_INACTIVE,
             )
             terminated_ids.add(record.id)
         if terminated_ids:
@@ -10121,6 +10366,11 @@ class TermDeckApplication(Gtk.Application):
         return True
 
     def do_activate(self) -> None:
+        if self.store is None:
+            detail = self._startup_error or "session registry initialization failed"
+            print(f"T1000: {detail}", file=sys.stderr)
+            self.quit()
+            return
         if not self.backend.available:
             dialog = Gtk.MessageDialog(
                 message_type=Gtk.MessageType.ERROR,
@@ -10133,7 +10383,7 @@ class TermDeckApplication(Gtk.Application):
             return
         # Repair stale registry state before browser-style restore so lost
         # backend sessions do not reappear as live tabs after a crash/reboot.
-        reconcile_store(
+        reconciliation = reconcile_store(
             self.store,
             backend=self.backend,
             sampler=self.sampler,
@@ -10141,15 +10391,6 @@ class TermDeckApplication(Gtk.Application):
             recover_missing=True,
             resource_sample_limit=UI_RESOURCE_REFRESH_BUDGET,
         )
-
-        # Older TermDeck versions sometimes persisted only ``codex --yolo``
-        # instead of the primary UUID.  The archive pass can inspect tens of
-        # gigabytes of rollout history, so never make notebook construction
-        # wait for it.  Rows are repaired in the background and the side pane
-        # is refreshed after the durable result is published.
-        schedule_legacy_recovery = getattr(self, "_schedule_legacy_recovery", None)
-        if callable(schedule_legacy_recovery):
-            schedule_legacy_recovery()
 
         # Reconcile cannot detect a crashed Codex/Claude payload: the tmux
         # session and its trailing fallback shell survive, so the row stays
@@ -10202,6 +10443,28 @@ class TermDeckApplication(Gtk.Application):
             if callable(restore_groups)
             else self.store.windows_with_visible_sessions()
         )
+        # ``windows_for_restore`` is intentionally layout-oriented and also
+        # returns never-started rows.  Cold startup must not turn those rows
+        # into processes.  Only the concrete reconciliation result can grant
+        # the live-session exception used to reattach a manual tab; a mocked
+        # or legacy result is left to the caller's explicit restore path.
+        if isinstance(reconciliation, ReconcileResult):
+            live_session_ids = {
+                row.id
+                for row in reconciliation.rows
+                if row.live_session and row.live_process
+            }
+            groups = [
+                (
+                    window_id,
+                    window_title,
+                    startup_restore_candidates(
+                        records,
+                        live_session_ids=live_session_ids,
+                    ),
+                )
+                for window_id, window_title, records in groups
+            ]
         windows_by_id = {
             getattr(window, "window_id", None): window
             for window in self.windows
@@ -10379,10 +10642,116 @@ class TermDeckApplication(Gtk.Application):
         ).start()
 
     def _payload_revival_timeout(self) -> bool:
-        """One-shot GLib callback: start the payload revival sweep once."""
+        """Start one payload revival sweep from the activation timer."""
 
         self._schedule_payload_revival()
         return False
+
+    def _get_recovery_coordinator(self) -> RecoveryCoordinator:
+        """Return the process-wide bounded recovery coordinator."""
+
+        coordinator = getattr(self, "_recovery_coordinator", None)
+        if isinstance(coordinator, RecoveryCoordinator):
+            return coordinator
+
+        def callback_executor(invoke: Callable[[], object]) -> object:
+            def run() -> bool:
+                invoke()
+                return False
+
+            return GLib.idle_add(run)
+
+        coordinator = RecoveryCoordinator(
+            self.backend,
+            self.store,
+            callback_executor=callback_executor,
+        )
+        self._recovery_coordinator = coordinator
+        return coordinator
+
+    def _schedule_payload_revival_with_coordinator(
+        self,
+        coordinator: RecoveryCoordinator,
+    ) -> None:
+        try:
+            candidates = payload_revival_candidates(self.store.list())
+        except Exception:
+            self._finish_payload_revival()
+            return
+        if not candidates:
+            self._finish_payload_revival()
+            return
+
+        remaining = len(candidates)
+        counts = {"ready": 0, "created": 0, "failed": 0}
+        state_lock = threading.Lock()
+
+        def complete(result: RecoveryResult) -> object:
+            nonlocal remaining
+            with state_lock:
+                if result.ready:
+                    counts["ready"] += 1
+                    if result.created:
+                        counts["created"] += 1
+                else:
+                    counts["failed"] += 1
+                remaining -= 1
+                finished = remaining == 0
+            if not finished:
+                return False
+            for window in list(self.windows):
+                try:
+                    window.side.refresh()
+                except Exception:
+                    pass
+            total_created = counts["created"]
+            total_failed = counts["failed"]
+            if total_created or total_failed:
+                show_toast = (
+                    getattr(self.windows[0], "show_toast", None)
+                    if self.windows
+                    else None
+                )
+                if callable(show_toast):
+                    parts: list[str] = []
+                    if total_created:
+                        parts.append(
+                            f"Relaunched {total_created} coding session"
+                            f"{'s' if total_created != 1 else ''} in place"
+                        )
+                    if total_failed:
+                        parts.append(
+                            f"{total_failed} remembered session"
+                            f"{'s' if total_failed != 1 else ''} could not be repaired safely"
+                        )
+                    show_toast(
+                        "; ".join(parts),
+                        kind="warning" if total_failed else "success",
+                    )
+            self._finish_payload_revival()
+            return False
+
+        for record in candidates:
+            try:
+                coordinator.submit(
+                    record,
+                    mode="payload",
+                    on_ready=complete,
+                    on_failed=complete,
+                )
+            except Exception as exc:
+                complete(
+                    RecoveryResult(
+                        session_id=str(getattr(record, "id", "")),
+                        mode="payload",
+                        state="failed",
+                        error=str(exc),
+                    )
+                )
+
+    def _finish_payload_revival(self) -> None:
+        with self._payload_revival_lock:
+            self._payload_revival_started = False
 
     def _schedule_payload_revival(self) -> None:
         """Relaunch dead or missing managed payloads from durable recipes.
@@ -10396,15 +10765,28 @@ class TermDeckApplication(Gtk.Application):
         once — and publish only a small summary back on the GTK context.
         """
 
-        if getattr(self, "_payload_revival_started", False):
+        with self._payload_revival_lock:
+            if self._payload_revival_started:
+                return
+            self._payload_revival_started = True
+        if isinstance(getattr(self, "store", None), SessionStore):
+            try:
+                coordinator = self._get_recovery_coordinator()
+            except Exception:
+                coordinator = None
+        else:
+            coordinator = None
+        if coordinator is not None:
+            self._schedule_payload_revival_with_coordinator(coordinator)
             return
-        self._payload_revival_started = True
         try:
             records = self.store.list()
+            candidates = payload_revival_candidates(records)
         except Exception:
+            self._finish_payload_revival()
             return
-        candidates = payload_revival_candidates(records)
         if not candidates:
+            self._finish_payload_revival()
             return
         try:
             store_path = self.store.path
@@ -10419,82 +10801,95 @@ class TermDeckApplication(Gtk.Application):
 
         def worker() -> None:
             try:
-                os.nice(10)
-            except (AttributeError, OSError):
-                pass
-            worker_store = None
-            if store_path is not None:
-                # The GUI store connection is thread-affine; use a private one.
                 try:
-                    worker_store = SessionStore(
-                        store_path,
-                        auth_root=auth_root,
-                        account_source=account_source,
-                        provision_auth_scopes=provision_auth_scopes,
+                    os.nice(10)
+                except (AttributeError, OSError):
+                    pass
+                worker_store = None
+                if store_path is not None:
+                    # The GUI store connection is thread-affine; use a private one.
+                    try:
+                        worker_store = SessionStore(
+                            store_path,
+                            auth_root=auth_root,
+                            account_source=account_source,
+                            provision_auth_scopes=provision_auth_scopes,
+                        )
+                    except Exception:
+                        worker_store = None
+                try:
+                    summary = revive_dead_payload_sessions(
+                        self.backend,
+                        candidates,
+                        store=worker_store,
                     )
+                finally:
+                    if worker_store is not None:
+                        try:
+                            worker_store.close()
+                        except Exception:
+                            pass
+                if not (summary.revived or summary.repaired or summary.failed):
+                    return
+
+                def publish() -> bool:
+                    try:
+                        for window in list(self.windows):
+                            try:
+                                window.side.refresh()
+                            except Exception:
+                                pass
+                        show_toast = (
+                            getattr(self.windows[0], "show_toast", None)
+                            if self.windows
+                            else None
+                        )
+                        if callable(show_toast):
+                            parts: list[str] = []
+                            if summary.revived:
+                                parts.append(
+                                    f"Relaunched {summary.revived} coding session"
+                                    f"{'s' if summary.revived != 1 else ''} in place"
+                                )
+                            if summary.repaired:
+                                parts.append(
+                                    f"corrected {summary.repaired} live session status"
+                                    f"{'es' if summary.repaired != 1 else ''}"
+                                )
+                            if summary.failed:
+                                parts.append(
+                                    f"{summary.failed} remembered session"
+                                    f"{'s' if summary.failed != 1 else ''} could not be repaired safely"
+                                )
+                            show_toast(
+                                "; ".join(parts),
+                                kind="warning" if summary.failed else "success",
+                            )
+                    except Exception:
+                        pass
+                    finally:
+                        self._finish_payload_revival()
+                    return False
+
+                try:
+                    GLib.idle_add(publish)
                 except Exception:
-                    worker_store = None
-            try:
-                summary = revive_dead_payload_sessions(
-                    self.backend,
-                    candidates,
-                    store=worker_store,
-                )
-            finally:
-                if worker_store is not None:
-                    try:
-                        worker_store.close()
-                    except Exception:
-                        pass
-            if not (summary.revived or summary.repaired or summary.failed):
-                return
-
-            def publish() -> bool:
-                for window in list(self.windows):
-                    try:
-                        window.side.refresh()
-                    except Exception:
-                        pass
-                show_toast = (
-                    getattr(self.windows[0], "show_toast", None)
-                    if self.windows
-                    else None
-                )
-                if callable(show_toast):
-                    parts: list[str] = []
-                    if summary.revived:
-                        parts.append(
-                            f"Relaunched {summary.revived} coding session"
-                            f"{'s' if summary.revived != 1 else ''} in place"
-                        )
-                    if summary.repaired:
-                        parts.append(
-                            f"corrected {summary.repaired} live session status"
-                            f"{'es' if summary.repaired != 1 else ''}"
-                        )
-                    if summary.failed:
-                        parts.append(
-                            f"{summary.failed} remembered session"
-                            f"{'s' if summary.failed != 1 else ''} could not be repaired safely"
-                        )
-                    show_toast(
-                        "; ".join(parts),
-                        kind="warning" if summary.failed else "success",
-                    )
-                return False
-
-            try:
-                GLib.idle_add(publish)
+                    # The app may be shutting down; respawned payloads keep
+                    # running inside tmux and need no UI callback.
+                    pass
             except Exception:
-                # The app may be shutting down; respawned payloads keep
-                # running inside tmux and need no UI callback.
                 pass
+            finally:
+                self._finish_payload_revival()
 
-        threading.Thread(
-            target=worker,
-            name="termdeck-payload-revival",
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=worker,
+                name="termdeck-payload-revival",
+                daemon=True,
+            ).start()
+        except Exception:
+            self._finish_payload_revival()
 
 
 

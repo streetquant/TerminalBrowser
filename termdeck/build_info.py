@@ -409,8 +409,14 @@ def release_status(
     result["managed_current_release_id"] = state.get("current_release_id") if state else None
 
     manifest_path = _inferred_manifest_path()
-    if build_info["build_mode"] == "development" and manifest_path is None:
-        result.update({"posture": "development", "ok": not errors})
+    build_mode = str(build_info["build_mode"])
+    if build_mode != "release":
+        if manifest_path is not None:
+            result["manifest_path"] = str(manifest_path)
+            errors.append(
+                f"{build_mode} build cannot be reported as a managed production release"
+            )
+        result.update({"posture": build_mode, "ok": not errors})
         return result
     if manifest_path is None:
         result.update({"posture": "unmanaged-wheel", "ok": not errors})

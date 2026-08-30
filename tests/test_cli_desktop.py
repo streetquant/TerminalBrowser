@@ -18,6 +18,25 @@ class CliDesktopTests(unittest.TestCase):
             self.assertTrue(payload["dry_run"])
             self.assertIn("Exec=t1000 gui", payload["desktop_entry"])
 
+    def test_install_desktop_autostart_requires_managed_ssd(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("sys.stdout"), mock.patch(
+            "termdeck.desktop_integration.managed_autostart_ready",
+            return_value=(False, "storage unavailable"),
+        ):
+            self.assertEqual(
+                main(
+                    [
+                        "install-desktop",
+                        "--autostart",
+                        "--data-home",
+                        tmp,
+                        "--config-home",
+                        tmp,
+                    ]
+                ),
+                1,
+            )
+
     def test_install_and_uninstall_desktop_cli(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch("sys.stdout"):
             self.assertEqual(main(["install-desktop", "--data-home", tmp, "--command", "t1000"]), 0)
@@ -28,6 +47,41 @@ class CliDesktopTests(unittest.TestCase):
             self.assertEqual(main(["uninstall-desktop", "--data-home", tmp]), 0)
             self.assertFalse(desktop_file.exists())
             self.assertFalse(icon_file.exists())
+
+    def test_cli_removes_autostart_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("sys.stdout"), mock.patch(
+            "termdeck.desktop_integration.managed_autostart_ready",
+            return_value=(True, "verified"),
+        ):
+            self.assertEqual(
+                main(
+                    [
+                        "install-desktop",
+                        "--autostart",
+                        "--data-home",
+                        tmp,
+                        "--config-home",
+                        tmp,
+                    ]
+                ),
+                0,
+            )
+            autostart = Path(tmp) / "autostart" / "io.github.t1000.T1000.desktop"
+            self.assertTrue(autostart.exists())
+            self.assertEqual(
+                main(
+                    [
+                        "uninstall-desktop",
+                        "--autostart",
+                        "--data-home",
+                        tmp,
+                        "--config-home",
+                        tmp,
+                    ]
+                ),
+                0,
+            )
+            self.assertFalse(autostart.exists())
 
 
 if __name__ == "__main__":

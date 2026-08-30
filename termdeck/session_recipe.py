@@ -103,8 +103,8 @@ def _normalise_cwd(value: object, *, base_directory: str | Path | None = None) -
         base = Path(base_directory).expanduser() if base_directory is not None else Path.cwd()
         requested = base / requested
     try:
-        normalised = requested.resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
+        normalised = Path(os.path.abspath(os.fspath(requested)))
+    except (OSError, RuntimeError, TypeError) as exc:
         raise SessionRecipeError("session recipe cwd cannot be normalised") from exc
     text = str(normalised)
     if not Path(text).is_absolute():
@@ -339,22 +339,13 @@ def resolve_working_directory(
     requested = Path(recipe.cwd)
     try:
         if requested.is_dir():
-            return ResolvedWorkingDirectory(requested.resolve(), False, recipe.cwd)
-    except (OSError, RuntimeError):
-        pass
-
-    # Never recreate a missing mount/project path automatically.  Walk to the
-    # nearest existing parent; if even that cannot be resolved, use HOME or /.
-    for candidate in requested.parents:
-        try:
-            if candidate.is_dir():
-                return ResolvedWorkingDirectory(candidate.resolve(), True, recipe.cwd)
-        except (OSError, RuntimeError):
-            continue
-    fallback = Path(home).expanduser() if home is not None else Path.home()
-    try:
-        if fallback.is_dir():
-            return ResolvedWorkingDirectory(fallback.resolve(), True, recipe.cwd)
-    except (OSError, RuntimeError):
-        pass
-    return ResolvedWorkingDirectory(Path("/"), True, recipe.cwd)
+            canonical = requested.resolve(strict=True)
+            if canonical.is_dir():
+                return ResolvedWorkingDirectory(requested, False, recipe.cwd)
+    except (OSError, RuntimeError) as exc:
+        raise SessionRecipeError(
+            f"session recipe working directory is unavailable: {recipe.cwd}"
+        ) from exc
+    raise SessionRecipeError(
+        f"session recipe working directory is unavailable: {recipe.cwd}"
+    )

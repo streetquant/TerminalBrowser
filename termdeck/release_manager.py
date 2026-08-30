@@ -182,6 +182,32 @@ class ReleaseError(RuntimeError):
     """A release failed a safety, identity, or atomicity contract."""
 
 
+def _require_production_build(
+    build_info: Mapping[str, object],
+    *,
+    label: str,
+) -> None:
+    if build_info.get("build_mode") != "release":
+        raise ReleaseError(
+            f"{label} is not a production release "
+            f"(build mode={build_info.get('build_mode')!r})"
+        )
+
+
+def _require_managed_storage(layout: "ReleaseLayout"):
+    from .storage_fabric import require_hot_storage
+
+    try:
+        return require_hot_storage(
+            managed_root=layout.root,
+            launcher_path=layout.launcher_path,
+            production=True,
+        )
+    except Exception as exc:
+        reason = getattr(exc, "reason", str(exc))
+        raise ReleaseError(f"managed storage attestation failed: {reason}") from exc
+
+
 @dataclass(frozen=True)
 class SourceSnapshot:
     root: Path
@@ -1371,6 +1397,10 @@ def _read_activation_artifact_snapshot(
             manifest = validate_release_manifest(json.loads(manifest_bytes.decode("utf-8")))
         except (UnicodeDecodeError, json.JSONDecodeError, BuildIdentityError) as exc:
             raise ReleaseError(f"activation target manifest is invalid: {exc}") from exc
+        _require_production_build(
+            manifest["build_info"],
+            label="activation target",
+        )
         if manifest_bytes != canonical_json_bytes(manifest):
             raise ReleaseError("activation target manifest is not canonical")
         if manifest.get("release_id") != release_id:
@@ -2062,6 +2092,10 @@ def verify_installed_tree(release_dir: str | Path) -> dict[str, object]:
         manifest = validate_release_manifest(read_json(manifest_path, label="release manifest"))
     except BuildIdentityError as exc:
         raise ReleaseError(str(exc)) from exc
+    _require_production_build(
+        manifest["build_info"],
+        label="installed release manifest",
+    )
     if manifest_path.read_bytes() != canonical_json_bytes(manifest):
         raise ReleaseError("installed release manifest is not canonical")
     build_info = manifest.get("build_info")
@@ -2317,6 +2351,8 @@ try:
     build_info = manifest.get("build_info")
     if not isinstance(build_info, dict):
         raise RuntimeError("managed manifest has no build info")
+    if build_info.get("build_mode") != "release":
+        raise RuntimeError("managed build is not a production release")
     build_fields = {
         key: build_info.get(key)
         for key in (
@@ -2432,6 +2468,16 @@ os.environ["T1000_MANAGED_BIN_DIR"] = str(launcher.parent)
 os.environ["T1000_RELEASE_MANIFEST"] = str(manifest_path)
 os.environ["T1000_RELEASE_STATE"] = str(STATE)
 sys.path.insert(0, str(site))
+try:
+    from termdeck.storage_fabric import require_hot_storage
+    require_hot_storage(
+        managed_root=ROOT,
+        launcher_path=launcher,
+        production=True,
+    )
+except Exception as exc:
+    print(f"t1000 managed launcher refused unsafe storage: {exc}", file=sys.stderr)
+    raise SystemExit(78)
 from termdeck.build_info import release_status
 status = release_status(verify_artifact=False, managed_root=ROOT)
 if not status.get("ok") or status.get("release_id") != release_id:
@@ -2851,6 +2897,10 @@ def _stage_release(
     manifest_path: Path,
 ) -> Path:
     assert verified.manifest is not None
+    _require_production_build(
+        verified.manifest["build_info"],
+        label="release artifact",
+    )
     release_id = str(verified.manifest["release_id"])
     layout.releases_dir.mkdir(parents=True, exist_ok=True)
     final = layout.releases_dir / release_id
@@ -2926,11 +2976,17 @@ def install_release(
     bin_dir: str | Path | None = None,
     python: str | Path | None = None,
     lock_timeout: float = 15.0,
+    production: bool = False,
 ) -> dict[str, object]:
     layout = release_layout(root=root, bin_dir=bin_dir)
+    storage_attestation = _require_managed_storage(layout) if production else None
     manifest_source = Path(manifest_path).expanduser()
     verified = verify_wheel(wheel_path, manifest_path=manifest_source)
     assert verified.manifest is not None
+    _require_production_build(
+        verified.manifest["build_info"],
+        label="release artifact",
+    )
     release_id = str(verified.manifest["release_id"])
     interpreter = (
         Path(python).expanduser().resolve(strict=True)
@@ -3105,6 +3161,8 @@ def install_release(
             "state_generation": new_state["generation"],
             "live_processes_restarted": False,
         }
+        if storage_attestation is not None:
+            result["storage_attestation"] = storage_attestation.as_dict()
         return result
 
 
@@ -3323,6 +3381,22 @@ def _verify_managed_activation(
     if not isinstance(current, str) or not _RELEASE_ID.fullmatch(current):
         raise ReleaseError("managed current release id is invalid")
 
+    manifest_path = layout.releases_dir / current / "manifest.json"
+    manifest_bytes = _read_regular_file_bytes(
+        manifest_path,
+        label="managed release manifest",
+        maximum_bytes=_MAX_MANIFEST_BYTES,
+    )
+    try:
+        manifest = validate_release_manifest(
+            json.loads(manifest_bytes.decode("utf-8"))
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, BuildIdentityError) as exc:
+        raise ReleaseError(f"managed release manifest is invalid: {exc}") from exc
+    if manifest_bytes != canonical_json_bytes(manifest):
+        raise ReleaseError("managed release manifest is not canonical")
+    _require_production_build(manifest["build_info"], label="managed release")
+
     interpreter = Path(str(state.get("python_executable", "")))
     _regular_file_hash(interpreter, label="managed Python interpreter", executable=True)
     try:
@@ -3350,7 +3424,6 @@ def _verify_managed_activation(
     if launcher_hash != activation.launcher_sha256:
         raise ReleaseError("managed launcher SHA-256 does not match canonical activation")
 
-    manifest_path = layout.releases_dir / current / "manifest.json"
     manifest_hash = _regular_file_hash(manifest_path, label="managed release manifest")
     if manifest_hash != state.get("manifest_sha256"):
         raise ReleaseError("managed release manifest SHA-256 does not match state.json")

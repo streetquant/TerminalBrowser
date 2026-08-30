@@ -8,9 +8,14 @@ fail-closed delegation to ``create_or_resume``.
 from __future__ import annotations
 
 import inspect
+import threading
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
+import termdeck.gtk_app as gtk_app
 from termdeck.gtk_app import (
+    PayloadRevivalSummary,
     TermDeckApplication,
     payload_revival_candidates,
     revive_dead_payload_sessions,
@@ -237,9 +242,147 @@ class SchedulingTests(unittest.TestCase):
         self.assertIn("_payload_revival_timeout", source)
         self.assertIn("GLib.timeout_add_seconds(2, payload_revival_timeout)", source)
 
-    def test_schedule_guard_is_single_shot(self):
-        source = inspect.getsource(TermDeckApplication._schedule_payload_revival)
-        self.assertIn('_payload_revival_started', source)
+    def _app(self, records=None):
+        app = TermDeckApplication.__new__(TermDeckApplication)
+        app._payload_revival_lock = threading.Lock()
+        app._payload_revival_started = False
+        app.backend = object()
+        app.windows = []
+        stored_records = [make_record("dead")] if records is None else list(records)
+        app.store = SimpleNamespace(
+            list=mock.Mock(return_value=stored_records),
+            path=None,
+        )
+        return app
+
+    def test_second_sweep_runs_after_first_worker_finishes(self):
+        app = self._app()
+        threads = []
+
+        class DeferredThread:
+            def __init__(self, *, target, **_kwargs):
+                self.target = target
+                threads.append(self)
+
+            def start(self):
+                return None
+
+        with mock.patch.object(gtk_app.threading, "Thread", DeferredThread), mock.patch.object(
+            gtk_app,
+            "revive_dead_payload_sessions",
+            return_value=PayloadRevivalSummary(),
+        ):
+            TermDeckApplication._schedule_payload_revival(app)
+            TermDeckApplication._schedule_payload_revival(app)
+            self.assertEqual(len(threads), 1)
+            self.assertTrue(app._payload_revival_started)
+
+            threads[0].target()
+            self.assertFalse(app._payload_revival_started)
+
+            TermDeckApplication._schedule_payload_revival(app)
+            self.assertEqual(len(threads), 2)
+
+    def test_worker_failure_releases_sweep_guard(self):
+        app = self._app()
+        threads = []
+
+        class DeferredThread:
+            def __init__(self, *, target, **_kwargs):
+                self.target = target
+                threads.append(self)
+
+            def start(self):
+                return None
+
+        with mock.patch.object(gtk_app.threading, "Thread", DeferredThread), mock.patch.object(
+            gtk_app,
+            "revive_dead_payload_sessions",
+            side_effect=RuntimeError("worker failed"),
+        ):
+            TermDeckApplication._schedule_payload_revival(app)
+            threads[0].target()
+            self.assertFalse(app._payload_revival_started)
+            TermDeckApplication._schedule_payload_revival(app)
+            self.assertEqual(len(threads), 2)
+
+    def test_store_failures_and_empty_candidates_release_sweep_guard(self):
+        app = self._app(records=[])
+        TermDeckApplication._schedule_payload_revival(app)
+        self.assertFalse(app._payload_revival_started)
+        app.store.list.return_value = [make_record("again")]
+
+        threads = []
+
+        class DeferredThread:
+            def __init__(self, *, target, **_kwargs):
+                threads.append(target)
+
+            def start(self):
+                return None
+
+        with mock.patch.object(gtk_app.threading, "Thread", DeferredThread):
+            app.store.list.side_effect = RuntimeError("store failed")
+            TermDeckApplication._schedule_payload_revival(app)
+            self.assertFalse(app._payload_revival_started)
+            self.assertEqual(threads, [])
+
+    def test_idle_publish_failure_releases_sweep_guard(self):
+        app = self._app()
+        threads = []
+
+        class DeferredThread:
+            def __init__(self, *, target, **_kwargs):
+                self.target = target
+                threads.append(self)
+
+            def start(self):
+                return None
+
+        with mock.patch.object(gtk_app.threading, "Thread", DeferredThread), mock.patch.object(
+            gtk_app,
+            "revive_dead_payload_sessions",
+            return_value=PayloadRevivalSummary(revived=1),
+        ), mock.patch.object(
+            gtk_app.GLib,
+            "idle_add",
+            side_effect=RuntimeError("GTK is shutting down"),
+        ):
+            TermDeckApplication._schedule_payload_revival(app)
+            threads[0].target()
+            self.assertFalse(app._payload_revival_started)
+            TermDeckApplication._schedule_payload_revival(app)
+            self.assertEqual(len(threads), 2)
+
+    def test_activation_skips_legacy_archive_scan_but_schedules_payload_revival(self):
+        class FakeGLib:
+            scheduled = []
+
+            @classmethod
+            def timeout_add_seconds(cls, delay, callback):
+                cls.scheduled.append((delay, callback))
+                return len(cls.scheduled)
+
+        app = TermDeckApplication.__new__(TermDeckApplication)
+        app.backend = SimpleNamespace(available=True)
+        app.store = SimpleNamespace(windows_for_restore=lambda: [])
+        app.sampler = object()
+        app.windows = []
+        app.workspace_path = None
+        app._schedule_legacy_recovery = mock.Mock()
+        app._payload_revival_timeout = mock.Mock(return_value=False)
+        app.prompt_for_new_window = mock.Mock()
+
+        with mock.patch.object(gtk_app, "GLib", FakeGLib), mock.patch.object(
+            gtk_app, "reconcile_store"
+        ):
+            TermDeckApplication.do_activate(app)
+
+        app._schedule_legacy_recovery.assert_not_called()
+        self.assertEqual(len(FakeGLib.scheduled), 1)
+        self.assertEqual(FakeGLib.scheduled[0][0], 2)
+        FakeGLib.scheduled[0][1]()
+        app._payload_revival_timeout.assert_called_once_with()
 
 
 if __name__ == "__main__":

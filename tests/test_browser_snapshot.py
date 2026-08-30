@@ -121,6 +121,55 @@ class BrowserSnapshotTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_snapshot_import_never_marks_layout_only_rows_recoverable(self):
+        snapshot = {
+            "schema": "termdeck.browser-snapshot",
+            "schema_version": 2,
+            "name": "intent-check",
+            "windows": [
+                {
+                    "window_id": "win",
+                    "title": "Window",
+                    "tabs": [
+                        {
+                            "session_id": "archived",
+                            "name": "archived",
+                            "tag": "old",
+                            "command": "bash",
+                            "cwd": ".",
+                            "status": "archived",
+                            "recovery_intent": "active",
+                        },
+                        {
+                            "session_id": "new",
+                            "name": "new",
+                            "tag": "new",
+                            "command": "bash",
+                            "cwd": ".",
+                            "status": "new",
+                            "recovery_intent": "active",
+                        },
+                    ],
+                }
+            ],
+        }
+
+        parsed = parse_snapshot(snapshot)
+        tabs = parsed["windows"][0]["tabs"]
+        self.assertEqual([tab["recovery_intent"] for tab in tabs], ["inactive", "inactive"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                result = import_browser_snapshot(store, snapshot, preserve_window_ids=True)
+                self.assertEqual([row.recovery_intent for row in result.rows], ["inactive", "inactive"])
+                self.assertEqual(
+                    [record.recovery_intent for record in store.list(include_archived=True)],
+                    ["inactive", "inactive"],
+                )
+            finally:
+                store.close()
+
     def test_restore_plan_includes_visible_non_stopped_tabs_and_explains_skips(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")

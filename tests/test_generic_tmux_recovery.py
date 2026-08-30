@@ -152,7 +152,7 @@ class GenericTmuxRecoveryTests(unittest.TestCase):
             self.assertIn("__termdeck_status=$?", launch_command)
             self.assertIn("exec ", launch_command)
 
-    def test_recipe_environment_and_missing_cwd_are_recovered_without_creating_path(self) -> None:
+    def test_missing_cwd_fails_before_tmux_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "unmounted" / "project"
             record = _record(
@@ -165,15 +165,11 @@ class GenericTmuxRecoveryTests(unittest.TestCase):
             with mock.patch.object(backend, "session_exists", return_value=False), checkpoint, wrapper, mock.patch.object(
                 backend, "_run", return_value=_completed()
             ) as run:
-                backend.create_or_resume(record)
+                with self.assertRaisesRegex(TmuxError, "working directory is unavailable"):
+                    backend.create_or_resume(record)
 
-            launch = run.call_args_list[0].args[0]
             self.assertFalse(missing.exists())
-            self.assertIn("MODE=production", launch)
-            self.assertIn("PORT=9000", launch)
-            self.assertIn("TERMDECK_RECOVERY_DEGRADED=missing-working-directory", launch)
-            self.assertIn(f"TERMDECK_RECOVERY_ORIGINAL_CWD={missing}", launch)
-            self.assertEqual(launch[launch.index("-c") + 1], str(Path(tmp).resolve()))
+            run.assert_not_called()
 
     def test_corrupted_recipe_fails_before_tmux_mutation(self) -> None:
         record = _record()

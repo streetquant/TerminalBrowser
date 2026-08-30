@@ -7,10 +7,153 @@ from pathlib import Path
 from unittest import mock
 
 from termdeck.models import SessionRecord
-from termdeck.session_store import SessionStore
+from termdeck.session_store import (
+    SessionDatabaseMigrationInProgress,
+    SessionStore,
+    default_auth_root,
+    default_db_path,
+    migrate_legacy_database,
+)
 
 
 class SessionStoreTests(unittest.TestCase):
+    def test_managed_defaults_use_sibling_termdeck_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            managed_root = Path(tmp) / "t1000-managed"
+            with mock.patch.dict(
+                os.environ,
+                {"T1000_MANAGED_ROOT": str(managed_root)},
+                clear=False,
+            ):
+                expected_root = managed_root.parent / "termdeck"
+                self.assertEqual(default_db_path(), expected_root / "sessions.sqlite3")
+                self.assertEqual(default_auth_root(), expected_root / "terminal-auth")
+                store = SessionStore(provision_auth_scopes=True)
+                try:
+                    self.assertEqual(store.path, expected_root / "sessions.sqlite3")
+                    self.assertEqual(store.auth_root, expected_root / "terminal-auth")
+                    self.assertEqual(
+                        store.path.stat().st_mode & 0o777,
+                        0o600,
+                    )
+                    self.assertEqual(
+                        expected_root.stat().st_mode & 0o777,
+                        0o700,
+                    )
+                    self.assertEqual(
+                        store.auth_root.stat().st_mode & 0o777,
+                        0o700,
+                    )
+                    for suffix in ("-wal", "-shm"):
+                        sidecar = store.path.with_name(f"{store.path.name}{suffix}")
+                        if sidecar.exists():
+                            self.assertEqual(sidecar.stat().st_mode & 0o777, 0o600)
+                finally:
+                    store.close()
+
+    def test_explicit_database_path_remains_authoritative_under_managed_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            explicit = Path(tmp) / "explicit" / "sessions.sqlite3"
+            managed_root = Path(tmp) / "t1000-managed"
+            with mock.patch.dict(
+                os.environ,
+                {"T1000_MANAGED_ROOT": str(managed_root)},
+                clear=False,
+            ):
+                store = SessionStore(explicit)
+                try:
+                    self.assertEqual(store.path, explicit)
+                    self.assertEqual(store.auth_root, explicit.parent / "terminal-auth")
+                    self.assertFalse(store.auth_root.exists())
+                finally:
+                    store.close()
+
+    def test_legacy_database_migration_is_atomic_and_does_not_copy_auth_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            connection = sqlite3.connect(legacy)
+            try:
+                connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+                connection.execute("INSERT INTO marker(value) VALUES ('legacy')")
+                connection.commit()
+            finally:
+                connection.close()
+            (legacy.parent / "terminal-auth").mkdir()
+            (legacy.parent / "terminal-auth" / "not-copied").write_text("x")
+            managed_root = root / "managed"
+            with mock.patch.dict(
+                os.environ,
+                {"T1000_MANAGED_ROOT": str(managed_root)},
+                clear=False,
+            ):
+                result = migrate_legacy_database(legacy_path=legacy)
+                destination = managed_root.parent / "termdeck" / "sessions.sqlite3"
+                self.assertEqual(result.status, "migrated")
+                self.assertEqual(result.source, legacy.resolve())
+                self.assertEqual(result.destination, destination.resolve())
+                self.assertTrue(destination.is_file())
+                self.assertFalse((destination.parent / "terminal-auth").exists())
+                migrated = sqlite3.connect(destination)
+                try:
+                    self.assertEqual(
+                        migrated.execute("SELECT value FROM marker").fetchone()[0],
+                        "legacy",
+                    )
+                finally:
+                    migrated.close()
+                before = destination.read_bytes()
+                repeated = migrate_legacy_database(legacy_path=legacy)
+                self.assertEqual(repeated.status, "destination_exists")
+                self.assertEqual(destination.read_bytes(), before)
+
+    def test_invalid_legacy_database_never_publishes_a_partial_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            legacy.write_bytes(b"not-a-sqlite-database")
+            managed_root = root / "managed"
+            with mock.patch.dict(
+                os.environ,
+                {"T1000_MANAGED_ROOT": str(managed_root)},
+                clear=False,
+            ), self.assertRaisesRegex(
+                RuntimeError,
+                "SQLite integrity check failed|not a readable SQLite database",
+            ):
+                migrate_legacy_database(legacy_path=legacy)
+            destination = managed_root.parent / "termdeck" / "sessions.sqlite3"
+            self.assertFalse(destination.exists())
+            self.assertEqual(
+                list(destination.parent.glob(".sessions.sqlite3.migration-*")),
+                [],
+            )
+
+    def test_concurrent_migration_fails_immediately_without_waiting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            connection = sqlite3.connect(legacy)
+            connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+            connection.commit()
+            connection.close()
+            managed_root = root / "managed"
+            with mock.patch.dict(
+                os.environ,
+                {"T1000_MANAGED_ROOT": str(managed_root)},
+                clear=False,
+            ), mock.patch(
+                "termdeck.session_store.fcntl.flock",
+                side_effect=BlockingIOError,
+            ), self.assertRaisesRegex(
+                SessionDatabaseMigrationInProgress,
+                "MIGRATION_IN_PROGRESS",
+            ):
+                migrate_legacy_database(legacy_path=legacy)
+
     def test_file_registry_uses_responsive_sqlite_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")
@@ -489,6 +632,81 @@ class SessionStoreTests(unittest.TestCase):
                 self.assertFalse(record.auth_restart_required)  # type: ignore[union-attr]
             finally:
                 store.close()
+
+    def test_schema_backfills_recovery_intent_from_legacy_statuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "sessions.sqlite3"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    tmux_name TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    last_opened_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    last_pid INTEGER,
+                    recovery_intent TEXT NOT NULL DEFAULT 'legacy'
+                )
+                """
+            )
+            rows = [
+                ("running", "running", "legacy"),
+                ("paused", "paused", "legacy"),
+                ("missing", "missing", "legacy"),
+                ("pending", "recovery-pending", "legacy"),
+                ("stopped", "stopped", "legacy"),
+                ("archived", "archived", "legacy"),
+                ("new", "new", "legacy"),
+                ("remembered", "remembered", "legacy"),
+                ("start-error", "start-error", "legacy"),
+                ("explicit-active", "stopped", "active"),
+                ("explicit-inactive", "running", "inactive"),
+            ]
+            conn.executemany(
+                """
+                INSERT INTO sessions
+                    (id, name, tag, command, cwd, tmux_name, created_at,
+                     last_opened_at, status, last_pid, recovery_intent)
+                VALUES (?, ?, 'default', 'bash', ?, ?, 'now', 'now', ?, NULL, ?)
+                """,
+                [
+                    (session_id, session_id, tmp, f"termdeck_{session_id}", status, intent)
+                    for session_id, status, intent in rows
+                ],
+            )
+            conn.commit()
+            conn.close()
+
+            store = SessionStore(db)
+            try:
+                intents = {
+                    record.id: record.recovery_intent
+                    for record in store.list(include_archived=True)
+                }
+            finally:
+                store.close()
+
+            self.assertEqual(
+                intents,
+                {
+                    "running": "active",
+                    "paused": "active",
+                    "missing": "active",
+                    "pending": "active",
+                    "stopped": "inactive",
+                    "archived": "inactive",
+                    "new": "inactive",
+                    "remembered": "inactive",
+                    "start-error": "legacy",
+                    "explicit-active": "active",
+                    "explicit-inactive": "inactive",
+                },
+            )
 
 
 if __name__ == "__main__":
