@@ -608,7 +608,7 @@ def main() -> int:
         cookies_one = pair(origin, first_invitation)
         cookies_two = pair(origin, second_invitation)
 
-        with urllib.request.urlopen(f"{origin}/_termdeck/assets/v3/terminal.js", timeout=5) as response:
+        with urllib.request.urlopen(f"{origin}/_termdeck/assets/v5/terminal.js", timeout=5) as response:
             result["terminal_asset_cache_control"] = response.headers.get("Cache-Control")
         opener = urllib.request.build_opener()
         request = urllib.request.Request(f"{origin}/_termdeck/healthz")
@@ -991,7 +991,13 @@ def main() -> int:
             )
             or (
                 item.get("type") == "warning"
-                and "GL Driver Message" not in item.get("text", "")
+                and not any(
+                    marker in item.get("text", "")
+                    for marker in (
+                        "GL Driver Message",
+                        "Automatic fallback to software WebGL has been deprecated",
+                    )
+                )
             )
         ]
         if unexpected_console:

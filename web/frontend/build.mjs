@@ -30,6 +30,15 @@ const result = await build({
   target: ["chrome120", "firefox121", "safari17"],
 });
 
+const strictPrefix = Buffer.from('"use strict";', "utf8");
+const javascriptBytes = await readFile(javascriptOutput);
+if (!javascriptBytes.subarray(0, strictPrefix.length).equals(strictPrefix)) {
+  await writeFile(
+    javascriptOutput,
+    Buffer.concat([strictPrefix, javascriptBytes]),
+  );
+}
+
 async function asset(path) {
   const bytes = await readFile(path);
   return {

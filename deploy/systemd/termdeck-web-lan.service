@@ -1,0 +1,37 @@
+[Unit]
+Description=TermDeck LAN HTTPS, WebSocket and prefixed Cloudflare proxy
+Wants=network-online.target
+After=network-online.target termdeck-web-backend.service
+Requires=termdeck-web-backend.service
+RequiresMountsFor=/8tb/projects/softwares/termdeck/.runtime/termdeck-lan
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=HOME=/home/arch
+Environment=USER=max
+Environment=LOGNAME=max
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=PATH=/home/arch/.local/bin:/usr/local/bin:/usr/bin:/bin
+UMask=0077
+ExecStartPre=/8tb/projects/softwares/termdeck/.runtime/termdeck-lan/bin/termdeck-web-prepare
+ExecStartPre=/usr/bin/nginx -t -p /8tb/projects/softwares/termdeck/.runtime/termdeck-lan/nginx/ -c /8tb/projects/softwares/termdeck/.runtime/termdeck-lan/nginx/nginx.conf
+ExecStart=/usr/bin/nginx -p /8tb/projects/softwares/termdeck/.runtime/termdeck-lan/nginx/ -c /8tb/projects/softwares/termdeck/.runtime/termdeck-lan/nginx/nginx.conf -g "daemon off;"
+ExecReload=/usr/bin/nginx -p /8tb/projects/softwares/termdeck/.runtime/termdeck-lan/nginx/ -c /8tb/projects/softwares/termdeck/.runtime/termdeck-lan/nginx/nginx.conf -s reload
+Restart=always
+RestartSec=2s
+TimeoutStartSec=45s
+TimeoutStopSec=30s
+KillSignal=SIGQUIT
+LimitNOFILE=65536
+TasksMax=1024
+MemoryHigh=1G
+MemoryMax=2G
+CPUWeight=200
+IOWeight=200
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

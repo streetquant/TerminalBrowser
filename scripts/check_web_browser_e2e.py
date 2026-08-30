@@ -1311,6 +1311,23 @@ def main() -> None:
             "page_one_terminal": None,
             "page_two_terminal": None,
         }
+        for label, page_value in (("page_one", page_one), ("page_two", page_two)):
+            if page_value is None:
+                continue
+            try:
+                partial[f"{label}_socket_events"] = page_value.evaluate(
+                    "() => window.__termdeckTestEvents || []"
+                )
+                partial[f"{label}_terminal"] = page_value.evaluate(BUFFER_SCRIPT)
+                partial[f"{label}_status"] = page_value.evaluate(
+                    "() => ({text: document.querySelector('#terminal-status')?.textContent || '', state: document.querySelector('#terminal-status')?.dataset.state || '', overlay: document.querySelector('#terminal-overlay')?.textContent || '', url: location.href, readyState: document.readyState, bodyConnection: document.body.dataset.termdeckConnection || ''})"
+                )
+                partial[f"{label}_html_tail"] = page_value.content()[-12000:]
+                page_value.screenshot(
+                    path=str(evidence / f"{label}-failure.png"), full_page=True
+                )
+            except Exception as diagnostic_error:  # noqa: BLE001 - preserve original failure
+                partial[f"{label}_diagnostic_error"] = repr(diagnostic_error)
         (evidence / "partial-result.json").write_text(
             json.dumps(partial, ensure_ascii=False, sort_keys=True, indent=2),
             encoding="utf-8",

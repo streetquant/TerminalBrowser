@@ -266,8 +266,8 @@ def http_profile(binary: Path, root: Path, evidence: Path) -> dict[str, Any]:
             "/random",
             "/_termdeck/api/v1/snapshot",
             "/_termdeck/api/v1/windows/random",
-            "/_termdeck/assets/v3/app.js",
-            "/_termdeck/assets/v3/app.css",
+            "/_termdeck/assets/v5/app.js",
+            "/_termdeck/assets/v5/app.css",
             "/_termdeck/healthz",
             "/_termdeck/readyz",
         )

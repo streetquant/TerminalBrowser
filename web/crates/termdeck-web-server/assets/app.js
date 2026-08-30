@@ -34,6 +34,20 @@
   const page = root.getAttribute("data-termdeck-page");
   const routeSlug = root.getAttribute("data-termdeck-slug") || "";
   const routePane = root.getAttribute("data-termdeck-pane") || "";
+  const rawBasePath = root.getAttribute("data-termdeck-base") || "";
+  const basePath = rawBasePath === "" || (
+    rawBasePath.length <= 128
+    && rawBasePath.startsWith("/")
+    && !rawBasePath.endsWith("/")
+    && /^\/[a-z0-9_-]+(?:\/[a-z0-9_-]+)*$/.test(rawBasePath)
+  ) ? rawBasePath : "";
+
+  function appPath(path) {
+    if (typeof path !== "string" || !path.startsWith("/") || path.startsWith("//")) {
+      throw new Error("Invalid application path.");
+    }
+    return `${basePath}${path}`;
+  }
 
   function isRecord(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -90,10 +104,10 @@
 
   function apiEndpoint(pageName, slug) {
     if (pageName === "home") {
-      return "/_termdeck/api/v1/snapshot";
+      return appPath("/_termdeck/api/v1/snapshot");
     }
     if (pageName === "window" && validSlug(slug)) {
-      return `/_termdeck/api/v1/windows/${encodeURIComponent(slug)}`;
+      return appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(slug)}`);
     }
     return "";
   }
@@ -246,25 +260,25 @@
     grid.setAttribute("aria-label", "TermDeck windows");
     for (const windowData of host.windows) {
       const running = windowData.panes.filter((pane) => pane.status === "running").length;
-      const card = link("", windowData.path, "card");
+      const card = link("", appPath(windowData.path), "card");
       card.replaceChildren(
         node("span", "card-title", windowData.name),
         node("span", "card-meta", `${windowData.panes.length} panes · ${running} running`),
         node("span", "identity", `Window ${windowData.id}`),
-        node("code", "", windowData.path),
+        node("code", "", appPath(windowData.path)),
       );
       grid.append(card);
     }
     if (host.windows.length === 0) {
       grid.append(node("div", "empty", "No remembered TermDeck windows are currently available."));
     }
-    fragment.append(grid, footer("/_termdeck/api/v1/snapshot"));
+    fragment.append(grid, footer(appPath("/_termdeck/api/v1/snapshot")));
     root.replaceChildren(fragment);
     document.title = "TermDeck";
   }
 
   function paneArticle(windowSlug, pane) {
-    const path = `/${encodeURIComponent(windowSlug)}/t/${encodeURIComponent(pane.id)}`;
+    const path = appPath(`/${encodeURIComponent(windowSlug)}/t/${encodeURIComponent(pane.id)}`);
     const article = link("", path, "pane pane-link");
     const main = node("div", "pane-main");
     main.append(node("h2", "", pane.title), node("p", "path", pane.cwd));
@@ -289,7 +303,7 @@
     }
     const fragment = document.createDocumentFragment();
     const navigation = node("nav");
-    navigation.append(link("← All windows", "/"));
+    navigation.append(link("← All windows", appPath("/")));
     fragment.append(
       navigation,
       hostHeader(
@@ -313,7 +327,7 @@
     }
     fragment.append(
       panes,
-      footer(`/_termdeck/api/v1/windows/${encodeURIComponent(windowData.slug)}`),
+      footer(appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(windowData.slug)}`)),
     );
     root.replaceChildren(fragment);
     document.title = `${windowData.name} · TermDeck`;
@@ -379,7 +393,7 @@
         signal: controller.signal,
         ...requestOptions,
       });
-      if (response.redirected && response.url.includes("/_termdeck/login")) {
+      if (response.redirected && new URL(response.url).pathname === appPath("/_termdeck/login")) {
         window.location.assign(response.url);
         throw new Error("Authentication expired.");
       }
@@ -480,6 +494,15 @@
     const MAX_IN_FLIGHT_FRAMES = 64;
     const INPUT_BATCH_MS = 3;
     const MAX_RECONNECT_MS = 5000;
+    const MAX_SOCKET_BUFFERED_BYTES = 512 * 1024;
+    const SOCKET_DRAIN_MS = 8;
+    const MAX_OUTPUT_BATCH_BYTES = 256 * 1024;
+    const MAX_OUTPUT_QUEUE_BYTES = 16 * 1024 * 1024;
+    const OUTPUT_HIDDEN_DELAY_MS = 16;
+    const STABLE_CONNECTION_MS = 10000;
+    const HEARTBEAT_INTERVAL_MS = 15000;
+    const HEARTBEAT_VISIBLE_TIMEOUT_MS = 45000;
+    const HEARTBEAT_HIDDEN_TIMEOUT_MS = 5 * 60 * 1000;
     const MIN_COLUMNS = 2;
     const MAX_COLUMNS = 1000;
     const MIN_ROWS = 2;
@@ -502,7 +525,13 @@
     let helloTimer = 0;
     let heartbeatTimer = 0;
     let inputBatchTimer = 0;
+    let stableTimer = 0;
+    let socketDrainTimer = 0;
+    let outputFlushTimer = 0;
+    let outputAnimationFrame = 0;
+    let socketGeneration = 0;
     let lastPongAt = Date.now();
+    let networkOnline = window.navigator.onLine !== false;
     let queuedBytes = 0;
     let queue = [];
     let inFlight = new Map();
@@ -511,6 +540,8 @@
     let disposed = false;
     let outputGeneration = 0;
     let outputChain = Promise.resolve();
+    let outputChunks = [];
+    let outputBytes = 0;
     let canonicalGeometry = null;
 
     function setStatus(message, kind) {
@@ -518,6 +549,7 @@
       status.dataset.state = kind || "";
       status.title = message;
       status.setAttribute("aria-label", message);
+      document.body.dataset.termdeckConnection = kind || "";
     }
 
     function setOverlay(message) {
@@ -558,17 +590,33 @@
 
     function streamUrl() {
       const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-      return `${scheme}//${window.location.host}/_termdeck/ws/v1/windows/${encodeURIComponent(windowSlug)}/panes/${encodeURIComponent(paneId)}`;
+      return `${scheme}//${window.location.host}${appPath(`/_termdeck/ws/v1/windows/${encodeURIComponent(windowSlug)}/panes/${encodeURIComponent(paneId)}`)}`;
     }
 
-    function socketOpen() {
-      return socket && socket.readyState === WebSocket.OPEN;
+    function socketOpen(candidate = socket) {
+      return candidate && candidate.readyState === WebSocket.OPEN;
+    }
+
+    function scheduleSocketDrain() {
+      if (disposed || socketDrainTimer) {
+        return;
+      }
+      socketDrainTimer = window.setTimeout(() => {
+        socketDrainTimer = 0;
+        sendAvailable();
+      }, SOCKET_DRAIN_MS);
     }
 
     function sendJson(value) {
-      if (socketOpen()) {
-        socket.send(JSON.stringify(value));
+      if (!socketOpen()) {
+        return false;
       }
+      if (socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) {
+        scheduleSocketDrain();
+        return false;
+      }
+      socket.send(JSON.stringify(value));
+      return true;
     }
 
     function remoteNextSequence(value) {
@@ -633,6 +681,10 @@
       if (!ready || !socketOpen()) {
         return;
       }
+      if (socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) {
+        scheduleSocketDrain();
+        return;
+      }
       while (queue.length > 0 && inFlight.size < MAX_IN_FLIGHT_FRAMES) {
         if (!Number.isSafeInteger(nextSequence) || nextSequence < 1) {
           throw new Error("Terminal input sequence is outside JavaScript's safe range.");
@@ -642,6 +694,10 @@
         nextSequence += 1;
         inFlight.set(frame.sequence, frame);
         socket.send(binaryFrame(frame.sequence, frame.bytes));
+        if (socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) {
+          scheduleSocketDrain();
+          break;
+        }
       }
     }
 
@@ -704,8 +760,69 @@
       }
     }
 
+    function cancelOutputSchedule() {
+      if (outputAnimationFrame) {
+        window.cancelAnimationFrame(outputAnimationFrame);
+        outputAnimationFrame = 0;
+      }
+      if (outputFlushTimer) {
+        window.clearTimeout(outputFlushTimer);
+        outputFlushTimer = 0;
+      }
+    }
+
+    function flushTerminalOutput() {
+      cancelOutputSchedule();
+      if (outputBytes === 0) {
+        return outputChain;
+      }
+      const chunks = outputChunks;
+      const bytes = outputBytes;
+      const generation = outputGeneration;
+      outputChunks = [];
+      outputBytes = 0;
+      const combined = new Uint8Array(bytes);
+      let cursor = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, cursor);
+        cursor += chunk.length;
+      }
+      outputChain = outputChain.then(
+        () => new Promise((resolve) => {
+          if (disposed || generation !== outputGeneration) {
+            resolve();
+            return;
+          }
+          terminalApi.write(combined, resolve);
+        }),
+      );
+      return outputChain;
+    }
+
+    function scheduleOutputFlush() {
+      if (disposed || outputBytes === 0 || outputAnimationFrame || outputFlushTimer) {
+        return;
+      }
+      if (outputBytes >= MAX_OUTPUT_BATCH_BYTES) {
+        flushTerminalOutput();
+        return;
+      }
+      if (document.visibilityState === "visible") {
+        outputAnimationFrame = window.requestAnimationFrame(() => {
+          outputAnimationFrame = 0;
+          flushTerminalOutput();
+        });
+      } else {
+        outputFlushTimer = window.setTimeout(() => {
+          outputFlushTimer = 0;
+          flushTerminalOutput();
+        }, OUTPUT_HIDDEN_DELAY_MS);
+      }
+    }
+
     function queueTerminalReset(geometryValue) {
       const geometry = requiredGeometry(geometryValue);
+      flushTerminalOutput();
       outputGeneration += 1;
       const generation = outputGeneration;
       outputChain = outputChain.then(() => {
@@ -719,21 +836,25 @@
     }
 
     function queueTerminalWrite(value) {
-      const generation = outputGeneration;
       const bytes = value instanceof Uint8Array ? value.slice() : new Uint8Array(value);
-      outputChain = outputChain.then(
-        () => new Promise((resolve) => {
-          if (disposed || generation !== outputGeneration) {
-            resolve();
-            return;
-          }
-          terminalApi.write(bytes, resolve);
-        }),
-      );
+      if (bytes.length === 0 || disposed) {
+        return outputChain;
+      }
+      if (outputBytes + bytes.length > MAX_OUTPUT_QUEUE_BYTES) {
+        setOverlay("Terminal output exceeded the bounded browser queue. Reconnecting to resynchronize.");
+        if (socketOpen()) {
+          socket.close(4009, "terminal output backpressure");
+        }
+        return outputChain;
+      }
+      outputChunks.push(bytes);
+      outputBytes += bytes.length;
+      scheduleOutputFlush();
       return outputChain;
     }
 
     function afterTerminalOutput(generation, callback) {
+      flushTerminalOutput();
       outputChain.then(() => {
         if (!disposed && generation === outputGeneration) {
           callback();
@@ -746,8 +867,13 @@
       canonicalGeometry = geometry;
       terminalApi.fitGrid(geometry.cols, geometry.rows);
       applyControl(event.control, true);
-      reconnectAttempt = 0;
       lastPongAt = Date.now();
+      window.clearTimeout(stableTimer);
+      stableTimer = window.setTimeout(() => {
+        if (!disposed && ready && socketOpen()) {
+          reconnectAttempt = 0;
+        }
+      }, STABLE_CONNECTION_MS);
       window.clearTimeout(helloTimer);
       setOverlay("");
       ready = true;
@@ -771,8 +897,12 @@
         return;
       }
       if (event.type === "ready" || event.type === "resynced") {
-        const generation = outputGeneration;
-        afterTerminalOutput(generation, () => finishReady(event));
+        // The protocol is ready as soon as control/sequence state arrives. The
+        // replay bytes are already ordered ahead of subsequent output by the
+        // bounded output chain, so do not make typing wait for xterm to finish
+        // painting a large history snapshot.
+        finishReady(event);
+        flushTerminalOutput();
         return;
       }
       if (event.type === "control") {
@@ -822,7 +952,12 @@
         return;
       }
       window.clearTimeout(reconnectTimer);
-      const delay = Math.min(MAX_RECONNECT_MS, 250 * 2 ** Math.min(reconnectAttempt, 5));
+      if (!networkOnline) {
+        setStatus("Offline", "offline");
+        return;
+      }
+      const ceiling = Math.min(MAX_RECONNECT_MS, 250 * 2 ** Math.min(reconnectAttempt, 5));
+      const delay = Math.max(100, Math.floor(Math.random() * Math.max(101, ceiling)));
       reconnectAttempt += 1;
       setStatus("Reconnecting…", "reconnecting");
       reconnectTimer = window.setTimeout(connect, delay);
@@ -853,7 +988,10 @@
     }
 
     function connect() {
-      if (disposed) {
+      if (disposed || !networkOnline) {
+        if (!networkOnline) {
+          setStatus("Offline", "offline");
+        }
         return;
       }
       if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
@@ -861,21 +999,26 @@
       }
       window.clearTimeout(reconnectTimer);
       window.clearTimeout(helloTimer);
+      window.clearTimeout(stableTimer);
       ready = false;
       mine = false;
       setStatus("Connecting…", "connecting");
+      const generation = socketGeneration + 1;
+      socketGeneration = generation;
       const candidate = new WebSocket(streamUrl(), "termdeck.terminal.v1");
       candidate.binaryType = "arraybuffer";
       socket = candidate;
+      const current = () => !disposed && generation === socketGeneration && candidate === socket;
       candidate.addEventListener("open", () => {
-        if (candidate !== socket) {
-          candidate.close();
+        if (!current()) {
+          candidate.close(1000, "superseded terminal socket");
           return;
         }
+        lastPongAt = Date.now();
         sendHelloWhenReady(candidate);
       });
       candidate.addEventListener("message", (message) => {
-        if (candidate !== socket) {
+        if (!current()) {
           return;
         }
         try {
@@ -891,20 +1034,28 @@
           candidate.close(4004, "invalid terminal frame");
         }
       });
-      candidate.addEventListener("close", () => {
-        if (candidate !== socket) {
+      candidate.addEventListener("close", (event) => {
+        if (!current()) {
           return;
         }
         flushInputBatch(false);
+        flushTerminalOutput();
         socket = null;
         ready = false;
         mine = false;
         window.clearTimeout(helloTimer);
+        window.clearTimeout(stableTimer);
         discardAmbiguousInput();
+        const closeDetail = event.code === 1000
+          ? "Terminal closed"
+          : `Connection closed · ${event.code || "network"}`;
+        setStatus(closeDetail, event.code === 1000 ? "connecting" : "reconnecting");
         scheduleReconnect();
       });
       candidate.addEventListener("error", () => {
-        setStatus("Terminal connection failed", "error");
+        if (current()) {
+          setStatus("Terminal connection failed", "error");
+        }
       });
     }
 
@@ -919,22 +1070,62 @@
     });
     observer.observe(host);
     const reconnectNow = () => {
+      networkOnline = true;
       reconnectAttempt = 0;
+      window.clearTimeout(reconnectTimer);
       if (!socketOpen()) {
+        connect();
+      } else {
+        lastPongAt = Date.now();
+        sendJson({ type: "ping" });
+      }
+    };
+    const pauseOffline = () => {
+      networkOnline = false;
+      window.clearTimeout(reconnectTimer);
+      setStatus("Offline", "offline");
+      if (socketOpen()) {
+        socket.close(4005, "browser offline");
+      }
+    };
+    const probeAfterResume = () => {
+      if (document.visibilityState !== "visible" || !networkOnline) {
+        return;
+      }
+      // Background tabs and suspended laptops may pause JavaScript timers for
+      // minutes. Treat resume as a new liveness epoch rather than closing a
+      // healthy server-side WebSocket because an old client timer fired late.
+      lastPongAt = Date.now();
+      reconnectAttempt = 0;
+      window.clearTimeout(reconnectTimer);
+      if (socketOpen()) {
+        sendJson({ type: "ping" });
+      } else {
         connect();
       }
     };
     window.addEventListener("online", reconnectNow);
+    window.addEventListener("offline", pauseOffline);
+    window.addEventListener("pageshow", probeAfterResume);
+    window.addEventListener("focus", probeAfterResume);
+    document.addEventListener("visibilitychange", probeAfterResume);
     heartbeatTimer = window.setInterval(() => {
       if (!ready || !socketOpen()) {
         return;
       }
-      if (Date.now() - lastPongAt > 45000) {
+      if (document.hidden) {
+        // Browsers throttle or freeze hidden-page timers. Keep the application
+        // socket open and let the proxy/server TCP keepalive own dead-peer
+        // detection; probe immediately when the page becomes visible again.
+        sendJson({ type: "ping" });
+        return;
+      }
+      if (Date.now() - lastPongAt > HEARTBEAT_VISIBLE_TIMEOUT_MS) {
         socket.close(4002, "terminal heartbeat timeout");
         return;
       }
       sendJson({ type: "ping" });
-    }, 15000);
+    }, HEARTBEAT_INTERVAL_MS);
     connect();
 
     return {
@@ -949,13 +1140,23 @@
         window.clearTimeout(webglTimer);
         window.clearTimeout(helloTimer);
         window.clearTimeout(inputBatchTimer);
+        window.clearTimeout(stableTimer);
+        window.clearTimeout(socketDrainTimer);
+        cancelOutputSchedule();
         window.clearInterval(heartbeatTimer);
         window.removeEventListener("online", reconnectNow);
+        window.removeEventListener("offline", pauseOffline);
+        window.removeEventListener("pageshow", probeAfterResume);
+        window.removeEventListener("focus", probeAfterResume);
+        document.removeEventListener("visibilitychange", probeAfterResume);
         queue = [];
         batchChunks = [];
         batchBytes = 0;
         queuedBytes = 0;
         inFlight.clear();
+        outputChunks = [];
+        outputBytes = 0;
+        socketGeneration += 1;
         if (socket) {
           socket.close(1000, "terminal switched");
           socket = null;
@@ -988,7 +1189,7 @@
     root.className = "workspace-main";
     const topbar = node("header", "workspace-headerbar");
     const leftTools = node("div", "workspace-header-left");
-    const homeLink = link("T1000", "/", "workspace-home");
+    const homeLink = link("T1000", appPath("/"), "workspace-home");
     homeLink.title = "All TermDeck windows";
     const newButton = node("button", "workspace-new-tab", "+");
     newButton.type = "button";
@@ -1080,6 +1281,7 @@
     let terminalMount = null;
     let refreshTimer = 0;
     let refreshInFlight = false;
+    let refreshRequested = false;
     let disposed = false;
 
     function currentPane() {
@@ -1087,11 +1289,11 @@
     }
 
     function panePath(paneId) {
-      return `/${encodeURIComponent(routeSlug)}/t/${encodeURIComponent(paneId)}`;
+      return appPath(`/${encodeURIComponent(routeSlug)}/t/${encodeURIComponent(paneId)}`);
     }
 
     function selectedFromLocation() {
-      const prefix = `/${routeSlug}/t/`;
+      const prefix = appPath(`/${routeSlug}/t/`);
       if (!window.location.pathname.startsWith(prefix)) {
         return "";
       }
@@ -1236,13 +1438,13 @@ ${pane.cwd}`;
       const removedActive = removesTab && pane.id === activePaneId;
       try {
         await mutateJson(
-          `/_termdeck/api/v1/windows/${encodeURIComponent(routeSlug)}/panes/${encodeURIComponent(pane.id)}/tab`,
+          appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(routeSlug)}/panes/${encodeURIComponent(pane.id)}/tab`),
           request,
           180000,
         );
         if (removedActive) {
           activePaneId = "";
-          window.history.replaceState({}, "", `/${encodeURIComponent(routeSlug)}`);
+          window.history.replaceState({}, "", appPath(`/${encodeURIComponent(routeSlug)}`));
         }
         await refreshWindow(true);
         if (removedActive) {
@@ -1279,7 +1481,7 @@ ${pane.cwd}`;
       };
       try {
         const result = await mutateJson(
-          `/_termdeck/api/v1/windows/${encodeURIComponent(routeSlug)}/tabs`,
+          appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(routeSlug)}/tabs`),
           payload,
           180000,
         );
@@ -1308,13 +1510,19 @@ ${pane.cwd}`;
     }
 
     async function refreshWindow(immediate) {
-      if (refreshInFlight || disposed) {
+      if (disposed) {
+        return;
+      }
+      if (refreshInFlight) {
+        if (immediate) {
+          refreshRequested = true;
+        }
         return;
       }
       refreshInFlight = true;
       try {
         const { payload, response } = await fetchJson(
-          `/_termdeck/api/v1/windows/${encodeURIComponent(routeSlug)}`,
+          appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(routeSlug)}`),
           { headers: { Accept: "application/json" }, method: "GET" },
         );
         const next = normalizeWindowEnvelope(payload);
@@ -1354,9 +1562,14 @@ ${pane.cwd}`;
         showClientNotice(`Window refresh failed. ${errorMessage(error)}`, "notice-error");
       } finally {
         refreshInFlight = false;
-        if (!immediate && !disposed) {
-          window.clearTimeout(refreshTimer);
-          refreshTimer = window.setTimeout(() => refreshWindow(false), document.hidden ? 30000 : 5000);
+        window.clearTimeout(refreshTimer);
+        if (!disposed) {
+          const queued = refreshRequested;
+          refreshRequested = false;
+          refreshTimer = window.setTimeout(
+            () => refreshWindow(queued),
+            queued ? 0 : document.hidden ? 30000 : 5000,
+          );
         }
       }
     }
@@ -1373,10 +1586,60 @@ ${pane.cwd}`;
       event.preventDefault();
       createTab();
     });
+    function orderedPaneIds() {
+      return envelope?.window.panes.map((pane) => pane.id) || [];
+    }
+
+    function cyclePane(direction) {
+      const paneIds = orderedPaneIds();
+      if (paneIds.length === 0) {
+        return;
+      }
+      const current = Math.max(0, paneIds.indexOf(activePaneId));
+      const selected = (current + direction + paneIds.length) % paneIds.length;
+      switchPane(paneIds[selected], true);
+    }
+
     window.addEventListener("keydown", (event) => {
       if (event.ctrlKey && event.altKey && event.key.toLowerCase() === "t") {
         event.preventDefault();
         newButton.click();
+        return;
+      }
+      if (event.altKey && !event.ctrlKey && !event.metaKey && /^[1-9]$/.test(event.key)) {
+        const paneId = orderedPaneIds()[Number(event.key) - 1];
+        if (paneId) {
+          event.preventDefault();
+          switchPane(paneId, true);
+        }
+        return;
+      }
+      if (event.ctrlKey && !event.altKey && !event.metaKey && event.key === "PageUp") {
+        event.preventDefault();
+        cyclePane(-1);
+        return;
+      }
+      if (event.ctrlKey && !event.altKey && !event.metaKey && event.key === "PageDown") {
+        event.preventDefault();
+        cyclePane(1);
+        return;
+      }
+      if (event.key === "Escape" && actionMenu.open) {
+        event.preventDefault();
+        actionMenu.open = false;
+        terminalMount?.focus();
+      }
+    });
+    tabbar.addEventListener("wheel", (event) => {
+      if (Math.abs(event.deltaY) <= Math.abs(event.deltaX) || tabbar.scrollWidth <= tabbar.clientWidth) {
+        return;
+      }
+      event.preventDefault();
+      tabbar.scrollLeft += event.deltaY;
+    }, { passive: false });
+    document.addEventListener("pointerdown", (event) => {
+      if (actionMenu.open && !actionMenu.contains(event.target)) {
+        actionMenu.open = false;
       }
     });
     window.addEventListener("popstate", () => {

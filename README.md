@@ -283,3 +283,7 @@ Install T-1000 from https://github.com/streetquant/TerminalBrowser by:
 ## License
 
 MIT
+
+## Web deployment and remote access
+
+TermDeck includes an authenticated browser terminal with persistent LAN HTTPS/WSS services, a validated `/t1000` reverse-proxy contract, and optional Cloudflare Tunnel exposure. See [docs/termdeck-web-deployment.md](docs/termdeck-web-deployment.md) for the threat model, service topology, dynamic-address certificate handling, deployment contracts, and rollback requirements.

@@ -80,10 +80,17 @@ pub const MAX_FRONTEND_ASSET_BYTES: usize = 64 * 1024;
 pub const MAX_TERMINAL_ASSET_BYTES: usize = 1024 * 1024;
 pub const MAX_HTTP_REQUEST_BYTES: usize = MAX_TERMINAL_INPUT_BYTES + 1_024;
 
-const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v3/app.css";
-const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v3/app.js";
-const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v3/terminal.css";
-const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v3/terminal.js";
+const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v5/app.css";
+const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v5/app.js";
+const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v5/terminal.css";
+const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v5/terminal.js";
+const EXTERNAL_BASE_PATH: &str = "/t1000";
+const ROOT_COOKIE_PATH: &str = "; Path=/;";
+const EXTERNAL_COOKIE_PATH: &str = "; Path=/t1000;";
+const FORWARDED_PREFIX_HEADER: &str = "x-forwarded-prefix";
+const FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
+const FORWARDED_HOST_HEADER: &str = "x-forwarded-host";
+const BASE_PATH_PLACEHOLDER: &str = "__TERMDECK_BASE_PATH__";
 const APP_CSS: &[u8] = include_bytes!("../assets/app.css");
 const APP_JS: &[u8] = include_bytes!("../assets/app.js");
 const TERMINAL_CSS: &[u8] = include_bytes!("../assets/terminal.css");
@@ -120,6 +127,23 @@ Options:\n\
   -h, --help               Show this help\n\n\
 Non-loopback listening remains refused. Authentication over plain HTTP is\n\
 available only with the explicit loopback-development opt-in.\n";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RequestBasePath(&'static str);
+
+impl RequestBasePath {
+    fn as_str(self) -> &'static str {
+        self.0
+    }
+
+    fn prefixed(self, path: &str) -> String {
+        debug_assert!(path.starts_with('/'));
+        let mut output = String::with_capacity(self.0.len() + path.len());
+        output.push_str(self.0);
+        output.push_str(path);
+        output
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -958,7 +982,82 @@ fn build_router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), auth_gate))
         .layer(middleware::from_fn_with_state(state.clone(), request_gate))
         .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn(forwarded_prefix_gate))
         .with_state(state)
+}
+
+async fn forwarded_prefix_gate(mut request: Request, next: Next) -> Response {
+    let forwarded_prefix_present = request.headers().contains_key(FORWARDED_PREFIX_HEADER);
+    let base_path = match single_header(request.headers(), FORWARDED_PREFIX_HEADER) {
+        None if forwarded_prefix_present => {
+            return bad_request_response("forwarded prefix must appear exactly once");
+        }
+        None => RequestBasePath::default(),
+        Some(value) => {
+            let prefix = match value.to_str() {
+                Ok(value) => value,
+                Err(_) => return bad_request_response("invalid forwarded prefix"),
+            };
+            let proto = single_header(request.headers(), FORWARDED_PROTO_HEADER)
+                .and_then(|value| value.to_str().ok());
+            let host = single_header(request.headers(), FORWARDED_HOST_HEADER)
+                .and_then(|value| value.to_str().ok());
+            if prefix != EXTERNAL_BASE_PATH
+                || proto != Some("https")
+                || !matches!(host, Some("maxchat.semiotech.org") | Some("semiotech.org"))
+            {
+                return forbidden_response("forwarded prefix is not trusted");
+            }
+            RequestBasePath(EXTERNAL_BASE_PATH)
+        }
+    };
+    request.extensions_mut().insert(base_path);
+    let mut response = next.run(request).await;
+    if !base_path.as_str().is_empty() {
+        if let Some(location) = response.headers().get(header::LOCATION).cloned()
+            && let Ok(location) = location.to_str()
+            && location.starts_with('/')
+            && !location.starts_with("//")
+            && !location.starts_with(EXTERNAL_BASE_PATH)
+            && let Ok(prefixed) = HeaderValue::from_str(base_path.prefixed(location).as_str())
+        {
+            response.headers_mut().insert(header::LOCATION, prefixed);
+        }
+        scope_response_cookie_paths(&mut response);
+        response.headers_mut().insert(
+            HeaderName::from_static("x-termdeck-base-path"),
+            HeaderValue::from_static(EXTERNAL_BASE_PATH),
+        );
+    }
+    response
+}
+
+fn scope_response_cookie_paths(response: &mut Response) {
+    let cookies: Vec<HeaderValue> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .cloned()
+        .collect();
+    if cookies.is_empty() {
+        return;
+    }
+    response.headers_mut().remove(header::SET_COOKIE);
+    for cookie in cookies {
+        let scoped = cookie
+            .to_str()
+            .ok()
+            .and_then(|value| {
+                HeaderValue::from_str(
+                    value
+                        .replacen(ROOT_COOKIE_PATH, EXTERNAL_COOKIE_PATH, 1)
+                        .as_str(),
+                )
+                .ok()
+            })
+            .unwrap_or(cookie);
+        response.headers_mut().append(header::SET_COOKIE, scoped);
+    }
 }
 
 async fn request_gate(State(state): State<AppState>, request: Request, next: Next) -> Response {
@@ -1080,11 +1179,14 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-async fn homepage(State(state): State<AppState>) -> Response {
+async fn homepage(
+    State(state): State<AppState>,
+    Extension(base_path): Extension<RequestBasePath>,
+) -> Response {
     publication_response(&state.cache, |publication| {
         (
             "text/html; charset=utf-8",
-            publication.homepage_html.clone(),
+            html_bytes_for_base(&publication.homepage_html, base_path),
         )
     })
 }
@@ -1121,34 +1223,50 @@ async fn terminal_js() -> Response {
     )
 }
 
-async fn setup_page(State(state): State<AppState>) -> Response {
+async fn setup_page(
+    State(state): State<AppState>,
+    Extension(base_path): Extension<RequestBasePath>,
+) -> Response {
     let Some(auth) = state.auth.as_ref() else {
         return not_found_response(false);
     };
     match auth.password_configured() {
         Ok(true) => redirect_response(LOGIN_PATH),
-        Ok(false) => password_page_response(StatusCode::OK, PasswordPage::Setup, None),
+        Ok(false) => password_page_response(StatusCode::OK, PasswordPage::Setup, None, base_path),
         Err(_error) => internal_error_response(),
     }
 }
 
-async fn login_page(State(state): State<AppState>) -> Response {
+async fn login_page(
+    State(state): State<AppState>,
+    Extension(base_path): Extension<RequestBasePath>,
+) -> Response {
     let Some(auth) = state.auth.as_ref() else {
         return not_found_response(false);
     };
     match auth.password_configured() {
-        Ok(true) => password_page_response(StatusCode::OK, PasswordPage::Login, None),
+        Ok(true) => password_page_response(StatusCode::OK, PasswordPage::Login, None, base_path),
         Ok(false) => redirect_response(SETUP_PATH),
         Err(_error) => internal_error_response(),
     }
 }
 
-async fn setup_submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    password_submit(state, headers, body, PasswordPage::Setup).await
+async fn setup_submit(
+    State(state): State<AppState>,
+    Extension(base_path): Extension<RequestBasePath>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    password_submit(state, headers, body, PasswordPage::Setup, base_path).await
 }
 
-async fn login_submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    password_submit(state, headers, body, PasswordPage::Login).await
+async fn login_submit(
+    State(state): State<AppState>,
+    Extension(base_path): Extension<RequestBasePath>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    password_submit(state, headers, body, PasswordPage::Login, base_path).await
 }
 
 async fn password_submit(
@@ -1156,6 +1274,7 @@ async fn password_submit(
     headers: HeaderMap,
     body: Bytes,
     page: PasswordPage,
+    base_path: RequestBasePath,
 ) -> Response {
     let Some(auth) = state.auth.as_ref() else {
         return not_found_response(false);
@@ -1175,6 +1294,7 @@ async fn password_submit(
             StatusCode::BAD_REQUEST,
             page,
             Some("The submitted form was invalid."),
+            base_path,
         );
     }
     let form = match parse_password_form(&body, page) {
@@ -1184,6 +1304,7 @@ async fn password_submit(
                 StatusCode::BAD_REQUEST,
                 page,
                 Some("Enter a valid password and device name."),
+                base_path,
             );
         }
     };
@@ -1197,6 +1318,7 @@ async fn password_submit(
             StatusCode::BAD_REQUEST,
             page,
             Some("The two passwords do not match."),
+            base_path,
         );
     }
     let permit = match Arc::clone(&state.password_slots).try_acquire_owned() {
@@ -1222,7 +1344,7 @@ async fn password_submit(
     .await;
     let session = match operation {
         Ok(Ok(value)) => value,
-        Ok(Err(error)) => return password_error_response(error, page),
+        Ok(Err(error)) => return password_error_response(error, page, base_path),
         Err(_error) => return internal_error_response(),
     };
     authenticated_session_redirect(cookie_auth.as_ref(), &session, "/")
@@ -1244,7 +1366,10 @@ fn authenticated_session_redirect(
     response
 }
 
-async fn pairing_page(State(state): State<AppState>) -> Response {
+async fn pairing_page(
+    State(state): State<AppState>,
+    Extension(_base_path): Extension<RequestBasePath>,
+) -> Response {
     let Some(auth) = state.auth.as_ref() else {
         return not_found_response(false);
     };
@@ -1257,6 +1382,7 @@ async fn pairing_page(State(state): State<AppState>) -> Response {
 
 async fn pairing_submit(
     State(state): State<AppState>,
+    Extension(base_path): Extension<RequestBasePath>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -1272,7 +1398,7 @@ async fn pairing_submit(
     };
     let session = match auth.pair(invitation_secret.as_str(), unix_ms()) {
         Ok(value) => value,
-        Err(error) => return pairing_error_response(error),
+        Err(error) => return pairing_error_response(error, base_path),
     };
     let cookies = match auth.session_cookie_headers(&session, unix_ms()) {
         Ok(value) => value,
@@ -1417,16 +1543,25 @@ async fn revoke_device(
     response
 }
 
-async fn window_page(State(state): State<AppState>, AxumPath(slug): AxumPath<String>) -> Response {
+async fn window_page(
+    State(state): State<AppState>,
+    Extension(base_path): Extension<RequestBasePath>,
+    AxumPath(slug): AxumPath<String>,
+) -> Response {
     publication_response(&state.cache, |publication| {
         publication.windows.get(&slug).map_or_else(
             || {
                 (
                     "text/html; charset=utf-8",
-                    Bytes::from(render_not_found_page(&slug)),
+                    Bytes::from(render_not_found_page(&slug, base_path)),
                 )
             },
-            |window| ("text/html; charset=utf-8", window.html.clone()),
+            |window| {
+                (
+                    "text/html; charset=utf-8",
+                    html_bytes_for_base(&window.html, base_path),
+                )
+            },
         )
     })
     .with_status_if_missing(&state.cache, &slug, false)
@@ -1753,6 +1888,7 @@ fn tab_action_error_response(error: TabActionError) -> Response {
 
 async fn terminal_page(
     State(state): State<AppState>,
+    Extension(base_path): Extension<RequestBasePath>,
     context: Option<Extension<SessionContext>>,
     AxumPath((slug, pane_id)): AxumPath<(String, String)>,
 ) -> Response {
@@ -1787,6 +1923,7 @@ async fn terminal_page(
     output.push_str("</strong><span class=\"path\">");
     escape_html_into(&mut output, pane.cwd.as_str());
     output.push_str("</span></div><span id=\"terminal-status\" class=\"terminal-status\" role=\"status\" aria-live=\"polite\">Connecting…</span></header><section id=\"terminal-shell\" class=\"xterm-shell\" aria-label=\"Interactive terminal\"><div id=\"terminal-xterm\" class=\"xterm-host\" data-termdeck-terminal=\"1\"></div><div id=\"terminal-overlay\" class=\"terminal-overlay\" hidden></div></section></main></body></html>");
+    let output = html_for_base(prefix_html_template(output), base_path);
     if ensure_response_bound(output.len()).is_err() {
         return internal_error_response();
     }
@@ -2078,7 +2215,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
     text_response(status, "application/json; charset=utf-8", Bytes::from(body))
 }
 
-async fn not_found(method: Method) -> Response {
+async fn not_found(Extension(base_path): Extension<RequestBasePath>, method: Method) -> Response {
     if method != Method::GET && method != Method::HEAD {
         return text_response(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -2086,7 +2223,11 @@ async fn not_found(method: Method) -> Response {
             Bytes::from_static(b"method not allowed\n"),
         );
     }
-    not_found_response(false)
+    text_response(
+        StatusCode::NOT_FOUND,
+        "text/html; charset=utf-8",
+        Bytes::from(render_not_found_page("", base_path)),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2156,7 +2297,12 @@ fn parse_password_form(body: &[u8], page: PasswordPage) -> Result<PasswordForm, 
     })
 }
 
-fn password_page_response(status: StatusCode, page: PasswordPage, error: Option<&str>) -> Response {
+fn password_page_response(
+    status: StatusCode,
+    page: PasswordPage,
+    error: Option<&str>,
+    base_path: RequestBasePath,
+) -> Response {
     let (title, heading, description, action, autocomplete, confirmation) = match page {
         PasswordPage::Setup => (
             "Set TermDeck password",
@@ -2178,7 +2324,7 @@ fn password_page_response(status: StatusCode, page: PasswordPage, error: Option<
     let mut output = String::with_capacity(2_048);
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
     escape_html_into(&mut output, title);
-    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v3/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck owner authentication</p><h1>");
+    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck owner authentication</p><h1>");
     escape_html_into(&mut output, heading);
     output.push_str("</h1><p class=\"subtle\">");
     escape_html_into(&mut output, description);
@@ -2217,6 +2363,7 @@ fn password_page_response(status: StatusCode, page: PasswordPage, error: Option<
         "Sign in"
     });
     output.push_str("</button></form></main></body></html>");
+    let output = html_for_base(prefix_html_template(output), base_path);
     text_response(status, "text/html; charset=utf-8", Bytes::from(output))
 }
 
@@ -2228,12 +2375,17 @@ fn password_capacity_response() -> Response {
     response
 }
 
-fn password_error_response(error: HttpAuthError, page: PasswordPage) -> Response {
+fn password_error_response(
+    error: HttpAuthError,
+    page: PasswordPage,
+    base_path: RequestBasePath,
+) -> Response {
     if let Some(retry_after_ms) = error.retry_after_ms() {
         let mut response = password_page_response(
             StatusCode::TOO_MANY_REQUESTS,
             page,
             Some("Too many attempts. Try again shortly."),
+            base_path,
         );
         let seconds = retry_after_ms.div_ceil(1_000).max(1);
         if let Ok(value) = HeaderValue::from_str(seconds.to_string().as_str()) {
@@ -2246,12 +2398,14 @@ fn password_error_response(error: HttpAuthError, page: PasswordPage) -> Response
             StatusCode::BAD_REQUEST,
             page,
             Some("Use at least eight characters without control characters."),
+            base_path,
         ),
         HttpAuthError::PasswordAlreadyConfigured => redirect_response(LOGIN_PATH),
         HttpAuthError::Unauthenticated => password_page_response(
             StatusCode::UNAUTHORIZED,
             PasswordPage::Login,
             Some("The password was not accepted."),
+            base_path,
         ),
         HttpAuthError::RateLimited { .. } => password_capacity_response(),
         HttpAuthError::Auth(_)
@@ -2267,7 +2421,12 @@ fn password_error_response(error: HttpAuthError, page: PasswordPage) -> Response
     }
 }
 
-const PAIRING_PAGE_HTML: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Recovery pairing · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v3/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>";
+fn render_pairing_page(base_path: RequestBasePath) -> String {
+    let output = String::from(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Recovery pairing · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
+    );
+    html_for_base(prefix_html_template(output), base_path)
+}
 
 #[derive(Serialize)]
 struct SessionDto<'a> {
@@ -2394,7 +2553,7 @@ fn unsafe_request_metadata_allowed(headers: &HeaderMap, secure: bool) -> bool {
         && matches!(fetch_mode, Some("navigate" | "cors" | "same-origin"))
 }
 
-fn pairing_error_response(error: HttpAuthError) -> Response {
+fn pairing_error_response(error: HttpAuthError, base_path: RequestBasePath) -> Response {
     if let Some(retry_after_ms) = error.retry_after_ms() {
         let mut response = json_error_response(StatusCode::TOO_MANY_REQUESTS, "rate-limited");
         let seconds = retry_after_ms.div_ceil(1_000).max(1);
@@ -2411,7 +2570,7 @@ fn pairing_error_response(error: HttpAuthError) -> Response {
         | HttpAuthError::CsrfRejected => text_response(
             StatusCode::UNAUTHORIZED,
             "text/html; charset=utf-8",
-            Bytes::from_static(PAIRING_PAGE_HTML.as_bytes()),
+            Bytes::from(render_pairing_page(base_path)),
         ),
         HttpAuthError::RateLimited { .. } => {
             json_error_response(StatusCode::TOO_MANY_REQUESTS, "rate-limited")
@@ -2488,8 +2647,32 @@ fn not_found_response(json: bool) -> Response {
         text_response(
             StatusCode::NOT_FOUND,
             "text/html; charset=utf-8",
-            Bytes::from(render_not_found_page("")),
+            Bytes::from(render_not_found_page("", RequestBasePath::default())),
         )
+    }
+}
+
+fn prefix_html_template(mut output: String) -> String {
+    let prefix = BASE_PATH_PLACEHOLDER;
+    for marker in ["href=\"/", "src=\"/", "action=\"/"] {
+        let replacement = format!("{}{prefix}/", &marker[..marker.len() - 1]);
+        output = output.replace(marker, replacement.as_str());
+    }
+    output.replacen(
+        "id=\"termdeck-app\"",
+        format!("id=\"termdeck-app\" data-termdeck-base=\"{BASE_PATH_PLACEHOLDER}\"").as_str(),
+        1,
+    )
+}
+
+fn html_for_base(template: String, base_path: RequestBasePath) -> String {
+    template.replace(BASE_PATH_PLACEHOLDER, base_path.as_str())
+}
+
+fn html_bytes_for_base(template: &Bytes, base_path: RequestBasePath) -> Bytes {
+    match std::str::from_utf8(template.as_ref()) {
+        Ok(value) => Bytes::from(value.replace(BASE_PATH_PLACEHOLDER, base_path.as_str())),
+        Err(_) => template.clone(),
     }
 }
 
@@ -2830,6 +3013,7 @@ fn render_homepage(
         );
     }
     output.push_str("</section><noscript><div class=\"notice\">Window navigation remains available; live refresh and terminal control require JavaScript.</div></noscript><footer class=\"footer-row\"><a href=\"/_termdeck/api/v1/snapshot\">Versioned JSON</a><p class=\"refresh-state\">Server-rendered snapshot</p></footer></main></body></html>");
+    let output = prefix_html_template(output);
     ensure_response_bound(output.len())?;
     Ok(output)
 }
@@ -2904,13 +3088,14 @@ fn render_window_page(
     output.push_str("</section><noscript><div class=\"notice\">Pane navigation remains available; live refresh and terminal control require JavaScript.</div></noscript><footer class=\"footer-row\"><a href=\"/_termdeck/api/v1/windows/");
     output.push_str(window.route().slug());
     output.push_str("\">Versioned JSON</a><p class=\"refresh-state\">Server-rendered snapshot</p></footer></main></body></html>");
+    let output = prefix_html_template(output);
     ensure_response_bound(output.len())?;
     Ok(output)
 }
 
-fn render_not_found_page(slug: &str) -> String {
+fn render_not_found_page(slug: &str, base_path: RequestBasePath) -> String {
     let mut output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Not found · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v3/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored TermDeck window owns this route",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Not found · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored TermDeck window owns this route",
     );
     if !slug.is_empty() {
         output.push_str(": <code>/");
@@ -2918,7 +3103,7 @@ fn render_not_found_page(slug: &str) -> String {
         output.push_str("</code>");
     }
     output.push_str(".</p><p><a href=\"/\">Return to all windows</a></p></main></body></html>");
-    output
+    html_for_base(prefix_html_template(output), base_path)
 }
 
 fn append_percent_encoded_path_segment(output: &mut String, value: &str) {
@@ -3109,12 +3294,13 @@ fn duration_ms(duration: Duration) -> Result<u64, ServerError> {
 mod tests {
     use super::{
         APP_CSS, APP_JS, AppState, CONTENT_SECURITY_POLICY, CacheAvailability, ConfigAction,
+        EXTERNAL_BASE_PATH, FORWARDED_HOST_HEADER, FORWARDED_PREFIX_HEADER, FORWARDED_PROTO_HEADER,
         FRONTEND_CSS_PATH, FRONTEND_JS_PATH, MAX_FRONTEND_ASSET_BYTES, MAX_PASSWORD_OPERATIONS,
         RenderedSnapshot, ServerConfig, ServerError, SnapshotCache, TERMINAL_JS_PATH, build_router,
         unix_ms,
     };
     use axum::body::{Body, to_bytes};
-    use axum::http::{Method, Request, StatusCode, header};
+    use axum::http::{HeaderValue, Method, Request, StatusCode, header};
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -3215,6 +3401,22 @@ mod tests {
         }
     }
 
+    fn prefixed_request(method: Method, uri: &str) -> Request<Body> {
+        let mut request = request(method, uri, "127.0.0.1:7391");
+        request.headers_mut().insert(
+            FORWARDED_PREFIX_HEADER,
+            HeaderValue::from_static(EXTERNAL_BASE_PATH),
+        );
+        request
+            .headers_mut()
+            .insert(FORWARDED_PROTO_HEADER, HeaderValue::from_static("https"));
+        request.headers_mut().insert(
+            FORWARDED_HOST_HEADER,
+            HeaderValue::from_static("maxchat.semiotech.org"),
+        );
+        request
+    }
+
     async fn body_text(response: axum::response::Response) -> String {
         let bytes = match to_bytes(response.into_body(), 2 * 1024 * 1024).await {
             Ok(value) => value,
@@ -3304,6 +3506,85 @@ mod tests {
             assert!(window_text.contains("Open terminal"));
             assert!(!window_text.contains("Viewer · read-only"));
             assert!(!window_text.contains("<style>"));
+        });
+    }
+
+    #[test]
+    fn trusted_forwarded_prefix_is_exact_and_rewrites_all_browser_paths() {
+        runtime().block_on(async {
+            let router = build_router(state(30_000, unix_ms()));
+            let home = router
+                .clone()
+                .oneshot(prefixed_request(Method::GET, "/"))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(home.status(), StatusCode::OK);
+            assert_eq!(
+                home.headers()
+                    .get("x-termdeck-base-path")
+                    .and_then(|value| value.to_str().ok()),
+                Some(EXTERNAL_BASE_PATH)
+            );
+            let home_text = body_text(home).await;
+            assert!(home_text.contains(r#"data-termdeck-base="/t1000""#));
+            assert!(home_text.contains(r#"href="/t1000/_termdeck/assets/v5/app.css""#));
+            assert!(home_text.contains(r#"src="/t1000/_termdeck/assets/v5/app.js""#));
+            assert!(home_text.contains(r#"href="/t1000/random""#));
+            assert!(!home_text.contains("__TERMDECK_BASE_PATH__"));
+            assert!(!home_text.contains(r#"href="/_termdeck/"#));
+
+            let window = router
+                .clone()
+                .oneshot(prefixed_request(Method::GET, "/random"))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(window.status(), StatusCode::OK);
+            let window_text = body_text(window).await;
+            assert!(window_text.contains(r#"data-termdeck-base="/t1000""#));
+            assert!(window_text.contains(r#"href="/t1000/random/t/session-one""#));
+            assert!(window_text.contains(r#"href="/t1000/_termdeck/assets/v5/app.css""#));
+
+            let asset = router
+                .clone()
+                .oneshot(prefixed_request(Method::GET, FRONTEND_CSS_PATH))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(asset.status(), StatusCode::OK);
+            assert_eq!(body_text(asset).await.as_bytes(), APP_CSS);
+
+            let mut untrusted_host = prefixed_request(Method::GET, "/");
+            untrusted_host.headers_mut().insert(
+                FORWARDED_HOST_HEADER,
+                HeaderValue::from_static("evil.example"),
+            );
+            let untrusted_host = router
+                .clone()
+                .oneshot(untrusted_host)
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(untrusted_host.status(), StatusCode::FORBIDDEN);
+
+            let mut untrusted_proto = prefixed_request(Method::GET, "/");
+            untrusted_proto
+                .headers_mut()
+                .insert(FORWARDED_PROTO_HEADER, HeaderValue::from_static("http"));
+            let untrusted_proto = router
+                .clone()
+                .oneshot(untrusted_proto)
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(untrusted_proto.status(), StatusCode::FORBIDDEN);
+
+            let mut duplicate = prefixed_request(Method::GET, "/");
+            duplicate.headers_mut().append(
+                FORWARDED_PREFIX_HEADER,
+                HeaderValue::from_static(EXTERNAL_BASE_PATH),
+            );
+            let duplicate = router
+                .oneshot(duplicate)
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
         });
     }
 
@@ -3657,10 +3938,11 @@ mod tests {
 mod auth_integration_tests {
     use super::auth_http::CSRF_HEADER_NAME;
     use super::{
-        APP_CSS, AppState, ConfigAction, HttpAuth, LOGIN_PATH, MAX_PASSWORD_OPERATIONS,
-        PAIRING_PATH, RenderedSnapshot, SESSION_PATH, SETUP_PATH, ServerConfig, ServerError,
-        SnapshotCache, TERMINAL_JS_PATH, build_router, ensure_auth_directory, loopback_authority,
-        parse_pairing_form, unix_ms,
+        APP_CSS, AppState, ConfigAction, EXTERNAL_BASE_PATH, FORWARDED_HOST_HEADER,
+        FORWARDED_PREFIX_HEADER, FORWARDED_PROTO_HEADER, HttpAuth, LOGIN_PATH,
+        MAX_PASSWORD_OPERATIONS, PAIRING_PATH, RenderedSnapshot, SESSION_PATH, SETUP_PATH,
+        ServerConfig, ServerError, SnapshotCache, TERMINAL_JS_PATH, build_router,
+        ensure_auth_directory, loopback_authority, parse_pairing_form, unix_ms,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
@@ -3820,6 +4102,21 @@ mod auth_integration_tests {
             .header(header::HOST, TEST_HOST)
             .body(body)
             .unwrap_or_else(|error| panic!("could not build HTTP auth request: {error}"))
+    }
+
+    fn with_external_prefix(mut request: Request<Body>) -> Request<Body> {
+        request.headers_mut().insert(
+            FORWARDED_PREFIX_HEADER,
+            HeaderValue::from_static(EXTERNAL_BASE_PATH),
+        );
+        request
+            .headers_mut()
+            .insert(FORWARDED_PROTO_HEADER, HeaderValue::from_static("https"));
+        request.headers_mut().insert(
+            FORWARDED_HOST_HEADER,
+            HeaderValue::from_static("maxchat.semiotech.org"),
+        );
+        request
     }
 
     fn authenticated_get(uri: &str, cookies: &CookieJar) -> Request<Body> {
@@ -3986,6 +4283,101 @@ mod auth_integration_tests {
                 .await
                 .unwrap_or_else(|error| match error {});
             assert_eq!(session.status(), StatusCode::NOT_FOUND);
+        });
+    }
+
+    #[test]
+    fn external_prefix_preserves_password_authentication_and_redirects() {
+        runtime().block_on(async {
+            let fixture = fixture(&[]);
+            let router = build_router(fixture.state.clone());
+            let password = "termdeck-test-owner-password-2026";
+
+            let home = router
+                .clone()
+                .oneshot(with_external_prefix(request(
+                    Method::GET,
+                    "/",
+                    Body::empty(),
+                )))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(home.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                home.headers()
+                    .get(header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("/t1000/_termdeck/login")
+            );
+
+            let login = router
+                .clone()
+                .oneshot(with_external_prefix(request(
+                    Method::GET,
+                    LOGIN_PATH,
+                    Body::empty(),
+                )))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(login.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                login
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("/t1000/_termdeck/setup")
+            );
+
+            let setup_page = router
+                .clone()
+                .oneshot(with_external_prefix(request(
+                    Method::GET,
+                    SETUP_PATH,
+                    Body::empty(),
+                )))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(setup_page.status(), StatusCode::OK);
+            let setup_text = body_text(setup_page).await;
+            assert!(setup_text.contains(r#"href="/t1000/_termdeck/assets/v5/app.css""#));
+            assert!(setup_text.contains(r#"action="/t1000/_termdeck/setup""#));
+            assert!(!setup_text.contains("__TERMDECK_BASE_PATH__"));
+
+            let setup = router
+                .clone()
+                .oneshot(with_external_prefix(password_request(
+                    SETUP_PATH,
+                    password,
+                    Some(password),
+                    "External browser",
+                )))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(setup.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                setup
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("/t1000/")
+            );
+            for value in setup.headers().get_all(header::SET_COOKIE).iter() {
+                let value = value
+                    .to_str()
+                    .unwrap_or_else(|error| panic!("invalid prefixed Set-Cookie: {error}"));
+                assert!(value.contains("; Path=/t1000;"));
+                assert!(!value.contains("; Path=/;"));
+            }
+            let cookies = cookies_from_response(&setup);
+
+            let authenticated = router
+                .oneshot(with_external_prefix(authenticated_get(
+                    "/_termdeck/api/v1/snapshot",
+                    &cookies,
+                )))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(authenticated.status(), StatusCode::OK);
         });
     }
 
@@ -4221,7 +4613,7 @@ mod auth_integration_tests {
                 .clone()
                 .oneshot(request(
                     Method::GET,
-                    "/_termdeck/assets/v3/app.css",
+                    "/_termdeck/assets/v5/app.css",
                     Body::empty(),
                 ))
                 .await

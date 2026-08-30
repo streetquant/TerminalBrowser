@@ -1,0 +1,35 @@
+[Unit]
+Description=TermDeck authenticated web backend
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/8tb/projects/softwares/termdeck/.runtime/termdeck-lan /home/arch/.local/share/termdeck
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=HOME=/home/arch
+Environment=USER=max
+Environment=LOGNAME=max
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=PATH=/home/arch/.local/bin:/home/arch/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+UMask=0077
+ExecStartPre=/usr/bin/test -x /8tb/projects/softwares/termdeck/.runtime/termdeck-lan/bin/termdeck-web-server
+ExecStartPre=/usr/bin/test -r /home/arch/.local/share/termdeck/sessions.sqlite3
+ExecStart=/8tb/projects/softwares/termdeck/.runtime/termdeck-lan/bin/termdeck-web-server --db /home/arch/.local/share/termdeck/sessions.sqlite3 --listen 127.0.0.1:7391 --auth-dir /8tb/projects/softwares/termdeck/.runtime/termdeck-lan/auth --allow-insecure-loopback-auth --host-id termdeck-max-lan --owner-id shayan --refresh-ms 750 --max-stale-ms 30000 --max-connections 256 --tmux /usr/bin/tmux --t1000 /home/arch/.local/bin/t1000 --tmux-timeout-ms 1500 --tab-action-timeout-ms 120000
+Restart=always
+RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=20s
+KillMode=process
+LimitNOFILE=65536
+TasksMax=4096
+MemoryHigh=2G
+MemoryMax=4G
+CPUWeight=200
+IOWeight=200
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

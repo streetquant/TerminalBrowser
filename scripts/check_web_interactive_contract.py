@@ -75,6 +75,8 @@ def main() -> None:
         'node("button", "workspace-tab-close", "×")',
         'sendJson({ type: "ping" })',
         'window.addEventListener("online", reconnectNow)',
+        "let refreshRequested = false;",
+        "queued ? 0 : document.hidden ? 30000 : 5000",
     ):
         require(text["app"], needle, "browser")
 
@@ -83,7 +85,7 @@ def main() -> None:
         'data-termdeck-pane=\\"',
         ".active_pane_id()",
         ".or_else(|| window.panes().first().map(PaneSnapshot::id))",
-        "/_termdeck/assets/v3/app.css",
+        "/_termdeck/assets/v5/app.css",
         "public, max-age=86400, immutable",
     ):
         require(server_production, needle, "immediate pane bootstrap")
@@ -93,7 +95,7 @@ def main() -> None:
         "proxy_set_header Upgrade $http_upgrade;",
         'proxy_set_header Connection "upgrade";',
         "proxy_set_header Sec-WebSocket-Protocol $http_sec_websocket_protocol;",
-        "proxy_read_timeout 3600s;",
+        "proxy_read_timeout 86400s;",
         "proxy_request_buffering off;",
     ):
         require(text["nginx"], needle, "nginx WebSocket proxy")
