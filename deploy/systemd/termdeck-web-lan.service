@@ -1,8 +1,7 @@
 [Unit]
 Description=TermDeck LAN HTTPS, WebSocket and prefixed Cloudflare proxy
-Wants=network-online.target
+Wants=network-online.target termdeck-web-backend.service
 After=network-online.target termdeck-web-backend.service
-Requires=termdeck-web-backend.service
 RequiresMountsFor=/8tb/projects/softwares/termdeck/.runtime/termdeck-lan
 StartLimitIntervalSec=0
 

@@ -1,9 +1,8 @@
 [Unit]
 Description=Temporary Cloudflare Quick Tunnel preview for TermDeck
 Documentation=https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/
-Wants=network-online.target
+Wants=network-online.target termdeck-web-lan.service
 After=network-online.target termdeck-web-lan.service
-Requires=termdeck-web-lan.service
 StartLimitIntervalSec=0
 
 [Service]
