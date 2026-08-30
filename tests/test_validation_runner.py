@@ -353,7 +353,9 @@ def test_xvfb_environment_uses_short_private_runtime_and_cleans_after_task(
     )
 
     assert runtime is not None
-    assert runtime.path.parent == runner._TASK_RUNTIME_BASE.resolve(strict=True)
+    assert runtime.path.parent == runner._safe_task_runtime_base(
+        runner._configured_task_runtime_base()
+    )
     assert len(os.fsencode(runtime.path)) <= runner._TASK_RUNTIME_MAX_PATH_BYTES
     assert stat.S_IMODE(runtime.path.stat().st_mode) == 0o700
     assert environment["XDG_RUNTIME_DIR"] == str(runtime.path)
@@ -391,6 +393,36 @@ def test_xvfb_environment_uses_short_private_runtime_and_cleans_after_task(
     assert task["runtime"]["external"] is True
     assert task["runtime"]["cleanup_ok"] is True
     assert not runtime.path.exists()
+
+
+def test_short_runtime_uses_validated_absolute_configured_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "short-runtime-base"
+    base.mkdir(mode=0o700)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.setenv(runner._TASK_RUNTIME_BASE_ENV, str(base))
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
+
+    runtime = runner._create_short_task_runtime(work)
+
+    assert runtime.path.parent == base.resolve(strict=True)
+    assert stat.S_IMODE(runtime.path.stat().st_mode) == 0o700
+    assert runner._cleanup_task_runtime(runtime)["cleanup_ok"] is True
+
+
+def test_short_runtime_rejects_relative_configured_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(runner._TASK_RUNTIME_BASE_ENV, "relative/runtime")
+
+    with pytest.raises(
+        runner.ValidationError,
+        match="T1000_VALIDATION_RUNTIME_BASE must be an absolute path",
+    ):
+        runner._create_short_task_runtime(Path.cwd())
 
 
 def test_production_host_environment_preserves_runtime_authority(
@@ -468,6 +500,7 @@ def test_short_runtime_has_owner_lease_and_bounded_dead_owner_recovery(
     base.mkdir(mode=0o700)
     work = tmp_path / "work"
     work.mkdir()
+    monkeypatch.delenv(runner._TASK_RUNTIME_BASE_ENV, raising=False)
     monkeypatch.setattr(runner, "_TASK_RUNTIME_BASE", base)
     monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
 

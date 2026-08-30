@@ -5,6 +5,38 @@ Codex account in one tab cannot change another tab. That private home must not
 become a second, stale Codex installation. The canonical Codex home remains the
 authority for configuration and reusable assets.
 
+## Warp Drives managed release state
+
+The managed release launcher accepts an absolute `T1000_MANAGED_ROOT` and
+fails closed unless the launcher, bootstrap, and root are real paths on the
+expected non-rotational SSD cell. The default release root is
+`/home/arch/.local/state/codex-project-homes/runtime/t1000-managed`. Mutable
+TermDeck state is kept in the adjacent
+`<T1000_MANAGED_ROOT parent>/termdeck/` directory, including the primary
+`sessions.sqlite3` registry, managed `terminal-auth/` scopes, and durable
+`recovery-intents/` sidecars. TermDeck also reports the Warp Drives attestation
+tuple `CODEX_STORAGE_FABRIC=warp-drives-v1`,
+`CODEX_WORKSPACE_STORAGE_CLASS=ssd-cell`, and
+`CODEX_BULK_STORAGE_MASKED=1` as advisory evidence; mount/device proof remains
+authoritative for TermDeck admission. Managed Codex workspace processes must
+independently receive the exact tuple from the canonical launcher.
+
+Legacy `~/.local/share/termdeck/` state is an import source, not a second
+managed authority. Only the primary GUI may explicitly import the legacy
+`sessions.sqlite3` registry into the managed database, and that operation does
+not copy or move `terminal-auth`, Codex configuration, conversation roots, or
+other legacy state. Existing private `CODEX_HOME` paths and auth-scope records
+remain immutable during database migration. A separate guarded recovery path
+may rebind an exact native Codex resume to a sparse managed-SSD scope only
+after a durable recovery claim and independent missing/dead/quiescent backend
+proof. It preserves the exact selected account, shares canonical session and
+account roots, publishes the registry change by compare-and-swap, and records
+a durable receipt. The legacy scope is never copied, moved, or deleted.
+
+External sessions, `codex-opencode`, unknown account selections, inexact resume
+recipes, incomplete lifecycle proof, and lost claims remain on the existing
+binding and fail closed rather than receiving an implicit path rewrite.
+
 `prepare_shared_codex_configuration()` applies this boundary:
 
 | Shared from the canonical Codex home | Kept private per terminal |

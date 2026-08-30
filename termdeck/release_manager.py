@@ -4081,12 +4081,32 @@ def _observer_client_environment(
         raise ReleaseError("process observer UID differs from the current user")
     try:
         account = pwd.getpwuid(expected_uid)
-        home = Path(account.pw_dir).resolve(strict=True)
         runtime = Path("/run/user") / str(expected_uid)
+    except KeyError as exc:
+        raise ReleaseError("canonical user-manager environment is unavailable") from exc
+    return _observer_client_environment_from_paths(
+        systemd_run,
+        expected_uid=expected_uid,
+        account=account,
+        runtime=runtime,
+    )
+
+
+def _observer_client_environment_from_paths(
+    systemd_run: Path,
+    *,
+    expected_uid: int,
+    account: object,
+    runtime: Path,
+) -> dict[str, str]:
+    """Validate explicit user-manager paths before constructing its environment."""
+
+    try:
+        home = Path(str(getattr(account, "pw_dir"))).resolve(strict=True)
         runtime_metadata = runtime.lstat()
         bus = runtime / "bus"
         bus_metadata = bus.lstat()
-    except (KeyError, OSError) as exc:
+    except (OSError, TypeError) as exc:
         raise ReleaseError("canonical user-manager environment is unavailable") from exc
     if (
         runtime.is_symlink()
@@ -4103,9 +4123,9 @@ def _observer_client_environment(
         raise ReleaseError("canonical user-manager bus is unsafe")
     environment = {
         "HOME": str(home),
-        "USER": account.pw_name,
-        "LOGNAME": account.pw_name,
-        "SHELL": account.pw_shell or "/bin/sh",
+        "USER": str(getattr(account, "pw_name")),
+        "LOGNAME": str(getattr(account, "pw_name")),
+        "SHELL": str(getattr(account, "pw_shell", "") or "/bin/sh"),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "XDG_RUNTIME_DIR": str(runtime),

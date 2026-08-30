@@ -10,6 +10,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import stat
 import struct
 import subprocess
@@ -19,6 +20,7 @@ import time
 import warnings
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -2635,6 +2637,7 @@ def test_process_observer_routes_only_incomplete_real_proc_scans(
 
 def test_user_manager_process_observer_dispatch_is_bounded_and_revalidated(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
     uid = os.getuid()
@@ -2665,6 +2668,31 @@ def test_user_manager_process_observer_dispatch_is_bounded_and_revalidated(
         0,
         canonical_json_bytes(payload),
         b"",
+    )
+    client_environment = {
+        "HOME": str(Path.home().resolve(strict=True)),
+        "USER": "max",
+        "LOGNAME": "max",
+        "SHELL": "/bin/bash",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
+        "PATH": "/usr/bin:/usr/local/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONHASHSEED": "0",
+    }
+    monkeypatch.setattr(
+        release_manager,
+        "_observer_client_environment",
+        lambda _systemd_run, *, expected_uid: dict(client_environment),
+    )
+    cross_root = tmp_path / "cross-process"
+    cross_root.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        release_manager,
+        "_canonical_process_cross_root",
+        lambda _expected_uid, *, runtime_root=None: cross_root,
     )
     with mock.patch.object(
         release_manager, "_verify_managed_activation", return_value=activation
@@ -2730,6 +2758,7 @@ def test_user_manager_process_observer_dispatch_is_bounded_and_revalidated(
 
 def test_user_manager_process_observer_rejects_bad_execution_and_receipts(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _root, _bin_dir, layout, state, proc_root = managed_process_fixture(tmp_path)
     uid = os.getuid()
@@ -2746,6 +2775,30 @@ def test_user_manager_process_observer_rejects_bad_execution_and_receipts(
         state=state,
         status=complete,
         expected_uid=uid,
+    )
+    monkeypatch.setattr(
+        release_manager,
+        "_observer_client_environment",
+        lambda _systemd_run, *, expected_uid: {
+            "HOME": str(Path.home().resolve(strict=True)),
+            "USER": "max",
+            "LOGNAME": "max",
+            "SHELL": "/bin/bash",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "XDG_RUNTIME_DIR": f"/run/user/{expected_uid}",
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{expected_uid}/bus",
+            "PATH": "/usr/bin:/usr/local/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONHASHSEED": "0",
+        },
+    )
+    cross_root = tmp_path / "cross-process"
+    cross_root.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        release_manager,
+        "_canonical_process_cross_root",
+        lambda _expected_uid, *, runtime_root=None: cross_root,
     )
     tampered = copy.deepcopy(valid)
     tampered["managed_state_sha256"] = "0" * 64
@@ -2811,6 +2864,75 @@ def test_user_manager_process_observer_rejects_bad_execution_and_receipts(
         "cross_process_shared": False,
         "cross_process_result": "published",
     }
+
+
+def test_observer_client_environment_validates_explicit_user_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    bus = runtime / "bus"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        monkeypatch.chdir(tmp_path)
+        listener.bind("runtime/bus")
+        account = SimpleNamespace(
+            pw_dir=str(home),
+            pw_name="test-user",
+            pw_shell="/bin/sh",
+        )
+
+        environment = release_manager._observer_client_environment_from_paths(
+            Path("/usr/bin/systemd-run"),
+            expected_uid=os.getuid(),
+            account=account,
+            runtime=runtime,
+        )
+
+        assert environment["HOME"] == str(home)
+        assert environment["XDG_RUNTIME_DIR"] == str(runtime)
+        assert environment["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={bus}"
+        assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+        assert environment["PYTHONHASHSEED"] == "0"
+    finally:
+        listener.close()
+
+
+def test_observer_client_environment_rejects_unsafe_explicit_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o755)
+    runtime.chmod(0o755)
+    bus = runtime / "bus"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        monkeypatch.chdir(tmp_path)
+        listener.bind("runtime/bus")
+        account = SimpleNamespace(
+            pw_dir=str(home),
+            pw_name="test-user",
+            pw_shell="/bin/sh",
+        )
+
+        with pytest.raises(
+            ReleaseError,
+            match="canonical user runtime directory is unsafe",
+        ):
+            release_manager._observer_client_environment_from_paths(
+                Path("/usr/bin/systemd-run"),
+                expected_uid=os.getuid(),
+                account=account,
+                runtime=runtime,
+            )
+    finally:
+        listener.close()
 
 
 

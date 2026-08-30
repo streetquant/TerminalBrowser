@@ -6,7 +6,9 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
+import termdeck.auth_scope_rebind as auth_scope_rebind_module
 from termdeck.auth_scope_rebind import (
     AuthScopeRebindClaim,
     AuthScopeRebindProof,
@@ -364,6 +366,44 @@ class AuthScopeRebindTests(unittest.TestCase):
         self.assertTrue(result.deferred)
         self.assertEqual(self.store.get(record.id).codex_home, old_home)
         self.assertFalse((default_auth_root(environ=self.env) / record.auth_scope_id).exists())
+
+    def test_claim_loss_after_sparse_staging_never_publishes_registry_or_receipt(self):
+        record = self._record(session_id="td-claim-loss", scope_id="auth-claim-loss")
+        old_home = Path(record.codex_home)
+        old_snapshot = _snapshot_tree(old_home)
+        claim = self._claim(record)
+        original_stage = auth_scope_rebind_module._ensure_new_scope
+
+        def stage_then_drop_claim(*args, **kwargs):
+            original_stage(*args, **kwargs)
+            self.store.conn.execute(
+                "DELETE FROM recovery_claims WHERE session_id = ?",
+                (record.id,),
+            )
+            self.store.conn.commit()
+
+        with mock.patch.object(
+            auth_scope_rebind_module,
+            "_ensure_new_scope",
+            side_effect=stage_then_drop_claim,
+        ):
+            result = rebind_auth_scope(
+                record,
+                self.store,
+                proof=AuthScopeRebindProof(True, True, True),
+                claim=claim,
+                canonical_home=self.canonical,
+                environ=self.env,
+                now=100.0,
+            )
+
+        destination = default_auth_root(environ=self.env) / record.auth_scope_id
+        self.assertTrue(result.deferred)
+        self.assertIn("durable recovery claim", result.detail)
+        self.assertEqual(self.store.get(record.id).codex_home, str(old_home))
+        self.assertEqual(_snapshot_tree(old_home), old_snapshot)
+        self.assertTrue(destination.is_dir())
+        self.assertIsNone(result.receipt_path)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.2.20
+
+- Added the Warp Drives managed release boundary. A managed launch uses an absolute, release-owned `T1000_MANAGED_ROOT`, verifies the launcher/bootstrap and root are on the expected non-rotational SSD cell, and fails closed when that boundary is unavailable. The tuple `CODEX_STORAGE_FABRIC=warp-drives-v1`, `CODEX_WORKSPACE_STORAGE_CLASS=ssd-cell`, and `CODEX_BULK_STORAGE_MASKED=1` is reported as advisory TermDeck evidence and remains mandatory for managed Codex workspace processes.
+- Preserved the exact logical working directory recorded by each recipe. Recovery validates that directory itself and no longer falls back to a parent, home directory, or `/`; an unavailable cwd is an explicit failed recovery.
+- Restricted legacy database import to the primary GUI and the single `sessions.sqlite3` registry. The copy is integrity-checked, atomic, retry-safe, and leaves `terminal-auth`, Codex configuration, and other legacy state untouched.
+- Added bounded concurrent recovery with durable per-target claims and single-flight behavior. Different recovery targets may proceed concurrently, while the same session, tmux pane, auth scope, or resume target cannot be recovered twice at once.
+- Added explicit durable recovery intent. An active intent matching the exact session fingerprint, name, and logical cwd authorizes stopped or start-error recovery; inactive or malformed intents block recovery, while legacy active-status rows retain their narrow compatibility path. New, remembered, external, and archived records remain non-runnable by default.
+- Added guarded SSD rebinding for pre-existing native Codex resume scopes. A durable recovery claim plus missing/dead/quiescent backend proof is required; the exact selected account and canonical session roots are preserved, the registry update is compare-and-swap protected, and the old scope remains untouched. External, OpenCode, ambiguous, or incompletely proven sessions fail closed without an implicit auth copy or path move.
+- Added `T1000_VALIDATION_RUNTIME_BASE` for production validation in contained hosts whose global `/tmp` is not safely mode `1777`. The override must be an absolute, existing, mode-`0700`, current-user directory and remains subject to the short-path and authenticated cleanup gates.
+
 ## 0.2.19
 
 - Made terminal history use one truthful viewport. Ordinary wheel, trackpad, selection autoscroll, Page Up/Page Down, and the persistent scrollbar now move VTE's visible normal-screen content; alternate-screen TUIs receive their negotiated mouse protocol without a thumb-only pseudo-scroll.

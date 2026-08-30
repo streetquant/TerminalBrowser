@@ -45,6 +45,7 @@ _TEST_SUMMARY_PATTERNS = {
     "xpassed": re.compile(r"(\d+) xpassed"),
 }
 _TASK_RUNTIME_BASE = Path("/tmp")
+_TASK_RUNTIME_BASE_ENV = "T1000_VALIDATION_RUNTIME_BASE"
 _TASK_RUNTIME_MAX_PATH_BYTES = 64
 _TASK_RUNTIME_LEASE_NAME = ".t1000-validation-owner.json"
 _TASK_RUNTIME_LEASE_SCHEMA = "t1000.validation-runtime-owner.v1"
@@ -606,6 +607,18 @@ def _safe_task_runtime_base(base: Path) -> Path:
     return resolved
 
 
+def _configured_task_runtime_base() -> Path:
+    raw = str(os.environ.get(_TASK_RUNTIME_BASE_ENV, "") or "").strip()
+    if not raw:
+        return _TASK_RUNTIME_BASE
+    configured = Path(raw).expanduser()
+    if not configured.is_absolute():
+        raise ValidationError(
+            f"{_TASK_RUNTIME_BASE_ENV} must be an absolute path"
+        )
+    return configured
+
+
 def _validate_runtime_lease_payload(
     payload: object,
     *,
@@ -772,7 +785,7 @@ def _reap_stale_task_runtimes(
     """Recover a bounded number of lease-bound dead validation runtimes."""
 
     runtime_base = _safe_task_runtime_base(
-        _TASK_RUNTIME_BASE if base is None else Path(base)
+        _configured_task_runtime_base() if base is None else Path(base)
     )
     entry_limit = max(0, min(int(max_entries), _TASK_RUNTIME_MAX_SCAN_ENTRIES))
     removal_limit = max(0, min(int(max_removals), _TASK_RUNTIME_MAX_REMOVALS))
@@ -826,7 +839,7 @@ def _reap_stale_task_runtimes(
 def _create_short_task_runtime(work: Path) -> _TaskRuntime:
     """Create one lease-bound short runtime suitable for desktop IPC."""
 
-    base = _safe_task_runtime_base(_TASK_RUNTIME_BASE)
+    base = _safe_task_runtime_base(_configured_task_runtime_base())
     prefix = f"t1v-{sha256_bytes(os.fsencode(str(work)))[:8]}-"
     path: Path | None = None
     try:
