@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import stat
 import subprocess
@@ -84,6 +85,25 @@ def _activation_lock(paths: ActivationPaths):
         os.chmod(lock_path, 0o600)
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
         yield
+
+
+@contextmanager
+def _try_activation_lock(paths: ActivationPaths):
+    """Try the activation lock without making the watchdog block activation."""
+
+    paths.evidence.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = paths.evidence / "activation.lock"
+    with lock_path.open("a+", encoding="ascii") as stream:
+        os.chmod(lock_path, 0o600)
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def _now() -> str:
@@ -318,17 +338,53 @@ def _copy(source: Path, destination: Path, mode: int) -> None:
 
 def _watchdog_unit(paths: ActivationPaths, tx: Path) -> str:
     wrapper = paths.target / "scripts/termdeck-web-activate.py"
+    command = shlex.join(
+        [
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            str(wrapper),
+            "--watchdog",
+            "--transaction",
+            str(tx),
+            "--target",
+            str(paths.target),
+            "--evidence",
+            str(paths.evidence),
+            "--runtime",
+            str(paths.runtime),
+            "--database",
+            str(paths.database),
+            "--managed-root",
+            str(paths.managed_root),
+            "--managed-bin",
+            str(paths.managed_bin),
+            "--unit-dir",
+            str(paths.unit_dir),
+        ]
+    )
+    writable = " ".join(
+        str(path)
+        for path in (
+            tx,
+            paths.evidence,
+            paths.runtime,
+            paths.unit_dir,
+            paths.managed_root,
+            paths.managed_bin,
+        )
+    )
     return f"""[Unit]
 Description=TermDeck web activation recovery watchdog
 After=default.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -I -B {wrapper} --watchdog --transaction {tx}
+ExecStart={command}
 Restart=no
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths={tx} {paths.evidence} {paths.runtime} {paths.unit_dir}
+ReadWritePaths={writable}
 TimeoutStopSec=20s
 
 [Install]
@@ -345,7 +401,27 @@ def _sources(paths: ActivationPaths, tx: Path) -> dict[str, tuple[Path, int]]:
     }
 
 
-def prepare(paths: ActivationPaths) -> dict[str, object]:
+def _web_source_tree(paths: ActivationPaths, commit: str) -> str:
+    return _run(
+        ["/usr/bin/git", "rev-parse", f"{commit}:web"],
+        cwd=paths.target,
+        timeout=30,
+    ).stdout.strip()
+
+
+def _publish_units(paths: ActivationPaths, tx: Path) -> None:
+    for unit in SERVICES:
+        staged = tx / "staged-units" / unit
+        mode = _fingerprint(staged).get("mode", 0o644)
+        _copy(staged, paths.unit_dir / unit, int(mode))
+
+
+def prepare(
+    paths: ActivationPaths,
+    *,
+    reuse_web_binary: Path | None = None,
+    reuse_web_source_commit: str | None = None,
+) -> dict[str, object]:
     source = _source(paths)
     tx, receipt = new_transaction(paths, source)
     try:
@@ -362,14 +438,40 @@ def prepare(paths: ActivationPaths) -> dict[str, object]:
         })
         _persist(paths, tx, receipt, "building-web")
         cargo_target = artifacts / "cargo-target"
-        environment = dict(os.environ)
-        environment["CARGO_TARGET_DIR"] = str(cargo_target)
-        _run(["/usr/bin/cargo", "build", "--release", "--locked", "-p", "termdeck-web-server"],
-             cwd=paths.target / "web", env=environment, timeout=1800)
-        binary = cargo_target / "release/termdeck-web-server"
-        if not binary.is_file() or not os.access(binary, os.X_OK):
-            raise WebActivationError("staged web build did not produce an executable")
-        _run([str(binary), "--help"], cwd=paths.target / "web", timeout=30)
+        current_web_tree = _web_source_tree(paths, source["commit"])
+        if reuse_web_binary is not None:
+            reuse_web_binary = reuse_web_binary.resolve()
+            if not reuse_web_binary.is_file() or not os.access(reuse_web_binary, os.X_OK):
+                raise WebActivationError("qualified reused web binary is unavailable")
+            reused_commit = reuse_web_source_commit or source["commit"]
+            reused_web_tree = _web_source_tree(paths, reused_commit)
+            if reused_web_tree != current_web_tree:
+                raise WebActivationError("reused web binary source tree differs from checkout")
+            _run([str(reuse_web_binary), "--help"], cwd=paths.target / "web", timeout=30)
+            binary = reuse_web_binary
+            receipt["web_binary"] = {
+                "reused": True,
+                "source_commit": reused_commit,
+                "source_tree": reused_web_tree,
+                "current_source_tree": current_web_tree,
+                "sha256": _sha(reuse_web_binary),
+            }
+        else:
+            environment = dict(os.environ)
+            environment["CARGO_TARGET_DIR"] = str(cargo_target)
+            _run(["/usr/bin/cargo", "build", "--release", "--locked", "-p", "termdeck-web-server"],
+                 cwd=paths.target / "web", env=environment, timeout=1800)
+            binary = cargo_target / "release/termdeck-web-server"
+            if not binary.is_file() or not os.access(binary, os.X_OK):
+                raise WebActivationError("staged web build did not produce an executable")
+            _run([str(binary), "--help"], cwd=paths.target / "web", timeout=30)
+            receipt["web_binary"] = {
+                "reused": False,
+                "source_commit": source["commit"],
+                "source_tree": current_web_tree,
+                "current_source_tree": current_web_tree,
+                "sha256": _sha(binary),
+            }
         _copy(binary, artifacts / "web/termdeck-web-server", 0o755)
         staged_runtime, staged_units = tx / "staged-runtime", tx / "staged-units"
         for relative, (source_path, mode) in _sources(paths, tx).items():
@@ -474,6 +576,19 @@ def _install(paths: ActivationPaths, package: Mapping[str, object]) -> dict[str,
     return result
 
 
+def _managed_release_id(paths: ActivationPaths) -> str | None:
+    state_path = paths.managed_root / "state.json"
+    if not state_path.exists():
+        return None
+    if state_path.is_symlink() or not state_path.is_file():
+        raise WebActivationError("managed release state is not a regular file")
+    state = _read(state_path)
+    current = state.get("current_release_id")
+    if current is not None and not isinstance(current, str):
+        raise WebActivationError("managed release state has an invalid current release id")
+    return current
+
+
 def _rollback_package(paths: ActivationPaths, release: object) -> None:
     if not isinstance(release, str):
         raise WebActivationError("prior managed release id is unavailable")
@@ -498,8 +613,8 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
         receipt["preimages"]["generated:" + relative] = _preimage(paths.runtime / relative, tx, "generated-" + relative.replace("/", "-"))
     for unit in (*SERVICES, WATCHDOG_UNIT):
         receipt["preimages"]["unit:" + unit] = _preimage(paths.unit_dir / unit, tx, "unit-" + unit)
-    state = _read(paths.managed_root / "state.json") if (paths.managed_root / "state.json").is_file() else {}
-    receipt["old_release_id"] = state.get("current_release_id")
+    receipt["old_release_id"] = _managed_release_id(paths)
+    receipt["package_before"] = {"current_release_id": receipt["old_release_id"]}
     _persist(paths, tx, receipt, "mutation-start")
     stop_heartbeat = threading.Event()
 
@@ -523,6 +638,8 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
         _persist(paths, tx, receipt, "runtime-publishing")
         for relative, (_source_path, mode) in _sources(paths, tx).items():
             _copy(tx / "staged-runtime" / relative, paths.runtime / relative, mode)
+        _publish_units(paths, tx)
+        receipt["service_units_published"] = True
         _systemd("daemon-reload")
         _persist(paths, tx, receipt, "runtime-staged")
         _persist(paths, tx, receipt, "services-stopping")
@@ -540,6 +657,9 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
         _persist(paths, tx, receipt)
         return {"ok": True, "action": "activated", "transaction": str(tx), "receipt": receipt}
     except Exception as exc:
+        if thread.is_alive():
+            stop_heartbeat.set()
+            thread.join()
         receipt["error"] = str(exc)
         _persist(paths, tx, receipt, "failed")
         try:
@@ -551,7 +671,8 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
         raise
     finally:
         stop_heartbeat.set()
-        thread.join(timeout=2)
+        if thread.is_alive():
+            thread.join()
 
 
 def rollback(paths: ActivationPaths, tx: Path, *, reason: str) -> dict[str, object]:
@@ -560,6 +681,11 @@ def rollback(paths: ActivationPaths, tx: Path, *, reason: str) -> dict[str, obje
         raise WebActivationError("rollback is not needed before the first mutation")
     _persist(paths, tx, receipt, "rollback-start")
     try:
+        current_release_id = _managed_release_id(paths)
+        old_release_id = receipt.get("old_release_id")
+        receipt["package_rollback_required"] = current_release_id != old_release_id
+        receipt["package_current_release_id"] = current_release_id
+        _persist(paths, tx, receipt)
         if receipt.get("services_stopped"):
             _stop_web()
         preimages = receipt.get("preimages")
@@ -569,8 +695,10 @@ def rollback(paths: ActivationPaths, tx: Path, *, reason: str) -> dict[str, obje
             if isinstance(record, Mapping):
                 _restore(record, tx)
         _systemd("daemon-reload", check=False)
-        if receipt.get("package_result"):
-            _rollback_package(paths, receipt.get("old_release_id"))
+        if current_release_id != old_release_id:
+            _rollback_package(paths, old_release_id)
+            if _managed_release_id(paths) != old_release_id:
+                raise WebActivationError("managed package identity did not return to its pre-activation release")
         _start_web()
         receipt["rollback_reason"] = reason
         receipt["post_checks"] = {"database": verify_database(paths, tx, receipt.get("database_before", {})), "processes": process_observation(receipt.get("processes_before", []))}
@@ -591,8 +719,22 @@ def watchdog(paths: ActivationPaths, tx: Path) -> int:
             return 0
         heartbeat = float(receipt.get("heartbeat_epoch", 0) or 0)
         if receipt.get("mutation_started") and heartbeat and time.time() - heartbeat > WATCHDOG_TIMEOUT:
-            rollback(paths, tx, reason="watchdog heartbeat expired")
-            return 0
+            with _try_activation_lock(paths) as acquired:
+                if acquired:
+                    # Re-read after acquiring the lock so a live activation that
+                    # refreshed its receipt cannot be mistaken for a stale owner.
+                    locked_tx, locked_receipt = load_transaction(paths, tx)
+                    locked_heartbeat = float(locked_receipt.get("heartbeat_epoch", 0) or 0)
+                    if (
+                        locked_receipt.get("mutation_started")
+                        and locked_heartbeat
+                        and time.time() - locked_heartbeat > WATCHDOG_TIMEOUT
+                    ):
+                        rollback(paths, locked_tx, reason="watchdog heartbeat expired")
+                        return 0
+                else:
+                    time.sleep(2)
+                    continue
         time.sleep(2)
 
 
@@ -610,6 +752,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     actions.add_argument("--watchdog", action="store_true")
     parser.add_argument("--transaction", type=Path)
     parser.add_argument("--latest", action="store_true")
+    parser.add_argument("--reuse-web-binary", type=Path)
+    parser.add_argument("--reuse-web-source-commit")
     for name in ("target", "evidence", "runtime", "database", "managed-root", "managed-bin", "unit-dir"):
         parser.add_argument("--" + name)
     args = parser.parse_args(argv)
@@ -623,7 +767,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             with _activation_lock(paths):
                 if args.prepare:
-                    result = prepare(paths)
+                    result = prepare(
+                        paths,
+                        reuse_web_binary=args.reuse_web_binary,
+                        reuse_web_source_commit=args.reuse_web_source_commit,
+                    )
                 elif args.execute:
                     if not args.transaction:
                         raise WebActivationError("--execute requires --transaction")
