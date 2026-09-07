@@ -410,9 +410,8 @@ def main() -> int:
         os.environ["TD_DEAD_MARKER"] = str(dead_marker)
         os.environ["TD_DEAD_RELEASE"] = str(dead_release)
         os.environ["T1000_MANAGED_ROOT"] = str(managed_root)
-        os.environ["CODEX_STORAGE_FABRIC"] = "warp-drives-v1"
-        os.environ["CODEX_WORKSPACE_STORAGE_CLASS"] = "ssd-cell"
-        os.environ["CODEX_BULK_STORAGE_MASKED"] = "1"
+        os.environ["CODEX_STORAGE_FABRIC"] = "direct-root"
+        os.environ["CODEX_WORKSPACE_STORAGE_CLASS"] = "non-rotational-block"
         os.environ["CODEX_STORAGE_ATTESTATION"] = "window-restore-private-ssd"
         os.environ["TERMDECK_CODEX_BINARY"] = str(fake_codex)
         os.environ["TERMDECK_CODEX_ACCOUNT_SOURCE"] = str(canonical_home)
