@@ -4,6 +4,7 @@
 
 - Qualified the Warp Drives source relocation with canonical deployment references to `/var/lib/codexpro-exec/termdeck-runtime`. The historical `/8tb/projects/softwares/termdeck/.runtime` bind remains an explicitly approved cutover compatibility path and is obsolete after activation.
 - Aligned clean-exit recovery coverage with dead-pane reuse: `respawn-pane` omits `-k` when the pane is already dead, while live in-place replacement continues to use `-k`.
+- Pinned the release workflow to its checkout when invoked by path, preventing an installed legacy TermDeck package from generating a mismatched managed bootstrap.
 
 ## 0.2.20
 

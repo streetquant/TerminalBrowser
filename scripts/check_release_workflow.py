@@ -15,6 +15,12 @@ import subprocess
 import sys
 import tempfile
 
+# Running a script by path puts only its scripts directory on sys.path; pin
+# release-manager imports to this checkout so the wheel and installer share one source.
+_REPOSITORY = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY))
+
 from termdeck.release_manager import (
     build_release,
     install_release,
