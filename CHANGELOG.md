@@ -9,6 +9,7 @@
 - Replaced byte-identical live database comparisons with supported SQLite backup integrity checks, preservation of pre-existing session identities, and process identity checks that allow legitimate session activity and natural exits.
 - Added the reviewable TermDeck web activation and watchdog entry points under scripts/; recovery receipts remain external and pin the source commit and qualified package.
 - Completed the activation transaction contract: the staged backend and LAN units are published before the bounded web restart, the watchdog carries the exact transaction paths and managed release write scope, rollback compares durable preflight and current package identities, and heartbeat recovery is quiesced and lock-serialized before rollback.
+- Bound the managed CLI launcher, backend unit, activation defaults, and storage attestation to the existing physical /var/lib/codexpro-exec/termdeck-state registry through TERMDECK_STATE_ROOT; the historical /home/arch/.local/share/termdeck path remains an inode-preserving compatibility alias and is never copied or merged.
 
 - Qualified the Warp Drives source relocation with canonical deployment references to `/var/lib/codexpro-exec/termdeck-runtime`. The historical `/8tb/projects/softwares/termdeck/.runtime` bind remains an explicitly approved cutover compatibility path and is obsolete after activation.
 - Aligned clean-exit recovery coverage with dead-pane reuse: `respawn-pane` omits `-k` when the pane is already dead, while live in-place replacement continues to use `-k`.

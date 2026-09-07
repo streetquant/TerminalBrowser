@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import shlex
 import sqlite3
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +22,25 @@ def _paths(tmp_path: Path) -> activation.ActivationPaths:
         managed_bin=tmp_path / "bin",
         unit_dir=tmp_path / "units",
     )
+
+
+
+def test_activation_defaults_bind_canonical_state_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root = tmp_path / "canonical" / "termdeck-state"
+    monkeypatch.setenv("TERMDECK_STATE_ROOT", str(state_root))
+
+    paths = activation.ActivationPaths.defaults(
+        target=tmp_path / "source",
+        evidence=tmp_path / "evidence",
+        runtime=tmp_path / "runtime",
+        managed_root=tmp_path / "managed",
+        managed_bin=tmp_path / "bin",
+        unit_dir=tmp_path / "units",
+    )
+
+    assert paths.database == state_root / "sessions.sqlite3"
 
 
 def test_transaction_pointer_and_receipt_exist_before_build(tmp_path: Path) -> None:
@@ -134,6 +156,13 @@ def test_custom_watchdog_command_and_write_scope_are_complete(tmp_path: Path) ->
     tx = paths.evidence / "tx-1"
     unit = activation._watchdog_unit(paths, tx)
 
+    properties = {
+        key: value
+        for line in unit.splitlines()
+        if "=" in line
+        for key, value in [line.split("=", 1)]
+    }
+    exec_args = shlex.split(properties["ExecStart"])
     for flag, value in (
         ("--transaction", tx),
         ("--target", paths.target),
@@ -144,10 +173,106 @@ def test_custom_watchdog_command_and_write_scope_are_complete(tmp_path: Path) ->
         ("--managed-bin", paths.managed_bin),
         ("--unit-dir", paths.unit_dir),
     ):
-        assert f"{flag} {value}" in unit
-    for path in (paths.managed_root, paths.managed_bin):
-        assert str(path) in unit
+        index = exec_args.index(flag)
+        assert exec_args[index + 1] == str(value)
+
+    read_write_paths = set(shlex.split(properties["ReadWritePaths"]))
+    for path in (
+        tx,
+        paths.evidence,
+        paths.runtime,
+        paths.unit_dir,
+        paths.managed_root,
+        paths.managed_bin,
+    ):
+        assert str(path) in read_write_paths
     assert "ProtectSystem=strict" in unit
+
+
+def test_watchdog_does_not_rollback_while_activation_lock_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    tx, receipt = activation.new_transaction(
+        paths,
+        source={"commit": "a" * 40, "tree": "b" * 40, "branch": "candidate", "origin_main": "a" * 40},
+    )
+    receipt.update(
+        {
+            "status": "mutation-start",
+            "mutation_started": True,
+            "heartbeat_epoch": time.time() - activation.WATCHDOG_TIMEOUT - 1,
+        }
+    )
+    activation._write(tx / "receipt.json", receipt)
+
+    @contextmanager
+    def lock_is_held(_paths: activation.ActivationPaths):
+        yield False
+
+    class WatchdogStopped(Exception):
+        pass
+
+    monkeypatch.setattr(activation, "_try_activation_lock", lock_is_held)
+    monkeypatch.setattr(
+        activation,
+        "rollback",
+        lambda *args, **kwargs: pytest.fail("watchdog rolled back while activation lock was held"),
+    )
+    monkeypatch.setattr(
+        activation.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(WatchdogStopped()),
+    )
+
+    with pytest.raises(WatchdogStopped):
+        activation.watchdog(paths, tx)
+
+
+@pytest.mark.parametrize("fresh_status", ["activated", "mutation-start"])
+def test_watchdog_rechecks_receipt_after_lock_before_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_status: str,
+) -> None:
+    paths = _paths(tmp_path)
+    tx, receipt = activation.new_transaction(
+        paths,
+        source={"commit": "a" * 40, "tree": "b" * 40, "branch": "candidate", "origin_main": "a" * 40},
+    )
+    stale = dict(receipt)
+    stale.update(
+        {
+            "status": "mutation-start",
+            "mutation_started": True,
+            "heartbeat_epoch": time.time() - activation.WATCHDOG_TIMEOUT - 1,
+        }
+    )
+    fresh = dict(stale)
+    fresh.update({"status": fresh_status, "heartbeat_epoch": time.time()})
+    reads = [(tx, stale), (tx, fresh)]
+
+    def reread(_paths: activation.ActivationPaths, _tx: Path):
+        return reads.pop(0)
+
+    class WatchdogStopped(Exception):
+        pass
+
+    monkeypatch.setattr(activation, "load_transaction", reread)
+    monkeypatch.setattr(
+        activation,
+        "rollback",
+        lambda *args, **kwargs: pytest.fail("watchdog rolled back after a fresh receipt reread"),
+    )
+    monkeypatch.setattr(
+        activation.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(WatchdogStopped()),
+    )
+
+    with pytest.raises(WatchdogStopped):
+        activation.watchdog(paths, tx)
+    assert reads == []
 
 
 def test_package_effect_before_receipt_ack_is_rolled_back_by_identity(

@@ -366,3 +366,30 @@ def test_gtk_tmux_event_watcher_uses_enforced_child_environment(
     assert observed["materialize"] is True
     assert observed["command"] == ["/usr/bin/tmux", "-C", "attach-session"]
     assert observed["popen"]["env"] is expected_environment  # type: ignore[index]
+
+
+def test_explicit_state_root_routes_managed_cli_to_the_canonical_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed_root = tmp_path / "managed" / "t1000-managed"
+    state_root = tmp_path / "canonical" / "termdeck-state"
+    database = state_root / "sessions.sqlite3"
+    database.parent.mkdir(parents=True)
+    database.touch()
+    observed: list[dict[str, object]] = []
+
+    monkeypatch.setenv("T1000_MANAGED_ROOT", str(managed_root))
+    monkeypatch.setenv("TERMDECK_STATE_ROOT", str(state_root))
+    monkeypatch.setattr(
+        cli,
+        "require_hot_storage",
+        lambda **kwargs: observed.append(kwargs),
+    )
+    args = argparse.Namespace(db=None, func=cli.cmd_sessions, command="sessions")
+
+    cli._prepare_managed_session_database(args)
+
+    assert args.db == database
+    assert observed == [
+        {"managed_root": managed_root, "db_path": database, "production": True}
+    ]

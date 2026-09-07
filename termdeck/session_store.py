@@ -53,6 +53,12 @@ def managed_state_dir(*, environ: Mapping[str, str] | None = None) -> Path:
     """
 
     values = os.environ if environ is None else environ
+    raw_state_root = str(values.get("TERMDECK_STATE_ROOT", "") or "").strip()
+    if raw_state_root:
+        state_root = Path(raw_state_root).expanduser()
+        if not state_root.is_absolute():
+            raise ValueError("TERMDECK_STATE_ROOT must be an absolute path")
+        return Path(os.path.abspath(os.fspath(state_root)))
     raw_root = str(values.get("T1000_MANAGED_ROOT", "") or "").strip()
     if not raw_root:
         return legacy_state_dir()

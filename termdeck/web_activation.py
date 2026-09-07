@@ -55,11 +55,21 @@ class ActivationPaths:
     @classmethod
     def defaults(cls, **overrides: Path | None) -> "ActivationPaths":
         source = Path(overrides.get("target") or Path(__file__).resolve().parents[1]).resolve()
+        state_root = Path(
+            os.environ.get("TERMDECK_STATE_ROOT", "/var/lib/codexpro-exec/termdeck-state")
+        ).expanduser()
+        if not state_root.is_absolute():
+            raise WebActivationError("TERMDECK_STATE_ROOT must be an absolute path")
+        database = Path(
+            overrides.get("database") or state_root / "sessions.sqlite3"
+        ).expanduser()
+        if not database.is_absolute():
+            raise WebActivationError("activation database must be an absolute path")
         return cls(
             source,
             Path(overrides.get("evidence") or "/var/lib/codexpro-exec/recovery/project-warp-move-20260905T161606Z/termdeck-move-20260907/activation-v2").resolve(),
             Path(overrides.get("runtime") or "/var/lib/codexpro-exec/termdeck-runtime/termdeck-lan").resolve(),
-            Path(overrides.get("database") or "/home/arch/.local/share/termdeck/sessions.sqlite3").resolve(),
+            database.resolve(),
             Path(overrides.get("managed_root") or "/var/lib/codexpro-exec/codex-state-project-homes/runtime/t1000-managed").resolve(),
             Path(overrides.get("managed_bin") or "/home/arch/.local/bin").resolve(),
             Path(overrides.get("unit_dir") or "/home/arch/.config/systemd/user").resolve(),

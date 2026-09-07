@@ -104,6 +104,14 @@ _BUILD_RUNNER_SOURCE = (
     "runpy.run_module('build', run_name='__main__', alter_sys=True)\n"
 )
 _MANAGED_BIN_DIR_ENV = "T1000_MANAGED_BIN_DIR"
+# The MaxCloud managed root is deliberately bound to the already-populated
+# physical TermDeck state directory. This keeps the generated CLI launcher,
+# web service, and auth-scope defaults on one database without copying or
+# merging an alternate registry.
+_DEPLOYMENT_MANAGED_ROOT = Path(
+    "/var/lib/codexpro-exec/codex-state-project-homes/runtime/t1000-managed"
+)
+_DEPLOYMENT_STATE_ROOT = Path("/var/lib/codexpro-exec/termdeck-state")
 _UUID = re.compile(
     r"(?<![0-9a-f])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])",
     re.IGNORECASE,
@@ -508,6 +516,19 @@ def _is_canonical_production_root(path: Path) -> bool:
         return path.exists() and canonical.exists() and path.samefile(canonical)
     except OSError:
         return False
+
+
+def _deployment_state_root(layout: ReleaseLayout) -> Path | None:
+    """Return the validated physical state root for the MaxCloud deployment."""
+
+    try:
+        if layout.root.resolve(strict=False) == _DEPLOYMENT_MANAGED_ROOT.resolve(
+            strict=False
+        ):
+            return _DEPLOYMENT_STATE_ROOT
+    except OSError:
+        pass
+    return None
 
 
 def _resolve_production_intent(
@@ -2750,6 +2771,12 @@ def _bootstrap_source(layout: ReleaseLayout, python: Path) -> bytes:
     """Return a self-contained launcher that verifies bytes before importing code."""
 
     root = str(layout.root.resolve())
+    state_root = _deployment_state_root(layout)
+    state_assignment = (
+        f'os.environ["TERMDECK_STATE_ROOT"] = {str(state_root)!r}\n'
+        if state_root is not None
+        else ""
+    )
     template = r'''#!/usr/bin/env __PYTHON_NAME__
 from __future__ import annotations
 import atexit
@@ -3835,7 +3862,7 @@ except Exception as exc:
 
 os.environ.pop("T1000_BOOTSTRAP_STATE_RETRY", None)
 os.environ["T1000_MANAGED_ROOT"] = str(ROOT)
-os.environ["T1000_MANAGED_BIN_DIR"] = str(launcher.parent)
+__STATE_ROOT_ASSIGNMENT__os.environ["T1000_MANAGED_BIN_DIR"] = str(launcher.parent)
 os.environ["T1000_RELEASE_MANIFEST"] = str(manifest_path)
 os.environ["T1000_RELEASE_STATE"] = str(STATE)
 verified_snapshot_importer = VerifiedSnapshotImporter(import_root, pinned_members)
@@ -3861,15 +3888,23 @@ from termdeck.cli import main
 sys.argv[0] = "t1000"
 raise SystemExit(main())
 '''
-    source = template.replace("__PYTHON_NAME__", python.name).replace(
-        "__ROOT_REPR__", repr(root)
+    source = (
+        template.replace("__PYTHON_NAME__", python.name)
+        .replace("__ROOT_REPR__", repr(root))
+        .replace("__STATE_ROOT_ASSIGNMENT__", state_assignment)
     )
     return source.encode("utf-8")
 
 
 def _launcher_source(layout: ReleaseLayout, python: Path) -> bytes:
+    state_root = _deployment_state_root(layout)
+    state_export = (
+        f"export TERMDECK_STATE_ROOT={shlex.quote(str(state_root))}\n"
+        if state_root is not None
+        else ""
+    )
     command = f'exec {shlex.quote(str(python))} -I -B {shlex.quote(str(layout.bootstrap_path))} "$@"\n'
-    return ("#!/bin/sh\nset -eu\n" + command).encode("utf-8")
+    return ("#!/bin/sh\nset -eu\n" + state_export + command).encode("utf-8")
 
 
 def _activation_bundle(

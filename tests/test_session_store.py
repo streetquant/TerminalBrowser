@@ -1785,3 +1785,31 @@ os._exit(0)
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_explicit_termdeck_state_root_binds_database_and_auth_defaults() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        managed_root = Path(tmp) / "managed" / "t1000-managed"
+        state_root = Path(tmp) / "canonical" / "termdeck-state"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "T1000_MANAGED_ROOT": str(managed_root),
+                "TERMDECK_STATE_ROOT": str(state_root),
+            },
+            clear=False,
+        ):
+            assert default_db_path() == state_root / "sessions.sqlite3"
+            assert default_auth_root() == state_root / "terminal-auth"
+
+
+def test_relative_termdeck_state_root_is_rejected() -> None:
+    with mock.patch.dict(
+        os.environ,
+        {"TERMDECK_STATE_ROOT": "relative/termdeck-state"},
+        clear=False,
+    ):
+        with unittest.TestCase().assertRaisesRegex(
+            ValueError, "TERMDECK_STATE_ROOT must be an absolute path"
+        ):
+            default_db_path()

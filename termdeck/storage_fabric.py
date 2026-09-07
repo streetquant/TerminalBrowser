@@ -872,14 +872,19 @@ def _default_paths(
     managed_root: Path,
     environment: Mapping[str, str],
 ) -> dict[str, Path]:
-    state_root = managed_root.parent / "termdeck"
-
     def configured(*names: str, default: Path) -> Path:
         for name in names:
             value = str(environment.get(name, "") or "").strip()
             if value:
                 return Path(value).expanduser()
         return default
+
+    state_root = configured(
+        "TERMDECK_STATE_ROOT",
+        default=managed_root.parent / "termdeck",
+    )
+    if not state_root.is_absolute():
+        raise ValueError("TERMDECK_STATE_ROOT must be an absolute path")
 
     return {
         "managed_release_root": managed_root,
