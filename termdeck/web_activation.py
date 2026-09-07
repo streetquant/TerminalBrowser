@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -72,6 +74,16 @@ class ActivationPaths:
 
 
 _LOCK = threading.RLock()
+
+
+@contextmanager
+def _activation_lock(paths: ActivationPaths):
+    paths.evidence.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = paths.evidence / "activation.lock"
+    with lock_path.open("a+", encoding="ascii") as stream:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        yield
 
 
 def _now() -> str:
@@ -603,17 +615,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         paths = _paths(args)
-        if args.prepare:
-            result = prepare(paths)
-        elif args.execute:
-            if not args.transaction:
-                raise WebActivationError("--execute requires --transaction")
-            result = execute(paths, args.transaction)
-        else:
+        if args.watchdog:
             tx = latest_transaction(paths) if args.latest else args.transaction
             if not tx:
-                raise WebActivationError("rollback/watchdog requires --transaction or --latest")
-            result = watchdog(paths, tx) if args.watchdog else rollback(paths, tx, reason="explicit recovery request")
+                raise WebActivationError("watchdog requires --transaction or --latest")
+            result = watchdog(paths, tx)
+        else:
+            with _activation_lock(paths):
+                if args.prepare:
+                    result = prepare(paths)
+                elif args.execute:
+                    if not args.transaction:
+                        raise WebActivationError("--execute requires --transaction")
+                    result = execute(paths, args.transaction)
+                else:
+                    tx = latest_transaction(paths) if args.latest else args.transaction
+                    if not tx:
+                        raise WebActivationError("rollback requires --transaction or --latest")
+                    result = rollback(paths, tx, reason="explicit recovery request")
         print(json.dumps(result, sort_keys=True, default=str))
         return 0
     except WebActivationError as exc:
