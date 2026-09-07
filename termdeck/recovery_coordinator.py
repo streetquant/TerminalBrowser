@@ -2,25 +2,33 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import math
 import os
 import shlex
 import sqlite3
-import hashlib
 import socket
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Callable, Iterable
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from .auth_scope_rebind import AuthScopeRebindProof, rebind_auth_scope
 from .models import RECOVERY_INTENT_ACTIVE
 from .session_reconcile import startup_recovery_allowed
 from .resources import process_tree_contains_codex
+from .session_recipe import record_recipe_fields
 from .session_store import SessionStore, utc_now
 from .tmux_backend import TmuxError
+
+
+_NO_QUIESCENCE_OBSERVATION = object()
 
 
 @dataclass(frozen=True)
@@ -71,6 +79,11 @@ class _Request:
     target_keys: tuple[str, ...] = ()
     claim_token: str | None = None
     next_claim_renewal: float = 0.0
+    following_claim: bool = False
+    followed_session_id: str = ""
+    followed_attempt: int = 0
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    claim_lost: threading.Event = field(default_factory=threading.Event)
 
 
 class _AdmissionUnavailable(RuntimeError):
@@ -83,6 +96,8 @@ class _ClaimHeld:
 
     owner_id: str
     expires_at: float
+    session_id: str = ""
+    attempt: int = 0
 
 
 @dataclass(frozen=True)
@@ -194,11 +209,13 @@ class RecoveryCoordinator:
             claim_ttl = os.environ.get(self.CLAIM_TTL_ENV, str(self.DEFAULT_CLAIM_TTL))
         self.claim_ttl = self._configured_claim_ttl(claim_ttl)
         self.wall_clock = wall_clock
-        self.owner_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex}"
+        self.owner_id = self._new_owner_id()
         self.max_workers = max_workers
         self._lock = threading.RLock()
         self._inflight: dict[str, _Request] = {}
         self._inflight_keys: dict[str, str] = {}
+        self._follower_wakeup = threading.Event()
+        self._follower_thread: threading.Thread | None = None
         self._closed = False
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
@@ -275,20 +292,49 @@ class RecoveryCoordinator:
                 )
                 self._deliver(result, listener)
                 return RecoverySubmission(session_id=session_id, state="closed", accepted=False)
+            target_key_set = set(target_keys)
             existing = next(
                 (
-                    self._inflight.get(existing_id)
-                    for key in target_keys
-                    if (existing_id := self._inflight_keys.get(key)) is not None
+                    request
+                    for request in self._inflight.values()
+                    if target_key_set.intersection(request.target_keys)
                 ),
                 None,
             )
             if existing is not None:
-                existing.listeners.append(listener)
-                return RecoverySubmission(
-                    session_id=session_id,
-                    state="deduplicated",
-                    accepted=True,
+                existing_session_id = str(getattr(existing.record, "id", ""))
+                if existing_session_id == session_id and existing.mode == mode:
+                    existing.listeners.append(listener)
+                    return RecoverySubmission(
+                        session_id=session_id,
+                        state="deduplicated",
+                        accepted=True,
+                    )
+                if existing_session_id == session_id:
+                    result = RecoveryResult(
+                        session_id=session_id,
+                        mode=mode,
+                        state="failed",
+                        error="an incompatible recovery mode is already in flight",
+                    )
+                    self._deliver(result, listener)
+                    return RecoverySubmission(
+                        session_id=session_id,
+                        state="rejected",
+                        accepted=False,
+                    )
+                return self._attach_claim_follower(
+                    record,
+                    mode=mode,
+                    initial_grid=initial_grid,
+                    listener=listener,
+                    target_keys=target_keys,
+                    held=_ClaimHeld(
+                        owner_id=self.owner_id,
+                        expires_at=float("inf"),
+                        session_id=existing_session_id,
+                        attempt=existing.attempt,
+                    ),
                 )
             if (
                 known_live is True
@@ -317,12 +363,29 @@ class RecoveryCoordinator:
                         accepted=False,
                     )
                 if not claimed:
-                    # A different process may currently own the same target.
-                    # Do not let a live-looking pane race that durable launch.
-                    return RecoverySubmission(
-                        session_id=session_id,
-                        state="deduplicated",
-                        accepted=True,
+                    if current is None or not startup_recovery_allowed(current):
+                        result = RecoveryResult(
+                            session_id=session_id,
+                            mode=mode,
+                            state="skipped",
+                            attempt=int(
+                                getattr(current or record, "recovery_attempts", 0)
+                                or 0
+                            ),
+                            error="recovery became ineligible before live attach",
+                        )
+                        self._deliver(result, listener)
+                        return RecoverySubmission(
+                            session_id=session_id,
+                            state="rejected",
+                            accepted=False,
+                        )
+                    return self._attach_claim_follower(
+                        current,
+                        mode=mode,
+                        initial_grid=initial_grid,
+                        listener=listener,
+                        target_keys=target_keys,
                     )
                 result = RecoveryResult(
                     session_id=session_id,
@@ -346,10 +409,13 @@ class RecoveryCoordinator:
                 self._deliver(result, listener)
                 return RecoverySubmission(session_id=session_id, state="failed", accepted=False)
             if isinstance(claim, _ClaimHeld):
-                return RecoverySubmission(
-                    session_id=session_id,
-                    state="deduplicated",
-                    accepted=True,
+                return self._attach_claim_follower(
+                    record,
+                    mode=mode,
+                    initial_grid=initial_grid,
+                    listener=listener,
+                    target_keys=target_keys,
+                    held=claim,
                 )
             if claim is None:
                 result = RecoveryResult(
@@ -404,23 +470,364 @@ class RecoveryCoordinator:
                 return RecoverySubmission(session_id=session_id, state="failed", accepted=False)
         return RecoverySubmission(session_id=session_id, state="queued", accepted=True)
 
+    def _attach_claim_follower(
+        self,
+        record,
+        *,
+        mode: str,
+        initial_grid: tuple[int, int] | None,
+        listener: _Listener,
+        target_keys: tuple[str, ...],
+        held: _ClaimHeld | None = None,
+    ) -> RecoverySubmission:
+        """Subscribe to a foreign durable claim without occupying a worker."""
+
+        session_id = str(getattr(record, "id", ""))
+        request = _Request(
+            record=record,
+            mode=mode,
+            initial_grid=initial_grid,
+            listeners=[listener],
+            attempt=int(getattr(record, "recovery_attempts", 0) or 0),
+            target_keys=target_keys,
+            following_claim=True,
+            followed_session_id=(
+                held.session_id if held is not None and held.session_id else session_id
+            ),
+            followed_attempt=(
+                held.attempt
+                if held is not None
+                else int(getattr(record, "recovery_attempts", 0) or 0)
+            ),
+        )
+        self._inflight[session_id] = request
+        for key in target_keys:
+            self._inflight_keys.setdefault(key, session_id)
+        try:
+            self._ensure_follower_monitor()
+        except Exception as exc:
+            self._inflight.pop(session_id, None)
+            for key in target_keys:
+                if self._inflight_keys.get(key) == session_id:
+                    self._inflight_keys.pop(key, None)
+            result = RecoveryResult(
+                session_id=session_id,
+                mode=mode,
+                state="failed",
+                attempt=request.attempt,
+                error=f"recovery claim could not be followed: {exc}",
+            )
+            self._deliver(result, listener)
+            return RecoverySubmission(
+                session_id=session_id,
+                state="failed",
+                accepted=False,
+            )
+        self._follower_wakeup.set()
+        return RecoverySubmission(
+            session_id=session_id,
+            state="deduplicated",
+            accepted=True,
+        )
+
+    def _ensure_follower_monitor(self) -> None:
+        thread = self._follower_thread
+        if thread is not None and thread.is_alive():
+            return
+        thread = threading.Thread(
+            target=self._follow_foreign_claims,
+            name="termdeck-recovery-claims",
+            daemon=True,
+        )
+        self._follower_thread = thread
+        thread.start()
+
+    def _complete_inflight(
+        self,
+        session_id: str,
+        result: RecoveryResult,
+        *,
+        expected: _Request | None = None,
+    ) -> bool:
+        with self._lock:
+            current = self._inflight.get(session_id)
+            if current is None or (expected is not None and current is not expected):
+                return False
+            completed = self._inflight.pop(session_id)
+            for key in completed.target_keys:
+                if self._inflight_keys.get(key) == session_id:
+                    self._inflight_keys.pop(key, None)
+        for listener in completed.listeners:
+            self._deliver(result, listener)
+        return True
+
+    def _follow_foreign_claims(self) -> None:
+        worker_store = None
+        owned_store = False
+        try:
+            worker_store, owned_store = self._worker_store()
+            if self.store is not None and worker_store is None:
+                raise _AdmissionUnavailable("claim-follower session store could not be opened")
+            while True:
+                with self._lock:
+                    if self._closed:
+                        return
+                    session_ids = tuple(
+                        session_id
+                        for session_id, request in self._inflight.items()
+                        if request.following_claim
+                    )
+                    if not session_ids:
+                        return
+                for session_id in session_ids:
+                    self._poll_claim_follower(session_id, worker_store)
+                self._follower_wakeup.wait(self.poll_interval)
+                self._follower_wakeup.clear()
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+            with self._lock:
+                followers = tuple(
+                    (session_id, request)
+                    for session_id, request in self._inflight.items()
+                    if request.following_claim
+                )
+            for session_id, request in followers:
+                self._complete_inflight(
+                    session_id,
+                    RecoveryResult(
+                        session_id=session_id,
+                        mode=request.mode,
+                        state="failed",
+                        attempt=request.attempt,
+                        error=f"recovery claim follower failed: {error}",
+                    ),
+                    expected=request,
+                )
+        finally:
+            self._close_store(worker_store, owned_store)
+            with self._lock:
+                if self._follower_thread is threading.current_thread():
+                    self._follower_thread = None
+                restart = not self._closed and any(
+                    request.following_claim for request in self._inflight.values()
+                )
+                if restart:
+                    self._ensure_follower_monitor()
+
+    def _poll_claim_follower(self, session_id: str, worker_store) -> None:
+        with self._lock:
+            request = self._inflight.get(session_id)
+            if request is None or not request.following_claim:
+                return
+        current = self._read_record_from(worker_store, request.record)
+        if current is None or not startup_recovery_allowed(current):
+            self._complete_inflight(
+                session_id,
+                RecoveryResult(
+                    session_id=session_id,
+                    mode=request.mode,
+                    state="skipped",
+                    attempt=int(getattr(current or request.record, "recovery_attempts", 0) or 0),
+                    error="recovery was made inactive while following another owner",
+                ),
+                expected=request,
+            )
+            return
+
+        ready_pid = self._followed_ready_pid(current)
+        if ready_pid is not None:
+            self._complete_inflight(
+                session_id,
+                RecoveryResult(
+                    session_id=session_id,
+                    mode=request.mode,
+                    state="ready",
+                    pid=ready_pid,
+                    created=False,
+                    attempt=int(getattr(current, "recovery_attempts", 0) or 0),
+                ),
+                expected=request,
+            )
+            return
+
+        with self._lock:
+            contenders = [
+                (candidate_id, candidate)
+                for candidate_id, candidate in self._inflight.items()
+                if candidate_id != session_id
+                and set(request.target_keys).intersection(candidate.target_keys)
+            ]
+            if any(not candidate.following_claim for _id, candidate in contenders):
+                return
+            follower_ids = [session_id, *(
+                candidate_id
+                for candidate_id, candidate in contenders
+                if candidate.following_claim
+            )]
+            if session_id != min(follower_ids):
+                return
+
+        held = self._foreign_claim(worker_store, request.target_keys)
+        if held is not None:
+            with self._lock:
+                if self._inflight.get(session_id) is request:
+                    request.followed_session_id = held.session_id
+                    request.followed_attempt = held.attempt
+            return
+        claim = self._mark_pending_in_store(
+            worker_store,
+            current,
+            request.target_keys,
+        )
+        if isinstance(claim, _ClaimHeld):
+            with self._lock:
+                if self._inflight.get(session_id) is request:
+                    request.followed_session_id = claim.session_id
+                    request.followed_attempt = claim.attempt
+            return
+        if claim is None:
+            self._complete_inflight(
+                session_id,
+                RecoveryResult(
+                    session_id=session_id,
+                    mode=request.mode,
+                    state="skipped",
+                    attempt=int(getattr(current, "recovery_attempts", 0) or 0),
+                    error="recovery became ineligible while following another owner",
+                ),
+                expected=request,
+            )
+            return
+        self._promote_claim_follower(
+            session_id,
+            request,
+            current,
+            claim,
+            worker_store,
+        )
+
+    def _followed_ready_pid(self, record) -> int | None:
+        state, state_pid, _detail = self._readiness_state(record)
+        if state == "ready" and state_pid is not None and int(state_pid) > 1:
+            return int(state_pid)
+        try:
+            pid = self._probe_ready(record)
+        except (OSError, TmuxError):
+            return None
+        if pid is None or not self._payload_ready(record, pid):
+            return None
+        return pid
+
+    def _foreign_claim(
+        self,
+        store,
+        target_keys: tuple[str, ...],
+    ) -> _ClaimHeld | None:
+        connection = getattr(store, "conn", None)
+        if connection is None or not target_keys:
+            return None
+        rows = connection.execute(
+            f"""
+            SELECT claims.session_id,
+                   claims.owner_id,
+                   claims.expires_at,
+                   sessions.recovery_attempts
+            FROM recovery_claims AS claims
+            LEFT JOIN sessions ON sessions.id = claims.session_id
+            WHERE claims.target_key IN ({", ".join("?" for _ in target_keys)})
+            """,
+            list(target_keys),
+        ).fetchall()
+        now = float(self.wall_clock())
+        held: list[_ClaimHeld] = []
+        for row in rows:
+            try:
+                expires_at = float(row["expires_at"])
+            except (TypeError, ValueError):
+                continue
+            owner_id = str(row["owner_id"])
+            if (
+                expires_at > now
+                and owner_id != self.owner_id
+                and self._claim_owner_alive(owner_id)
+            ):
+                held.append(
+                    _ClaimHeld(
+                        owner_id=owner_id,
+                        expires_at=expires_at,
+                        session_id=str(row["session_id"]),
+                        attempt=int(row["recovery_attempts"] or 0),
+                    )
+                )
+        return max(held, key=lambda item: item.expires_at) if held else None
+
+    def _promote_claim_follower(
+        self,
+        session_id: str,
+        request: _Request,
+        record,
+        claim: _Claim,
+        worker_store,
+    ) -> None:
+        error: Exception | None = None
+        with self._lock:
+            if self._closed or self._inflight.get(session_id) is not request:
+                error = _AdmissionUnavailable("recovery coordinator closed during claim handoff")
+            else:
+                request.record = record
+                request.attempt = claim.attempt
+                request.claim_token = claim.token
+                request.target_keys = claim.target_keys
+                request.following_claim = False
+                for key in claim.target_keys:
+                    self._inflight_keys.setdefault(key, session_id)
+                try:
+                    request.future = self._executor.submit(
+                        self._run,
+                        session_id,
+                        claim.attempt,
+                    )
+                except Exception as exc:
+                    error = exc
+        if error is None:
+            return
+        try:
+            self._persist_failure(
+                worker_store,
+                record,
+                claim.attempt,
+                str(error),
+                claim_token=claim.token,
+                target_keys=claim.target_keys,
+            )
+        except Exception:
+            pass
+        self._complete_inflight(
+            session_id,
+            RecoveryResult(
+                session_id=session_id,
+                mode=request.mode,
+                state="failed",
+                attempt=claim.attempt,
+                error=str(error),
+            ),
+            expected=request,
+        )
+
     def shutdown(self, *, wait: bool = False) -> None:
         with self._lock:
             self._closed = True
-        self._executor.shutdown(wait=wait, cancel_futures=not wait)
-        cancelled: list[_Request] = []
-        if not wait:
-            with self._lock:
-                for session_id, request in tuple(self._inflight.items()):
-                    future = request.future
-                    if future is None or not future.cancelled():
-                        continue
-                    self._inflight.pop(session_id, None)
-                    for key in request.target_keys:
-                        if self._inflight_keys.get(key) == session_id:
-                            self._inflight_keys.pop(key, None)
-                    cancelled.append(request)
-        for request in cancelled:
+            follower_thread = self._follower_thread
+            requests = tuple(self._inflight.items())
+            for _session_id, request in requests:
+                request.cancelled.set()
+        self._follower_wakeup.set()
+        cancelled: list[tuple[str, _Request]] = []
+        for session_id, request in requests:
+            future = request.future
+            if request.following_claim or future is None or future.cancel():
+                cancelled.append((session_id, request))
+        for session_id, request in cancelled:
             result = RecoveryResult(
                 session_id=str(getattr(request.record, "id", "")),
                 mode=request.mode,
@@ -428,19 +835,22 @@ class RecoveryCoordinator:
                 attempt=request.attempt,
                 error="recovery coordinator shut down before execution",
             )
-            for listener in request.listeners:
-                self._deliver(result, listener)
-            try:
-                self._persist_failure(
-                    self.store,
-                    request.record,
-                    request.attempt,
-                    result.error or "recovery coordinator shut down",
-                    claim_token=request.claim_token,
-                    target_keys=request.target_keys,
-                )
-            except Exception:
-                pass
+            if request.claim_token:
+                try:
+                    self._persist_failure(
+                        self.store,
+                        request.record,
+                        request.attempt,
+                        result.error,
+                        claim_token=request.claim_token,
+                        target_keys=request.target_keys,
+                    )
+                except Exception:
+                    pass
+            self._complete_inflight(session_id, result, expected=request)
+        self._executor.shutdown(wait=wait, cancel_futures=True)
+        if wait and follower_thread is not None and follower_thread is not threading.current_thread():
+            follower_thread.join(timeout=max(1.0, self.poll_interval * 4.0))
 
     close = shutdown
 
@@ -479,6 +889,173 @@ class RecoveryCoordinator:
         )
 
     @staticmethod
+    def _process_start_token(pid: int) -> str | None:
+        try:
+            payload = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return None
+        closing = payload.rfind(")")
+        if closing < 0:
+            return None
+        fields = payload[closing + 1 :].split()
+        return fields[19] if len(fields) > 19 else None
+
+    @staticmethod
+    def _boot_id() -> str | None:
+        try:
+            return Path("/proc/sys/kernel/random/boot_id").read_text(
+                encoding="utf-8"
+            ).strip() or None
+        except (OSError, UnicodeError):
+            return None
+
+    @classmethod
+    def _new_owner_id(cls) -> str:
+        pid = os.getpid()
+        start = cls._process_start_token(pid) or "unknown"
+        boot = cls._boot_id() or "unknown"
+        return f"{socket.gethostname()}:{pid}:{start}:{boot}:{uuid4().hex}"
+
+    @classmethod
+    def _claim_owner_alive(cls, owner_id: object) -> bool:
+        parts = str(owner_id or "").split(":")
+        if len(parts) not in {3, 5} or parts[0] != socket.gethostname():
+            return True
+        try:
+            pid = int(parts[1])
+        except (TypeError, ValueError):
+            return True
+        if pid <= 1:
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except (OSError, PermissionError):
+            return True
+        if len(parts) == 5:
+            expected_start, expected_boot = parts[2], parts[3]
+            observed_start = cls._process_start_token(pid)
+            observed_boot = cls._boot_id()
+            if (
+                expected_start != "unknown"
+                and observed_start is not None
+                and observed_start != expected_start
+            ):
+                return False
+            if (
+                expected_boot != "unknown"
+                and observed_boot is not None
+                and observed_boot != expected_boot
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _writer_lock_root(store) -> Path | None:
+        configured = str(
+            os.environ.get("TERMDECK_TMUX_RUNTIME", "")
+            or os.environ.get("TMUX_TMPDIR", "")
+        ).strip()
+        if configured:
+            root = Path(configured).expanduser()
+            if not root.is_absolute():
+                raise _AdmissionUnavailable(
+                    "tmux recovery writer lock root must be absolute"
+                )
+            return Path(os.path.abspath(os.fspath(root))) / "recovery-writer-locks"
+        path = getattr(store, "path", None)
+        if path is None or Path(path) == Path(":memory:"):
+            return None
+        database = Path(path).expanduser()
+        if not database.is_absolute():
+            database = Path.cwd() / database
+        return Path(os.path.abspath(os.fspath(database))).parent / "recovery-writer-locks"
+
+    @contextmanager
+    def _writer_scope(self, store, request: _Request):
+        """Hold crash-released locks for only this request's target identities."""
+
+        root = self._writer_lock_root(store)
+        if root is None or not request.target_keys:
+            yield
+            return
+        try:
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            metadata = root.lstat()
+            if (
+                root.is_symlink()
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise _AdmissionUnavailable(
+                    "recovery writer lock root has unsafe ownership or mode"
+                )
+        except _AdmissionUnavailable:
+            raise
+        except OSError as exc:
+            raise _AdmissionUnavailable(
+                f"recovery writer lock root is unavailable: {exc}"
+            ) from exc
+
+        locks: list[int] = []
+        try:
+            for target_key in sorted(request.target_keys):
+                name = hashlib.sha256(
+                    target_key.encode("utf-8", "surrogatepass")
+                ).hexdigest()
+                path = root / f"{name}.lock"
+                descriptor = os.open(
+                    path,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                try:
+                    metadata = os.fstat(descriptor)
+                    path_metadata = path.stat(follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_uid != os.geteuid()
+                        or stat.S_IMODE(metadata.st_mode) != 0o600
+                        or metadata.st_nlink != 1
+                        or (metadata.st_dev, metadata.st_ino)
+                        != (path_metadata.st_dev, path_metadata.st_ino)
+                    ):
+                        raise _AdmissionUnavailable(
+                            "recovery writer lock has unsafe ownership or mode"
+                        )
+                    while True:
+                        self._raise_if_cancelled(request)
+                        try:
+                            fcntl.flock(
+                                descriptor,
+                                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                            )
+                            break
+                        except BlockingIOError:
+                            request.cancelled.wait(min(self.poll_interval, 0.05))
+                    locks.append(descriptor)
+                    descriptor = -1
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+            yield
+        finally:
+            for descriptor in reversed(locks):
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    @staticmethod
     def _target_key(kind: str, value: object) -> str | None:
         normalized = str(value or "").strip()
         if not normalized:
@@ -487,6 +1064,27 @@ class RecoveryCoordinator:
             f"{kind}\0{normalized}".encode("utf-8", "surrogatepass")
         ).hexdigest()
         return f"{kind}:{digest}"
+
+    @staticmethod
+    def _resume_uuid(command: object) -> str | None:
+        try:
+            tokens = shlex.split(str(command or "").strip())
+        except ValueError:
+            return None
+        for index, token in enumerate(tokens):
+            candidate: str | None = None
+            if token == "resume" and index + 1 < len(tokens):
+                candidate = tokens[index + 1]
+            elif token == "--resume" and index + 1 < len(tokens):
+                candidate = tokens[index + 1]
+            elif token.startswith("--resume="):
+                candidate = token.partition("=")[2]
+            if candidate:
+                try:
+                    return str(UUID(candidate))
+                except (AttributeError, TypeError, ValueError):
+                    return None
+        return None
 
     def _single_flight_keys(self, record) -> tuple[str, ...]:
         values: list[tuple[str, object]] = [("session", getattr(record, "id", ""))]
@@ -501,13 +1099,8 @@ class RecoveryCoordinator:
                 command = str(getattr(record, field, "") or "").strip()
                 if not command:
                     continue
-                try:
-                    tokens = shlex.split(command)
-                except ValueError:
-                    tokens = command.split()
-                lowered = {str(token).casefold() for token in tokens}
-                if "resume" in lowered or "--thread" in lowered:
-                    target = f"{auth_scope}\0{command}" if auth_scope else command
+                if resume_id := self._resume_uuid(command):
+                    target = f"{auth_scope}\0{resume_id}" if auth_scope else resume_id
                     values.append(("auth-resume" if auth_scope else "resume", target))
                     break
         keys = {
@@ -522,7 +1115,15 @@ class RecoveryCoordinator:
         record,
         target_keys: tuple[str, ...],
     ) -> _Claim | _ClaimHeld | None:
-        if self.store is None:
+        return self._mark_pending_in_store(self.store, record, target_keys)
+
+    def _mark_pending_in_store(
+        self,
+        store,
+        record,
+        target_keys: tuple[str, ...],
+    ) -> _Claim | _ClaimHeld | None:
+        if store is None:
             if not startup_recovery_allowed(record):
                 return None
             return _Claim(
@@ -530,10 +1131,10 @@ class RecoveryCoordinator:
                 token=uuid4().hex,
                 target_keys=target_keys,
             )
-        connection = self._begin_store_write(self.store)
+        connection = self._begin_store_write(store)
         try:
             self._claim_table(connection)
-            current = self.store.get(str(getattr(record, "id")))
+            current = store.get(str(getattr(record, "id")))
             if current is None or not startup_recovery_allowed(current):
                 self._rollback_store_write(connection)
                 return None
@@ -557,9 +1158,23 @@ class RecoveryCoordinator:
                     str(existing["owner_id"]) == self.owner_id
                     and str(existing["session_id"]) == str(getattr(record, "id"))
                 )
-                if expires_at > now and not same_owner:
+                owner_id = str(existing["owner_id"])
+                if (
+                    expires_at > now
+                    and not same_owner
+                    and self._claim_owner_alive(owner_id)
+                ):
+                    held_session_id = str(existing["session_id"])
+                    held_record = store.get(held_session_id)
                     self._rollback_store_write(connection)
-                    return _ClaimHeld(str(existing["owner_id"]), expires_at)
+                    return _ClaimHeld(
+                        owner_id=owner_id,
+                        expires_at=expires_at,
+                        session_id=held_session_id,
+                        attempt=int(
+                            getattr(held_record, "recovery_attempts", 0) or 0
+                        ),
+                    )
             attempt = int(getattr(current, "recovery_attempts", 0) or 0) + 1
             token = uuid4().hex
             expires_at = now + self.claim_ttl
@@ -643,6 +1258,107 @@ class RecoveryCoordinator:
             except Exception:
                 pass
 
+    @staticmethod
+    def _raise_if_cancelled(request: _Request) -> None:
+        if request.claim_lost.is_set():
+            raise _AdmissionUnavailable("recovery claim was lost during execution")
+        if request.cancelled.is_set():
+            raise _AdmissionUnavailable(
+                "recovery coordinator shut down before completion"
+            )
+
+    def _claim_database_path(self) -> Path | None:
+        path = getattr(self.store, "path", None)
+        if path is None or str(path) == ":memory:":
+            return None
+        database = Path(path).expanduser()
+        if not database.is_absolute():
+            database = Path.cwd() / database
+        return Path(os.path.abspath(os.fspath(database)))
+
+    def _heartbeat_claim_once(self, request: _Request) -> None:
+        database = self._claim_database_path()
+        if database is None or not request.claim_token:
+            return
+        connection = sqlite3.connect(
+            database,
+            timeout=max(0.1, min(5.0, self.claim_ttl / 4.0)),
+        )
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            placeholders = ", ".join("?" for _ in request.target_keys)
+            expires_at = float(self.wall_clock()) + self.claim_ttl
+            updated = connection.execute(
+                f"""
+                UPDATE recovery_claims
+                SET expires_at = ?
+                WHERE owner_id = ?
+                  AND claim_token = ?
+                  AND session_id = ?
+                  AND target_key IN ({placeholders})
+                """,
+                [
+                    expires_at,
+                    self.owner_id,
+                    request.claim_token,
+                    str(getattr(request.record, "id")),
+                    *request.target_keys,
+                ],
+            )
+            if updated.rowcount != len(request.target_keys):
+                connection.rollback()
+                raise _AdmissionUnavailable("recovery claim was lost")
+            connection.commit()
+            request.next_claim_renewal = self.clock() + max(
+                0.1,
+                self.claim_ttl / 3.0,
+            )
+        except Exception:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            connection.close()
+
+    def _start_claim_heartbeat(
+        self,
+        request: _Request,
+        stop: threading.Event,
+    ) -> threading.Thread | None:
+        if self._claim_database_path() is None or not request.claim_token:
+            return None
+        interval = max(0.1, self.claim_ttl / 3.0)
+
+        def heartbeat() -> None:
+            while not stop.wait(interval):
+                if request.cancelled.is_set():
+                    return
+                try:
+                    self._heartbeat_claim_once(request)
+                except Exception:
+                    request.claim_lost.set()
+                    request.cancelled.set()
+                    return
+
+        thread = threading.Thread(
+            target=heartbeat,
+            name="termdeck-recovery-claim-heartbeat",
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _stop_claim_heartbeat(
+        self,
+        stop: threading.Event,
+        thread: threading.Thread | None,
+    ) -> None:
+        stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(1.0, min(6.0, self.claim_ttl / 3.0 + 1.0)))
+
     def _run(self, session_id: str, attempt: int) -> None:
         with self._lock:
             request = self._inflight.get(session_id)
@@ -652,59 +1368,79 @@ class RecoveryCoordinator:
         worker_store = None
         owned_store = False
         current = record
+        heartbeat_stop = threading.Event()
+        heartbeat_thread: threading.Thread | None = None
         try:
             worker_store, owned_store = self._worker_store()
             if self.store is not None and worker_store is None:
                 raise _AdmissionUnavailable("worker session store could not be opened")
-            current = self._read_record_from(worker_store, record)
-            if current is None or not startup_recovery_allowed(current):
-                self._release_claim(worker_store, request)
-                result = RecoveryResult(
-                    session_id=session_id,
-                    mode=request.mode,
-                    state="skipped",
-                    attempt=attempt,
-                    error="recovery was made inactive before execution",
-                )
-            else:
+            self._raise_if_cancelled(request)
+            self._renew_claim(worker_store, current, request, force=True)
+            heartbeat_thread = self._start_claim_heartbeat(request, heartbeat_stop)
+            with self._writer_scope(worker_store or self.store, request):
+                self._raise_if_cancelled(request)
                 self._renew_claim(worker_store, current, request, force=True)
-                current = self._maybe_rebind_auth_scope(current, request, worker_store)
-                pid, created, outcome = self._recover_target(
-                    current,
-                    request,
-                    worker_store,
-                )
-                claimed, current = self._persist_ready_if_eligible(
-                    worker_store,
-                    current,
-                    pid,
-                    claim_token=request.claim_token,
-                    target_keys=request.target_keys,
-                )
-                if not claimed:
+                current = self._read_record_from(worker_store, record)
+                if current is None or not startup_recovery_allowed(current):
+                    self._stop_claim_heartbeat(heartbeat_stop, heartbeat_thread)
+                    heartbeat_thread = None
+                    self._release_claim(worker_store, request)
                     result = RecoveryResult(
                         session_id=session_id,
                         mode=request.mode,
                         state="skipped",
                         attempt=attempt,
-                        error="recovery was made inactive before completion",
+                        error="recovery was made inactive before execution",
                     )
                 else:
-                    result = RecoveryResult(
-                        session_id=session_id,
-                        mode=request.mode,
-                        state="ready",
-                        pid=pid,
-                        created=created,
-                        attempt=attempt,
-                        action=getattr(outcome, "action", None),
-                        command=getattr(outcome, "command", None),
-                        cwd=getattr(outcome, "cwd", None),
-                        clear_recovery=bool(
-                            getattr(outcome, "clear_recovery", False)
-                        ),
+                    current = self._maybe_rebind_auth_scope(
+                        current,
+                        request,
+                        worker_store,
                     )
+                    pid, created, outcome = self._recover_target(
+                        current,
+                        request,
+                        worker_store,
+                    )
+                    self._stop_claim_heartbeat(heartbeat_stop, heartbeat_thread)
+                    heartbeat_thread = None
+                    self._raise_if_cancelled(request)
+                    self._renew_claim(worker_store, current, request, force=True)
+                    claimed, current = self._persist_ready_if_eligible(
+                        worker_store,
+                        current,
+                        pid,
+                        outcome=outcome,
+                        claim_token=request.claim_token,
+                        target_keys=request.target_keys,
+                    )
+                    if not claimed:
+                        result = RecoveryResult(
+                            session_id=session_id,
+                            mode=request.mode,
+                            state="skipped",
+                            attempt=attempt,
+                            error="recovery was made inactive before completion",
+                        )
+                    else:
+                        result = RecoveryResult(
+                            session_id=session_id,
+                            mode=request.mode,
+                            state="ready",
+                            pid=pid,
+                            created=created,
+                            attempt=attempt,
+                            action=getattr(outcome, "action", None),
+                            command=getattr(outcome, "command", None),
+                            cwd=getattr(outcome, "cwd", None),
+                            clear_recovery=bool(
+                                getattr(outcome, "clear_recovery", False)
+                            ),
+                        )
         except Exception as exc:
+            self._stop_claim_heartbeat(heartbeat_stop, heartbeat_thread)
+            heartbeat_thread = None
             error = str(exc) or exc.__class__.__name__
             try:
                 self._persist_failure(
@@ -725,6 +1461,7 @@ class RecoveryCoordinator:
                 error=error,
             )
         finally:
+            self._stop_claim_heartbeat(heartbeat_stop, heartbeat_thread)
             self._close_store(worker_store, owned_store)
         with self._lock:
             completed = self._inflight.pop(session_id, None)
@@ -746,6 +1483,8 @@ class RecoveryCoordinator:
     def _auth_scope_rebind_proof(
         self,
         record,
+        *,
+        quiescence_observation: object = _NO_QUIESCENCE_OBSERVATION,
     ) -> tuple[bool, AuthScopeRebindProof]:
         """Collect independent missing/dead/quiescent evidence for rebinding."""
 
@@ -768,37 +1507,110 @@ class RecoveryCoordinator:
             except (OSError, TmuxError):
                 dead = False
 
-        quiescent = False
-        for name in (
-            "auth_scope_quiescent",
-            "recovery_quiescent",
-            "quiescent_auth_scope",
-            "scope_quiescent",
-        ):
-            probe = getattr(self.backend, name, None)
-            if not callable(probe):
-                continue
-            try:
-                value = probe(record)
-            except (OSError, TmuxError):
-                continue
-            if isinstance(value, dict):
-                quiescent = value.get("quiescent") is True
-            else:
-                quiescent = value is True
-            break
-        if not quiescent:
-            auth_exists = getattr(self.backend, "_auth_session_exists", None)
-            if callable(auth_exists):
+        quiescent = self._reported_quiescent(quiescence_observation)
+        if quiescence_observation is _NO_QUIESCENCE_OBSERVATION:
+            for name in (
+                "auth_scope_writer_quiescent",
+                "rollout_lifecycle_quiescent",
+                "auth_scope_quiescent",
+                "recovery_quiescent",
+                "quiescent_auth_scope",
+                "scope_quiescent",
+            ):
+                probe = getattr(self.backend, name, None)
+                if not callable(probe):
+                    continue
                 try:
-                    quiescent = not bool(auth_exists(record))
+                    value = probe(record)
                 except (OSError, TmuxError):
-                    quiescent = False
+                    continue
+                quiescent = self._reported_quiescent(value)
+                break
         return True, AuthScopeRebindProof(
             missing=True,
             dead=dead,
             quiescent=quiescent,
         )
+
+    @staticmethod
+    def _reported_quiescent(value: object) -> bool:
+        if isinstance(value, dict):
+            return value.get("quiescent") is True
+        return value is True
+
+    @staticmethod
+    def _private_owned_directory(path: Path) -> bool:
+        try:
+            metadata = path.lstat()
+        except OSError:
+            return False
+        return (
+            not path.is_symlink()
+            and stat.S_ISDIR(metadata.st_mode)
+            and metadata.st_uid == os.geteuid()
+            and stat.S_IMODE(metadata.st_mode) == 0o700
+        )
+
+    def _record_uses_exact_managed_auth_scope(self, record, store) -> bool:
+        """Recognize only the exact private scope already owned by the store."""
+
+        if store is None:
+            return False
+        scope_id = str(getattr(record, "auth_scope_id", "") or "").strip()
+        raw_home = str(getattr(record, "codex_home", "") or "").strip()
+        raw_root = getattr(store, "auth_root", None)
+        if (
+            not scope_id.startswith("auth-")
+            or Path(scope_id).name != scope_id
+            or not raw_home
+            or raw_root is None
+        ):
+            return False
+        home = Path(raw_home).expanduser()
+        root = Path(raw_root).expanduser()
+        if not home.is_absolute() or not root.is_absolute():
+            return False
+        exact_home = Path(os.path.abspath(os.fspath(home)))
+        exact_root = Path(os.path.abspath(os.fspath(root)))
+        expected_home = exact_root / scope_id
+        return (
+            exact_home == expected_home
+            and self._private_owned_directory(exact_root)
+            and self._private_owned_directory(expected_home)
+        )
+
+    def _rebind_legacy_auth_scope(
+        self,
+        record,
+        request: _Request,
+        worker_store,
+        *,
+        quiescence_observation: object = _NO_QUIESCENCE_OBSERVATION,
+    ):
+        missing, proof = self._auth_scope_rebind_proof(
+            record,
+            quiescence_observation=quiescence_observation,
+        )
+        if not missing:
+            return record
+        rebind_store = worker_store or self.store
+        result = rebind_auth_scope(
+            record,
+            rebind_store,
+            proof=proof,
+            claim_token=request.claim_token,
+            claim_owner=self.owner_id,
+            claim_target_keys=request.target_keys,
+            expected_old_home=getattr(record, "codex_home", None),
+            canonical_home=getattr(rebind_store, "account_source", None),
+            auth_root=getattr(rebind_store, "auth_root", None),
+        )
+        if not result.ok:
+            raise TmuxError(f"Codex auth-scope rebind deferred: {result.detail}")
+        refreshed = self._read_record_from(worker_store, record)
+        if refreshed is None:
+            raise TmuxError("session disappeared after Codex auth-scope rebind")
+        return refreshed
 
     def _maybe_rebind_auth_scope(self, record, request: _Request, worker_store):
         """Move only an unbound exact Codex resume onto managed SSD state."""
@@ -809,25 +1621,23 @@ class RecoveryCoordinator:
             return record
         if not self._is_codex_recovery(record):
             return record
-        missing, proof = self._auth_scope_rebind_proof(record)
-        if not missing:
+        managed_stores = (worker_store, self.store)
+        if any(
+            candidate is not None
+            and self._record_uses_exact_managed_auth_scope(record, candidate)
+            for candidate in managed_stores
+        ):
             return record
-        result = rebind_auth_scope(
-            record,
-            worker_store or self.store,
-            proof=proof,
-            claim_token=request.claim_token,
-            claim_owner=self.owner_id,
-            claim_target_keys=request.target_keys,
-            expected_old_home=getattr(record, "codex_home", None),
-            now=float(self.wall_clock()),
-        )
-        if not result.ok:
-            raise TmuxError(f"Codex auth-scope rebind deferred: {result.detail}")
-        refreshed = self._read_record_from(worker_store, record)
-        if refreshed is None:
-            raise TmuxError("session disappeared after Codex auth-scope rebind")
-        return refreshed
+        quiescence = getattr(self.backend, "auth_scope_writer_quiescence", None)
+        if callable(quiescence):
+            with quiescence(record) as observation:
+                return self._rebind_legacy_auth_scope(
+                    record,
+                    request,
+                    worker_store,
+                    quiescence_observation=observation,
+                )
+        return self._rebind_legacy_auth_scope(record, request, worker_store)
 
     def _recover_target(
         self,
@@ -983,6 +1793,12 @@ class RecoveryCoordinator:
         seen_target = False
         last_detail = ""
         while True:
+            if request is not None:
+                self._raise_if_cancelled(request)
+            else:
+                with self._lock:
+                    if self._closed:
+                        raise TmuxError("recovery coordinator closed before readiness")
             self._renew_claim(worker_store, record, request)
             state, state_pid, state_detail = self._readiness_state(record)
             if state_detail:
@@ -1157,6 +1973,7 @@ class RecoveryCoordinator:
         record,
         pid: int,
         *,
+        outcome: object | None = None,
         claim_token: str | None = None,
         target_keys: tuple[str, ...] = (),
     ) -> tuple[bool, object | None]:
@@ -1202,29 +2019,73 @@ class RecoveryCoordinator:
             status = str(getattr(current, "status", "")).casefold()
             if status in {"missing", "recovery-pending", "start-error"}:
                 status = "running"
-            updated = connection.execute(
-                """
-                UPDATE sessions
-                SET status = ?,
-                    last_pid = ?,
-                    recovery_last_error = NULL,
-                    last_opened_at = ?
-                WHERE id = ?
-                """,
-                (
-                    status or "running",
-                    pid,
-                    utc_now(),
-                    str(getattr(record, "id")),
-                ),
-            )
+            clear_recovery = bool(getattr(outcome, "clear_recovery", False))
+            if clear_recovery:
+                command = str(getattr(outcome, "command", "") or "").strip()
+                cwd = str(getattr(outcome, "cwd", "") or "").strip()
+                if not command or not cwd:
+                    raise _AdmissionUnavailable(
+                        "shell bridge did not provide a durable command and directory"
+                    )
+                recipe, recipe_sha256, restart_policy = record_recipe_fields(
+                    command=command,
+                    cwd=cwd,
+                    restart_policy="on-failure",
+                    origin="launch",
+                )
+                updated = connection.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?,
+                        last_pid = ?,
+                        recovery_last_error = NULL,
+                        last_opened_at = ?,
+                        command = ?,
+                        cwd = ?,
+                        recovery_command = NULL,
+                        recovery_cwd = NULL,
+                        recovery_recipe = ?,
+                        recovery_recipe_sha256 = ?,
+                        restart_policy = ?,
+                        auth_restart_required = 0
+                    WHERE id = ?
+                    """,
+                    (
+                        status or "running",
+                        pid,
+                        utc_now(),
+                        command,
+                        cwd,
+                        recipe,
+                        recipe_sha256,
+                        restart_policy,
+                        str(getattr(record, "id")),
+                    ),
+                )
+            else:
+                updated = connection.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?,
+                        last_pid = ?,
+                        recovery_last_error = NULL,
+                        last_opened_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        status or "running",
+                        pid,
+                        utc_now(),
+                        str(getattr(record, "id")),
+                    ),
+                )
             if updated.rowcount != 1:
                 self._rollback_store_write(connection)
                 return False, current
             if claim_token:
                 self._delete_claims(connection, current, claim_token, target_keys)
             connection.commit()
-            return True, current
+            return True, store.get(str(getattr(record, "id")))
         except Exception:
             self._rollback_store_write(connection)
             raise

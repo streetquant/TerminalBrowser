@@ -337,12 +337,19 @@ def test_process_runner_drains_short_output_before_receipt_when_descendant_holds
     assert stdout_path.read_bytes() == captured
 
 
-def test_xvfb_environment_uses_short_private_runtime_and_cleans_after_task(
+def test_ci_xvfb_environment_uses_portable_private_runtime_and_cleans_after_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     work = tmp_path / ("deep-validation-work-" * 8)
     work.mkdir(parents=True)
+    portable_base = tmp_path / "portable-tmp"
+    portable_base.mkdir(mode=0o1777)
+    portable_base.chmod(0o1777)
+    monkeypatch.delenv(runner._TASK_RUNTIME_BASE_ENV, raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_BASE", portable_base)
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/host/bus")
 
@@ -350,6 +357,7 @@ def test_xvfb_environment_uses_short_private_runtime_and_cleans_after_task(
         REPO_ROOT,
         work,
         environment="xvfb-dbus",
+        profile="ci",
     )
 
     assert runtime is not None
@@ -359,6 +367,9 @@ def test_xvfb_environment_uses_short_private_runtime_and_cleans_after_task(
     assert len(os.fsencode(runtime.path)) <= runner._TASK_RUNTIME_MAX_PATH_BYTES
     assert stat.S_IMODE(runtime.path.stat().st_mode) == 0o700
     assert environment["XDG_RUNTIME_DIR"] == str(runtime.path)
+    assert environment["TMUX_TMPDIR"] == str(runtime.path)
+    assert environment[runner._TASK_RUNTIME_BASE_ENV] == str(runtime.path)
+    assert environment[runner._TASK_RUNTIME_POLICY_ENV] == "ci"
     assert "DBUS_SESSION_BUS_ADDRESS" not in environment
     for key in ("TMPDIR", "XDG_CACHE_HOME", "PYTHONPYCACHEPREFIX"):
         path = Path(environment[key])
@@ -395,6 +406,210 @@ def test_xvfb_environment_uses_short_private_runtime_and_cleans_after_task(
     assert not runtime.path.exists()
 
 
+def test_validation_child_environment_excludes_ambient_secrets_and_shell_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = {
+        "OPENAI_API_KEY": "synthetic-openai-secret",
+        "GITHUB_TOKEN": "synthetic-github-secret",
+        "AWS_SECRET_ACCESS_KEY": "synthetic-aws-secret",
+        "TERMDECK_AUTH_COOKIE": "synthetic-auth-cookie",
+        "SSH_AUTH_SOCK": "/synthetic/private-agent.sock",
+        "BASH_ENV": "/synthetic/bash-env",
+        "ENV": "/synthetic/sh-env",
+        "LD_PRELOAD": "/synthetic/preload.so",
+    }
+    for key, value in secrets.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("T1000_EXPECTED_SITE", "/synthetic/expected-site")
+
+    runtime_base = tmp_path / "runtime-base"
+    runtime_base.mkdir(mode=0o700)
+    runtime_base.chmod(0o700)
+    monkeypatch.setenv(runner._TASK_RUNTIME_BASE_ENV, str(runtime_base))
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
+    work = tmp_path / "work"
+    work.mkdir()
+    environment, runtime = runner._task_environment(
+        REPO_ROOT,
+        work,
+        environment="isolated",
+    )
+
+    assert runtime is not None
+    assert environment["T1000_EXPECTED_SITE"] == "/synthetic/expected-site"
+    assert not set(secrets).intersection(environment)
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+    task = runner.run_process(
+        task_id="sanitized-environment",
+        kind="test",
+        relative="sanitized-environment",
+        argv=[
+            sys.executable,
+            "-P",
+            "-B",
+            "-c",
+            "import json,os;print(json.dumps(dict(os.environ),sort_keys=True))",
+        ],
+        cwd=work,
+        env={**environment, **secrets},
+        output_root=output,
+        timeout_seconds=5,
+        grace_seconds=1,
+        stdout_limit=16 * 1024,
+        stderr_limit=4096,
+        cleanup_runtime=runtime,
+    )
+
+    assert task["ok"] is True, task
+    assert task["runtime"]["cleanup_ok"] is True
+    stdout = (output / task["stdout"]["path"]).read_text(encoding="utf-8")
+    stderr = (output / task["stderr"]["path"]).read_text(encoding="utf-8")
+    child_environment = json.loads(stdout)
+    assert not set(secrets).intersection(child_environment)
+    encoded_evidence = stdout + stderr + json.dumps(task, sort_keys=True)
+    for key, value in secrets.items():
+        assert key not in encoded_evidence
+        assert value not in encoded_evidence
+
+
+def test_inventory_and_tool_probe_children_use_the_closed_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "synthetic-tool-probe-secret")
+    monkeypatch.setenv("BASH_ENV", "/synthetic/tool-probe-shell-hook")
+    observed: list[dict[str, str]] = []
+
+    def completed(argv, **kwargs):
+        observed.append(dict(kwargs["env"]))
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(runner.subprocess, "run", completed)
+
+    assert runner._git_source_paths(tmp_path) == []
+    result = runner._tool_output([sys.executable, "--version"], cwd=tmp_path)
+
+    assert result["available"] is True
+    assert len(observed) == 2
+    for environment in observed:
+        assert "GITHUB_TOKEN" not in environment
+        assert "BASH_ENV" not in environment
+        assert environment["PATH"]
+
+
+def test_normal_validation_tmux_argv_emits_no_debug_logs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmux = runner.shutil.which("tmux")
+    if tmux is None:
+        pytest.skip("tmux is unavailable")
+    with runner.tempfile.TemporaryDirectory(prefix="tv-", dir="/tmp") as raw_base:
+        runtime_base = Path(raw_base)
+        runtime_base.chmod(0o700)
+        monkeypatch.setenv(runner._TASK_RUNTIME_BASE_ENV, str(runtime_base))
+        work = tmp_path / ("deep-validation-shard-" * 8)
+        work.mkdir()
+        assert len(os.fsencode(work / "tmp")) >= 121
+
+        environment, runtime = runner._task_environment(
+            REPO_ROOT,
+            work,
+            environment="isolated",
+        )
+        assert runtime is not None
+        assert environment["TMUX_TMPDIR"] == str(runtime.path)
+        assert len(os.fsencode(runtime.path)) <= runner._TASK_RUNTIME_MAX_PATH_BYTES
+        socket = "validation-no-debug"
+        command = (
+            "import subprocess;"
+            f"tmux={tmux!r};socket={socket!r};"
+            "subprocess.run([tmux,'-L',socket,'new-session','-d','/bin/sh','-c','exit 0'],check=True);"
+            "subprocess.run([tmux,'-L',socket,'kill-server'],check=False);"
+            "print('1 passed')"
+        )
+        output = tmp_path / "output"
+        output.mkdir(mode=0o700)
+        task = runner.run_process(
+            task_id="tmux-no-debug",
+            kind="test",
+            relative="tmux-no-debug",
+            argv=[sys.executable, "-P", "-B", "-c", command],
+            cwd=work,
+            env=environment,
+            output_root=output,
+            timeout_seconds=10,
+            grace_seconds=1,
+            stdout_limit=4096,
+            stderr_limit=4096,
+            cleanup_runtime=runtime,
+        )
+
+        assert task["ok"] is True, task
+        assert task["runtime"]["cleanup_ok"] is True
+        assert not runtime.path.exists()
+        assert not list(work.glob("tmux-client-*.log"))
+        assert not list(work.glob("tmux-server-*.log"))
+        assert not list(work.glob("tmux-out-*.log"))
+
+
+def test_xvfb_smoke_argv_uses_glx_safe_server_with_private_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "short-runtime-base"
+    base.mkdir(mode=0o700)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.setenv(runner._TASK_RUNTIME_BASE_ENV, str(base))
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/host/bus")
+    executables = {
+        "xvfb-run": "/usr/bin/xvfb-run",
+        "dbus-run-session": "/usr/bin/dbus-run-session",
+    }
+    monkeypatch.setattr(runner.shutil, "which", executables.__getitem__)
+
+    environment, runtime = runner._task_environment(
+        tmp_path,
+        work,
+        environment="xvfb-dbus",
+        profile="ci",
+    )
+    assert runtime is not None
+    try:
+        assert runner._build_smoke_argv(
+            {"environment": "xvfb-dbus", "path": "scripts/check_demo_smoke.py"},
+            python="/usr/bin/python3.14",
+            root=tmp_path,
+        ) == [
+            "/usr/bin/xvfb-run",
+            "-a",
+            "-s",
+            "-screen 0 1280x1024x24 -extension GLX",
+            "/usr/bin/dbus-run-session",
+            "--",
+            "/usr/bin/python3.14",
+            "-P",
+            "-B",
+            str(tmp_path / "scripts/check_demo_smoke.py"),
+        ]
+        assert environment["XDG_RUNTIME_DIR"] == str(runtime.path)
+        assert environment["TMUX_TMPDIR"] == str(runtime.path)
+        assert environment[runner._TASK_RUNTIME_BASE_ENV] == str(runtime.path)
+        assert environment[runner._TASK_RUNTIME_POLICY_ENV] == "ci"
+        assert environment["TMPDIR"] == str(runtime.path / "t")
+        assert environment["XDG_CACHE_HOME"] == str(runtime.path / "c")
+        assert environment["PYTHONPYCACHEPREFIX"] == str(runtime.path / "p")
+        assert "DBUS_SESSION_BUS_ADDRESS" not in environment
+    finally:
+        assert runner._cleanup_task_runtime(runtime)["cleanup_ok"] is True
+
+
 def test_short_runtime_uses_validated_absolute_configured_base(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -425,6 +640,187 @@ def test_short_runtime_rejects_relative_configured_base(
         runner._create_short_task_runtime(Path.cwd())
 
 
+def test_portable_runtime_prefers_trusted_xdg_runtime_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    xdg_runtime = tmp_path / "xdg-runtime"
+    xdg_runtime.mkdir(mode=0o700)
+    xdg_runtime.chmod(0o700)
+    monkeypatch.delenv(runner._TASK_RUNTIME_BASE_ENV, raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg_runtime))
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
+
+    base = runner._configured_task_runtime_base()
+
+    assert base == xdg_runtime / runner._TASK_RUNTIME_PORTABLE_NAME
+    assert base.parent == xdg_runtime
+    assert base.stat().st_uid == os.geteuid()
+    assert stat.S_IMODE(base.stat().st_mode) == 0o700
+
+
+def test_portable_runtime_fallback_is_stable_private_per_user_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback_parent = tmp_path / "tmp"
+    fallback_parent.mkdir(mode=0o1777)
+    fallback_parent.chmod(0o1777)
+    monkeypatch.delenv(runner._TASK_RUNTIME_BASE_ENV, raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_BASE", fallback_parent)
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
+
+    first = runner._configured_task_runtime_base()
+    second = runner._configured_task_runtime_base()
+
+    assert first == second == fallback_parent / f"t1000-validation-{os.geteuid()}"
+    assert first.stat().st_uid == os.geteuid()
+    assert stat.S_IMODE(first.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "mode"))
+def test_portable_runtime_rejects_unsafe_existing_fallback_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_kind: str,
+) -> None:
+    fallback_parent = tmp_path / "tmp"
+    fallback_parent.mkdir(mode=0o1777)
+    fallback_parent.chmod(0o1777)
+    candidate = fallback_parent / f"t1000-validation-{os.geteuid()}"
+    if unsafe_kind == "symlink":
+        target = tmp_path / "target"
+        target.mkdir(mode=0o700)
+        target.chmod(0o700)
+        candidate.symlink_to(target, target_is_directory=True)
+    else:
+        candidate.mkdir(mode=0o755)
+        candidate.chmod(0o755)
+    monkeypatch.delenv(runner._TASK_RUNTIME_BASE_ENV, raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_BASE", fallback_parent)
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
+
+    with pytest.raises(
+        runner.ValidationError,
+        match="portable validation runtime base is not a private 0700 directory",
+    ):
+        runner._configured_task_runtime_base()
+
+
+def test_portable_runtime_rejects_foreign_owned_fallback_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback_parent = tmp_path / "tmp"
+    fallback_parent.mkdir(mode=0o1777)
+    fallback_parent.chmod(0o1777)
+    foreign_uid = os.geteuid() + 1
+    candidate = fallback_parent / f"t1000-validation-{foreign_uid}"
+    candidate.mkdir(mode=0o700)
+    candidate.chmod(0o700)
+    monkeypatch.delenv(runner._TASK_RUNTIME_BASE_ENV, raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_BASE", fallback_parent)
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
+    monkeypatch.setattr(runner.os, "geteuid", lambda: foreign_uid)
+
+    with pytest.raises(
+        runner.ValidationError,
+        match="portable validation runtime base is not a private 0700 directory",
+    ):
+        runner._configured_task_runtime_base()
+
+
+def test_production_xvfb_environment_fails_closed_without_private_ssd_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delenv(runner._TASK_RUNTIME_BASE_ENV, raising=False)
+
+    with pytest.raises(
+        runner.ValidationError,
+        match="T1000_VALIDATION_RUNTIME_BASE is required for production smokes",
+    ):
+        runner._task_environment(
+            REPO_ROOT,
+            work,
+            environment="xvfb-dbus",
+            profile="production",
+        )
+
+    base = tmp_path / "production-runtime-base"
+    base.mkdir(mode=0o1777)
+    base.chmod(0o1777)
+    monkeypatch.setenv(runner._TASK_RUNTIME_BASE_ENV, str(base))
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
+
+    with pytest.raises(
+        runner.ValidationError,
+        match="is not a private 0700 directory",
+    ):
+        runner._task_environment(
+            REPO_ROOT,
+            work,
+            environment="xvfb-dbus",
+            profile="production",
+        )
+
+    base.chmod(0o700)
+    import termdeck.storage_fabric as storage_fabric
+
+    def reject_storage(**_kwargs: object) -> None:
+        raise RuntimeError("rotational backing device")
+
+    monkeypatch.setattr(storage_fabric, "require_hot_storage", reject_storage)
+
+    with pytest.raises(
+        runner.ValidationError,
+        match="not verified Warp Drives SSD storage",
+    ):
+        runner._task_environment(
+            REPO_ROOT,
+            work,
+            environment="xvfb-dbus",
+            profile="production",
+        )
+    assert not list(base.iterdir())
+
+
+def test_production_runtime_attestation_overrides_unrelated_default_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "production-runtime-base"
+    base.mkdir(mode=0o700)
+    base.chmod(0o700)
+    monkeypatch.setenv(runner._TASK_RUNTIME_BASE_ENV, str(base))
+    import termdeck.storage_fabric as storage_fabric
+
+    observed: dict[str, object] = {}
+
+    def accept_storage(**kwargs: object) -> None:
+        observed.update(kwargs)
+
+    monkeypatch.setattr(storage_fabric, "require_hot_storage", accept_storage)
+
+    assert runner._production_task_runtime_base() == base
+    assert observed == {
+        "hot_paths": {
+            "auth_root": base,
+            "checkpoint_root": base,
+            "database_root": base,
+            "runtime_root": base,
+            "tmux_runtime": base,
+        },
+        "managed_root": base,
+        "production": True,
+    }
+
+
 def test_production_host_environment_preserves_runtime_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -433,6 +829,11 @@ def test_production_host_environment_preserves_runtime_authority(
     monkeypatch.setenv("TMPDIR", "/authoritative/tmp")
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/authoritative/runtime")
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/authoritative/bus")
+    monkeypatch.setenv("T1000_MANAGED_ROOT", "/authoritative/managed-root")
+    monkeypatch.setenv("T1000_MANAGED_BIN_DIR", "/authoritative/bin")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-production-inventory")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/authoritative/private-agent.sock")
+    monkeypatch.setenv("TMUX", "/authoritative/tmux,1,0")
 
     environment, runtime = runner._task_environment(
         REPO_ROOT,
@@ -445,17 +846,29 @@ def test_production_host_environment_preserves_runtime_authority(
     assert environment["TMPDIR"] == "/authoritative/tmp"
     assert environment["XDG_RUNTIME_DIR"] == "/authoritative/runtime"
     assert environment["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/authoritative/bus"
+    assert environment["T1000_MANAGED_ROOT"] == "/authoritative/managed-root"
+    assert environment["T1000_MANAGED_BIN_DIR"] == "/authoritative/bin"
+    assert "OPENAI_API_KEY" not in environment
+    assert "SSH_AUTH_SOCK" not in environment
+    assert "TMUX" not in environment
 
 
 def test_changed_short_runtime_identity_fails_task_and_is_not_removed(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     work = tmp_path / "work"
     work.mkdir()
+    base = tmp_path / "short-runtime-base"
+    base.mkdir(mode=0o700)
+    base.chmod(0o700)
+    monkeypatch.setenv(runner._TASK_RUNTIME_BASE_ENV, str(base))
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
     environment, runtime = runner._task_environment(
         REPO_ROOT,
         work,
         environment="xvfb-dbus",
+        profile="ci",
     )
     assert runtime is not None
     output = tmp_path / "output"
@@ -500,8 +913,7 @@ def test_short_runtime_has_owner_lease_and_bounded_dead_owner_recovery(
     base.mkdir(mode=0o700)
     work = tmp_path / "work"
     work.mkdir()
-    monkeypatch.delenv(runner._TASK_RUNTIME_BASE_ENV, raising=False)
-    monkeypatch.setattr(runner, "_TASK_RUNTIME_BASE", base)
+    monkeypatch.setenv(runner._TASK_RUNTIME_BASE_ENV, str(base))
     monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
 
     runtime = runner._create_short_task_runtime(work)
@@ -524,16 +936,98 @@ def test_short_runtime_has_owner_lease_and_bounded_dead_owner_recovery(
     assert not runtime.path.exists()
 
 
-def test_short_runtime_reaper_consumes_only_total_entry_and_removal_budgets(
+def test_short_runtime_reaper_bounds_raw_scans_and_advances_past_unrelated_entries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base = tmp_path / "short-runtime-base"
     base.mkdir(mode=0o700)
-    monkeypatch.setattr(runner, "_TASK_RUNTIME_BASE", base)
     monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
-    for index in range(12):
+    for index in range(runner._TASK_RUNTIME_MAX_SCAN_ENTRIES + 32):
         (base / f"unrelated-{index:02d}").mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    runtime = runner._create_short_task_runtime(work, base=base)
+    monkeypatch.setattr(runner, "_runtime_owner_alive", lambda _lease: False)
+
+    receipts = []
+    for _attempt in range(80):
+        observed = runner._reap_stale_task_runtimes(
+            base=base,
+            max_entries=5,
+            max_removals=1,
+        )
+        receipts.append(observed)
+        assert observed["scanned_entries"] <= 5
+        if not runtime.path.exists():
+            break
+
+    assert sum(int(receipt["removed"]) for receipt in receipts) == 1
+    assert not runtime.path.exists()
+
+
+def test_short_runtime_reaper_fairly_removes_owned_malformed_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "short-runtime-base"
+    base.mkdir(mode=0o700)
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
+    malformed = []
+    for index in range(9):
+        candidate = base / f"t1v-deadbeef-{index:08x}"
+        candidate.mkdir(mode=0o700)
+        candidate.chmod(0o700)
+        malformed.append(candidate)
+    symlink = base / "t1v-feedface-deadbeef"
+    symlink.symlink_to(tmp_path, target_is_directory=True)
+    malformed.append(symlink)
+    quarantine = base / f"t1v-q-{'a' * 32}"
+    quarantine.write_text("malformed quarantine residue\n", encoding="utf-8")
+    malformed.append(quarantine)
+    work = tmp_path / "work"
+    work.mkdir()
+    runtime = runner._create_short_task_runtime(work, base=base)
+    monkeypatch.setattr(runner, "_runtime_owner_alive", lambda _lease: False)
+
+    receipts = []
+    for _attempt in range(20):
+        observed = runner._reap_stale_task_runtimes(
+            base=base,
+            max_entries=3,
+            max_removals=2,
+        )
+        receipts.append(observed)
+        assert observed["scanned_entries"] <= 3
+        assert observed["removed"] <= 2
+        if not runtime.path.exists() and not any(path.exists() or path.is_symlink() for path in malformed):
+            break
+
+    assert len(receipts) > 1
+    assert any(receipt["cursor_continued"] is True for receipt in receipts[1:])
+    assert sum(int(receipt["removed_malformed"]) for receipt in receipts) == len(
+        malformed
+    )
+    assert not runtime.path.exists()
+    assert not any(
+        path.exists() or path.is_symlink()
+        for path in malformed
+    )
+
+
+def test_short_runtime_reaper_bounds_candidates_and_removals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "short-runtime-base"
+    base.mkdir(mode=0o700)
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
+    runtimes = []
+    for index in range(6):
+        work = tmp_path / f"work-{index}"
+        work.mkdir()
+        runtimes.append(runner._create_short_task_runtime(work, base=base))
+    monkeypatch.setattr(runner, "_runtime_owner_alive", lambda _lease: False)
 
     observed = runner._reap_stale_task_runtimes(
         base=base,
@@ -541,9 +1035,11 @@ def test_short_runtime_reaper_consumes_only_total_entry_and_removal_budgets(
         max_removals=2,
     )
 
-    assert observed["inspected_entries"] <= 5
-    assert observed["removed"] <= 2
+    assert observed["inspected_entries"] == 5
+    assert observed["removed"] == 2
     assert observed["entry_bound_reached"] is True
+    assert observed["removal_bound_reached"] is True
+    assert sum(runtime.path.exists() for runtime in runtimes) == 4
 
 
 def test_source_fingerprint_is_deterministic_and_excludes_output(tmp_path: Path) -> None:
@@ -571,12 +1067,138 @@ def test_atomic_receipt_is_canonical_private_and_replaceable(tmp_path: Path) -> 
     assert json.loads(receipt.read_text()) == {"ok": False}
 
 
+def test_manifest_check_does_not_create_or_reap_runtime_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _fixture_repo(tmp_path, smoke_source="print('{\"ok\":true}')\n")
+    output = tmp_path / "result"
+    fallback_parent = tmp_path / "tmp"
+    fallback_parent.mkdir(mode=0o1777)
+    fallback_parent.chmod(0o1777)
+    monkeypatch.delenv(runner._TASK_RUNTIME_BASE_ENV, raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_BASE", fallback_parent)
+
+    def unexpected_reap(**_kwargs: object) -> dict[str, object]:
+        raise AssertionError("manifest checks must not reap runtime state")
+
+    monkeypatch.setattr(runner, "_reap_stale_task_runtimes", unexpected_reap)
+    args = argparse.Namespace(
+        root=str(root),
+        manifest="scripts/validation_manifest.json",
+        profile="ci",
+        output=str(output),
+        python=sys.executable,
+        tests_only=False,
+        smokes_only=False,
+        check_manifest=True,
+    )
+
+    code, receipt = runner.run_validation(args)
+
+    assert code == 0
+    assert receipt["ok"] is True
+    assert "runtime_preflight" not in receipt
+    assert not (fallback_parent / f"t1000-validation-{os.geteuid()}").exists()
+
+
+def test_ci_smokes_only_runs_without_configured_runtime_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke_source = """import json, os, stat
+from pathlib import Path
+runtime = Path(os.environ['T1000_VALIDATION_RUNTIME_BASE'])
+temporary = Path(os.environ['TMPDIR'])
+assert os.environ['T1000_VALIDATION_RUNTIME_POLICY'] == 'ci'
+assert runtime == Path(os.environ['TMUX_TMPDIR'])
+assert runtime in temporary.parents
+assert stat.S_IMODE(runtime.stat().st_mode) == 0o700
+print(json.dumps({'ok': True}))
+"""
+    root = _fixture_repo(tmp_path, smoke_source=smoke_source)
+    output = tmp_path / "result"
+    portable_base = tmp_path / "portable-tmp"
+    portable_base.mkdir(mode=0o1777)
+    portable_base.chmod(0o1777)
+    monkeypatch.delenv(runner._TASK_RUNTIME_BASE_ENV, raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_BASE", portable_base)
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
+    monkeypatch.setattr(
+        runner,
+        "_build_smoke_argv",
+        lambda entry, *, python, root: [python, "-P", "-B", str(root / entry["path"])],
+    )
+    monkeypatch.setattr(runner, "tool_versions", lambda root, python: {})
+    args = argparse.Namespace(
+        root=str(root),
+        manifest="scripts/validation_manifest.json",
+        profile="ci",
+        output=str(output),
+        python=sys.executable,
+        tests_only=False,
+        smokes_only=True,
+        check_manifest=False,
+    )
+
+    code, receipt = runner.run_validation(args)
+
+    assert code == 0
+    assert receipt["ok"] is True
+    assert receipt["completed"] is True
+    task = receipt["tasks"][0]
+    assert task["summary"] == {"ok": True, "skipped": False}
+    runtime_path = Path(task["runtime"]["path"])
+    assert runtime_path.parent == (
+        portable_base / f"t1000-validation-{os.geteuid()}"
+    ).resolve(strict=True)
+    assert task["runtime"]["cleanup_ok"] is True
+    assert not runtime_path.exists()
+
+
+def test_production_smokes_only_fails_before_task_without_runtime_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _fixture_repo(tmp_path, smoke_source="print('{\"ok\":true}')\n")
+    output = tmp_path / "result"
+    monkeypatch.delenv(runner._TASK_RUNTIME_BASE_ENV, raising=False)
+    monkeypatch.setattr(runner, "tool_versions", lambda root, python: {})
+    args = argparse.Namespace(
+        root=str(root),
+        manifest="scripts/validation_manifest.json",
+        profile="production",
+        output=str(output),
+        python=sys.executable,
+        tests_only=False,
+        smokes_only=True,
+        check_manifest=False,
+    )
+
+    code, receipt = runner.run_validation(args)
+
+    assert code == 1
+    assert receipt["ok"] is False
+    assert receipt["completed"] is False
+    assert receipt["tasks"] == []
+    assert "T1000_VALIDATION_RUNTIME_BASE is required for production smokes" in receipt[
+        "failures"
+    ][0]["reason"]
+
+
 def test_runner_writes_durable_failure_receipt_for_malformed_smoke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = _fixture_repo(tmp_path)
     output = tmp_path / "result"
+    runtime_base = tmp_path / "short-runtime-base"
+    runtime_base.mkdir(mode=0o700)
+    runtime_base.chmod(0o700)
+    monkeypatch.setenv(runner._TASK_RUNTIME_BASE_ENV, str(runtime_base))
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
     monkeypatch.setattr(
         runner,
         "_build_smoke_argv",

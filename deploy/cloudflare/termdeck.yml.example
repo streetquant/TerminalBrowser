@@ -11,7 +11,7 @@ ingress:
     service: https://127.0.0.1:7443
     originRequest:
       originServerName: termdeck.local
-      caPool: /8tb/projects/softwares/termdeck/.runtime/termdeck-lan/tls/ca.crt
+      caPool: /var/lib/codexpro-exec/termdeck-runtime/termdeck-lan/tls/ca.crt
       httpHostHeader: termdeck.semiotech.org
       connectTimeout: 5s
       tlsTimeout: 5s

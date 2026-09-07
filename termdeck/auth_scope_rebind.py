@@ -900,7 +900,7 @@ def rebind_auth_scope(
             new_home=new_text,
             scope_id=scope_id,
             claim=durable_claim,
-            now=check_time,
+            now=time.time() if now is None else check_time,
         )
         if not cas_ok:
             return _defer(record, cas_detail, old_home=old_path, new_home=destination, auth_scope_id=scope_id, selected_account=selected_label, selected_account_key=selected_key, recovery_command=recovery_command, recovery_cwd=recovery_cwd)

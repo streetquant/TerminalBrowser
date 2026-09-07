@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -15,7 +16,7 @@ from types import SimpleNamespace
 
 import gi
 
-from smoke_support import stream_ready
+from smoke_support import require_private_validation_runtime, stream_ready
 
 gi.require_version("GdkPixbuf", "2.0")
 
@@ -33,13 +34,20 @@ def _drain_gtk(Gtk, *, until=None, timeout: float = 5.0) -> None:
 
 def main() -> int:
     marker = "termdeck-clipboard-paste-marker"
-    with tempfile.TemporaryDirectory(prefix="termdeck-clipboard-paste-") as tmp:
+    tempfile_root = Path(tempfile.gettempdir()).resolve()
+    runtime_base = require_private_validation_runtime()
+    with tempfile.TemporaryDirectory(
+        prefix=".termdeck-clipboard-tmux-",
+        dir=runtime_base,
+    ) as tmux_tmp_name, tempfile.TemporaryDirectory(
+        prefix="termdeck-clipboard-paste-"
+    ) as tmp:
         root = Path(tmp)
         home = root / "home"
-        tmux_tmp = root / "tmux"
+        tmux_tmp = Path(tmux_tmp_name)
         project = root / "clipboard-project"
         home.mkdir()
-        tmux_tmp.mkdir(mode=0o700)
+        tmux_tmp.chmod(0o700)
         project.mkdir()
         os.environ["HOME"] = str(home)
         os.environ["TMUX_TMPDIR"] = str(tmux_tmp)
@@ -126,20 +134,62 @@ def main() -> int:
             _drain_gtk(Gtk)
 
             fed.clear()
+
+            image_feed_errors: list[Exception] = []
+            observed_image_path: Path | None = None
+            observed_image_dimensions: tuple[int, int] | None = None
+
+            def _capture_image_feed(text: str) -> bool:
+                nonlocal observed_image_dimensions, observed_image_path
+                fed.append(text)
+                try:
+                    image_tokens = shlex.split(text)
+                    if len(image_tokens) != 1:
+                        raise AssertionError(f"clipboard image path was not shell-safe: {text!r}")
+                    candidate = Path(image_tokens[0])
+                    if candidate.suffix != ".png" or not candidate.is_absolute():
+                        raise AssertionError(
+                            f"clipboard image path was not an absolute PNG path: {text!r}"
+                        )
+                    image_metadata = candidate.lstat()
+                    image_parent = candidate.parent.resolve(strict=True)
+                    if (
+                        image_parent != tempfile_root
+                        or not stat.S_ISREG(image_metadata.st_mode)
+                        or image_metadata.st_uid != os.geteuid()
+                        or stat.S_IMODE(image_metadata.st_mode) != 0o600
+                    ):
+                        raise AssertionError(
+                            f"clipboard image was not securely materialised under {tempfile_root}: "
+                            f"{text!r}"
+                        )
+                    saved_image = GdkPixbuf.Pixbuf.new_from_file(str(candidate))
+                    observed_image_dimensions = (
+                        saved_image.get_width(),
+                        saved_image.get_height(),
+                    )
+                    if observed_image_dimensions != (2, 2):
+                        raise AssertionError("materialised clipboard image has the wrong dimensions")
+                    observed_image_path = candidate
+                except Exception as exc:
+                    image_feed_errors.append(exc)
+                return True
+
+            attach._feed_text = _capture_image_feed
             handled = window.on_terminal_key_press(attach.terminal, event)
             _drain_gtk(Gtk, until=lambda: bool(fed))
             if not handled:
                 raise AssertionError("image Ctrl+Shift+V was not consumed by TermDeck")
             if len(fed) != 1:
                 raise AssertionError(f"clipboard image path was not fed exactly once: {fed!r}")
-            image_path = Path(fed[0])
-            if image_path.suffix != ".png" or not image_path.is_file():
-                raise AssertionError(f"clipboard image was not materialised as PNG: {fed[0]!r}")
-            saved_image = GdkPixbuf.Pixbuf.new_from_file(str(image_path))
-            if (saved_image.get_width(), saved_image.get_height()) != (2, 2):
-                raise AssertionError("materialised clipboard image has the wrong dimensions")
-            image_path.unlink()
-            attach._clipboard_image_paths.discard(str(image_path))
+            if image_feed_errors:
+                raise AssertionError("clipboard image validation failed during feeding") from image_feed_errors[0]
+            if observed_image_path is None or observed_image_dimensions != (2, 2):
+                raise AssertionError("clipboard image was not validated during feeding")
+            image_path = observed_image_path
+            attach._cleanup_clipboard_images()
+            if image_path.exists() or attach._clipboard_image_paths:
+                raise AssertionError("clipboard image was not cleaned up after use")
 
             # The first ordinary key pressed while header chrome owns focus
             # must be replayed into VTE, not lost to the old widget.

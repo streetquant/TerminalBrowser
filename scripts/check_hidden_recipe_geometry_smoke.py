@@ -10,6 +10,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from smoke_support import require_private_validation_runtime
+
 
 def _drain(Gtk, *, until=None, timeout: float = 12.0) -> bool:
     deadline = time.monotonic() + timeout
@@ -27,12 +29,18 @@ def _grid(payload: dict[str, object]) -> str:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="t1000-hidden-recipe-grid-") as tmp:
+    runtime_base = require_private_validation_runtime()
+    with tempfile.TemporaryDirectory(
+        prefix="t1000-hidden-recipe-grid-"
+    ) as tmp, tempfile.TemporaryDirectory(
+        prefix="tdhr-",
+        dir=runtime_base,
+    ) as tmux_tmp_dir:
         root = Path(tmp)
         home = root / "home"
-        tmux_tmp = root / "tmux"
+        tmux_tmp = Path(tmux_tmp_dir)
         home.mkdir()
-        tmux_tmp.mkdir(mode=0o700)
+        tmux_tmp.chmod(0o700)
         os.environ.update(HOME=str(home), TMUX_TMPDIR=str(tmux_tmp), NO_AT_BRIDGE="1")
 
         helper = root / "record_grid.py"

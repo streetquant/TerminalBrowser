@@ -141,9 +141,9 @@ def main() -> int:
         if doctor.get("release", {}).get("release_id") != release_id:
             raise AssertionError(f"doctor lost release identity: {doctor!r}")
 
-        # The bootstrap verifies every installed file against wheel RECORD before
-        # importing termdeck. Prove that a modified module is rejected, restore
-        # it, then prove normal launch resumes.
+        # The bootstrap authenticates a descriptor derived from wheel RECORD and
+        # verifies its exact site entries before importing termdeck. Prove that a
+        # modified module is rejected, restore it, then prove normal launch resumes.
         cli_path = release_dir / "site" / "termdeck" / "cli.py"
         original_cli = cli_path.read_bytes()
         original_mode = cli_path.stat().st_mode & 0o777
@@ -156,7 +156,7 @@ def main() -> int:
             env=environment,
             expected=78,
         )
-        if "RECORD verification failed" not in rejected.stderr:
+        if "installed site member" not in rejected.stderr:
             raise AssertionError(f"tampered managed site was not rejected: {rejected.stderr!r}")
         cli_path.chmod(0o644)
         cli_path.write_bytes(original_cli)

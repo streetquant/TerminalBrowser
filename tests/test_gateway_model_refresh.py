@@ -213,7 +213,9 @@ def test_clean_exit_bridges_old_payload_to_shell_without_resuming_agent(tmp_path
     assert derived_recipe.origin == "native-resume"
     assert derived.status == "new"
     respawn = run.call_args_list[0].args[0]
-    assert respawn[:4] == ["respawn-pane", "-k", "-t", "%42"]
+    # A dead pane is reused directly; -k is reserved for live replacement.
+    assert respawn[:3] == ["respawn-pane", "-t", "%42"]
+    assert "-k" not in respawn
     assert "SHELL_MODE=fallback" in respawn
     assert respawn[-3:] == ["-c", str(tmp_path), "/bin/bash -i"]
     await_pid.assert_called_once_with(record, pane_id="%42")
@@ -231,8 +233,11 @@ def test_failed_dead_payload_resumes_durable_recipe(
     )
     with mock.patch.object(backend, "_pane_lifecycle", return_value=lifecycle), mock.patch.object(
         backend, "create_or_resume"
-    ) as create, mock.patch.object(backend, "pane_pid", return_value=333):
+    ) as create, mock.patch.object(
+        backend, "_await_live_pane_pid", return_value=333
+    ) as await_pid:
         result = backend.recover_dead_payload(record)
+        await_pid.assert_called_once_with(record, pane_id="%42")
 
     assert result.action == "restarted"
     assert result.pid == 333
@@ -281,8 +286,11 @@ def test_always_policy_restarts_even_after_clean_exit(tmp_path: Path) -> None:
     )
     with mock.patch.object(backend, "_pane_lifecycle", return_value=lifecycle), mock.patch.object(
         backend, "create_or_resume"
-    ) as create, mock.patch.object(backend, "pane_pid", return_value=555):
+    ) as create, mock.patch.object(
+        backend, "_await_live_pane_pid", return_value=555
+    ) as await_pid:
         result = backend.recover_dead_payload(record)
+        await_pid.assert_called_once_with(record, pane_id="%42")
     assert result.action == "restarted"
     assert result.pid == 555
     create.assert_called_once()

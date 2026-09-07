@@ -71,11 +71,22 @@ _MAX_WHEEL_ENTRIES = 20_000
 _MAX_WHEEL_MEMBER_BYTES = 128 * 1024 * 1024
 _MAX_WHEEL_TOTAL_BYTES = 512 * 1024 * 1024
 _MAX_WHEEL_ARCHIVE_BYTES = 512 * 1024 * 1024
+_MAX_WHEEL_PATH_COMPONENTS = 256
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+_MAX_SITE_MANIFEST_BYTES = 16 * 1024 * 1024
+_MAX_RELEASE_VERIFICATION_BYTES = _MAX_SITE_MANIFEST_BYTES + 64 * 1024
+_MAX_SITE_DIRECTORIES = 100_000
 _MAX_ACTIVATION_SOURCE_BYTES = 2 * 1024 * 1024
 _MAX_ACTIVATION_PROBE_OUTPUT_BYTES = 6 * 1024 * 1024
 _MAX_ACTIVATION_PROBE_STDERR_BYTES = 64 * 1024
 _ACTIVATION_PROBE_SCHEMA = "t1000.activation-probe.v1"
+_RELEASE_VERIFICATION_SCHEMA = "t1000.release-verification.v2"
+_SITE_MANIFEST_SCHEMA = "t1000.installed-site-manifest.v1"
+_AUTOSTART_RECEIPT_SCHEMA = "t1000.autostart-activation-receipt.v1"
+_AUTOSTART_DESCRIPTOR_NAME = "io.github.t1000.T1000.desktop"
+_AUTOSTART_RECEIPT_NAME = "autostart-receipt.json"
+_MAX_AUTOSTART_DESCRIPTOR_BYTES = 64 * 1024
+_MAX_AUTOSTART_RECEIPT_BYTES = 64 * 1024
 _RELEASE_ID = re.compile(r"^[0-9a-f]{64}$")
 _RELEASE_VERSION_PREFIX = re.compile(
     r"^([0-9]+)\.([0-9]+)\.([0-9]+)(?:[A-Za-z0-9.+-].*)?$"
@@ -208,6 +219,83 @@ def _require_managed_storage(layout: "ReleaseLayout"):
         raise ReleaseError(f"managed storage attestation failed: {reason}") from exc
 
 
+def _storage_attestation_binding(attestation: object) -> str:
+    try:
+        payload = attestation.as_dict()  # type: ignore[attr-defined]
+    except Exception as exc:
+        raise ReleaseError(f"managed storage attestation is not serializable: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise ReleaseError("managed storage attestation is not an object")
+    raw_rows = payload.get("path_evidence")
+    if not isinstance(raw_rows, Sequence) or isinstance(raw_rows, (str, bytes)):
+        paths = payload.get("paths")
+        raw_rows = list(paths.values()) if isinstance(paths, Mapping) else []
+    evidence_fields = (
+        "name",
+        "requested",
+        "resolved",
+        "role",
+        "device",
+        "mount_point",
+        "source",
+        "filesystem",
+        "rotational",
+        "storage_class",
+    )
+
+    def normalized_evidence(value: Mapping[object, object]) -> dict[str, object]:
+        return {key: value.get(key) for key in evidence_fields}
+
+    rows: list[dict[str, object]] = []
+    for value in raw_rows:
+        if not isinstance(value, Mapping):
+            raise ReleaseError("managed storage attestation path evidence is invalid")
+        rows.append(normalized_evidence(value))
+    rows.sort(key=lambda row: str(row.get("name", "")))
+    launcher_value = payload.get("launcher")
+    launcher = (
+        normalized_evidence(launcher_value)
+        if isinstance(launcher_value, Mapping)
+        else None
+    )
+    environment_value = payload.get("environment")
+    environment = None
+    if isinstance(environment_value, Mapping):
+        environment = {
+            key: environment_value.get(key)
+            for key in (
+                "expected",
+                "observed",
+                "matches",
+                "status",
+                "advisory",
+                "used_for_admission",
+            )
+        }
+    binding = {
+        "schema": payload.get("schema"),
+        "fabric": payload.get("fabric", payload.get("storage_fabric")),
+        "storage_class": payload.get("storage_class"),
+        "production": payload.get("production"),
+        "paths": rows,
+        "launcher": launcher,
+        "environment": environment,
+    }
+    return sha256_bytes(canonical_json_bytes(binding))
+
+
+def _revalidate_managed_storage(
+    layout: "ReleaseLayout",
+    expected_binding: str,
+    *,
+    phase: str,
+):
+    observed = _require_managed_storage(layout)
+    if _storage_attestation_binding(observed) != expected_binding:
+        raise ReleaseError(f"managed storage identity changed {phase}")
+    return observed
+
+
 @dataclass(frozen=True)
 class SourceSnapshot:
     root: Path
@@ -291,6 +379,17 @@ class _ActivationBundle:
 
 
 @dataclass(frozen=True)
+class _AutostartPublication:
+    descriptor_path: Path
+    receipt_path: Path
+    descriptor: bytes
+    receipt: bytes
+    descriptor_preimage: _FileSnapshot
+    receipt_preimage: _FileSnapshot
+    repaired: bool
+
+
+@dataclass(frozen=True)
 class _BoundedProcessResult:
     returncode: int
     stdout: bytes
@@ -369,7 +468,7 @@ def release_layout(
     bin_dir: str | Path | None = None,
 ) -> ReleaseLayout:
     managed = (
-        Path(root).expanduser() if root is not None else default_managed_root()
+        Path(root).expanduser() if root is not None else _default_release_root()
     ).absolute()
     binaries = (
         Path(bin_dir).expanduser() if bin_dir is not None else _default_managed_bin_dir()
@@ -384,6 +483,44 @@ def release_layout(
         launcher_path=binaries / "t1000",
         legacy_dir=managed / "legacy",
     )
+
+
+def _canonical_managed_root() -> Path:
+    return Path(default_managed_root(env={})).expanduser().absolute()
+
+
+def _default_release_root(*, env: Mapping[str, str] | None = None) -> Path:
+    return (
+        Path(default_managed_root(env=os.environ if env is None else env))
+        .expanduser()
+        .absolute()
+    )
+
+
+def _is_canonical_production_root(path: Path) -> bool:
+    canonical = _canonical_managed_root()
+    try:
+        if path.resolve(strict=False) == canonical.resolve(strict=False):
+            return True
+    except OSError:
+        pass
+    try:
+        return path.exists() and canonical.exists() and path.samefile(canonical)
+    except OSError:
+        return False
+
+
+def _resolve_production_intent(
+    layout: ReleaseLayout,
+    production: bool | None,
+) -> bool:
+    """Prevent callers from downgrading the canonical production root."""
+
+    if production is not None and not isinstance(production, bool):
+        raise ReleaseError("production intent must be a boolean when provided")
+    if _is_canonical_production_root(layout.root):
+        return True
+    return bool(production)
 
 
 def _run(
@@ -614,6 +751,16 @@ def _source_version(root: Path) -> str:
     match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']\s*$', init, re.MULTILINE)
     if match is None or match.group(1) != version:
         raise ReleaseError("pyproject.toml and termdeck.__version__ disagree")
+    bundled_path = root / "termdeck" / "_build_info.json"
+    try:
+        bundled = json.loads(bundled_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"could not read source build-info metadata: {exc}") from exc
+    if isinstance(bundled, Mapping) and "version" in bundled:
+        if bundled.get("version") != version:
+            raise ReleaseError(
+                "pyproject.toml and source termdeck/_build_info.json disagree"
+            )
     return version
 
 
@@ -1056,7 +1203,11 @@ def _safe_member_name(name: str) -> str:
     if not name or "\\" in name or "\x00" in name:
         raise ReleaseError(f"unsafe wheel member name: {name!r}")
     pure = PurePosixPath(name)
-    if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+    if (
+        pure.is_absolute()
+        or len(pure.parts) > _MAX_WHEEL_PATH_COMPONENTS
+        or any(part in {"", ".", ".."} for part in pure.parts)
+    ):
         raise ReleaseError(f"unsafe wheel member path: {name!r}")
     normalized = str(pure)
     if normalized != name.rstrip("/"):
@@ -1700,8 +1851,24 @@ def _publish_files_transactionally(
     writes: Sequence[tuple[Path, bytes, int, str]],
     *,
     verify: Callable[[], None] | None = None,
+    descriptor_rooted: bool = False,
 ) -> None:
     """Publish a small activation set and restore every preimage on failure."""
+
+    if descriptor_rooted:
+        from .desktop_integration import (
+            _publish_files_transactionally as publish_descriptor_rooted,
+        )
+
+        try:
+            publish_descriptor_rooted(tuple(writes), finalize=verify)
+        except Exception as exc:
+            if "rollback was incomplete" in str(exc):
+                raise ReleaseError(f"activation publication failed: {exc}") from exc
+            raise ReleaseError(
+                f"activation publication failed and was rolled back: {exc}"
+            ) from exc
+        return
 
     snapshots = [
         (path, _capture_file(path, label=label), label)
@@ -1764,6 +1931,240 @@ def _optional_regular_hash(
 
 def _state_digest(path: Path) -> str | None:
     return _optional_regular_hash(path, label="managed state")
+
+
+def _release_verification_path(layout: ReleaseLayout, release_id: str) -> Path:
+    if _RELEASE_ID.fullmatch(release_id) is None:
+        raise ReleaseError("release verification release id is unsafe")
+    return layout.root / f"verification-{release_id}.json"
+
+
+def _validate_release_verification_receipt(
+    value: object,
+    *,
+    release_id: str,
+    manifest_sha256: str,
+    wheel_sha256: str,
+    wheel_size: int,
+    frozen_directories: bool | None = None,
+    site_manifest_sha256: str | None = None,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ReleaseError("release verification receipt is not an object")
+    receipt = {str(key): item for key, item in value.items()}
+    expected_fields = {
+        "schema",
+        "release_id",
+        "manifest_sha256",
+        "wheel_sha256",
+        "wheel_size",
+        "installed_members",
+        "installed_directories",
+        "site_directories",
+        "frozen_directories",
+        "site_manifest",
+        "site_manifest_sha256",
+        "method",
+    }
+    if set(receipt) != expected_fields:
+        raise ReleaseError("release verification receipt fields differ from schema")
+    if receipt["schema"] != _RELEASE_VERIFICATION_SCHEMA:
+        raise ReleaseError("release verification receipt schema is unsupported")
+    if receipt["release_id"] != release_id:
+        raise ReleaseError("release verification receipt release id mismatch")
+    for key, expected in (
+        ("manifest_sha256", manifest_sha256),
+        ("wheel_sha256", wheel_sha256),
+    ):
+        observed = receipt[key]
+        if not isinstance(observed, str) or not re.fullmatch(r"[0-9a-f]{64}", observed):
+            raise ReleaseError(f"release verification receipt {key} is invalid")
+        if observed != expected:
+            raise ReleaseError(f"release verification receipt {key} mismatch")
+    if (
+        isinstance(receipt["wheel_size"], bool)
+        or not isinstance(receipt["wheel_size"], int)
+        or receipt["wheel_size"] != wheel_size
+    ):
+        raise ReleaseError("release verification receipt wheel size mismatch")
+    for key in ("installed_members", "installed_directories", "site_directories"):
+        count = receipt[key]
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ReleaseError(f"release verification receipt {key} is invalid")
+    if receipt["installed_directories"] != receipt["site_directories"] + 2:
+        raise ReleaseError("release verification receipt directory count mismatch")
+    if not isinstance(receipt["frozen_directories"], bool):
+        raise ReleaseError("release verification receipt frozen policy is invalid")
+    if frozen_directories is not None and receipt["frozen_directories"] != frozen_directories:
+        raise ReleaseError("release verification receipt frozen policy mismatch")
+    site_manifest = _validate_site_manifest(
+        receipt["site_manifest"],
+        release_id=release_id,
+        wheel_sha256=wheel_sha256,
+        installed_members=int(receipt["installed_members"]),
+        installed_directories=int(receipt["site_directories"]),
+    )
+    observed_site_manifest_sha256 = receipt["site_manifest_sha256"]
+    if (
+        not isinstance(observed_site_manifest_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", observed_site_manifest_sha256) is None
+    ):
+        raise ReleaseError("release verification receipt site manifest digest is invalid")
+    if observed_site_manifest_sha256 != sha256_bytes(canonical_json_bytes(site_manifest)):
+        raise ReleaseError("release verification receipt site manifest digest mismatch")
+    if (
+        site_manifest_sha256 is not None
+        and observed_site_manifest_sha256 != site_manifest_sha256
+    ):
+        raise ReleaseError("release verification receipt installed site mismatch")
+    if receipt["method"] != "full-records-site-manifest-v2":
+        raise ReleaseError("release verification receipt method is unsupported")
+    return receipt
+
+
+def _read_release_verification_receipt(
+    layout: ReleaseLayout,
+    release_id: str,
+    *,
+    manifest: Mapping[str, object],
+    manifest_bytes: bytes,
+    site_manifest_sha256: str | None = None,
+) -> dict[str, object]:
+    wheel_sha256 = manifest.get("wheel_sha256")
+    wheel_size = manifest.get("wheel_size")
+    if (
+        not isinstance(wheel_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", wheel_sha256) is None
+        or isinstance(wheel_size, bool)
+        or not isinstance(wheel_size, int)
+        or wheel_size <= 0
+    ):
+        raise ReleaseError("release verification manifest has invalid wheel identity")
+    receipt_path = _release_verification_path(layout, release_id)
+    try:
+        receipt_stat = receipt_path.lstat()
+    except OSError as exc:
+        raise ReleaseError(f"could not inspect release verification receipt: {exc}") from exc
+    if (
+        stat.S_ISLNK(receipt_stat.st_mode)
+        or not stat.S_ISREG(receipt_stat.st_mode)
+        or stat.S_IMODE(receipt_stat.st_mode) & 0o222
+        or receipt_stat.st_nlink != 1
+    ):
+        raise ReleaseError("release verification receipt is writable, linked, or unsafe")
+    receipt_bytes = _read_regular_file_bytes(
+        receipt_path,
+        label="release verification receipt",
+        maximum_bytes=_MAX_RELEASE_VERIFICATION_BYTES,
+    )
+    try:
+        value = json.loads(receipt_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"release verification receipt is invalid: {exc}") from exc
+    if receipt_bytes != canonical_json_bytes(value):
+        raise ReleaseError("release verification receipt is not canonical")
+    return _validate_release_verification_receipt(
+        value,
+        release_id=release_id,
+        manifest_sha256=sha256_bytes(manifest_bytes),
+        wheel_sha256=wheel_sha256,
+        wheel_size=wheel_size,
+        frozen_directories=_release_requires_frozen_directories(manifest["build_info"]),
+        site_manifest_sha256=site_manifest_sha256,
+    )
+
+
+def _write_release_verification_receipt(
+    layout: ReleaseLayout,
+    release_id: str,
+    release_dir: Path,
+    verification: Mapping[str, object] | None = None,
+    site_manifest: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Persist the result of one complete install-time tree verification.
+
+    Launchers consume this immutable, release-bound receipt for a bounded,
+    descriptor-directed site check instead of an unbounded recursive walk. The
+    full verifier remains authoritative for install, explicit verify, and rollback.
+    """
+
+    if _RELEASE_ID.fullmatch(release_id) is None:
+        raise ReleaseError("release verification release id is unsafe")
+    try:
+        releases_root = layout.releases_dir.resolve(strict=True)
+        resolved_release = release_dir.resolve(strict=True)
+        resolved_release.relative_to(releases_root)
+    except OSError as exc:
+        raise ReleaseError(f"could not resolve release verification target: {exc}") from exc
+    except ValueError as exc:
+        raise ReleaseError("release verification target escaped managed releases") from exc
+    manifest_path = resolved_release / "manifest.json"
+    manifest_bytes = _read_regular_file_bytes(
+        manifest_path,
+        label="release verification manifest",
+        maximum_bytes=_MAX_MANIFEST_BYTES,
+    )
+    try:
+        manifest = validate_release_manifest(json.loads(manifest_bytes.decode("utf-8")))
+    except (UnicodeDecodeError, json.JSONDecodeError, BuildIdentityError) as exc:
+        raise ReleaseError(f"release verification manifest is invalid: {exc}") from exc
+    if manifest_bytes != canonical_json_bytes(manifest):
+        raise ReleaseError("release verification manifest is not canonical")
+    if manifest["release_id"] != release_id:
+        raise ReleaseError("release verification manifest release id mismatch")
+    if verification is None or site_manifest is None:
+        verification, site_manifest = _verify_installed_tree_details(resolved_release)
+    validated_site_manifest = _validate_site_manifest(
+        site_manifest,
+        release_id=release_id,
+        wheel_sha256=str(manifest["wheel_sha256"]),
+        installed_members=int(verification.get("installed_members", 0)),
+    )
+    site_manifest_sha256 = sha256_bytes(canonical_json_bytes(validated_site_manifest))
+    if verification.get("site_manifest_sha256") != site_manifest_sha256:
+        raise ReleaseError("release verification site manifest changed after full verification")
+    receipt = _validate_release_verification_receipt(
+        {
+            "schema": _RELEASE_VERIFICATION_SCHEMA,
+            "release_id": release_id,
+            "manifest_sha256": sha256_bytes(manifest_bytes),
+            "wheel_sha256": manifest["wheel_sha256"],
+            "wheel_size": manifest["wheel_size"],
+            "installed_members": verification.get("installed_members"),
+            "installed_directories": verification.get("installed_directories"),
+            "site_directories": len(validated_site_manifest["directories"]),
+            "frozen_directories": verification.get("frozen_directories"),
+            "site_manifest": validated_site_manifest,
+            "site_manifest_sha256": site_manifest_sha256,
+            "method": "full-records-site-manifest-v2",
+        },
+        release_id=release_id,
+        manifest_sha256=sha256_bytes(manifest_bytes),
+        wheel_sha256=str(manifest["wheel_sha256"]),
+        wheel_size=int(manifest["wheel_size"]),
+        frozen_directories=_release_requires_frozen_directories(manifest["build_info"]),
+        site_manifest_sha256=site_manifest_sha256,
+    )
+    receipt_path = _release_verification_path(layout, release_id)
+    if _path_lexists(receipt_path):
+        mode = receipt_path.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise ReleaseError("release verification receipt is not a regular file")
+    _atomic_write_bytes(
+        receipt_path,
+        canonical_json_bytes(receipt),
+        mode=0o444,
+    )
+    written = _read_release_verification_receipt(
+        layout,
+        release_id,
+        manifest=manifest,
+        manifest_bytes=manifest_bytes,
+        site_manifest_sha256=site_manifest_sha256,
+    )
+    if written != receipt:
+        raise ReleaseError("release verification receipt changed while being written")
+    return written
 
 
 def _release_requires_frozen_directories(
@@ -2006,6 +2407,8 @@ def _verify_release_directories(root: Path, *, frozen: bool) -> int:
         if frozen and stat.S_IMODE(entry_mode) != 0o555:
             raise ReleaseError(f"installed frozen directory is writable or has wrong mode: {directory}")
         count += 1
+        if count > _MAX_SITE_DIRECTORIES + 2:
+            raise ReleaseError("installed release directory count is unsafe")
         for name in directories:
             child = directory / name
             child_mode = child.lstat().st_mode
@@ -2014,21 +2417,71 @@ def _verify_release_directories(root: Path, *, frozen: bool) -> int:
     return count
 
 
-def _installed_site_files(site: Path) -> set[str]:
-    """Return the exact regular-file set, rejecting links and special files."""
+def _exact_directory_names(
+    path: Path,
+    *,
+    label: str,
+    expected: set[str],
+) -> None:
+    names: set[str] = set()
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                names.add(entry.name)
+                if len(names) > len(expected):
+                    raise ReleaseError(f"{label} contains unexpected entries")
+    except OSError as exc:
+        raise ReleaseError(f"could not enumerate {label}: {path}: {exc}") from exc
+    if names != expected:
+        raise ReleaseError(
+            f"{label} entries differ from the immutable release envelope: "
+            f"missing={sorted(expected - names)}, extra={sorted(names - expected)}"
+        )
+
+
+def _verify_release_envelope(
+    root: Path,
+    *,
+    wheel_name: str,
+) -> Path:
+    _exact_directory_names(
+        root,
+        label="installed release root",
+        expected={"site", "artifacts", "manifest.json"},
+    )
+    artifacts = root / "artifacts"
+    artifacts_mode = artifacts.lstat().st_mode
+    if stat.S_ISLNK(artifacts_mode) or not stat.S_ISDIR(artifacts_mode):
+        raise ReleaseError("installed release artifacts is not a real directory")
+    _exact_directory_names(
+        artifacts,
+        label="installed release artifacts",
+        expected={wheel_name},
+    )
+    return artifacts / wheel_name
+
+
+def _installed_site_entries(site: Path) -> tuple[set[str], set[str]]:
+    """Return exact regular-file and directory sets after a full safe walk."""
 
     mode = site.lstat().st_mode
     if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
         raise ReleaseError("installed release site is not a real directory")
     root = site.resolve(strict=True)
     files: set[str] = set()
-    for current, directories, names in os.walk(site, topdown=True, followlinks=False):
+    site_directories: set[str] = {"."}
+    for current, child_directories, names in os.walk(
+        site, topdown=True, followlinks=False
+    ):
         directory = Path(current)
         try:
             directory.resolve(strict=True).relative_to(root)
         except ValueError as exc:
             raise ReleaseError(f"installed release directory escaped site: {directory}") from exc
-        for name in directories:
+        relative_directory = directory.relative_to(site).as_posix()
+        if relative_directory != ".":
+            site_directories.add(relative_directory)
+        for name in child_directories:
             path = directory / name
             entry_mode = path.lstat().st_mode
             if stat.S_ISLNK(entry_mode) or not stat.S_ISDIR(entry_mode):
@@ -2048,7 +2501,7 @@ def _installed_site_files(site: Path) -> set[str]:
             except ValueError as exc:
                 raise ReleaseError(f"installed release file escaped site: {path}") from exc
             files.add(path.relative_to(site).as_posix())
-    return files
+    return files, site_directories
 
 
 def _read_installed_member(site: Path, name: str) -> bytes:
@@ -2075,7 +2528,141 @@ def _read_installed_member(site: Path, name: str) -> bytes:
         os.close(descriptor)
 
 
-def verify_installed_tree(release_dir: str | Path) -> dict[str, object]:
+def _record_digest_hex(value: str, *, name: str) -> str:
+    match = re.fullmatch(r"sha256=([A-Za-z0-9_-]{43})", value)
+    if match is None:
+        raise ReleaseError(f"installed RECORD SHA-256 is invalid: {name}")
+    try:
+        decoded = base64.urlsafe_b64decode(match.group(1) + "=")
+    except ValueError as exc:
+        raise ReleaseError(f"installed RECORD SHA-256 is invalid: {name}") from exc
+    if len(decoded) != hashlib.sha256().digest_size:
+        raise ReleaseError(f"installed RECORD SHA-256 is invalid: {name}")
+    return decoded.hex()
+
+
+def _validate_site_manifest(
+    value: object,
+    *,
+    release_id: str,
+    wheel_sha256: str,
+    installed_members: int | None = None,
+    installed_directories: int | None = None,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ReleaseError("installed site manifest is not an object")
+    manifest = {str(key): item for key, item in value.items()}
+    expected_fields = {
+        "schema",
+        "release_id",
+        "wheel_sha256",
+        "directories",
+        "files",
+    }
+    if set(manifest) != expected_fields:
+        raise ReleaseError("installed site manifest fields differ from schema")
+    if manifest["schema"] != _SITE_MANIFEST_SCHEMA:
+        raise ReleaseError("installed site manifest schema is unsupported")
+    if manifest["release_id"] != release_id:
+        raise ReleaseError("installed site manifest release id mismatch")
+    if manifest["wheel_sha256"] != wheel_sha256:
+        raise ReleaseError("installed site manifest wheel mismatch")
+
+    directory_values = manifest["directories"]
+    if not isinstance(directory_values, list):
+        raise ReleaseError("installed site manifest directories are invalid")
+    if not directory_values or len(directory_values) > _MAX_SITE_DIRECTORIES:
+        raise ReleaseError("installed site manifest directory count is unsafe")
+    if any(not isinstance(item, str) for item in directory_values):
+        raise ReleaseError("installed site manifest directory path is invalid")
+    directory_names = list(directory_values)
+    if directory_names != sorted(set(directory_names)) or "." not in directory_names:
+        raise ReleaseError("installed site manifest directories are not canonical")
+    directory_set = set(directory_names)
+    for name in directory_names:
+        if name == ".":
+            continue
+        _safe_member_name(name)
+        parent = PurePosixPath(name).parent.as_posix()
+        if parent not in directory_set:
+            raise ReleaseError("installed site manifest directory parent is missing")
+
+    file_values = manifest["files"]
+    if not isinstance(file_values, list):
+        raise ReleaseError("installed site manifest files are invalid")
+    if not file_values or len(file_values) > _MAX_WHEEL_ENTRIES:
+        raise ReleaseError("installed site manifest file count is unsafe")
+    normalized_files: list[list[object]] = []
+    total_size = 0
+    for row in file_values:
+        if not isinstance(row, list) or len(row) != 3:
+            raise ReleaseError("installed site manifest file row is invalid")
+        name, digest, size = row
+        if not isinstance(name, str):
+            raise ReleaseError("installed site manifest file path is invalid")
+        _safe_member_name(name)
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ReleaseError(f"installed site manifest digest is invalid: {name}")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ReleaseError(f"installed site manifest size is invalid: {name}")
+        parent = PurePosixPath(name).parent.as_posix()
+        if parent not in directory_set:
+            raise ReleaseError(f"installed site manifest file parent is missing: {name}")
+        total_size += size
+        if total_size > _MAX_WHEEL_TOTAL_BYTES:
+            raise ReleaseError("installed site manifest total size is unsafe")
+        normalized_files.append([name, digest, size])
+    if normalized_files != sorted(normalized_files, key=lambda row: str(row[0])):
+        raise ReleaseError("installed site manifest files are not sorted")
+    file_names = [str(row[0]) for row in normalized_files]
+    if len(file_names) != len(set(file_names)):
+        raise ReleaseError("installed site manifest file paths are duplicated")
+    if installed_members is not None and len(file_names) != installed_members:
+        raise ReleaseError("installed site manifest member count mismatch")
+    if installed_directories is not None and len(directory_names) != installed_directories:
+        raise ReleaseError("installed site manifest directory count mismatch")
+    if len(canonical_json_bytes(manifest)) > _MAX_SITE_MANIFEST_BYTES:
+        raise ReleaseError("installed site manifest exceeds the safety limit")
+    return manifest
+
+
+def _site_manifest_from_verified_tree(
+    *,
+    release_id: str,
+    verified: VerifiedWheel,
+    site: Path,
+    directories: set[str],
+) -> dict[str, object]:
+    record_name = f"{verified.dist_info}/RECORD"
+    file_rows: list[list[object]] = []
+    for name, digest, size_text in sorted(verified.record_rows):
+        if name == record_name:
+            if digest or size_text:
+                raise ReleaseError("installed RECORD self-row is not empty")
+            content = _read_installed_member(site, name)
+            file_rows.append([name, sha256_bytes(content), len(content)])
+            continue
+        if not size_text.isdecimal() or str(int(size_text)) != size_text:
+            raise ReleaseError(f"installed RECORD size is invalid: {name}")
+        file_rows.append([name, _record_digest_hex(digest, name=name), int(size_text)])
+    return _validate_site_manifest(
+        {
+            "schema": _SITE_MANIFEST_SCHEMA,
+            "release_id": release_id,
+            "wheel_sha256": verified.sha256,
+            "directories": sorted(directories),
+            "files": file_rows,
+        },
+        release_id=release_id,
+        wheel_sha256=verified.sha256,
+        installed_members=len(verified.members),
+        installed_directories=len(directories),
+    )
+
+
+def _verify_installed_tree_details(
+    release_dir: str | Path,
+) -> tuple[dict[str, object], dict[str, object]]:
     source = Path(release_dir).expanduser()
     mode = source.lstat().st_mode
     if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
@@ -2102,11 +2689,14 @@ def verify_installed_tree(release_dir: str | Path) -> dict[str, object]:
     if not isinstance(build_info, Mapping):
         raise ReleaseError("installed release manifest has no build-info mapping")
     frozen_directories = _release_requires_frozen_directories(build_info)
+    wheel = _verify_release_envelope(
+        root,
+        wheel_name=str(manifest["wheel"]),
+    )
     installed_directories = _verify_release_directories(
         root,
         frozen=frozen_directories,
     )
-    wheel = root / "artifacts" / str(manifest["wheel"])
     wheel_stat = wheel.lstat()
     if (
         stat.S_ISLNK(wheel_stat.st_mode)
@@ -2117,7 +2707,7 @@ def verify_installed_tree(release_dir: str | Path) -> dict[str, object]:
         raise ReleaseError("installed wheel artifact is writable, linked, or unsafe")
     verified = verify_wheel(wheel, manifest_path=manifest_path)
     site = root / "site"
-    actual_files = _installed_site_files(site)
+    actual_files, site_directories = _installed_site_entries(site)
     expected_files = set(verified.members)
     if actual_files != expected_files:
         raise ReleaseError(
@@ -2133,14 +2723,27 @@ def verify_installed_tree(release_dir: str | Path) -> dict[str, object]:
             continue
         if _record_hash(content) != digest or str(len(content)) != size_text:
             raise ReleaseError(f"installed wheel member failed RECORD verification: {name}")
-    return {
+    site_manifest = _site_manifest_from_verified_tree(
+        release_id=str(manifest["release_id"]),
+        verified=verified,
+        site=site,
+        directories=site_directories,
+    )
+    result = {
         "ok": True,
         "release_id": manifest["release_id"],
         "wheel_sha256": verified.sha256,
         "installed_members": len(verified.members),
         "installed_directories": installed_directories,
         "frozen_directories": frozen_directories,
+        "site_manifest_sha256": sha256_bytes(canonical_json_bytes(site_manifest)),
     }
+    return result, site_manifest
+
+
+def verify_installed_tree(release_dir: str | Path) -> dict[str, object]:
+    result, _site_manifest = _verify_installed_tree_details(release_dir)
+    return result
 
 
 def _bootstrap_source(layout: ReleaseLayout, python: Path) -> bytes:
@@ -2149,19 +2752,34 @@ def _bootstrap_source(layout: ReleaseLayout, python: Path) -> bytes:
     root = str(layout.root.resolve())
     template = r'''#!/usr/bin/env __PYTHON_NAME__
 from __future__ import annotations
+import atexit
 import base64
 import csv
 import hashlib
 import io
+import importlib.abc
+import importlib.util
 import json
 import os
 import re
 import stat
 import sys
+import tempfile
+import zipfile
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__ROOT_REPR__)
 STATE = ROOT / "state.json"
+RELEASE_VERIFICATION_SCHEMA = "t1000.release-verification.v2"
+SITE_MANIFEST_SCHEMA = "t1000.installed-site-manifest.v1"
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_SITE_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_RELEASE_VERIFICATION_BYTES = MAX_SITE_MANIFEST_BYTES + 64 * 1024
+MAX_WHEEL_BYTES = 512 * 1024 * 1024
+MAX_RUNTIME_BYTES = 512 * 1024 * 1024
+MAX_WHEEL_ENTRIES = 20_000
+MAX_WHEEL_PATH_COMPONENTS = 256
+MAX_SITE_DIRECTORIES = 100_000
 sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
@@ -2180,31 +2798,47 @@ def digest_bytes(value):
     return hashlib.sha256(value).hexdigest()
 
 
-def digest_file(path):
+def digest_file(path, *, maximum_bytes):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        entry = os.fstat(descriptor)
+    except Exception:
+        os.close(descriptor)
+        raise
+    if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
+        os.close(descriptor)
+        raise RuntimeError(f"cannot hash a non-regular file: {path}")
+    if entry.st_size < 0 or entry.st_size > maximum_bytes:
+        os.close(descriptor)
+        raise RuntimeError(f"file exceeds the {maximum_bytes}-byte digest limit: {path}")
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
+    with os.fdopen(descriptor, "rb", closefd=True) as handle:
+        remaining = entry.st_size
+        while remaining:
+            chunk = handle.read(min(1024 * 1024, remaining))
             if not chunk:
-                break
+                raise RuntimeError(f"file changed while being hashed: {path}")
             digest.update(chunk)
+            remaining -= len(chunk)
+        if handle.read(1):
+            raise RuntimeError(f"file grew while being hashed: {path}")
+    after = os.stat(path, follow_symlinks=False)
+    if (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) != (
+        entry.st_dev,
+        entry.st_ino,
+        entry.st_size,
+        entry.st_mtime_ns,
+        entry.st_ctime_ns,
+    ):
+        raise RuntimeError(f"file changed while being hashed: {path}")
     return digest.hexdigest()
-
-
-def record_hash(value):
-    encoded = base64.urlsafe_b64encode(hashlib.sha256(value).digest()).rstrip(b"=")
-    return "sha256=" + encoded.decode("ascii")
-
-
-def safe_member(name):
-    if not isinstance(name, str) or not name or "\\" in name or "\x00" in name:
-        raise RuntimeError(f"unsafe RECORD path: {name!r}")
-    pure = PurePosixPath(name)
-    if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
-        raise RuntimeError(f"unsafe RECORD path: {name!r}")
-    if str(pure) != name:
-        raise RuntimeError(f"non-canonical RECORD path: {name!r}")
-    return pure
 
 
 def regular_file(path, label, *, immutable=False, executable=False):
@@ -2220,11 +2854,64 @@ def regular_file(path, label, *, immutable=False, executable=False):
     return path
 
 
+def bounded_bytes(path, label, maximum_bytes):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        entry = os.fstat(descriptor)
+    except Exception:
+        os.close(descriptor)
+        raise
+    mode = entry.st_mode
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        os.close(descriptor)
+        raise RuntimeError(f"{label} is not a regular file: {path}")
+    if entry.st_size < 0 or entry.st_size > maximum_bytes:
+        os.close(descriptor)
+        raise RuntimeError(f"{label} exceeds the {maximum_bytes}-byte safety limit")
+    with os.fdopen(descriptor, "rb", closefd=True) as handle:
+        value = handle.read(entry.st_size)
+        if len(value) != entry.st_size or handle.read(1):
+            raise RuntimeError(f"{label} changed while being read")
+    after = path.lstat()
+    if (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) != (
+        entry.st_dev,
+        entry.st_ino,
+        entry.st_size,
+        entry.st_mtime_ns,
+        entry.st_ctime_ns,
+    ):
+        raise RuntimeError(f"{label} changed while being read")
+    return value
+
+
 def real_directory(path, label):
     mode = path.lstat().st_mode
     if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
         raise RuntimeError(f"{label} is not a real directory: {path}")
     return path.resolve(strict=True)
+
+
+def exact_directory_entries(path, label, expected):
+    names = set()
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                names.add(entry.name)
+                if len(names) > len(expected):
+                    raise RuntimeError(
+                        f"{label} contains unexpected entries outside the immutable release envelope"
+                    )
+    except OSError as exc:
+        raise RuntimeError(f"could not enumerate {label}: {exc}") from exc
+    if names != set(expected):
+        raise RuntimeError(f"{label} entries differ from the immutable release envelope")
 
 
 def frozen_directories_required(build_info):
@@ -2244,37 +2931,681 @@ def frozen_directories_required(build_info):
     return numeric >= (0, 2, 13)
 
 
-def verify_release_directories(root, *, frozen):
-    resolved_root = root.resolve(strict=True)
-
-    def walk_error(error):
-        raise RuntimeError(f"could not inspect managed release directories: {error}")
-
-    for current, directories, _names in os.walk(
-        root,
-        topdown=True,
-        followlinks=False,
-        onerror=walk_error,
+def safe_member(name):
+    if not isinstance(name, str) or not name or "\\" in name or "\x00" in name:
+        raise RuntimeError(f"unsafe wheel member name: {name!r}")
+    trailing = name.endswith("/")
+    normalized = name[:-1] if trailing else name
+    parts = normalized.split("/")
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or len(parts) > MAX_WHEEL_PATH_COMPONENTS
+        or any(part in {"", ".", ".."} for part in parts)
     ):
-        directory = Path(current)
-        mode = directory.lstat().st_mode
-        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-            raise RuntimeError(f"managed release contains an unsafe directory: {directory}")
-        directory.resolve(strict=True).relative_to(resolved_root)
-        if frozen and stat.S_IMODE(mode) != 0o555:
-            raise RuntimeError(
-                f"managed frozen directory is writable or has wrong mode: {directory}"
+        raise RuntimeError(f"unsafe wheel member path: {name!r}")
+    if "/".join(parts) != normalized:
+        raise RuntimeError(f"non-canonical wheel member path: {name!r}")
+    return normalized
+
+
+def record_digest_hex(value, name):
+    match = re.fullmatch(r"sha256=([A-Za-z0-9_-]{43})", value)
+    if match is None:
+        raise RuntimeError(f"wheel RECORD SHA-256 is invalid: {name}")
+    decoded = base64.urlsafe_b64decode(match.group(1) + "=")
+    if len(decoded) != hashlib.sha256().digest_size:
+        raise RuntimeError(f"wheel RECORD SHA-256 is invalid: {name}")
+    return decoded.hex()
+
+
+def validate_site_manifest(value, *, release_id, wheel_sha256):
+    if not isinstance(value, dict):
+        raise RuntimeError("installed site manifest is not an object")
+    expected_fields = {"schema", "release_id", "wheel_sha256", "directories", "files"}
+    if set(value) != expected_fields:
+        raise RuntimeError("installed site manifest fields differ from schema")
+    if value["schema"] != SITE_MANIFEST_SCHEMA:
+        raise RuntimeError("installed site manifest schema is unsupported")
+    if value["release_id"] != release_id:
+        raise RuntimeError("installed site manifest release id mismatch")
+    if value["wheel_sha256"] != wheel_sha256:
+        raise RuntimeError("installed site manifest wheel mismatch")
+    directories = value["directories"]
+    if not isinstance(directories, list) or not directories or len(directories) > MAX_SITE_DIRECTORIES:
+        raise RuntimeError("installed site manifest directory count is unsafe")
+    if any(not isinstance(item, str) for item in directories):
+        raise RuntimeError("installed site manifest directory path is invalid")
+    if directories != sorted(set(directories)) or "." not in directories:
+        raise RuntimeError("installed site manifest directories are not canonical")
+    directory_set = set(directories)
+    for name in directories:
+        if name == ".":
+            continue
+        safe_member(name)
+        if PurePosixPath(name).parent.as_posix() not in directory_set:
+            raise RuntimeError("installed site manifest directory parent is missing")
+    files = value["files"]
+    if not isinstance(files, list) or not files or len(files) > MAX_WHEEL_ENTRIES:
+        raise RuntimeError("installed site manifest file count is unsafe")
+    names = []
+    total_size = 0
+    for row in files:
+        if not isinstance(row, list) or len(row) != 3:
+            raise RuntimeError("installed site manifest file row is invalid")
+        name, digest, size = row
+        if not isinstance(name, str):
+            raise RuntimeError("installed site manifest file path is invalid")
+        safe_member(name)
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise RuntimeError(f"installed site manifest digest is invalid: {name}")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise RuntimeError(f"installed site manifest size is invalid: {name}")
+        if PurePosixPath(name).parent.as_posix() not in directory_set:
+            raise RuntimeError(f"installed site manifest file parent is missing: {name}")
+        total_size += size
+        if total_size > MAX_WHEEL_BYTES:
+            raise RuntimeError("installed site manifest total size is unsafe")
+        names.append(name)
+    if names != sorted(names) or len(names) != len(set(names)):
+        raise RuntimeError("installed site manifest file paths are not canonical")
+    if len(canonical(value)) > MAX_SITE_MANIFEST_BYTES:
+        raise RuntimeError("installed site manifest exceeds the safety limit")
+    return value
+
+
+def site_manifest_from_wheel(path, *, release_id, expected_sha256, expected_size):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) & 0o222:
+            raise RuntimeError("managed wheel is writable, linked, or unsafe")
+        if before.st_size != expected_size or before.st_size > MAX_WHEEL_BYTES:
+            raise RuntimeError("managed wheel artifact failed size verification")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            digest = hashlib.sha256()
+            remaining = before.st_size
+            while remaining:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise RuntimeError("managed wheel changed while being hashed")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if handle.read(1) or digest.hexdigest() != expected_sha256:
+                raise RuntimeError("managed wheel artifact failed size/SHA-256 verification")
+            handle.seek(0)
+            with zipfile.ZipFile(handle) as archive:
+                infos = archive.infolist()
+                if not infos or len(infos) > MAX_WHEEL_ENTRIES:
+                    raise RuntimeError("managed wheel entry count is unsafe")
+                names = set()
+                files = set()
+                file_infos = {}
+                directories = {"."}
+                total_size = 0
+                for info in infos:
+                    name = safe_member(info.filename)
+                    if name in names:
+                        raise RuntimeError(f"managed wheel contains duplicate member: {name}")
+                    names.add(name)
+                    if info.flag_bits & 0x1 or info.file_size < 0 or info.file_size > 128 * 1024 * 1024:
+                        raise RuntimeError(f"managed wheel member is unsafe: {name}")
+                    total_size += info.file_size
+                    if total_size > MAX_WHEEL_BYTES:
+                        raise RuntimeError("managed wheel uncompressed size exceeds safety limit")
+                    if info.is_dir():
+                        directories.add(name)
+                    else:
+                        files.add(name)
+                        file_infos[name] = info
+                    parent = PurePosixPath(name).parent
+                    while parent.as_posix() != ".":
+                        directories.add(parent.as_posix())
+                        if len(directories) > MAX_SITE_DIRECTORIES:
+                            raise RuntimeError("managed wheel directory count is unsafe")
+                        parent = parent.parent
+                records = sorted(name for name in files if name.endswith(".dist-info/RECORD"))
+                if len(records) != 1:
+                    raise RuntimeError("managed wheel must contain exactly one RECORD")
+                record_name = records[0]
+                if file_infos[record_name].file_size > MAX_SITE_MANIFEST_BYTES:
+                    raise RuntimeError("managed wheel RECORD exceeds the safety limit")
+                record_bytes = archive.read(record_name)
+                if len(record_bytes) > MAX_SITE_MANIFEST_BYTES:
+                    raise RuntimeError("managed wheel RECORD exceeds the safety limit")
+                pinned_members = {}
+                for name in sorted(files):
+                    info = file_infos[name]
+                    content = archive.read(info)
+                    if len(content) != info.file_size:
+                        raise RuntimeError(f"managed wheel member changed size: {name}")
+                    mode = (info.external_attr >> 16) & 0xFFFF
+                    pinned_members[name] = (content, bool(mode & 0o111))
+        try:
+            record_text = record_bytes.decode("utf-8")
+            rows = list(csv.reader(io.StringIO(record_text)))
+        except (UnicodeDecodeError, csv.Error) as exc:
+            raise RuntimeError(f"managed wheel RECORD is invalid: {exc}") from exc
+        record_map = {}
+        for row in rows:
+            if len(row) != 3:
+                raise RuntimeError("managed wheel RECORD row is malformed")
+            name, digest_value, size_text = row
+            name = safe_member(name)
+            if name in record_map:
+                raise RuntimeError(f"managed wheel RECORD path is duplicated: {name}")
+            record_map[name] = (digest_value, size_text)
+        if set(record_map) != files:
+            raise RuntimeError("managed wheel RECORD coverage differs from archive")
+        file_rows = []
+        for name in sorted(files):
+            digest_value, size_text = record_map[name]
+            if name == record_name:
+                if digest_value or size_text:
+                    raise RuntimeError("managed wheel RECORD self-row is not empty")
+                file_rows.append([name, digest_bytes(record_bytes), len(record_bytes)])
+                continue
+            if not size_text.isdecimal() or str(int(size_text)) != size_text:
+                raise RuntimeError(f"managed wheel RECORD size is invalid: {name}")
+            file_rows.append([name, record_digest_hex(digest_value, name), int(size_text)])
+        after = os.fstat(descriptor)
+        path_after = os.stat(path, follow_symlinks=False)
+        identity = lambda entry: (
+            entry.st_dev,
+            entry.st_ino,
+            entry.st_size,
+            entry.st_mtime_ns,
+            entry.st_ctime_ns,
+        )
+        if identity(after) != identity(before) or identity(path_after) != identity(before):
+            raise RuntimeError("managed wheel changed while being verified")
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"managed wheel is invalid: {exc}") from exc
+    finally:
+        os.close(descriptor)
+    return (
+        validate_site_manifest(
+            {
+                "schema": SITE_MANIFEST_SCHEMA,
+                "release_id": release_id,
+                "wheel_sha256": expected_sha256,
+                "directories": sorted(directories),
+                "files": file_rows,
+            },
+            release_id=release_id,
+            wheel_sha256=expected_sha256,
+        ),
+        pinned_members,
+    )
+
+
+def verify_installed_site(site, site_manifest, *, frozen):
+    site_root = site.resolve(strict=True)
+    directories = set(site_manifest["directories"])
+    children = {name: {} for name in directories}
+    for name in directories:
+        if name == ".":
+            continue
+        parent = PurePosixPath(name).parent.as_posix()
+        child = PurePosixPath(name).name
+        if child in children[parent]:
+            raise RuntimeError(f"installed site path collision: {name}")
+        children[parent][child] = "directory"
+    for name, _digest, _size in site_manifest["files"]:
+        parent = PurePosixPath(name).parent.as_posix()
+        child = PurePosixPath(name).name
+        if child in children[parent]:
+            raise RuntimeError(f"installed site path collision: {name}")
+        children[parent][child] = "file"
+    for name in sorted(directories, key=lambda value: (value.count("/"), value)):
+        target = site if name == "." else site.joinpath(*PurePosixPath(name).parts)
+        entry = target.lstat()
+        if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+            raise RuntimeError(f"installed site directory is unsafe: {name}")
+        target.resolve(strict=True).relative_to(site_root)
+        if frozen and stat.S_IMODE(entry.st_mode) != 0o555:
+            raise RuntimeError(f"installed site directory is not frozen: {name}")
+        expected = children[name]
+        observed = {}
+        with os.scandir(target) as entries:
+            for index, child in enumerate(entries):
+                if index >= len(expected):
+                    raise RuntimeError(f"installed site directory contains extra entries: {name}")
+                if child.is_symlink():
+                    raise RuntimeError(f"installed site contains a symlink: {child.path}")
+                if child.is_dir(follow_symlinks=False):
+                    observed[child.name] = "directory"
+                elif child.is_file(follow_symlinks=False):
+                    observed[child.name] = "file"
+                else:
+                    raise RuntimeError(f"installed site contains a special file: {child.path}")
+        if observed != expected:
+            raise RuntimeError(f"installed site directory entries mismatch: {name}")
+    for name, expected_digest, expected_size in site_manifest["files"]:
+        target = site.joinpath(*PurePosixPath(name).parts)
+        entry = regular_file(target, "installed site member", immutable=True).lstat()
+        target.resolve(strict=True).relative_to(site_root)
+        if entry.st_size != expected_size:
+            raise RuntimeError(f"installed site member size mismatch: {name}")
+        if digest_file(target, maximum_bytes=expected_size) != expected_digest:
+            raise RuntimeError(f"installed site member SHA-256 mismatch: {name}")
+
+
+def snapshot_identity(entry):
+    return (
+        entry.st_dev,
+        entry.st_ino,
+        stat.S_IFMT(entry.st_mode),
+        stat.S_IMODE(entry.st_mode),
+        entry.st_nlink,
+        entry.st_size,
+    )
+
+
+def discard_partial_snapshot(snapshot, descriptor, files, directories):
+    descriptor_root = Path(f"/proc/self/fd/{descriptor}")
+    try:
+        for name in sorted(directories, key=lambda value: (value.count("/"), value)):
+            target = descriptor_root if name == "." else descriptor_root.joinpath(*PurePosixPath(name).parts)
+            try:
+                entry = target.lstat()
+                if not stat.S_ISLNK(entry.st_mode) and stat.S_ISDIR(entry.st_mode):
+                    target.chmod(0o700)
+            except OSError:
+                pass
+        for name in reversed(files):
+            target = descriptor_root.joinpath(*PurePosixPath(name).parts)
+            try:
+                entry = target.lstat()
+                if not stat.S_ISLNK(entry.st_mode) and stat.S_ISREG(entry.st_mode):
+                    target.unlink()
+            except OSError:
+                pass
+        for name in sorted(
+            (value for value in directories if value != "."),
+            key=lambda value: (value.count("/"), value),
+            reverse=True,
+        ):
+            try:
+                descriptor_root.joinpath(*PurePosixPath(name).parts).rmdir()
+            except OSError:
+                pass
+        try:
+            named = snapshot.lstat()
+            opened = os.fstat(descriptor)
+            if snapshot_identity(named) == snapshot_identity(opened):
+                snapshot.rmdir()
+        except OSError:
+            pass
+    finally:
+        os.close(descriptor)
+
+
+def cleanup_import_snapshot(snapshot, descriptor, files, directories, identities):
+    descriptor_root = Path(f"/proc/self/fd/{descriptor}")
+    try:
+        named_root = snapshot.lstat()
+        opened_root = os.fstat(descriptor)
+        if snapshot_identity(named_root) != identities["."]:
+            return
+        if snapshot_identity(opened_root) != identities["."]:
+            return
+        for name, expected in identities.items():
+            if name == ".":
+                continue
+            target = descriptor_root.joinpath(*PurePosixPath(name).parts)
+            if snapshot_identity(target.lstat()) != expected:
+                return
+        for name in sorted(directories, key=lambda value: (value.count("/"), value)):
+            target = descriptor_root if name == "." else descriptor_root.joinpath(*PurePosixPath(name).parts)
+            target.chmod(0o700)
+        for name in files:
+            descriptor_root.joinpath(*PurePosixPath(name).parts).unlink()
+        for name in sorted(
+            (value for value in directories if value != "."),
+            key=lambda value: (value.count("/"), value),
+            reverse=True,
+        ):
+            descriptor_root.joinpath(*PurePosixPath(name).parts).rmdir()
+        snapshot.rmdir()
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def verify_import_snapshot(
+    snapshot,
+    descriptor,
+    files,
+    directories,
+    identities,
+    *,
+    expected_device,
+):
+    descriptor_root = Path(f"/proc/self/fd/{descriptor}")
+    opened_root = os.fstat(descriptor)
+    named_root = snapshot.lstat()
+    if snapshot_identity(opened_root) != identities["."]:
+        raise RuntimeError("verified import snapshot root descriptor changed")
+    if snapshot_identity(named_root) != identities["."]:
+        raise RuntimeError("verified import snapshot root path changed")
+    if opened_root.st_dev != expected_device:
+        raise RuntimeError("verified import snapshot is not on the managed release device")
+    if descriptor_root.resolve(strict=True) != snapshot.resolve(strict=True):
+        raise RuntimeError("verified import snapshot descriptor path mismatch")
+
+    children = {name: {} for name in directories}
+    for name in directories:
+        if name == ".":
+            continue
+        parent = PurePosixPath(name).parent.as_posix()
+        children[parent][PurePosixPath(name).name] = "directory"
+    for name in files:
+        parent = PurePosixPath(name).parent.as_posix()
+        child = PurePosixPath(name).name
+        if child in children[parent]:
+            raise RuntimeError(f"verified import snapshot path collision: {name}")
+        children[parent][child] = "file"
+
+    for name in sorted(directories, key=lambda value: (value.count("/"), value)):
+        target = descriptor_root if name == "." else descriptor_root.joinpath(*PurePosixPath(name).parts)
+        entry = os.fstat(descriptor) if name == "." else target.lstat()
+        if snapshot_identity(entry) != identities[name]:
+            raise RuntimeError(f"verified import snapshot directory changed: {name}")
+        if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+            raise RuntimeError(f"verified import snapshot directory is unsafe: {name}")
+        if stat.S_IMODE(entry.st_mode) != 0o500:
+            raise RuntimeError(f"verified import snapshot directory mode is unsafe: {name}")
+        observed = {}
+        with os.scandir(target) as entries:
+            for index, child in enumerate(entries):
+                if index >= len(children[name]):
+                    raise RuntimeError(f"verified import snapshot directory has extra entries: {name}")
+                if child.is_symlink():
+                    raise RuntimeError(f"verified import snapshot contains a symlink: {child.path}")
+                if child.is_dir(follow_symlinks=False):
+                    observed[child.name] = "directory"
+                elif child.is_file(follow_symlinks=False):
+                    observed[child.name] = "file"
+                else:
+                    raise RuntimeError(f"verified import snapshot contains a special file: {child.path}")
+        if observed != children[name]:
+            raise RuntimeError(f"verified import snapshot directory entries mismatch: {name}")
+
+    for name, (content, mode, digest) in files.items():
+        target = descriptor_root.joinpath(*PurePosixPath(name).parts)
+        entry = target.lstat()
+        if snapshot_identity(entry) != identities[name]:
+            raise RuntimeError(f"verified import snapshot member changed: {name}")
+        if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
+            raise RuntimeError(f"verified import snapshot member is unsafe: {name}")
+        if stat.S_IMODE(entry.st_mode) != mode or entry.st_nlink != 1:
+            raise RuntimeError(f"verified import snapshot member mode is unsafe: {name}")
+        if digest_file(target, maximum_bytes=len(content)) != digest:
+            raise RuntimeError(f"verified import snapshot member digest mismatch: {name}")
+    return descriptor_root
+
+
+def materialize_import_snapshot(root, release, site_manifest, pinned_members):
+    manifest_rows = {
+        name: (digest, size)
+        for name, digest, size in site_manifest["files"]
+    }
+    if set(pinned_members) != set(manifest_rows):
+        raise RuntimeError("verified import bytes differ from the installed site descriptor")
+    files = {}
+    for name in sorted(pinned_members):
+        content, executable = pinned_members[name]
+        expected_digest, expected_size = manifest_rows[name]
+        if len(content) != expected_size or digest_bytes(content) != expected_digest:
+            raise RuntimeError(f"verified import bytes do not match the descriptor: {name}")
+        files[name] = (
+            content,
+            0o500 if executable else 0o400,
+            expected_digest,
+        )
+    directories = tuple(site_manifest["directories"])
+    snapshot = Path(
+        tempfile.mkdtemp(
+            prefix=f".bootstrap-import-{os.getpid()}-",
+            dir=root,
+        )
+    )
+    try:
+        descriptor = os.open(
+            snapshot,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except Exception:
+        try:
+            snapshot.rmdir()
+        except OSError:
+            pass
+        raise
+    descriptor_root = Path(f"/proc/self/fd/{descriptor}")
+    created_directories = ["."]
+    created_files = []
+    try:
+        for name in sorted(
+            (value for value in directories if value != "."),
+            key=lambda value: (value.count("/"), value),
+        ):
+            descriptor_root.joinpath(*PurePosixPath(name).parts).mkdir(mode=0o700)
+            created_directories.append(name)
+        for name, (content, mode, _digest) in files.items():
+            target = descriptor_root.joinpath(*PurePosixPath(name).parts)
+            member_descriptor = os.open(
+                target,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                mode,
             )
-        for name in directories:
-            child = directory / name
-            child_mode = child.lstat().st_mode
-            if stat.S_ISLNK(child_mode) or not stat.S_ISDIR(child_mode):
-                raise RuntimeError(f"managed release contains an unsafe directory: {child}")
+            try:
+                offset = 0
+                while offset < len(content):
+                    written = os.write(member_descriptor, content[offset:])
+                    if written <= 0:
+                        raise RuntimeError(f"could not materialize verified import member: {name}")
+                    offset += written
+                os.fchmod(member_descriptor, mode)
+            finally:
+                os.close(member_descriptor)
+            created_files.append(name)
+        for name in sorted(
+            created_directories,
+            key=lambda value: (value.count("/"), value),
+            reverse=True,
+        ):
+            target = descriptor_root if name == "." else descriptor_root.joinpath(*PurePosixPath(name).parts)
+            target.chmod(0o500)
+        identities = {".": snapshot_identity(os.fstat(descriptor))}
+        for name in created_directories:
+            if name == ".":
+                continue
+            target = descriptor_root.joinpath(*PurePosixPath(name).parts)
+            identities[name] = snapshot_identity(target.lstat())
+        for name in created_files:
+            target = descriptor_root.joinpath(*PurePosixPath(name).parts)
+            identities[name] = snapshot_identity(target.lstat())
+        import_root = verify_import_snapshot(
+            snapshot,
+            descriptor,
+            files,
+            directories,
+            identities,
+            expected_device=release.lstat().st_dev,
+        )
+    except Exception:
+        discard_partial_snapshot(snapshot, descriptor, created_files, created_directories)
+        raise
+    return snapshot, descriptor, import_root, tuple(files), directories, identities
+
+
+class SnapshotResourceReader:
+    def __init__(self, root):
+        self.root = root
+
+    def _target(self, resource):
+        if not isinstance(resource, str) or not resource or Path(resource).name != resource:
+            raise FileNotFoundError(resource)
+        return self.root / resource
+
+    def open_resource(self, resource):
+        return self._target(resource).open("rb")
+
+    def resource_path(self, resource):
+        return str(self._target(resource))
+
+    def is_resource(self, resource):
+        try:
+            entry = self._target(resource).lstat()
+        except OSError:
+            return False
+        return not stat.S_ISLNK(entry.st_mode) and stat.S_ISREG(entry.st_mode)
+
+    def contents(self):
+        with os.scandir(self.root) as entries:
+            return tuple(entry.name for entry in entries)
+
+    def files(self):
+        return self.root
+
+
+class VerifiedSnapshotImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def __init__(self, root, pinned_members):
+        self.root = root
+        self.modules = {}
+        for name, (content, _executable) in pinned_members.items():
+            if not name.startswith("termdeck/") or not name.endswith(".py"):
+                continue
+            parts = list(PurePosixPath(name).parts)
+            is_package = parts[-1] == "__init__.py"
+            module_parts = parts[:-1] if is_package else parts[:-1] + [parts[-1][:-3]]
+            if not module_parts or any(not part.isidentifier() for part in module_parts):
+                continue
+            fullname = ".".join(module_parts)
+            if fullname in self.modules:
+                raise RuntimeError(f"verified import module path collision: {fullname}")
+            self.modules[fullname] = (name, content, is_package)
+        package = self.modules.get("termdeck")
+        if package is None or not package[2]:
+            raise RuntimeError("verified import bytes have no termdeck package")
+
+    def find_spec(self, fullname, path=None, target=None):
+        record = self.modules.get(fullname)
+        if record is None:
+            if fullname == "termdeck" or fullname.startswith("termdeck."):
+                raise ModuleNotFoundError(f"module is absent from verified import bytes: {fullname}")
+            return None
+        name, _content, is_package = record
+        spec = importlib.util.spec_from_loader(
+            fullname,
+            self,
+            is_package=is_package,
+        )
+        if spec is None:
+            raise ImportError(f"could not create verified import spec: {fullname}")
+        spec.cached = None
+        if is_package:
+            spec.submodule_search_locations = [
+                str(self.root.joinpath(*PurePosixPath(name).parent.parts))
+            ]
+        return spec
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        name, content, _is_package = self.modules[module.__name__]
+        filename = str(self.root.joinpath(*PurePosixPath(name).parts))
+        code = compile(content, filename, "exec", dont_inherit=True)
+        exec(code, module.__dict__)
+
+    def get_filename(self, fullname):
+        name, _content, _is_package = self.modules[fullname]
+        return str(self.root.joinpath(*PurePosixPath(name).parts))
+
+    def get_resource_reader(self, fullname):
+        name, _content, is_package = self.modules.get(fullname, (None, None, False))
+        if not is_package or not isinstance(name, str):
+            return None
+        return SnapshotResourceReader(
+            self.root.joinpath(*PurePosixPath(name).parent.parts)
+        )
+
+
+def validate_release_verification(receipt, *, release_id, manifest, manifest_bytes):
+    if not isinstance(receipt, dict):
+        raise RuntimeError("release verification receipt is not an object")
+    expected_fields = {
+        "schema",
+        "release_id",
+        "manifest_sha256",
+        "wheel_sha256",
+        "wheel_size",
+        "installed_members",
+        "installed_directories",
+        "site_directories",
+        "frozen_directories",
+        "site_manifest",
+        "site_manifest_sha256",
+        "method",
+    }
+    if set(receipt) != expected_fields:
+        raise RuntimeError("release verification receipt fields differ from schema")
+    if receipt["schema"] != RELEASE_VERIFICATION_SCHEMA:
+        raise RuntimeError("release verification receipt schema is unsupported")
+    if receipt["release_id"] != release_id:
+        raise RuntimeError("release verification receipt release id mismatch")
+    if receipt["manifest_sha256"] != digest_bytes(manifest_bytes):
+        raise RuntimeError("release verification receipt manifest mismatch")
+    if receipt["wheel_sha256"] != manifest.get("wheel_sha256"):
+        raise RuntimeError("release verification receipt wheel mismatch")
+    if receipt["wheel_size"] != manifest.get("wheel_size"):
+        raise RuntimeError("release verification receipt wheel size mismatch")
+    for field in ("manifest_sha256", "wheel_sha256"):
+        if not isinstance(receipt[field], str) or re.fullmatch(r"[0-9a-f]{64}", receipt[field]) is None:
+            raise RuntimeError(f"release verification receipt {field} is invalid")
+    for field in ("wheel_size", "installed_members", "installed_directories", "site_directories"):
+        value = receipt[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise RuntimeError(f"release verification receipt {field} is invalid")
+    if receipt["installed_directories"] != receipt["site_directories"] + 2:
+        raise RuntimeError("release verification receipt directory count mismatch")
+    if not isinstance(receipt["frozen_directories"], bool):
+        raise RuntimeError("release verification receipt frozen policy is invalid")
+    if receipt["frozen_directories"] != frozen_directories_required(manifest.get("build_info")):
+        raise RuntimeError("release verification receipt frozen policy mismatch")
+    site_manifest = validate_site_manifest(
+        receipt["site_manifest"],
+        release_id=release_id,
+        wheel_sha256=receipt["wheel_sha256"],
+    )
+    if len(site_manifest["files"]) != receipt["installed_members"]:
+        raise RuntimeError("release verification receipt site member count mismatch")
+    if len(site_manifest["directories"]) != receipt["site_directories"]:
+        raise RuntimeError("release verification receipt site directory count mismatch")
+    site_manifest_sha256 = receipt["site_manifest_sha256"]
+    if not isinstance(site_manifest_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", site_manifest_sha256) is None:
+        raise RuntimeError("release verification receipt site manifest digest is invalid")
+    if digest_bytes(canonical(site_manifest)) != site_manifest_sha256:
+        raise RuntimeError("release verification receipt site manifest digest mismatch")
+    if receipt["method"] != "full-records-site-manifest-v2":
+        raise RuntimeError("release verification receipt method is unsupported")
+    return site_manifest
 
 
 try:
     regular_file(STATE, "managed state")
-    raw_state = STATE.read_bytes()
+    raw_state = bounded_bytes(STATE, "managed state", MAX_MANIFEST_BYTES)
     state = json.loads(raw_state.decode("utf-8"))
     if canonical(state) != raw_state:
         raise RuntimeError("managed state is not canonical")
@@ -2321,13 +3652,13 @@ try:
     )
     if bootstrap.resolve(strict=True) != expected_bootstrap.resolve(strict=True):
         raise RuntimeError("managed bootstrap path mismatch")
-    if digest_file(bootstrap) != state["bootstrap_sha256"]:
+    if digest_file(bootstrap, maximum_bytes=MAX_RUNTIME_BYTES) != state["bootstrap_sha256"]:
         raise RuntimeError("managed bootstrap SHA-256 mismatch")
     launcher = Path(state.get("launcher_path", ""))
     if not launcher.is_absolute():
         raise RuntimeError("managed launcher path is not absolute")
     regular_file(launcher, "managed launcher", executable=True)
-    if digest_file(launcher) != state["launcher_sha256"]:
+    if digest_file(launcher, maximum_bytes=MAX_RUNTIME_BYTES) != state["launcher_sha256"]:
         raise RuntimeError("managed launcher SHA-256 mismatch")
 
     releases_root = real_directory(ROOT / "releases", "managed releases root")
@@ -2337,7 +3668,7 @@ try:
     manifest_path = regular_file(
         release / "manifest.json", "managed manifest", immutable=True
     )
-    manifest_bytes = manifest_path.read_bytes()
+    manifest_bytes = bounded_bytes(manifest_path, "managed manifest", MAX_MANIFEST_BYTES)
     if digest_bytes(manifest_bytes) != state.get("manifest_sha256"):
         raise RuntimeError("managed manifest does not match state.json")
     manifest = json.loads(manifest_bytes.decode("utf-8"))
@@ -2366,11 +3697,12 @@ try:
     }
     if digest_bytes(canonical(build_fields)) != build_info.get("build_id"):
         raise RuntimeError("managed build_id mismatch")
-    frozen_directories = frozen_directories_required(build_info)
-    verify_release_directories(release, frozen=frozen_directories)
     wheel_hash = manifest.get("wheel_sha256")
     if not isinstance(wheel_hash, str) or re.fullmatch(r"[0-9a-f]{64}", wheel_hash) is None:
         raise RuntimeError("managed wheel SHA-256 is invalid")
+    wheel_size = manifest.get("wheel_size")
+    if isinstance(wheel_size, bool) or not isinstance(wheel_size, int) or wheel_size <= 0:
+        raise RuntimeError("managed wheel size is invalid")
     expected_release = digest_bytes(
         canonical({"build_id": build_info.get("build_id"), "wheel_sha256": wheel_hash})
     )
@@ -2380,66 +3712,84 @@ try:
     wheel_name = manifest.get("wheel")
     if not isinstance(wheel_name, str) or Path(wheel_name).name != wheel_name:
         raise RuntimeError("managed wheel name is unsafe")
-    wheel = regular_file(
-        release / "artifacts" / wheel_name, "managed wheel", immutable=True
+    exact_directory_entries(
+        release,
+        "managed release",
+        {"site", "artifacts", "manifest.json"},
     )
-    if wheel.stat().st_size != manifest.get("wheel_size") or digest_file(wheel) != wheel_hash:
-        raise RuntimeError("managed wheel artifact failed size/SHA-256 verification")
+    artifacts = real_directory(release / "artifacts", "managed release artifacts")
+    exact_directory_entries(
+        artifacts,
+        "managed release artifacts",
+        {wheel_name},
+    )
+    wheel = regular_file(
+        artifacts / wheel_name, "managed wheel", immutable=True
+    )
+    expected_site_manifest, pinned_members = site_manifest_from_wheel(
+        wheel,
+        release_id=release_id,
+        expected_sha256=wheel_hash,
+        expected_size=wheel_size,
+    )
 
     site = real_directory(release / "site", "managed release site")
+    if frozen_directories_required(build_info):
+        for directory, label in (
+            (release, "managed release"),
+            (artifacts, "managed release artifacts"),
+            (site, "managed release site"),
+        ):
+            if stat.S_IMODE(directory.lstat().st_mode) != 0o555:
+                raise RuntimeError(f"{label} is not frozen")
     build_info_path = regular_file(
         site / "termdeck" / "_build_info.json",
         "bundled build info",
         immutable=True,
     )
-    if json.loads(build_info_path.read_text(encoding="utf-8")) != build_info:
-        raise RuntimeError("bundled build info does not match the manifest")
-    records = sorted(site.glob("*.dist-info/RECORD"))
-    if len(records) != 1:
-        raise RuntimeError("managed site must contain exactly one wheel RECORD")
-    record_path = regular_file(
-        records[0], "managed wheel RECORD", immutable=True
+    build_info_bytes = bounded_bytes(
+        build_info_path,
+        "bundled build info",
+        MAX_MANIFEST_BYTES,
     )
-    record_name = record_path.relative_to(site).as_posix()
-    rows = list(csv.reader(io.StringIO(record_path.read_text(encoding="utf-8"))))
-    expected_files = set()
-    for row in rows:
-        if len(row) != 3:
-            raise RuntimeError("managed RECORD row is malformed")
-        name, expected_hash, expected_size = row
-        pure = safe_member(name)
-        target = regular_file(
-            site.joinpath(*pure.parts), "managed RECORD member", immutable=True
-        )
-        resolved = target.resolve(strict=True)
-        resolved.relative_to(site)
-        expected_files.add(name)
-        content = target.read_bytes()
-        if name == record_name:
-            if expected_hash or expected_size:
-                raise RuntimeError("managed RECORD self-row is not empty")
-            continue
-        if record_hash(content) != expected_hash or str(len(content)) != expected_size:
-            raise RuntimeError(f"managed RECORD verification failed: {name}")
-    actual_files = set()
-    for current, directories, names in os.walk(site, topdown=True, followlinks=False):
-        directory = Path(current)
-        directory.resolve(strict=True).relative_to(site)
-        for name in directories:
-            child = directory / name
-            mode = child.lstat().st_mode
-            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-                raise RuntimeError(f"managed site contains an unsafe directory: {child}")
-        for name in names:
-            child = regular_file(
-                directory / name, "managed site member", immutable=True
-            )
-            child.resolve(strict=True).relative_to(site)
-            actual_files.add(child.relative_to(site).as_posix())
-    if actual_files != expected_files:
-        raise RuntimeError("managed site file set differs from wheel RECORD")
+    try:
+        bundled_build_info = json.loads(build_info_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"bundled build info is invalid: {exc}") from exc
+    if bundled_build_info != build_info:
+        raise RuntimeError("bundled build info does not match the manifest")
+    verification_path = ROOT / f"verification-{release_id}.json"
+    regular_file(
+        verification_path,
+        "release verification receipt",
+        immutable=True,
+    )
+    verification_bytes = bounded_bytes(
+        verification_path,
+        "release verification receipt",
+        MAX_RELEASE_VERIFICATION_BYTES,
+    )
+    try:
+        verification = json.loads(verification_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"release verification receipt is invalid: {exc}") from exc
+    if canonical(verification) != verification_bytes:
+        raise RuntimeError("release verification receipt is not canonical")
+    site_manifest = validate_release_verification(
+        verification,
+        release_id=release_id,
+        manifest=manifest,
+        manifest_bytes=manifest_bytes,
+    )
+    if site_manifest != expected_site_manifest:
+        raise RuntimeError("release verification receipt is not derived from the managed wheel")
+    verify_installed_site(
+        site,
+        site_manifest,
+        frozen=frozen_directories_required(build_info),
+    )
 
-    latest_state = regular_file(STATE, "managed state").read_bytes()
+    latest_state = bounded_bytes(STATE, "managed state", MAX_MANIFEST_BYTES)
     if latest_state != raw_state:
         try:
             retry = int(os.environ.get("T1000_BOOTSTRAP_STATE_RETRY", "0"))
@@ -2458,6 +3808,27 @@ try:
                 *sys.argv[1:],
             ],
         )
+    (
+        import_snapshot,
+        import_snapshot_descriptor,
+        import_root,
+        import_snapshot_files,
+        import_snapshot_directories,
+        import_snapshot_identities,
+    ) = materialize_import_snapshot(
+        ROOT,
+        release,
+        site_manifest,
+        pinned_members,
+    )
+    atexit.register(
+        cleanup_import_snapshot,
+        import_snapshot,
+        import_snapshot_descriptor,
+        import_snapshot_files,
+        import_snapshot_directories,
+        import_snapshot_identities,
+    )
 except Exception as exc:
     print(f"t1000 managed launcher refused an invalid release: {exc}", file=sys.stderr)
     raise SystemExit(78)
@@ -2467,7 +3838,10 @@ os.environ["T1000_MANAGED_ROOT"] = str(ROOT)
 os.environ["T1000_MANAGED_BIN_DIR"] = str(launcher.parent)
 os.environ["T1000_RELEASE_MANIFEST"] = str(manifest_path)
 os.environ["T1000_RELEASE_STATE"] = str(STATE)
-sys.path.insert(0, str(site))
+verified_snapshot_importer = VerifiedSnapshotImporter(import_root, pinned_members)
+sys.meta_path.insert(0, verified_snapshot_importer)
+sys.path.insert(0, str(import_root))
+del pinned_members
 try:
     from termdeck.storage_fabric import require_hot_storage
     require_hot_storage(
@@ -2812,6 +4186,538 @@ def _verified_release_activation_bundle(
     return _derive_release_activation_bundle(layout, release_id, interpreter)
 
 
+def _canonical_production_launcher_path() -> Path:
+    from .desktop_integration import MANAGED_LAUNCHER
+
+    return MANAGED_LAUNCHER
+
+
+def _production_autostart_path() -> Path:
+    from .desktop_integration import desktop_paths
+
+    path = desktop_paths().autostart_file.absolute()
+    if path.name != _AUTOSTART_DESCRIPTOR_NAME:
+        raise ReleaseError("production autostart descriptor name is not canonical")
+    return path
+
+
+def _production_autostart_receipt_path(layout: ReleaseLayout) -> Path:
+    return layout.root / _AUTOSTART_RECEIPT_NAME
+
+
+def _production_manages_autostart(
+    layout: ReleaseLayout,
+    *,
+    production: bool,
+) -> bool:
+    if not production or not _is_canonical_production_root(layout.root):
+        return False
+    expected_launcher = _canonical_production_launcher_path()
+    if layout.launcher_path != expected_launcher:
+        raise ReleaseError(
+            "the canonical production root requires the stable launcher at "
+            f"{expected_launcher}"
+        )
+    return True
+
+
+def _canonical_production_autostart_descriptor(layout: ReleaseLayout) -> bytes:
+    expected_launcher = _canonical_production_launcher_path()
+    if layout.launcher_path != expected_launcher:
+        raise ReleaseError("production autostart cannot target a non-canonical launcher")
+    from .desktop_integration import _build_autostart_entry_for_launcher
+
+    content = _build_autostart_entry_for_launcher(expected_launcher).encode("utf-8")
+    if (
+        not content
+        or len(content) > _MAX_AUTOSTART_DESCRIPTOR_BYTES
+        or b"\x00" in content
+        or b"\r" in content
+        or not content.endswith(b"\n")
+    ):
+        raise ReleaseError("production autostart descriptor bytes are not canonical LF-only text")
+    lines = content.decode("utf-8").splitlines()
+    required = {
+        f"Exec={expected_launcher} gui",
+        f"TryExec={expected_launcher}",
+        f"X-T1000-Managed-Launcher={expected_launcher}",
+    }
+    if any(lines.count(line) != 1 for line in required):
+        raise ReleaseError("production autostart descriptor has the wrong launcher contract")
+    return content
+
+
+def _bounded_file_snapshot(
+    path: Path,
+    *,
+    label: str,
+    maximum_bytes: int,
+) -> _FileSnapshot:
+    if not _path_lexists(path):
+        return _FileSnapshot(False)
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise ReleaseError(f"could not inspect {label}: {path}: {exc}") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ReleaseError(f"{label} is not a regular file: {path}")
+    content = _read_regular_file_bytes(
+        path,
+        label=label,
+        maximum_bytes=maximum_bytes,
+    )
+    try:
+        after = path.lstat()
+    except OSError as exc:
+        raise ReleaseError(f"could not revalidate {label}: {path}: {exc}") from exc
+    identity = lambda entry: (
+        entry.st_dev,
+        entry.st_ino,
+        entry.st_mode,
+        entry.st_uid,
+        entry.st_nlink,
+        entry.st_size,
+        entry.st_mtime_ns,
+        entry.st_ctime_ns,
+    )
+    if identity(before) != identity(after):
+        raise ReleaseError(f"{label} changed while being captured: {path}")
+    return _FileSnapshot(True, content, stat.S_IMODE(after.st_mode))
+
+
+def _private_regular_snapshot(
+    path: Path,
+    *,
+    label: str,
+    maximum_bytes: int,
+) -> _FileSnapshot:
+    snapshot = _bounded_file_snapshot(
+        path,
+        label=label,
+        maximum_bytes=maximum_bytes,
+    )
+    if not snapshot.exists:
+        return snapshot
+    metadata = path.lstat()
+    if (
+        metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or snapshot.mode != 0o600
+    ):
+        raise ReleaseError(f"{label} is not a private user-owned 0600 file: {path}")
+    return snapshot
+
+
+def _validate_autostart_prior_descriptor(
+    value: object,
+    *,
+    layout: ReleaseLayout,
+    descriptor_path: Path,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ReleaseError("autostart receipt prior descriptor is invalid")
+    prior = {str(key): item for key, item in value.items()}
+    if set(prior) != {"backup_path", "mode", "sha256", "size", "source_path"}:
+        raise ReleaseError("autostart receipt prior descriptor fields are invalid")
+    if prior["source_path"] != str(descriptor_path):
+        raise ReleaseError("autostart receipt prior descriptor path mismatch")
+    digest = prior["sha256"]
+    size = prior["size"]
+    mode = prior["mode"]
+    backup_path = prior["backup_path"]
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ReleaseError("autostart receipt prior descriptor digest is invalid")
+    if (
+        isinstance(size, bool)
+        or not isinstance(size, int)
+        or not 0 <= size <= _MAX_AUTOSTART_DESCRIPTOR_BYTES
+    ):
+        raise ReleaseError("autostart receipt prior descriptor size is invalid")
+    if isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 0o777:
+        raise ReleaseError("autostart receipt prior descriptor mode is invalid")
+    if not isinstance(backup_path, str) or not Path(backup_path).is_absolute():
+        raise ReleaseError("autostart receipt prior descriptor backup path is invalid")
+    backup = Path(backup_path)
+    try:
+        backup.resolve(strict=True).relative_to(layout.legacy_dir.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise ReleaseError(
+            "autostart prior descriptor backup escaped the legacy directory"
+        ) from exc
+    snapshot = _private_regular_snapshot(
+        backup,
+        label="autostart prior descriptor backup",
+        maximum_bytes=_MAX_AUTOSTART_DESCRIPTOR_BYTES,
+    )
+    if (
+        not snapshot.exists
+        or len(snapshot.content) != size
+        or sha256_bytes(snapshot.content) != digest
+    ):
+        raise ReleaseError("autostart prior descriptor backup does not match its receipt")
+    return {
+        "backup_path": str(backup),
+        "mode": mode,
+        "sha256": digest,
+        "size": size,
+        "source_path": str(descriptor_path),
+    }
+
+
+def _validate_autostart_receipt(
+    value: object,
+    *,
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    descriptor_path: Path,
+    descriptor: bytes,
+    bind_state: bool = True,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ReleaseError("production autostart receipt is not an object")
+    receipt = {str(key): item for key, item in value.items()}
+    expected_fields = {
+        "schema",
+        "status",
+        "active_release_id",
+        "state_generation",
+        "state_sha256",
+        "descriptor_path",
+        "descriptor_sha256",
+        "descriptor_size",
+        "launcher_path",
+        "launcher_sha256",
+        "prior_descriptor",
+    }
+    if set(receipt) != expected_fields:
+        raise ReleaseError("production autostart receipt fields differ from schema")
+    if receipt["schema"] != _AUTOSTART_RECEIPT_SCHEMA:
+        raise ReleaseError("production autostart receipt schema is unsupported")
+    receipt_release_id = receipt["active_release_id"]
+    if receipt_release_id is not None and (
+        not isinstance(receipt_release_id, str)
+        or _RELEASE_ID.fullmatch(receipt_release_id) is None
+    ):
+        raise ReleaseError("production autostart receipt active release is invalid")
+    expected_status = "managed" if receipt_release_id is not None else "legacy-degraded"
+    if receipt["status"] != expected_status:
+        raise ReleaseError("production autostart receipt status mismatch")
+    state_generation = receipt["state_generation"]
+    if (
+        isinstance(state_generation, bool)
+        or not isinstance(state_generation, int)
+        or state_generation < 0
+    ):
+        raise ReleaseError("production autostart receipt state generation is invalid")
+    state_sha256 = receipt["state_sha256"]
+    if (
+        not isinstance(state_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", state_sha256) is None
+    ):
+        raise ReleaseError("production autostart receipt managed-state digest is invalid")
+    if bind_state:
+        if receipt_release_id != state.get("current_release_id"):
+            raise ReleaseError("production autostart receipt active release mismatch")
+        if state_generation != state.get("generation"):
+            raise ReleaseError("production autostart receipt state generation mismatch")
+        expected_state_sha256 = sha256_bytes(canonical_json_bytes(state))
+        if state_sha256 != expected_state_sha256:
+            raise ReleaseError("production autostart receipt managed-state digest mismatch")
+    if receipt["descriptor_path"] != str(descriptor_path):
+        raise ReleaseError("production autostart receipt descriptor path mismatch")
+    descriptor_sha256 = sha256_bytes(descriptor)
+    if receipt["descriptor_sha256"] != descriptor_sha256:
+        raise ReleaseError("production autostart receipt descriptor digest mismatch")
+    if receipt["descriptor_size"] != len(descriptor):
+        raise ReleaseError("production autostart receipt descriptor size mismatch")
+    if receipt["launcher_path"] != str(layout.launcher_path):
+        raise ReleaseError("production autostart receipt launcher path mismatch")
+    observed_launcher_sha256 = receipt["launcher_sha256"]
+    if (
+        not isinstance(observed_launcher_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", observed_launcher_sha256) is None
+    ):
+        raise ReleaseError("production autostart receipt launcher digest is invalid")
+    if bind_state and observed_launcher_sha256 != state.get("launcher_sha256"):
+        raise ReleaseError("production autostart receipt launcher digest mismatch")
+    receipt["prior_descriptor"] = _validate_autostart_prior_descriptor(
+        receipt["prior_descriptor"],
+        layout=layout,
+        descriptor_path=descriptor_path,
+    )
+    return {key: receipt[key] for key in sorted(receipt)}
+
+
+def _read_autostart_receipt(
+    layout: ReleaseLayout,
+    *,
+    state: Mapping[str, object],
+    descriptor_path: Path,
+    descriptor: bytes,
+    bind_state: bool = True,
+) -> dict[str, object]:
+    receipt_path = _production_autostart_receipt_path(layout)
+    snapshot = _private_regular_snapshot(
+        receipt_path,
+        label="production autostart receipt",
+        maximum_bytes=_MAX_AUTOSTART_RECEIPT_BYTES,
+    )
+    if not snapshot.exists:
+        raise ReleaseError("production autostart receipt is missing")
+    try:
+        value = json.loads(snapshot.content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"production autostart receipt is invalid: {exc}") from exc
+    if snapshot.content != canonical_json_bytes(value):
+        raise ReleaseError("production autostart receipt is not canonical")
+    return _validate_autostart_receipt(
+        value,
+        layout=layout,
+        state=state,
+        descriptor_path=descriptor_path,
+        descriptor=descriptor,
+        bind_state=bind_state,
+    )
+
+
+def _backup_autostart_descriptor(
+    layout: ReleaseLayout,
+    descriptor_path: Path,
+    *,
+    snapshot: _FileSnapshot | None = None,
+) -> dict[str, object] | None:
+    if snapshot is None:
+        snapshot = _bounded_file_snapshot(
+            descriptor_path,
+            label="existing production autostart descriptor",
+            maximum_bytes=_MAX_AUTOSTART_DESCRIPTOR_BYTES,
+        )
+    if not snapshot.exists:
+        return None
+    metadata = descriptor_path.lstat()
+    if (
+        metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or snapshot.mode & 0o022
+    ):
+        raise ReleaseError("existing production autostart descriptor is not safely owned")
+    digest = sha256_bytes(snapshot.content)
+    layout.legacy_dir.mkdir(parents=True, exist_ok=True)
+    legacy_mode = layout.legacy_dir.lstat().st_mode
+    if stat.S_ISLNK(legacy_mode) or not stat.S_ISDIR(legacy_mode):
+        raise ReleaseError("legacy descriptor directory is not a real directory")
+    backup = layout.legacy_dir / f"autostart-{digest}.desktop"
+    if _path_lexists(backup):
+        existing = _private_regular_snapshot(
+            backup,
+            label="autostart prior descriptor backup",
+            maximum_bytes=_MAX_AUTOSTART_DESCRIPTOR_BYTES,
+        )
+        if not existing.exists or existing.content != snapshot.content:
+            raise ReleaseError("autostart prior descriptor backup path has different bytes")
+    else:
+        _atomic_write_bytes(backup, snapshot.content, mode=0o600)
+    return {
+        "backup_path": str(backup),
+        "mode": snapshot.mode,
+        "sha256": digest,
+        "size": len(snapshot.content),
+        "source_path": str(descriptor_path),
+    }
+
+
+def _autostart_descriptor_matches(path: Path, expected: bytes) -> bool:
+    snapshot = _bounded_file_snapshot(
+        path,
+        label="production autostart descriptor",
+        maximum_bytes=_MAX_AUTOSTART_DESCRIPTOR_BYTES,
+    )
+    if not snapshot.exists:
+        return False
+    metadata = path.lstat()
+    return bool(
+        snapshot.content == expected
+        and snapshot.mode == 0o644
+        and metadata.st_uid == os.geteuid()
+        and metadata.st_nlink == 1
+    )
+
+
+def _prepare_production_autostart_publication(
+    layout: ReleaseLayout,
+    *,
+    prior_state: Mapping[str, object],
+    state: Mapping[str, object],
+) -> _AutostartPublication:
+    descriptor_path = _production_autostart_path()
+    receipt_path = _production_autostart_receipt_path(layout)
+    descriptor = _canonical_production_autostart_descriptor(layout)
+    descriptor_preimage = _bounded_file_snapshot(
+        descriptor_path,
+        label="existing production autostart descriptor",
+        maximum_bytes=_MAX_AUTOSTART_DESCRIPTOR_BYTES,
+    )
+    receipt_preimage = _private_regular_snapshot(
+        receipt_path,
+        label="production autostart receipt",
+        maximum_bytes=_MAX_AUTOSTART_RECEIPT_BYTES,
+    )
+    existing_receipt: dict[str, object] | None = None
+    if receipt_preimage.exists:
+        existing_receipt = _read_autostart_receipt(
+            layout,
+            state=prior_state,
+            descriptor_path=descriptor_path,
+            descriptor=descriptor,
+        )
+        if receipt_preimage.content != canonical_json_bytes(existing_receipt):
+            raise ReleaseError("production autostart receipt changed while being prepared")
+        prior_descriptor = existing_receipt["prior_descriptor"]
+    else:
+        if int(prior_state.get("generation", 0)) > 0:
+            raise ReleaseError(
+                "production autostart receipt is missing for an existing managed generation"
+            )
+        prior_descriptor = _backup_autostart_descriptor(
+            layout,
+            descriptor_path,
+            snapshot=descriptor_preimage,
+        )
+    receipt = _validate_autostart_receipt(
+        {
+            "schema": _AUTOSTART_RECEIPT_SCHEMA,
+            "status": (
+                "managed" if state.get("current_release_id") is not None else "legacy-degraded"
+            ),
+            "active_release_id": state.get("current_release_id"),
+            "state_generation": state.get("generation"),
+            "state_sha256": sha256_bytes(canonical_json_bytes(state)),
+            "descriptor_path": str(descriptor_path),
+            "descriptor_sha256": sha256_bytes(descriptor),
+            "descriptor_size": len(descriptor),
+            "launcher_path": str(layout.launcher_path),
+            "launcher_sha256": state.get("launcher_sha256"),
+            "prior_descriptor": prior_descriptor,
+        },
+        layout=layout,
+        state=state,
+        descriptor_path=descriptor_path,
+        descriptor=descriptor,
+    )
+    receipt_bytes = canonical_json_bytes(receipt)
+    receipt_matches = bool(
+        existing_receipt is not None
+        and canonical_json_bytes(existing_receipt) == receipt_bytes
+    )
+    return _AutostartPublication(
+        descriptor_path=descriptor_path,
+        receipt_path=receipt_path,
+        descriptor=descriptor,
+        receipt=receipt_bytes,
+        descriptor_preimage=descriptor_preimage,
+        receipt_preimage=receipt_preimage,
+        repaired=(
+            not _autostart_descriptor_matches(descriptor_path, descriptor)
+            or not receipt_matches
+        ),
+    )
+
+
+def _verify_production_autostart(
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+) -> dict[str, object]:
+    descriptor_path = _production_autostart_path()
+    descriptor = _canonical_production_autostart_descriptor(layout)
+    snapshot = _bounded_file_snapshot(
+        descriptor_path,
+        label="production autostart descriptor",
+        maximum_bytes=_MAX_AUTOSTART_DESCRIPTOR_BYTES,
+    )
+    if not snapshot.exists or snapshot.content != descriptor or snapshot.mode != 0o644:
+        raise ReleaseError("production autostart descriptor does not match canonical bytes")
+    metadata = descriptor_path.lstat()
+    if metadata.st_uid != os.geteuid() or metadata.st_nlink != 1:
+        raise ReleaseError("production autostart descriptor is not safely user-owned")
+    receipt = _read_autostart_receipt(
+        layout,
+        state=state,
+        descriptor_path=descriptor_path,
+        descriptor=descriptor,
+    )
+    launcher_sha256 = _regular_file_hash(
+        layout.launcher_path,
+        label="production autostart launcher",
+        executable=True,
+    )
+    if launcher_sha256 != receipt["launcher_sha256"]:
+        raise ReleaseError("production autostart launcher does not match its receipt")
+    return {
+        "status": receipt["status"],
+        "active_release_id": receipt["active_release_id"],
+        "descriptor_path": str(descriptor_path),
+        "descriptor_sha256": receipt["descriptor_sha256"],
+        "launcher_path": str(layout.launcher_path),
+        "launcher_sha256": launcher_sha256,
+        "receipt_path": str(_production_autostart_receipt_path(layout)),
+        "state_generation": receipt["state_generation"],
+        "prior_descriptor": receipt["prior_descriptor"],
+    }
+
+
+def _publish_production_autostart(
+    publication: _AutostartPublication,
+    *,
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    finalize: Callable[[], None] | None = None,
+) -> dict[str, object]:
+    from .desktop_integration import _publish_files_transactionally as publish_desktop_files
+
+    verified: dict[str, object] | None = None
+
+    def verify() -> None:
+        nonlocal verified
+        if finalize is not None:
+            finalize()
+        verified = _verify_production_autostart(layout, state)
+
+    publish_desktop_files(
+        (
+            (
+                publication.descriptor_path,
+                publication.descriptor,
+                0o644,
+                "production autostart descriptor",
+            ),
+            (
+                publication.receipt_path,
+                publication.receipt,
+                0o600,
+                "production autostart receipt",
+            ),
+        ),
+        finalize=verify,
+        expected_preimages={
+            publication.descriptor_path: (
+                publication.descriptor_preimage.exists,
+                publication.descriptor_preimage.content,
+                publication.descriptor_preimage.mode,
+            ),
+            publication.receipt_path: (
+                publication.receipt_preimage.exists,
+                publication.receipt_preimage.content,
+                publication.receipt_preimage.mode,
+            ),
+        },
+    )
+    if verified is None:
+        raise ReleaseError("production autostart publication was not verified")
+    return verified
+
+
 def _backup_legacy_launcher(layout: ReleaseLayout) -> dict[str, object] | None:
     if not _path_lexists(layout.launcher_path):
         return None
@@ -2834,13 +4740,21 @@ def _backup_legacy_launcher(layout: ReleaseLayout) -> dict[str, object] | None:
 
 
 def _verify_release_dir(layout: ReleaseLayout, release_id: str) -> dict[str, object]:
+    result, _site_manifest = _verify_release_dir_details(layout, release_id)
+    return result
+
+
+def _verify_release_dir_details(
+    layout: ReleaseLayout,
+    release_id: str,
+) -> tuple[dict[str, object], dict[str, object]]:
     if not _RELEASE_ID.fullmatch(release_id):
         raise ReleaseError("release id is unsafe")
     release_dir = layout.releases_dir / release_id
-    result = verify_installed_tree(release_dir)
+    result, site_manifest = _verify_installed_tree_details(release_dir)
     if result["release_id"] != release_id:
         raise ReleaseError("installed directory and manifest release ids disagree")
-    return result
+    return result, site_manifest
 
 
 def _remove_staging_tree(
@@ -2905,7 +4819,14 @@ def _stage_release(
     layout.releases_dir.mkdir(parents=True, exist_ok=True)
     final = layout.releases_dir / release_id
     if final.exists():
-        _verify_release_dir(layout, release_id)
+        verification, site_manifest = _verify_release_dir_details(layout, release_id)
+        _write_release_verification_receipt(
+            layout,
+            release_id,
+            final,
+            verification,
+            site_manifest,
+        )
         return final
     stage = layout.releases_dir / f".staging-{release_id}-{os.getpid()}-{uuid.uuid4().hex}"
     wheel_content = _verified_wheel_bytes(verified)
@@ -2930,9 +4851,16 @@ def _stage_release(
             raise ReleaseError("verified manifest has no build-info mapping")
         if _release_requires_frozen_directories(build_info):
             _freeze_release_tree(stage)
-        verify_installed_tree(stage)
+        verification, site_manifest = _verify_installed_tree_details(stage)
         os.replace(stage, final)
         _fsync_directory(layout.releases_dir)
+        _write_release_verification_receipt(
+            layout,
+            release_id,
+            final,
+            verification,
+            site_manifest,
+        )
     except Exception:
         if _path_lexists(stage):
             _remove_staging_tree(layout, stage, release_id=release_id)
@@ -2976,10 +4904,20 @@ def install_release(
     bin_dir: str | Path | None = None,
     python: str | Path | None = None,
     lock_timeout: float = 15.0,
-    production: bool = False,
+    production: bool | None = None,
 ) -> dict[str, object]:
     layout = release_layout(root=root, bin_dir=bin_dir)
+    production = _resolve_production_intent(layout, production)
+    manage_autostart = _production_manages_autostart(
+        layout,
+        production=production,
+    )
     storage_attestation = _require_managed_storage(layout) if production else None
+    storage_binding = (
+        _storage_attestation_binding(storage_attestation)
+        if storage_attestation is not None
+        else None
+    )
     manifest_source = Path(manifest_path).expanduser()
     verified = verify_wheel(wheel_path, manifest_path=manifest_source)
     assert verified.manifest is not None
@@ -3044,6 +4982,12 @@ def install_release(
         if current is not None and existing_hash not in allowed_existing:
             raise ReleaseError("managed t1000 launcher changed outside the release manager")
 
+        if storage_binding is not None:
+            storage_attestation = _revalidate_managed_storage(
+                layout,
+                storage_binding,
+                phase="inside the install lock before release mutation",
+            )
         release_dir = _stage_release(layout, verified, manifest_source)
         _verify_staged_import(release_dir, interpreter)
         manifest_hash = _regular_file_hash(
@@ -3114,6 +5058,15 @@ def install_release(
         else:
             new_state = state
 
+        autostart_publication = (
+            _prepare_production_autostart_publication(
+                layout,
+                prior_state=state,
+                state=new_state,
+            )
+            if manage_autostart
+            else None
+        )
         if _state_digest(layout.state_path) != state_digest:
             raise ReleaseError("managed state changed during install; compare-and-swap refused")
 
@@ -3136,7 +5089,17 @@ def install_release(
                 (layout.launcher_path, expected_launcher, 0o755, "t1000 launcher")
             )
 
+        autostart_verification: dict[str, object] | None = None
+
         def verify_publication() -> None:
+            nonlocal storage_attestation
+            nonlocal autostart_verification
+            if storage_binding is not None:
+                storage_attestation = _revalidate_managed_storage(
+                    layout,
+                    storage_binding,
+                    phase="during install publication",
+                )
             observed_state = load_managed_state(layout)
             if observed_state != new_state:
                 raise ReleaseError("published managed state differs from the transaction")
@@ -3145,14 +5108,55 @@ def install_release(
                 observed_state,
                 verify_release=True,
             )
+            if autostart_publication is not None:
+                def finalize_autostart() -> None:
+                    nonlocal storage_attestation
+                    if storage_binding is not None:
+                        storage_attestation = _revalidate_managed_storage(
+                            layout,
+                            storage_binding,
+                            phase="after production autostart publication",
+                        )
+                    final_state = load_managed_state(layout)
+                    if final_state != new_state:
+                        raise ReleaseError(
+                            "managed state changed during production autostart publication"
+                        )
+                    _verify_managed_activation(
+                        layout,
+                        final_state,
+                        verify_release=False,
+                    )
 
-        _publish_files_transactionally(writes, verify=verify_publication)
+                autostart_verification = _publish_production_autostart(
+                    autostart_publication,
+                    layout=layout,
+                    state=new_state,
+                    finalize=finalize_autostart,
+                )
+
+        if storage_binding is not None:
+            storage_attestation = _revalidate_managed_storage(
+                layout,
+                storage_binding,
+                phase="immediately before install publication",
+            )
+        _publish_files_transactionally(
+            writes,
+            verify=verify_publication,
+            descriptor_rooted=production,
+        )
 
         result = {
             "ok": True,
             "action": "release-install",
             "idempotent": idempotent,
-            "repaired": repaired_bootstrap or repaired_launcher or state_needs_update,
+            "repaired": (
+                repaired_bootstrap
+                or repaired_launcher
+                or state_needs_update
+                or bool(autostart_publication and autostart_publication.repaired)
+            ),
             "release_id": release_id,
             "previous_release_id": new_state.get("previous_release_id"),
             "root": str(layout.root),
@@ -3161,6 +5165,8 @@ def install_release(
             "state_generation": new_state["generation"],
             "live_processes_restarted": False,
         }
+        if autostart_verification is not None:
+            result["autostart"] = autostart_verification
         if storage_attestation is not None:
             result["storage_attestation"] = storage_attestation.as_dict()
         return result
@@ -3173,8 +5179,20 @@ def rollback_release(
     release_id: str | None = None,
     to_legacy: bool = False,
     lock_timeout: float = 15.0,
+    production: bool | None = None,
 ) -> dict[str, object]:
     layout = release_layout(root=root, bin_dir=bin_dir)
+    production = _resolve_production_intent(layout, production)
+    manage_autostart = _production_manages_autostart(
+        layout,
+        production=production,
+    )
+    storage_attestation = _require_managed_storage(layout) if production else None
+    storage_binding = (
+        _storage_attestation_binding(storage_attestation)
+        if storage_attestation is not None
+        else None
+    )
     if release_id is not None and to_legacy:
         raise ReleaseError("choose either a managed release or --legacy, not both")
     with release_lock(layout, timeout=lock_timeout):
@@ -3183,6 +5201,12 @@ def rollback_release(
         current = state.get("current_release_id")
         if current is None:
             raise ReleaseError("there is no managed current release to roll back")
+        if storage_binding is not None:
+            storage_attestation = _revalidate_managed_storage(
+                layout,
+                storage_binding,
+                phase="inside the rollback lock before release mutation",
+            )
 
         if to_legacy:
             legacy = state.get("legacy_launcher")
@@ -3221,15 +5245,66 @@ def rollback_release(
                     "legacy_launcher": dict(legacy),
                 }
             )
+            autostart_publication = (
+                _prepare_production_autostart_publication(
+                    layout,
+                    prior_state=state,
+                    state=new_state,
+                )
+                if manage_autostart
+                else None
+            )
             if _state_digest(layout.state_path) != state_digest:
                 raise ReleaseError("managed state changed during rollback")
 
+            autostart_verification: dict[str, object] | None = None
+
             def verify_legacy_publication() -> None:
+                nonlocal storage_attestation
+                nonlocal autostart_verification
+                if storage_binding is not None:
+                    storage_attestation = _revalidate_managed_storage(
+                        layout,
+                        storage_binding,
+                        phase="during legacy rollback publication",
+                    )
                 observed = load_managed_state(layout)
                 if observed != new_state:
                     raise ReleaseError("published legacy rollback state differs from transaction")
                 _verify_managed_activation(layout, observed, verify_release=False)
+                if autostart_publication is not None:
+                    def finalize_autostart() -> None:
+                        nonlocal storage_attestation
+                        if storage_binding is not None:
+                            storage_attestation = _revalidate_managed_storage(
+                                layout,
+                                storage_binding,
+                                phase="after legacy rollback autostart publication",
+                            )
+                        final_state = load_managed_state(layout)
+                        if final_state != new_state:
+                            raise ReleaseError(
+                                "managed state changed during legacy rollback autostart publication"
+                            )
+                        _verify_managed_activation(
+                            layout,
+                            final_state,
+                            verify_release=False,
+                        )
 
+                    autostart_verification = _publish_production_autostart(
+                        autostart_publication,
+                        layout=layout,
+                        state=new_state,
+                        finalize=finalize_autostart,
+                    )
+
+            if storage_binding is not None:
+                storage_attestation = _revalidate_managed_storage(
+                    layout,
+                    storage_binding,
+                    phase="immediately before legacy rollback publication",
+                )
             _publish_files_transactionally(
                 [
                     (
@@ -3246,8 +5321,9 @@ def rollback_release(
                     ),
                 ],
                 verify=verify_legacy_publication,
+                descriptor_rooted=production,
             )
-            return {
+            result = {
                 "ok": True,
                 "action": "release-rollback",
                 "target": "legacy-launcher",
@@ -3255,13 +5331,27 @@ def rollback_release(
                 "state_generation": new_state["generation"],
                 "live_processes_restarted": False,
             }
+            if autostart_verification is not None:
+                result["autostart"] = autostart_verification
+            if storage_attestation is not None:
+                result["storage_attestation"] = storage_attestation.as_dict()
+            return result
 
         target = release_id or state.get("previous_release_id")
         if not isinstance(target, str) or not _RELEASE_ID.fullmatch(target):
             raise ReleaseError("no verified previous managed release is available")
         if target == current:
             raise ReleaseError("rollback target is already current")
-        _verify_release_dir(layout, target)
+        target_verification, target_site_manifest = _verify_release_dir_details(
+            layout, target
+        )
+        _write_release_verification_receipt(
+            layout,
+            target,
+            layout.releases_dir / target,
+            target_verification,
+            target_site_manifest,
+        )
         interpreter = Path(str(state.get("python_executable", "")))
         _regular_file_hash(
             interpreter,
@@ -3297,10 +5387,29 @@ def rollback_release(
                 "legacy_launcher": state.get("legacy_launcher"),
             }
         )
+        autostart_publication = (
+            _prepare_production_autostart_publication(
+                layout,
+                prior_state=state,
+                state=new_state,
+            )
+            if manage_autostart
+            else None
+        )
         if _state_digest(layout.state_path) != state_digest:
             raise ReleaseError("managed state changed during rollback")
 
+        autostart_verification: dict[str, object] | None = None
+
         def verify_managed_publication() -> None:
+            nonlocal storage_attestation
+            nonlocal autostart_verification
+            if storage_binding is not None:
+                storage_attestation = _revalidate_managed_storage(
+                    layout,
+                    storage_binding,
+                    phase="during managed rollback publication",
+                )
             observed = load_managed_state(layout)
             if observed != new_state:
                 raise ReleaseError("published managed rollback state differs from transaction")
@@ -3310,7 +5419,40 @@ def rollback_release(
                 verify_release=True,
                 expected_activation=target_activation,
             )
+            if autostart_publication is not None:
+                def finalize_autostart() -> None:
+                    nonlocal storage_attestation
+                    if storage_binding is not None:
+                        storage_attestation = _revalidate_managed_storage(
+                            layout,
+                            storage_binding,
+                            phase="after managed rollback autostart publication",
+                        )
+                    final_state = load_managed_state(layout)
+                    if final_state != new_state:
+                        raise ReleaseError(
+                            "managed state changed during managed rollback autostart publication"
+                        )
+                    _verify_managed_activation(
+                        layout,
+                        final_state,
+                        verify_release=False,
+                        expected_activation=target_activation,
+                    )
 
+                autostart_verification = _publish_production_autostart(
+                    autostart_publication,
+                    layout=layout,
+                    state=new_state,
+                    finalize=finalize_autostart,
+                )
+
+        if storage_binding is not None:
+            storage_attestation = _revalidate_managed_storage(
+                layout,
+                storage_binding,
+                phase="immediately before managed rollback publication",
+            )
         _publish_files_transactionally(
             [
                 (
@@ -3333,8 +5475,9 @@ def rollback_release(
                 ),
             ],
             verify=verify_managed_publication,
+            descriptor_rooted=production,
         )
-        return {
+        result = {
             "ok": True,
             "action": "release-rollback",
             "release_id": target,
@@ -3343,6 +5486,11 @@ def rollback_release(
             "activation_origin": target_activation.origin,
             "live_processes_restarted": False,
         }
+        if autostart_verification is not None:
+            result["autostart"] = autostart_verification
+        if storage_attestation is not None:
+            result["storage_attestation"] = storage_attestation.as_dict()
+        return result
 
 
 def _verify_managed_activation(
@@ -3435,6 +5583,14 @@ def _verify_managed_activation(
             "manifest_sha256": manifest_hash,
         }
     )
+    if verify_release:
+        _read_release_verification_receipt(
+            layout,
+            current,
+            manifest=manifest,
+            manifest_bytes=manifest_bytes,
+            site_manifest_sha256=str(release["site_manifest_sha256"]),
+        )
     return {
         "current_release_id": current,
         "python_executable": str(resolved_interpreter),
@@ -6066,10 +8222,17 @@ def managed_release_status(
             state,
             verify_release=verify,
         )
+        autostart = (
+            _verify_production_autostart(layout, state)
+            if _production_manages_autostart(layout, production=True)
+            else None
+        )
     except (OSError, ReleaseError) as exc:
         payload.update({"ok": False, "error": str(exc)})
     else:
         payload["activation"] = activation
+        if autostart is not None:
+            payload["autostart"] = autostart
         if "release" in activation:
             payload["release"] = activation["release"]
         payload["verified"] = verify

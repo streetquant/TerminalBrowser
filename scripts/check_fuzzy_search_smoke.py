@@ -33,6 +33,7 @@ def main() -> int:
 
         Gtk.init([])
         app = TermDeckApplication(db_path=root / "tabs.sqlite3")
+        app.register(None)
         pytest_record = app.store.create(
             "pytest",
             "tests",

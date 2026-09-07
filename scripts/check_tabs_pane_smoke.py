@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from smoke_support import require_private_validation_runtime
+
 
 def _drain_gtk(Gtk, *, until=None, timeout: float = 3.0) -> None:
     deadline = time.monotonic() + timeout
@@ -31,12 +33,18 @@ def _translated_origin(widget, destination) -> tuple[int, int]:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="termdeck-tabs-pane-smoke-") as tmp:
+    runtime_base = require_private_validation_runtime()
+    with tempfile.TemporaryDirectory(
+        prefix="termdeck-tabs-pane-smoke-"
+    ) as tmp, tempfile.TemporaryDirectory(
+        prefix="tdtp-",
+        dir=runtime_base,
+    ) as tmux_tmp_dir:
         root = Path(tmp)
         home = root / "home"
-        tmux_tmp = root / "tmux"
+        tmux_tmp = Path(tmux_tmp_dir)
         home.mkdir()
-        tmux_tmp.mkdir(mode=0o700)
+        tmux_tmp.chmod(0o700)
         os.environ["HOME"] = str(home)
         os.environ["TMUX_TMPDIR"] = str(tmux_tmp)
         os.environ["NO_AT_BRIDGE"] = "1"

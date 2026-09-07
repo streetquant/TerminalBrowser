@@ -148,5 +148,5 @@ Validate before any reload:
 
 ```bash
 caddy validate --adapter caddyfile --config deploy/caddy/termdeck-web.Caddyfile
-nginx -t -p /8tb/projects/softwares/termdeck/.runtime/termdeck-lan/nginx/ -c "$PWD/deploy/nginx/termdeck-web.nginx.conf"
+nginx -t -p /var/lib/codexpro-exec/termdeck-runtime/termdeck-lan/nginx/ -c "$PWD/deploy/nginx/termdeck-web.nginx.conf"
 ```

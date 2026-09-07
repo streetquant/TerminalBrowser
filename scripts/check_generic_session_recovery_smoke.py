@@ -13,6 +13,8 @@ import sys
 import tempfile
 import time
 
+from smoke_support import require_private_validation_runtime
+
 
 def _wait(predicate, *, timeout: float = 20.0, detail: str) -> None:
     deadline = time.monotonic() + timeout
@@ -52,16 +54,13 @@ def main() -> int:
     from termdeck.tmux_backend import TmuxBackend, TmuxError
 
     # tmux uses AF_UNIX sockets whose pathname is normally limited to roughly
-    # 108 bytes. Validation sandboxes may expose a very long XDG/TMP path, so the
-    # disposable authority must use the short in-namespace /tmp spelling.
-    runtime_parent = Path("/tmp")
-    if not runtime_parent.is_dir() or not os.access(
-        runtime_parent, os.W_OK | os.X_OK
-    ):
-        raise RuntimeError("short writable /tmp namespace is unavailable")
+    # 108 bytes. The validation runner supplies a short private SSD directory
+    # for this authority while keeping the smoke's other artifacts under its
+    # task-local temporary root.
+    runtime_base = require_private_validation_runtime()
 
     with tempfile.TemporaryDirectory(prefix="tgr-") as tmp, tempfile.TemporaryDirectory(
-        prefix="tgrs-", dir=runtime_parent
+        prefix="tgrs-", dir=runtime_base
     ) as socket_tmp:
         root = Path(tmp)
         socket_root = Path(socket_tmp)
@@ -358,16 +357,21 @@ def main() -> int:
                 environment={"MODE": "missing"},
                 restart_policy="on-failure",
             )
-            backend.create_or_resume(missing)
-            missing_payload = _invocation(missing_state, 1)
+            try:
+                backend.create_or_resume(missing)
+            except TmuxError as exc:
+                if "working directory is unavailable" not in str(exc):
+                    raise AssertionError(
+                        f"missing-cwd recovery failed for an unexpected reason: {exc}"
+                    ) from exc
+            else:
+                raise AssertionError("missing exact working directory was recovered")
             if missing_cwd.exists():
                 raise AssertionError("recovery silently recreated a missing working directory")
-            if (
-                missing_payload["cwd"] != str(root)
-                or missing_payload["degraded"] != "missing-working-directory"
-                or missing_payload["original_cwd"] != str(missing_cwd)
-            ):
-                raise AssertionError(f"missing-cwd degradation was incorrect: {missing_payload}")
+            if missing_state.exists():
+                raise AssertionError("missing-cwd recovery launched a fallback worker")
+            if backend.session_exists(missing):
+                raise AssertionError("missing-cwd recovery mutated tmux")
 
             corrupt = store.create(
                 "corrupt",
@@ -412,7 +416,7 @@ def main() -> int:
                         "clean_exit_shell_bridge": True,
                         "clean_exit_shell_input": True,
                         "always_policy_restarted": True,
-                        "missing_cwd_degraded": True,
+                        "missing_cwd_refused": True,
                         "corrupt_recipe_refused": True,
                         "generic_environment_overlay": True,
                         "optional_native_adapters_consulted": False,

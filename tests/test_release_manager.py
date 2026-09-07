@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import copy
 import concurrent.futures
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import csv
 import hashlib
 import io
@@ -26,6 +26,7 @@ from unittest import mock
 import pytest
 
 import termdeck.release_manager as release_manager
+from termdeck.desktop_integration import DesktopIntegrationError
 from termdeck.build_info import (
     BUILD_INFO_SCHEMA,
     MANAGED_STATE_SCHEMA,
@@ -33,6 +34,7 @@ from termdeck.build_info import (
     canonical_json_bytes,
     compute_build_id,
     compute_release_id,
+    default_managed_root,
     sha256_bytes,
     sha256_file,
 )
@@ -262,6 +264,41 @@ def thaw_directories(root: Path) -> None:
                 child.chmod(0o755)
 
 
+@contextmanager
+def production_autostart_environment(
+    *,
+    bin_dir: Path,
+    descriptor_path: Path,
+):
+    attestation = SimpleNamespace(
+        as_dict=lambda: {
+            "schema": "termdeck.storage-fabric-attestation.v1",
+            "fabric": "warp-drives-v1",
+            "storage_class": "ssd-cell",
+            "production": True,
+            "path_evidence": [],
+        }
+    )
+    with mock.patch.object(
+        release_manager,
+        "_is_canonical_production_root",
+        return_value=True,
+    ), mock.patch.object(
+        release_manager,
+        "_canonical_production_launcher_path",
+        return_value=(bin_dir / "t1000").absolute(),
+    ), mock.patch.object(
+        release_manager,
+        "_production_autostart_path",
+        return_value=descriptor_path.absolute(),
+    ), mock.patch.object(
+        release_manager,
+        "_require_managed_storage",
+        return_value=attestation,
+    ):
+        yield
+
+
 def managed_process_fixture(
     tmp_path: Path,
 ) -> tuple[Path, Path, object, dict[str, object], Path]:
@@ -446,6 +483,19 @@ def test_snapshot_source_refuses_dirty_by_default_and_labels_candidate(tmp_path:
     assert dirty.build_mode == "dirty-candidate"
     assert dirty.source_commit.endswith("+dirty")
     assert dirty.dirty_entries
+
+
+def test_snapshot_source_rejects_stale_bundled_version_metadata(tmp_path: Path) -> None:
+    init_git_project(tmp_path)
+    (tmp_path / "termdeck" / "_build_info.json").write_text(
+        '{"version":"0.2.9"}\n',
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "stale metadata"], cwd=tmp_path, check=True)
+
+    with pytest.raises(ReleaseError, match="source termdeck/_build_info.json disagree"):
+        snapshot_source(tmp_path)
 
 
 def test_snapshot_source_rejects_tracked_symlink(tmp_path: Path) -> None:
@@ -5270,6 +5320,43 @@ def test_installed_tree_rejects_extra_files_symlinks_and_writable_payloads(
     assert verify_installed_tree(release_dir)["ok"] is True
 
 
+@pytest.mark.parametrize(
+    "tamper",
+    ["release-extra", "artifacts-extra", "artifacts-symlink"],
+)
+def test_installed_tree_rejects_nonexact_release_envelope(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    wheel, manifest_path, manifest = artifact(tmp_path, "e", version="0.2.20")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel, manifest_path, root=root, bin_dir=bin_dir)
+    release_dir = root / "releases" / str(manifest["release_id"])
+    artifacts = release_dir / "artifacts"
+    displaced = release_dir / "artifacts-displaced"
+    try:
+        if tamper == "release-extra":
+            release_dir.chmod(0o755)
+            (release_dir / "unexpected").write_bytes(b"unexpected\n")
+        elif tamper == "artifacts-extra":
+            artifacts.chmod(0o755)
+            (artifacts / "unexpected").write_bytes(b"unexpected\n")
+        else:
+            release_dir.chmod(0o755)
+            artifacts.rename(displaced)
+            artifacts.symlink_to(displaced, target_is_directory=True)
+
+        with pytest.raises(ReleaseError, match="envelope|unexpected|real directory"):
+            verify_installed_tree(release_dir)
+    finally:
+        if artifacts.is_symlink():
+            artifacts.unlink()
+            displaced.rename(artifacts)
+        thaw_directories(release_dir)
+
+
 def test_release_layout_bin_dir_precedence_uses_runtime_environment(
     tmp_path: Path,
 ) -> None:
@@ -5354,12 +5441,954 @@ def test_launcher_bootstrap_and_staged_import_preserve_isolation_and_no_bytecode
     managed_bin_assignment = 'os.environ["T1000_MANAGED_BIN_DIR"] = str(launcher.parent)'
     assert managed_bin_assignment in bootstrap
     assert bootstrap.index(managed_bin_assignment) > bootstrap.index("latest_state =")
-    assert bootstrap.index(managed_bin_assignment) < bootstrap.index("sys.path.insert(0, str(site))")
+    assert bootstrap.index(managed_bin_assignment) < bootstrap.index(
+        "sys.path.insert(0, str(import_root))"
+    )
 
     with mock.patch("termdeck.release_manager._run") as run:
         _verify_staged_import(tmp_path / "release", python)
     argv = run.call_args.args[0]
     assert argv[:4] == [str(python), "-I", "-B", "-c"]
+
+
+def test_managed_bootstrap_uses_bounded_verification_receipt_and_invalidates_tampering(
+    tmp_path: Path,
+) -> None:
+    wheel_path = tmp_path / "t1000-0.2.13-py3-none-any.whl"
+    info = write_wheel(
+        wheel_path,
+        seed="a",
+        version="0.2.13",
+        extra_members={
+            "termdeck/build_info.py": (
+                "import json, os\n"
+                "from pathlib import Path\n"
+                "def release_status(**kwargs):\n"
+                "    assert Path(__file__).is_file()\n"
+                "    with open(os.environ['T1000_RELEASE_MANIFEST'], encoding='utf-8') as handle:\n"
+                "        manifest = json.load(handle)\n"
+                "    return {'ok': True, 'release_id': manifest['release_id']}\n"
+            ).encode(),
+            "termdeck/storage_fabric.py": (
+                "import os\n"
+                "import atexit\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "def _restore(path, content, mode):\n"
+                "    path.chmod(0o600)\n"
+                "    path.write_bytes(content)\n"
+                "    path.chmod(mode)\n"
+                "def require_hot_storage(**kwargs):\n"
+                "    target = os.environ.pop('T1000_TEST_POST_VERIFY_SWAP', '')\n"
+                "    if target:\n"
+                "        paths = {Path(target), Path(sys.path[0]) / 'termdeck' / 'cli.py'}\n"
+                "        for path in paths:\n"
+                "            content = path.read_bytes()\n"
+                "            mode = path.stat().st_mode & 0o777\n"
+                "            path.chmod(0o600)\n"
+                "            path.write_bytes(b'def main():\\n    return 42\\n')\n"
+                "            path.chmod(mode)\n"
+                "            if path != Path(target):\n"
+                "                atexit.register(_restore, path, content, mode)\n"
+                "    return None\n"
+            ).encode(),
+        },
+    )
+    manifest_path = tmp_path / "t1000-0.2.13.release.json"
+    manifest = write_manifest(manifest_path, wheel_path, info)
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(
+            wheel_path,
+            manifest_path,
+            root=root,
+            bin_dir=bin_dir,
+            python=Path(sys.executable),
+        )
+
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    bootstrap = _bootstrap_source(layout, Path(sys.executable).resolve(strict=True)).decode()
+    assert "os.walk(" not in bootstrap
+    assert "glob(" not in bootstrap
+    assert "MAX_RELEASE_VERIFICATION_BYTES" in bootstrap
+    assert "verification-" in bootstrap
+    assert "VerifiedSnapshotImporter(import_root, pinned_members)" in bootstrap
+    assert "sys.path.insert(0, str(site))" not in bootstrap
+    assert "sys.path.insert(0, str(import_root))" in bootstrap
+    receipt_path = release_manager._release_verification_path(layout, str(manifest["release_id"]))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["method"] == "full-records-site-manifest-v2"
+    assert receipt["wheel_sha256"] == manifest["wheel_sha256"]
+    assert receipt["site_manifest_sha256"] == sha256_bytes(
+        canonical_json_bytes(receipt["site_manifest"])
+    )
+
+    environment = dict(os.environ)
+    for name in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "T1000_MANAGED_ROOT",
+        "T1000_RELEASE_MANIFEST",
+        "T1000_RELEASE_STATE",
+    ):
+        environment.pop(name, None)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    launcher = bin_dir / "t1000"
+    started = subprocess.run(
+        [str(launcher)],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert started.returncode == 0, started.stderr
+
+    release_dir = root / "releases" / str(manifest["release_id"])
+    envelope_extra = release_dir / "unexpected-release-root-entry"
+    release_dir.chmod(0o755)
+    envelope_extra.write_bytes(b"unexpected\n")
+    envelope_extra.chmod(0o444)
+    release_dir.chmod(0o555)
+    rejected_envelope = subprocess.run(
+        [str(launcher)],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert rejected_envelope.returncode == 78
+    assert "immutable release envelope" in rejected_envelope.stderr
+    release_dir.chmod(0o755)
+    envelope_extra.unlink()
+    release_dir.chmod(0o555)
+
+    cli_path = release_dir / "site" / "termdeck" / "cli.py"
+    original_cli = cli_path.read_bytes()
+    raced_environment = dict(environment)
+    raced_environment["T1000_TEST_POST_VERIFY_SWAP"] = str(cli_path)
+    raced = subprocess.run(
+        [str(launcher)],
+        cwd=tmp_path,
+        env=raced_environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert raced.returncode == 0, raced.stderr
+    assert cli_path.read_bytes() == b"def main():\n    return 42\n"
+    assert not tuple(root.glob(".bootstrap-import-*"))
+    cli_path.chmod(0o644)
+    cli_path.write_bytes(original_cli)
+    cli_path.chmod(0o444)
+
+    for member in ("termdeck/cli.py", "termdeck/storage_fabric.py"):
+        target = release_dir / "site" / member
+        original = target.read_bytes()
+        original_mode = stat.S_IMODE(target.stat().st_mode)
+        tampered = bytearray(original)
+        tampered[0] ^= 1
+        target.chmod(0o644)
+        target.write_bytes(tampered)
+        target.chmod(original_mode)
+        rejected_site = subprocess.run(
+            [str(launcher)],
+            cwd=tmp_path,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert rejected_site.returncode == 78
+        assert f"installed site member SHA-256 mismatch: {member}" in rejected_site.stderr
+        target.chmod(0o644)
+        target.write_bytes(original)
+        target.chmod(original_mode)
+        restored = subprocess.run(
+            [str(launcher)],
+            cwd=tmp_path,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert restored.returncode == 0, restored.stderr
+
+    package_dir = release_dir / "site" / "termdeck"
+    injected = package_dir / "same_uid_injected.py"
+    package_dir.chmod(0o755)
+    injected.write_text("raise SystemExit(42)\n", encoding="utf-8")
+    injected.chmod(0o444)
+    package_dir.chmod(0o555)
+    rejected_extra = subprocess.run(
+        [str(launcher)],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert rejected_extra.returncode == 78
+    assert "installed site directory contains extra entries: termdeck" in rejected_extra.stderr
+    package_dir.chmod(0o755)
+    injected.unlink()
+    package_dir.chmod(0o555)
+
+    receipt_path.chmod(0o644)
+    receipt["wheel_sha256"] = "0" * 64
+    receipt_path.write_bytes(canonical_json_bytes(receipt))
+    receipt_path.chmod(0o444)
+    status = managed_release_status(root=root, bin_dir=bin_dir, verify=True)
+    assert status["ok"] is False
+    assert "release verification receipt wheel_sha256 mismatch" in str(status["error"])
+    rejected = subprocess.run(
+        [str(launcher)],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert rejected.returncode == 78
+    assert "release verification receipt wheel mismatch" in rejected.stderr
+
+    receipt["wheel_sha256"] = manifest["wheel_sha256"]
+    receipt_path.chmod(0o644)
+    receipt_path.write_bytes(canonical_json_bytes(receipt))
+    receipt_path.chmod(0o444)
+    receipt["installed_directories"] += 1
+    receipt_path.chmod(0o644)
+    receipt_path.write_bytes(canonical_json_bytes(receipt))
+    receipt_path.chmod(0o444)
+    rejected_counter_tamper = subprocess.run(
+        [str(launcher)],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert rejected_counter_tamper.returncode == 78
+    assert "release verification receipt directory count mismatch" in (
+        rejected_counter_tamper.stderr
+    )
+    receipt["installed_directories"] -= 1
+    receipt_path.chmod(0o644)
+    receipt_path.write_bytes(canonical_json_bytes(receipt))
+    receipt_path.chmod(0o444)
+    forged_cli = bytearray(original_cli)
+    forged_cli[0] ^= 1
+    cli_path.chmod(0o644)
+    cli_path.write_bytes(forged_cli)
+    cli_path.chmod(0o444)
+    forged_receipt = copy.deepcopy(receipt)
+    forged_receipt["wheel_sha256"] = manifest["wheel_sha256"]
+    for row in forged_receipt["site_manifest"]["files"]:
+        if row[0] == "termdeck/cli.py":
+            row[1] = sha256_bytes(bytes(forged_cli))
+            break
+    else:
+        raise AssertionError("site manifest omitted termdeck/cli.py")
+    forged_receipt["site_manifest_sha256"] = sha256_bytes(
+        canonical_json_bytes(forged_receipt["site_manifest"])
+    )
+    receipt_path.chmod(0o644)
+    receipt_path.write_bytes(canonical_json_bytes(forged_receipt))
+    receipt_path.chmod(0o444)
+    forged = subprocess.run(
+        [str(launcher)],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert forged.returncode == 78
+    assert "receipt is not derived from the managed wheel" in forged.stderr
+    cli_path.chmod(0o644)
+    cli_path.write_bytes(original_cli)
+    cli_path.chmod(0o444)
+    receipt_path.chmod(0o644)
+    receipt_path.write_bytes(canonical_json_bytes(receipt))
+    receipt_path.chmod(0o444)
+
+    saved_receipt = receipt_path.with_suffix(".saved")
+    receipt_path.rename(saved_receipt)
+    receipt_path.symlink_to(saved_receipt.name)
+    swapped = subprocess.run(
+        [str(launcher)],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert swapped.returncode == 78
+    assert "release verification receipt is not a regular file" in swapped.stderr
+    receipt_path.unlink()
+    saved_receipt.rename(receipt_path)
+
+
+def test_canonical_managed_root_forces_production_intent_and_ignores_xdg_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "wrong-data-root"))
+    monkeypatch.delenv("T1000_MANAGED_ROOT", raising=False)
+    default_layout = release_layout()
+    expected = home / ".local/state/codex-project-homes/runtime/t1000-managed"
+    assert default_managed_root() == expected
+    assert default_layout.root == expected
+    assert release_manager._resolve_production_intent(default_layout, None) is True
+    assert release_manager._resolve_production_intent(default_layout, False) is True
+    assert release_manager._resolve_production_intent(default_layout, True) is True
+    expected.mkdir(parents=True)
+    alias = tmp_path / "managed-alias"
+    alias.symlink_to(expected, target_is_directory=True)
+    alias_layout = release_layout(root=alias, bin_dir=tmp_path / "alias-bin")
+    assert release_manager._resolve_production_intent(alias_layout, None) is True
+    bind_alias = tmp_path / "bind-alias"
+    bind_alias.mkdir()
+    bind_layout = release_layout(root=bind_alias, bin_dir=tmp_path / "bind-bin")
+    with mock.patch.object(Path, "samefile", return_value=True):
+        assert release_manager._resolve_production_intent(bind_layout, None) is True
+    isolated_layout = release_layout(root=tmp_path / "isolated", bin_dir=tmp_path / "bin")
+    assert release_manager._resolve_production_intent(isolated_layout, None) is False
+    assert release_manager._resolve_production_intent(isolated_layout, False) is False
+    assert release_manager._resolve_production_intent(isolated_layout, True) is True
+
+
+def test_default_managed_root_honors_supplied_home_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process_home = tmp_path / "process-home"
+    supplied_home = tmp_path / "supplied-home"
+    monkeypatch.setenv("HOME", str(process_home))
+
+    assert default_managed_root(env={"HOME": str(supplied_home)}) == (
+        supplied_home / ".local/state/codex-project-homes/runtime/t1000-managed"
+    )
+    assert release_manager._canonical_managed_root() == (
+        process_home / ".local/state/codex-project-homes/runtime/t1000-managed"
+    )
+
+
+def test_production_autostart_path_honors_xdg_config_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_home = tmp_path / "xdg-config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+
+    assert release_manager._production_autostart_path() == (
+        config_home
+        / "autostart"
+        / release_manager._AUTOSTART_DESCRIPTOR_NAME
+    ).absolute()
+
+
+@pytest.mark.parametrize("value", ["relative/config", "~/.config-alt"])
+def test_production_autostart_path_rejects_relative_xdg_config_home(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", value)
+
+    with pytest.raises(DesktopIntegrationError, match="absolute"):
+        release_manager._production_autostart_path()
+
+
+@pytest.mark.parametrize("existing", [None, b"[Desktop Entry]\nExec=/opt/custom/t1000 gui\n"])
+def test_production_install_publishes_authenticated_autostart_and_preserves_evidence(
+    tmp_path: Path,
+    existing: bytes | None,
+) -> None:
+    wheel, manifest_path, manifest = artifact(tmp_path, "a")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    descriptor = tmp_path / "config" / "autostart" / "io.github.t1000.T1000.desktop"
+    if existing is not None:
+        descriptor.parent.mkdir(parents=True)
+        descriptor.write_bytes(existing)
+        descriptor.chmod(0o644)
+
+    with production_autostart_environment(
+        bin_dir=bin_dir,
+        descriptor_path=descriptor,
+    ), mock.patch("termdeck.release_manager._verify_staged_import"):
+        result = install_release(
+            wheel,
+            manifest_path,
+            root=root,
+            bin_dir=bin_dir,
+            production=True,
+        )
+        layout = release_layout(root=root, bin_dir=bin_dir)
+        state = load_managed_state(layout)
+        expected = release_manager._canonical_production_autostart_descriptor(layout)
+        verified = release_manager._verify_production_autostart(layout, state)
+        status = managed_release_status(root=root, bin_dir=bin_dir, verify=True)
+
+    assert descriptor.read_bytes() == expected
+    assert stat.S_IMODE(descriptor.stat().st_mode) == 0o644
+    receipt_path = root / release_manager._AUTOSTART_RECEIPT_NAME
+    assert stat.S_IMODE(receipt_path.stat().st_mode) == 0o600
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["active_release_id"] == manifest["release_id"]
+    assert receipt["descriptor_sha256"] == sha256_bytes(expected)
+    assert receipt["launcher_sha256"] == sha256_file(bin_dir / "t1000")
+    assert receipt["state_sha256"] == sha256_bytes(canonical_json_bytes(state))
+    assert result["autostart"] == verified
+    assert status["ok"] is True
+    assert status["autostart"] == verified
+    prior = receipt["prior_descriptor"]
+    if existing is None:
+        assert prior is None
+    else:
+        assert prior["sha256"] == sha256_bytes(existing)
+        backup = Path(prior["backup_path"])
+        assert backup.read_bytes() == existing
+        assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+
+
+def test_production_install_repairs_descriptor_but_rejects_malformed_receipt(
+    tmp_path: Path,
+) -> None:
+    wheel_a, manifest_a_path, manifest_a = artifact(tmp_path, "a")
+    wheel_b, manifest_b_path, _manifest_b = artifact(tmp_path, "b")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    descriptor = tmp_path / "config" / "autostart" / "io.github.t1000.T1000.desktop"
+
+    with production_autostart_environment(
+        bin_dir=bin_dir,
+        descriptor_path=descriptor,
+    ), mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(
+            wheel_a,
+            manifest_a_path,
+            root=root,
+            bin_dir=bin_dir,
+            production=True,
+        )
+        layout = release_layout(root=root, bin_dir=bin_dir)
+        descriptor.write_bytes(b"[Desktop Entry]\nExec=/tmp/tampered\n")
+        descriptor.chmod(0o644)
+        repaired = install_release(
+            wheel_a,
+            manifest_a_path,
+            root=root,
+            bin_dir=bin_dir,
+            production=True,
+        )
+        assert repaired["idempotent"] is True
+        assert repaired["repaired"] is True
+        expected = release_manager._canonical_production_autostart_descriptor(layout)
+        assert descriptor.read_bytes() == expected
+
+        state_before = layout.state_path.read_bytes()
+        bootstrap_before = layout.bootstrap_path.read_bytes()
+        launcher_before = layout.launcher_path.read_bytes()
+        receipt_path = root / release_manager._AUTOSTART_RECEIPT_NAME
+        valid_receipt = receipt_path.read_bytes()
+        receipt_path.write_bytes(b"{}\n")
+        receipt_path.chmod(0o600)
+        with pytest.raises(ReleaseError, match="receipt fields differ from schema"):
+            install_release(
+                wheel_b,
+                manifest_b_path,
+                root=root,
+                bin_dir=bin_dir,
+                production=True,
+            )
+
+        receipt_path.unlink()
+        outside_receipt = tmp_path / "outside-receipt.json"
+        outside_receipt.write_bytes(valid_receipt)
+        outside_receipt.chmod(0o600)
+        receipt_path.symlink_to(outside_receipt)
+        with pytest.raises(ReleaseError, match="receipt is not a regular file"):
+            install_release(
+                wheel_b,
+                manifest_b_path,
+                root=root,
+                bin_dir=bin_dir,
+                production=True,
+            )
+
+    assert layout.state_path.read_bytes() == state_before
+    assert layout.bootstrap_path.read_bytes() == bootstrap_before
+    assert layout.launcher_path.read_bytes() == launcher_before
+    assert load_managed_state(layout)["current_release_id"] == manifest_a["release_id"]
+
+
+def test_production_install_rejects_symlinked_autostart_without_publishing_activation(
+    tmp_path: Path,
+) -> None:
+    wheel, manifest_path, _manifest = artifact(tmp_path, "a")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    descriptor = tmp_path / "config" / "autostart" / "io.github.t1000.T1000.desktop"
+    outside = tmp_path / "outside.desktop"
+    outside.write_bytes(b"outside\n")
+    descriptor.parent.mkdir(parents=True)
+    descriptor.symlink_to(outside)
+
+    with production_autostart_environment(
+        bin_dir=bin_dir,
+        descriptor_path=descriptor,
+    ), mock.patch("termdeck.release_manager._verify_staged_import"), pytest.raises(
+        ReleaseError,
+        match="not a regular file",
+    ):
+        install_release(
+            wheel,
+            manifest_path,
+            root=root,
+            bin_dir=bin_dir,
+            production=True,
+        )
+
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    assert descriptor.is_symlink()
+    assert outside.read_bytes() == b"outside\n"
+    assert not layout.state_path.exists()
+    assert not layout.bootstrap_path.exists()
+    assert not layout.launcher_path.exists()
+    assert not (root / release_manager._AUTOSTART_RECEIPT_NAME).exists()
+
+
+def test_production_autostart_path_swap_rolls_back_release_activation(
+    tmp_path: Path,
+) -> None:
+    import termdeck.desktop_integration as desktop_integration
+
+    wheel, manifest_path, _manifest = artifact(tmp_path, "a")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    descriptor = tmp_path / "config" / "autostart" / "io.github.t1000.T1000.desktop"
+    descriptor.parent.mkdir(parents=True)
+    descriptor.write_bytes(b"[Desktop Entry]\nExec=/opt/custom/t1000 gui\n")
+    descriptor.chmod(0o644)
+    attacker = tmp_path / "attacker.desktop"
+    attacker.write_bytes(b"attacker\n")
+    real_atomic = desktop_integration._atomic_write_bytes
+    swapped = False
+
+    def swap_after_descriptor(path: Path, content: bytes, **kwargs: object):
+        nonlocal swapped
+        published = real_atomic(path, content, **kwargs)
+        if Path(path).absolute() == descriptor.absolute() and not swapped:
+            swapped = True
+            descriptor.unlink()
+            descriptor.symlink_to(attacker)
+        return published
+
+    with production_autostart_environment(
+        bin_dir=bin_dir,
+        descriptor_path=descriptor,
+    ), mock.patch("termdeck.release_manager._verify_staged_import"), mock.patch.object(
+        desktop_integration,
+        "_atomic_write_bytes",
+        side_effect=swap_after_descriptor,
+    ), pytest.raises(ReleaseError, match="activation publication failed"):
+        install_release(
+            wheel,
+            manifest_path,
+            root=root,
+            bin_dir=bin_dir,
+            production=True,
+        )
+
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    assert swapped is True
+    assert descriptor.is_symlink()
+    assert attacker.read_bytes() == b"attacker\n"
+    assert not layout.state_path.exists()
+    assert not layout.bootstrap_path.exists()
+    assert not layout.launcher_path.exists()
+    assert not (root / release_manager._AUTOSTART_RECEIPT_NAME).exists()
+
+
+def test_production_autostart_preimage_change_refuses_publication(
+    tmp_path: Path,
+) -> None:
+    wheel, manifest_path, _manifest = artifact(tmp_path, "a")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    descriptor = tmp_path / "config" / "autostart" / "io.github.t1000.T1000.desktop"
+    descriptor.parent.mkdir(parents=True)
+    descriptor.write_bytes(b"[Desktop Entry]\nExec=/opt/custom/t1000 gui\n")
+    descriptor.chmod(0o644)
+    changed = b"[Desktop Entry]\nExec=/usr/bin/changed-during-install gui\n"
+    real_publish = release_manager._publish_production_autostart
+
+    def change_before_publication(publication, **kwargs: object):
+        descriptor.write_bytes(changed)
+        descriptor.chmod(0o644)
+        return real_publish(publication, **kwargs)
+
+    with production_autostart_environment(
+        bin_dir=bin_dir,
+        descriptor_path=descriptor,
+    ), mock.patch("termdeck.release_manager._verify_staged_import"), mock.patch.object(
+        release_manager,
+        "_publish_production_autostart",
+        side_effect=change_before_publication,
+    ), pytest.raises(ReleaseError, match="changed before publication"):
+        install_release(
+            wheel,
+            manifest_path,
+            root=root,
+            bin_dir=bin_dir,
+            production=True,
+        )
+
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    assert descriptor.read_bytes() == changed
+    assert not layout.state_path.exists()
+    assert not layout.bootstrap_path.exists()
+    assert not layout.launcher_path.exists()
+    assert not (root / release_manager._AUTOSTART_RECEIPT_NAME).exists()
+
+
+def test_production_autostart_receipt_replay_and_rollbacks_are_generation_bound(
+    tmp_path: Path,
+) -> None:
+    wheel_a, manifest_a_path, manifest_a = artifact(tmp_path, "a")
+    wheel_b, manifest_b_path, manifest_b = artifact(tmp_path, "b")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    launcher = bin_dir / "t1000"
+    launcher.write_bytes(b"#!/bin/sh\necho legacy\n")
+    launcher.chmod(0o755)
+    descriptor = tmp_path / "config" / "autostart" / "io.github.t1000.T1000.desktop"
+    descriptor.parent.mkdir(parents=True)
+    descriptor.write_bytes(b"[Desktop Entry]\nExec=/opt/custom/t1000 gui\n")
+    descriptor.chmod(0o644)
+
+    with production_autostart_environment(
+        bin_dir=bin_dir,
+        descriptor_path=descriptor,
+    ), mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(
+            wheel_a,
+            manifest_a_path,
+            root=root,
+            bin_dir=bin_dir,
+            production=True,
+        )
+        receipt_path = root / release_manager._AUTOSTART_RECEIPT_NAME
+        receipt_a = receipt_path.read_bytes()
+        canonical_descriptor = descriptor.read_bytes()
+        install_release(
+            wheel_b,
+            manifest_b_path,
+            root=root,
+            bin_dir=bin_dir,
+            production=True,
+        )
+        layout = release_layout(root=root, bin_dir=bin_dir)
+        state_b = load_managed_state(layout)
+        receipt_b = receipt_path.read_bytes()
+        receipt_path.unlink()
+        with pytest.raises(ReleaseError, match="receipt is missing"):
+            install_release(
+                wheel_b,
+                manifest_b_path,
+                root=root,
+                bin_dir=bin_dir,
+                production=True,
+            )
+        receipt_path.write_bytes(receipt_b)
+        receipt_path.chmod(0o600)
+        receipt_path.write_bytes(receipt_a)
+        receipt_path.chmod(0o600)
+        with pytest.raises(ReleaseError, match="active release|state generation"):
+            release_manager._verify_production_autostart(layout, state_b)
+        with pytest.raises(ReleaseError, match="active release|state generation"):
+            install_release(
+                wheel_b,
+                manifest_b_path,
+                root=root,
+                bin_dir=bin_dir,
+                production=True,
+            )
+        receipt_path.write_bytes(receipt_b)
+        receipt_path.chmod(0o600)
+        assert receipt_path.read_bytes() == receipt_b
+
+        target = release_manager._current_activation_bundle(
+            layout,
+            Path(str(state_b["python_executable"])),
+        )
+        with mock.patch.object(
+            release_manager,
+            "_derive_release_activation_bundle",
+            return_value=target,
+        ):
+            rolled = rollback_release(
+                root=root,
+                bin_dir=bin_dir,
+                release_id=str(manifest_a["release_id"]),
+                production=True,
+            )
+        managed_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        assert rolled["autostart"]["status"] == "managed"
+        assert managed_receipt["active_release_id"] == manifest_a["release_id"]
+        assert managed_receipt["state_generation"] > state_b["generation"]
+        assert descriptor.read_bytes() == canonical_descriptor
+
+        degraded = rollback_release(
+            root=root,
+            bin_dir=bin_dir,
+            to_legacy=True,
+            production=True,
+        )
+        degraded_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        assert degraded["autostart"]["status"] == "legacy-degraded"
+        assert degraded_receipt["active_release_id"] is None
+        assert descriptor.read_bytes() == canonical_descriptor
+        assert launcher.read_bytes() == b"#!/bin/sh\necho legacy\n"
+        assert manifest_b["release_id"] != manifest_a["release_id"]
+
+
+def test_production_rollback_requires_and_reports_storage_attestation(
+    tmp_path: Path,
+) -> None:
+    wheel_a, manifest_a_path, _manifest_a = artifact(tmp_path, "a")
+    wheel_b, manifest_b_path, _manifest_b = artifact(tmp_path, "b")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel_a, manifest_a_path, root=root, bin_dir=bin_dir)
+        install_release(wheel_b, manifest_b_path, root=root, bin_dir=bin_dir)
+    attestation = SimpleNamespace(as_dict=lambda: {"storage_class": "ssd-cell"})
+    with mock.patch.object(
+        release_manager,
+        "_require_managed_storage",
+        return_value=attestation,
+    ) as require_storage, mock.patch.object(
+        release_manager,
+        "_derive_release_activation_bundle",
+        return_value=release_manager._current_activation_bundle(
+            release_layout(root=root, bin_dir=bin_dir),
+            Path(sys.executable).resolve(strict=True),
+        ),
+    ):
+        result = rollback_release(root=root, bin_dir=bin_dir, production=True)
+    assert require_storage.call_count == 4
+    assert result["storage_attestation"] == {"storage_class": "ssd-cell"}
+
+
+def test_production_install_rolls_back_activation_when_storage_rebinds(
+    tmp_path: Path,
+) -> None:
+    wheel_a, manifest_a_path, manifest_a = artifact(tmp_path, "a")
+    wheel_b, manifest_b_path, _manifest_b = artifact(tmp_path, "b")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel_a, manifest_a_path, root=root, bin_dir=bin_dir)
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    before_state = layout.state_path.read_bytes()
+    before_bootstrap = layout.bootstrap_path.read_bytes()
+    before_launcher = layout.launcher_path.read_bytes()
+
+    def attestation(device: str) -> SimpleNamespace:
+        payload = {
+            "schema": "termdeck.storage-fabric-attestation.v1",
+            "fabric": "warp-drives-v1",
+            "storage_class": "ssd-cell",
+            "production": True,
+            "path_evidence": [
+                {
+                    "name": "managed_release_root",
+                    "requested": str(root),
+                    "resolved": str(root),
+                    "role": "hot",
+                    "device": device,
+                    "mount_point": str(tmp_path),
+                    "source": f"/dev/{device}",
+                    "filesystem": "ext4",
+                    "rotational": "0",
+                    "storage_class": "ssd-cell",
+                }
+            ],
+        }
+        return SimpleNamespace(as_dict=lambda: copy.deepcopy(payload))
+
+    with mock.patch(
+        "termdeck.release_manager._verify_staged_import"
+    ), mock.patch.object(
+        release_manager,
+        "_require_managed_storage",
+        side_effect=[
+            attestation("nvme0n1"),
+            attestation("nvme0n1"),
+            attestation("nvme0n1"),
+            attestation("sda"),
+        ],
+    ):
+        with pytest.raises(
+            ReleaseError,
+            match="activation publication failed and was rolled back: "
+            "managed storage identity changed during install publication",
+        ):
+            install_release(
+                wheel_b,
+                manifest_b_path,
+                root=root,
+                bin_dir=bin_dir,
+                production=True,
+            )
+
+    assert layout.state_path.read_bytes() == before_state
+    assert layout.bootstrap_path.read_bytes() == before_bootstrap
+    assert layout.launcher_path.read_bytes() == before_launcher
+    assert load_managed_state(layout)["current_release_id"] == manifest_a["release_id"]
+
+
+def test_production_install_rejects_same_device_managed_root_swap(
+    tmp_path: Path,
+) -> None:
+    import termdeck.desktop_integration as desktop_integration
+
+    wheel, manifest_path, _manifest = artifact(tmp_path, "a")
+    root = tmp_path / "managed"
+    displaced = tmp_path / "managed-displaced"
+    bin_dir = tmp_path / "bin"
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    attestation = SimpleNamespace(
+        as_dict=lambda: {
+            "schema": "termdeck.storage-fabric-attestation.v1",
+            "fabric": "warp-drives-v1",
+            "storage_class": "ssd-cell",
+            "production": True,
+            "path_evidence": [],
+        }
+    )
+    real_atomic = desktop_integration._atomic_write_bytes
+    swapped = False
+
+    def swap_root_before_first_write(path: Path, content: bytes, **kwargs: object):
+        nonlocal swapped
+        if Path(path) == layout.bootstrap_path and not swapped:
+            swapped = True
+            root.rename(displaced)
+            root.mkdir()
+            (root / "attacker-marker").write_text("replacement\n", encoding="utf-8")
+        return real_atomic(path, content, **kwargs)
+
+    with mock.patch("termdeck.release_manager._verify_staged_import"), mock.patch.object(
+        release_manager,
+        "_require_managed_storage",
+        return_value=attestation,
+    ), mock.patch.object(
+        desktop_integration,
+        "_atomic_write_bytes",
+        side_effect=swap_root_before_first_write,
+    ), pytest.raises(ReleaseError, match="parent identity changed"):
+        install_release(
+            wheel,
+            manifest_path,
+            root=root,
+            bin_dir=bin_dir,
+            production=True,
+        )
+
+    assert swapped is True
+    assert (root / "attacker-marker").read_text(encoding="utf-8") == "replacement\n"
+    assert not layout.state_path.exists()
+    assert not layout.bootstrap_path.exists()
+    assert not layout.launcher_path.exists()
+    assert not (displaced / "state.json").exists()
+    assert not (displaced / "bootstrap.py").exists()
+
+
+def test_production_rollback_rolls_back_activation_when_storage_rebinds(
+    tmp_path: Path,
+) -> None:
+    wheel_a, manifest_a_path, _manifest_a = artifact(tmp_path, "a")
+    wheel_b, manifest_b_path, manifest_b = artifact(tmp_path, "b")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    with mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(wheel_a, manifest_a_path, root=root, bin_dir=bin_dir)
+        install_release(wheel_b, manifest_b_path, root=root, bin_dir=bin_dir)
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    before_state = layout.state_path.read_bytes()
+    before_bootstrap = layout.bootstrap_path.read_bytes()
+    before_launcher = layout.launcher_path.read_bytes()
+    stable_payload = {
+        "schema": "termdeck.storage-fabric-attestation.v1",
+        "fabric": "warp-drives-v1",
+        "storage_class": "ssd-cell",
+        "production": True,
+        "path_evidence": [
+            {
+                "name": "managed_release_root",
+                "requested": str(root),
+                "resolved": str(root),
+                "role": "hot",
+                "device": "nvme0n1",
+                "mount_point": str(tmp_path),
+                "source": "/dev/nvme0n1",
+                "filesystem": "ext4",
+                "rotational": "0",
+                "storage_class": "ssd-cell",
+            }
+        ],
+    }
+    rebound_payload = copy.deepcopy(stable_payload)
+    rebound_payload["path_evidence"][0]["device"] = "sda"
+    rebound_payload["path_evidence"][0]["source"] = "/dev/sda"
+    target_activation = release_manager._current_activation_bundle(
+        layout,
+        Path(sys.executable).resolve(strict=True),
+    )
+    with mock.patch.object(
+        release_manager,
+        "_require_managed_storage",
+        side_effect=[
+            SimpleNamespace(as_dict=lambda: copy.deepcopy(stable_payload)),
+            SimpleNamespace(as_dict=lambda: copy.deepcopy(stable_payload)),
+            SimpleNamespace(as_dict=lambda: copy.deepcopy(stable_payload)),
+            SimpleNamespace(as_dict=lambda: copy.deepcopy(rebound_payload)),
+        ],
+    ), mock.patch.object(
+        release_manager,
+        "_derive_release_activation_bundle",
+        return_value=target_activation,
+    ):
+        with pytest.raises(
+            ReleaseError,
+            match="activation publication failed and was rolled back: "
+            "managed storage identity changed during managed rollback publication",
+        ):
+            rollback_release(root=root, bin_dir=bin_dir, production=True)
+
+    assert layout.state_path.read_bytes() == before_state
+    assert layout.bootstrap_path.read_bytes() == before_bootstrap
+    assert layout.launcher_path.read_bytes() == before_launcher
+    assert load_managed_state(layout)["current_release_id"] == manifest_b["release_id"]
 
 
 def test_new_policy_install_freezes_directories_and_blocks_bytecode_creation(
@@ -5458,7 +6487,7 @@ def test_failed_verification_cleans_a_frozen_unique_staging_tree(tmp_path: Path)
         raise ReleaseError("simulated verification failure after freeze")
 
     with mock.patch(
-        "termdeck.release_manager.verify_installed_tree",
+        "termdeck.release_manager._verify_installed_tree_details",
         side_effect=freeze_then_fail,
     ), pytest.raises(ReleaseError, match="after freeze"):
         _stage_release(layout, verified, manifest_path)

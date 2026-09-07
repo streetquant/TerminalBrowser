@@ -183,6 +183,34 @@ class SessionReconcileTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_live_external_tab_is_reattached_but_missing_external_tab_is_not_restarted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                external_live = store.create("external-live", "dev", "bash", tmp)
+                external_missing = store.create("external-missing", "dev", "bash", tmp)
+                external_live = store.update(
+                    external_live.id,
+                    status="running",
+                    external=True,
+                    visible=True,
+                )
+                external_missing = store.update(
+                    external_missing.id,
+                    status="running",
+                    external=True,
+                    visible=True,
+                )
+
+                selected = startup_restore_candidates(
+                    [external_live, external_missing],
+                    live_session_ids=[external_live.id],
+                )
+
+                self.assertEqual([record.id for record in selected], [external_live.id])
+            finally:
+                store.close()
+
     def test_explicit_stop_wins_over_stale_live_backend_observation(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")

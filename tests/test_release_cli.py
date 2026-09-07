@@ -108,6 +108,7 @@ def test_release_handlers_forward_exact_user_arguments() -> None:
         bin_dir=Path("bin"),
         python=None,
         lock_timeout=2.5,
+        production=True,
     )
 
     with mock.patch("termdeck.cli.rollback_release", return_value={"ok": True}) as rollback:
@@ -128,6 +129,7 @@ def test_release_handlers_forward_exact_user_arguments() -> None:
         release_id="c" * 64,
         to_legacy=False,
         lock_timeout=3.0,
+        production=True,
     )
 
     with mock.patch(

@@ -5,15 +5,24 @@ from pathlib import Path
 from unittest import mock
 
 from termdeck.cli import main
+from termdeck.desktop_integration import DesktopIntegrationError
 
 
 class CliDesktopTests(unittest.TestCase):
+    @staticmethod
+    def _stdout_payload(stdout) -> dict[str, object]:
+        written = "".join(
+            call.args[0] + call.kwargs.get("end", "\n")
+            for call in stdout.write.call_args_list
+            if call.args
+        )
+        return json.loads(written)
+
     def test_install_desktop_dry_run_outputs_json(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch("sys.stdout") as stdout:
             code = main(["install-desktop", "--dry-run", "--data-home", tmp, "--command", "t1000"])
             self.assertEqual(code, 0)
-            written = "".join(call.args[0] + (call.kwargs.get("end", "\n")) for call in stdout.write.call_args_list if call.args)
-            payload = json.loads(written)
+            payload = self._stdout_payload(stdout)
             self.assertEqual(payload["action"], "install-desktop")
             self.assertTrue(payload["dry_run"])
             self.assertIn("Exec=t1000 gui", payload["desktop_entry"])
@@ -82,6 +91,32 @@ class CliDesktopTests(unittest.TestCase):
                 0,
             )
             self.assertFalse(autostart.exists())
+
+    def test_install_safety_error_is_structured_json(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "termdeck.cli.install_desktop",
+            side_effect=DesktopIntegrationError("unsafe desktop target"),
+        ), mock.patch("sys.stdout") as stdout:
+            code = main(["install-desktop", "--data-home", tmp])
+            self.assertEqual(code, 1)
+            payload = self._stdout_payload(stdout)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["action"], "install-desktop")
+            self.assertEqual(payload["error_type"], "DesktopIntegrationError")
+            self.assertIn("unsafe desktop target", payload["error"])
+
+    def test_uninstall_safety_error_is_structured_json(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "termdeck.cli.uninstall_desktop",
+            side_effect=DesktopIntegrationError("unsafe desktop ancestor"),
+        ), mock.patch("sys.stdout") as stdout:
+            code = main(["uninstall-desktop", "--data-home", tmp])
+            self.assertEqual(code, 1)
+            payload = self._stdout_payload(stdout)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["action"], "uninstall-desktop")
+            self.assertEqual(payload["error_type"], "DesktopIntegrationError")
+            self.assertIn("unsafe desktop ancestor", payload["error"])
 
 
 if __name__ == "__main__":

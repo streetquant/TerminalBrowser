@@ -11,7 +11,7 @@ Environment=HOME=/home/arch
 Environment=USER=max
 Environment=LOGNAME=max
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-ExecStart=/8tb/projects/softwares/termdeck/.runtime/termdeck-lan/bin/termdeck-cloudflare-preview
+ExecStart=/var/lib/codexpro-exec/termdeck-runtime/termdeck-lan/bin/termdeck-cloudflare-preview
 Restart=always
 RestartSec=5s
 TimeoutStartSec=45s
@@ -27,7 +27,7 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/8tb/projects/softwares/termdeck/.runtime/termdeck-lan
+ReadWritePaths=/var/lib/codexpro-exec/termdeck-runtime/termdeck-lan
 LimitNOFILE=65536
 TasksMax=1024
 MemoryHigh=512M

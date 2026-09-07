@@ -326,8 +326,13 @@ def _target_keys(record: object, recipe: SessionRecipe | None) -> tuple[str, ...
             command = recipe.command
         if not command:
             command = _text(getattr(record, "command", ""))
-        if _resume_uuid(command):
-            values.append(("auth-resume" if auth_scope else "resume", f"{auth_scope}\0{command}" if auth_scope else command))
+        if resume_id := _resume_uuid(command):
+            values.append(
+                (
+                    "auth-resume" if auth_scope else "resume",
+                    f"{auth_scope}\0{resume_id}" if auth_scope else resume_id,
+                )
+            )
     keys = {
         key
         for kind, value in values

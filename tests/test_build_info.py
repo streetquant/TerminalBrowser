@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
+from termdeck import __version__
 from termdeck.build_info import (
     BUILD_INFO_SCHEMA,
     MANAGED_STATE_SCHEMA,
@@ -172,6 +174,29 @@ def test_release_status_reports_development_without_inventing_release() -> None:
     assert status["posture"] == "development"
     assert status["release_id"] is None
     assert status["build_info"]["build_id"] == "development"
+
+
+def test_repository_release_metadata_matches_package_version() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    project_document = (repository / "pyproject.toml").read_text(encoding="utf-8")
+    project_block = project_document.split("[project]", 1)[1].split("\n[", 1)[0]
+    version_match = re.search(
+        r'^version\s*=\s*"([^"]+)"\s*$', project_block, re.MULTILINE
+    )
+    assert version_match is not None
+    project_version = version_match.group(1)
+    build_info = load_bundled_build_info(repository / "termdeck" / "_build_info.json")
+
+    assert project_version == __version__ == build_info["version"]
+    assert f"\n## {project_version}\n" in (repository / "CHANGELOG.md").read_text(
+        encoding="utf-8"
+    )
+    assert f"\n## {project_version}\n" in (repository / "RELEASE_NOTES.md").read_text(
+        encoding="utf-8"
+    )
+    assert (repository / "docs" / "releases" / f"v{project_version}.md").read_text(
+        encoding="utf-8"
+    ).startswith(f"# T1000 {project_version}\n")
 
 
 def test_release_status_rejects_dirty_candidate_as_managed_release(

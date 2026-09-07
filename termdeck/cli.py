@@ -30,7 +30,12 @@ def _codex_auth_manager_class():
 from .command_palette import build_palette_items, search_palette, serialise_palette_items
 from .capture_search import render_output_search_table, search_session_output
 from .control_plan import build_control_plan
-from .desktop_integration import build_install_plan, install_desktop, uninstall_desktop
+from .desktop_integration import (
+    DesktopIntegrationError,
+    build_install_plan,
+    install_desktop,
+    uninstall_desktop,
+)
 from .diagnostics import build_diagnostic_payload, write_diagnostic_bundle
 from .freeze_diagnostics import build_freeze_diagnostic_payload
 from .auth_scope_gc import plan_auth_scope_gc
@@ -58,9 +63,9 @@ from .session_store import (
     DEFAULT_DB_PATH,
     SessionStore,
     default_db_path,
-    legacy_state_dir,
     utc_now,
 )
+from .storage_fabric import StorageFabricError, require_hot_storage
 from .settings import sample_settings_json
 from .shutdown_service import (
     ShutdownServiceError,
@@ -402,6 +407,7 @@ def cmd_release_rollback(args: argparse.Namespace) -> int:
             release_id=getattr(args, "release_id", None),
             to_legacy=bool(getattr(args, "legacy", False)),
             lock_timeout=float(getattr(args, "lock_timeout", 15.0)),
+            production=True,
         )
     except (BuildIdentityError, ReleaseError, OSError, ValueError) as exc:
         return _print_release_error("release-rollback", exc)
@@ -459,30 +465,52 @@ def cmd_auth_gc(args: argparse.Namespace) -> int:
 
 
 def cmd_install_desktop(args: argparse.Namespace) -> int:
-    plan = build_install_plan(
-        command=getattr(args, "command", None),
-        data_home=getattr(args, "data_home", None),
-        config_home=getattr(args, "config_home", None),
-    )
-    payload = install_desktop(
-        plan,
-        dry_run=bool(getattr(args, "dry_run", False)),
-        update_database=bool(getattr(args, "update_database", False)),
-        install_autostart=bool(getattr(args, "autostart", False)),
-    )
+    try:
+        plan = build_install_plan(
+            command=getattr(args, "command", None),
+            data_home=getattr(args, "data_home", None),
+            config_home=getattr(args, "config_home", None),
+        )
+        payload = install_desktop(
+            plan,
+            dry_run=bool(getattr(args, "dry_run", False)),
+            update_database=bool(getattr(args, "update_database", False)),
+            install_autostart=bool(getattr(args, "autostart", False)),
+        )
+    except (DesktopIntegrationError, OSError, ValueError) as exc:
+        _print_json(
+            {
+                "ok": False,
+                "action": "install-desktop",
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
+        )
+        return 1
     _print_json(payload)
     return 0 if payload.get("ok") else 1
 
 
 def cmd_uninstall_desktop(args: argparse.Namespace) -> int:
-    payload = uninstall_desktop(
-        data_home=getattr(args, "data_home", None),
-        config_home=getattr(args, "config_home", None),
-        dry_run=bool(getattr(args, "dry_run", False)),
-        remove_autostart=bool(getattr(args, "autostart", False)),
-    )
+    try:
+        payload = uninstall_desktop(
+            data_home=getattr(args, "data_home", None),
+            config_home=getattr(args, "config_home", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            remove_autostart=bool(getattr(args, "autostart", False)),
+        )
+    except (DesktopIntegrationError, OSError, ValueError) as exc:
+        _print_json(
+            {
+                "ok": False,
+                "action": "uninstall-desktop",
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
+        )
+        return 1
     _print_json(payload)
-    return 0
+    return 0 if payload.get("ok") else 1
 
 
 def cmd_install_checkpoint_service(args: argparse.Namespace) -> int:
@@ -1712,6 +1740,22 @@ def _add_config_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path, default=None, help="optional T1000 JSON config path")
 
 
+def _mark_session_database_usage(parser: argparse.ArgumentParser) -> None:
+    subparsers = [
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    ]
+    if not subparsers:
+        parser.set_defaults(
+            _uses_session_db=any(action.dest == "db" for action in parser._actions)
+        )
+        return
+    for action in subparsers:
+        for child in action.choices.values():
+            _mark_session_database_usage(child)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="t1000", description="Named terminal windows with directory-backed tabs")
     parser.add_argument("--version", action="version", version=f"t1000 {__version__}")
@@ -2228,7 +2272,13 @@ def build_parser() -> argparse.ArgumentParser:
     gui.set_defaults(func=cmd_gui)
 
     parser.add_argument("--workspace", type=Path, default=None, help=argparse.SUPPRESS)
-    parser.set_defaults(func=cmd_gui, db=None, workspace=None)
+    parser.set_defaults(
+        func=cmd_gui,
+        db=None,
+        workspace=None,
+        _uses_session_db=True,
+    )
+    _mark_session_database_usage(parser)
     return parser
 
 
@@ -2250,27 +2300,58 @@ def _adopt_process_name(name: str = "t1000") -> None:
         pass
 
 
-def _prepare_managed_session_database(args: argparse.Namespace) -> None:
-    """Keep non-GUI commands on the legacy registry until primary cutover.
+class ManagedSessionDatabaseUnavailable(RuntimeError):
+    """A managed CLI command must wait for primary database migration."""
 
-    The GUI performs the one-time migration only after GApplication has made
-    it the primary instance.  Running a database copy from every CLI command
-    could fork registry history while an older desktop process was still
-    writing the legacy database.
+
+def _prepare_managed_session_database(args: argparse.Namespace) -> None:
+    """Attest and bind the exact database used by a managed CLI command.
+
+    The GUI remains the sole owner of default-registry migration after it wins
+    GApplication primary ownership.  Other managed commands defer while that
+    database is absent; they never open the legacy HDD registry as a fallback.
     """
 
-    if getattr(args, "db", None) is not None:
+    raw_managed_root = os.environ.get("T1000_MANAGED_ROOT", "").strip()
+    uses_session_db = bool(
+        getattr(args, "_uses_session_db", hasattr(args, "db"))
+    )
+    if not raw_managed_root or not uses_session_db:
         return
-    if not os.environ.get("T1000_MANAGED_ROOT", "").strip():
-        return
-    if getattr(args, "func", None) in {cmd_gui, cmd_recovery_intent}:
-        return
-    if not hasattr(args, "db"):
-        return
-    managed = default_db_path()
-    legacy = legacy_state_dir() / "sessions.sqlite3"
-    if not managed.exists() and legacy.is_file():
-        args.db = legacy
+    managed_root = Path(raw_managed_root).expanduser()
+    if not managed_root.is_absolute():
+        raise ValueError("T1000_MANAGED_ROOT must be an absolute path")
+
+    explicit = getattr(args, "db", None)
+    if explicit is not None and Path(explicit) == Path(":memory:"):
+        raise ValueError("managed CLI commands require a file-backed session database")
+    effective = Path(explicit).expanduser() if explicit is not None else default_db_path()
+    if not effective.is_absolute():
+        effective = Path.cwd() / effective
+    effective = Path(os.path.abspath(os.fspath(effective)))
+
+    require_hot_storage(
+        managed_root=managed_root,
+        db_path=effective,
+        production=True,
+    )
+    if effective.exists() and not effective.is_file():
+        raise ValueError(f"TermDeck database path is not a regular file: {effective}")
+    args.db = effective
+
+    managed_default = Path(
+        os.path.abspath(os.fspath(default_db_path()))
+    )
+    if (
+        effective == managed_default
+        and not effective.exists()
+        and getattr(args, "func", None) is not cmd_gui
+    ):
+        command = str(getattr(args, "command", "managed command") or "managed command")
+        raise ManagedSessionDatabaseUnavailable(
+            "managed session database migration is pending; start the primary "
+            f"T1000 GUI before running {command}"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2284,8 +2365,21 @@ def main(argv: list[str] | None = None) -> int:
     _adopt_process_name()
     parser = build_parser()
     args = parser.parse_args(argv)
-    _prepare_managed_session_database(args)
-    return int(args.func(args))
+    try:
+        _prepare_managed_session_database(args)
+    except (
+        ManagedSessionDatabaseUnavailable,
+        StorageFabricError,
+        OSError,
+        ValueError,
+    ) as exc:
+        print(f"t1000 managed CLI refused unsafe session state: {exc}", file=sys.stderr)
+        return 78
+    try:
+        return int(args.func(args))
+    except StorageFabricError as exc:
+        print(f"t1000 managed CLI refused unsafe session state: {exc}", file=sys.stderr)
+        return 78
 
 
 if __name__ == "__main__":

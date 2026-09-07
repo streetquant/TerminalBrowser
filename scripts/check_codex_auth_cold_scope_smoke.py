@@ -193,11 +193,7 @@ def main() -> int:
         )
         return 0
 
-    workspace_root = Path(__file__).resolve().parents[1]
-    with tempfile.TemporaryDirectory(
-        prefix=".termdeck-cold-auth-",
-        dir=workspace_root,
-    ) as tmp:
+    with tempfile.TemporaryDirectory(prefix="td-") as tmp:
         root = Path(tmp)
         fake_user_home = root / "home"
         canonical_home = fake_user_home / ".codex"

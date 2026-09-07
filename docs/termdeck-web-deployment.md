@@ -4,7 +4,7 @@ The browser client is served by a loopback-only Rust backend and a persistent ng
 
 ## Local service
 
-Install `scripts/termdeck-web-prepare-runtime.sh` as `/8tb/projects/softwares/termdeck/.runtime/termdeck-lan/bin/termdeck-web-prepare`, install the user units from `deploy/systemd`, run `systemctl --user daemon-reload`, and enable `termdeck-web-backend.service` plus `termdeck-web-lan.service`. The user must have lingering enabled. The backend remains bound to `127.0.0.1:7391`; only nginx binds port 7443.
+Install `scripts/termdeck-web-prepare-runtime.sh` as `/var/lib/codexpro-exec/termdeck-runtime/termdeck-lan/bin/termdeck-web-prepare`, install the user units from `deploy/systemd`, run `systemctl --user daemon-reload`, and enable `termdeck-web-backend.service` plus `termdeck-web-lan.service`. The user must have lingering enabled. The backend remains bound to `127.0.0.1:7391`; only nginx binds port 7443.
 
 The certificate is signed by the existing TermDeck LAN CA and includes the current DHCP address, `127.0.0.1`, `termdeck.local`, and `max.local`. Re-running the preparation script is idempotent and rotates only when the address changes or the certificate approaches expiry.
 

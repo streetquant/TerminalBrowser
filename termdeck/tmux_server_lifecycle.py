@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from .storage_fabric import StorageFabricError, tmux_subprocess_environment
+
 _SYSTEMD_RUN = Path("/usr/bin/systemd-run")
 _SYSTEMCTL = Path("/usr/bin/systemctl")
 _BUSCTL = Path("/usr/bin/busctl")
@@ -107,7 +109,12 @@ def user_systemd_scope_available() -> bool:
 def _socket_root_visible_to_user_manager(*, timeout: float = 2.0) -> bool:
     """Prove the tmux socket root is shared with user-systemd's mount namespace."""
 
-    raw_root = os.environ.get("TMUX_TMPDIR", "/tmp").strip() or "/tmp"
+    try:
+        child_environment = tmux_subprocess_environment(materialize=True)
+    except StorageFabricError:
+        return False
+    values = os.environ if child_environment is None else child_environment
+    raw_root = values.get("TMUX_TMPDIR", "/tmp").strip() or "/tmp"
     root = Path(raw_root).expanduser()
     try:
         if not root.is_dir():
@@ -180,6 +187,10 @@ def _run(
     timeout: float,
 ) -> subprocess.CompletedProcess[str]:
     try:
+        child_environment = tmux_subprocess_environment(materialize=True)
+    except StorageFabricError as exc:
+        raise TmuxServerIsolationError(str(exc)) from exc
+    try:
         return subprocess.run(
             [str(item) for item in argv],
             text=True,
@@ -187,6 +198,7 @@ def _run(
             stderr=subprocess.PIPE,
             check=False,
             timeout=max(0.05, float(timeout)),
+            env=child_environment,
         )
     except subprocess.TimeoutExpired as exc:
         raise TmuxServerIsolationError(

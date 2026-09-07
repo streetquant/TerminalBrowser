@@ -13,13 +13,32 @@ expected non-rotational SSD cell. The default release root is
 `/home/arch/.local/state/codex-project-homes/runtime/t1000-managed`. Mutable
 TermDeck state is kept in the adjacent
 `<T1000_MANAGED_ROOT parent>/termdeck/` directory, including the primary
-`sessions.sqlite3` registry, managed `terminal-auth/` scopes, and durable
-`recovery-intents/` sidecars. TermDeck also reports the Warp Drives attestation
-tuple `CODEX_STORAGE_FABRIC=warp-drives-v1`,
+`sessions.sqlite3` registry, managed `terminal-auth/` scopes, and the
+recovery-intent state described below. TermDeck also reports the Warp Drives
+attestation tuple `CODEX_STORAGE_FABRIC=warp-drives-v1`,
 `CODEX_WORKSPACE_STORAGE_CLASS=ssd-cell`, and
 `CODEX_BULK_STORAGE_MASKED=1` as advisory evidence; mount/device proof remains
 authoritative for TermDeck admission. Managed Codex workspace processes must
 independently receive the exact tuple from the canonical launcher.
+
+### Recovery-intent managed state
+
+| Managed-state sibling | Lifecycle and authority |
+| --- | --- |
+| `recovery-intents/` | Durable pending requests, one canonical sidecar per session. A matching repeat returns the same request id; the sidecar remains until a durable acknowledgement exists and consumption completes, or rejection moves it to quarantine. |
+| `recovery-intent-acks/` | Durable terminal acknowledgements for consumed requests. An acknowledgement makes a matching retry idempotent only while the managed row still has the same identity and fingerprint with active recovery intent; stale acknowledgements are removed and malformed ones are quarantined. |
+| `recovery-intent-locks/` | Private per-session coordination files. They serialize only the same session, retire when no pending sidecar remains, and are not recovery authority or durable backup material. |
+| `recovery-intent-tmp/` | Transient staging for atomic intent and acknowledgement publication. Orphan cleanup is entry- and time-bounded; unsafe residue is quarantined rather than followed or trusted. |
+| `recovery-intent-quarantine/` | Retained rejected, malformed, or unsafe artifacts for audit. Quarantined files are excluded from active recovery and are not automatically consumed as requests. |
+
+A quiescent managed-state backup should keep `sessions.sqlite3`,
+`recovery-intents/`, and `recovery-intent-acks/` as one logical set. Retain
+`recovery-intent-quarantine/` when its audit evidence is required;
+`recovery-intent-locks/` and `recovery-intent-tmp/` are reproducible
+coordination and staging state, not durable backup inputs. After restore,
+pending requests still require the managed fingerprint check and
+acknowledgements still require the matching active database row, so a stale
+backup artifact cannot authorize a changed session identity.
 
 Legacy `~/.local/share/termdeck/` state is an import source, not a second
 managed authority. Only the primary GUI may explicitly import the legacy
@@ -63,8 +82,12 @@ rejects another TermDeck private wrapper as its launcher to prevent recursion.
 It also rejects any user-supplied `-c`/`--config` value containing
 `sqlite_home`; Codex applies duplicate CLI overrides in argument order, so
 allowing a later duplicate would defeat terminal-private state.
-`TERMDECK_CODEX_BINARY` can select an explicit launcher, but it must be an
-absolute executable outside the private scope.
+In production, `TERMDECK_CODEX_BINARY` may select only the recognized managed
+Codex launcher whose installed identity and helper contract pass attestation.
+An arbitrary absolute executable, a binary merely named `codex`, or a PATH
+position is not trust evidence and is rejected. An injected launcher attestor
+exists for release verification and deterministic tests; it is not a
+user-configurable production contract.
 
 Reconciliation is intentionally non-destructive. Missing canonical assets are
 linked, and existing links must resolve to the expected canonical target. An

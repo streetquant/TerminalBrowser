@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-RUNTIME = Path("/8tb/projects/softwares/termdeck/.runtime/termdeck-lan")
+RUNTIME = Path("/var/lib/codexpro-exec/termdeck-runtime/termdeck-lan")
 URL_FILE = RUNTIME / "cloudflare-preview-url.json"
 EMPTY_CONFIG = RUNTIME / "cloudflare-preview-empty.yml"
 URL_PATTERN = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")

@@ -168,6 +168,176 @@ class WindowTabModelTests(TestCase):
         self.assertEqual(updates[0][1]["visible"], True)
         self.assertEqual(side.refresh_count, 1)
 
+    def test_store_bookkeeping_failure_does_not_hide_later_tabs(self) -> None:
+        records = [
+            SimpleNamespace(id="first", tab_index=0, visible=True, status="running"),
+            SimpleNamespace(id="second", tab_index=1, visible=True, status="running"),
+        ]
+
+        class Backend:
+            def session_exists_many(self, candidates):
+                return {candidate.id: True for candidate in candidates}
+
+            def pane_pids(self, candidates):
+                return {candidate.id: 200 + index for index, candidate in enumerate(candidates)}
+
+        def reject_update(_session_id, **_changes):
+            raise KeyError("row was concurrently removed")
+
+        window = SimpleNamespace(
+            app_context=SimpleNamespace(
+                backend=Backend(),
+                store=SimpleNamespace(update=reject_update),
+            ),
+            tabs={},
+            side=SideStub(),
+        )
+
+        def open_session(record, **_kwargs):
+            if record.id == "first":
+                raise RuntimeError("first VTE failed")
+            window.tabs[record.id] = object()
+
+        window.open_session = open_session
+
+        restored = TermDeckWindow.restore_previous_tabs(window, records=records)
+
+        self.assertEqual(restored, 1)
+        self.assertEqual(set(window.tabs), {"second"})
+        self.assertEqual(window._restore_retry_ids, {"first"})
+
+    def test_accepted_recovery_never_falls_through_to_direct_restart(self) -> None:
+        record = SimpleNamespace(
+            id="dead-pane",
+            tab_index=0,
+            visible=True,
+            status="running",
+        )
+        captured = {}
+
+        class Coordinator:
+            def submit(self, candidate, **kwargs):
+                captured.update(kwargs)
+                captured["record"] = candidate
+                return SimpleNamespace(accepted=True, state="queued")
+
+        class Backend:
+            def session_exists_many(self, candidates):
+                return {candidate.id: False for candidate in candidates}
+
+            def pane_pids(self, _candidates):
+                return {}
+
+        window = SimpleNamespace(
+            app_context=SimpleNamespace(
+                backend=Backend(),
+                store=SimpleNamespace(get=lambda _session_id: record),
+                _get_recovery_coordinator=lambda: Coordinator(),
+            ),
+            tabs={},
+            side=SideStub(),
+            _restore_callbacks_alive=True,
+        )
+
+        def open_session(candidate, **kwargs):
+            captured["open"] = (candidate, kwargs)
+            window.tabs[candidate.id] = object()
+
+        window.open_session = open_session
+        with mock.patch("termdeck.gtk_app.startup_recovery_allowed", return_value=True):
+            restored = TermDeckWindow.restore_previous_tabs(window, records=[record])
+
+        self.assertEqual(restored, 0)
+        self.assertNotIn("open", captured)
+        self.assertEqual(captured["mode"], "payload")
+        self.assertEqual(window._restore_inflight_ids, {record.id})
+
+        captured["on_ready"](SimpleNamespace(pid=6101))
+
+        self.assertEqual(set(window.tabs), {record.id})
+        self.assertEqual(window._restore_inflight_ids, set())
+        self.assertFalse(captured["open"][1]["restart_missing"])
+
+    def test_destroyed_window_ignores_late_recovery_callback(self) -> None:
+        record = SimpleNamespace(
+            id="late-pane",
+            tab_index=0,
+            visible=True,
+            status="running",
+        )
+        captured = {}
+
+        class Coordinator:
+            def submit(self, _candidate, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(accepted=True, state="queued")
+
+        class Backend:
+            def session_exists_many(self, candidates):
+                return {candidate.id: False for candidate in candidates}
+
+            def pane_pids(self, _candidates):
+                return {}
+
+        window = SimpleNamespace(
+            app_context=SimpleNamespace(
+                backend=Backend(),
+                store=SimpleNamespace(
+                    get=lambda _session_id: (_ for _ in ()).throw(
+                        AssertionError("destroyed callback touched the store")
+                    ),
+                ),
+                _get_recovery_coordinator=lambda: Coordinator(),
+            ),
+            tabs={},
+            side=SideStub(),
+            _restore_callbacks_alive=True,
+            open_session=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("destroyed callback opened a tab")
+            ),
+        )
+        with mock.patch("termdeck.gtk_app.startup_recovery_allowed", return_value=True):
+            TermDeckWindow.restore_previous_tabs(window, records=[record])
+
+        window._restore_callbacks_alive = False
+        captured["on_ready"](SimpleNamespace(pid=6102))
+
+        self.assertEqual(window.tabs, {})
+        self.assertEqual(window._restore_inflight_ids, set())
+
+    def test_retry_discards_explicitly_stopped_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            try:
+                record = store.create("stopped", "terminal", "bash", tmp)
+                record = store.update(
+                    record.id,
+                    status="stopped",
+                    recovery_intent="inactive",
+                    visible=True,
+                )
+                restore = mock.Mock()
+                window = SimpleNamespace(
+                    _restore_callbacks_alive=True,
+                    _restore_retry_source_id=9,
+                    _restore_retry_attempts=0,
+                    _restore_retry_ids={record.id},
+                    tabs={},
+                    app_context=SimpleNamespace(
+                        store=store,
+                        backend=SimpleNamespace(session_exists=lambda _record: False),
+                    ),
+                    restore_previous_tabs=restore,
+                )
+
+                result = TermDeckWindow._retry_restore_tabs(window)
+
+                self.assertFalse(result)
+                self.assertEqual(window._restore_retry_ids, set())
+                restore.assert_not_called()
+            finally:
+                store.close()
+
     def test_restore_restarts_selected_tabs_when_the_backend_was_lost(self) -> None:
         record = SimpleNamespace(id="crashed", tab_index=0)
         calls = []

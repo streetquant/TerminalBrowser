@@ -16,7 +16,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Sequence
 
 from .checkpointing import CheckpointResult, DmtcpCheckpointManager
 from .codex_auth import (
@@ -65,6 +65,7 @@ from .resize_signal import (
     private_launch_tuple_for_scope,
     propagate_terminal_resize as _propagate_terminal_resize,
 )
+from .storage_fabric import StorageFabricError, tmux_subprocess_environment
 from .resources import (
     observe_recovery_metadata,
     process_tree,
@@ -674,6 +675,10 @@ class TmuxBackend:
         bypass_query_backoff: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         self.require_available()
+        try:
+            child_environment = tmux_subprocess_environment(materialize=True)
+        except StorageFabricError as exc:
+            raise TmuxError(str(exc)) from exc
         command = [self.executable, *args]
         limit = self.command_timeout if timeout is None else max(0.05, float(timeout))
         command_name = str(args[0]) if args else ""
@@ -712,6 +717,7 @@ class TmuxBackend:
                 stderr=subprocess.PIPE,
                 check=False,
                 timeout=limit,
+                env=child_environment,
             )
         except subprocess.TimeoutExpired as exc:
             detail = f"tmux command timed out after {limit:g}s: {args[0] if args else 'command'}"
@@ -790,6 +796,46 @@ class TmuxBackend:
             result.stderr.strip()
             or "tmux could not prove whether the terminal auth writer is running"
         )
+
+    @contextmanager
+    def auth_scope_writer_quiescence(
+        self,
+        record: SessionRecord,
+    ) -> Iterator[dict[str, object]]:
+        """Hold exact per-scope fencing while a missing tab is rebound.
+
+        The transaction lock excludes another TermDeck mutation, while the two
+        non-blocking lifetime locks cover both legacy and current managed Codex
+        launchers.  The caller must keep this context open through the durable
+        auth-scope compare-and-swap so an active writer cannot enter between
+        the quiescence observation and the rebind.
+        """
+
+        with auth_transaction_lock(record):
+            if self._auth_session_exists(record):
+                yield {
+                    "quiescent": False,
+                    "detail": "the terminal auth session is still live",
+                }
+                return
+            lifetime_lease = _acquire_auth_lifetime_lease(record)
+            try:
+                if not lifetime_lease.held:
+                    raise TmuxError(
+                        "Codex scope lifetime lease changed during quiescence proof"
+                    )
+                if self._auth_session_exists(record):
+                    yield {
+                        "quiescent": False,
+                        "detail": "the terminal auth session became live during proof",
+                    }
+                    return
+                yield {
+                    "quiescent": True,
+                    "detail": "both Codex lifetime generations are exclusively fenced",
+                }
+            finally:
+                lifetime_lease.release()
 
     def private_auth_environment_ready(self, record: SessionRecord) -> bool:
         """Verify the bound pane process was born with this tab's auth scope.
@@ -1741,7 +1787,7 @@ class TmuxBackend:
         # while retaining the auth transaction lock around this mutation.
         if lifetime_lease is not None:
             lifetime_lease.release()
-        args = ["respawn-pane", "-k", "-t", lifecycle.pane_id]
+        args = ["respawn-pane", "-t", lifecycle.pane_id]
         args.extend(self._environment_args(spec.environment))
         args.extend(["-c", str(spec.directory), spec.command])
         self._run(args)
@@ -1789,7 +1835,7 @@ class TmuxBackend:
                         except ValueError:
                             last_detail = "replacement pane reported an invalid pid"
                         else:
-                            if pid > 0:
+                            if pid > 1:
                                 self.invalidate_cache()
                                 return pid
                     else:
@@ -1836,7 +1882,7 @@ class TmuxBackend:
         spec = self._launch_spec(shell_record)
         if lifetime_lease is not None:
             lifetime_lease.release()
-        args = ["respawn-pane", "-k", "-t", lifecycle.pane_id]
+        args = ["respawn-pane", "-t", lifecycle.pane_id]
         args.extend(self._environment_args(spec.environment))
         args.extend(["-c", str(spec.directory), spec.command])
         self._run(args)
@@ -1905,6 +1951,23 @@ class TmuxBackend:
             with auth_transaction_lock(record):
                 observed = lifecycle_or_result()
                 if isinstance(observed, DeadPayloadRecoveryResult):
+                    if (
+                        self._exact_codex_recovery(record) is not None
+                        or self._exact_claude_recovery(record) is not None
+                    ):
+                        previous_pid = observed.pid
+                        self._recover_exact_over_idle_placeholder(record)
+                        recovered_pid = self.authoritative_live_pane_pid(record)
+                        if recovered_pid is None or recovered_pid <= 1:
+                            raise TmuxError(
+                                "exact recovery did not produce an authoritative live pane"
+                            )
+                        if recovered_pid != previous_pid:
+                            return DeadPayloadRecoveryResult(
+                                action="restarted",
+                                pid=recovered_pid,
+                                detail="exact payload resumed over its idle placeholder",
+                            )
                     return observed
                 lifecycle = observed
                 if (
@@ -1937,9 +2000,7 @@ class TmuxBackend:
 
         probe = replace(record, status="recovery-pending")
         self.create_or_resume(probe)
-        pid = self.pane_pid(record)
-        if pid is None:
-            raise TmuxError("restarted payload has no live pane pid")
+        pid = self._await_live_pane_pid(record, pane_id=lifecycle.pane_id)
         return DeadPayloadRecoveryResult(
             action="restarted",
             pid=pid,
@@ -1986,7 +2047,8 @@ class TmuxBackend:
                                 lifetime_lease=lifetime_lease,
                             )
                         finally:
-                            lifetime_lease.release()
+                            if lifetime_lease.held:
+                                lifetime_lease.release()
                     elif (
                         record.status.casefold() == "recovery-pending"
                         and (
@@ -2012,7 +2074,8 @@ class TmuxBackend:
                         create_kwargs["initial_grid"] = initial_grid
                     self._create_or_resume_unlocked(record, **create_kwargs)
                 finally:
-                    lifetime_lease.release()
+                    if lifetime_lease.held:
+                        lifetime_lease.release()
             return
 
         if self.session_exists(record):
@@ -2564,6 +2627,8 @@ class TmuxBackend:
             str(launch_directory),
             command,
         ])
+        if raw_codex_home and lifetime_lease is not None:
+            lifetime_lease.release()
         self._run(launch_args)
         # Make the session visually clean when attached.
         self._run(["set-option", "-t", record.tmux_name, "status", "off"], check=False)

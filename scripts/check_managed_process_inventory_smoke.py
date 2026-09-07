@@ -91,6 +91,11 @@ def main() -> int:
                 "direct_complete": True,
                 "broker_attempted": False,
                 "broker_result": "not-needed",
+                "singleflight_role": "none",
+                "broker_shared": False,
+                "direct_singleflight_role": "leader",
+                "direct_shared": False,
+                "direct_scan_result": "accepted",
             }:
                 raise AssertionError(f"invalid direct observer receipt: {observer!r}")
         elif observer.get("mode") == "systemd-user-manager":

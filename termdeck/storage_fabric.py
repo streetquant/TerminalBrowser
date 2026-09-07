@@ -14,7 +14,7 @@ import os
 import stat as stat_module
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Mapping, MutableMapping, Sequence
 
 STORAGE_ATTESTATION_SCHEMA = "termdeck.storage-fabric-attestation.v1"
 STORAGE_ATTESTATION_VERSION = 1
@@ -34,6 +34,105 @@ EXPECTED_STORAGE_ENVIRONMENT = {
     "CODEX_WORKSPACE_STORAGE_CLASS": STORAGE_CLASS,
     "CODEX_BULK_STORAGE_MASKED": "1",
 }
+
+
+@dataclass
+class _PinnedDirectory:
+    path: Path
+    descriptor: int
+    device: str
+    identity: tuple[int, int]
+
+    @property
+    def proc_path(self) -> Path:
+        return Path(f"/proc/{os.getpid()}/fd/{self.descriptor}")
+
+    def close(self) -> None:
+        descriptor = self.descriptor
+        if descriptor < 0:
+            return
+        self.descriptor = -1
+        os.close(descriptor)
+
+
+@dataclass
+class _ProductionDirectoryBinding:
+    path: Path
+    expected_device: str
+    pinned: _PinnedDirectory | None = None
+
+    def close(self) -> None:
+        if self.pinned is not None:
+            self.pinned.close()
+            self.pinned = None
+
+
+@dataclass
+class _ProductionDatabaseBinding:
+    path: Path
+    expected_device: str
+    parent: _PinnedDirectory | None = None
+
+    def close(self) -> None:
+        if self.parent is not None:
+            self.parent.close()
+            self.parent = None
+
+
+@dataclass
+class DatabaseFileBinding:
+    """Descriptor-rooted SQLite file admitted by production storage proof."""
+
+    path: Path
+    parent: _PinnedDirectory
+    descriptor: int
+    expected_device: str
+    identity: tuple[int, int]
+
+    @property
+    def sqlite_path(self) -> str:
+        return f"/proc/self/fd/{self.descriptor}"
+
+    def revalidate(self) -> None:
+        _revalidate_pinned_directory(self.parent)
+        try:
+            metadata = os.stat(
+                self.path.name,
+                dir_fd=self.parent.descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise StorageFabricError(
+                f"database_root: admitted database identity is no longer reachable: {exc}"
+            ) from exc
+        if stat_module.S_ISLNK(metadata.st_mode) or not stat_module.S_ISREG(
+            metadata.st_mode
+        ):
+            raise StorageFabricError(
+                "database_root: admitted database path is no longer a regular file"
+            )
+        observed_identity = (int(metadata.st_dev), int(metadata.st_ino))
+        if observed_identity != self.identity:
+            raise StorageFabricError(
+                "database_root: database identity changed after production admission"
+            )
+        if _device_id(metadata.st_dev) != self.expected_device:
+            raise StorageFabricError(
+                "database_root: database device changed after production admission"
+            )
+
+    def close(self) -> None:
+        descriptor = self.descriptor
+        if descriptor >= 0:
+            self.descriptor = -1
+            os.close(descriptor)
+        self.parent.close()
+
+
+_PRODUCTION_TMUX_RUNTIME_BINDING: (
+    _ProductionDirectoryBinding | tuple[Path, str] | None
+) = None
+_PRODUCTION_DATABASE_BINDING: _ProductionDatabaseBinding | None = None
 
 DEFAULT_MANAGED_ROOT = Path(
     ".local/state/codex-project-homes/runtime/t1000-managed"
@@ -122,6 +221,159 @@ def _device_id(value: int) -> str:
         return f"{os.major(value)}:{os.minor(value)}"
     except (AttributeError, OSError, TypeError, ValueError):
         return ""
+
+
+def _directory_identity(metadata: object) -> tuple[int, int]:
+    return (
+        int(getattr(metadata, "st_dev", -1)),
+        int(getattr(metadata, "st_ino", -1)),
+    )
+
+
+def _open_pinned_directory(
+    path: str | Path,
+    *,
+    create: bool,
+    expected_device: str | None = None,
+    require_owner: bool = False,
+    final_mode: int | None = None,
+) -> _PinnedDirectory:
+    """Open an absolute directory without following any path component."""
+
+    requested = _as_absolute(path)
+    if requested == Path("/") and (require_owner or final_mode is not None):
+        raise StorageFabricError("filesystem root cannot be used as private hot state")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        descriptor = os.open("/", flags)
+    except OSError as exc:
+        raise StorageFabricError(
+            f"could not bind directory root for {requested}: {exc}"
+        ) from exc
+    current = Path("/")
+    try:
+        for component in requested.parts[1:]:
+            created = False
+            try:
+                before = os.stat(
+                    component,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise StorageFabricError(
+                        f"path identity disappeared before use: {requested}"
+                    )
+                try:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise StorageFabricError(
+                        f"could not create admitted directory {current / component}: {exc}"
+                    ) from exc
+                try:
+                    before = os.stat(
+                        component,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise StorageFabricError(
+                        f"could not inspect admitted directory {current / component}: {exc}"
+                    ) from exc
+                created = True
+            except OSError as exc:
+                raise StorageFabricError(
+                    f"could not inspect admitted directory {current / component}: {exc}"
+                ) from exc
+            if stat_module.S_ISLNK(before.st_mode):
+                raise StorageFabricError(
+                    f"path contains a symlink: {current / component}"
+                )
+            if not stat_module.S_ISDIR(before.st_mode):
+                raise StorageFabricError(
+                    f"path component is not a directory: {current / component}"
+                )
+            try:
+                child_descriptor = os.open(component, flags, dir_fd=descriptor)
+            except OSError as exc:
+                raise StorageFabricError(
+                    f"could not bind admitted directory {current / component}: {exc}"
+                ) from exc
+            try:
+                opened = os.fstat(child_descriptor)
+                after = os.stat(
+                    component,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    _directory_identity(before) != _directory_identity(opened)
+                    or _directory_identity(after) != _directory_identity(opened)
+                ):
+                    raise StorageFabricError(
+                        f"path identity changed while binding {current / component}"
+                    )
+            except Exception:
+                os.close(child_descriptor)
+                raise
+            os.close(descriptor)
+            descriptor = child_descriptor
+            current /= component
+            if created and current == requested and final_mode is not None:
+                os.fchmod(descriptor, final_mode)
+
+        metadata = os.fstat(descriptor)
+        if require_owner and metadata.st_uid != os.geteuid():
+            raise StorageFabricError(
+                f"admitted directory is not owned by the current user: {requested}"
+            )
+        if final_mode is not None and stat_module.S_IMODE(metadata.st_mode) != final_mode:
+            if metadata.st_uid != os.geteuid():
+                raise StorageFabricError(
+                    f"admitted directory permissions cannot be hardened: {requested}"
+                )
+            os.fchmod(descriptor, final_mode)
+            metadata = os.fstat(descriptor)
+        observed_device = _device_id(metadata.st_dev)
+        if expected_device is not None and observed_device != expected_device:
+            raise StorageFabricError(
+                f"admitted directory device changed for {requested}: "
+                f"expected {expected_device}, observed {observed_device or 'unknown'}"
+            )
+        return _PinnedDirectory(
+            path=requested,
+            descriptor=descriptor,
+            device=observed_device,
+            identity=_directory_identity(metadata),
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _revalidate_pinned_directory(binding: _PinnedDirectory) -> None:
+    if binding.descriptor < 0:
+        raise StorageFabricError(f"admitted directory binding is closed: {binding.path}")
+    current = _open_pinned_directory(
+        binding.path,
+        create=False,
+        expected_device=binding.device,
+    )
+    try:
+        if current.identity != binding.identity:
+            raise StorageFabricError(
+                f"path identity changed after production admission: {binding.path}"
+            )
+        retained = os.fstat(binding.descriptor)
+        if _directory_identity(retained) != binding.identity:
+            raise StorageFabricError(
+                f"retained directory identity changed after production admission: {binding.path}"
+            )
+    finally:
+        current.close()
 
 
 @dataclass(frozen=True)
@@ -363,6 +615,7 @@ def _nearest_existing(
     probes: StorageFabricProbes,
 ) -> tuple[Path | None, str | None]:
     current = path
+    anchor: Path | None = None
     while True:
         try:
             metadata = probes.lstat(current)
@@ -378,7 +631,22 @@ def _nearest_existing(
             return None, f"path contains a symlink: {current}"
         if not (stat_module.S_ISDIR(mode) or stat_module.S_ISREG(mode)):
             return None, f"path is not a regular file or directory: {current}"
-        return current, None
+        anchor = current
+        break
+
+    current = anchor
+    while current.parent != current:
+        current = current.parent
+        try:
+            metadata = probes.lstat(current)
+        except OSError as exc:
+            return None, f"could not inspect path ancestor {current}: {exc}"
+        mode = int(getattr(metadata, "st_mode", 0))
+        if stat_module.S_ISLNK(mode):
+            return None, f"path contains a symlink: {current}"
+        if not stat_module.S_ISDIR(mode):
+            return None, f"path ancestor is not a directory: {current}"
+    return anchor, None
 
 
 def _failed_path(
@@ -548,7 +816,11 @@ def _attest_path(
     )
 
 
-def _environment_report(environment: Mapping[str, str]) -> dict[str, object]:
+def _environment_report(
+    environment: Mapping[str, str],
+    *,
+    production: bool,
+) -> dict[str, object]:
     observed = {key: str(environment.get(key, "") or "") for key in STORAGE_ENVIRONMENT_KEYS}
     matches = observed == EXPECTED_STORAGE_ENVIRONMENT
     present = all(observed.values())
@@ -557,8 +829,8 @@ def _environment_report(environment: Mapping[str, str]) -> dict[str, object]:
         "observed": observed,
         "matches": matches,
         "status": "matching" if matches else ("partial" if present else "missing"),
-        "advisory": True,
-        "used_for_admission": False,
+        "advisory": not production,
+        "used_for_admission": production,
     }
 
 
@@ -718,7 +990,17 @@ def attest_storage_fabric(
                 require_ssd=False,
             )
 
+    environment_report = _environment_report(
+        observed_environment,
+        production=bool(production),
+    )
     failures = [path.reason for path in evidence if not path.ok]
+    if production and not environment_report["matches"]:
+        failures.append(
+            "production runtime environment is unqualified: expected "
+            f"{EXPECTED_STORAGE_ENVIRONMENT!r}, observed "
+            f"{environment_report['observed']!r}"
+        )
     if failures:
         reason = failures[0] if len(failures) == 1 else (
             f"{len(failures)} hot paths failed storage attestation; first failure: {failures[0]}"
@@ -733,7 +1015,7 @@ def attest_storage_fabric(
         reason=reason,
         paths=tuple(evidence),
         launcher=launcher_evidence,
-        environment=_environment_report(observed_environment),
+        environment=environment_report,
         production=bool(production),
     )
 
@@ -744,10 +1026,317 @@ def storage_attestation(*args: object, **kwargs: object) -> StorageAttestation:
     return attest_storage_fabric(*args, **kwargs)
 
 
+def _bind_production_tmux_runtime(
+    attestation: StorageAttestation,
+    *,
+    environment: MutableMapping[str, str] | None = None,
+    materialize: bool = False,
+) -> Path:
+    """Bind tmux clients to the exact runtime admitted by production storage."""
+
+    evidence = next(
+        (path for path in attestation.paths if path.name == "tmux_runtime"),
+        None,
+    )
+    if (
+        evidence is None
+        or not evidence.ok
+        or evidence.storage_class != STORAGE_CLASS
+        or not evidence.device
+    ):
+        raise StorageFabricError(
+            "tmux_runtime: production storage attestation did not admit an SSD runtime",
+            attestation,
+        )
+    runtime = Path(evidence.resolved)
+    if not runtime.is_absolute():
+        raise StorageFabricError(
+            "tmux_runtime: production storage attestation returned a non-absolute path",
+            attestation,
+        )
+
+    binding = _ProductionDirectoryBinding(runtime, evidence.device)
+    if materialize:
+        binding.pinned = _open_pinned_directory(
+            runtime,
+            create=True,
+            expected_device=evidence.device,
+            require_owner=True,
+            final_mode=0o700,
+        )
+
+    global _PRODUCTION_TMUX_RUNTIME_BINDING
+    previous = _PRODUCTION_TMUX_RUNTIME_BINDING
+    _PRODUCTION_TMUX_RUNTIME_BINDING = binding
+    if isinstance(previous, _ProductionDirectoryBinding):
+        previous.close()
+    target = os.environ if environment is None else environment
+    target["TERMDECK_TMUX_RUNTIME"] = str(runtime)
+    target["TMUX_TMPDIR"] = str(runtime)
+    target.pop("TMUX", None)
+    return runtime
+
+
+def _bind_production_database(
+    attestation: StorageAttestation,
+    *,
+    materialize: bool = False,
+) -> Path:
+    evidence = next(
+        (path for path in attestation.paths if path.name == "database_root"),
+        None,
+    )
+    if (
+        evidence is None
+        or not evidence.ok
+        or evidence.storage_class != STORAGE_CLASS
+        or not evidence.device
+    ):
+        raise StorageFabricError(
+            "database_root: production storage attestation did not admit an SSD database",
+            attestation,
+        )
+    database = Path(evidence.resolved)
+    if not database.is_absolute() or database.name in {"", ".", ".."}:
+        raise StorageFabricError(
+            "database_root: production storage attestation returned an invalid path",
+            attestation,
+        )
+    binding = _ProductionDatabaseBinding(database, evidence.device)
+    if materialize:
+        binding.parent = _open_pinned_directory(
+            database.parent,
+            create=True,
+            expected_device=evidence.device,
+            require_owner=True,
+            final_mode=0o700,
+        )
+
+    global _PRODUCTION_DATABASE_BINDING
+    previous = _PRODUCTION_DATABASE_BINDING
+    _PRODUCTION_DATABASE_BINDING = binding
+    if previous is not None:
+        previous.close()
+    return database
+
+
+def _materialize_tmux_binding(
+    binding: _ProductionDirectoryBinding,
+) -> _PinnedDirectory:
+    if binding.pinned is None:
+        binding.pinned = _open_pinned_directory(
+            binding.path,
+            create=True,
+            expected_device=binding.expected_device,
+            require_owner=True,
+            final_mode=0o700,
+        )
+    else:
+        _revalidate_pinned_directory(binding.pinned)
+    return binding.pinned
+
+
+def _materialize_database_parent(
+    binding: _ProductionDatabaseBinding,
+) -> _PinnedDirectory:
+    if binding.parent is None:
+        binding.parent = _open_pinned_directory(
+            binding.path.parent,
+            create=True,
+            expected_device=binding.expected_device,
+            require_owner=True,
+            final_mode=0o700,
+        )
+    else:
+        _revalidate_pinned_directory(binding.parent)
+    return binding.parent
+
+
+def pin_production_database(
+    path: str | Path,
+) -> DatabaseFileBinding | None:
+    """Pin the admitted database inode immediately before SQLite opens it."""
+
+    parent = pin_production_database_parent(path)
+    if parent is None:
+        return None
+    binding = _PRODUCTION_DATABASE_BINDING
+    assert binding is not None
+    requested = binding.path
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            requested.name,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent.descriptor,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat_module.S_ISREG(metadata.st_mode):
+            raise StorageFabricError(
+                "database_root: admitted database is not a regular file"
+            )
+        if _device_id(metadata.st_dev) != binding.expected_device:
+            raise StorageFabricError(
+                "database_root: database device changed before SQLite open"
+            )
+        os.fchmod(descriptor, 0o600)
+        result = DatabaseFileBinding(
+            path=requested,
+            parent=parent,
+            descriptor=descriptor,
+            expected_device=binding.expected_device,
+            identity=_directory_identity(metadata),
+        )
+        result.revalidate()
+        return result
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        parent.close()
+        raise
+
+
+def pin_production_database_parent(
+    path: str | Path,
+) -> _PinnedDirectory | None:
+    """Duplicate the retained parent descriptor for a production DB path."""
+
+    binding = _PRODUCTION_DATABASE_BINDING
+    if binding is None:
+        return None
+    requested = _as_absolute(path)
+    if requested != binding.path:
+        raise StorageFabricError(
+            "database_root: requested database drifted from production admission"
+        )
+    admitted_parent = _materialize_database_parent(binding)
+    _revalidate_pinned_directory(admitted_parent)
+    parent_descriptor = os.dup(admitted_parent.descriptor)
+    parent_metadata = os.fstat(parent_descriptor)
+    parent = _PinnedDirectory(
+        path=admitted_parent.path,
+        descriptor=parent_descriptor,
+        device=_device_id(parent_metadata.st_dev),
+        identity=_directory_identity(parent_metadata),
+    )
+    return parent
+
+
+def tmux_subprocess_environment(
+    *,
+    materialize: bool = False,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, str] | None:
+    """Return a child environment bound to admitted production tmux storage.
+
+    Development processes that have not performed production storage admission
+    retain the historical inherited environment. Once admission succeeds, the
+    stable logical variables remain fixed to the attested path; materialized
+    tmux children use a procfd alias for the retained directory descriptor.
+    """
+
+    binding = _PRODUCTION_TMUX_RUNTIME_BINDING
+    if binding is None:
+        return None
+    if isinstance(binding, tuple):
+        runtime, expected_device = binding
+        binding = _ProductionDirectoryBinding(
+            _as_absolute(runtime),
+            str(expected_device),
+        )
+        globals()["_PRODUCTION_TMUX_RUNTIME_BINDING"] = binding
+    runtime = binding.path
+    expected_device = binding.expected_device
+    source = os.environ if environment is None else environment
+    configured_runtime = str(source.get("TERMDECK_TMUX_RUNTIME", "") or "")
+    configured_tmpdir = str(source.get("TMUX_TMPDIR", "") or "")
+    expected = str(runtime)
+    if configured_runtime != expected or configured_tmpdir != expected:
+        raise StorageFabricError(
+            "tmux_runtime: production tmux environment drifted from the attested SSD path"
+        )
+
+    pinned = None
+    if materialize:
+        try:
+            pinned = _materialize_tmux_binding(binding)
+            metadata = os.fstat(pinned.descriptor)
+            observed_device = _device_id(metadata.st_dev)
+            socket_root_name = f"tmux-{os.geteuid()}"
+            try:
+                socket_root_metadata = os.stat(
+                    socket_root_name,
+                    dir_fd=pinned.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                socket_root_metadata = None
+            if socket_root_metadata is not None:
+                if stat_module.S_ISLNK(
+                    socket_root_metadata.st_mode
+                ) or not stat_module.S_ISDIR(socket_root_metadata.st_mode):
+                    raise OSError("tmux socket root is not a directory")
+                if socket_root_metadata.st_uid != os.geteuid():
+                    raise OSError("tmux socket root is not owned by the current user")
+                if _device_id(socket_root_metadata.st_dev) != expected_device:
+                    raise OSError("tmux socket root is not on the attested device")
+                socket_root_descriptor = os.open(
+                    socket_root_name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=pinned.descriptor,
+                )
+                try:
+                    try:
+                        socket_metadata = os.stat(
+                            "default",
+                            dir_fd=socket_root_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        socket_metadata = None
+                    if socket_metadata is not None:
+                        if not stat_module.S_ISSOCK(socket_metadata.st_mode):
+                            raise OSError("tmux default socket is not a Unix socket")
+                        if _device_id(socket_metadata.st_dev) != expected_device:
+                            raise OSError("tmux default socket is not on the attested device")
+                finally:
+                    os.close(socket_root_descriptor)
+        except OSError as exc:
+            raise StorageFabricError(
+                f"tmux_runtime: could not materialize the attested runtime {runtime}: {exc}"
+            ) from exc
+        if observed_device != expected_device:
+            raise StorageFabricError(
+                "tmux_runtime: materialized runtime device does not match storage attestation"
+            )
+
+    child = dict(source)
+    child["TERMDECK_TMUX_RUNTIME"] = expected
+    child["TMUX_TMPDIR"] = str(pinned.proc_path) if pinned is not None else expected
+    child.pop("TMUX", None)
+    return child
+
+
 def require_storage_fabric(*args: object, **kwargs: object) -> StorageAttestation:
     """Return an admitted attestation or fail closed with its exact reason."""
 
-    return attest_storage_fabric(*args, **kwargs).require()
+    attestation = attest_storage_fabric(*args, **kwargs).require()
+    if attestation.production:
+        materialize = kwargs.get("probes") is None
+        _bind_production_database(attestation, materialize=materialize)
+        try:
+            _bind_production_tmux_runtime(
+                attestation,
+                materialize=materialize,
+            )
+        except Exception:
+            global _PRODUCTION_DATABASE_BINDING
+            if _PRODUCTION_DATABASE_BINDING is not None:
+                _PRODUCTION_DATABASE_BINDING.close()
+                _PRODUCTION_DATABASE_BINDING = None
+            raise
+    return attestation
 
 
 def require_hot_storage(*args: object, **kwargs: object) -> StorageAttestation:
@@ -771,6 +1360,7 @@ class StorageFabric:
 
 
 __all__ = [
+    "DatabaseFileBinding",
     "DEFAULT_MANAGED_ROOT",
     "EXPECTED_STORAGE_ENVIRONMENT",
     "MountEvidence",
@@ -788,7 +1378,10 @@ __all__ = [
     "WARP_DRIVES_FABRIC",
     "attest_storage_fabric",
     "parse_mountinfo",
+    "pin_production_database",
+    "pin_production_database_parent",
     "require_hot_storage",
     "require_storage_fabric",
     "storage_attestation",
+    "tmux_subprocess_environment",
 ]

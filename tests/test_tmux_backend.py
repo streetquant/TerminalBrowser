@@ -780,6 +780,11 @@ class TmuxBackendTests(unittest.TestCase):
                 "os.environ",
                 {"TERMDECK_CODEX_BINARY": str(host_codex)},
                 clear=False,
+            ), mock.patch(
+                "termdeck.codex_config_scope._launcher_is_attested",
+                side_effect=lambda _candidate, resolved, _home, _attestor: (
+                    resolved == host_codex.resolve()
+                ),
             ):
                 prepare_auth_scope(private_home, account_source=source_home)
             self.assertTrue((private_home / "bin" / "codex").is_file())
@@ -824,7 +829,7 @@ class TmuxBackendTests(unittest.TestCase):
             finally:
                 state.close()
 
-    def test_missing_recovery_directory_falls_back_to_the_saved_tab_directory(self):
+    def test_missing_recovery_directory_fails_closed_without_saved_tab_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "deleted-repo"
             record = _record(
@@ -843,18 +848,10 @@ class TmuxBackendTests(unittest.TestCase):
             ), mock.patch.object(
                 backend, "_run", return_value=completed
             ) as run:
-                backend.create_or_resume(record)
+                with self.assertRaisesRegex(TmuxError, "working directory is unavailable"):
+                    backend.create_or_resume(record)
 
-            launch = run.call_args_list[0].args[0]
-            self.assertEqual(launch[launch.index("-c") + 1], tmp)
-            self.assertIn(
-                "TERMDECK_RECOVERY_DEGRADED=missing-working-directory",
-                launch,
-            )
-            self.assertIn(
-                f"TERMDECK_RECOVERY_ORIGINAL_CWD={missing}",
-                launch,
-            )
+            run.assert_not_called()
             self.assertFalse(missing.exists())
 
     def test_opaque_recovery_metadata_is_replayed_as_user_owned_recipe(self):
@@ -1239,7 +1236,12 @@ class TmuxBackendTests(unittest.TestCase):
             backend = TmuxBackend(executable="tmux")
             events = []
             lease = mock.Mock(name="lifetime_lease", held=True)
-            lease.release.side_effect = lambda: events.append("lease-release")
+
+            def release_lease():
+                events.append("lease-release")
+                lease.held = False
+
+            lease.release.side_effect = release_lease
             completed = subprocess.CompletedProcess(
                 args=["tmux"], returncode=0, stdout="", stderr=""
             )
@@ -1268,8 +1270,10 @@ class TmuxBackendTests(unittest.TestCase):
             migrate.assert_called_once_with(str(codex_home))
             ensure.assert_called_once_with(str(codex_home), require_complete=True)
             self.assertEqual(run.call_args_list[0].args[0][0], "new-session")
-            self.assertEqual(events[:3], ["migrate", "ensure", "new-session"])
-            self.assertEqual(events[-1], "lease-release")
+            self.assertEqual(
+                events[:4],
+                ["migrate", "ensure", "lease-release", "new-session"],
+            )
             lease.release.assert_called_once_with()
 
     def test_indeterminate_private_liveness_fails_before_config_migration(self):
@@ -1474,6 +1478,99 @@ class TmuxBackendTests(unittest.TestCase):
 
             closed = [item[1] for item in events if item[0] == "close"]
             self.assertEqual(closed, list(reversed(opened_fds)))
+
+    def test_auth_scope_writer_quiescence_holds_both_lifetime_generations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_home = root / "cache"
+            codex_home = root / "auth-one"
+            codex_home.mkdir()
+            record = _record(auth_scope_id="auth-one", codex_home=str(codex_home))
+            backend = TmuxBackend(executable="tmux")
+
+            with mock.patch.dict(
+                os.environ, {"XDG_CACHE_HOME": str(cache_home)}, clear=False
+            ), mock.patch.object(
+                backend, "_auth_session_exists", side_effect=(False, False)
+            ) as exists, mock.patch(
+                "termdeck.tmux_backend.os.kill"
+            ) as kill:
+                paths = (
+                    _auth_legacy_lifetime_lock_path(record),
+                    _auth_lifetime_lock_path(record),
+                )
+                with backend.auth_scope_writer_quiescence(record) as observation:
+                    self.assertTrue(observation["quiescent"])
+                    for path in paths:
+                        descriptor = os.open(path, os.O_RDWR | os.O_APPEND)
+                        try:
+                            with self.assertRaises(BlockingIOError):
+                                fcntl.flock(
+                                    descriptor,
+                                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                                )
+                        finally:
+                            os.close(descriptor)
+
+                for path in paths:
+                    descriptor = os.open(path, os.O_RDWR | os.O_APPEND)
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                        os.close(descriptor)
+
+            self.assertEqual(exists.call_count, 2)
+            kill.assert_not_called()
+
+    def test_auth_scope_writer_quiescence_rejects_live_tmux_without_locking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "auth-one"
+            codex_home.mkdir()
+            record = _record(auth_scope_id="auth-one", codex_home=str(codex_home))
+            backend = TmuxBackend(executable="tmux")
+
+            with mock.patch.object(
+                backend, "_auth_session_exists", return_value=True
+            ), mock.patch(
+                "termdeck.tmux_backend._acquire_auth_lifetime_lease"
+            ) as acquire, mock.patch(
+                "termdeck.tmux_backend.os.kill"
+            ) as kill:
+                with backend.auth_scope_writer_quiescence(record) as observation:
+                    self.assertFalse(observation["quiescent"])
+
+            acquire.assert_not_called()
+            kill.assert_not_called()
+
+    def test_auth_scope_writer_quiescence_rejects_active_legacy_writer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_home = root / "cache"
+            codex_home = root / "auth-one"
+            codex_home.mkdir()
+            record = _record(auth_scope_id="auth-one", codex_home=str(codex_home))
+            backend = TmuxBackend(executable="tmux")
+
+            with mock.patch.dict(
+                os.environ, {"XDG_CACHE_HOME": str(cache_home)}, clear=False
+            ):
+                legacy_path = _auth_legacy_lifetime_lock_path(record)
+                legacy_path.parent.mkdir(parents=True, mode=0o700)
+                holder = os.open(legacy_path, os.O_RDWR | os.O_CREAT, 0o600)
+                fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    with mock.patch.object(
+                        backend, "_auth_session_exists", return_value=False
+                    ), mock.patch(
+                        "termdeck.tmux_backend.os.kill"
+                    ) as kill, self.assertRaisesRegex(TmuxError, "still owns"):
+                        with backend.auth_scope_writer_quiescence(record):
+                            self.fail("active writer must not be reported quiescent")
+                    kill.assert_not_called()
+                finally:
+                    fcntl.flock(holder, fcntl.LOCK_UN)
+                    os.close(holder)
 
     def test_legacy_lifetime_holder_blocks_backend_before_canonical_open(self):
         with tempfile.TemporaryDirectory() as tmp:

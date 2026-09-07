@@ -24,6 +24,7 @@ from termdeck.resize_signal import (
     private_launch_tuple_for_scope,
     propagate_terminal_resize,
 )
+from smoke_support import require_private_validation_runtime
 
 
 _REQUESTED_COLUMNS = 100
@@ -102,11 +103,10 @@ def main() -> int:
         return 0
 
     package_site_bound, module_origins = _module_origins()
-    socket = f"termdeck-contained-{os.getpid()}-{uuid.uuid4().hex[:12]}"
-    tmux_tmp = Path(tempfile.mkdtemp(prefix="t1000-contained-", dir="/tmp"))
-    tmux_tmp.chmod(0o700)
+    runtime_base = require_private_validation_runtime()
+    socket = f"c-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     environment = os.environ.copy()
-    environment["TMUX_TMPDIR"] = str(tmux_tmp)
+    environment["TMUX_TMPDIR"] = str(runtime_base)
 
     controller: PaneStreamController | None = None
     identities: dict[str, int] = {}
@@ -114,7 +114,10 @@ def main() -> int:
     signal_lock = threading.Lock()
     outputs: list[bytes] = []
 
-    with tempfile.TemporaryDirectory(prefix="t1000-contained-source-", dir="/tmp") as raw_root:
+    with tempfile.TemporaryDirectory(
+        prefix="contained-source-",
+        dir=runtime_base,
+    ) as raw_root:
         root = Path(raw_root)
         root.chmod(0o700)
         target = root / "target.py"
@@ -411,7 +414,6 @@ raise SystemExit(inner.wait())
                 timeout=10,
                 check=False,
             )
-            shutil.rmtree(tmux_tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

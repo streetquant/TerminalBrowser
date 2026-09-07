@@ -1,22 +1,129 @@
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 from unittest import mock
 
+import termdeck.session_store as session_store_module
 from termdeck.models import SessionRecord
 from termdeck.session_store import (
+    SessionDatabaseMigrationError,
     SessionDatabaseMigrationInProgress,
     SessionStore,
     default_auth_root,
     default_db_path,
+    legacy_state_dir,
     migrate_legacy_database,
 )
 
 
 class SessionStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._test_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self._test_home.cleanup)
+        home = Path(self._test_home.name) / "home"
+        home.mkdir()
+        managed_root = home / ".local" / "state" / "t1000-managed"
+        managed_state = managed_root.parent / "termdeck"
+        environment = mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(home),
+                "T1000_MANAGED_ROOT": str(managed_root),
+                "TERMDECK_CODEX_ACCOUNT_SOURCE": str(home / ".codex"),
+            },
+            clear=False,
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        defaults = mock.patch.multiple(
+            session_store_module,
+            APP_DIR=managed_state,
+            DEFAULT_DB_PATH=managed_state / "sessions.sqlite3",
+            DEFAULT_AUTH_ROOT=managed_state / "terminal-auth",
+        )
+        defaults.start()
+        self.addCleanup(defaults.stop)
+        process_fence = mock.patch.object(
+            session_store_module,
+            "_proc_process_directories",
+            return_value=(Path("/proc") / str(os.getpid()),),
+        )
+        process_fence.start()
+        self.addCleanup(process_fence.stop)
+
+    @staticmethod
+    def _guard_sqlite_source(legacy: Path):
+        source_metadata = legacy.stat()
+        source_identity = (
+            int(source_metadata.st_dev),
+            int(source_metadata.st_ino),
+        )
+        real_connect = sqlite3.connect
+
+        def guarded_connect(database, *args, **kwargs):
+            database_text = os.fsdecode(os.fspath(database))
+            candidate_text = database_text
+            if database_text.startswith("file:"):
+                parsed = urlsplit(database_text)
+                if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+                    return real_connect(database, *args, **kwargs)
+                candidate_text = unquote(parsed.path)
+            try:
+                metadata = Path(candidate_text).stat()
+            except OSError:
+                pass
+            else:
+                if (int(metadata.st_dev), int(metadata.st_ino)) == source_identity:
+                    raise AssertionError(
+                        "migration SQLite-opened the live legacy source"
+                    )
+            return real_connect(database, *args, **kwargs)
+
+        return guarded_connect
+
+    def test_default_paths_are_fenced_inside_the_test_home(self):
+        home = Path(os.environ["HOME"])
+        self.assertTrue(default_db_path().is_relative_to(home))
+        self.assertTrue(default_auth_root().is_relative_to(home))
+        self.assertTrue(legacy_state_dir().is_relative_to(home))
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("T1000_MANAGED_ROOT", None)
+            legacy_root = home / ".local" / "share" / "termdeck"
+            self.assertEqual(default_db_path(), legacy_root / "sessions.sqlite3")
+            self.assertEqual(default_auth_root(), legacy_root / "terminal-auth")
+
+    def test_sqlite_source_guard_rejects_path_uri_proc_and_hardlink_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy.sqlite3"
+            connection = sqlite3.connect(legacy)
+            connection.close()
+            alias = root / "alias.sqlite3"
+            os.link(legacy, alias)
+            descriptor = os.open(legacy, os.O_RDONLY)
+            self.addCleanup(os.close, descriptor)
+            guarded_connect = self._guard_sqlite_source(legacy)
+
+            for candidate in (
+                str(legacy),
+                legacy.as_uri(),
+                str(alias),
+                f"/proc/self/fd/{descriptor}",
+                Path(f"/proc/self/fd/{descriptor}").as_uri(),
+            ):
+                with self.subTest(candidate=candidate), self.assertRaisesRegex(
+                    AssertionError,
+                    "SQLite-opened the live legacy source",
+                ):
+                    guarded_connect(candidate)
+
     def test_managed_defaults_use_sibling_termdeck_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             managed_root = Path(tmp) / "t1000-managed"
@@ -104,9 +211,222 @@ class SessionStoreTests(unittest.TestCase):
                 finally:
                     migrated.close()
                 before = destination.read_bytes()
+                self.assertIsNotNone(result.receipt_path)
+                self.assertTrue(result.receipt_path.is_file())  # type: ignore[union-attr]
                 repeated = migrate_legacy_database(legacy_path=legacy)
-                self.assertEqual(repeated.status, "destination_exists")
+                self.assertEqual(repeated.status, "verified")
+                self.assertEqual(repeated.database_id, result.database_id)
                 self.assertEqual(destination.read_bytes(), before)
+
+    def test_stale_empty_managed_database_is_repaired_with_parity_and_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy_store = SessionStore(legacy)
+            first = legacy_store.create(
+                "one",
+                "dev",
+                "codex",
+                root,
+                window_id="window-one",
+                window_title="One",
+            )
+            second = legacy_store.create(
+                "two",
+                "dev",
+                "bash",
+                root,
+                window_id="window-two",
+                window_title="Two",
+            )
+            legacy_store.remember_window("window-one", "One")
+            legacy_store.remember_window("window-two", "Two")
+            legacy_store.set_window_captain("window-one", first.id)
+            legacy_store.close()
+            source_before = {
+                path.name: path.read_bytes()
+                for path in legacy.parent.iterdir()
+                if path.is_file()
+            }
+
+            managed_root = root / "managed" / "t1000-managed"
+            target = managed_root.parent / "termdeck" / "sessions.sqlite3"
+            stale_store = SessionStore(target)
+            stale_store.close()
+
+            with mock.patch.dict(
+                os.environ,
+                {"T1000_MANAGED_ROOT": str(managed_root)},
+                clear=False,
+            ):
+                result = migrate_legacy_database(
+                    destination=target,
+                    legacy_path=legacy,
+                )
+
+                self.assertEqual(result.status, "repaired_existing")
+                self.assertIsNotNone(result.backup_path)
+                self.assertTrue((result.backup_path / "logical.sqlite3").is_file())  # type: ignore[operator]
+                self.assertFalse((result.backup_path / "original.sqlite3-shm").exists())  # type: ignore[operator]
+                repaired = SessionStore(target)
+                try:
+                    self.assertEqual(
+                        {record.id for record in repaired.list()},
+                        {first.id, second.id},
+                    )
+                    self.assertEqual(
+                        repaired.remembered_windows(),
+                        [("window-one", "One"), ("window-two", "Two")],
+                    )
+                    self.assertEqual(
+                        repaired.captain_for_window("window-one").id,  # type: ignore[union-attr]
+                        first.id,
+                    )
+                finally:
+                    repaired.close()
+
+                with mock.patch(
+                    "termdeck.session_store._migration_source_parent",
+                    side_effect=AssertionError("sealed restart touched legacy state"),
+                ):
+                    repeated = migrate_legacy_database(
+                        destination=target,
+                        legacy_path=legacy,
+                    )
+                self.assertEqual(repeated.status, "verified")
+                self.assertEqual(repeated.database_id, result.database_id)
+
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in legacy.parent.iterdir()
+                    if path.is_file()
+                },
+                source_before,
+            )
+
+    def test_divergent_managed_database_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            target = root / "managed" / "sessions.sqlite3"
+            legacy_store = SessionStore(legacy)
+            legacy_store.create("legacy", "dev", "codex", root)
+            legacy_store.close()
+            target_store = SessionStore(target)
+            target_store.create("managed-only", "dev", "bash", root)
+            target_store.close()
+            source_before = legacy.read_bytes()
+            target_before = target.read_bytes()
+
+            with self.assertRaisesRegex(
+                SessionDatabaseMigrationError,
+                "diverges from the legacy registry",
+            ):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+
+            self.assertEqual(legacy.read_bytes(), source_before)
+            self.assertEqual(target.read_bytes(), target_before)
+            self.assertEqual(
+                list(target.parent.glob(".sessions.sqlite3.pre-migration-*")),
+                [],
+            )
+
+    def test_live_wal_writer_blocks_migration_without_source_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            writer = sqlite3.connect(legacy)
+            try:
+                self.assertEqual(
+                    str(writer.execute("PRAGMA journal_mode = WAL").fetchone()[0]).lower(),
+                    "wal",
+                )
+                writer.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT)")
+                writer.execute("INSERT INTO marker(value) VALUES ('held-open')")
+                writer.commit()
+                source_before = {
+                    path.name: path.read_bytes()
+                    for path in legacy.parent.iterdir()
+                    if path.is_file()
+                }
+                with self.assertRaisesRegex(
+                    SessionDatabaseMigrationError,
+                    "legacy session database is still open",
+                ):
+                    migrate_legacy_database(
+                        destination=root / "managed" / "sessions.sqlite3",
+                        legacy_path=legacy,
+                    )
+                self.assertEqual(
+                    {
+                        path.name: path.read_bytes()
+                        for path in legacy.parent.iterdir()
+                        if path.is_file()
+                    },
+                    source_before,
+                )
+            finally:
+                writer.close()
+
+    def test_closed_wal_snapshot_migrates_without_opening_live_legacy_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            origin = root / "origin.sqlite3"
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            writer = sqlite3.connect(origin)
+            try:
+                self.assertEqual(
+                    str(writer.execute("PRAGMA journal_mode = WAL").fetchone()[0]).lower(),
+                    "wal",
+                )
+                writer.execute("PRAGMA wal_autocheckpoint = 0")
+                writer.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT)")
+                writer.execute("INSERT INTO marker(value) VALUES ('from-wal')")
+                writer.commit()
+                for suffix in ("", "-wal", "-shm"):
+                    source_file = origin.with_name(f"{origin.name}{suffix}")
+                    if source_file.exists():
+                        legacy.with_name(f"{legacy.name}{suffix}").write_bytes(
+                            source_file.read_bytes()
+                        )
+            finally:
+                writer.close()
+
+            source_before = {
+                path.name: path.read_bytes()
+                for path in legacy.parent.iterdir()
+                if path.is_file()
+            }
+            target = root / "managed" / "sessions.sqlite3"
+            with mock.patch(
+                "termdeck.session_store.sqlite3.connect",
+                side_effect=self._guard_sqlite_source(legacy),
+            ):
+                result = migrate_legacy_database(
+                    destination=target,
+                    legacy_path=legacy,
+                )
+
+            self.assertEqual(result.status, "migrated")
+            migrated = sqlite3.connect(target)
+            try:
+                self.assertEqual(
+                    migrated.execute("SELECT value FROM marker").fetchone()[0],
+                    "from-wal",
+                )
+            finally:
+                migrated.close()
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in legacy.parent.iterdir()
+                    if path.is_file()
+                },
+                source_before,
+            )
 
     def test_invalid_legacy_database_never_publishes_a_partial_destination(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -153,6 +473,760 @@ class SessionStoreTests(unittest.TestCase):
                 "MIGRATION_IN_PROGRESS",
             ):
                 migrate_legacy_database(legacy_path=legacy)
+
+    def test_migration_rejects_lock_path_swap_after_flock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            connection = sqlite3.connect(legacy)
+            connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+            connection.commit()
+            connection.close()
+            target = root / "managed" / "sessions.sqlite3"
+            lock_path = target.parent / ".sessions.sqlite3.migration.lock"
+            moved_lock = target.parent / ".moved-migration.lock"
+            real_flock = session_store_module.fcntl.flock
+
+            def swap_lock_path(descriptor, operation):
+                real_flock(descriptor, operation)
+                os.replace(lock_path, moved_lock)
+                lock_path.write_bytes(b"")
+                lock_path.chmod(0o600)
+
+            with mock.patch(
+                "termdeck.session_store.fcntl.flock",
+                side_effect=swap_lock_path,
+            ), self.assertRaisesRegex(
+                SessionDatabaseMigrationError,
+                "migration lock is unsafe",
+            ):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+
+            self.assertFalse(target.exists())
+
+    def test_migration_rejects_same_path_and_hardlink_alias_without_sqlite_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy.sqlite3"
+            connection = sqlite3.connect(legacy)
+            connection.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY)")
+            connection.commit()
+            connection.close()
+
+            with mock.patch(
+                "termdeck.session_store.sqlite3.connect",
+                side_effect=AssertionError("unexpected SQLite open"),
+            ), self.assertRaisesRegex(
+                SessionDatabaseMigrationError,
+                "paths must be distinct",
+            ):
+                migrate_legacy_database(destination=legacy, legacy_path=legacy)
+
+            alias = root / "managed.sqlite3"
+            os.link(legacy, alias)
+            with mock.patch(
+                "termdeck.session_store.sqlite3.connect",
+                side_effect=AssertionError("unexpected SQLite open"),
+            ), self.assertRaisesRegex(
+                SessionDatabaseMigrationError,
+                "files must be distinct",
+            ):
+                migrate_legacy_database(destination=alias, legacy_path=legacy)
+
+    def test_unsealed_target_and_orphaned_receipt_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "managed" / "sessions.sqlite3"
+            target.parent.mkdir()
+            connection = sqlite3.connect(target)
+            connection.execute("CREATE TABLE marker (value TEXT)")
+            connection.commit()
+            connection.close()
+            missing_source = root / "missing" / "sessions.sqlite3"
+
+            with self.assertRaisesRegex(
+                SessionDatabaseMigrationError,
+                "unverified managed session database",
+            ):
+                migrate_legacy_database(
+                    destination=target,
+                    legacy_path=missing_source,
+                )
+
+            target.unlink()
+            receipt = target.parent / ".sessions.sqlite3.migration-receipt.json"
+            receipt.write_text("{}\n", encoding="utf-8")
+            receipt.chmod(0o600)
+            with self.assertRaisesRegex(
+                SessionDatabaseMigrationError,
+                "database is missing",
+            ):
+                migrate_legacy_database(
+                    destination=target,
+                    legacy_path=missing_source,
+                )
+
+            receipt.unlink()
+            os.mkfifo(receipt, 0o600)
+            with self.assertRaisesRegex(
+                SessionDatabaseMigrationError,
+                "receipt is unsafe",
+            ):
+                migrate_legacy_database(
+                    destination=target,
+                    legacy_path=missing_source,
+                )
+
+    def test_migration_preserves_304_sessions_17_windows_and_9_remembered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            target = root / "managed" / "sessions.sqlite3"
+            store = SessionStore(legacy)
+            records = []
+            try:
+                for index in range(304):
+                    window_index = index % 17
+                    records.append(
+                        store.create(
+                            f"session-{index:03d}",
+                            "migration",
+                            "bash",
+                            root,
+                            window_id=f"window-{window_index:02d}",
+                            window_title=f"Window {window_index:02d}",
+                            tab_index=index // 17,
+                        )
+                    )
+                store.conn.execute("DELETE FROM remembered_windows")
+                for index in range(9):
+                    window_id = f"window-{index:02d}"
+                    store.remember_window(window_id, f"Window {index:02d}")
+                    store.set_window_captain(window_id, records[index].id)
+                store.conn.execute("PRAGMA user_version = 23")
+                store.conn.commit()
+            finally:
+                store.close()
+
+            source = sqlite3.connect(legacy)
+            try:
+                source_rows = source.execute(
+                    "SELECT * FROM sessions ORDER BY id"
+                ).fetchall()
+                source_windows = source.execute(
+                    "SELECT * FROM remembered_windows ORDER BY window_id"
+                ).fetchall()
+                source_schema = source.execute(
+                    """
+                    SELECT type, name, tbl_name, COALESCE(sql, '')
+                    FROM sqlite_master
+                    WHERE name NOT LIKE 'sqlite_%'
+                    ORDER BY type, name, tbl_name, sql
+                    """
+                ).fetchall()
+            finally:
+                source.close()
+
+            with mock.patch(
+                "termdeck.session_store.sqlite3.connect",
+                side_effect=self._guard_sqlite_source(legacy),
+            ):
+                result = migrate_legacy_database(
+                    destination=target,
+                    legacy_path=legacy,
+                )
+
+            self.assertEqual(result.status, "migrated")
+            receipt_document = json.loads(result.receipt_path.read_text())  # type: ignore[union-attr]
+            source_summary = receipt_document["source_summary"]
+            self.assertEqual(source_summary["session_count"], 304)
+            self.assertEqual(source_summary["distinct_window_count"], 17)
+            self.assertEqual(source_summary["remembered_window_count"], 9)
+            self.assertEqual(receipt_document["destination_summary"], source_summary)
+            self.assertEqual(receipt_document["source_file_sha256"]["main"], result.source_sha256)
+
+            migrated = sqlite3.connect(target)
+            try:
+                self.assertEqual(
+                    migrated.execute("SELECT * FROM sessions ORDER BY id").fetchall(),
+                    source_rows,
+                )
+                self.assertEqual(
+                    migrated.execute(
+                        "SELECT * FROM remembered_windows ORDER BY window_id"
+                    ).fetchall(),
+                    source_windows,
+                )
+                self.assertEqual(
+                    migrated.execute("SELECT COUNT(DISTINCT window_id) FROM sessions").fetchone()[0],
+                    17,
+                )
+                self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 23)
+                target_schema = migrated.execute(
+                    """
+                    SELECT type, name, tbl_name, COALESCE(sql, '')
+                    FROM sqlite_master
+                    WHERE name NOT LIKE 'sqlite_%'
+                      AND name != 'termdeck_migration_state'
+                      AND tbl_name != 'termdeck_migration_state'
+                    ORDER BY type, name, tbl_name, sql
+                    """
+                ).fetchall()
+                self.assertEqual(target_schema, source_schema)
+            finally:
+                migrated.close()
+
+            target_before = target.read_bytes()
+            for path in legacy.parent.iterdir():
+                path.unlink()
+            legacy.parent.rmdir()
+            repeated = migrate_legacy_database(
+                destination=target,
+                legacy_path=legacy,
+            )
+            self.assertEqual(repeated.status, "verified")
+            self.assertEqual(repeated.database_id, result.database_id)
+            self.assertEqual(repeated.destination_sha256, result.destination_sha256)
+            self.assertEqual(target.read_bytes(), target_before)
+
+    def test_source_change_during_publish_rolls_back_new_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            connection = sqlite3.connect(legacy)
+            connection.execute(
+                "CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO marker(value) VALUES ('before')")
+            connection.commit()
+            connection.close()
+            target = root / "managed" / "sessions.sqlite3"
+            real_link = os.link
+
+            def mutate_source_then_link(*args, **kwargs):
+                with legacy.open("ab") as writer:
+                    writer.write(b"raw-tamper")
+                    writer.flush()
+                    os.fsync(writer.fileno())
+                return real_link(*args, **kwargs)
+
+            with mock.patch(
+                "termdeck.session_store.os.link",
+                side_effect=mutate_source_then_link,
+            ), self.assertRaisesRegex(
+                SessionDatabaseMigrationError,
+                "changed during migration",
+            ):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+
+            self.assertFalse(target.exists())
+            self.assertFalse(
+                (target.parent / ".sessions.sqlite3.migration-receipt.json").exists()
+            )
+
+    def test_crash_before_receipt_commit_revalidates_source_on_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            connection = sqlite3.connect(legacy)
+            connection.execute(
+                "CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO marker(value) VALUES ('before-crash')")
+            connection.commit()
+            connection.close()
+            target = root / "managed" / "sessions.sqlite3"
+            receipt = target.parent / ".sessions.sqlite3.migration-receipt.json"
+            read_descriptor, write_descriptor = os.pipe()
+            child_pid = os.fork()
+            if child_pid == 0:
+                os.close(read_descriptor)
+
+                def crash_before_receipt(parent, name, content):
+                    del parent, name, content
+                    os.write(write_descriptor, b"C")
+                    os._exit(73)
+
+                with mock.patch.object(
+                    session_store_module,
+                    "_write_private_at",
+                    side_effect=crash_before_receipt,
+                ), mock.patch.object(
+                    session_store_module,
+                    "_proc_process_directories",
+                    return_value=(Path("/proc") / str(os.getpid()),),
+                ):
+                    migrate_legacy_database(destination=target, legacy_path=legacy)
+                os._exit(74)
+
+            os.close(write_descriptor)
+            try:
+                self.assertEqual(os.read(read_descriptor, 1), b"C")
+            finally:
+                os.close(read_descriptor)
+            waited_pid, status = os.waitpid(child_pid, 0)
+            self.assertEqual(waited_pid, child_pid)
+            self.assertTrue(os.WIFEXITED(status))
+            self.assertEqual(os.WEXITSTATUS(status), 73)
+            self.assertTrue(target.is_file())
+            self.assertFalse(receipt.exists())
+
+            source = sqlite3.connect(legacy)
+            source.execute("INSERT INTO marker(value) VALUES ('after-crash')")
+            source.commit()
+            source.close()
+
+            retried = migrate_legacy_database(destination=target, legacy_path=legacy)
+
+            self.assertEqual(retried.status, "repaired_existing")
+            self.assertTrue(receipt.is_file())
+            migrated = sqlite3.connect(target)
+            try:
+                self.assertEqual(
+                    migrated.execute("SELECT value FROM marker ORDER BY id").fetchall(),
+                    [("before-crash",), ("after-crash",)],
+                )
+            finally:
+                migrated.close()
+
+    def test_ofd_fence_survives_same_process_open_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            connection = sqlite3.connect(legacy)
+            connection.execute(
+                "CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO marker(value) VALUES ('initial')")
+            connection.commit()
+            connection.close()
+            target = root / "managed" / "sessions.sqlite3"
+            real_link = os.link
+            writer_script = """
+import sqlite3
+import sys
+
+try:
+    connection = sqlite3.connect(sys.argv[1], timeout=0.0)
+    connection.execute("INSERT INTO marker(value) VALUES ('child')")
+    connection.commit()
+except sqlite3.OperationalError:
+    raise SystemExit(23)
+finally:
+    try:
+        connection.close()
+    except NameError:
+        pass
+"""
+            observed = []
+
+            def probe_fence_then_link(*args, **kwargs):
+                same_process = sqlite3.connect(legacy, timeout=0.0)
+                same_process.close()
+                child = subprocess.run(
+                    [sys.executable, "-c", writer_script, str(legacy)],
+                    check=False,
+                )
+                observed.append(child.returncode)
+                return real_link(*args, **kwargs)
+
+            with mock.patch(
+                "termdeck.session_store.os.link",
+                side_effect=probe_fence_then_link,
+            ):
+                result = migrate_legacy_database(
+                    destination=target,
+                    legacy_path=legacy,
+                )
+
+            self.assertEqual(result.status, "migrated")
+            self.assertEqual(observed, [23])
+            source = sqlite3.connect(legacy)
+            try:
+                self.assertEqual(source.execute("SELECT COUNT(*) FROM marker").fetchone()[0], 1)
+            finally:
+                source.close()
+
+    def test_nondumpable_legacy_holder_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            connection = sqlite3.connect(legacy)
+            connection.execute("CREATE TABLE marker (value TEXT)")
+            connection.commit()
+            connection.close()
+            holder_script = """
+import ctypes
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+if ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) != 0:
+    raise SystemExit(2)
+print("READY", flush=True)
+sys.stdin.readline()
+connection.close()
+"""
+            holder = subprocess.Popen(
+                [sys.executable, "-c", holder_script, str(legacy)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "READY")  # type: ignore[union-attr]
+                with mock.patch.object(
+                    session_store_module,
+                    "_proc_process_directories",
+                    return_value=(
+                        Path("/proc") / str(os.getpid()),
+                        Path("/proc") / str(holder.pid),
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        SessionDatabaseMigrationError,
+                        "cannot prove.*quiescent",
+                    ):
+                        migrate_legacy_database(
+                            destination=root / "managed" / "sessions.sqlite3",
+                            legacy_path=legacy,
+                        )
+            finally:
+                holder.communicate("\n", timeout=5)
+
+    def test_copied_component_hash_mismatch_never_publishes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            alternate = root / "alternate.sqlite3"
+            legacy.parent.mkdir()
+            for path, value in ((legacy, "legacy"), (alternate, "alternate")):
+                connection = sqlite3.connect(path)
+                connection.execute("CREATE TABLE marker (value TEXT)")
+                connection.execute("INSERT INTO marker(value) VALUES (?)", (value,))
+                connection.commit()
+                connection.close()
+            target = root / "managed" / "sessions.sqlite3"
+            real_copy = session_store_module._copy_descriptor
+            replaced = False
+
+            def replace_first_copy(descriptor, destination):
+                nonlocal replaced
+                real_copy(descriptor, destination)
+                if not replaced:
+                    replaced = True
+                    Path(destination).write_bytes(alternate.read_bytes())
+
+            with mock.patch(
+                "termdeck.session_store._copy_descriptor",
+                side_effect=replace_first_copy,
+            ), self.assertRaisesRegex(
+                SessionDatabaseMigrationError,
+                "descriptor hash proof",
+            ):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+            self.assertFalse(target.exists())
+
+    def test_verified_receipt_rejects_target_swap_during_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            connection = sqlite3.connect(legacy)
+            connection.execute("CREATE TABLE marker (value TEXT)")
+            connection.execute("INSERT INTO marker(value) VALUES ('legacy')")
+            connection.commit()
+            connection.close()
+            target = root / "managed" / "sessions.sqlite3"
+            migrate_legacy_database(destination=target, legacy_path=legacy)
+            decoy = root / "decoy.sqlite3"
+            connection = sqlite3.connect(decoy)
+            connection.execute("CREATE TABLE decoy (value TEXT)")
+            connection.commit()
+            connection.close()
+            original = target.parent / "original.sqlite3"
+            real_hash = session_store_module._sha256_descriptor
+            swapped = False
+
+            def swap_during_hash(descriptor):
+                nonlocal swapped
+                if not swapped:
+                    swapped = True
+                    os.replace(target, original)
+                    os.replace(decoy, target)
+                return real_hash(descriptor)
+
+            with mock.patch(
+                "termdeck.session_store._sha256_descriptor",
+                side_effect=swap_during_hash,
+            ), self.assertRaisesRegex(
+                SessionDatabaseMigrationError,
+                "identity changed|changed during receipt",
+            ):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+
+    def test_verified_receipt_rejects_hardlink_and_midcheck_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            connection = sqlite3.connect(legacy)
+            connection.execute("CREATE TABLE marker (value TEXT)")
+            connection.commit()
+            connection.close()
+            target = root / "managed" / "sessions.sqlite3"
+            migrated = migrate_legacy_database(destination=target, legacy_path=legacy)
+            assert migrated.receipt_path is not None
+            receipt = migrated.receipt_path
+            receipt_alias = target.parent / "receipt-alias.json"
+            os.link(receipt, receipt_alias)
+
+            with self.assertRaisesRegex(
+                SessionDatabaseMigrationError,
+                "receipt is unsafe",
+            ):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+
+            receipt_alias.unlink()
+            real_hash = session_store_module._sha256_descriptor
+            mutated = False
+
+            def mutate_receipt_during_hash(descriptor):
+                nonlocal mutated
+                digest = real_hash(descriptor)
+                if not mutated:
+                    mutated = True
+                    receipt.write_bytes(b"{}\n")
+                return digest
+
+            with mock.patch.object(
+                session_store_module,
+                "_sha256_descriptor",
+                side_effect=mutate_receipt_during_hash,
+            ), self.assertRaisesRegex(
+                SessionDatabaseMigrationError,
+                "receipt changed during verification",
+            ):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+
+    def test_live_managed_writer_blocks_existing_target_repair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            target = root / "managed" / "sessions.sqlite3"
+            legacy_store = SessionStore(legacy)
+            legacy_store.create("legacy", "dev", "bash", root)
+            legacy_store.close()
+            target_store = SessionStore(target)
+            target_store.create("existing", "dev", "bash", root)
+            try:
+                with self.assertRaisesRegex(
+                    SessionDatabaseMigrationError,
+                    "legacy session database is still open",
+                ):
+                    migrate_legacy_database(destination=target, legacy_path=legacy)
+                self.assertIsNone(target_store.get("td-does-not-exist"))
+                self.assertEqual(len(target_store.list()), 1)
+            finally:
+                target_store.close()
+
+    def test_row_content_mismatch_never_publishes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            connection = sqlite3.connect(legacy)
+            connection.execute(
+                "CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO marker(value) VALUES ('source')")
+            connection.commit()
+            connection.close()
+            target = root / "managed" / "sessions.sqlite3"
+            real_backup = session_store_module._sqlite_backup
+
+            def corrupt_backup(source, destination):
+                summary = real_backup(source, destination)
+                copied = sqlite3.connect(destination)
+                try:
+                    copied.execute("UPDATE marker SET value = 'corrupt'")
+                    copied.commit()
+                finally:
+                    copied.close()
+                return summary
+
+            with mock.patch(
+                "termdeck.session_store._sqlite_backup",
+                side_effect=corrupt_backup,
+            ), self.assertRaisesRegex(
+                SessionDatabaseMigrationError,
+                "row/window/schema parity",
+            ):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+            self.assertFalse(target.exists())
+
+    def test_content_digest_is_independent_of_insertion_order(self):
+        first = sqlite3.connect(":memory:")
+        second = sqlite3.connect(":memory:")
+        try:
+            for connection, rows in (
+                (first, [(1, "one"), (2, "two"), (3, "three")]),
+                (second, [(3, "three"), (1, "one"), (2, "two")]),
+            ):
+                connection.execute("CREATE TABLE marker (id INTEGER, value TEXT)")
+                connection.executemany("INSERT INTO marker VALUES (?, ?)", rows)
+                connection.commit()
+            first_summary = session_store_module._database_summary(first)
+            second_summary = session_store_module._database_summary(second)
+            self.assertEqual(first_summary, second_summary)
+        finally:
+            first.close()
+            second.close()
+
+    def test_subset_proof_is_bounded_and_rejects_changed_values(self):
+        source = sqlite3.connect(":memory:")
+        destination = sqlite3.connect(":memory:")
+        source.row_factory = sqlite3.Row
+        destination.row_factory = sqlite3.Row
+        try:
+            for connection in (source, destination):
+                connection.execute(
+                    "CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO marker VALUES (?, ?)",
+                    [(1, "one"), (2, "two")],
+                )
+                connection.commit()
+            with mock.patch.object(
+                session_store_module,
+                "_MIGRATION_COMPARE_ROW_LIMIT",
+                2,
+            ):
+                self.assertTrue(
+                    session_store_module._database_is_lossless_subset(
+                        destination,
+                        source,
+                    )
+                )
+            destination.execute("UPDATE marker SET value = 'changed' WHERE id = 2")
+            destination.commit()
+            self.assertFalse(
+                session_store_module._database_is_lossless_subset(
+                    destination,
+                    source,
+                )
+            )
+            with mock.patch.object(
+                session_store_module,
+                "_MIGRATION_COMPARE_ROW_LIMIT",
+                1,
+            ):
+                self.assertFalse(
+                    session_store_module._database_is_lossless_subset(
+                        destination,
+                        source,
+                    )
+                )
+        finally:
+            source.close()
+            destination.close()
+
+    def test_hot_rollback_journal_recovers_only_on_private_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            script = """
+import os
+import sqlite3
+import sys
+
+database = sys.argv[1]
+connection = sqlite3.connect(database)
+connection.execute("PRAGMA journal_mode = DELETE")
+connection.execute("PRAGMA page_size = 1024")
+connection.execute("PRAGMA cache_size = 4")
+connection.execute("PRAGMA cache_spill = ON")
+connection.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+connection.executemany(
+    "INSERT INTO marker(id, value) VALUES (?, ?)",
+    [(index, "old-" + "x" * 2000) for index in range(80)],
+)
+connection.commit()
+connection.execute("BEGIN IMMEDIATE")
+connection.executemany(
+    "UPDATE marker SET value = ? WHERE id = ?",
+    [("new-" + "y" * 2000, index) for index in range(80)],
+)
+os._exit(0)
+"""
+            subprocess.run(
+                [sys.executable, "-c", script, str(legacy)],
+                check=True,
+            )
+            journal = legacy.with_name(f"{legacy.name}-journal")
+            self.assertTrue(journal.is_file())
+            source_before = {
+                path.name: path.read_bytes()
+                for path in legacy.parent.iterdir()
+                if path.is_file()
+            }
+            target = root / "managed" / "sessions.sqlite3"
+
+            with mock.patch(
+                "termdeck.session_store.sqlite3.connect",
+                side_effect=self._guard_sqlite_source(legacy),
+            ):
+                result = migrate_legacy_database(
+                    destination=target,
+                    legacy_path=legacy,
+                )
+
+            self.assertEqual(result.status, "migrated")
+            migrated = sqlite3.connect(target)
+            try:
+                values = migrated.execute(
+                    "SELECT value FROM marker ORDER BY id"
+                ).fetchall()
+            finally:
+                migrated.close()
+            self.assertEqual(len(values), 80)
+            self.assertTrue(all(value.startswith("old-") for (value,) in values))
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in legacy.parent.iterdir()
+                    if path.is_file()
+                },
+                source_before,
+            )
+
+    def test_verified_restart_cleans_crash_left_migration_hardlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy" / "sessions.sqlite3"
+            legacy.parent.mkdir()
+            connection = sqlite3.connect(legacy)
+            connection.execute("CREATE TABLE marker (value TEXT)")
+            connection.commit()
+            connection.close()
+            target = root / "managed" / "sessions.sqlite3"
+            first = migrate_legacy_database(destination=target, legacy_path=legacy)
+            residue = target.parent / ".sessions.sqlite3.migration-crash"
+            os.link(target, residue)
+
+            repeated = migrate_legacy_database(destination=target, legacy_path=legacy)
+
+            self.assertEqual(repeated.status, "verified")
+            self.assertEqual(repeated.database_id, first.database_id)
+            self.assertFalse(residue.exists())
+            self.assertEqual(target.stat().st_nlink, 1)
 
     def test_file_registry_uses_responsive_sqlite_profile(self):
         with tempfile.TemporaryDirectory() as tmp:

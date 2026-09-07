@@ -59,7 +59,10 @@ from .models import RECOVERY_INTENT_INACTIVE, SessionRecord, TerminalTheme
 from .persistence import PersistenceResult, persist_live_sessions
 from .redaction import redact_text
 from .recovery_coordinator import RecoveryCoordinator, RecoveryResult
-from .recovery_intent import consume_pending_recovery_intents
+from .recovery_intent import (
+    consume_pending_recovery_intents,
+    recovery_intent_backlog_pending,
+)
 from .resources import ResourceSampler
 from .session_lifecycle import archive_records, hide_records, move_records, pin_records, recently_closed_records, rename_record, reopen_closed_records, unpin_records
 from .session_reconcile import (
@@ -82,6 +85,7 @@ from .session_store import (
     short_id,
     utc_now,
 )
+from .storage_fabric import tmux_subprocess_environment
 from .settings import AppSettings, SettingsError, save_terminal_options
 from .shortcuts import build_shortcut_map, index_from_key_name, shortcut_entries
 from .task_snapshot import build_task_snapshot
@@ -4972,8 +4976,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         # the store state and retry the attach in-place; never recreate a live
         # tmux target merely because the widget was not built yet.
         self._restore_retry_ids: set[str] = set()
+        self._restore_inflight_ids: set[str] = set()
         self._restore_retry_source_id = 0
         self._restore_retry_attempts = 0
+        self._restore_callbacks_alive = True
         # GUI workspace recipes launch hidden/background payloads only after a
         # mapped terminal surface proves one stable canonical grid.  All fields
         # are window-local and are cancelled before destruction.
@@ -5272,6 +5278,15 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
     def _on_destroy(self, *_args) -> None:
         self._tab_directory_refresh_alive = False
+        self._restore_callbacks_alive = False
+        self._restore_retry_ids.clear()
+        self._restore_inflight_ids.clear()
+        if self._restore_retry_source_id:
+            try:
+                GLib.source_remove(self._restore_retry_source_id)
+            except Exception:
+                pass
+            self._restore_retry_source_id = 0
         if self._terminal_layout_sync_source_id:
             try:
                 GLib.source_remove(self._terminal_layout_sync_source_id)
@@ -6056,6 +6071,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         if not isinstance(retry_ids, set):
             retry_ids = set()
             self._restore_retry_ids = retry_ids
+        inflight_ids = getattr(self, "_restore_inflight_ids", None)
+        if not isinstance(inflight_ids, set):
+            inflight_ids = set()
+            self._restore_inflight_ids = inflight_ids
         restored = 0
         restore_records = sorted(records, key=lambda row: row.tab_index) if records is not None else self.app_context.store.restore_candidates(
             window_id=self.window_id,
@@ -6092,6 +6111,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         for record in restore_records:
             if record.id in self.tabs:
                 continue
+            if record.id in inflight_ids:
+                continue
             known_live = live_by_id.get(record.id) if live_by_id is not None else None
             if coordinator is not None:
                 try:
@@ -6104,11 +6125,14 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                         session_id: str = record.id,
                         fallback: SessionRecord = record,
                     ) -> object:
-                        current = self.app_context.store.get(session_id) or fallback
+                        inflight_ids.discard(session_id)
+                        if not getattr(self, "_restore_callbacks_alive", True):
+                            return False
                         self._restore_retry_ids.discard(session_id)
                         if session_id in self.tabs:
                             return False
                         try:
+                            current = self.app_context.store.get(session_id) or fallback
                             self.open_session(
                                 current,
                                 restart_missing=False,
@@ -6126,7 +6150,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                                     session_id,
                                     status="recovery-pending",
                                     last_pid=None,
-                                    visible=bool(getattr(current, "visible", True)),
+                                    visible=bool(getattr(fallback, "visible", True)),
                                     recovery_last_error=str(exc),
                                 )
                             except Exception:
@@ -6140,6 +6164,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                         result: RecoveryResult,
                         session_id: str = record.id,
                     ) -> object:
+                        inflight_ids.discard(session_id)
+                        if not getattr(self, "_restore_callbacks_alive", True):
+                            return False
                         if session_id in self.tabs:
                             self.side.refresh()
                             return False
@@ -6150,23 +6177,26 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                         self.side.refresh()
                         return False
 
+                    inflight_ids.add(record.id)
                     try:
                         submission = coordinator.submit(
                             record,
-                            mode="restore",
+                            mode="payload",
                             known_live=known_live,
                             known_pid=pids_by_id.get(record.id),
                             on_ready=recovery_ready,
                             on_failed=recovery_failed,
                         )
                     except Exception:
+                        inflight_ids.discard(record.id)
                         failed_ids.add(record.id)
                         continue
                     else:
-                        if known_live is not True:
+                        if submission.accepted:
                             continue
-                        if submission.state not in {"live", "queued", "deduplicated"}:
-                            continue
+                        inflight_ids.discard(record.id)
+                        failed_ids.add(record.id)
+                        continue
             elif coordinator_unavailable:
                 try:
                     if startup_recovery_allowed(record):
@@ -6200,12 +6230,15 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                     if str(getattr(record, "status", "")).casefold() == "recovery-pending"
                     else "start-error"
                 )
-                self.app_context.store.update(
-                    record.id,
-                    status=failure_status,
-                    last_pid=None,
-                    visible=bool(getattr(record, "visible", True)),
-                )
+                try:
+                    self.app_context.store.update(
+                        record.id,
+                        status=failure_status,
+                        last_pid=None,
+                        visible=bool(getattr(record, "visible", True)),
+                    )
+                except Exception:
+                    pass
                 continue
             if len(self.tabs) > before:
                 restored += 1
@@ -6223,6 +6256,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     def _schedule_restore_retry(self) -> None:
         """Retry only rows whose notebook client was not materialized."""
 
+        if not getattr(self, "_restore_callbacks_alive", True):
+            return
         if getattr(self, "_restore_retry_source_id", 0):
             return
         # A bounded retry window avoids a permanent loop when a backend is
@@ -6243,6 +6278,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
     def _retry_restore_tabs(self) -> bool:
         self._restore_retry_source_id = 0
+        if not getattr(self, "_restore_callbacks_alive", True):
+            self._restore_retry_ids.clear()
+            self._restore_retry_attempts = 0
+            return False
         self._restore_retry_attempts += 1
         retry_ids = getattr(self, "_restore_retry_ids", set())
         ids = tuple(retry_ids)
@@ -6255,7 +6294,20 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 retry_ids.discard(session_id)
                 continue
             record = self.app_context.store.get(session_id)
-            if record is not None and bool(getattr(record, "visible", True)):
+            try:
+                live_ids = ()
+                if record is not None and self.app_context.backend.session_exists(record):
+                    live_ids = (record.id,)
+                eligible = bool(
+                    record is not None
+                    and startup_restore_candidates(
+                        (record,),
+                        live_session_ids=live_ids,
+                    )
+                )
+            except Exception:
+                eligible = False
+            if record is not None and bool(getattr(record, "visible", True)) and eligible:
                 rows.append(record)
             else:
                 retry_ids.discard(session_id)
@@ -6754,6 +6806,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             self.app_context.backend,
             record,
         )
+        attach_environment = tmux_subprocess_environment(materialize=True)
 
         terminal = AttachTerminal(
             self.app_context.backend.attach_command(record),
@@ -6783,6 +6836,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 self.app_context.theme.scrollback_lines,
             ),
             font_override=self.zoomed_font(),
+            child_environment=attach_environment,
             prepare_target_handler=(prepare_target if launch_after_allocation else None),
             prepare_target_error_handler=(
                 prepare_target_failed if launch_after_allocation else None
@@ -9212,17 +9266,16 @@ def open_primary_session_store(db_path: Path) -> SessionStore:
 
     The fixed default GApplication identity first forwards a new activation to
     any older TermDeck primary.  Only a genuinely new primary reaches startup,
-    so it is the sole process allowed to publish the one-time SSD copy.  Once
-    the managed database exists, later starts never touch the legacy HDD path.
+    so it is the sole process allowed to publish or repair the SSD copy.  A
+    sealed database verifies from its local receipt without touching the legacy
+    HDD path; an unsealed database must pass guarded parity migration first.
     """
 
     default_path = DEFAULT_DB_PATH.expanduser().resolve(strict=False)
     managed_launch = bool(os.environ.get("T1000_MANAGED_ROOT", "").strip())
-    if managed_launch and db_path == default_path and not db_path.exists():
+    if managed_launch and db_path == default_path:
         migrate_legacy_database(destination=db_path)
     store = SessionStore(db_path)
-    if managed_launch and db_path == default_path:
-        consume_pending_recovery_intents(store)
     return store
 
 
@@ -9408,6 +9461,10 @@ class TermDeckApplication(Gtk.Application):
         self._last_legacy_recovery_result: LegacyRecoveryResult | None = None
         self._payload_revival_lock = threading.Lock()
         self._payload_revival_started = False
+        self._recovery_intent_drain_guard = threading.Lock()
+        self._recovery_intent_drain_started = False
+        self._recovery_intent_refresh_pending = False
+        self._recovery_intent_drain_stop = threading.Event()
         # Shared snapshot memo: multiple periodic table refreshers (window
         # overview, tab manager) reuse one tmux/proc sampling pass per tick
         # instead of each running their own identical pass.
@@ -9439,6 +9496,8 @@ class TermDeckApplication(Gtk.Application):
             )
             self.quit()
             return
+        if os.environ.get("T1000_MANAGED_ROOT", "").strip():
+            GLib.idle_add(self._schedule_recovery_intent_drain)
         try:
             self._chrome_css = apply_app_chrome(self.settings)
         except Exception:
@@ -9484,6 +9543,101 @@ class TermDeckApplication(Gtk.Application):
         )
         return True
 
+    def _queue_recovery_intent_refresh(self) -> None:
+        with self._recovery_intent_drain_guard:
+            if self._recovery_intent_refresh_pending:
+                return
+            self._recovery_intent_refresh_pending = True
+
+        def publish() -> bool:
+            with self._recovery_intent_drain_guard:
+                self._recovery_intent_refresh_pending = False
+            if self.store is not None and not self._recovery_intent_drain_stop.is_set():
+                try:
+                    self.activate()
+                except Exception:
+                    pass
+            return False
+
+        try:
+            GLib.idle_add(publish)
+        except Exception:
+            with self._recovery_intent_drain_guard:
+                self._recovery_intent_refresh_pending = False
+
+    def _schedule_recovery_intent_drain(self) -> bool:
+        if self.store is None or self._recovery_intent_drain_stop.is_set():
+            return False
+        with self._recovery_intent_drain_guard:
+            if self._recovery_intent_drain_started:
+                return False
+            self._recovery_intent_drain_started = True
+        try:
+            store_path = self.store.path
+            auth_root = self.store.auth_root
+            account_source = self.store.account_source
+            provision_auth_scopes = self.store.provision_auth_scopes
+        except Exception:
+            with self._recovery_intent_drain_guard:
+                self._recovery_intent_drain_started = False
+            return False
+
+        def worker() -> None:
+            worker_store = None
+            retry_delay = 0.05
+            try:
+                try:
+                    os.nice(10)
+                except (AttributeError, OSError):
+                    pass
+                worker_store = SessionStore(
+                    store_path,
+                    auth_root=auth_root,
+                    account_source=account_source,
+                    provision_auth_scopes=provision_auth_scopes,
+                )
+                while not self._recovery_intent_drain_stop.is_set():
+                    if not recovery_intent_backlog_pending():
+                        break
+                    outcomes = consume_pending_recovery_intents(
+                        worker_store,
+                        time_budget_seconds=0.05,
+                    )
+                    if any(outcome.state != "pending" for outcome in outcomes):
+                        self._queue_recovery_intent_refresh()
+                    if any(outcome.state != "pending" for outcome in outcomes):
+                        retry_delay = 0.05
+                        continue
+                    if self._recovery_intent_drain_stop.wait(retry_delay):
+                        break
+                    retry_delay = min(1.0, retry_delay * 2.0)
+            except Exception as exc:
+                print(
+                    f"T1000: deferred recovery-intent drain stopped safely: {exc}",
+                    file=sys.stderr,
+                )
+            finally:
+                if worker_store is not None:
+                    try:
+                        worker_store.close()
+                    except Exception:
+                        pass
+                with self._recovery_intent_drain_guard:
+                    self._recovery_intent_drain_started = False
+
+        thread = threading.Thread(
+            target=worker,
+            name="termdeck-recovery-intent-drain",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except Exception:
+            with self._recovery_intent_drain_guard:
+                self._recovery_intent_drain_started = False
+            raise
+        return False
+
     # Notification kinds that change what the task tables and panes display.
     # High-frequency stream kinds (output, pane-offset, focus, resize) are
     # excluded on purpose; "unknown" is a forward-compatible catch-all and is
@@ -9526,12 +9680,14 @@ class TermDeckApplication(Gtk.Application):
         def spawn_transport() -> "subprocess.Popen[bytes]":
             # The parent-death signal keeps this watcher from surviving as
             # a zombie client when the app dies without running its cleanup.
+            child_environment = tmux_subprocess_environment(materialize=True)
             return subprocess.Popen(
                 [executable, "-C", "attach-session"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 preexec_fn=bind_transport_to_parent_death,
+                env=child_environment,
             )
 
         self._tmux_events_client = ControlModeClient(
@@ -9626,6 +9782,7 @@ class TermDeckApplication(Gtk.Application):
         return records, items
 
     def do_shutdown(self) -> None:
+        self._recovery_intent_drain_stop.set()
         coordinator = getattr(self, "_recovery_coordinator", None)
         if coordinator is not None:
             self._recovery_coordinator = None

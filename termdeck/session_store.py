@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import os
 import re
 import sqlite3
 import stat
+import struct
 import tempfile
 import uuid
 from collections.abc import Iterable, Mapping
@@ -28,9 +30,14 @@ from .session_recipe import (
     record_recipe_fields,
     recovery_command_specificity,
 )
-
-_LEGACY_APP_DIR = Path.home() / ".local" / "share" / "termdeck"
-
+from .storage_fabric import (
+    DatabaseFileBinding,
+    StorageFabricError,
+    _PinnedDirectory,
+    _open_pinned_directory,
+    pin_production_database,
+    pin_production_database_parent,
+)
 
 def legacy_state_dir() -> Path:
     return Path.home() / ".local" / "share" / "termdeck"
@@ -48,7 +55,7 @@ def managed_state_dir(*, environ: Mapping[str, str] | None = None) -> Path:
     values = os.environ if environ is None else environ
     raw_root = str(values.get("T1000_MANAGED_ROOT", "") or "").strip()
     if not raw_root:
-        return _LEGACY_APP_DIR
+        return legacy_state_dir()
     root = Path(raw_root).expanduser()
     if not root.is_absolute():
         raise ValueError("T1000_MANAGED_ROOT must be an absolute path")
@@ -83,6 +90,27 @@ class SessionDatabaseMigration:
     destination: Path
     source_sha256: str | None = None
     destination_sha256: str | None = None
+    receipt_path: Path | None = None
+    backup_path: Path | None = None
+    database_id: str | None = None
+
+
+_MIGRATION_RECEIPT_SCHEMA = "termdeck.session-database-migration.v2"
+_MIGRATION_STATE_TABLE = "termdeck_migration_state"
+_MIGRATION_COMPARE_ROW_LIMIT = 100_000
+
+
+@dataclass(frozen=True)
+class _DatabaseSummary:
+    schema_sha256: str
+    content_sha256: str
+    user_version: int
+    session_count: int
+    remembered_window_count: int
+    distinct_window_count: int
+    captain_count: int
+    total_row_count: int
+    table_counts: tuple[tuple[str, int], ...]
 
 _SAFE = re.compile(r"[^a-zA-Z0-9_]+")
 
@@ -162,24 +190,40 @@ def tmux_safe_name(name: str) -> str:
     return cleaned[:96]
 
 
-def _migration_file(path: str | Path, *, label: str) -> Path:
+def _absolute_migration_path(path: str | Path, *, label: str) -> Path:
     candidate = Path(path).expanduser()
     if candidate == Path(":memory:"):
         raise SessionDatabaseMigrationError(f"{label} cannot be an in-memory database")
-    try:
-        if candidate.is_symlink():
-            raise SessionDatabaseMigrationError(f"{label} must not be a symlink")
-        resolved = candidate.resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
-        raise SessionDatabaseMigrationError(f"cannot resolve {label}") from exc
-    if resolved.exists():
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    return Path(os.path.abspath(os.fspath(candidate)))
+
+
+def _migration_file(path: str | Path, *, label: str) -> Path:
+    absolute = _absolute_migration_path(path, label=label)
+    current = absolute
+    while True:
         try:
-            mode = resolved.lstat().st_mode
+            metadata = current.lstat()
+        except FileNotFoundError:
+            pass
         except OSError as exc:
             raise SessionDatabaseMigrationError(f"cannot inspect {label}") from exc
-        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-            raise SessionDatabaseMigrationError(f"{label} must be a regular file")
-    return resolved
+        else:
+            if stat.S_ISLNK(metadata.st_mode):
+                raise SessionDatabaseMigrationError(
+                    f"{label} contains a symlink: {current}"
+                )
+            if current == absolute and not stat.S_ISREG(metadata.st_mode):
+                raise SessionDatabaseMigrationError(f"{label} must be a regular file")
+            if current != absolute and not stat.S_ISDIR(metadata.st_mode):
+                raise SessionDatabaseMigrationError(
+                    f"{label} ancestor must be a directory: {current}"
+                )
+        if current.parent == current:
+            break
+        current = current.parent
+    return absolute
 
 
 def _sha256_file(path: Path) -> str:
@@ -190,9 +234,410 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _file_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
+
+
+def _sha256_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+@dataclass
+class _LegacySnapshotFile:
+    name: str
+    descriptor: int
+    signature: tuple[int, int, int, int, int]
+    sha256: str
+    ofd_locked: bool = False
+
+    def close(self) -> None:
+        descriptor = self.descriptor
+        if descriptor < 0:
+            return
+        self.descriptor = -1
+        os.close(descriptor)
+
+
+def _open_regular_at(
+    parent: _PinnedDirectory,
+    name: str,
+    *,
+    label: str,
+    required: bool,
+    writable: bool = False,
+) -> int | None:
+    try:
+        descriptor = os.open(
+            name,
+            (os.O_RDWR if writable else os.O_RDONLY)
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC
+            | os.O_NONBLOCK,
+            dir_fd=parent.descriptor,
+        )
+    except FileNotFoundError:
+        if required:
+            raise SessionDatabaseMigrationError(f"{label} does not exist")
+        return None
+    except OSError as exc:
+        raise SessionDatabaseMigrationError(f"cannot open {label}: {exc}") from exc
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise SessionDatabaseMigrationError(f"{label} must be a regular file")
+    return descriptor
+
+
+def _open_legacy_snapshot_files(
+    source: Path,
+    parent: _PinnedDirectory,
+    *,
+    require_private: bool = False,
+) -> dict[str, _LegacySnapshotFile]:
+    files: dict[str, _LegacySnapshotFile] = {}
+    try:
+        for suffix in ("", "-wal", "-journal", "-shm"):
+            name = f"{source.name}{suffix}"
+            descriptor = _open_regular_at(
+                parent,
+                name,
+                label=f"legacy session database{suffix}",
+                required=not suffix,
+                writable=require_private,
+            )
+            if descriptor is None:
+                continue
+            metadata = os.fstat(descriptor)
+            if require_private and (
+                metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+            ):
+                os.close(descriptor)
+                raise SessionDatabaseMigrationError(
+                    "cannot prove that the legacy session database is private"
+                )
+            files[suffix] = _LegacySnapshotFile(
+                name=name,
+                descriptor=descriptor,
+                signature=_file_signature(metadata),
+                sha256=_sha256_descriptor(descriptor),
+            )
+        return files
+    except Exception:
+        for item in files.values():
+            item.close()
+        raise
+
+
+def _validate_legacy_snapshot_files(
+    source: Path,
+    parent: _PinnedDirectory,
+    files: Mapping[str, _LegacySnapshotFile],
+) -> None:
+    for suffix in ("", "-wal", "-journal", "-shm"):
+        expected = files.get(suffix)
+        name = f"{source.name}{suffix}"
+        try:
+            metadata = os.stat(
+                name,
+                dir_fd=parent.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if expected is not None:
+                raise SessionDatabaseMigrationError(
+                    "legacy session database changed during migration; retry after "
+                    "the old T1000 writer exits"
+                )
+            continue
+        if expected is None or stat.S_ISLNK(metadata.st_mode):
+            raise SessionDatabaseMigrationError(
+                "legacy session database changed during migration; retry after "
+                "the old T1000 writer exits"
+            )
+        if (
+            _file_signature(metadata) != expected.signature
+            or _file_signature(os.fstat(expected.descriptor)) != expected.signature
+            or _sha256_descriptor(expected.descriptor) != expected.sha256
+        ):
+            raise SessionDatabaseMigrationError(
+                "legacy session database changed during migration; retry after "
+                "the old T1000 writer exits"
+            )
+
+
+def _process_is_gone_or_zombie(process: Path) -> bool:
+    try:
+        status_text = (process / "status").read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    except OSError:
+        return False
+    return any(
+        line.startswith("State:") and "Z" in line.split()
+        for line in status_text.splitlines()
+    )
+
+
+def _proc_process_directories() -> tuple[Path, ...]:
+    try:
+        return tuple(Path("/proc").iterdir())
+    except OSError as exc:
+        raise SessionDatabaseMigrationError(
+            "cannot prove that the legacy session database is quiescent"
+        ) from exc
+
+
+def _assert_legacy_snapshot_quiescent(
+    files: Mapping[str, _LegacySnapshotFile],
+) -> None:
+    """Reject migration while another process holds source SQLite files."""
+
+    expected = {
+        (item.signature[0], item.signature[1]) for item in files.values()
+    }
+    expected_locks = {
+        (
+            int(os.major(item.signature[0])),
+            int(os.minor(item.signature[0])),
+            int(item.signature[1]),
+        )
+        for item in files.values()
+    }
+    try:
+        with Path("/proc/locks").open("r", encoding="utf-8") as handle:
+            lock_text = handle.read(4 * 1024 * 1024 + 1)
+    except OSError as exc:
+        raise SessionDatabaseMigrationError(
+            "cannot prove that the legacy session database is quiescent"
+        ) from exc
+    if len(lock_text) > 4 * 1024 * 1024:
+        raise SessionDatabaseMigrationError(
+            "cannot prove that the legacy session database is quiescent"
+        )
+    own_pid = os.getpid()
+    for line in lock_text.splitlines():
+        fields = line.split()
+        lock_pid = None
+        if len(fields) >= 5:
+            try:
+                lock_pid = int(fields[4])
+            except ValueError:
+                pass
+        for field in fields:
+            identity = field.split(":")
+            if len(identity) != 3:
+                continue
+            try:
+                lock_identity = (
+                    int(identity[0], 16),
+                    int(identity[1], 16),
+                    int(identity[2], 10),
+                )
+            except ValueError:
+                continue
+            own_ofd_lock = fields[1:2] == ["OFDLCK"] and any(
+                item.ofd_locked
+                and (
+                    int(os.major(item.signature[0])),
+                    int(os.minor(item.signature[0])),
+                    int(item.signature[1]),
+                )
+                == lock_identity
+                for item in files.values()
+            )
+            if (
+                lock_identity in expected_locks
+                and lock_pid != own_pid
+                and not own_ofd_lock
+            ):
+                raise SessionDatabaseMigrationError(
+                    "legacy session database is still open; retry after the old "
+                    "T1000 writer exits"
+                )
+            break
+    own_descriptors = {item.descriptor for item in files.values()}
+    for process in _proc_process_directories():
+        if not process.name.isdecimal():
+            continue
+        try:
+            process_metadata = process.stat()
+        except FileNotFoundError:
+            continue
+        except ProcessLookupError:
+            continue
+        except PermissionError as exc:
+            if _process_is_gone_or_zombie(process):
+                continue
+            raise SessionDatabaseMigrationError(
+                "cannot prove that the legacy session database is quiescent"
+            ) from exc
+        except OSError as exc:
+            raise SessionDatabaseMigrationError(
+                "cannot prove that the legacy session database is quiescent"
+            ) from exc
+        if process_metadata.st_uid != os.geteuid():
+            continue
+        try:
+            descriptors = tuple((process / "fd").iterdir())
+        except FileNotFoundError:
+            continue
+        except ProcessLookupError:
+            continue
+        except PermissionError as exc:
+            if _process_is_gone_or_zombie(process):
+                continue
+            raise SessionDatabaseMigrationError(
+                "cannot prove that the legacy session database is quiescent"
+            ) from exc
+        except OSError as exc:
+            raise SessionDatabaseMigrationError(
+                "cannot prove that the legacy session database is quiescent"
+            ) from exc
+        for descriptor_path in descriptors:
+            if (
+                int(process.name) == own_pid
+                and descriptor_path.name.isdecimal()
+                and int(descriptor_path.name) in own_descriptors
+            ):
+                continue
+            try:
+                metadata = descriptor_path.stat()
+            except FileNotFoundError:
+                continue
+            except ProcessLookupError:
+                continue
+            except OSError as exc:
+                raise SessionDatabaseMigrationError(
+                    "cannot prove that the legacy session database is quiescent"
+                ) from exc
+            if (int(metadata.st_dev), int(metadata.st_ino)) in expected:
+                raise SessionDatabaseMigrationError(
+                    "legacy session database is still open; retry after the old "
+                    "T1000 writer exits"
+                )
+
+
+def _lock_legacy_snapshot_files(
+    files: Mapping[str, _LegacySnapshotFile],
+) -> None:
+    """Hold SQLite-compatible exclusive fences until migration is sealed."""
+
+    if not hasattr(fcntl, "F_OFD_SETLK"):
+        raise SessionDatabaseMigrationError(
+            "cannot establish an open-file-description migration fence"
+        )
+    for item in files.values():
+        try:
+            request = struct.pack(
+                "hhqqi",
+                fcntl.F_WRLCK,
+                os.SEEK_SET,
+                0,
+                0,
+                0,
+            )
+            fcntl.fcntl(
+                item.descriptor,
+                fcntl.F_OFD_SETLK,
+                request,
+            )
+            item.ofd_locked = True
+        except OSError as exc:
+            raise SessionDatabaseMigrationError(
+                "legacy session database is still open; retry after the old "
+                "T1000 writer exits"
+            ) from exc
+
+
+
+def _copy_descriptor(descriptor: int, destination: Path) -> None:
+    output = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while chunk := os.read(descriptor, 1024 * 1024):
+            view = memoryview(chunk)
+            while view:
+                written = os.write(output, view)
+                view = view[written:]
+        os.fsync(output)
+    finally:
+        os.close(output)
+
+
+def _verify_descriptor_copy(
+    source: _LegacySnapshotFile,
+    destination: Path,
+) -> None:
+    descriptor = os.open(
+        destination,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or int(metadata.st_size) != int(source.signature[2])
+            or _sha256_descriptor(descriptor) != source.sha256
+        ):
+            raise SessionDatabaseMigrationError(
+                "copied SQLite component failed its descriptor hash proof"
+            )
+    finally:
+        os.close(descriptor)
+
+
+def _copy_legacy_sqlite_snapshot(
+    source: Path,
+    source_parent: _PinnedDirectory,
+    snapshot_directory: Path,
+) -> tuple[Path, dict[str, _LegacySnapshotFile]]:
+    files = _open_legacy_snapshot_files(
+        source,
+        source_parent,
+        require_private=True,
+    )
+    try:
+        _assert_legacy_snapshot_quiescent(files)
+        _lock_legacy_snapshot_files(files)
+        _assert_legacy_snapshot_quiescent(files)
+        for suffix in ("", "-wal", "-journal"):
+            item = files.get(suffix)
+            if item is not None:
+                copied = snapshot_directory / item.name
+                _copy_descriptor(item.descriptor, copied)
+                _verify_descriptor_copy(item, copied)
+        _validate_legacy_snapshot_files(source, source_parent, files)
+        return snapshot_directory / source.name, files
+    except Exception:
+        for item in files.values():
+            item.close()
+        raise
+
+
 def _harden_regular_file(path: Path, mode: int) -> None:
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+        )
     except FileNotFoundError:
         return
     try:
@@ -210,6 +655,29 @@ def _harden_database_permissions(path: Path) -> None:
     _harden_regular_file(path.with_name(f"{path.name}-shm"), 0o600)
 
 
+def _harden_bound_database_permissions(binding: DatabaseFileBinding) -> None:
+    os.fchmod(binding.descriptor, 0o600)
+    for suffix in ("-wal", "-shm"):
+        try:
+            descriptor = os.open(
+                f"{binding.path.name}{suffix}",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=binding.parent.descriptor,
+            )
+        except FileNotFoundError:
+            continue
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise SessionDatabaseMigrationError(
+                    "database sidecar is not a regular file: "
+                    f"{binding.path.name}{suffix}"
+                )
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+
+
 def _is_managed_state_path(path: Path) -> bool:
     try:
         path.resolve(strict=False).relative_to(
@@ -220,10 +688,11 @@ def _is_managed_state_path(path: Path) -> bool:
     return True
 
 
-def _check_sqlite_database(path: Path) -> None:
+def _check_sqlite_database(path: Path, *, immutable: bool = False) -> None:
+    query = "mode=ro&immutable=1" if immutable else "mode=ro"
     try:
         connection = sqlite3.connect(
-            f"{path.as_uri()}?mode=ro",
+            f"{path.as_uri()}?{query}",
             uri=True,
             timeout=5.0,
         )
@@ -246,20 +715,1048 @@ def _check_sqlite_database(path: Path) -> None:
         connection.close()
 
 
+def _normalize_private_sqlite_snapshot(path: Path) -> None:
+    """Recover copied WAL/journal state and leave one standalone database."""
+
+    try:
+        connection = sqlite3.connect(str(path), timeout=1.0)
+    except (OSError, sqlite3.Error) as exc:
+        raise SessionDatabaseMigrationError(
+            f"{path} is not a readable SQLite database"
+        ) from exc
+    try:
+        result = connection.execute("PRAGMA quick_check").fetchone()
+        if not result or str(result[0]).casefold() != "ok":
+            detail = str(result[0]) if result else "no result"
+            raise SessionDatabaseMigrationError(
+                f"SQLite integrity check failed for {path}: {detail}"
+            )
+        mode = connection.execute("PRAGMA journal_mode = DELETE").fetchone()
+        if mode is None or str(mode[0]).casefold() != "delete":
+            raise SessionDatabaseMigrationError(
+                "legacy session snapshot could not be made standalone"
+            )
+        connection.execute("PRAGMA synchronous = FULL")
+        connection.commit()
+    except sqlite3.Error as exc:
+        raise SessionDatabaseMigrationError(
+            f"SQLite integrity check failed for {path}"
+        ) from exc
+    finally:
+        connection.close()
+    _check_sqlite_database(path, immutable=True)
+
+
+def _open_readonly_database(path: Path) -> sqlite3.Connection:
+    try:
+        connection = sqlite3.connect(
+            f"{path.as_uri()}?mode=ro",
+            uri=True,
+            timeout=1.0,
+        )
+    except (OSError, sqlite3.Error) as exc:
+        raise SessionDatabaseMigrationError(
+            f"{path} is not a readable SQLite database"
+        ) from exc
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _database_tables(connection: sqlite3.Connection) -> tuple[str, ...]:
+    rows = connection.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name NOT LIKE 'sqlite_%'
+          AND name != ?
+        ORDER BY name
+        """,
+        (_MIGRATION_STATE_TABLE,),
+    ).fetchall()
+    return tuple(str(row[0]) for row in rows)
+
+
+def _table_columns(
+    connection: sqlite3.Connection,
+    table: str,
+) -> tuple[tuple[str, int], ...]:
+    rows = connection.execute(
+        f"PRAGMA table_info({_quote_identifier(table)})"
+    ).fetchall()
+    return tuple((str(row[1]), int(row[5])) for row in rows)
+
+
+def _table_count(connection: sqlite3.Connection, table: str) -> int:
+    row = connection.execute(
+        f"SELECT COUNT(*) FROM {_quote_identifier(table)}"
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _update_content_digest(digest: Any, value: object) -> None:
+    if value is None:
+        tag = b"n"
+        payload = b""
+    elif isinstance(value, int):
+        tag = b"i"
+        payload = str(value).encode("ascii")
+    elif isinstance(value, float):
+        tag = b"f"
+        payload = struct.pack(">d", value)
+    elif isinstance(value, str):
+        tag = b"s"
+        payload = value.encode("utf-8", errors="surrogatepass")
+    elif isinstance(value, (bytes, bytearray, memoryview)):
+        tag = b"b"
+        payload = bytes(value)
+    else:
+        raise SessionDatabaseMigrationError(
+            f"unsupported SQLite value type in migration parity proof: {type(value).__name__}"
+        )
+    digest.update(tag)
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+
+
+def _database_content_sha256(
+    connection: sqlite3.Connection,
+    tables: Iterable[str],
+) -> str:
+    digest = hashlib.sha256()
+    for table in tables:
+        encoded_table = table.encode("utf-8", errors="surrogatepass")
+        digest.update(b"t")
+        digest.update(len(encoded_table).to_bytes(8, "big"))
+        digest.update(encoded_table)
+        try:
+            row_digests: list[bytes] = []
+            rows = connection.execute(
+                f"SELECT * FROM {_quote_identifier(table)}"
+            )
+            for row in rows:
+                row_digest = hashlib.sha256()
+                row_digest.update(len(row).to_bytes(8, "big"))
+                for value in row:
+                    _update_content_digest(row_digest, value)
+                row_digests.append(row_digest.digest())
+            for row_digest in sorted(row_digests):
+                digest.update(b"r")
+                digest.update(row_digest)
+        except sqlite3.Error as exc:
+            raise SessionDatabaseMigrationError(
+                f"cannot prove row-content parity for SQLite table {table}"
+            ) from exc
+        digest.update(b"e")
+    return digest.hexdigest()
+
+
+def _database_summary(connection: sqlite3.Connection) -> _DatabaseSummary:
+    tables = _database_tables(connection)
+    table_counts = tuple((table, _table_count(connection, table)) for table in tables)
+    schema_rows = connection.execute(
+        """
+        SELECT type, name, tbl_name, COALESCE(sql, '')
+        FROM sqlite_master
+        WHERE name NOT LIKE 'sqlite_%'
+          AND name != ?
+          AND tbl_name != ?
+        ORDER BY type, name, tbl_name, sql
+        """,
+        (_MIGRATION_STATE_TABLE, _MIGRATION_STATE_TABLE),
+    ).fetchall()
+    schema_sha256 = hashlib.sha256(
+        json.dumps(
+            [tuple(str(value) for value in row) for row in schema_rows],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    user_version_row = connection.execute("PRAGMA user_version").fetchone()
+    user_version = int(user_version_row[0]) if user_version_row is not None else 0
+    counts = dict(table_counts)
+    distinct_windows = 0
+    if "sessions" in counts and any(
+        name == "window_id" for name, _position in _table_columns(connection, "sessions")
+    ):
+        row = connection.execute(
+            "SELECT COUNT(DISTINCT window_id) FROM sessions"
+        ).fetchone()
+        distinct_windows = int(row[0]) if row is not None else 0
+    return _DatabaseSummary(
+        schema_sha256=schema_sha256,
+        content_sha256=_database_content_sha256(connection, tables),
+        user_version=user_version,
+        session_count=counts.get("sessions", 0),
+        remembered_window_count=counts.get("remembered_windows", 0),
+        distinct_window_count=distinct_windows,
+        captain_count=counts.get("window_captains", 0),
+        total_row_count=sum(counts.values()),
+        table_counts=table_counts,
+    )
+
+
+def _database_is_lossless_subset(
+    destination: sqlite3.Connection,
+    source: sqlite3.Connection,
+) -> bool:
+    """Allow replacement only when every destination row exists unchanged."""
+
+    destination_tables = _database_tables(destination)
+    destination_counts = {
+        table: _table_count(destination, table) for table in destination_tables
+    }
+    if sum(destination_counts.values()) > _MIGRATION_COMPARE_ROW_LIMIT:
+        return False
+    source_tables = set(_database_tables(source))
+    for table in destination_tables:
+        row_count = destination_counts[table]
+        if table not in source_tables:
+            return False
+        destination_columns = _table_columns(destination, table)
+        source_columns = _table_columns(source, table)
+        destination_names = tuple(name for name, _position in destination_columns)
+        source_names = {name for name, _position in source_columns}
+        if any(name not in source_names for name in destination_names):
+            return False
+        primary_key = tuple(
+            name
+            for name, position in sorted(
+                destination_columns,
+                key=lambda item: item[1] if item[1] else len(destination_columns) + 1,
+            )
+            if position
+        )
+        source_primary_key = tuple(
+            name
+            for name, position in sorted(
+                source_columns,
+                key=lambda item: item[1] if item[1] else len(source_columns) + 1,
+            )
+            if position
+        )
+        if row_count == 0:
+            continue
+        if not primary_key or primary_key != source_primary_key:
+            return False
+        columns_sql = ", ".join(_quote_identifier(name) for name in destination_names)
+        rows = destination.execute(
+            f"SELECT {columns_sql} FROM {_quote_identifier(table)}"
+        )
+        where = " AND ".join(
+            f"{_quote_identifier(name)} IS ?" for name in primary_key
+        )
+        for row in rows:
+            values = {name: row[name] for name in destination_names}
+            source_row = source.execute(
+                f"SELECT {columns_sql} FROM {_quote_identifier(table)} WHERE {where}",
+                tuple(values[name] for name in primary_key),
+            ).fetchone()
+            if source_row is None or any(
+                source_row[name] != values[name] for name in destination_names
+            ):
+                return False
+    return True
+
+
+def _verify_summary_parity(
+    source: _DatabaseSummary,
+    destination: _DatabaseSummary,
+) -> None:
+    if source != destination:
+        raise SessionDatabaseMigrationError(
+            "managed session database snapshot failed row/window/schema parity"
+        )
+
+
+def _summary_document(summary: _DatabaseSummary) -> dict[str, object]:
+    return {
+        "schema_sha256": summary.schema_sha256,
+        "content_sha256": summary.content_sha256,
+        "user_version": summary.user_version,
+        "session_count": summary.session_count,
+        "remembered_window_count": summary.remembered_window_count,
+        "distinct_window_count": summary.distinct_window_count,
+        "captain_count": summary.captain_count,
+        "total_row_count": summary.total_row_count,
+        "table_counts": {name: count for name, count in summary.table_counts},
+    }
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _validate_summary_document(value: object) -> None:
+    if not isinstance(value, dict):
+        raise SessionDatabaseMigrationError(
+            "managed session migration parity proof is invalid"
+        )
+    required = {
+        "schema_sha256",
+        "content_sha256",
+        "user_version",
+        "session_count",
+        "remembered_window_count",
+        "distinct_window_count",
+        "captain_count",
+        "total_row_count",
+        "table_counts",
+    }
+    if set(value) != required:
+        raise SessionDatabaseMigrationError(
+            "managed session migration parity proof is invalid"
+        )
+    if not _is_sha256(value["schema_sha256"]) or not _is_sha256(
+        value["content_sha256"]
+    ):
+        raise SessionDatabaseMigrationError(
+            "managed session migration parity proof is invalid"
+        )
+    count_names = required - {"schema_sha256", "content_sha256", "table_counts"}
+    if any(type(value[name]) is not int or int(value[name]) < 0 for name in count_names):
+        raise SessionDatabaseMigrationError(
+            "managed session migration parity proof is invalid"
+        )
+    table_counts = value["table_counts"]
+    if not isinstance(table_counts, dict) or any(
+        not isinstance(name, str) or type(count) is not int or count < 0
+        for name, count in table_counts.items()
+    ):
+        raise SessionDatabaseMigrationError(
+            "managed session migration parity proof is invalid"
+        )
+    if int(value["total_row_count"]) != sum(table_counts.values()):
+        raise SessionDatabaseMigrationError(
+            "managed session migration parity proof is invalid"
+        )
+    for summary_name, table_name in (
+        ("session_count", "sessions"),
+        ("remembered_window_count", "remembered_windows"),
+        ("captain_count", "window_captains"),
+    ):
+        if int(value[summary_name]) != int(table_counts.get(table_name, 0)):
+            raise SessionDatabaseMigrationError(
+                "managed session migration parity proof is invalid"
+            )
+    if int(value["distinct_window_count"]) > int(value["session_count"]):
+        raise SessionDatabaseMigrationError(
+            "managed session migration parity proof is invalid"
+        )
+
+
+def _validate_receipt_core(
+    core: object,
+    *,
+    source: Path,
+    destination: Path,
+) -> None:
+    if not isinstance(core, dict):
+        raise SessionDatabaseMigrationError(
+            "managed session migration marker payload is invalid"
+        )
+    required = {
+        "schema",
+        "database_id",
+        "created_at",
+        "source",
+        "destination",
+        "migration_status",
+        "source_raw_main_sha256",
+        "source_file_sha256",
+        "source_snapshot_sha256",
+        "destination_snapshot_sha256",
+        "source_summary",
+        "destination_summary",
+        "prior_destination_snapshot_sha256",
+        "backup_path",
+    }
+    if set(core) != required:
+        raise SessionDatabaseMigrationError(
+            "managed session migration marker payload is invalid"
+        )
+    try:
+        database_id = str(uuid.UUID(str(core["database_id"])))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise SessionDatabaseMigrationError(
+            "managed session migration marker payload is invalid"
+        ) from exc
+    status = core["migration_status"]
+    if (
+        core["schema"] != _MIGRATION_RECEIPT_SCHEMA
+        or database_id != core["database_id"]
+        or not isinstance(core["created_at"], str)
+        or not core["created_at"]
+        or core["source"] != str(source)
+        or core["destination"] != str(destination)
+        or status not in {"migrated", "repaired_existing"}
+    ):
+        raise SessionDatabaseMigrationError(
+            "managed session migration marker does not match this database"
+        )
+    for name in (
+        "source_raw_main_sha256",
+        "source_snapshot_sha256",
+        "destination_snapshot_sha256",
+    ):
+        if not _is_sha256(core[name]):
+            raise SessionDatabaseMigrationError(
+                "managed session migration marker payload is invalid"
+            )
+    if core["source_snapshot_sha256"] != core["destination_snapshot_sha256"]:
+        raise SessionDatabaseMigrationError(
+            "managed session migration parity proof is invalid"
+        )
+    source_files = core["source_file_sha256"]
+    if (
+        not isinstance(source_files, dict)
+        or set(source_files) - {"main", "wal", "journal", "shm"}
+        or source_files.get("main") != core["source_raw_main_sha256"]
+        or any(not _is_sha256(value) for value in source_files.values())
+    ):
+        raise SessionDatabaseMigrationError(
+            "managed session migration marker payload is invalid"
+        )
+    _validate_summary_document(core["source_summary"])
+    _validate_summary_document(core["destination_summary"])
+    if core["source_summary"] != core["destination_summary"]:
+        raise SessionDatabaseMigrationError(
+            "managed session migration parity proof is invalid"
+        )
+    prior_digest = core["prior_destination_snapshot_sha256"]
+    backup_path = core["backup_path"]
+    if status == "migrated":
+        valid_prior = prior_digest is None and backup_path is None
+    else:
+        valid_prior = (
+            _is_sha256(prior_digest)
+            and isinstance(backup_path, str)
+            and Path(backup_path).is_absolute()
+        )
+    if not valid_prior:
+        raise SessionDatabaseMigrationError(
+            "managed session migration marker payload is invalid"
+        )
+
+
+def _migration_receipt_name(destination: Path) -> str:
+    return f".{destination.name}.migration-receipt.json"
+
+
+def _receipt_core_bytes(core: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        dict(core),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _receipt_document(core: Mapping[str, object]) -> tuple[bytes, str]:
+    digest = hashlib.sha256(_receipt_core_bytes(core)).hexdigest()
+    document = dict(core)
+    document["receipt_sha256"] = digest
+    encoded = (
+        json.dumps(
+            document,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    return encoded, digest
+
+
+def _read_private_at(parent: _PinnedDirectory, name: str) -> bytes | None:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+            dir_fd=parent.descriptor,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SessionDatabaseMigrationError(
+            "managed session migration receipt cannot be opened safely"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or int(metadata.st_nlink) != 1
+            or metadata.st_size > 64 * 1024
+        ):
+            raise SessionDatabaseMigrationError(
+                "managed session migration receipt is unsafe"
+            )
+        path_metadata = os.stat(
+            name,
+            dir_fd=parent.descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            (int(path_metadata.st_dev), int(path_metadata.st_ino))
+            != (int(metadata.st_dev), int(metadata.st_ino))
+        ):
+            raise SessionDatabaseMigrationError(
+                "managed session migration receipt is unsafe"
+            )
+        content = bytearray()
+        while len(content) <= 64 * 1024:
+            chunk = os.read(descriptor, min(8192, 64 * 1024 + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > 64 * 1024:
+            raise SessionDatabaseMigrationError(
+                "managed session migration receipt is too large"
+            )
+        final_metadata = os.fstat(descriptor)
+        final_path_metadata = os.stat(
+            name,
+            dir_fd=parent.descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            _file_signature(final_metadata) != _file_signature(metadata)
+            or (int(final_path_metadata.st_dev), int(final_path_metadata.st_ino))
+            != (int(metadata.st_dev), int(metadata.st_ino))
+        ):
+            raise SessionDatabaseMigrationError(
+                "managed session migration receipt changed while it was read"
+            )
+        return bytes(content)
+    finally:
+        os.close(descriptor)
+
+
+def _write_private_at(parent: _PinnedDirectory, name: str, content: bytes) -> None:
+    descriptor = -1
+    temporary_name = f".{name}.tmp-{uuid.uuid4().hex}"
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=parent.descriptor,
+        )
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=parent.descriptor,
+            dst_dir_fd=parent.descriptor,
+        )
+        os.fsync(parent.descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=parent.descriptor)
+        except FileNotFoundError:
+            pass
+
+
+def _unlink_private_at(parent: _PinnedDirectory, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=parent.descriptor)
+    except FileNotFoundError:
+        return
+    os.fsync(parent.descriptor)
+
+
+def _validate_bound_path(
+    parent: _PinnedDirectory,
+    name: str,
+    opened_metadata: os.stat_result,
+) -> os.stat_result:
+    try:
+        path_metadata = os.stat(
+            name,
+            dir_fd=parent.descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise SessionDatabaseMigrationError(
+            "managed session database identity changed during receipt verification"
+        ) from exc
+    if (
+        not stat.S_ISREG(path_metadata.st_mode)
+        or (int(path_metadata.st_dev), int(path_metadata.st_ino))
+        != (int(opened_metadata.st_dev), int(opened_metadata.st_ino))
+    ):
+        raise SessionDatabaseMigrationError(
+            "managed session database identity changed during receipt verification"
+        )
+    return path_metadata
+
+
+def _unlink_bound_path(
+    parent: _PinnedDirectory,
+    name: str,
+    opened_metadata: os.stat_result,
+) -> None:
+    _validate_bound_path(parent, name, opened_metadata)
+    os.unlink(name, dir_fd=parent.descriptor)
+    os.fsync(parent.descriptor)
+
+
+def _clean_migration_link_residue(
+    parent: _PinnedDirectory,
+    destination: Path,
+    descriptor: int,
+) -> None:
+    opened_metadata = os.fstat(descriptor)
+    _validate_bound_path(parent, destination.name, opened_metadata)
+    if int(opened_metadata.st_nlink) == 1:
+        return
+    prefix = f".{destination.name}.migration-"
+    for name in os.listdir(parent.descriptor):
+        if not name.startswith(prefix):
+            continue
+        try:
+            metadata = os.stat(
+                name,
+                dir_fd=parent.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        if (
+            stat.S_ISREG(metadata.st_mode)
+            and (int(metadata.st_dev), int(metadata.st_ino))
+            == (int(opened_metadata.st_dev), int(opened_metadata.st_ino))
+        ):
+            os.unlink(name, dir_fd=parent.descriptor)
+    os.fsync(parent.descriptor)
+    opened_metadata = os.fstat(descriptor)
+    _validate_bound_path(parent, destination.name, opened_metadata)
+    if int(opened_metadata.st_nlink) != 1:
+        raise SessionDatabaseMigrationError(
+            "managed session database has an unsafe hard-link alias"
+        )
+
+
+def _install_migration_marker(
+    snapshot: Path,
+    *,
+    core: Mapping[str, object],
+    receipt_sha256: str,
+) -> None:
+    connection = sqlite3.connect(str(snapshot), timeout=1.0)
+    try:
+        mode = connection.execute("PRAGMA journal_mode = DELETE").fetchone()
+        if mode is None or str(mode[0]).casefold() != "delete":
+            raise SessionDatabaseMigrationError(
+                "managed session migration snapshot could not be made standalone"
+            )
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_quote_identifier(_MIGRATION_STATE_TABLE)} (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                schema TEXT NOT NULL,
+                database_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                receipt_sha256 TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(f"DELETE FROM {_quote_identifier(_MIGRATION_STATE_TABLE)}")
+        connection.execute(
+            f"""
+            INSERT INTO {_quote_identifier(_MIGRATION_STATE_TABLE)}
+                (singleton, schema, database_id, payload_json, receipt_sha256)
+            VALUES (1, ?, ?, ?, ?)
+            """,
+            (
+                _MIGRATION_RECEIPT_SCHEMA,
+                str(core["database_id"]),
+                _receipt_core_bytes(core).decode("utf-8"),
+                receipt_sha256,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    _check_sqlite_database(snapshot, immutable=True)
+    descriptor = os.open(snapshot, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _verified_migration_receipt(
+    destination: Path,
+    source: Path,
+    parent: _PinnedDirectory,
+) -> SessionDatabaseMigration | None:
+    receipt_name = _migration_receipt_name(destination)
+    existing_receipt = _read_private_at(parent, receipt_name)
+    if existing_receipt is None:
+        return None
+    descriptor = _open_regular_at(
+        parent,
+        destination.name,
+        label="managed session database",
+        required=True,
+    )
+    assert descriptor is not None
+    try:
+        _clean_migration_link_residue(parent, destination, descriptor)
+        opened_metadata = os.fstat(descriptor)
+        _validate_bound_path(parent, destination.name, opened_metadata)
+        connection = _open_readonly_database(Path(f"/proc/self/fd/{descriptor}"))
+        try:
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (_MIGRATION_STATE_TABLE,),
+            ).fetchone()
+            if exists is None:
+                raise SessionDatabaseMigrationError(
+                    "managed session migration receipt is not bound to the database"
+                )
+            row = connection.execute(
+                f"""
+                SELECT schema, database_id, payload_json, receipt_sha256
+                FROM {_quote_identifier(_MIGRATION_STATE_TABLE)}
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            if row is None or str(row["schema"]) != _MIGRATION_RECEIPT_SCHEMA:
+                raise SessionDatabaseMigrationError(
+                    "managed session migration marker is invalid"
+                )
+            try:
+                core = json.loads(str(row["payload_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise SessionDatabaseMigrationError(
+                    "managed session migration marker payload is invalid"
+                ) from exc
+            _validate_receipt_core(
+                core,
+                source=source,
+                destination=destination,
+            )
+            assert isinstance(core, dict)
+            encoded, digest = _receipt_document(core)
+            if (
+                digest != str(row["receipt_sha256"])
+                or str(row["database_id"]) != str(core.get("database_id", ""))
+            ):
+                raise SessionDatabaseMigrationError(
+                    "managed session migration marker does not match this database"
+                )
+        finally:
+            connection.close()
+        _validate_bound_path(parent, destination.name, opened_metadata)
+        if existing_receipt != encoded:
+            raise SessionDatabaseMigrationError(
+                "managed session migration receipt does not match its database marker"
+            )
+        _validate_bound_path(parent, destination.name, opened_metadata)
+        destination_digest = _sha256_descriptor(descriptor)
+        if _file_signature(os.fstat(descriptor)) != _file_signature(opened_metadata):
+            raise SessionDatabaseMigrationError(
+                "managed session database changed during receipt verification"
+            )
+        _validate_bound_path(parent, destination.name, opened_metadata)
+        final_receipt = _read_private_at(parent, receipt_name)
+        if final_receipt != encoded:
+            raise SessionDatabaseMigrationError(
+                "managed session migration receipt changed during verification"
+            )
+    finally:
+        os.close(descriptor)
+    receipt_path = destination.parent / receipt_name
+    return SessionDatabaseMigration(
+        "verified",
+        source,
+        destination,
+        source_sha256=str(core.get("source_raw_main_sha256") or "") or None,
+        destination_sha256=destination_digest,
+        receipt_path=receipt_path,
+        backup_path=Path(str(core["backup_path"])) if core.get("backup_path") else None,
+        database_id=str(core.get("database_id") or "") or None,
+    )
+
+
+def _sqlite_backup(source: Path, destination: Path) -> _DatabaseSummary:
+    source_connection = _open_readonly_database(source)
+    try:
+        source_summary = _database_summary(source_connection)
+        destination_connection = sqlite3.connect(str(destination), timeout=1.0)
+        try:
+            source_connection.backup(destination_connection)
+            destination_connection.commit()
+        except sqlite3.Error as exc:
+            raise SessionDatabaseMigrationError(
+                f"database snapshot failed for {source}"
+            ) from exc
+        finally:
+            destination_connection.close()
+    finally:
+        source_connection.close()
+    os.chmod(destination, 0o600)
+    _check_sqlite_database(destination, immutable=True)
+    descriptor = os.open(destination, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    connection = _open_readonly_database(destination)
+    try:
+        destination_summary = _database_summary(connection)
+    finally:
+        connection.close()
+    _verify_summary_parity(source_summary, destination_summary)
+    return source_summary
+
+
+def _open_exclusive_database(destination: Path) -> sqlite3.Connection:
+    try:
+        connection = sqlite3.connect(str(destination), timeout=0.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 0")
+        connection.execute("PRAGMA locking_mode = EXCLUSIVE")
+        connection.execute("BEGIN EXCLUSIVE")
+        connection.rollback()
+        return connection
+    except sqlite3.Error as exc:
+        try:
+            connection.close()
+        except UnboundLocalError:
+            pass
+        raise SessionDatabaseMigrationError(
+            "managed session database changed or became busy during migration"
+        ) from exc
+
+
+def _replace_database_from_snapshot(
+    source: Path,
+    destination_connection: sqlite3.Connection,
+) -> _DatabaseSummary:
+    """Transactionally replace a quiescent SQLite database from a snapshot."""
+
+    source_connection = _open_readonly_database(source)
+    try:
+        try:
+            source_connection.backup(destination_connection)
+            destination_connection.commit()
+            journal_mode = destination_connection.execute(
+                "PRAGMA journal_mode = DELETE"
+            ).fetchone()
+            if journal_mode is None or str(journal_mode[0]).casefold() != "delete":
+                raise SessionDatabaseMigrationError(
+                    "managed session database could not be made standalone"
+                )
+            destination_connection.execute("PRAGMA synchronous = FULL")
+            destination_connection.commit()
+        except sqlite3.Error as exc:
+            raise SessionDatabaseMigrationError(
+                "managed session database changed or became busy during migration"
+            ) from exc
+    finally:
+        source_connection.close()
+    source_connection = _open_readonly_database(source)
+    try:
+        source_summary = _database_summary(source_connection)
+    finally:
+        source_connection.close()
+    destination_summary = _database_summary(destination_connection)
+    _verify_summary_parity(source_summary, destination_summary)
+    return destination_summary
+
+
+def _open_migration_lock(parent: _PinnedDirectory, name: str) -> int:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC
+            | os.O_NONBLOCK,
+            0o600,
+            dir_fd=parent.descriptor,
+        )
+    except OSError as exc:
+        raise SessionDatabaseMigrationError("cannot create migration lock") from exc
+    try:
+        os.fchmod(descriptor, 0o600)
+        _validate_migration_lock(parent, name, descriptor)
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _validate_migration_lock(
+    parent: _PinnedDirectory,
+    name: str,
+    descriptor: int,
+) -> None:
+    try:
+        metadata = os.fstat(descriptor)
+        path_metadata = os.stat(
+            name,
+            dir_fd=parent.descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise SessionDatabaseMigrationError("migration lock is unsafe") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or int(metadata.st_nlink) != 1
+        or (int(metadata.st_dev), int(metadata.st_ino))
+        != (int(path_metadata.st_dev), int(path_metadata.st_ino))
+    ):
+        raise SessionDatabaseMigrationError("migration lock is unsafe")
+
+
+def _create_backup_directory(
+    parent: _PinnedDirectory,
+    destination: Path,
+) -> tuple[_PinnedDirectory, Path]:
+    name = f".{destination.name}.pre-migration-{uuid.uuid4().hex}"
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent.descriptor)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent.descriptor,
+        )
+    except OSError as exc:
+        raise SessionDatabaseMigrationError(
+            "cannot create managed session database backup"
+        ) from exc
+    metadata = os.fstat(descriptor)
+    backup_path = destination.parent / name
+    return (
+        _PinnedDirectory(
+            path=backup_path,
+            descriptor=descriptor,
+            device=parent.device,
+            identity=(int(metadata.st_dev), int(metadata.st_ino)),
+        ),
+        backup_path,
+    )
+
+
+def _remove_backup_directory(
+    parent: _PinnedDirectory,
+    backup: _PinnedDirectory,
+) -> None:
+    for name in (
+        "original.sqlite3",
+        "original.sqlite3-wal",
+        "original.sqlite3-journal",
+        "original.sqlite3-shm",
+        "logical.sqlite3",
+        "logical.sqlite3-wal",
+        "logical.sqlite3-journal",
+        "logical.sqlite3-shm",
+    ):
+        try:
+            os.unlink(name, dir_fd=backup.descriptor)
+        except FileNotFoundError:
+            pass
+    name = backup.path.name
+    backup.close()
+    try:
+        os.rmdir(name, dir_fd=parent.descriptor)
+    except FileNotFoundError:
+        pass
+
+
+def _migration_target_parent(target: Path) -> _PinnedDirectory:
+    try:
+        production_parent = pin_production_database_parent(target)
+        if production_parent is not None:
+            return production_parent
+        return _open_pinned_directory(
+            target.parent,
+            create=True,
+            require_owner=True,
+            final_mode=0o700,
+        )
+    except StorageFabricError as exc:
+        raise SessionDatabaseMigrationError(
+            f"cannot bind managed session database parent: {exc}"
+        ) from exc
+
+
+def _migration_source_parent(source: Path) -> _PinnedDirectory:
+    try:
+        parent = _open_pinned_directory(source.parent, create=False)
+    except StorageFabricError as exc:
+        raise SessionDatabaseMigrationError(
+            f"cannot bind legacy session database parent: {exc}"
+        ) from exc
+    metadata = os.fstat(parent.descriptor)
+    if (
+        metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        parent.close()
+        raise SessionDatabaseMigrationError(
+            "cannot prove that the legacy session database parent is private"
+        )
+    return parent
+
+
+def _harden_regular_at(parent: _PinnedDirectory, name: str, mode: int) -> None:
+    descriptor = _open_regular_at(
+        parent,
+        name,
+        label=f"managed database file {name}",
+        required=False,
+    )
+    if descriptor is None:
+        return
+    try:
+        os.fchmod(descriptor, mode)
+    finally:
+        os.close(descriptor)
+
+
+def _harden_database_at(parent: _PinnedDirectory, name: str) -> None:
+    _harden_regular_at(parent, name, 0o600)
+    _harden_regular_at(parent, f"{name}-wal", 0o600)
+    _harden_regular_at(parent, f"{name}-shm", 0o600)
+
+
 def migrate_legacy_database(
     destination: str | Path | None = None,
     *,
     legacy_path: str | Path | None = None,
 ) -> SessionDatabaseMigration:
-    """Copy only the legacy SQLite registry into the managed SSD state.
+    """Publish a parity-proven SSD copy without mutating the legacy registry.
 
-    Migration is explicit and never runs from ``SessionStore`` construction.
-    It does not inspect or copy ``terminal-auth`` or any other legacy state.
-    An existing destination is validated and left untouched, making retries
-    safe after interruption.
+    A previously published database is accepted only when its embedded receipt
+    verifies.  An unsealed destination may be repaired only when every one of
+    its durable rows exists unchanged in a quiescent legacy snapshot.  This
+    permits recovery from the known empty/outdated SSD bootstrap without ever
+    overwriting divergent managed state.
     """
 
-    source = _migration_file(
+    source = _absolute_migration_path(
         legacy_path
         if legacy_path is not None
         else legacy_state_dir() / "sessions.sqlite3",
@@ -270,23 +1767,30 @@ def migrate_legacy_database(
         label="managed session database",
     )
     if source == target:
-        if not source.exists():
-            return SessionDatabaseMigration("already_current", source, target)
-        _check_sqlite_database(source)
-        digest = _sha256_file(source)
-        return SessionDatabaseMigration("already_current", source, target, digest, digest)
-    if not source.exists():
-        return SessionDatabaseMigration("source_missing", source, target)
-
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    target.parent.chmod(0o700)
-    lock_path = target.with_name(f".{target.name}.migration.lock")
+        raise SessionDatabaseMigrationError(
+            "legacy and managed session database paths must be distinct"
+        )
     try:
-        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        if source.exists() and target.exists() and os.path.samefile(source, target):
+            raise SessionDatabaseMigrationError(
+                "legacy and managed session database files must be distinct"
+            )
     except OSError as exc:
-        raise SessionDatabaseMigrationError("cannot create migration lock") from exc
+        raise SessionDatabaseMigrationError(
+            "cannot compare legacy and managed session database identities"
+        ) from exc
+
+    target_parent = _migration_target_parent(target)
+    source_parent: _PinnedDirectory | None = None
+    source_files: dict[str, _LegacySnapshotFile] | None = None
+    target_files: dict[str, _LegacySnapshotFile] | None = None
+    backup: _PinnedDirectory | None = None
+    backup_retained = False
+    target_connection: sqlite3.Connection | None = None
+    temporary_basename: str | None = None
+    lock_name = f".{target.name}.migration.lock"
     try:
-        os.fchmod(lock_fd, 0o600)
+        lock_fd = _open_migration_lock(target_parent, lock_name)
         with os.fdopen(lock_fd, "r+b", closefd=True) as lock_handle:
             try:
                 fcntl.flock(
@@ -298,94 +1802,374 @@ def migrate_legacy_database(
                     "MIGRATION_IN_PROGRESS: another primary T1000 process is "
                     "publishing the managed session database"
                 ) from exc
-            if target.exists():
-                _check_sqlite_database(target)
-                _harden_database_permissions(target)
-                digest = _sha256_file(target)
-                return SessionDatabaseMigration(
-                    "destination_exists",
-                    source,
-                    target,
-                    destination_sha256=digest,
+            _validate_migration_lock(
+                target_parent,
+                lock_name,
+                lock_handle.fileno(),
+            )
+
+            existing_receipt = _read_private_at(
+                target_parent,
+                _migration_receipt_name(target),
+            )
+            target_descriptor = _open_regular_at(
+                target_parent,
+                target.name,
+                label="managed session database",
+                required=False,
+            )
+            target_exists = target_descriptor is not None
+            if not target_exists and existing_receipt is not None:
+                raise SessionDatabaseMigrationError(
+                    "managed session database is missing but its migration receipt remains"
                 )
-            _check_sqlite_database(source)
-            source_digest = _sha256_file(source)
+            if target_descriptor is not None:
+                try:
+                    _clean_migration_link_residue(
+                        target_parent,
+                        target,
+                        target_descriptor,
+                    )
+                    _check_sqlite_database(target_parent.proc_path / target.name)
+                    verified = _verified_migration_receipt(
+                        target,
+                        source,
+                        target_parent,
+                    )
+                    if verified is not None:
+                        _harden_database_at(target_parent, target.name)
+                        return verified
+                finally:
+                    os.close(target_descriptor)
+
+            source = _migration_file(source, label="legacy session database")
+            try:
+                source.lstat()
+            except FileNotFoundError:
+                if target_exists:
+                    raise SessionDatabaseMigrationError(
+                        "unverified managed session database cannot be accepted "
+                        "without the legacy source"
+                    )
+                return SessionDatabaseMigration("source_missing", source, target)
+            except OSError as exc:
+                raise SessionDatabaseMigrationError(
+                    "cannot inspect legacy session database"
+                ) from exc
+
+            source_parent = _migration_source_parent(source)
             temporary_fd, temporary_name = tempfile.mkstemp(
                 prefix=f".{target.name}.migration-",
-                dir=target.parent,
+                dir=target_parent.proc_path,
             )
+            os.fchmod(temporary_fd, 0o600)
+            os.close(temporary_fd)
             temporary = Path(temporary_name)
-            try:
-                os.fchmod(temporary_fd, 0o600)
-                os.close(temporary_fd)
-                temporary_fd = -1
-                source_connection = sqlite3.connect(
-                    f"{source.as_uri()}?mode=ro",
-                    uri=True,
-                    timeout=5.0,
+            temporary_basename = temporary.name
+
+            with tempfile.TemporaryDirectory(
+                prefix=f".{target.name}.legacy-snapshot-",
+                dir=target_parent.proc_path,
+            ) as snapshot_name:
+                snapshot, source_files = _copy_legacy_sqlite_snapshot(
+                    source,
+                    source_parent,
+                    Path(snapshot_name),
                 )
-                try:
-                    source_generation = int(
-                        source_connection.execute("PRAGMA data_version").fetchone()[0]
+                _assert_legacy_snapshot_quiescent(source_files)
+                _normalize_private_sqlite_snapshot(snapshot)
+                source_summary = _sqlite_backup(snapshot, temporary)
+                _validate_legacy_snapshot_files(source, source_parent, source_files)
+                _assert_legacy_snapshot_quiescent(source_files)
+
+            source_digest = source_files[""].sha256
+            source_file_digests = {
+                "main" if not suffix else suffix[1:]: item.sha256
+                for suffix, item in source_files.items()
+            }
+            source_snapshot_digest = _sha256_file(temporary)
+            backup_path: Path | None = None
+            backup_logical: Path | None = None
+            prior_target_digest: str | None = None
+            prior_target_summary: _DatabaseSummary | None = None
+
+            if target_exists:
+                target_files = _open_legacy_snapshot_files(target, target_parent)
+                _assert_legacy_snapshot_quiescent(target_files)
+                backup, backup_path = _create_backup_directory(target_parent, target)
+                os.fsync(target_parent.descriptor)
+                backup_root = backup.proc_path
+                for suffix in ("", "-wal", "-journal"):
+                    item = target_files.get(suffix)
+                    if item is None:
+                        continue
+                    copied = backup_root / f"original.sqlite3{suffix}"
+                    _copy_descriptor(
+                        item.descriptor,
+                        copied,
                     )
-                    target_connection = sqlite3.connect(str(temporary), timeout=5.0)
-                    try:
-                        source_connection.backup(target_connection)
-                        target_connection.commit()
-                    finally:
-                        target_connection.close()
-                    if int(
-                        source_connection.execute("PRAGMA data_version").fetchone()[0]
-                    ) != source_generation:
+                    _verify_descriptor_copy(item, copied)
+                backup_logical = backup_root / "logical.sqlite3"
+                with tempfile.TemporaryDirectory(
+                    prefix=".logical-snapshot-",
+                    dir=backup_root,
+                ) as target_snapshot_name:
+                    working = Path(target_snapshot_name) / "original.sqlite3"
+                    for suffix in ("", "-wal", "-journal"):
+                        item = target_files.get(suffix)
+                        if item is not None:
+                            copied = working.with_name(f"{working.name}{suffix}")
+                            _copy_descriptor(
+                                item.descriptor,
+                                copied,
+                            )
+                            _verify_descriptor_copy(item, copied)
+                    _normalize_private_sqlite_snapshot(working)
+                    prior_target_summary = _sqlite_backup(working, backup_logical)
+                os.fsync(backup.descriptor)
+                os.fsync(target_parent.descriptor)
+                prior_target_digest = _sha256_file(backup_logical)
+                destination_connection = _open_readonly_database(backup_logical)
+                source_connection = _open_readonly_database(temporary)
+                try:
+                    if not _database_is_lossless_subset(
+                        destination_connection,
+                        source_connection,
+                    ):
                         raise SessionDatabaseMigrationError(
-                            "legacy session database changed during migration; retry "
-                            "after the old T1000 writer exits"
+                            "managed session database diverges from the legacy "
+                            "registry; refusing automatic replacement"
                         )
                 finally:
                     source_connection.close()
-                _check_sqlite_database(temporary)
-                with temporary.open("rb") as handle:
-                    os.fsync(handle.fileno())
-                try:
-                    os.link(temporary, target)
-                except FileExistsError:
-                    _check_sqlite_database(target)
-                    _harden_database_permissions(target)
-                    digest = _sha256_file(target)
-                    return SessionDatabaseMigration(
-                        "destination_exists",
-                        source,
-                        target,
-                        source_sha256=source_digest,
-                        destination_sha256=digest,
-                    )
-                os.unlink(temporary)
-                directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-                target_digest = _sha256_file(target)
-                return SessionDatabaseMigration(
-                    "migrated",
-                    source,
-                    target,
-                    source_sha256=source_digest,
-                    destination_sha256=target_digest,
+                    destination_connection.close()
+                _validate_legacy_snapshot_files(target, target_parent, target_files)
+                _assert_legacy_snapshot_quiescent(target_files)
+                target_connection = _open_exclusive_database(
+                    target_parent.proc_path / target.name
                 )
-            except (OSError, sqlite3.Error) as exc:
-                raise SessionDatabaseMigrationError(
-                    f"legacy session database migration failed: {exc}"
-                ) from exc
+                _validate_bound_path(
+                    target_parent,
+                    target.name,
+                    os.fstat(target_files[""].descriptor),
+                )
+                assert prior_target_summary is not None
+                _verify_summary_parity(
+                    prior_target_summary,
+                    _database_summary(target_connection),
+                )
+
+            database_id = str(uuid.uuid4())
+            migration_status = "repaired_existing" if target_exists else "migrated"
+            core: dict[str, object] = {
+                "schema": _MIGRATION_RECEIPT_SCHEMA,
+                "database_id": database_id,
+                "created_at": utc_now(),
+                "source": str(source),
+                "destination": str(target),
+                "migration_status": migration_status,
+                "source_raw_main_sha256": source_digest,
+                "source_file_sha256": source_file_digests,
+                "source_snapshot_sha256": source_snapshot_digest,
+                "destination_snapshot_sha256": source_snapshot_digest,
+                "source_summary": _summary_document(source_summary),
+                "destination_summary": _summary_document(source_summary),
+                "prior_destination_snapshot_sha256": prior_target_digest,
+                "backup_path": str(backup_path) if backup_path is not None else None,
+            }
+            receipt_bytes, receipt_digest = _receipt_document(core)
+            _install_migration_marker(
+                temporary,
+                core=core,
+                receipt_sha256=receipt_digest,
+            )
+            migrated_connection = _open_readonly_database(temporary)
+            try:
+                _verify_summary_parity(
+                    source_summary,
+                    _database_summary(migrated_connection),
+                )
             finally:
-                if temporary_fd >= 0:
-                    os.close(temporary_fd)
-                try:
-                    temporary.unlink()
-                except FileNotFoundError:
-                    pass
-    except OSError as exc:
-        raise SessionDatabaseMigrationError("cannot lock managed session database") from exc
+                migrated_connection.close()
+
+            _validate_legacy_snapshot_files(source, source_parent, source_files)
+            _assert_legacy_snapshot_quiescent(source_files)
+            published_descriptor: int | None = None
+            published_metadata: os.stat_result | None = None
+            published_new = False
+            target_replaced = False
+            publication_committed = False
+            try:
+                if target_files is not None:
+                    _validate_legacy_snapshot_files(
+                        target,
+                        target_parent,
+                        target_files,
+                    )
+                    assert target_connection is not None
+                    assert backup_logical is not None
+                    backup_retained = True
+                    target_replaced = True
+                    _replace_database_from_snapshot(temporary, target_connection)
+                    _validate_bound_path(
+                        target_parent,
+                        target.name,
+                        os.fstat(target_files[""].descriptor),
+                    )
+                else:
+                    try:
+                        os.link(
+                            temporary_basename,
+                            target.name,
+                            src_dir_fd=target_parent.descriptor,
+                            dst_dir_fd=target_parent.descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileExistsError as exc:
+                        raise SessionDatabaseMigrationError(
+                            "managed session database appeared during migration; retry"
+                        ) from exc
+                    published_new = True
+                    published_descriptor = _open_regular_at(
+                        target_parent,
+                        target.name,
+                        label="managed session database",
+                        required=True,
+                    )
+                    assert published_descriptor is not None
+                    published_metadata = os.fstat(published_descriptor)
+                    _validate_bound_path(
+                        target_parent,
+                        target.name,
+                        published_metadata,
+                    )
+                    os.unlink(temporary_basename, dir_fd=target_parent.descriptor)
+                    temporary_basename = None
+                    os.fsync(target_parent.descriptor)
+
+                _validate_legacy_snapshot_files(source, source_parent, source_files)
+                _assert_legacy_snapshot_quiescent(source_files)
+                if target_connection is not None:
+                    published_summary = _database_summary(target_connection)
+                else:
+                    _check_sqlite_database(target_parent.proc_path / target.name)
+                    published_connection = _open_readonly_database(
+                        target_parent.proc_path / target.name
+                    )
+                    try:
+                        published_summary = _database_summary(published_connection)
+                    finally:
+                        published_connection.close()
+                _verify_summary_parity(source_summary, published_summary)
+
+                if published_descriptor is None:
+                    published_descriptor = _open_regular_at(
+                        target_parent,
+                        target.name,
+                        label="managed session database",
+                        required=True,
+                    )
+                    assert published_descriptor is not None
+                    published_metadata = os.fstat(published_descriptor)
+                assert published_metadata is not None
+                _validate_bound_path(
+                    target_parent,
+                    target.name,
+                    published_metadata,
+                )
+                os.fsync(published_descriptor)
+                target_digest = _sha256_descriptor(published_descriptor)
+                os.fchmod(published_descriptor, 0o600)
+                _harden_regular_at(target_parent, f"{target.name}-wal", 0o600)
+                _harden_regular_at(target_parent, f"{target.name}-shm", 0o600)
+                _validate_legacy_snapshot_files(source, source_parent, source_files)
+                _assert_legacy_snapshot_quiescent(source_files)
+                _validate_bound_path(
+                    target_parent,
+                    target.name,
+                    published_metadata,
+                )
+                if target_files is not None:
+                    _validate_bound_path(
+                        target_parent,
+                        target.name,
+                        os.fstat(target_files[""].descriptor),
+                    )
+                _write_private_at(
+                    target_parent,
+                    _migration_receipt_name(target),
+                    receipt_bytes,
+                )
+                publication_committed = True
+            except Exception:
+                if not publication_committed:
+                    if target_replaced:
+                        assert target_connection is not None
+                        assert backup_logical is not None
+                        try:
+                            _replace_database_from_snapshot(
+                                backup_logical,
+                                target_connection,
+                            )
+                        except Exception:
+                            backup_retained = True
+                            raise
+                    elif published_new and published_metadata is not None:
+                        _unlink_bound_path(
+                            target_parent,
+                            target.name,
+                            published_metadata,
+                        )
+                raise
+            finally:
+                if published_descriptor is not None:
+                    os.close(published_descriptor)
+            if target_connection is not None:
+                target_connection.close()
+                target_connection = None
+            verified = _verified_migration_receipt(target, source, target_parent)
+            if verified is None:
+                raise SessionDatabaseMigrationError(
+                    "managed session migration receipt was not published"
+                )
+            return SessionDatabaseMigration(
+                migration_status,
+                source,
+                target,
+                source_sha256=source_digest,
+                destination_sha256=target_digest,
+                receipt_path=verified.receipt_path,
+                backup_path=backup_path,
+                database_id=database_id,
+            )
+    except SessionDatabaseMigrationError:
+        raise
+    except (OSError, sqlite3.Error, StorageFabricError) as exc:
+        raise SessionDatabaseMigrationError(
+            f"legacy session database migration failed: {exc}"
+        ) from exc
+    finally:
+        if target_connection is not None:
+            target_connection.close()
+        if source_files is not None:
+            for item in source_files.values():
+                item.close()
+        if target_files is not None:
+            for item in target_files.values():
+                item.close()
+        if temporary_basename is not None:
+            try:
+                os.unlink(temporary_basename, dir_fd=target_parent.descriptor)
+            except FileNotFoundError:
+                pass
+        if backup is not None:
+            if backup_retained:
+                backup.close()
+            else:
+                _remove_backup_directory(target_parent, backup)
+        if source_parent is not None:
+            source_parent.close()
+        target_parent.close()
 
 
 class SessionStore:
@@ -432,25 +2216,52 @@ class SessionStore:
             if provision_auth_scopes is None
             else bool(provision_auth_scopes)
         )
+        self._database_binding: DatabaseFileBinding | None = None
         if self.path != Path(":memory:"):
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self._managed_state:
-                managed_root = managed_state_dir()
-                managed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-                managed_root.chmod(0o700)
-                self.path.parent.chmod(0o700)
-                _harden_database_permissions(self.path)
+            self._database_binding = pin_production_database(self.path)
+            if self._database_binding is not None:
+                self.path = self._database_binding.path
+                _harden_bound_database_permissions(self._database_binding)
+            else:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                if self._managed_state:
+                    managed_root = managed_state_dir()
+                    managed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    managed_root.chmod(0o700)
+                    self.path.parent.chmod(0o700)
+                    _harden_database_permissions(self.path)
         if self.provision_auth_scopes:
             self.auth_root.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.auth_root.chmod(0o700)
         # Keep the GUI responsive if a second TermDeck/CLI process briefly
         # holds the registry, and avoid a full fsync for every tab-state update.
-        self.conn = sqlite3.connect(str(self.path), timeout=1.0)
-        self.conn.row_factory = sqlite3.Row
-        self._configure_connection()
-        self._init_schema()
-        if self._managed_state:
-            _harden_database_permissions(self.path)
+        sqlite_path = (
+            self._database_binding.sqlite_path
+            if self._database_binding is not None
+            else str(self.path)
+        )
+        try:
+            self.conn = sqlite3.connect(sqlite_path, timeout=1.0)
+            if self._database_binding is not None:
+                self._database_binding.revalidate()
+            self.conn.row_factory = sqlite3.Row
+            self._configure_connection()
+            self._init_schema()
+            if self._database_binding is not None:
+                self._database_binding.revalidate()
+                _harden_bound_database_permissions(self._database_binding)
+            elif self._managed_state:
+                _harden_database_permissions(self.path)
+        except Exception:
+            connection = getattr(self, "conn", None)
+            try:
+                if connection is not None:
+                    connection.close()
+            finally:
+                if self._database_binding is not None:
+                    self._database_binding.close()
+                    self._database_binding = None
+            raise
 
     def _configure_connection(self) -> None:
         self.conn.execute("PRAGMA busy_timeout = 1000")
@@ -469,7 +2280,12 @@ class SessionStore:
             pass
 
     def close(self) -> None:
-        self.conn.close()
+        try:
+            self.conn.close()
+        finally:
+            if self._database_binding is not None:
+                self._database_binding.close()
+                self._database_binding = None
 
     def _init_schema(self) -> None:
         self.conn.execute(

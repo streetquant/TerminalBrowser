@@ -11,11 +11,33 @@ from unittest import mock
 
 from termdeck.codex_config_scope import (
     CodexConfigScopeError,
-    migrate_quiescent_codex_configuration,
+    migrate_quiescent_codex_configuration as _migrate_quiescent_codex_configuration,
     prepare_private_bash_launch_command,
-    prepare_shared_codex_configuration,
+    prepare_shared_codex_configuration as _prepare_shared_codex_configuration,
     resolve_codex_launcher,
 )
+
+
+_ATTESTED_TEST_LAUNCHERS: set[Path] = set()
+
+
+def _attest_test_launcher(candidate: Path) -> bool:
+    return candidate in _ATTESTED_TEST_LAUNCHERS
+
+
+def prepare_shared_codex_configuration(private_home, canonical_home):
+    return _prepare_shared_codex_configuration(
+        private_home,
+        canonical_home,
+        launcher_attestor=_attest_test_launcher,
+    )
+
+
+def migrate_quiescent_codex_configuration(private_home):
+    return _migrate_quiescent_codex_configuration(
+        private_home,
+        launcher_attestor=_attest_test_launcher,
+    )
 
 
 def _write_launcher(path: Path) -> None:
@@ -42,6 +64,7 @@ Path(os.environ["TERMDECK_TEST_CODEX_RECORD"]).write_text(
         encoding="utf-8",
     )
     path.chmod(0o700)
+    _ATTESTED_TEST_LAUNCHERS.add(path.resolve())
 
 
 class CodexConfigScopeTests(unittest.TestCase):
@@ -609,9 +632,64 @@ class CodexConfigScopeTests(unittest.TestCase):
                     private,
                     search_path=str(system_launcher.parent),
                     user_home=root / "user",
+                    launcher_attestor=_attest_test_launcher,
                 )
 
             self.assertEqual(resolved, user_launcher.resolve())
+
+    def test_unattested_executable_named_codex_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            private = root / "private"
+            launcher = root / "untrusted-bin" / "codex"
+            _write_launcher(launcher)
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                resolved = resolve_codex_launcher(
+                    private,
+                    search_path=str(launcher.parent),
+                    user_home=root / "empty-user-home",
+                )
+
+            self.assertIsNone(resolved)
+
+    def test_unattested_explicit_launcher_override_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            private = root / "private"
+            launcher = root / "untrusted-bin" / "codex"
+            _write_launcher(launcher)
+
+            with mock.patch.dict(
+                os.environ,
+                {"TERMDECK_CODEX_BINARY": str(launcher)},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(
+                    CodexConfigScopeError,
+                    "not an attested managed Codex launcher",
+                ):
+                    resolve_codex_launcher(private, user_home=root / "user")
+
+    def test_explicit_test_attestation_accepts_fixture_launcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            private = root / "private"
+            launcher = root / "fixture-bin" / "codex"
+            _write_launcher(launcher)
+
+            with mock.patch.dict(
+                os.environ,
+                {"TERMDECK_CODEX_BINARY": str(launcher)},
+                clear=True,
+            ):
+                resolved = resolve_codex_launcher(
+                    private,
+                    user_home=root / "user",
+                    launcher_attestor=_attest_test_launcher,
+                )
+
+            self.assertEqual(resolved, launcher.resolve())
 
     def test_symlinked_wrapper_directory_is_rejected_without_asset_changes(self):
         with tempfile.TemporaryDirectory() as tmp:

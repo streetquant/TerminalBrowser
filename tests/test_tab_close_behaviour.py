@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest import TestCase
 
 from termdeck.gtk_app import TermDeckApplication, TermDeckWindow
+from termdeck.models import RECOVERY_INTENT_INACTIVE
 from termdeck.session_store import SessionStore
 
 
@@ -99,6 +100,7 @@ class TabCloseBehaviourTest(TestCase):
                     "last_pid": None,
                     "recovery_command": None,
                     "recovery_cwd": None,
+                    "recovery_intent": RECOVERY_INTENT_INACTIVE,
                 },
             ),
         )
@@ -114,6 +116,7 @@ class TabCloseBehaviourTest(TestCase):
                     "last_pid": None,
                     "recovery_command": None,
                     "recovery_cwd": None,
+                    "recovery_intent": RECOVERY_INTENT_INACTIVE,
                 },
             ),
         )

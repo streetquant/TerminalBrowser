@@ -15,12 +15,13 @@ import hashlib
 import json
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+from smoke_support import require_private_validation_runtime
 
 
 def _drain(Gtk, *, until=None, timeout: float = 8.0) -> None:
@@ -271,16 +272,20 @@ def _complete_composer(text: str) -> bool:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="termdeck-scroll-") as tmp:
+    runtime_base = require_private_validation_runtime()
+    with tempfile.TemporaryDirectory(prefix="termdeck-scroll-") as tmp, tempfile.TemporaryDirectory(
+        prefix="tds-",
+        dir=runtime_base,
+    ) as tmux_tmp_name:
         root = Path(tmp)
         home = root / "home"
         # tmux Unix-domain socket paths are bounded (typically 108 bytes). The
         # CodexPro test TMPDIR is intentionally nested beneath the repository,
         # so placing TMUX_TMPDIR under ``root`` can make every launch fail with
         # ENAMETOOLONG before the UI is exercised. Keep only the socket root in
-        # a short, private /tmp directory while all test artifacts remain under
-        # the workspace-local temporary root.
-        tmux_tmp = Path(tempfile.mkdtemp(prefix="tds-", dir="/tmp"))
+        # the short, private validation runtime while all test artifacts remain
+        # under the workspace-local temporary root.
+        tmux_tmp = Path(tmux_tmp_name)
         home.mkdir()
         tmux_tmp.chmod(0o700)
         os.environ["HOME"] = str(home)
@@ -865,6 +870,13 @@ sys.stdout.flush()
                     )
                 ),
             )
+            _drain(
+                Gtk,
+                until=lambda: (
+                    not window.toast_revealer.get_reveal_child()
+                    and not window.toast_revealer.get_child_revealed()
+                ),
+            )
 
             native_attach.scroll_to_bottom()
             _drain(
@@ -1181,7 +1193,6 @@ sys.stdout.flush()
                     pass
             app.store.close()
             app.quit()
-            shutil.rmtree(tmux_tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

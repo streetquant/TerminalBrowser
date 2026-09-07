@@ -13,7 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from smoke_support import stream_ready
+from smoke_support import require_private_validation_runtime, stream_ready
 
 
 def _drain_gtk(Gtk, *, until=None, timeout: float = 6.0) -> None:
@@ -126,22 +126,16 @@ def _write_codex_state_db(
 
 
 def main() -> int:
-    short_runtime = Path("/dev/shm")
-    runtime_dir = str(short_runtime) if short_runtime.is_dir() and os.access(short_runtime, os.W_OK) else None
-    # tmux's AF_UNIX socket path is limited to roughly 108 bytes. Keep only its
-    # socket root on a short runtime filesystem; the fixture binaries stay on an
-    # executable filesystem because /dev/shm is commonly mounted noexec.
-    with tempfile.TemporaryDirectory(prefix="termdeck-auth-selector-") as tmp, tempfile.TemporaryDirectory(
-        prefix="td-tmux-", dir=runtime_dir
-    ) as tmux_socket_tmp:
+    runtime_base = require_private_validation_runtime()
+    if os.environ.get("TMUX_TMPDIR") != str(runtime_base):
+        raise RuntimeError("TMUX_TMPDIR is not the runner-attested validation runtime")
+    with tempfile.TemporaryDirectory(prefix="termdeck-auth-selector-") as tmp:
         root = Path(tmp)
         home = root / "home"
-        tmux_tmp = Path(tmux_socket_tmp)
         binaries = root / "bin"
         project = root / "project"
         for directory in (home, binaries, project):
             directory.mkdir()
-        tmux_tmp.chmod(0o700)
 
         source_accounts = home / ".codex" / "accounts"
         source_accounts.mkdir(parents=True)
@@ -393,7 +387,6 @@ int main(int argc, char **argv) {
         source_before = _digest_tree(home / ".codex")
 
         os.environ["HOME"] = str(home)
-        os.environ["TMUX_TMPDIR"] = str(tmux_tmp)
         os.environ["NO_AT_BRIDGE"] = "1"
         os.environ["SHELL"] = "/bin/bash"
         os.environ["PATH"] = f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}"
@@ -403,6 +396,7 @@ int main(int argc, char **argv) {
         from termdeck.gtk_app import Gtk, TermDeckApplication
 
         app = TermDeckApplication(db_path=root / "tabs.sqlite3")
+        app.register(None)
         app.codex_auth = CodexAuthManager()
         record = app.store.create(
             "legacy-auth-shell",
@@ -515,7 +509,6 @@ int main(int argc, char **argv) {
         try:
             if not app.backend.private_auth_environment_ready(record):
                 raise AssertionError("idle selector fixture did not start with private auth")
-            app.register(None)
             app.activate()
             _drain_gtk(
                 Gtk,

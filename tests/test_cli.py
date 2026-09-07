@@ -10,7 +10,7 @@ from termdeck.cli import _persist_auth_update_with_retry, _prepare_managed_sessi
 
 
 class CliTests(unittest.TestCase):
-    def test_managed_cli_uses_legacy_registry_until_primary_gui_cutover(self):
+    def test_managed_cli_defers_without_touching_legacy_registry(self):
         from pathlib import Path
         from unittest import mock
 
@@ -19,15 +19,24 @@ class CliTests(unittest.TestCase):
             managed_root = root / "managed" / "t1000-managed"
             legacy = root / "legacy" / "sessions.sqlite3"
             legacy.parent.mkdir(parents=True)
-            legacy.touch()
-            args = argparse.Namespace(db=None, func=cmd_sessions)
+            legacy.write_bytes(b"legacy-registry")
+            args = argparse.Namespace(db=None, func=cmd_sessions, command="sessions")
             with mock.patch.dict(
                 "os.environ",
                 {"T1000_MANAGED_ROOT": str(managed_root)},
                 clear=False,
-            ), mock.patch("termdeck.cli.legacy_state_dir", return_value=legacy.parent):
-                _prepare_managed_session_database(args)
-            self.assertEqual(args.db, legacy)
+            ), mock.patch("termdeck.cli.require_hot_storage") as require_storage:
+                with self.assertRaisesRegex(RuntimeError, "migration is pending"):
+                    _prepare_managed_session_database(args)
+            managed = managed_root.parent / "termdeck" / "sessions.sqlite3"
+            require_storage.assert_called_once_with(
+                managed_root=managed_root,
+                db_path=managed,
+                production=True,
+            )
+            self.assertEqual(args.db, managed)
+            self.assertEqual(legacy.read_bytes(), b"legacy-registry")
+            self.assertEqual(sorted(path.name for path in legacy.parent.iterdir()), [legacy.name])
 
     def test_managed_primary_gui_defers_database_cutover_to_startup(self):
         from unittest import mock
@@ -37,15 +46,33 @@ class CliTests(unittest.TestCase):
             "os.environ",
             {"T1000_MANAGED_ROOT": "/ssd/t1000"},
             clear=False,
-        ):
+        ), mock.patch("termdeck.cli.require_hot_storage") as require_storage:
             _prepare_managed_session_database(args)
-        self.assertIsNone(args.db)
+        expected = pathlib.Path("/ssd/termdeck/sessions.sqlite3")
+        self.assertEqual(args.db, expected)
+        require_storage.assert_called_once_with(
+            managed_root=pathlib.Path("/ssd/t1000"),
+            db_path=expected,
+            production=True,
+        )
 
-    def test_explicit_database_never_enters_managed_cutover(self):
+    def test_explicit_managed_database_is_attested_and_bound(self):
+        from unittest import mock
+
         explicit = pathlib.Path("/tmp/explicit.sqlite3")
         args = argparse.Namespace(db=explicit, func=cmd_sessions)
-        _prepare_managed_session_database(args)
+        with mock.patch.dict(
+            "os.environ",
+            {"T1000_MANAGED_ROOT": "/ssd/t1000"},
+            clear=False,
+        ), mock.patch("termdeck.cli.require_hot_storage") as require_storage:
+            _prepare_managed_session_database(args)
         self.assertEqual(args.db, explicit)
+        require_storage.assert_called_once_with(
+            managed_root=pathlib.Path("/ssd/t1000"),
+            db_path=explicit,
+            production=True,
+        )
 
     def test_auth_store_retry_keeps_retrying_until_commit(self):
         import sqlite3

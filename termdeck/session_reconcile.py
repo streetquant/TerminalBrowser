@@ -239,13 +239,20 @@ def startup_restore_candidates(
     live_ids = {str(session_id) for session_id in live_session_ids}
     selected: list[SessionRecord] = []
     for record in records:
-        if bool(getattr(record, "external", False)):
-            continue
         status = str(getattr(record, "status", "")).strip().casefold()
         if status == "archived" or status in _NEVER_STARTED_STATUSES:
             continue
         intent = _durable_recovery_intent(record)
         if intent is False:
+            continue
+        if bool(getattr(record, "external", False)):
+            # Adopted panes can never be recreated, but an authoritative cold-
+            # start observation may safely reattach one that is still live.
+            if (
+                str(getattr(record, "id", "")) in live_ids
+                and status in {"running", "paused"}
+            ):
+                selected.append(record)
             continue
         if str(getattr(record, "id", "")) in live_ids:
             # Reattachment is safe only for the live state proven by the

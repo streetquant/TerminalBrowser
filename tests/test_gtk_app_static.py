@@ -54,7 +54,12 @@ class GtkAppStaticTests(unittest.TestCase):
         self.assertIn("coordinator.submit(", restore_source)
         self.assertIn("known_live=known_live", restore_source)
         self.assertIn("known_pid=pids_by_id.get(record.id)", restore_source)
-        self.assertIn("if known_live is not True:", restore_source)
+        self.assertIn("on_ready=recovery_ready", restore_source)
+        self.assertIn("on_failed=recovery_failed", restore_source)
+        self.assertIn("if submission.accepted:", restore_source)
+        self.assertIn("known_live=True", restore_source)
+        self.assertIn("known_pid=result.pid", restore_source)
+        self.assertNotIn("if known_live is not True:", restore_source)
 
     def test_termdeck_window_has_no_duplicate_method_definitions(self):
         tree = ast.parse(GTK_APP.read_text(encoding="utf-8"))

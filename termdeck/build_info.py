@@ -334,9 +334,11 @@ def default_managed_root(*, env: Mapping[str, str] | None = None) -> Path:
     configured = environment.get("T1000_MANAGED_ROOT", "").strip()
     if configured:
         return Path(configured).expanduser()
-    data_home = environment.get("XDG_DATA_HOME", "").strip()
-    root = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
-    return root / "t1000" / "managed"
+    from .storage_fabric import DEFAULT_MANAGED_ROOT
+
+    configured_home = environment.get("HOME", "").strip()
+    home = Path(configured_home) if configured_home else Path.home()
+    return home / DEFAULT_MANAGED_ROOT
 
 
 def _inferred_manifest_path() -> Path | None:

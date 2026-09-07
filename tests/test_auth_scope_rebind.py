@@ -405,6 +405,45 @@ class AuthScopeRebindTests(unittest.TestCase):
         self.assertTrue(destination.is_dir())
         self.assertIsNone(result.receipt_path)
 
+    def test_claim_expiry_during_staging_is_rechecked_with_fresh_time(self):
+        record = self._record(session_id="td-claim-expiry", scope_id="auth-claim-expiry")
+        old_home = Path(record.codex_home)
+        claim = self._claim(record)
+        self.store.conn.execute(
+            "UPDATE recovery_claims SET expires_at = 100.5 WHERE session_id = ?",
+            (record.id,),
+        )
+        self.store.conn.commit()
+        current_time = [100.0]
+        original_stage = auth_scope_rebind_module._ensure_new_scope
+
+        def stage_past_expiry(*args, **kwargs):
+            original_stage(*args, **kwargs)
+            current_time[0] = 101.0
+
+        with mock.patch.object(
+            auth_scope_rebind_module,
+            "_ensure_new_scope",
+            side_effect=stage_past_expiry,
+        ), mock.patch.object(
+            auth_scope_rebind_module.time,
+            "time",
+            side_effect=lambda: current_time[0],
+        ):
+            result = rebind_auth_scope(
+                record,
+                self.store,
+                proof=AuthScopeRebindProof(True, True, True),
+                claim=claim,
+                canonical_home=self.canonical,
+                environ=self.env,
+            )
+
+        self.assertTrue(result.deferred)
+        self.assertIn("expired", result.detail)
+        self.assertEqual(self.store.get(record.id).codex_home, str(old_home))
+        self.assertIsNone(result.receipt_path)
+
 
 if __name__ == "__main__":
     unittest.main()

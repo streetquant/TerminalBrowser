@@ -2,6 +2,110 @@
 
 ## Unreleased
 
+## 0.2.20
+
+T1000 0.2.20 is the Warp Drives managed-release compatibility candidate. It
+adds the storage, migration, and recovery boundaries needed for that runtime;
+promotion and a live managed GUI handoff remain explicit validation gates, not
+claims made by this source note.
+
+### Warp Drives storage and exact working directories
+
+A managed launch now requires an absolute `T1000_MANAGED_ROOT` whose launcher,
+bootstrap, and release root pass current-user ownership, mount, device, and
+non-rotational storage checks. The Warp Drives environment tuple is recorded as
+advisory TermDeck evidence and remains mandatory for managed Codex workspace
+processes, but it does not replace those path and storage proofs.
+
+Session recipes preserve the exact absolute logical `cwd`. Launch and recovery
+fail closed when that directory is unavailable; they do not substitute a
+resolved parent, the home directory, or `/`. Recovery intent binds the same
+logical spelling so it cannot authorize another checkout or workspace.
+
+### Primary-only migration and explicit recovery authority
+
+Only the new primary GUI may import the legacy `sessions.sqlite3` registry into
+managed state. The copy is integrity-checked, atomic, retry-safe, and leaves the
+legacy source available. It does not move `terminal-auth`, Codex configuration,
+conversation roots, or other legacy state, and secondary activations do not
+become independent migration authorities.
+
+Recovery uses a bounded worker pool with durable per-target claims. Different
+targets can proceed concurrently, while the same session, tmux pane, auth
+scope, or resume target remains single-flight. Stopped and start-error rows
+require an active durable intent matching the stored session fingerprint, name,
+and logical `cwd`; malformed, inactive, new, remembered, external, and archived
+records do not become runnable through incidental discovery.
+
+### Guarded authentication-scope rebind
+
+A pre-existing native Codex resume scope may be rebound under managed SSD state
+only while the recovery coordinator holds the durable claim and proves the old
+backend missing, dead, and quiescent. The sparse replacement preserves the
+selected account and canonical session roots, publishes through compare-and-swap,
+and leaves the old scope untouched. External, OpenCode, ambiguous, or
+incompletely proven sessions remain fail closed.
+
+### Artifact and validation boundary
+
+The release wheel is intentionally the desktop/runtime package. Packaging and
+release verification admit only `termdeck/` plus the wheel's distribution
+metadata; `scripts/`, `docs/`, `tests/`, and `web/` remain repository-side
+qualification or deployment inputs rather than installed wheel members.
+
+Production smokes require an explicitly supplied private mode-`0700`
+`T1000_VALIDATION_RUNTIME_BASE` that passes Warp Drives SSD verification. The CI
+profile instead creates a dedicated private portable runtime and does not claim
+Warp Drives qualification. Focused tests, reproducible double-build, strict
+artifact verification, managed installation, and live GUI-only handoff with
+preserved tmux, pane, payload, working-directory, account, and conversation
+identity remain promotion evidence that must be collected separately.
+
+## 0.2.19
+
+T1000 0.2.19 makes terminal presentation, open-tab lifecycle, and Codex account
+changes agree with the identities already owned by VTE, tmux, and the canonical
+Codex account source.
+
+### One truthful terminal surface
+
+Ordinary wheel, trackpad, Page Up/Page Down, selection autoscroll, and the
+persistent scrollbar now move VTE's visible normal-screen viewport. Mouse-aware
+alternate-screen applications retain their negotiated protocol rather than a
+thumb-only pseudo-scroll. Tmux replay clears and reconstructs each captured row
+with bounded style, wrap, mode, and cursor restoration, eliminating stale
+background rectangles and overlapping composer rows across attach, resize,
+scroll, and Tabs-pane geometry changes.
+
+The hidden-start Tabs pane maps its complete widget subtree before measurement,
+and an open terminal remains in the tab strip and Tabs pane when its transient
+Codex child exits. Hidden, archived, and explicitly removed records keep their
+existing lifecycle semantics.
+
+### Atomic Codex account and recovery boundaries
+
+Selecting a Codex profile for a running session performs one same-pane handoff
+that preserves the conversation UUID, pane, working directory, model, and tab.
+Failure restores both the previous account pointer and payload. Private per-tab
+scopes observe the canonical system-wide account source, so external token or
+profile replacement is applied through the same verified transaction instead
+of leaving a stale credential copy.
+
+Exact recovery preserves the canonical `codex-opencode` model and remains
+fail-closed when Codex has closed its rollout descriptor. Only one owner-only,
+non-symlinked CLI rollout matching the process working directory and bounded
+start window is accepted; ambiguous candidates are not guessed by timestamp.
+
+### Validation boundary
+
+The release contract includes focused unit coverage and real GTK/VTE/tmux
+smokes for viewport movement, deterministic replay, hidden-start pane mapping,
+open-tab lifecycle, immediate authentication switching, rollback, and exact
+conversation continuity, followed by reproducible build and managed handoff
+checks. Those gates require their own receipts; this aggregate note describes
+the contract without asserting a live GUI verification that is not recorded
+here.
+
 ## 0.2.18
 
 T1000 0.2.18 closes the complete OpenCode composer, scrolling, keyboard, and false-recovery incident without changing the selected model in any existing tab or replacing any payload that is already live.

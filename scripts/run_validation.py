@@ -46,12 +46,17 @@ _TEST_SUMMARY_PATTERNS = {
 }
 _TASK_RUNTIME_BASE = Path("/tmp")
 _TASK_RUNTIME_BASE_ENV = "T1000_VALIDATION_RUNTIME_BASE"
+_TASK_RUNTIME_POLICY_ENV = "T1000_VALIDATION_RUNTIME_POLICY"
 _TASK_RUNTIME_MAX_PATH_BYTES = 64
+_TASK_RUNTIME_PORTABLE_NAME = "t1000-validation"
+_TASK_RUNTIME_FALLBACK_PREFIX = "t1000-validation-"
+_TASK_RUNTIME_PATH_SAMPLE = "t1v-00000000-00000000"
 _TASK_RUNTIME_LEASE_NAME = ".t1000-validation-owner.json"
 _TASK_RUNTIME_LEASE_SCHEMA = "t1000.validation-runtime-owner.v1"
 _TASK_RUNTIME_MAX_LEASE_BYTES = 4096
 _TASK_RUNTIME_MAX_SCAN_ENTRIES = 256
 _TASK_RUNTIME_MAX_REMOVALS = 32
+_TASK_RUNTIME_MAX_REAPER_CURSORS = 16
 _TASK_RUNTIME_NAME = re.compile(r"^t1v-[0-9a-f]{8}-[a-z0-9_]{8}$")
 _TASK_RUNTIME_QUARANTINE_NAME = re.compile(r"^t1v-q-[0-9a-f]{32}$")
 _TASK_RUNTIME_LEASE_KEYS = {
@@ -64,10 +69,72 @@ _TASK_RUNTIME_LEASE_KEYS = {
     "start_ticks",
     "uid",
 }
+_INHERITED_SUBPROCESS_ENV_KEYS = frozenset(
+    {
+        "DBUS_SESSION_BUS_ADDRESS",
+        "HOME",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "LOGNAME",
+        "NO_COLOR",
+        "PATH",
+        "SHELL",
+        "SOURCE_DATE_EPOCH",
+        "T1000_EXPECTED_SITE",
+        "T1000_MANAGED_BIN_DIR",
+        "T1000_MANAGED_ROOT",
+        "T1000_RELEASE_MANIFEST",
+        "T1000_RELEASE_STATE",
+        _TASK_RUNTIME_BASE_ENV,
+        "TERM",
+        "TERMDECK_REAL_CODEX_BINARY",
+        "TERMINFO",
+        "TERMINFO_DIRS",
+        "TMPDIR",
+        "TZ",
+        "USER",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_DIRS",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "XDG_STATE_HOME",
+    }
+)
+_VALIDATION_SUBPROCESS_ENV_KEYS = frozenset(
+    {
+        "NO_AT_BRIDGE",
+        "PYTHONBREAKPOINT",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONHASHSEED",
+        "PYTHONPATH",
+        "PYTHONPYCACHEPREFIX",
+        "TMUX_TMPDIR",
+        _TASK_RUNTIME_POLICY_ENV,
+    }
+)
+_TASK_RUNTIME_REAPER_CURSOR_LOCK = threading.Lock()
+_TASK_RUNTIME_REAPER_CURSORS: dict[tuple[str, int, int], Any] = {}
 
 
 class ValidationError(RuntimeError):
     """Raised when the validation contract cannot be trusted or completed."""
+
+
+def _subprocess_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Return the closed environment contract for every validation child."""
+
+    permitted = _INHERITED_SUBPROCESS_ENV_KEYS | _VALIDATION_SUBPROCESS_ENV_KEYS
+    environment = {
+        key: str(value)
+        for key, value in source.items()
+        if key in permitted and isinstance(value, str)
+    }
+    environment.setdefault("PATH", os.defpath)
+    return environment
 
 
 class _TaskRuntime:
@@ -386,6 +453,7 @@ def _git_source_paths(root: Path) -> list[str]:
         completed = subprocess.run(
             ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
             cwd=root,
+            env=_subprocess_environment(os.environ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -469,6 +537,7 @@ def _tool_output(argv: Sequence[str], *, cwd: Path, timeout: float = 10.0) -> di
         completed = subprocess.run(
             list(argv),
             cwd=cwd,
+            env=_subprocess_environment(os.environ),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=False,
@@ -599,7 +668,8 @@ def _safe_task_runtime_base(base: Path) -> Path:
         metadata.st_uid == os.geteuid() and stat.S_IMODE(metadata.st_mode) == 0o700
     )
     if (
-        stat.S_ISLNK(metadata.st_mode)
+        resolved != base
+        or stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
         or not (conventional_tmp or private_base)
     ):
@@ -607,16 +677,127 @@ def _safe_task_runtime_base(base: Path) -> Path:
     return resolved
 
 
+def _private_task_runtime_base(base: Path, *, name: str) -> Path:
+    try:
+        resolved = base.resolve(strict=True)
+        metadata = base.lstat()
+    except OSError as exc:
+        raise ValidationError(f"{name} is unavailable") from exc
+    if (
+        resolved != base
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise ValidationError(f"{name} is not a private 0700 directory")
+    return resolved
+
+
+def _runtime_base_fits_path_budget(base: Path) -> bool:
+    return (
+        len(os.fsencode(base / _TASK_RUNTIME_PATH_SAMPLE))
+        <= _TASK_RUNTIME_MAX_PATH_BYTES
+    )
+
+
+def _ensure_private_task_runtime_base(parent: Path, name: str) -> Path:
+    candidate = parent / name
+    created = False
+    try:
+        candidate.mkdir(mode=0o700)
+        created = True
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise ValidationError("portable validation runtime base cannot be created") from exc
+    if created:
+        try:
+            candidate.chmod(0o700)
+        except OSError as exc:
+            raise ValidationError(
+                "portable validation runtime base cannot be secured"
+            ) from exc
+    return _private_task_runtime_base(
+        candidate,
+        name="portable validation runtime base",
+    )
+
+
+def _portable_task_runtime_base() -> Path:
+    raw_xdg = str(os.environ.get("XDG_RUNTIME_DIR", "") or "").strip()
+    if raw_xdg:
+        xdg = Path(raw_xdg).expanduser()
+        if xdg.is_absolute():
+            try:
+                trusted_xdg = _private_task_runtime_base(
+                    xdg,
+                    name="XDG_RUNTIME_DIR",
+                )
+            except ValidationError:
+                trusted_xdg = None
+            if trusted_xdg is not None:
+                candidate = trusted_xdg / _TASK_RUNTIME_PORTABLE_NAME
+                if _runtime_base_fits_path_budget(candidate):
+                    return _ensure_private_task_runtime_base(
+                        trusted_xdg,
+                        _TASK_RUNTIME_PORTABLE_NAME,
+                    )
+
+    fallback_parent = _safe_task_runtime_base(_TASK_RUNTIME_BASE)
+    fallback_metadata = fallback_parent.lstat()
+    if stat.S_IMODE(fallback_metadata.st_mode) != 0o1777:
+        raise ValidationError(
+            "portable validation runtime fallback parent is not mode 1777"
+        )
+    fallback_name = f"{_TASK_RUNTIME_FALLBACK_PREFIX}{os.geteuid()}"
+    candidate = fallback_parent / fallback_name
+    if not _runtime_base_fits_path_budget(candidate):
+        raise ValidationError("portable validation runtime exceeds the path-length budget")
+    return _ensure_private_task_runtime_base(fallback_parent, fallback_name)
+
+
 def _configured_task_runtime_base() -> Path:
     raw = str(os.environ.get(_TASK_RUNTIME_BASE_ENV, "") or "").strip()
     if not raw:
-        return _TASK_RUNTIME_BASE
+        return _portable_task_runtime_base()
     configured = Path(raw).expanduser()
     if not configured.is_absolute():
         raise ValidationError(
             f"{_TASK_RUNTIME_BASE_ENV} must be an absolute path"
         )
-    return configured
+    return _private_task_runtime_base(
+        configured,
+        name=_TASK_RUNTIME_BASE_ENV,
+    )
+
+
+def _production_task_runtime_base() -> Path:
+    raw = str(os.environ.get(_TASK_RUNTIME_BASE_ENV, "") or "").strip()
+    if not raw:
+        raise ValidationError(
+            f"{_TASK_RUNTIME_BASE_ENV} is required for production smokes"
+        )
+    base = _configured_task_runtime_base()
+    try:
+        from termdeck.storage_fabric import require_hot_storage
+
+        require_hot_storage(
+            managed_root=base,
+            hot_paths={
+                "auth_root": base,
+                "checkpoint_root": base,
+                "database_root": base,
+                "runtime_root": base,
+                "tmux_runtime": base,
+            },
+            production=True,
+        )
+    except Exception as exc:
+        raise ValidationError(
+            f"{_TASK_RUNTIME_BASE_ENV} is not verified Warp Drives SSD storage: {base}"
+        ) from exc
+    return base
 
 
 def _validate_runtime_lease_payload(
@@ -759,7 +940,10 @@ def _quarantine_remove_task_runtime(
         result["error"] = "runtime identity changed during quarantine rename"
     else:
         try:
-            shutil.rmtree(quarantine)
+            if stat.S_ISDIR(observed.st_mode) and not stat.S_ISLNK(observed.st_mode):
+                shutil.rmtree(quarantine)
+            else:
+                quarantine.unlink()
         except OSError as exc:
             result["error"] = f"runtime quarantine cleanup failed: {exc}"
         else:
@@ -776,6 +960,43 @@ def _quarantine_remove_task_runtime(
     return result
 
 
+def _task_runtime_reaper_cursor(
+    runtime_base: Path,
+) -> tuple[tuple[str, int, int], Any, bool]:
+    try:
+        metadata = runtime_base.lstat()
+    except OSError as exc:
+        raise ValidationError("short task runtime base cannot be scanned") from exc
+    key = (str(runtime_base), int(metadata.st_dev), int(metadata.st_ino))
+    for stale_key in tuple(_TASK_RUNTIME_REAPER_CURSORS):
+        if stale_key[0] == key[0] and stale_key != key:
+            _TASK_RUNTIME_REAPER_CURSORS.pop(stale_key).close()
+    iterator = _TASK_RUNTIME_REAPER_CURSORS.pop(key, None)
+    continued = iterator is not None
+    if iterator is None:
+        try:
+            iterator = os.scandir(runtime_base)
+        except OSError as exc:
+            raise ValidationError("short task runtime base cannot be scanned") from exc
+        while len(_TASK_RUNTIME_REAPER_CURSORS) >= _TASK_RUNTIME_MAX_REAPER_CURSORS:
+            oldest_key = next(iter(_TASK_RUNTIME_REAPER_CURSORS))
+            _TASK_RUNTIME_REAPER_CURSORS.pop(oldest_key).close()
+    _TASK_RUNTIME_REAPER_CURSORS[key] = iterator
+    return key, iterator, continued
+
+
+def _owned_task_runtime_metadata(path: Path) -> os.stat_result | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValidationError("malformed validation runtime cannot be inspected") from exc
+    if metadata.st_uid != os.geteuid():
+        return None
+    return metadata
+
+
 def _reap_stale_task_runtimes(
     *,
     base: Path | None = None,
@@ -784,66 +1005,112 @@ def _reap_stale_task_runtimes(
 ) -> dict[str, object]:
     """Recover a bounded number of lease-bound dead validation runtimes."""
 
-    runtime_base = _safe_task_runtime_base(
-        _configured_task_runtime_base() if base is None else Path(base)
+    runtime_base = _private_task_runtime_base(
+        _configured_task_runtime_base() if base is None else Path(base),
+        name="short task runtime base",
     )
     entry_limit = max(0, min(int(max_entries), _TASK_RUNTIME_MAX_SCAN_ENTRIES))
     removal_limit = max(0, min(int(max_removals), _TASK_RUNTIME_MAX_REMOVALS))
     receipt: dict[str, object] = {
         "base": str(runtime_base),
+        "cursor_continued": False,
         "entry_bound_reached": False,
         "failed": 0,
         "inspected_entries": 0,
         "removed": 0,
+        "removed_malformed": 0,
         "removal_bound_reached": False,
         "retained_live": 0,
         "retained_unsafe": 0,
+        "scan_cycle_complete": False,
+        "scanned_entries": 0,
     }
-    try:
-        iterator = os.scandir(runtime_base)
-    except OSError as exc:
-        raise ValidationError("short task runtime base cannot be scanned") from exc
-    with iterator:
-        for entry in iterator:
-            if int(receipt["inspected_entries"]) >= entry_limit:
-                receipt["entry_bound_reached"] = True
+    if entry_limit == 0:
+        receipt["entry_bound_reached"] = True
+        return receipt
+    with _TASK_RUNTIME_REAPER_CURSOR_LOCK:
+        cursor_key, iterator, cursor_continued = _task_runtime_reaper_cursor(
+            runtime_base
+        )
+        receipt["cursor_continued"] = cursor_continued
+        while int(receipt["scanned_entries"]) < entry_limit:
+            try:
+                entry = next(iterator)
+            except StopIteration:
+                iterator.close()
+                _TASK_RUNTIME_REAPER_CURSORS.pop(cursor_key, None)
+                receipt["scan_cycle_complete"] = True
                 break
-            receipt["inspected_entries"] = int(receipt["inspected_entries"]) + 1
+            except OSError as exc:
+                iterator.close()
+                _TASK_RUNTIME_REAPER_CURSORS.pop(cursor_key, None)
+                raise ValidationError(
+                    "short task runtime base cannot be scanned"
+                ) from exc
+            receipt["scanned_entries"] = int(receipt["scanned_entries"]) + 1
             if (
                 _TASK_RUNTIME_NAME.fullmatch(entry.name) is None
                 and _TASK_RUNTIME_QUARANTINE_NAME.fullmatch(entry.name) is None
             ):
                 continue
+            receipt["inspected_entries"] = int(receipt["inspected_entries"]) + 1
             candidate = runtime_base / entry.name
+            malformed = _TASK_RUNTIME_QUARANTINE_NAME.fullmatch(entry.name) is not None
+            metadata: os.stat_result | None = None
             try:
-                lease, metadata = _read_task_runtime_lease(candidate)
-                if _runtime_owner_alive(lease):
-                    receipt["retained_live"] = int(receipt["retained_live"]) + 1
-                    continue
+                if not malformed:
+                    lease, metadata = _read_task_runtime_lease(candidate)
+                    if _runtime_owner_alive(lease):
+                        receipt["retained_live"] = int(receipt["retained_live"]) + 1
+                        continue
             except ValidationError:
-                # Malformed, linked, foreign, or ambiguous entries are not
-                # deletion authority; retain them for explicit inspection.
+                malformed = True
+            if malformed:
+                try:
+                    metadata = _owned_task_runtime_metadata(candidate)
+                except ValidationError:
+                    receipt["failed"] = int(receipt["failed"]) + 1
+                    continue
+                if metadata is None:
+                    receipt["retained_unsafe"] = int(receipt["retained_unsafe"]) + 1
+                    continue
+            if metadata is None:
                 receipt["retained_unsafe"] = int(receipt["retained_unsafe"]) + 1
                 continue
             if int(receipt["removed"]) >= removal_limit:
                 receipt["removal_bound_reached"] = True
+                if malformed:
+                    receipt["retained_unsafe"] = int(receipt["retained_unsafe"]) + 1
                 continue
             removal = _quarantine_remove_task_runtime(candidate, expected=metadata)
             if removal.get("removed") is True:
                 receipt["removed"] = int(receipt["removed"]) + 1
+                if malformed:
+                    receipt["removed_malformed"] = int(
+                        receipt["removed_malformed"]
+                    ) + 1
             else:
                 receipt["failed"] = int(receipt["failed"]) + 1
+        if int(receipt["scanned_entries"]) >= entry_limit:
+            receipt["entry_bound_reached"] = True
     return receipt
 
 
-def _create_short_task_runtime(work: Path) -> _TaskRuntime:
+def _create_short_task_runtime(
+    work: Path,
+    *,
+    base: Path | None = None,
+) -> _TaskRuntime:
     """Create one lease-bound short runtime suitable for desktop IPC."""
 
-    base = _safe_task_runtime_base(_configured_task_runtime_base())
+    runtime_base = _private_task_runtime_base(
+        _configured_task_runtime_base() if base is None else Path(base),
+        name="short task runtime base",
+    )
     prefix = f"t1v-{sha256_bytes(os.fsencode(str(work)))[:8]}-"
     path: Path | None = None
     try:
-        path = Path(tempfile.mkdtemp(prefix=prefix, dir=base))
+        path = Path(tempfile.mkdtemp(prefix=prefix, dir=runtime_base))
         path.chmod(0o700)
         metadata = path.lstat()
     except OSError as exc:
@@ -958,10 +1225,10 @@ def _task_environment(
     work: Path,
     *,
     environment: str,
+    profile: str | None = None,
 ) -> tuple[dict[str, str], _TaskRuntime | None]:
-    env = os.environ.copy()
-    for key in ("PYTHONSTARTUP", "PYTHONINSPECT"):
-        env.pop(key, None)
+    env = _subprocess_environment(os.environ)
+    env.pop(_TASK_RUNTIME_POLICY_ENV, None)
     env.update(
         {
             "NO_AT_BRIDGE": "1",
@@ -974,33 +1241,40 @@ def _task_environment(
     runtime: _TaskRuntime | None = None
     try:
         if environment != "production-host":
+            runtime_base = None
             if environment == "xvfb-dbus":
-                runtime = _create_short_task_runtime(work)
-                cache = runtime.path / "c"
-                temporary = runtime.path / "t"
-                pycache = runtime.path / "p"
+                if profile not in _PROFILES:
+                    raise ValidationError(
+                        "xvfb-dbus tasks require an explicit validation profile"
+                    )
+                runtime_base = (
+                    _production_task_runtime_base()
+                    if profile == "production"
+                    else None
+                )
                 for key in (
                     "DBUS_SESSION_BUS_ADDRESS",
                     "DBUS_SESSION_BUS_PID",
                     "DBUS_SESSION_BUS_WINDOWID",
                 ):
                     env.pop(key, None)
-                env["XDG_RUNTIME_DIR"] = str(runtime.path)
-            else:
-                cache = work / "cache"
-                temporary = work / "tmp"
-                pycache = work / "pycache"
+            runtime = _create_short_task_runtime(work, base=runtime_base)
+            cache = runtime.path / "c"
+            temporary = runtime.path / "t"
+            pycache = runtime.path / "p"
+            if environment == "xvfb-dbus":
+                env[_TASK_RUNTIME_BASE_ENV] = str(runtime.path)
+                env[_TASK_RUNTIME_POLICY_ENV] = str(profile)
             for directory in (cache, temporary, pycache):
                 directory.mkdir(parents=True, exist_ok=True, mode=0o700)
                 directory.chmod(0o700)
             env.update(
                 {
                     "PYTHONPYCACHEPREFIX": str(pycache),
+                    "TMUX_TMPDIR": str(runtime.path),
                     "TMPDIR": str(temporary),
                     "XDG_CACHE_HOME": str(cache),
-                    "XDG_RUNTIME_DIR": str(
-                        runtime.path if runtime is not None else temporary
-                    ),
+                    "XDG_RUNTIME_DIR": str(runtime.path),
                 }
             )
     except BaseException as exc:
@@ -1201,7 +1475,7 @@ def run_process(
         process = subprocess.Popen(
             list(argv),
             cwd=cwd,
-            env=dict(env),
+            env=_subprocess_environment(env),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1411,7 +1685,18 @@ def _build_smoke_argv(entry: Mapping[str, object], *, python: str, root: Path) -
     dbus = shutil.which("dbus-run-session")
     if not xvfb or not dbus:
         raise ValidationError("portable GUI smokes require xvfb-run and dbus-run-session")
-    return [xvfb, "-a", dbus, "--", python, "-P", "-B", script]
+    return [
+        xvfb,
+        "-a",
+        "-s",
+        "-screen 0 1280x1024x24 -extension GLX",
+        dbus,
+        "--",
+        python,
+        "-P",
+        "-B",
+        script,
+    ]
 
 
 def _record_failure(failures: list[dict[str, object]], task: Mapping[str, object], reason: str) -> None:
@@ -1488,12 +1773,20 @@ def run_validation(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
                 "state": "running",
             },
         )
-        runtime_preflight = _reap_stale_task_runtimes()
-        receipt["runtime_preflight"] = runtime_preflight
-        if int(runtime_preflight.get("failed", 0)):
-            raise ValidationError(
-                "short task runtime recovery could not complete an authenticated removal"
+        if not args.check_manifest and (selected_tests or selected_smokes):
+            runtime_preflight_base = (
+                _production_task_runtime_base()
+                if args.profile == "production" and selected_smokes
+                else None
             )
+            runtime_preflight = _reap_stale_task_runtimes(
+                base=runtime_preflight_base
+            )
+            receipt["runtime_preflight"] = runtime_preflight
+            if int(runtime_preflight.get("failed", 0)):
+                raise ValidationError(
+                    "short task runtime recovery could not complete an authenticated removal"
+                )
 
         limits = manifest["limits"]
         assert isinstance(limits, dict)
@@ -1590,7 +1883,10 @@ def run_validation(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
                 work = output / "work" / "smokes" / task_id
                 work.mkdir(parents=True, mode=0o700)
                 env, task_runtime = _task_environment(
-                    root, work, environment=environment
+                    root,
+                    work,
+                    environment=environment,
+                    profile=args.profile,
                 )
                 try:
                     argv = _build_smoke_argv(entry, python=args.python, root=root)

@@ -364,6 +364,11 @@ class CodexAuthTests(unittest.TestCase):
 
             with mock.patch.dict(
                 os.environ, {"TERMDECK_CODEX_BINARY": str(launcher)}
+            ), mock.patch(
+                "termdeck.codex_config_scope._launcher_is_attested",
+                side_effect=lambda _candidate, resolved, _home, _attestor: (
+                    resolved == launcher.resolve()
+                ),
             ):
                 prepare_auth_scope(private, account_source=source)
 

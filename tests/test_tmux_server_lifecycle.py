@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
+import termdeck.storage_fabric as storage_fabric
 from termdeck.tmux_server_lifecycle import (
     TmuxServerIsolationError,
     isolate_existing_tmux_server,
@@ -409,3 +412,46 @@ def test_tmux_backend_run_uses_scope_wrapper_for_new_session():
             mock.call("/usr/bin/tmux", query_timeout=0.35, timeout=2.0),
         ]
     )
+
+
+def test_tmux_backend_child_uses_exact_attested_socket_runtime(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from termdeck.tmux_backend import TmuxBackend
+
+    runtime = tmp_path / "tmux-runtime"
+    device = f"{os.major(tmp_path.stat().st_dev)}:{os.minor(tmp_path.stat().st_dev)}"
+    monkeypatch.setattr(
+        storage_fabric,
+        "_PRODUCTION_TMUX_RUNTIME_BINDING",
+        (runtime, device),
+    )
+    monkeypatch.setenv("TERMDECK_TMUX_RUNTIME", str(runtime))
+    monkeypatch.setenv("TMUX_TMPDIR", str(runtime))
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,123,0")
+    completed = subprocess.CompletedProcess(
+        args=["/usr/bin/tmux", "list-sessions"],
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+    backend = TmuxBackend(executable="/usr/bin/tmux")
+
+    with mock.patch(
+        "termdeck.tmux_backend.subprocess.run",
+        return_value=completed,
+    ) as run:
+        result = backend._run(["list-sessions"])
+
+    assert result is completed
+    child = run.call_args.kwargs["env"]
+    assert child["TERMDECK_TMUX_RUNTIME"] == str(runtime)
+    assert Path(child["TMUX_TMPDIR"]).samefile(runtime)
+    assert child["TMUX_TMPDIR"] != str(runtime)
+    assert "TMUX" not in child
+    assert runtime.is_dir()
+    assert runtime.stat().st_dev == tmp_path.stat().st_dev
+    binding = storage_fabric._PRODUCTION_TMUX_RUNTIME_BINDING
+    assert isinstance(binding, storage_fabric._ProductionDirectoryBinding)
+    binding.close()

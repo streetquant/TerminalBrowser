@@ -10,7 +10,11 @@ import tempfile
 import time
 from pathlib import Path
 
-from smoke_support import stream_ready, stream_snapshot
+from smoke_support import (
+    require_private_validation_runtime,
+    stream_ready,
+    stream_snapshot,
+)
 
 
 def _drain_gtk(Gtk, *, until=None, timeout: float = 5.0) -> None:
@@ -66,12 +70,18 @@ def _right_click_tree_row(Gtk, tree, path) -> None:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="termdeck-manager-move-smoke-") as tmp:
+    runtime_base = require_private_validation_runtime()
+    with tempfile.TemporaryDirectory(
+        prefix="termdeck-manager-move-smoke-"
+    ) as tmp, tempfile.TemporaryDirectory(
+        prefix="tdmm-",
+        dir=runtime_base,
+    ) as tmux_tmp_dir:
         root = Path(tmp)
         home = root / "home"
-        tmux_tmp = root / "tmux"
+        tmux_tmp = Path(tmux_tmp_dir)
         home.mkdir()
-        tmux_tmp.mkdir(mode=0o700)
+        tmux_tmp.chmod(0o700)
         os.environ["HOME"] = str(home)
         os.environ["TMUX_TMPDIR"] = str(tmux_tmp)
         os.environ["NO_AT_BRIDGE"] = "1"
