@@ -121,7 +121,7 @@ class DesktopIntegrationTests(unittest.TestCase):
         entry = build_autostart_entry()
         self.assertIn("Exec=/home/arch/.local/bin/t1000 gui", entry)
         self.assertIn("TryExec=/home/arch/.local/bin/t1000", entry)
-        self.assertIn("X-T1000-Storage-Fabric=warp-drives-v1", entry)
+        self.assertIn("X-T1000-Storage-Policy=direct-root", entry)
         self.assertIn("X-T1000-Fail-Closed=true", entry)
         self.assertNotIn("sh -c", entry)
         self.assertNotIn("DBUS_SESSION_BUS_ADDRESS=", entry)

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.21
+
+- Made the managed launcher and storage attestation truthful for the canonical direct-root SSD. Production admission uses observed mount, device, filesystem, and rotational evidence; environment labels are advisory metadata, and no launcher or recovery check claims bulk masking or an ssd-cell class without independent proof.
+- Added a bounded, source-owned web cutover transaction. It durably publishes its transaction receipt and latest pointer before the first mutation, stages every build artifact before package installation, arms an independent recovery watchdog before stopping web units, and permits rollback from every mutation phase.
+- Replaced byte-identical live database comparisons with supported SQLite backup integrity checks, preservation of pre-existing session identities, and process identity checks that allow legitimate session activity and natural exits.
+- Added the reviewable TermDeck web activation and watchdog entry points under scripts/; recovery receipts remain external and pin the source commit and qualified package.
+
 - Qualified the Warp Drives source relocation with canonical deployment references to `/var/lib/codexpro-exec/termdeck-runtime`. The historical `/8tb/projects/softwares/termdeck/.runtime` bind remains an explicitly approved cutover compatibility path and is obsolete after activation.
 - Aligned clean-exit recovery coverage with dead-pane reuse: `respawn-pane` omits `-k` when the pane is already dead, while live in-place replacement continues to use `-k`.
 - Pinned the release workflow to its checkout when invoked by path, preventing an installed legacy TermDeck package from generating a mismatched managed bootstrap.

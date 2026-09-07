@@ -18,21 +18,27 @@ from typing import Callable, Mapping, MutableMapping, Sequence
 
 STORAGE_ATTESTATION_SCHEMA = "termdeck.storage-fabric-attestation.v1"
 STORAGE_ATTESTATION_VERSION = 1
-STORAGE_FABRIC = "warp-drives-v1"
-STORAGE_CLASS = "ssd-cell"
 
+# The launcher proves the exact mount, device, filesystem, and rotational
+# state.  A canonical SSD path does not prove a storage-fabric label, a
+# workspace cell, or bulk-storage masking, so the public attestation uses
+# only the direct-root facts that are actually observed.
+STORAGE_FABRIC = "direct-root"
+STORAGE_CLASS = "non-rotational-block"
+
+# Compatibility names remain importable for older callers, but no longer
+# carry the old, unproven fabric or cell labels.
 WARP_DRIVES_FABRIC = STORAGE_FABRIC
 SSD_CELL_STORAGE_CLASS = STORAGE_CLASS
 
 STORAGE_ENVIRONMENT_KEYS = (
     "CODEX_STORAGE_FABRIC",
     "CODEX_WORKSPACE_STORAGE_CLASS",
-    "CODEX_BULK_STORAGE_MASKED",
 )
+UNVERIFIED_STORAGE_ENVIRONMENT_KEYS = ("CODEX_BULK_STORAGE_MASKED",)
 EXPECTED_STORAGE_ENVIRONMENT = {
     "CODEX_STORAGE_FABRIC": STORAGE_FABRIC,
     "CODEX_WORKSPACE_STORAGE_CLASS": STORAGE_CLASS,
-    "CODEX_BULK_STORAGE_MASKED": "1",
 }
 
 
@@ -564,7 +570,9 @@ class StorageAttestation:
     @property
     def hot_state_would_fallback_to_hdd(self) -> bool:
         return any(
-            not path.ok or path.rotational == "1" or path.storage_class != STORAGE_CLASS
+            not path.ok
+            or path.rotational == "1"
+            or path.storage_class != STORAGE_CLASS
             for path in self.paths
         )
 
@@ -821,16 +829,26 @@ def _environment_report(
     *,
     production: bool,
 ) -> dict[str, object]:
-    observed = {key: str(environment.get(key, "") or "") for key in STORAGE_ENVIRONMENT_KEYS}
+    del production
+    observed = {
+        key: str(environment.get(key, "") or "")
+        for key in STORAGE_ENVIRONMENT_KEYS
+    }
+    unverified = {
+        key: str(environment.get(key, "") or "")
+        for key in UNVERIFIED_STORAGE_ENVIRONMENT_KEYS
+        if str(environment.get(key, "") or "")
+    }
     matches = observed == EXPECTED_STORAGE_ENVIRONMENT
     present = all(observed.values())
     return {
         "expected": dict(EXPECTED_STORAGE_ENVIRONMENT),
         "observed": observed,
+        "unverified": unverified,
         "matches": matches,
         "status": "matching" if matches else ("partial" if present else "missing"),
-        "advisory": not production,
-        "used_for_admission": production,
+        "advisory": True,
+        "used_for_admission": False,
     }
 
 
@@ -994,13 +1012,11 @@ def attest_storage_fabric(
         observed_environment,
         production=bool(production),
     )
+    # Environment variables are descriptive metadata only.  Production
+    # admission is based on the path/device proof above, so a launcher
+    # started by a desktop or systemd manager without these optional
+    # variables remains truthful and usable.
     failures = [path.reason for path in evidence if not path.ok]
-    if production and not environment_report["matches"]:
-        failures.append(
-            "production runtime environment is unqualified: expected "
-            f"{EXPECTED_STORAGE_ENVIRONMENT!r}, observed "
-            f"{environment_report['observed']!r}"
-        )
     if failures:
         reason = failures[0] if len(failures) == 1 else (
             f"{len(failures)} hot paths failed storage attestation; first failure: {failures[0]}"
@@ -1008,7 +1024,8 @@ def attest_storage_fabric(
     else:
         reason = (
             f"all {len(evidence)} hot paths resolve to non-rotational "
-            f"{STORAGE_FABRIC}/{STORAGE_CLASS} storage"
+            f"{STORAGE_FABRIC}/{STORAGE_CLASS} storage; "
+            "environment labels are advisory"
         )
     return StorageAttestation(
         ok=not failures,
@@ -1045,7 +1062,8 @@ def _bind_production_tmux_runtime(
         or not evidence.device
     ):
         raise StorageFabricError(
-            "tmux_runtime: production storage attestation did not admit an SSD runtime",
+            "tmux_runtime: production storage attestation did not admit a "
+            "non-rotational block runtime",
             attestation,
         )
     runtime = Path(evidence.resolved)
@@ -1093,7 +1111,8 @@ def _bind_production_database(
         or not evidence.device
     ):
         raise StorageFabricError(
-            "database_root: production storage attestation did not admit an SSD database",
+            "database_root: production storage attestation did not admit a "
+            "non-rotational block database",
             attestation,
         )
     database = Path(evidence.resolved)
@@ -1369,6 +1388,7 @@ __all__ = [
     "STORAGE_ATTESTATION_VERSION",
     "STORAGE_CLASS",
     "STORAGE_ENVIRONMENT_KEYS",
+    "UNVERIFIED_STORAGE_ENVIRONMENT_KEYS",
     "STORAGE_FABRIC",
     "StorageAttestation",
     "StorageFabric",

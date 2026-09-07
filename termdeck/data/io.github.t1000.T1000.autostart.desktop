@@ -13,5 +13,5 @@ X-GNOME-Autostart-enabled=true
 X-GNOME-Autostart-Notify=true
 X-KDE-autostart-after=panel
 X-T1000-Managed-Launcher=@T1000_MANAGED_LAUNCHER@
-X-T1000-Storage-Fabric=warp-drives-v1
+X-T1000-Storage-Policy=direct-root
 X-T1000-Fail-Closed=true

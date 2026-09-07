@@ -14,12 +14,11 @@ expected non-rotational SSD cell. The default release root is
 TermDeck state is kept in the adjacent
 `<T1000_MANAGED_ROOT parent>/termdeck/` directory, including the primary
 `sessions.sqlite3` registry, managed `terminal-auth/` scopes, and the
-recovery-intent state described below. TermDeck also reports the Warp Drives
-attestation tuple `CODEX_STORAGE_FABRIC=warp-drives-v1`,
-`CODEX_WORKSPACE_STORAGE_CLASS=ssd-cell`, and
-`CODEX_BULK_STORAGE_MASKED=1` as advisory evidence; mount/device proof remains
-authoritative for TermDeck admission. Managed Codex workspace processes must
-independently receive the exact tuple from the canonical launcher.
+recovery-intent state described below. TermDeck reports a direct-root attestation derived from the observed mount,
+device, filesystem, and rotational checks. Environment labels are advisory
+metadata only. The direct-root proof does not infer a workspace cell or bulk
+storage masking. Managed Codex workspace processes receive the attestation
+receipt from the canonical launcher when one is available.
 
 ### Recovery-intent managed state
 

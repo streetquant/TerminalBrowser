@@ -19,9 +19,8 @@ from termdeck.session_store import SessionStore
 
 class RecoveryQualificationTests(unittest.TestCase):
     _STORAGE = {
-        "CODEX_STORAGE_FABRIC": "warp-drives-v1",
-        "CODEX_WORKSPACE_STORAGE_CLASS": "ssd-cell",
-        "CODEX_BULK_STORAGE_MASKED": "1",
+        "CODEX_STORAGE_FABRIC": "direct-root",
+        "CODEX_WORKSPACE_STORAGE_CLASS": "non-rotational-block",
         "CODEX_STORAGE_ATTESTATION": "receipt-for-test-cell",
     }
 

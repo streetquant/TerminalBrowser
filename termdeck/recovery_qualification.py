@@ -483,21 +483,21 @@ def _rollout_observation(
 
 
 def _storage_observation(environment: Mapping[str, str]) -> tuple[str, QualificationReason | None, QualificationCheck]:
+    # Direct-root evidence does not infer bulk-storage masking.
     expected = {
-        "CODEX_STORAGE_FABRIC": "warp-drives-v1",
-        "CODEX_WORKSPACE_STORAGE_CLASS": "ssd-cell",
-        "CODEX_BULK_STORAGE_MASKED": "1",
+        "CODEX_STORAGE_FABRIC": "direct-root",
+        "CODEX_WORKSPACE_STORAGE_CLASS": "non-rotational-block",
     }
     for key, expected_value in expected.items():
         actual = _text(environment.get(key))
         if not actual:
             return "deferred", _reason("storage_attestation_missing", f"{key} is not present", "storage_attestation"), _check("deferred", f"{key} is missing")
         if actual != expected_value:
-            return "fail_closed", _reason("storage_attestation_invalid", f"{key}={actual!r}; expected {expected_value!r}", "storage_attestation"), _check("invalid", f"{key} does not match the warp-drives contract")
+            return "fail_closed", _reason("storage_attestation_invalid", f"{key}={actual!r}; expected {expected_value!r}", "storage_attestation"), _check("invalid", f"{key} does not match the direct-root contract")
     attestation = _text(environment.get("CODEX_STORAGE_ATTESTATION"))
     if not attestation or attestation.casefold() == "none":
         return "deferred", _reason("storage_attestation_missing", "CODEX_STORAGE_ATTESTATION is absent", "storage_attestation"), _check("deferred", "workspace receipt is missing")
-    return "pass", None, _check("pass", "warp-drives-v1, SSD cell, masked bulk storage, and receipt are present")
+    return "pass", None, _check("pass", "direct-root non-rotational block storage and receipt are present")
 
 
 def _auth_observation(record: object, *, native_codex: bool) -> tuple[str, QualificationReason | None, QualificationCheck]:

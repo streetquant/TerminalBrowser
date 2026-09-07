@@ -183,7 +183,7 @@ def test_mount_proof_overrides_conflicting_shell_environment() -> None:
     assert result.environment["advisory"] is True
 
 
-def test_production_attestation_rejects_unqualified_runtime_environment() -> None:
+def test_production_attestation_accepts_direct_root_without_launcher_metadata() -> None:
     _filesystem, probes = _ssd_fixture()
 
     result = attest_storage_fabric(
@@ -193,10 +193,11 @@ def test_production_attestation_rejects_unqualified_runtime_environment() -> Non
         production=True,
     )
 
-    assert not result.ok
-    assert "runtime environment is unqualified" in result.reason
-    assert result.environment["used_for_admission"] is True
-    assert result.environment["advisory"] is False
+    assert result.ok
+    assert result.environment["status"] == "missing"
+    assert result.environment["used_for_admission"] is False
+    assert result.environment["advisory"] is True
+    assert "environment labels are advisory" in result.reason
 
 
 def test_attestation_rejects_rotational_hot_path_with_exact_reason() -> None:

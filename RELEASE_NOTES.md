@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.2.21
+
+The managed release now reports the canonical direct-root storage evidence
+without inferring a storage-fabric name, an ssd-cell workspace, or bulk
+storage masking. Production admission follows the observed mount, device,
+filesystem, and rotational checks; environment labels remain advisory.
+
+The source tree also contains the bounded web activation transaction and its
+independent recovery watchdog. The transaction publishes durable recovery
+state before any mutation, prepares all build artifacts before installing a
+package, preserves existing SQLite session identities through a live backup
+integrity check, and allows rollback after any mutation phase.
+
 ## 0.2.20
 
 T1000 0.2.20 is the Warp Drives managed-release compatibility candidate. It
