@@ -266,3 +266,78 @@ def test_package_effect_before_receipt_ack_is_rolled_back_by_identity(
     assert "package-installed" not in persist_statuses
     assert FakeThread.instances[0].join_calls == 1
 
+def test_execute_publishes_units_before_stopping_web_services(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    paths.target.mkdir()
+    paths.managed_root.mkdir()
+    old_release = "a" * 64
+    new_release = "b" * 64
+    activation._write(paths.managed_root / "state.json", {"current_release_id": old_release})
+    tx, receipt = activation.new_transaction(
+        paths,
+        source={"commit": "c" * 40, "tree": "d" * 40, "branch": "candidate", "origin_main": "c" * 40},
+    )
+    receipt["status"] = "artifacts-staged"
+    receipt["package"] = {
+        "wheel": "qualified.whl",
+        "manifest": "qualified.release.json",
+        "release_id": new_release,
+    }
+    activation._write(tx / "receipt.json", receipt)
+
+    monkeypatch.setenv("TERMDECK_ACTIVATION_APPROVED", "1")
+    monkeypatch.setattr(
+        activation,
+        "snapshot_database",
+        lambda paths, tx, label: {"session_ids": [], "session_count": 0, "integrity": "ok"},
+    )
+    monkeypatch.setattr(activation, "process_snapshot", lambda: [])
+    monkeypatch.setattr(activation, "_sources", lambda paths, tx: {})
+    monkeypatch.setattr(activation, "_arm", lambda paths, tx: None)
+    monkeypatch.setattr(
+        activation,
+        "_systemd",
+        lambda *args, check=True: SimpleNamespace(returncode=0),
+    )
+    events: list[str] = []
+    monkeypatch.setattr(
+        activation,
+        "_publish_units",
+        lambda paths, tx: events.append("publish-units"),
+    )
+    monkeypatch.setattr(
+        activation,
+        "_install",
+        lambda paths, package: (
+            activation._write(
+                paths.managed_root / "state.json",
+                {"current_release_id": new_release},
+            )
+            or {"ok": True, "release_id": new_release}
+        ),
+    )
+    monkeypatch.setattr(activation, "_stop_web", lambda: events.append("stop-web"))
+    monkeypatch.setattr(activation, "_start_web", lambda: events.append("start-web"))
+    monkeypatch.setattr(activation, "_health", lambda: {"backend": "ok"})
+    monkeypatch.setattr(
+        activation,
+        "verify_database",
+        lambda paths, tx, before: {"integrity": "ok", "lost_session_ids": []},
+    )
+    monkeypatch.setattr(
+        activation,
+        "process_observation",
+        lambda before: {"disappeared": [], "natural_exit_allowed": True},
+    )
+    monkeypatch.setattr(activation, "_disarm", lambda: None)
+
+    result = activation.execute(paths, tx)
+
+    assert result["action"] == "activated"
+    assert events.index("publish-units") < events.index("stop-web")
+    final = activation._read(tx / "receipt.json")
+    assert final["status"] == "activated"
+    assert final["service_units_published"] is True
+
