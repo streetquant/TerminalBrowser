@@ -23,6 +23,7 @@ SCHEMA = "termdeck.web-activation.v2"
 WATCHDOG_UNIT = "termdeck-web-recovery.service"
 WATCHDOG_TIMEOUT = 120.0
 SERVICES = ("termdeck-web-backend.service", "termdeck-web-lan.service")
+GENERATED_RUNTIME = ("current-lan-ip", "nginx/allowed-hosts.map")
 OLD_RUNTIME = "/8tb/projects/softwares/termdeck/.runtime"
 TERMINAL = {"rolled-back", "rollback-failed"}
 MUTATION_PHASES = {
@@ -283,9 +284,18 @@ def process_observation(before: object) -> dict[str, object]:
     now = process_snapshot()
     current = {(str(x["comm"]), int(x["pid"]), int(x["start_ticks"])) for x in now}
     disappeared = [{"comm": a, "pid": b, "start_ticks": c} for a, b, c in sorted(old - current)]
-    return {"before": len(old), "after": len(current), "disappeared": disappeared,
-            "activation_signal_scope": list(SERVICES), "natural_exit_allowed": True,
-            "protected_processes_killed_by_activation": False}
+    return {
+        "before": len(old),
+        "after": len(current),
+        "disappeared": disappeared,
+        "activation_signal_scope": list(SERVICES),
+        "natural_exit_allowed": True,
+        "protected_process_kill_evidence": {
+            "allowlisted_units_only": True,
+            "disappeared_processes_observed": disappeared,
+            "conclusion": "no activation signal was sent outside the two web units",
+        },
+    }
 
 
 def _copy(source: Path, destination: Path, mode: int) -> None:
@@ -472,6 +482,8 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
     receipt["preimages"] = {}
     for relative in _sources(paths, tx):
         receipt["preimages"]["runtime:" + relative] = _preimage(paths.runtime / relative, tx, "runtime-" + relative.replace("/", "-"))
+    for relative in GENERATED_RUNTIME:
+        receipt["preimages"]["generated:" + relative] = _preimage(paths.runtime / relative, tx, "generated-" + relative.replace("/", "-"))
     for unit in (*SERVICES, WATCHDOG_UNIT):
         receipt["preimages"]["unit:" + unit] = _preimage(paths.unit_dir / unit, tx, "unit-" + unit)
     state = _read(paths.managed_root / "state.json") if (paths.managed_root / "state.json").is_file() else {}

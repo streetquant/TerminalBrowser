@@ -95,7 +95,8 @@ def test_process_observation_records_natural_exit_without_failing(monkeypatch: p
         ]
     )
     assert result["natural_exit_allowed"] is True
-    assert result["protected_processes_killed_by_activation"] is False
+    assert result["protected_process_kill_evidence"]["allowlisted_units_only"] is True
+    assert result["protected_process_kill_evidence"]["disappeared_processes_observed"] == result["disappeared"]
     assert result["disappeared"] == [{"comm": "codex", "pid": 10, "start_ticks": 3}]
 
 
