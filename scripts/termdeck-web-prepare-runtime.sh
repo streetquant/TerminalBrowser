@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 
-runtime=/var/lib/codexpro-exec/termdeck-runtime/termdeck-lan
+runtime=/var/lib/cloudmcp-exec/termdeck-runtime/termdeck-lan
 tls="$runtime/tls"
 nginx_root="$runtime/nginx"
 mkdir -p "$tls" "$nginx_root/logs" "$nginx_root/temp/client" "$nginx_root/temp/proxy"

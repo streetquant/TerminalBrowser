@@ -109,9 +109,9 @@ _MANAGED_BIN_DIR_ENV = "T1000_MANAGED_BIN_DIR"
 # web service, and auth-scope defaults on one database without copying or
 # merging an alternate registry.
 _DEPLOYMENT_MANAGED_ROOT = Path(
-    "/var/lib/codexpro-exec/codex-state-project-homes/runtime/t1000-managed"
+    "/var/lib/cloudmcp-exec/codex-state-project-homes/runtime/t1000-managed"
 )
-_DEPLOYMENT_STATE_ROOT = Path("/var/lib/codexpro-exec/termdeck-state")
+_DEPLOYMENT_STATE_ROOT = Path("/var/lib/cloudmcp-exec/termdeck-state")
 _UUID = re.compile(
     r"(?<![0-9a-f])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])",
     re.IGNORECASE,

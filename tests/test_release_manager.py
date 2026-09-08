@@ -6594,15 +6594,15 @@ def test_semantic_runtime_snapshot_ignores_transient_client_identity(tmp_path: P
 
 def test_deployment_managed_launcher_binds_canonical_termdeck_state_root() -> None:
     layout = release_layout(
-        root="/var/lib/codexpro-exec/codex-state-project-homes/runtime/t1000-managed",
+        root="/var/lib/cloudmcp-exec/codex-state-project-homes/runtime/t1000-managed",
         bin_dir="/tmp/termdeck-test-bin",
     )
     python = Path("/usr/bin/python3.14")
     launcher = _launcher_source(layout, python).decode("utf-8")
     bootstrap = _bootstrap_source(layout, python).decode("utf-8")
 
-    assert "export TERMDECK_STATE_ROOT=/var/lib/codexpro-exec/termdeck-state\n" in launcher
+    assert "export TERMDECK_STATE_ROOT=/var/lib/cloudmcp-exec/termdeck-state\n" in launcher
     assert (
         'os.environ["TERMDECK_STATE_ROOT"] = '
-        "'/var/lib/codexpro-exec/termdeck-state'"
+        "'/var/lib/cloudmcp-exec/termdeck-state'"
     ) in bootstrap
