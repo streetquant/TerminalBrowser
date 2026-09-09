@@ -86,3 +86,80 @@ fi
 /usr/bin/openssl x509 -in "$cert" -noout -ext subjectAltName | /usr/bin/grep -Fq "IP Address:$lan_ip"
 printf '%s\n' "$lan_ip" >"$runtime/current-lan-ip"
 chmod 600 "$runtime/current-lan-ip" "$nginx_root/allowed-hosts.map"
+
+# Keep the LAN runtime receipt derived from the exact files that the service
+# will use.  The receipt is written last, after TLS rotation and host-map
+# generation, so an atomic update can never describe a partial runtime.
+/usr/bin/python3 - "$runtime" "$lan_ip" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+runtime = Path(sys.argv[1]).resolve()
+lan_ip_object = ipaddress.ip_address(sys.argv[2])
+lan_ip = str(lan_ip_object)
+if lan_ip_object.version != 4 or not lan_ip_object.is_private:
+    raise SystemExit(f"TermDeck receipt refused non-private IPv4 address: {lan_ip}")
+
+config = runtime / "nginx" / "nginx.conf"
+listen = re.findall(r"^\s*listen\s+[^;:]+:(\d+)\s+ssl\s*;\s*$", config.read_text(encoding="utf-8"), re.MULTILINE)
+if len(listen) != 1:
+    raise SystemExit("TermDeck receipt requires exactly one TLS listen port")
+https_port = int(listen[0])
+if not 1 <= https_port <= 65535:
+    raise SystemExit(f"TermDeck receipt found invalid HTTPS port: {https_port}")
+
+relative_files = (
+    "bin/termdeck-web-server",
+    "nginx/nginx.conf",
+    "tls/ca.crt",
+    "tls/server-chain.crt",
+    "tls/server.crt",
+)
+files: dict[str, str] = {}
+for relative in relative_files:
+    path = runtime / relative
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise SystemExit(f"TermDeck receipt requires a regular file: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    files[relative] = digest.hexdigest()
+
+receipt = {
+    "files": files,
+    "https_port": https_port,
+    "lan_ip": lan_ip,
+    "ok": True,
+    "schema": "termdeck.lan-runtime-build.v1",
+}
+destination = runtime / "build-receipt.json"
+fd, temporary = tempfile.mkstemp(prefix=".build-receipt.", dir=runtime)
+temporary_path = Path(temporary)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(receipt, stream, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(temporary_path, 0o644)
+    os.replace(temporary_path, destination)
+    directory_fd = os.open(runtime, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    if temporary_path.exists():
+        temporary_path.unlink()
+PY
