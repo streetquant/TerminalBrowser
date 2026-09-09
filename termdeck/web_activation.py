@@ -27,7 +27,9 @@ WATCHDOG_UNIT = "termdeck-web-recovery.service"
 WATCHDOG_TIMEOUT = 120.0
 SERVICES = ("termdeck-web-backend.service", "termdeck-web-lan.service")
 GENERATED_RUNTIME = ("current-lan-ip", "nginx/allowed-hosts.map")
-OLD_RUNTIME = "/8tb/projects/softwares/termdeck/.runtime"
+# Keep the retirement guard independent of the retired disk prefix.
+# The stable suffix still rejects any old source-runtime bind marker.
+OBSOLETE_RUNTIME_MARKER = b"termdeck/.runtime"
 TERMINAL = {"rolled-back", "rollback-failed"}
 MUTATION_PHASES = {
     "mutation-start", "watchdog-installing", "watchdog-armed",
@@ -485,12 +487,12 @@ def prepare(
         _copy(binary, artifacts / "web/termdeck-web-server", 0o755)
         staged_runtime, staged_units = tx / "staged-runtime", tx / "staged-units"
         for relative, (source_path, mode) in _sources(paths, tx).items():
-            if OLD_RUNTIME.encode() in source_path.read_bytes():
+            if OBSOLETE_RUNTIME_MARKER in source_path.read_bytes():
                 raise WebActivationError(f"obsolete runtime marker in {relative}")
             _copy(source_path, staged_runtime / relative, mode)
         for unit in SERVICES:
             source_path = paths.target / "deploy/systemd" / unit
-            if OLD_RUNTIME.encode() in source_path.read_bytes():
+            if OBSOLETE_RUNTIME_MARKER in source_path.read_bytes():
                 raise WebActivationError(f"obsolete runtime marker in {unit}")
             _copy(source_path, staged_units / unit, 0o644)
         _atomic(staged_units / WATCHDOG_UNIT, _watchdog_unit(paths, tx).encode(), 0o644)
