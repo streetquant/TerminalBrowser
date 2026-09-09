@@ -26,7 +26,11 @@ SCHEMA = "termdeck.web-activation.v2"
 WATCHDOG_UNIT = "termdeck-web-recovery.service"
 WATCHDOG_TIMEOUT = 120.0
 SERVICES = ("termdeck-web-backend.service", "termdeck-web-lan.service")
-GENERATED_RUNTIME = ("current-lan-ip", "nginx/allowed-hosts.map")
+GENERATED_RUNTIME = (
+    "current-lan-ip",
+    "nginx/allowed-hosts.map",
+    "build-receipt.json",
+)
 # Keep the retirement guard independent of the retired disk prefix.
 # The stable suffix still rejects any old source-runtime bind marker.
 OBSOLETE_RUNTIME_MARKER = b"termdeck/.runtime"
@@ -802,4 +806,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
