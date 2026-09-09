@@ -3,6 +3,7 @@ Description=Temporary Cloudflare Quick Tunnel preview for TermDeck
 Documentation=https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/
 Wants=network-online.target termdeck-web-lan.service
 After=network-online.target termdeck-web-lan.service
+RequiresMountsFor=/warp
 StartLimitIntervalSec=0
 
 [Service]
@@ -11,7 +12,7 @@ Environment=HOME=/home/arch
 Environment=USER=max
 Environment=LOGNAME=max
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-ExecStart=/var/lib/cloudmcp-exec/termdeck-runtime/termdeck-lan/bin/termdeck-cloudflare-preview
+ExecStart=/warp/runtime/termdeck/termdeck-lan/bin/termdeck-cloudflare-preview
 Restart=always
 RestartSec=5s
 TimeoutStartSec=45s
@@ -27,7 +28,7 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/var/lib/cloudmcp-exec/termdeck-runtime/termdeck-lan
+ReadWritePaths=/warp/runtime/termdeck/termdeck-lan
 LimitNOFILE=65536
 TasksMax=1024
 MemoryHigh=512M

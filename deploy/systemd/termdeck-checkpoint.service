@@ -2,13 +2,13 @@
 Description=Persist TermDeck sessions before the user manager stops
 Documentation=https://github.com/Rebel0789/t1000
 After=user@1000.service local-fs.target
-RequiresMountsFor="/var/lib/cloudmcp-exec/termdeck-state" "/var/lib/cloudmcp-exec/termdeck-runtime"
+RequiresMountsFor=/warp "/warp/state/termdeck" "/warp/runtime/termdeck"
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/bin/true
-ExecStop=-/usr/bin/runuser -u max -- /usr/bin/env HOME="/var/lib/cloudmcp-exec/termdeck-state" PATH="/var/lib/cloudmcp-exec/codex-state-project-homes/runtime/t1000-managed:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin" /usr/bin/python3.14 -I -B "/var/lib/cloudmcp-exec/codex-state-project-homes/runtime/t1000-managed/bootstrap.py" checkpoint --all
+ExecStop=-/usr/bin/runuser -u max -- /usr/bin/env HOME="/warp/state/termdeck" PATH="/warp/runtime/termdeck/t1000-managed:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin" /usr/bin/python3.14 -I -B "/warp/runtime/termdeck/t1000-managed/bootstrap.py" checkpoint --all
 TimeoutStopSec=15min
 StandardOutput=journal
 StandardError=journal

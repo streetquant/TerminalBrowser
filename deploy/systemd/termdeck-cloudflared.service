@@ -3,6 +3,7 @@ Description=Cloudflare Tunnel for TermDeck
 Documentation=https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
 Wants=network-online.target termdeck-web-lan.service
 After=network-online.target termdeck-web-lan.service
+RequiresMountsFor=/warp
 StartLimitIntervalSec=0
 
 [Service]
@@ -11,7 +12,7 @@ Environment=HOME=/home/arch
 Environment=USER=max
 Environment=LOGNAME=max
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/cloudflared --config /home/arch/.cloudflared/termdeck.yml --no-autoupdate tunnel run
+ExecStart=/usr/bin/cloudflared --config /warp/runtime/termdeck/cloudflared/termdeck.yml --no-autoupdate tunnel run
 Restart=always
 RestartSec=3s
 TimeoutStartSec=45s

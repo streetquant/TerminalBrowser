@@ -43,6 +43,19 @@ def test_activation_defaults_bind_canonical_state_root(
     assert paths.database == state_root / "sessions.sqlite3"
 
 
+def test_activation_defaults_bind_warp_recovery_evidence_root(tmp_path: Path) -> None:
+    paths = activation.ActivationPaths.defaults(
+        target=tmp_path / "source",
+        runtime=tmp_path / "runtime",
+        database=tmp_path / "sessions.sqlite3",
+        managed_root=tmp_path / "managed",
+        managed_bin=tmp_path / "bin",
+        unit_dir=tmp_path / "units",
+    )
+
+    assert paths.evidence == Path("/warp/recovery/termdeck-migration/activation-v2")
+
+
 def test_transaction_pointer_and_receipt_exist_before_build(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     tx, receipt = activation.new_transaction(

@@ -5,7 +5,7 @@
   "service": "https://127.0.0.1:7443",
   "originRequest": {
     "originServerName": "termdeck.local",
-    "caPool": "/var/lib/cloudmcp-exec/termdeck-runtime/termdeck-lan/tls/ca.crt",
+    "caPool": "/warp/runtime/termdeck/termdeck-lan/tls/ca.crt",
     "httpHostHeader": "maxchat.semiotech.org",
     "connectTimeout": "5s",
     "tlsTimeout": "5s",

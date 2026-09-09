@@ -5754,19 +5754,32 @@ def test_canonical_managed_root_forces_production_intent_and_ignores_xdg_data(
     expected = home / ".local/state/codex-project-homes/runtime/t1000-managed"
     assert default_managed_root() == expected
     assert default_layout.root == expected
-    assert release_manager._resolve_production_intent(default_layout, None) is True
-    assert release_manager._resolve_production_intent(default_layout, False) is True
+    assert release_manager._canonical_source_root() == Path(
+        "/warp/projects/software/termdeck"
+    )
+    assert release_manager._canonical_managed_root() == Path(
+        "/warp/runtime/termdeck/t1000-managed"
+    )
+    assert release_manager._resolve_production_intent(default_layout, None) is False
+    assert release_manager._resolve_production_intent(default_layout, False) is False
     assert release_manager._resolve_production_intent(default_layout, True) is True
     expected.mkdir(parents=True)
     alias = tmp_path / "managed-alias"
     alias.symlink_to(expected, target_is_directory=True)
     alias_layout = release_layout(root=alias, bin_dir=tmp_path / "alias-bin")
-    assert release_manager._resolve_production_intent(alias_layout, None) is True
-    bind_alias = tmp_path / "bind-alias"
-    bind_alias.mkdir()
-    bind_layout = release_layout(root=bind_alias, bin_dir=tmp_path / "bind-bin")
-    with mock.patch.object(Path, "samefile", return_value=True):
-        assert release_manager._resolve_production_intent(bind_layout, None) is True
+    assert release_manager._resolve_production_intent(alias_layout, None) is False
+    source_layout = release_layout(
+        root=release_manager._canonical_source_root(),
+        bin_dir=tmp_path / "source-bin",
+    )
+    assert release_manager._resolve_production_intent(source_layout, None) is False
+    assert release_manager._resolve_production_intent(source_layout, False) is False
+    canonical_layout = release_layout(
+        root=release_manager._canonical_managed_root(),
+        bin_dir=tmp_path / "canonical-bin",
+    )
+    assert release_manager._resolve_production_intent(canonical_layout, None) is True
+    assert release_manager._resolve_production_intent(canonical_layout, False) is True
     isolated_layout = release_layout(root=tmp_path / "isolated", bin_dir=tmp_path / "bin")
     assert release_manager._resolve_production_intent(isolated_layout, None) is False
     assert release_manager._resolve_production_intent(isolated_layout, False) is False
@@ -5784,8 +5797,11 @@ def test_default_managed_root_honors_supplied_home_mapping(
     assert default_managed_root(env={"HOME": str(supplied_home)}) == (
         supplied_home / ".local/state/codex-project-homes/runtime/t1000-managed"
     )
-    assert release_manager._canonical_managed_root() == (
-        process_home / ".local/state/codex-project-homes/runtime/t1000-managed"
+    assert release_manager._canonical_source_root() == Path(
+        "/warp/projects/software/termdeck"
+    )
+    assert release_manager._canonical_managed_root() == Path(
+        "/warp/runtime/termdeck/t1000-managed"
     )
 
 
@@ -6594,15 +6610,15 @@ def test_semantic_runtime_snapshot_ignores_transient_client_identity(tmp_path: P
 
 def test_deployment_managed_launcher_binds_canonical_termdeck_state_root() -> None:
     layout = release_layout(
-        root="/var/lib/cloudmcp-exec/codex-state-project-homes/runtime/t1000-managed",
+        root="/warp/runtime/termdeck/t1000-managed",
         bin_dir="/tmp/termdeck-test-bin",
     )
     python = Path("/usr/bin/python3.14")
     launcher = _launcher_source(layout, python).decode("utf-8")
     bootstrap = _bootstrap_source(layout, python).decode("utf-8")
 
-    assert "export TERMDECK_STATE_ROOT=/var/lib/cloudmcp-exec/termdeck-state\n" in launcher
+    assert "export TERMDECK_STATE_ROOT=/warp/state/termdeck\n" in launcher
     assert (
         'os.environ["TERMDECK_STATE_ROOT"] = '
-        "'/var/lib/cloudmcp-exec/termdeck-state'"
+        "'/warp/state/termdeck'"
     ) in bootstrap

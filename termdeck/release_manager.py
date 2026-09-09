@@ -109,9 +109,12 @@ _MANAGED_BIN_DIR_ENV = "T1000_MANAGED_BIN_DIR"
 # web service, and auth-scope defaults on one database without copying or
 # merging an alternate registry.
 _DEPLOYMENT_MANAGED_ROOT = Path(
-    "/var/lib/cloudmcp-exec/codex-state-project-homes/runtime/t1000-managed"
+    "/warp/runtime/termdeck/t1000-managed"
 )
-_DEPLOYMENT_STATE_ROOT = Path("/var/lib/cloudmcp-exec/termdeck-state")
+_DEPLOYMENT_STATE_ROOT = Path("/warp/state/termdeck")
+# The source checkout is the deployment's canonical release identity. The
+# managed release files remain under _DEPLOYMENT_MANAGED_ROOT.
+_CANONICAL_SOURCE_ROOT = Path("/warp/projects/software/termdeck")
 _UUID = re.compile(
     r"(?<![0-9a-f])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])",
     re.IGNORECASE,
@@ -493,8 +496,16 @@ def release_layout(
     )
 
 
+def _canonical_source_root() -> Path:
+    """Return the immutable source/build identity for the MaxCloud checkout."""
+
+    return _CANONICAL_SOURCE_ROOT.resolve(strict=False)
+
+
 def _canonical_managed_root() -> Path:
-    return Path(default_managed_root(env={})).expanduser().absolute()
+    """Return the mutable managed-release root for the MaxCloud deployment."""
+
+    return _DEPLOYMENT_MANAGED_ROOT.resolve(strict=False)
 
 
 def _default_release_root(*, env: Mapping[str, str] | None = None) -> Path:

@@ -62,7 +62,7 @@ class ActivationPaths:
     def defaults(cls, **overrides: Path | None) -> "ActivationPaths":
         source = Path(overrides.get("target") or Path(__file__).resolve().parents[1]).resolve()
         state_root = Path(
-            os.environ.get("TERMDECK_STATE_ROOT", "/var/lib/cloudmcp-exec/termdeck-state")
+            os.environ.get("TERMDECK_STATE_ROOT", "/warp/state/termdeck")
         ).expanduser()
         if not state_root.is_absolute():
             raise WebActivationError("TERMDECK_STATE_ROOT must be an absolute path")
@@ -73,11 +73,11 @@ class ActivationPaths:
             raise WebActivationError("activation database must be an absolute path")
         return cls(
             source,
-            Path(overrides.get("evidence") or "/var/lib/cloudmcp-exec/recovery/project-warp-move-20260905T161606Z/termdeck-move-20260907/activation-v2").resolve(),
-            Path(overrides.get("runtime") or "/var/lib/cloudmcp-exec/termdeck-runtime/termdeck-lan").resolve(),
+            Path(overrides.get("evidence") or "/warp/recovery/termdeck-migration/activation-v2").resolve(),
+            Path(overrides.get("runtime") or "/warp/runtime/termdeck/termdeck-lan").resolve(),
             database.resolve(),
-            Path(overrides.get("managed_root") or "/var/lib/cloudmcp-exec/codex-state-project-homes/runtime/t1000-managed").resolve(),
-            Path(overrides.get("managed_bin") or "/home/arch/.local/bin").resolve(),
+            Path(overrides.get("managed_root") or "/warp/runtime/termdeck/t1000-managed").resolve(),
+            Path(overrides.get("managed_bin") or "/warp/runtime/termdeck/bin").resolve(),
             Path(overrides.get("unit_dir") or "/home/arch/.config/systemd/user").resolve(),
         )
 

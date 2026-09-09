@@ -119,8 +119,8 @@ class DesktopIntegrationTests(unittest.TestCase):
 
     def test_autostart_entry_uses_only_managed_launcher(self):
         entry = build_autostart_entry()
-        self.assertIn("Exec=/home/arch/.local/bin/t1000 gui", entry)
-        self.assertIn("TryExec=/home/arch/.local/bin/t1000", entry)
+        self.assertIn("Exec=/warp/runtime/termdeck/bin/t1000 gui", entry)
+        self.assertIn("TryExec=/warp/runtime/termdeck/bin/t1000", entry)
         self.assertIn("X-T1000-Storage-Policy=direct-root", entry)
         self.assertIn("X-T1000-Fail-Closed=true", entry)
         self.assertNotIn("sh -c", entry)
@@ -129,10 +129,10 @@ class DesktopIntegrationTests(unittest.TestCase):
 
     def test_autostart_entry_ignores_menu_override_and_uses_stable_launcher(self):
         plan = build_install_plan(command="/opt/custom/t1000 --profile desktop")
-        self.assertIn("Exec=/home/arch/.local/bin/t1000 gui", plan.autostart_entry)
-        self.assertIn("TryExec=/home/arch/.local/bin/t1000", plan.autostart_entry)
+        self.assertIn("Exec=/warp/runtime/termdeck/bin/t1000 gui", plan.autostart_entry)
+        self.assertIn("TryExec=/warp/runtime/termdeck/bin/t1000", plan.autostart_entry)
         self.assertIn(
-            "X-T1000-Managed-Launcher=/home/arch/.local/bin/t1000",
+            "X-T1000-Managed-Launcher=/warp/runtime/termdeck/bin/t1000",
             plan.autostart_entry,
         )
         self.assertNotIn("/opt/custom/t1000", plan.autostart_entry)
@@ -396,7 +396,7 @@ class DesktopIntegrationTests(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertTrue(plan.paths.autostart_file.exists())
             self.assertEqual(plan.paths.autostart_file.stat().st_mode & 0o777, 0o644)
-            self.assertIn("Exec=/home/arch/.local/bin/t1000 gui", plan.paths.autostart_file.read_text())
+            self.assertIn("Exec=/warp/runtime/termdeck/bin/t1000 gui", plan.paths.autostart_file.read_text())
             removed = uninstall_desktop(config_home=config, data_home=tmp, remove_autostart=True)
             self.assertIn(str(plan.paths.autostart_file), removed["removed"])
             self.assertFalse(plan.paths.autostart_file.exists())

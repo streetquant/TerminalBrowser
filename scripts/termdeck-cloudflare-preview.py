@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-RUNTIME = Path("/var/lib/cloudmcp-exec/termdeck-runtime/termdeck-lan")
+RUNTIME = Path("/warp/runtime/termdeck/termdeck-lan")
 URL_FILE = RUNTIME / "cloudflare-preview-url.json"
 EMPTY_CONFIG = RUNTIME / "cloudflare-preview-empty.yml"
 URL_PATTERN = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
