@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from termdeck.codex_config_scope import (
@@ -636,6 +637,46 @@ class CodexConfigScopeTests(unittest.TestCase):
                 )
 
             self.assertEqual(resolved, user_launcher.resolve())
+
+    def test_managed_launcher_attestation_matches_shipped_helper_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_home = root / "user"
+            private = root / "private"
+            bin_dir = user_home / ".local" / "bin"
+            libexec_dir = user_home / ".local" / "libexec"
+            bin_dir.mkdir(parents=True)
+            libexec_dir.mkdir(parents=True)
+            private.mkdir()
+            launcher = bin_dir / "codex-contained-user"
+            entry = bin_dir / "codex"
+            helper = libexec_dir / "codex-contained-user.sh"
+            launcher.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -Eeuo pipefail\n"
+                f"exec {helper} \"$@\"\n",
+                encoding="utf-8",
+            )
+            launcher.chmod(0o700)
+            entry.symlink_to(launcher)
+            helper.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -Eeuo pipefail\n"
+                "resolver=\"${CODEX_CANONICAL_WORKSPACE_HELPER:-resolver}\"\n"
+                "scope_helper=\"${CODEX_RUNTIME_SCOPE_HELPER:-scope}\"\n"
+                "vendor_root=\"${CODEX_VENDOR_RUNTIME_ROOT:-vendor}\"\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o700)
+            with (
+                mock.patch(
+                    "termdeck.codex_config_scope.pwd.getpwuid",
+                    return_value=SimpleNamespace(pw_dir=str(user_home)),
+                ),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                resolved = resolve_codex_launcher(private, user_home=user_home)
+            self.assertEqual(resolved, launcher.resolve())
 
     def test_unattested_executable_named_codex_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

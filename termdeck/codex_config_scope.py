@@ -208,9 +208,9 @@ def _is_managed_codex_launcher(
     return (
         os.fsencode(expected_helper) in launcher
         and helper.startswith(b"#!/usr/bin/env bash\nset -Eeuo pipefail\n")
-        and b"CODEX_SSD_WORKSPACE_HELPER" in helper
+        and b"CODEX_CANONICAL_WORKSPACE_HELPER" in helper
         and b"CODEX_RUNTIME_SCOPE_HELPER" in helper
-        and b"vendor_runtime_root" in helper
+        and b"CODEX_VENDOR_RUNTIME_ROOT" in helper
     )
 
 
