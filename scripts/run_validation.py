@@ -941,6 +941,7 @@ def _quarantine_remove_task_runtime(
     else:
         try:
             if stat.S_ISDIR(observed.st_mode) and not stat.S_ISLNK(observed.st_mode):
+                _make_quarantined_runtime_tree_removable(quarantine)
                 shutil.rmtree(quarantine)
             else:
                 quarantine.unlink()
@@ -958,6 +959,63 @@ def _quarantine_remove_task_runtime(
     else:
         result["state"] = "quarantined"
     return result
+
+
+def _make_quarantined_runtime_tree_removable(root: Path) -> None:
+    """Open only owned directories inside an authenticated runtime for removal.
+
+    Release verification intentionally freezes its disposable managed-release
+    directories. Once the enclosing task runtime has been authenticated and
+    renamed into its private quarantine, those read-only descendants must not
+    make cleanup fail after the task itself has already succeeded. This walk
+    changes permissions only on owned directories below that quarantined root;
+    it never follows directory symlinks or broadens the cleanup target.
+    """
+
+    def _raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for current, directories, _files in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+        onerror=_raise_walk_error,
+    ):
+        current_path = Path(current)
+        current_metadata = current_path.lstat()
+        if (
+            stat.S_ISLNK(current_metadata.st_mode)
+            or not stat.S_ISDIR(current_metadata.st_mode)
+            or current_metadata.st_uid != os.geteuid()
+        ):
+            raise PermissionError(
+                f"quarantined runtime directory is not owned by the validator: {current_path}"
+            )
+        current_mode = stat.S_IMODE(current_metadata.st_mode)
+        required_mode = current_mode | stat.S_IWUSR | stat.S_IXUSR
+        if required_mode != current_mode:
+            current_path.chmod(required_mode)
+
+        # os.walk enters children after yielding the parent. Make owned
+        # children traversable before that happens, while excluding symlinks
+        # from both mutation and recursion.
+        for name in tuple(directories):
+            child = current_path / name
+            child_metadata = child.lstat()
+            if stat.S_ISLNK(child_metadata.st_mode):
+                directories.remove(name)
+                continue
+            if not stat.S_ISDIR(child_metadata.st_mode):
+                directories.remove(name)
+                continue
+            if child_metadata.st_uid != os.geteuid():
+                raise PermissionError(
+                    f"quarantined runtime directory is not owned by the validator: {child}"
+                )
+            child_mode = stat.S_IMODE(child_metadata.st_mode)
+            child_required_mode = child_mode | stat.S_IWUSR | stat.S_IXUSR
+            if child_required_mode != child_mode:
+                child.chmod(child_required_mode)
 
 
 def _task_runtime_reaper_cursor(

@@ -406,6 +406,40 @@ def test_ci_xvfb_environment_uses_portable_private_runtime_and_cleans_after_task
     assert not runtime.path.exists()
 
 
+def test_cleanup_task_runtime_removes_owned_readonly_descendants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = tmp_path / "short-runtime-base"
+    base.mkdir(mode=0o700)
+    monkeypatch.setenv(runner._TASK_RUNTIME_BASE_ENV, str(base))
+    monkeypatch.setattr(runner, "_TASK_RUNTIME_MAX_PATH_BYTES", 4096)
+    runtime = runner._create_short_task_runtime(tmp_path / "work")
+    frozen = runtime.path / "t" / "pytest-of-user" / "managed" / "releases" / "release"
+    frozen.mkdir(parents=True)
+    (frozen / "artifact").write_text("disposable\n", encoding="utf-8")
+    for directory in reversed(frozen.parents):
+        if directory != runtime.path and runtime.path in directory.parents:
+            directory.chmod(0o555)
+    frozen.chmod(0o555)
+
+    try:
+        cleanup = runner._cleanup_task_runtime(runtime)
+        assert cleanup["cleanup_ok"] is True, cleanup
+        assert not runtime.path.exists()
+    finally:
+        if runtime.path.exists():
+            for current, directories, _files in os.walk(
+                runtime.path, topdown=True, followlinks=False
+            ):
+                Path(current).chmod(0o755)
+                for name in directories:
+                    child = Path(current) / name
+                    if not child.is_symlink():
+                        child.chmod(0o755)
+            shutil.rmtree(runtime.path, ignore_errors=True)
+
+
 def test_validation_child_environment_excludes_ambient_secrets_and_shell_injection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
