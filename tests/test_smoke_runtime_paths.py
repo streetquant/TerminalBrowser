@@ -177,7 +177,7 @@ def test_ci_private_validation_runtime_does_not_require_warp_drives(
     def reject_storage(**_kwargs: object) -> None:
         raise AssertionError("CI must not require Warp Drives")
 
-    monkeypatch.setattr(storage_fabric, "require_hot_storage", reject_storage)
+    monkeypatch.setattr(storage_fabric, "attest_storage_fabric", reject_storage)
 
     assert require_private_validation_runtime() == runtime
 
@@ -198,10 +198,14 @@ def test_private_validation_runtime_requires_verified_ssd(
 
     import termdeck.storage_fabric as storage_fabric
 
-    def reject_storage(**_kwargs: object) -> None:
-        raise RuntimeError("rotational backing device")
+    class RejectedAttestation:
+        def require(self) -> object:
+            raise RuntimeError("rotational backing device")
 
-    monkeypatch.setattr(storage_fabric, "require_hot_storage", reject_storage)
+    def reject_storage(**_kwargs: object) -> RejectedAttestation:
+        return RejectedAttestation()
+
+    monkeypatch.setattr(storage_fabric, "attest_storage_fabric", reject_storage)
 
     with pytest.raises(RuntimeError, match="not verified Warp Drives SSD storage"):
         require_private_validation_runtime()
@@ -228,10 +232,15 @@ def test_private_validation_runtime_returns_verified_directory(
 
     observed: dict[str, object] = {}
 
-    def accept_storage(**kwargs: object) -> None:
-        observed.update(kwargs)
+    class AcceptedAttestation:
+        def require(self) -> object:
+            return self
 
-    monkeypatch.setattr(storage_fabric, "require_hot_storage", accept_storage)
+    def accept_storage(**kwargs: object) -> AcceptedAttestation:
+        observed.update(kwargs)
+        return AcceptedAttestation()
+
+    monkeypatch.setattr(storage_fabric, "attest_storage_fabric", accept_storage)
 
     assert require_private_validation_runtime() == runtime
     assert observed["managed_root"] == runtime

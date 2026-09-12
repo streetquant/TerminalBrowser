@@ -37,7 +37,9 @@ def main() -> int:
     tempfile_root = Path(tempfile.gettempdir()).resolve()
     runtime_base = require_private_validation_runtime()
     with tempfile.TemporaryDirectory(
-        prefix=".termdeck-clipboard-tmux-",
+        # Keep the tmux socket path below the AF_UNIX pathname limit even
+        # when the runner's private runtime is nested under a task directory.
+        prefix="tdcb-",
         dir=runtime_base,
     ) as tmux_tmp_name, tempfile.TemporaryDirectory(
         prefix="termdeck-clipboard-paste-"
@@ -45,6 +47,11 @@ def main() -> int:
         root = Path(tmp)
         home = root / "home"
         tmux_tmp = Path(tmux_tmp_name)
+        socket_path = tmux_tmp / f"tmux-{os.geteuid()}" / "default"
+        if len(os.fsencode(socket_path)) >= 108:
+            raise AssertionError(
+                f"tmux socket path exceeds the AF_UNIX budget: {socket_path}"
+            )
         project = root / "clipboard-project"
         home.mkdir()
         tmux_tmp.chmod(0o700)
