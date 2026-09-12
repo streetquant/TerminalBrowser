@@ -97,6 +97,9 @@ def test_actual_manifest_is_canonical_and_covers_exact_inventory() -> None:
     managed = entries["scripts/check_managed_process_inventory_smoke.py"]
     assert managed["profiles"] == ["production"]
     assert managed["environment"] == "production-host"
+    lifecycle = entries["scripts/check_tmux_server_lifecycle_smoke.py"]
+    assert lifecycle["profiles"] == ["production"]
+    assert lifecycle["environment"] == "production-host"
     contained = entries["scripts/check_contained_resize_smoke.py"]
     assert contained["profiles"] == ["ci", "production"]
     assert contained["environment"] == "xvfb-dbus"
@@ -106,7 +109,7 @@ def test_actual_manifest_is_canonical_and_covers_exact_inventory() -> None:
     assert web["environment"] == "xvfb-dbus"
     assert web["timeout_seconds"] == 600
     for path, entry in entries.items():
-        if path == managed["path"]:
+        if path in {managed["path"], lifecycle["path"]}:
             continue
         assert entry["profiles"] == ["ci", "production"]
         assert entry["environment"] == "xvfb-dbus"
@@ -129,10 +132,10 @@ def test_profile_selection_is_closed_and_complete() -> None:
         discovered_tests=tests,
     )
     assert ci_tests == production_tests == tests
-    assert len(ci_smokes) == 24
+    assert len(ci_smokes) == 23
     assert len(production_smokes) == 25
     assert all(entry["environment"] == "xvfb-dbus" for entry in ci_smokes)
-    assert sum(entry["environment"] == "production-host" for entry in production_smokes) == 1
+    assert sum(entry["environment"] == "production-host" for entry in production_smokes) == 2
 
 
 def test_manifest_rejects_inventory_drift_duplicates_and_unsafe_paths(tmp_path: Path) -> None:

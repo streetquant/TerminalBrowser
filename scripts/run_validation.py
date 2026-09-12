@@ -33,7 +33,17 @@ _RECEIPT_SCHEMA = "t1000.validation-receipt.v1"
 _RUNNING_SCHEMA = "t1000.validation-running.v1"
 _PROFILES = ("ci", "production")
 _ENVIRONMENTS = ("production-host", "xvfb-dbus")
-_PRODUCTION_ONLY_SMOKE = "scripts/check_managed_process_inventory_smoke.py"
+# These smokes inspect or exercise the real per-user systemd manager.  Running
+# them inside the disposable ``dbus-run-session`` used by portable GUI smokes
+# intentionally hides the host manager and turns a supported host capability
+# into a misleading skip.  Keep the host-only set explicit so the manifest
+# cannot silently place a systemd-dependent smoke back in the isolated class.
+_PRODUCTION_HOST_SMOKES = frozenset(
+    {
+        "scripts/check_managed_process_inventory_smoke.py",
+        "scripts/check_tmux_server_lifecycle_smoke.py",
+    }
+)
 _TOP_LEVEL_KEYS = {"limits", "profiles", "schema", "smokes", "tests"}
 _TEST_KEYS = {"pattern", "profiles", "timeout_seconds"}
 _LIMIT_KEYS = {
@@ -384,9 +394,11 @@ def validate_manifest_payload(
         environment = entry.get("environment")
         if environment not in _ENVIRONMENTS:
             raise ValidationError(f"smoke entry {index} has an unknown environment")
-        if relative == _PRODUCTION_ONLY_SMOKE:
+        if relative in _PRODUCTION_HOST_SMOKES:
             if entry_profiles != ["production"] or environment != "production-host":
-                raise ValidationError("managed process inventory must be production-host only")
+                raise ValidationError(
+                    f"host capability smoke {relative} must be production-host only"
+                )
         elif entry_profiles != list(_PROFILES) or environment != "xvfb-dbus":
             raise ValidationError(
                 f"portable smoke {relative} must run in ci and production via xvfb-dbus"
