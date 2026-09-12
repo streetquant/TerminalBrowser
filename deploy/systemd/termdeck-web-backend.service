@@ -1,7 +1,8 @@
 [Unit]
 Description=TermDeck authenticated web backend
 Wants=network-online.target
-After=network-online.target
+After=warp.mount network-online.target
+ConditionPathIsMountPoint=/warp
 RequiresMountsFor=/warp /warp/runtime/termdeck/termdeck-lan /warp/state/termdeck
 StartLimitIntervalSec=0
 

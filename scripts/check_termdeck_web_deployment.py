@@ -24,6 +24,8 @@ checks={
  'dynamic_rfc1918':all(x in texts['prepare'] for x in ('ip -4 route get','192.168.0.0/16','subjectAltName')),
  'persistent_backend':'Restart=always' in texts['backend'] and 'WantedBy=default.target' in texts['backend'],
  'persistent_proxy':'Restart=always' in texts['lan'] and 'WantedBy=default.target' in texts['lan'],
+ 'warp_mount_guard':'ConditionPathIsMountPoint=/warp' in texts['backend'] and 'ConditionPathIsMountPoint=/warp' in texts['lan'],
+ 'warp_mount_order':'After=warp.mount' in texts['backend'] and 'After=warp.mount' in texts['lan'],
  'noncascading_web_restart':'Requires=termdeck-web-backend.service' not in texts['lan'],
  'noncascading_cloudflare_restart':'Requires=termdeck-web-lan.service' not in texts['preview'] and 'Requires=termdeck-web-lan.service' not in (ROOT/'deploy/systemd/termdeck-cloudflared.service').read_text(errors='strict'),
  'quick_tunnel_isolated':'cloudflare-preview-empty.yml' in texts['preview'] and 'trycloudflare' in texts['preview'],

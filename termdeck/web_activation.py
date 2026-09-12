@@ -393,9 +393,23 @@ def _watchdog_unit(paths: ActivationPaths, tx: Path) -> str:
             paths.managed_bin,
         )
     )
+    required_mounts = " ".join(
+        str(path)
+        for path in (
+            Path("/warp"),
+            paths.target,
+            paths.evidence,
+            paths.runtime,
+            paths.database.parent,
+            paths.managed_root,
+            paths.managed_bin,
+        )
+    )
     return f"""[Unit]
 Description=TermDeck web activation recovery watchdog
-After=default.target
+After=warp.mount default.target
+ConditionPathIsMountPoint=/warp
+RequiresMountsFor={required_mounts}
 
 [Service]
 Type=simple

@@ -157,6 +157,9 @@ def test_watchdog_is_armed_as_a_separate_user_unit(tmp_path: Path) -> None:
     assert "termdeck-web-recovery.service" not in "\n".join(activation.SERVICES)
     assert "--watchdog --transaction" in unit
     assert str(tmp_path / "evidence" / "tx-1") in unit
+    assert "After=warp.mount default.target" in unit
+    assert "ConditionPathIsMountPoint=/warp" in unit
+    assert "RequiresMountsFor=/warp" in unit
     assert "Restart=no" in unit
     assert "CODEX_BULK_STORAGE_MASKED" not in unit
     assert "warp-drives-v1" not in unit
@@ -213,6 +216,18 @@ def test_custom_watchdog_command_and_write_scope_are_complete(tmp_path: Path) ->
         paths.managed_bin,
     ):
         assert str(path) in read_write_paths
+
+    required_mounts = set(shlex.split(properties["RequiresMountsFor"]))
+    for path in (
+        Path("/warp"),
+        paths.target,
+        paths.evidence,
+        paths.runtime,
+        paths.database.parent,
+        paths.managed_root,
+        paths.managed_bin,
+    ):
+        assert str(path) in required_mounts
     assert "ProtectSystem=strict" in unit
 
 
@@ -492,4 +507,3 @@ def test_execute_publishes_units_before_stopping_web_services(
     final = activation._read(tx / "receipt.json")
     assert final["status"] == "activated"
     assert final["service_units_published"] is True
-

@@ -1,7 +1,8 @@
 [Unit]
 Description=TermDeck LAN HTTPS, WebSocket and prefixed Cloudflare proxy
 Wants=network-online.target termdeck-web-backend.service
-After=network-online.target termdeck-web-backend.service
+After=warp.mount network-online.target termdeck-web-backend.service
+ConditionPathIsMountPoint=/warp
 RequiresMountsFor=/warp /warp/runtime/termdeck/termdeck-lan
 StartLimitIntervalSec=0
 
