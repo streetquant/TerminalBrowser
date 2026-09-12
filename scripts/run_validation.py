@@ -21,6 +21,13 @@ import time
 from typing import Any, Mapping, Sequence
 import uuid
 
+# Running this file by path places only ``scripts`` on ``sys.path``.  Pin the
+# validation runner to the checkout before any production preflight imports
+# TermDeck so that its storage and release checks exercise this exact source.
+_REPOSITORY = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY))
+
 _MANIFEST_SCHEMA = "t1000.validation-manifest.v1"
 _RECEIPT_SCHEMA = "t1000.validation-receipt.v1"
 _RUNNING_SCHEMA = "t1000.validation-running.v1"
