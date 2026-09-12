@@ -220,9 +220,32 @@ finally:
 """,
                 encoding="utf-8",
             )
-            record = window.current_record()
+            # Clipboard ownership can briefly disturb the notebook's current
+            # page while GTK drains the portal callbacks. Resolve the session
+            # from the already-selected terminal widget and restore that page
+            # before routing the first-key assertion.
+            attach_session_id = next(
+                (
+                    session_id
+                    for session_id, tab in window.tabs.items()
+                    if tab.widget is attach
+                ),
+                None,
+            )
+            if attach_session_id is None:
+                raise AssertionError("clipboard terminal disappeared before keyboard routing")
+            attach_page = window.notebook.page_num(attach)
+            if attach_page < 0:
+                raise AssertionError("clipboard terminal page disappeared before keyboard routing")
+            if window.current_session_id() != attach_session_id:
+                window.notebook.set_current_page(attach_page)
+                _drain_gtk(
+                    Gtk,
+                    until=lambda: window.current_session_id() == attach_session_id,
+                )
+            record = app.store.get(attach_session_id)
             if record is None:
-                raise AssertionError("no current record was available for keyboard routing")
+                raise AssertionError("clipboard terminal record disappeared before keyboard routing")
             _drain_gtk(Gtk, until=lambda: stream_ready(attach))
             command = shlex.join(
                 [
