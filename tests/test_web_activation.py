@@ -136,6 +136,20 @@ def test_process_observation_records_natural_exit_without_failing(monkeypatch: p
     assert result["disappeared"] == [{"comm": "codex", "pid": 10, "start_ticks": 3}]
 
 
+def test_process_snapshot_observes_only_agent_independent_runtime_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(returncode=1, stdout="")
+
+    monkeypatch.setattr(activation, "_run", fake_run)
+
+    assert activation.process_snapshot() == []
+    observed_names = [command[-1] for command in calls]
+    assert observed_names == ["tmux", "t1000"]
+
+
 def test_watchdog_is_armed_as_a_separate_user_unit(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     unit = activation._watchdog_unit(paths, tmp_path / "evidence" / "tx-1")

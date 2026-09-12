@@ -26,6 +26,9 @@ SCHEMA = "termdeck.web-activation.v2"
 WATCHDOG_UNIT = "termdeck-web-recovery.service"
 WATCHDOG_TIMEOUT = 120.0
 SERVICES = ("termdeck-web-backend.service", "termdeck-web-lan.service")
+# Activation receipts observe stable TermDeck runtime processes only. Model and
+# client executables remain opaque and are handled by session metadata.
+PROCESS_OBSERVATION_NAMES = ("tmux", "t1000")
 GENERATED_RUNTIME = (
     "current-lan-ip",
     "nginx/allowed-hosts.map",
@@ -309,7 +312,7 @@ def verify_database(paths: ActivationPaths, tx: Path, before: Mapping[str, objec
 
 def process_snapshot() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    for name in ("tmux", "t1000", "codex", "codex-pro", "codex-cli"):
+    for name in PROCESS_OBSERVATION_NAMES:
         result = _run(["/usr/bin/pgrep", "-x", name], timeout=10, check=False)
         if result.returncode not in (0, 1):
             raise WebActivationError(f"process observation failed for {name}")
