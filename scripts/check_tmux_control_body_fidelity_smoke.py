@@ -47,9 +47,9 @@ def _wait_until(predicate, *, timeout: float = 5.0) -> None:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="termdeck-control-body-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="tdcb-") as tmp:
         root = Path(tmp)
-        socket = f"termdeck-control-body-{root.name}"
+        socket = root.name
         worker = root / "writer.py"
         worker.write_text(
             "import sys, time\n"

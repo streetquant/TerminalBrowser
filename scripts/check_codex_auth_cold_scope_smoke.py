@@ -16,6 +16,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from smoke_support import install_fixture_launcher_attestation
+
 
 _LOGIN_STATUS_MARKER = "__TERMDECK_LOGIN_STATUS_RC__="
 
@@ -254,6 +256,7 @@ def main() -> int:
             "TMUX_PANE",
         ):
             os.environ.pop(key, None)
+        install_fixture_launcher_attestation(codex_launcher)
 
         # Import only after HOME is isolated. SessionStore must take its normal
         # omitted-account_source path and resolve this temp ~/.codex itself.

@@ -1519,6 +1519,57 @@ class TmuxBackend:
             args.extend(["-e", f"{key}={value}"])
         return args
 
+    @staticmethod
+    def _with_explicit_private_environment(
+        command: str,
+        environment: Sequence[tuple[str, str]],
+    ) -> str:
+        """Start a private-scope payload with its actual inherited environment.
+
+        tmux stores a session environment PATH but does not consistently pass
+        a replacement PATH to a respawned process. The private auth contract
+        is process based, so make the four scope values explicit at exec time.
+        env replaces itself with the supervisor shell, leaving proc and every
+        descendant bound to the scope.
+        """
+
+        values = dict(environment)
+        assignments = [
+            f"{name}={values[name]}"
+            for name in (
+                "CODEX_HOME",
+                "TERMDECK_AUTH_SCOPE_ID",
+                "CODEX_TERMDECK_GATE_ROOT",
+                "PATH",
+            )
+            if name in values
+        ]
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = []
+        shell_argv = bool(argv) and (
+            Path(argv[0]).name.casefold() == "bash"
+            and "-c" not in argv
+            and not any(
+                any(character in item for character in "|&;<>()$" + chr(96))
+                for item in argv
+            )
+        )
+        if shell_argv:
+            return shlex.join(["/usr/bin/env", *assignments, *argv])
+        return shlex.join(
+            [
+                "/usr/bin/env",
+                *assignments,
+                "/bin/bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                command,
+            ]
+        )
+
     @classmethod
     def _command_is_interactive_shell(cls, command: str) -> bool:
         """Return whether *command* already leaves the pane at a shell prompt.
@@ -1750,6 +1801,12 @@ class TmuxBackend:
             command = self._with_interactive_shell_fallback(
                 command,
                 fallback_shell_command,
+            )
+
+        if raw_codex_home:
+            command = self._with_explicit_private_environment(
+                command,
+                environment.items(),
             )
 
         return _LaunchSpec(

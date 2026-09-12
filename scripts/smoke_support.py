@@ -88,9 +88,14 @@ def require_private_validation_runtime() -> Path:
     if policy == "ci":
         return candidate
     try:
-        from termdeck.storage_fabric import require_hot_storage
+        from termdeck.storage_fabric import attest_storage_fabric
 
-        require_hot_storage(
+        # The production profile still needs physical-storage admission, but
+        # GUI smokes create disposable databases and tmux runtimes inside the
+        # task runtime.  Use a non-binding attestation here so those fixtures
+        # are checked against the same verified SSD without being mistaken for
+        # the live production bindings.
+        attest_storage_fabric(
             managed_root=candidate,
             hot_paths={
                 "auth_root": candidate,
@@ -100,12 +105,39 @@ def require_private_validation_runtime() -> Path:
                 "tmux_runtime": candidate,
             },
             production=True,
-        )
+        ).require()
     except Exception as exc:
         raise RuntimeError(
             f"{_VALIDATION_RUNTIME_ENV} is not verified Warp Drives SSD storage: {candidate}"
         ) from exc
     return candidate
+
+
+def install_fixture_launcher_attestation(launcher: Path) -> None:
+    """Allow a disposable executable to satisfy fixture-only launcher policy."""
+
+    from termdeck import codex_config_scope
+
+    expected = launcher.resolve(strict=True)
+
+    def attest_fixture(candidate: Path) -> bool:
+        return candidate == expected
+
+    prepare = codex_config_scope.prepare_shared_codex_configuration
+    migrate = codex_config_scope.migrate_quiescent_codex_configuration
+
+    def prepare_fixture(private_home, canonical_home):
+        return prepare(
+            private_home,
+            canonical_home,
+            launcher_attestor=attest_fixture,
+        )
+
+    def migrate_fixture(private_home):
+        return migrate(private_home, launcher_attestor=attest_fixture)
+
+    codex_config_scope.prepare_shared_codex_configuration = prepare_fixture
+    codex_config_scope.migrate_quiescent_codex_configuration = migrate_fixture
 
 
 @dataclass(frozen=True)

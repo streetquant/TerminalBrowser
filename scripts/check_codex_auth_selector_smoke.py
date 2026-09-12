@@ -13,7 +13,11 @@ import tempfile
 import time
 from pathlib import Path
 
-from smoke_support import require_private_validation_runtime, stream_ready
+from smoke_support import (
+    install_fixture_launcher_attestation,
+    require_private_validation_runtime,
+    stream_ready,
+)
 
 
 def _drain_gtk(Gtk, *, until=None, timeout: float = 6.0) -> None:
@@ -347,6 +351,7 @@ int main(int argc, char **argv) {
                 f"stdout={compiled.stdout!r}, stderr={compiled.stderr!r}"
             )
         fake_codex.chmod(0o755)
+        install_fixture_launcher_attestation(fake_codex)
 
         live_session_id = "019f71b3-fa32-7251-bac3-c628f34dd154"
         # The private Codex wrapper confines writes to the target workspace, so
