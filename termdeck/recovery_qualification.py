@@ -25,6 +25,7 @@ from typing import Iterable, Mapping
 
 from .session_recipe import SessionRecipe, SessionRecipeError, recipe_from_record
 from .session_store import default_db_path
+from .sqlite_io import SQLiteReadOnlyError, read_only_refresh
 
 
 CLASSIFICATIONS = ("eligible", "deferred", "fail_closed", "skipped")
@@ -817,6 +818,44 @@ def _empty_error_report(path: Path, error: str) -> RecoveryQualificationReport:
     return RecoveryQualificationReport(db_path=str(path), panes=(), ok=False, error=error)
 
 
+def _qualify_recovery_connection(
+    path: Path,
+    connection: sqlite3.Connection,
+    *,
+    values: Mapping[str, str],
+    rollout_root: str | Path | None,
+    rollout_states: Mapping[str, object] | None,
+    max_rollout_files: int,
+    now: float | None,
+) -> RecoveryQualificationReport:
+    _schema_columns(connection)
+    try:
+        rows = connection.execute(
+            "SELECT rowid AS __qualification_rowid__, * FROM sessions"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = connection.execute("SELECT * FROM sessions").fetchall()
+    audit_now = float(now if now is not None else datetime.now(timezone.utc).timestamp())
+    records = [_record_from_row(dict(row)) for row in rows]
+    qualified = [
+        _qualify_row(
+            index,
+            record,
+            connection,
+            environment=values,
+            rollout_root=rollout_root,
+            rollout_states=rollout_states,
+            max_rollout_files=max_rollout_files,
+            now=audit_now,
+        )
+        for index, record in enumerate(records, start=1)
+    ]
+    return RecoveryQualificationReport(
+        db_path=str(path),
+        panes=tuple(_apply_target_conflicts(qualified)),
+    )
+
+
 def qualify_recovery(
     db_path: str | Path | None = None,
     *,
@@ -825,6 +864,8 @@ def qualify_recovery(
     rollout_states: Mapping[str, object] | None = None,
     max_rollout_files: int = _MAX_ROLLOUT_FILES,
     now: float | None = None,
+    readonly_retry_attempts: int = 3,
+    readonly_retry_delay_seconds: float = 0.025,
 ) -> RecoveryQualificationReport:
     """Audit a primary or explicit registry without mutating it.
 
@@ -836,55 +877,32 @@ def qualify_recovery(
 
     path = Path(db_path).expanduser() if db_path is not None else default_db_path()
     values = os.environ if environment is None else environment
-    connection: sqlite3.Connection | None = None
-    before: int | None = None
     try:
-        connection = _open_read_only(path)
-        _schema_columns(connection)
-        before = int(connection.execute("PRAGMA data_version").fetchone()[0])
-        try:
-            rows = connection.execute(
-                "SELECT rowid AS __qualification_rowid__, * FROM sessions"
-            ).fetchall()
-        except sqlite3.OperationalError:
-            rows = connection.execute("SELECT * FROM sessions").fetchall()
-        audit_now = float(now if now is not None else datetime.now(timezone.utc).timestamp())
-        records = [_record_from_row(dict(row)) for row in rows]
-        qualified = [
-            _qualify_row(
-                index,
-                record,
+        refreshed = read_only_refresh(
+            path,
+            lambda connection: _qualify_recovery_connection(
+                Path(path),
                 connection,
-                environment=values,
+                values=values,
                 rollout_root=rollout_root,
                 rollout_states=rollout_states,
                 max_rollout_files=max_rollout_files,
-                now=audit_now,
-            )
-            for index, record in enumerate(records, start=1)
-        ]
-        qualified = _apply_target_conflicts(qualified)
-        after = int(connection.execute("PRAGMA data_version").fetchone()[0])
-        if before != after:
-            return RecoveryQualificationReport(
-                db_path=str(path),
-                panes=tuple(qualified),
-                ok=False,
-                error="session database changed during read-only qualification",
-                source_data_version=before,
-                source_data_version_after=after,
-            )
-        return RecoveryQualificationReport(
-            db_path=str(path),
-            panes=tuple(qualified),
-            source_data_version=before,
-            source_data_version_after=after,
+                now=now,
+            ),
+            operation="recovery qualification",
+            opener=_open_read_only,
+            attempts=readonly_retry_attempts,
+            delay_seconds=readonly_retry_delay_seconds,
         )
+        return replace(
+            refreshed.value,
+            source_data_version=refreshed.data_version_before,
+            source_data_version_after=refreshed.data_version_after,
+        )
+    except SQLiteReadOnlyError as exc:
+        return _empty_error_report(path, str(exc))
     except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
         return _empty_error_report(path, str(exc))
-    finally:
-        if connection is not None:
-            connection.close()
 
 
 def audit_recovery(*args: object, **kwargs: object) -> RecoveryQualificationReport:
