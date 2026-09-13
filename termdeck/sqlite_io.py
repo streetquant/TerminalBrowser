@@ -171,6 +171,18 @@ class SQLiteReadOnlyFailure:
     data_version_before: int | None = None
     data_version_after: int | None = None
 
+    @property
+    def sqlite_errorcode(self) -> int | None:
+        """Python sqlite3's conventional name for the extended result code."""
+
+        return self.sqlite_extended_code
+
+    @property
+    def sqlite_errorname(self) -> str | None:
+        """Python sqlite3's conventional name for the result-code name."""
+
+        return self.sqlite_error_name
+
     def as_dict(self) -> dict[str, object]:
         return {
             "operation": self.operation,
@@ -181,6 +193,8 @@ class SQLiteReadOnlyFailure:
             "max_attempts": self.max_attempts,
             "transient": self.transient,
             "reason": self.reason,
+            "sqlite_errorcode": self.sqlite_extended_code,
+            "sqlite_errorname": self.sqlite_error_name,
             "sqlite_extended_code": self.sqlite_extended_code,
             "sqlite_error_name": self.sqlite_error_name,
             "sqlite_primary_code": self.sqlite_primary_code,
