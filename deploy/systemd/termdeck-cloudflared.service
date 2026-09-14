@@ -8,7 +8,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-Environment=HOME=/home/arch
+Environment=HOME=/warp/state/termdeck
 Environment=USER=max
 Environment=LOGNAME=max
 Environment=PATH=/usr/local/bin:/usr/bin:/bin

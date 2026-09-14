@@ -8,13 +8,13 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-Environment=HOME=/home/arch
+Environment=HOME=/warp/state/termdeck
 Environment=USER=max
 Environment=LOGNAME=max
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 Environment=TERMDECK_STATE_ROOT=/warp/state/termdeck
-Environment=PATH=/warp/runtime/termdeck/bin:/home/arch/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/warp/runtime/termdeck/bin:/usr/local/bin:/usr/bin:/bin
 UMask=0077
 ExecStartPre=/usr/bin/test -x /warp/runtime/termdeck/termdeck-lan/bin/termdeck-web-server
 ExecStartPre=/usr/bin/test -r /warp/state/termdeck/sessions.sqlite3
