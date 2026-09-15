@@ -3,7 +3,8 @@ Description=TermDeck LAN HTTPS, WebSocket and prefixed Cloudflare proxy
 Wants=network-online.target termdeck-web-backend.service
 After=warp.mount network-online.target termdeck-web-backend.service
 ConditionPathIsMountPoint=/warp
-RequiresMountsFor=/warp /warp/runtime/termdeck/termdeck-lan
+ConditionPathIsDirectory=/warp/runtime/termdeck/termdeck-lan
+RequiresMountsFor=/warp/projects/software/termdeck /warp/runtime/termdeck /warp/state/termdeck
 StartLimitIntervalSec=0
 
 [Service]
@@ -15,15 +16,15 @@ Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 Environment=PATH=/warp/runtime/termdeck/bin:/usr/local/bin:/usr/bin:/bin
 UMask=0077
-ExecStartPre=/warp/runtime/termdeck/termdeck-lan/bin/termdeck-web-prepare
-ExecStartPre=/usr/bin/nginx -t -p /warp/runtime/termdeck/termdeck-lan/nginx/ -c /warp/runtime/termdeck/termdeck-lan/nginx/nginx.conf
-ExecStart=/usr/bin/nginx -p /warp/runtime/termdeck/termdeck-lan/nginx/ -c /warp/runtime/termdeck/termdeck-lan/nginx/nginx.conf -g "daemon off;"
-ExecReload=/usr/bin/nginx -p /warp/runtime/termdeck/termdeck-lan/nginx/ -c /warp/runtime/termdeck/termdeck-lan/nginx/nginx.conf -s reload
-Restart=always
+ExecStart=/warp/runtime/termdeck/t1000-managed/termdeck-web-lan
+ExecStop=/warp/runtime/termdeck/t1000-managed/termdeck-web-lan-stop
+Restart=on-failure
+RestartMode=direct
 RestartSec=2s
 TimeoutStartSec=45s
 TimeoutStopSec=30s
 KillSignal=SIGQUIT
+KillMode=control-group
 LimitNOFILE=65536
 TasksMax=1024
 MemoryHigh=1G

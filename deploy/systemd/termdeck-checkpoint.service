@@ -1,14 +1,22 @@
 [Unit]
 Description=Persist TermDeck sessions before the user manager stops
 Documentation=https://github.com/Rebel0789/t1000
-After=user@1000.service local-fs.target
-RequiresMountsFor=/warp "/warp/state/termdeck" "/warp/runtime/termdeck"
+After=warp.mount user@1000.service local-fs.target
+Before=umount.target shutdown.target
+ConditionPathIsMountPoint=/warp
+ConditionPathIsDirectory=/warp/state/termdeck
+ConditionPathIsDirectory=/warp/runtime/termdeck/t1000-managed
+RequiresMountsFor=/warp/projects/software/termdeck /warp/runtime/termdeck /warp/state/termdeck
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/true
-ExecStop=-/usr/bin/runuser -u max -- /usr/bin/env HOME="/warp/state/termdeck" PATH="/warp/runtime/termdeck/t1000-managed:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin" /usr/bin/python3.14 -I -B "/warp/runtime/termdeck/t1000-managed/bootstrap.py" checkpoint --all
+KillMode=control-group
+Environment=HOME=/warp/state/termdeck
+ExecStart=/warp/runtime/termdeck/t1000-managed/termdeck-checkpoint
+ExecStop=/warp/runtime/termdeck/t1000-managed/termdeck-checkpoint-stop
+Restart=on-failure
+RestartMode=direct
 TimeoutStopSec=15min
 StandardOutput=journal
 StandardError=journal

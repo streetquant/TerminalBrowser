@@ -2,8 +2,10 @@
 Description=Cloudflare Tunnel for TermDeck
 Documentation=https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
 Wants=network-online.target termdeck-web-lan.service
-After=network-online.target termdeck-web-lan.service
-RequiresMountsFor=/warp
+After=warp.mount network-online.target termdeck-web-lan.service
+ConditionPathIsMountPoint=/warp
+ConditionPathIsDirectory=/warp/runtime/termdeck/termdeck-lan
+RequiresMountsFor=/warp/projects/software/termdeck /warp/runtime/termdeck /warp/state/termdeck
 StartLimitIntervalSec=0
 
 [Service]
@@ -12,8 +14,10 @@ Environment=HOME=/warp/state/termdeck
 Environment=USER=max
 Environment=LOGNAME=max
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/cloudflared --config /warp/runtime/termdeck/cloudflared/termdeck.yml --no-autoupdate tunnel run
-Restart=always
+ExecStart=/warp/runtime/termdeck/t1000-managed/termdeck-cloudflared
+ExecStop=/warp/runtime/termdeck/t1000-managed/termdeck-cloudflared-stop
+Restart=on-failure
+RestartMode=direct
 RestartSec=3s
 TimeoutStartSec=45s
 TimeoutStopSec=45s
@@ -28,6 +32,7 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+KillMode=control-group
 LimitNOFILE=65536
 TasksMax=1024
 MemoryHigh=512M

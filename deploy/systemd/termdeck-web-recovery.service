@@ -1,0 +1,35 @@
+[Unit]
+Description=TermDeck web activation recovery watchdog
+After=warp.mount default.target
+ConditionPathIsMountPoint=/warp
+ConditionPathIsDirectory=/warp/projects/software/termdeck
+ConditionPathIsDirectory=/warp/runtime/termdeck/t1000-managed
+ConditionPathIsDirectory=/warp/runtime/termdeck/bin
+# No pending activation is a successful inactive condition; a present LATEST
+# is watched until it reaches a terminal state.
+ConditionPathExists=/warp/state/termdeck/recovery/activation-v2/LATEST
+RequiresMountsFor=/warp/projects/software/termdeck /warp/runtime/termdeck /warp/state/termdeck
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=HOME=/warp/state/termdeck
+Environment=USER=max
+Environment=LOGNAME=max
+Environment=PATH=/warp/runtime/termdeck/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/warp/runtime/termdeck/t1000-managed/termdeck-web-recovery
+ExecStop=/warp/runtime/termdeck/t1000-managed/termdeck-web-recovery-stop
+Restart=on-failure
+RestartMode=direct
+KillMode=control-group
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/warp/state/termdeck/recovery/activation-v2 /warp/runtime/termdeck/termdeck-lan /home/arch/.config/systemd/user /warp/runtime/termdeck/t1000-managed /warp/runtime/termdeck/bin
+TimeoutStartSec=30s
+TimeoutStopSec=20s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

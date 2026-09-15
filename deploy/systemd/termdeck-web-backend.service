@@ -3,7 +3,9 @@ Description=TermDeck authenticated web backend
 Wants=network-online.target
 After=warp.mount network-online.target
 ConditionPathIsMountPoint=/warp
-RequiresMountsFor=/warp /warp/runtime/termdeck/termdeck-lan /warp/state/termdeck
+ConditionPathIsDirectory=/warp/runtime/termdeck/termdeck-lan
+ConditionPathIsDirectory=/warp/state/termdeck
+RequiresMountsFor=/warp/projects/software/termdeck /warp/runtime/termdeck /warp/state/termdeck
 StartLimitIntervalSec=0
 
 [Service]
@@ -16,14 +18,14 @@ Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 Environment=TERMDECK_STATE_ROOT=/warp/state/termdeck
 Environment=PATH=/warp/runtime/termdeck/bin:/usr/local/bin:/usr/bin:/bin
 UMask=0077
-ExecStartPre=/usr/bin/test -x /warp/runtime/termdeck/termdeck-lan/bin/termdeck-web-server
-ExecStartPre=/usr/bin/test -r /warp/state/termdeck/sessions.sqlite3
-ExecStart=/warp/runtime/termdeck/termdeck-lan/bin/termdeck-web-server --db /warp/state/termdeck/sessions.sqlite3 --listen 127.0.0.1:7391 --auth-dir /warp/runtime/termdeck/termdeck-lan/auth --allow-insecure-loopback-auth --host-id termdeck-max-lan --owner-id shayan --refresh-ms 750 --max-stale-ms 30000 --max-connections 256 --tmux /usr/bin/tmux --t1000 /warp/runtime/termdeck/bin/t1000 --tmux-timeout-ms 1500 --tab-action-timeout-ms 120000
-Restart=always
+ExecStart=/warp/runtime/termdeck/t1000-managed/termdeck-web-backend
+ExecStop=/warp/runtime/termdeck/t1000-managed/termdeck-web-backend-stop
+Restart=on-failure
+RestartMode=direct
 RestartSec=2s
 TimeoutStartSec=30s
 TimeoutStopSec=20s
-KillMode=process
+KillMode=control-group
 LimitNOFILE=65536
 TasksMax=4096
 MemoryHigh=2G
