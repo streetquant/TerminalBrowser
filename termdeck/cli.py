@@ -70,9 +70,7 @@ from .settings import sample_settings_json
 from .shutdown_service import (
     ShutdownServiceError,
     install_system_checkpoint_service,
-    install_user_checkpoint_service,
     uninstall_system_checkpoint_service,
-    uninstall_user_checkpoint_service,
 )
 from .shortcuts import build_shortcut_report, render_shortcut_table, shortcut_entries, shortcut_entries_to_dicts, shortcut_profile_names
 from .task_snapshot import build_task_snapshot, filter_task_snapshot, render_task_table, sort_task_snapshot, task_snapshot_to_dicts
@@ -515,27 +513,28 @@ def cmd_uninstall_desktop(args: argparse.Namespace) -> int:
 
 def cmd_install_checkpoint_service(args: argparse.Namespace) -> int:
     try:
-        if bool(getattr(args, "system", False)):
-            user = getattr(args, "user", None)
-            uid = getattr(args, "uid", None)
-            home = getattr(args, "home", None)
-            if user is None or uid is None or home is None:
-                raise ShutdownServiceError("--system requires --user, --uid, and --home")
-            result = install_system_checkpoint_service(
-                executable=getattr(args, "executable", None),
-                user=user,
-                uid=uid,
-                home=home,
-                required_mounts=tuple(getattr(args, "required_mount", ()) or ()),
-                unit_dir=getattr(args, "unit_dir", None),
-                enable=not bool(getattr(args, "no_enable", False)),
+        if not bool(getattr(args, "system", False)):
+            raise ShutdownServiceError(
+                "checkpoint service installation is system-only; rerun with --system "
+                "--user max --uid 1000 --home /home/arch"
             )
-        else:
-            result = install_user_checkpoint_service(
-                executable=getattr(args, "executable", None),
-                unit_dir=getattr(args, "unit_dir", None),
-                enable=not bool(getattr(args, "no_enable", False)),
+        user = getattr(args, "user", None)
+        uid = getattr(args, "uid", None)
+        home = getattr(args, "home", None)
+        if user is None or uid is None or home is None:
+            raise ShutdownServiceError(
+                "--system requires the fixed service identity "
+                "--user max --uid 1000 --home /home/arch"
             )
+        result = install_system_checkpoint_service(
+            executable=getattr(args, "executable", None),
+            user=user,
+            uid=uid,
+            home=home,
+            required_mounts=tuple(getattr(args, "required_mount", ()) or ()),
+            unit_dir=getattr(args, "unit_dir", None),
+            enable=not bool(getattr(args, "no_enable", False)),
+        )
     except ShutdownServiceError as exc:
         _print_json({"action": "install-checkpoint-service", "ok": False, "error": str(exc)})
         return 1
@@ -547,16 +546,14 @@ def cmd_install_checkpoint_service(args: argparse.Namespace) -> int:
 
 def cmd_uninstall_checkpoint_service(args: argparse.Namespace) -> int:
     try:
-        if bool(getattr(args, "system", False)):
-            result = uninstall_system_checkpoint_service(
-                unit_dir=getattr(args, "unit_dir", None),
-                disable=not bool(getattr(args, "no_disable", False)),
+        if not bool(getattr(args, "system", False)):
+            raise ShutdownServiceError(
+                "checkpoint service removal is system-only; rerun with --system"
             )
-        else:
-            result = uninstall_user_checkpoint_service(
-                unit_dir=getattr(args, "unit_dir", None),
-                disable=not bool(getattr(args, "no_disable", False)),
-            )
+        result = uninstall_system_checkpoint_service(
+            unit_dir=getattr(args, "unit_dir", None),
+            disable=not bool(getattr(args, "no_disable", False)),
+        )
     except ShutdownServiceError as exc:
         _print_json({"action": "uninstall-checkpoint-service", "ok": False, "error": str(exc)})
         return 1
@@ -1916,25 +1913,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     install_checkpoint_service = sub.add_parser(
         "install-checkpoint-service",
-        help="install and enable the user shutdown checkpoint hook",
+        help="install and enable the strict system shutdown checkpoint service",
+        description="install and enable the strict system shutdown checkpoint service",
     )
     install_checkpoint_service.add_argument("--executable", type=Path, default=None)
-    install_checkpoint_service.add_argument("--unit-dir", type=Path, default=None)
-    install_checkpoint_service.add_argument("--system", action="store_true", help="install the strict system-level shutdown-ordered service")
-    install_checkpoint_service.add_argument("--user", default=None, help="target user name for --system")
-    install_checkpoint_service.add_argument("--uid", type=int, default=None, help="target numeric uid for --system")
-    install_checkpoint_service.add_argument("--home", type=Path, default=None, help="target home directory for --system")
+    install_checkpoint_service.add_argument("--unit-dir", type=Path, default=None, help="system unit directory override")
+    install_checkpoint_service.add_argument("--system", action="store_true", help="required: install the strict system-level shutdown-ordered service")
+    install_checkpoint_service.add_argument("--user", default=None, help="required exact service user: max")
+    install_checkpoint_service.add_argument("--uid", type=int, default=None, help="required exact service uid: 1000")
+    install_checkpoint_service.add_argument("--home", type=Path, default=None, help="required exact service home: /home/arch")
     install_checkpoint_service.add_argument("--required-mount", action="append", type=Path, default=[], help="mount path that must remain available during checkpointing")
-    install_checkpoint_service.add_argument("--no-enable", action="store_true")
+    install_checkpoint_service.add_argument(
+        "--no-enable",
+        action="store_true",
+        help="write the system unit without enabling it",
+    )
     install_checkpoint_service.set_defaults(func=cmd_install_checkpoint_service)
 
     uninstall_checkpoint_service = sub.add_parser(
         "uninstall-checkpoint-service",
-        help="disable and remove the user shutdown checkpoint hook",
+        help="disable and remove the strict system shutdown checkpoint service",
+        description="disable and remove the strict system shutdown checkpoint service",
     )
-    uninstall_checkpoint_service.add_argument("--unit-dir", type=Path, default=None)
-    uninstall_checkpoint_service.add_argument("--system", action="store_true", help="remove the strict system-level service")
-    uninstall_checkpoint_service.add_argument("--no-disable", action="store_true")
+    uninstall_checkpoint_service.add_argument("--unit-dir", type=Path, default=None, help="system unit directory override")
+    uninstall_checkpoint_service.add_argument("--system", action="store_true", help="required: remove the strict system-level service")
+    uninstall_checkpoint_service.add_argument(
+        "--no-disable",
+        action="store_true",
+        help="remove the system unit without disabling it",
+    )
     uninstall_checkpoint_service.set_defaults(func=cmd_uninstall_checkpoint_service)
 
     parse = sub.add_parser("parse-terminator", help="print imported Terminator theme as JSON")

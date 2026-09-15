@@ -8,12 +8,110 @@ from pathlib import Path
 from unittest import mock
 
 from termdeck.checkpointing import CheckpointResult
-from termdeck.cli import cmd_checkpoint
+from termdeck.cli import (
+    build_parser,
+    cmd_checkpoint,
+    cmd_install_checkpoint_service,
+    cmd_uninstall_checkpoint_service,
+)
 from termdeck.persistence import PersistenceResult
 from termdeck.session_store import SessionStore
+from termdeck.shutdown_service import ShutdownServiceResult
 
 
 class CheckpointCliTests(unittest.TestCase):
+    def test_checkpoint_service_install_requires_system_mode_before_dispatch(self):
+        args = argparse.Namespace(
+            system=False,
+            executable=Path("/tmp/t1000"),
+            unit_dir=Path("/tmp/units"),
+            user="max",
+            uid=1000,
+            home=Path("/home/arch"),
+            required_mount=[],
+            no_enable=False,
+        )
+        output = io.StringIO()
+        with mock.patch("termdeck.cli.install_system_checkpoint_service") as install, contextlib.redirect_stdout(output):
+            code = cmd_install_checkpoint_service(args)
+
+        self.assertEqual(code, 1)
+        install.assert_not_called()
+        payload = json.loads(output.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["action"], "install-checkpoint-service")
+        self.assertIn("system-only", payload["error"])
+        self.assertIn("--system", payload["error"])
+        self.assertIn("--user max --uid 1000 --home /home/arch", payload["error"])
+
+    def test_checkpoint_service_install_dispatches_only_the_system_contract(self):
+        args = argparse.Namespace(
+            system=True,
+            executable=Path("/tmp/t1000"),
+            unit_dir=Path("/tmp/units"),
+            user="max",
+            uid=1000,
+            home=Path("/home/arch"),
+            required_mount=[Path("/warp/projects"), Path("/warp/state")],
+            no_enable=False,
+        )
+        expected = ShutdownServiceResult(
+            "install-system",
+            Path("/tmp/units/termdeck-checkpoint.service"),
+            True,
+            "installed",
+        )
+        output = io.StringIO()
+        with mock.patch(
+            "termdeck.cli.install_system_checkpoint_service",
+            return_value=expected,
+        ) as install, contextlib.redirect_stdout(output):
+            code = cmd_install_checkpoint_service(args)
+
+        self.assertEqual(code, 0)
+        install.assert_called_once_with(
+            executable=Path("/tmp/t1000"),
+            user="max",
+            uid=1000,
+            home=Path("/home/arch"),
+            required_mounts=(Path("/warp/projects"), Path("/warp/state")),
+            unit_dir=Path("/tmp/units"),
+            enable=True,
+        )
+        self.assertTrue(json.loads(output.getvalue())["ok"])
+
+    def test_checkpoint_service_removal_requires_system_mode_before_dispatch(self):
+        args = argparse.Namespace(system=False, unit_dir=Path("/tmp/units"), no_disable=False)
+        output = io.StringIO()
+        with mock.patch("termdeck.cli.uninstall_system_checkpoint_service") as uninstall, contextlib.redirect_stdout(output):
+            code = cmd_uninstall_checkpoint_service(args)
+
+        self.assertEqual(code, 1)
+        uninstall.assert_not_called()
+        payload = json.loads(output.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["action"], "uninstall-checkpoint-service")
+        self.assertIn("system-only", payload["error"])
+        self.assertIn("--system", payload["error"])
+
+    def test_checkpoint_service_help_documents_the_system_only_contract(self):
+        parser = build_parser()
+        subparsers = next(
+            action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+        )
+        install_help = subparsers.choices["install-checkpoint-service"].format_help()
+        uninstall_help = subparsers.choices["uninstall-checkpoint-service"].format_help()
+
+        self.assertIn("strict system shutdown checkpoint service", install_help)
+        self.assertIn("required: install the strict system-level", install_help)
+        self.assertIn("required exact service user: max", install_help)
+        self.assertIn("required exact service uid: 1000", install_help)
+        self.assertIn("required exact service home: /home/arch", install_help)
+        self.assertNotIn("user shutdown checkpoint hook", install_help)
+        self.assertIn("strict system shutdown checkpoint service", uninstall_help)
+        self.assertIn("required: remove the strict system-level", uninstall_help)
+        self.assertNotIn("user shutdown checkpoint hook", uninstall_help)
+
     def test_checkpoint_all_selects_only_active_managed_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "sessions.sqlite3"

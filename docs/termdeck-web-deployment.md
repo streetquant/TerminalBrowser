@@ -10,7 +10,7 @@ The certificate is signed by the existing TermDeck LAN CA and includes the curre
 
 ## Activation recovery evidence
 
-The web activation helper stores transaction receipts and rollback markers by default under `/warp/recovery/termdeck-migration/activation-v2`. This direct Warp recovery hierarchy is separate from the TermDeck runtime and session-state directories. Historical recovery artifacts under `/var/lib/cloudmcp-exec` are evidence only; use an explicit reviewed `--evidence` path when replaying a historical transaction.
+The web activation helper stores transaction receipts and rollback markers by default under `/warp/state/termdeck/recovery/activation-v2`. This state-root recovery hierarchy is separate from the TermDeck runtime and session-state directories. Historical recovery artifacts under `/var/lib/cloudmcp-exec` are evidence only; use an explicit reviewed `--evidence` path when replaying a historical transaction.
 
 ## Cloudflare
 

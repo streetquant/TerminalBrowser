@@ -237,12 +237,12 @@ Foreground Codex tabs persist the primary conversation UUID and reopen directly 
 
 ```bash
 t1000 checkpoint --all                    # inspect/save exact Codex recovery state
-t1000 install-checkpoint-service          # user-level compatibility hook
 sudo t1000 install-checkpoint-service \
-  --system --user "$USER" --uid "$(id -u)" --home "$HOME"
+  --system --user max --uid 1000 --home /home/arch
+sudo t1000 uninstall-checkpoint-service --system
 ```
 
-The strict system service performs a final exact-UUID scan before the user manager and tmux scopes stop. Ordinary shells and jobs remain alive across TermDeck GUI restarts because tmux owns them, but their instruction-level memory is not generically restored after an operating-system reboot. Automatic DMTCP wrapping is disabled: real tmux PTYs exposed application-signal conflicts, fork-path failures, and indefinite drains on external network sockets. Long-running non-Codex work should use its own durable checkpoints and idempotent resume command. A missing uncheckpointed process fails closed as `recovery-pending`; TermDeck never silently reruns it from the beginning.
+The checkpoint service is system-only and requires `--system`. Installation requires the exact service identity `--user max --uid 1000 --home /home/arch`; other identities are rejected because the shutdown wrapper and systemd ordering are bound to that account. It performs a final exact-UUID scan before the user manager and tmux scopes stop. Ordinary shells and jobs remain alive across TermDeck GUI restarts because tmux owns them, but their instruction-level memory is not generically restored after an operating-system reboot. Automatic DMTCP wrapping is disabled: real tmux PTYs exposed application-signal conflicts, fork-path failures, and indefinite drains on external network sockets. Long-running non-Codex work should use its own durable checkpoints and idempotent resume command. A missing uncheckpointed process fails closed as `recovery-pending`; TermDeck never silently reruns it from the beginning.
 
 Foreground startup never scans the global Codex rollout archive. Tabs must carry a checkpointed primary conversation UUID before automatic recovery; older rows that contain only `codex --yolo` remain explicit recovery exceptions until a bounded maintenance operation can bind one exact `source="cli"` rollout. TermDeck never guesses a conversation, falls back to another workspace, or starts a replacement thread merely to make a pane look healthy.
 
