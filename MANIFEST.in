@@ -1,0 +1,15 @@
+# Privileged deployment inputs are source-distribution files only.  Keep this
+# list explicit: they must never enter the general Python wheel by directory
+# wildcard.
+include deploy/preparer-install-manifest.json
+include deploy/termdeck-preparer-install-plan.md
+include deploy/termdeck-preparer-broker
+include deploy/systemd/termdeck-runtime-attestd.service
+include deploy/systemd/termdeck-preparer-broker.socket
+include deploy/systemd/termdeck-preparer-broker.service
+include deploy/systemd/termdeck-preparer.sysusers.conf
+include deploy/systemd/termdeck-preparer.tmpfiles.conf
+include scripts/deploy/install-preparer-assets.py
+include scripts/deploy/termdeck-runtime-attestd
+include scripts/termdeck-preparer-state.py
+include scripts/termdeck-web-prepare-runtime.sh

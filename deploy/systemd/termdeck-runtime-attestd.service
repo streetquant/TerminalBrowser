@@ -1,0 +1,75 @@
+[Unit]
+Description=TermDeck root runtime attestation signer
+Documentation=https://github.com/Rebel0789/t1000
+After=local-fs.target systemd-tmpfiles-setup.service
+RequiresMountsFor=/warp/runtime/termdeck/termdeck-lan
+ConditionPathIsDirectory=/etc/termdeck/control
+ConditionPathIsDirectory=/etc/termdeck/control/records
+ConditionPathIsDirectory=/warp/runtime/termdeck/termdeck-lan
+ConditionPathExists=/etc/termdeck/control/runtime-attestd.key
+ConditionPathExists=/etc/termdeck/runtime-attestd.pub
+StartLimitIntervalSec=30s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/libexec/termdeck-runtime-attestd daemon
+Restart=on-failure
+RestartMode=direct
+RestartSec=2s
+TimeoutStartSec=15s
+TimeoutStopSec=10s
+KillMode=control-group
+
+# The signer may mutate only its root-owned socket/record namespace.  The
+# private key remains read-only inside that exception and /warp is replaced by
+# an empty read-only view containing only the canonical LAN runtime directory.
+# Binding the directory lets a receipt published after daemon startup become
+# visible while the signer's view remains read-only.
+ProtectSystem=strict
+ReadWritePaths=/etc/termdeck/control
+ReadOnlyPaths=/etc/termdeck/control/runtime-attestd.key /etc/termdeck/runtime-attestd.pub
+TemporaryFileSystem=/warp:ro
+BindReadOnlyPaths=/warp/runtime/termdeck/termdeck-lan
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_CHOWN
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateMounts=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+KeyringMode=private
+DevicePolicy=closed
+IPAddressDeny=any
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+TasksMax=32
+LimitNOFILE=256
+MemoryMax=256M
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

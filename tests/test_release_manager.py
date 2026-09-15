@@ -5993,8 +5993,6 @@ def test_production_install_rejects_symlinked_autostart_without_publishing_activ
 def test_production_autostart_path_swap_rolls_back_release_activation(
     tmp_path: Path,
 ) -> None:
-    import termdeck.desktop_integration as desktop_integration
-
     wheel, manifest_path, _manifest = artifact(tmp_path, "a")
     root = tmp_path / "managed"
     bin_dir = tmp_path / "bin"
@@ -6004,13 +6002,13 @@ def test_production_autostart_path_swap_rolls_back_release_activation(
     descriptor.chmod(0o644)
     attacker = tmp_path / "attacker.desktop"
     attacker.write_bytes(b"attacker\n")
-    real_atomic = desktop_integration._atomic_write_bytes
+    real_commit = release_manager._commit_staged_file
     swapped = False
 
-    def swap_after_descriptor(path: Path, content: bytes, **kwargs: object):
+    def swap_after_descriptor(parents, record, **kwargs: object):
         nonlocal swapped
-        published = real_atomic(path, content, **kwargs)
-        if Path(path).absolute() == descriptor.absolute() and not swapped:
+        published = real_commit(parents, record, **kwargs)
+        if record.path == descriptor.absolute() and not swapped:
             swapped = True
             descriptor.unlink()
             descriptor.symlink_to(attacker)
@@ -6020,8 +6018,8 @@ def test_production_autostart_path_swap_rolls_back_release_activation(
         bin_dir=bin_dir,
         descriptor_path=descriptor,
     ), mock.patch("termdeck.release_manager._verify_staged_import"), mock.patch.object(
-        desktop_integration,
-        "_atomic_write_bytes",
+        release_manager,
+        "_commit_staged_file",
         side_effect=swap_after_descriptor,
     ), pytest.raises(ReleaseError, match="activation publication failed"):
         install_release(
@@ -6053,21 +6051,21 @@ def test_production_autostart_preimage_change_refuses_publication(
     descriptor.write_bytes(b"[Desktop Entry]\nExec=/opt/custom/t1000 gui\n")
     descriptor.chmod(0o644)
     changed = b"[Desktop Entry]\nExec=/usr/bin/changed-during-install gui\n"
-    real_publish = release_manager._publish_production_autostart
+    real_publish = release_manager._publish_install_wrapper_and_activation
 
-    def change_before_publication(publication, **kwargs: object):
+    def change_before_publication(publication, writes, **kwargs: object):
         descriptor.write_bytes(changed)
         descriptor.chmod(0o644)
-        return real_publish(publication, **kwargs)
+        return real_publish(publication, writes, **kwargs)
 
     with production_autostart_environment(
         bin_dir=bin_dir,
         descriptor_path=descriptor,
     ), mock.patch("termdeck.release_manager._verify_staged_import"), mock.patch.object(
         release_manager,
-        "_publish_production_autostart",
+        "_publish_install_wrapper_and_activation",
         side_effect=change_before_publication,
-    ), pytest.raises(ReleaseError, match="changed before publication"):
+    ), pytest.raises(ReleaseError, match="changed after activation preflight"):
         install_release(
             wheel,
             manifest_path,

@@ -1,0 +1,68 @@
+{
+  "entries": [
+    {
+      "destination": "/usr/libexec/termdeck-runtime-attestd",
+      "group": "root",
+      "mode": "0755",
+      "owner": "root",
+      "source": "scripts/deploy/termdeck-runtime-attestd"
+    },
+    {
+      "destination": "/usr/libexec/termdeck-preparer-broker",
+      "group": "root",
+      "mode": "0755",
+      "owner": "root",
+      "source": "deploy/termdeck-preparer-broker"
+    },
+    {
+      "destination": "/usr/libexec/termdeck-preparer-state",
+      "group": "root",
+      "mode": "0755",
+      "owner": "root",
+      "source": "scripts/termdeck-preparer-state.py"
+    },
+    {
+      "destination": "/usr/libexec/termdeck-web-prepare-runtime",
+      "group": "root",
+      "mode": "0755",
+      "owner": "root",
+      "source": "scripts/termdeck-web-prepare-runtime.sh"
+    },
+    {
+      "destination": "/usr/lib/systemd/system/termdeck-runtime-attestd.service",
+      "group": "root",
+      "mode": "0644",
+      "owner": "root",
+      "source": "deploy/systemd/termdeck-runtime-attestd.service"
+    },
+    {
+      "destination": "/usr/lib/systemd/system/termdeck-preparer-broker.socket",
+      "group": "root",
+      "mode": "0644",
+      "owner": "root",
+      "source": "deploy/systemd/termdeck-preparer-broker.socket"
+    },
+    {
+      "destination": "/usr/lib/systemd/system/termdeck-preparer-broker.service",
+      "group": "root",
+      "mode": "0644",
+      "owner": "root",
+      "source": "deploy/systemd/termdeck-preparer-broker.service"
+    },
+    {
+      "destination": "/usr/lib/sysusers.d/termdeck-preparer.conf",
+      "group": "root",
+      "mode": "0644",
+      "owner": "root",
+      "source": "deploy/systemd/termdeck-preparer.sysusers.conf"
+    },
+    {
+      "destination": "/usr/lib/tmpfiles.d/termdeck-preparer.conf",
+      "group": "root",
+      "mode": "0644",
+      "owner": "root",
+      "source": "deploy/systemd/termdeck-preparer.tmpfiles.conf"
+    }
+  ],
+  "schema": "termdeck.preparer-install-manifest.v1"
+}

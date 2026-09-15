@@ -1,0 +1,72 @@
+[Unit]
+Description=TermDeck one-request privileged preparer broker
+Documentation=https://github.com/Rebel0789/t1000
+After=local-fs.target termdeck-runtime-attestd.service
+Wants=termdeck-runtime-attestd.service
+Requires=termdeck-preparer-broker.socket
+RequiresMountsFor=/warp/runtime/termdeck/termdeck-lan
+ConditionPathIsDirectory=/var/lib/termdeck-preparer
+ConditionPathIsDirectory=/warp/runtime/termdeck/termdeck-lan
+ConditionPathExists=/warp/runtime/termdeck/.termdeck-tls-recovery-key
+RefuseManualStart=yes
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0077
+Sockets=termdeck-preparer-broker.socket
+ExecStart=/usr/libexec/termdeck-preparer-broker
+Restart=no
+TimeoutStartSec=200s
+TimeoutStopSec=10s
+RuntimeMaxSec=200s
+KillMode=control-group
+
+# systemd owns the max-only activation socket.  The root broker validates its
+# single named LISTEN_FD and SO_PEERCRED, then drops a bounded child to the
+# dedicated preparer identity.  The child can write only its private state,
+# the canonical LAN runtime subtree, and the one TLS journal authenticator;
+# the root broker does not perform those writes.
+RuntimeDirectory=termdeck-preparer-broker
+RuntimeDirectoryMode=0711
+RuntimeDirectoryPreserve=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/termdeck-preparer /warp/runtime/termdeck/termdeck-lan -/warp/runtime/termdeck/.termdeck-tls-recovery-key
+TemporaryFileSystem=/warp:ro
+BindPaths=/warp/runtime/termdeck/termdeck-lan -/warp/runtime/termdeck/.termdeck-tls-recovery-key
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_KILL
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateMounts=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+KeyringMode=private
+DevicePolicy=closed
+IPAddressDeny=any
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+TasksMax=8
+LimitNOFILE=64
+MemoryMax=256M
+
+StandardOutput=journal
+StandardError=journal

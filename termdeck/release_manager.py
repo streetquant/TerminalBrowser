@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import configparser
+import ctypes
 import csv
 import errno
 import fcntl
@@ -38,14 +39,18 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 keeps TOML in the compatible backport.
+    import tomli as tomllib
 import uuid
 import zipfile
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, replace
 from email.parser import Parser
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from types import MappingProxyType
+from typing import Any, Callable, Iterable, Iterator, Mapping, NoReturn, Sequence
 
 from .build_info import (
     BUILD_INFO_SCHEMA,
@@ -87,12 +92,41 @@ _AUTOSTART_DESCRIPTOR_NAME = "io.github.t1000.T1000.desktop"
 _AUTOSTART_RECEIPT_NAME = "autostart-receipt.json"
 _MAX_AUTOSTART_DESCRIPTOR_BYTES = 64 * 1024
 _MAX_AUTOSTART_RECEIPT_BYTES = 64 * 1024
+_SERVICE_WRAPPER_PREIMAGE_SCHEMA = "t1000.service-wrapper-preimage.v1"
+_SERVICE_WRAPPER_PREIMAGE_NAME = "service-wrapper-preimage.json"
+_FIRST_INSTALL_PREIMAGE_SCHEMA = "t1000.first-install-preimage.v1"
+_FIRST_INSTALL_PREIMAGE_NAME = "first-install-preimage.json"
+_MAX_FIRST_INSTALL_PREIMAGE_BYTES = 64 * 1024
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
+_PUBLICATION_EINTR_RETRIES = 8
+_PUBLICATION_JOURNAL_SCHEMA = "t1000.publication-transaction.v1"
+_PUBLICATION_JOURNAL_PREFIX = ".termdeck-publication-"
+_PUBLICATION_JOURNAL_SUFFIX = ".json"
+# Each append-only frame contains the complete authenticated preimage set, so
+# a multi-wrapper publication legitimately accumulates several frames.  Bound
+# a single frame tightly enough to reject a malicious giant record, while
+# allowing the complete durable log to hold its ordered recovery history.
+_MAX_PUBLICATION_JOURNAL_FRAME_BYTES = 8 * 1024 * 1024
+_MAX_PUBLICATION_JOURNAL_BYTES = 64 * 1024 * 1024
+# A release install and its inverse must never reuse a fixed journal pathname.
+# Activation keeps the exact journal inode in its outer durable receipt.  If an
+# ordinary install cleaned its terminal journal and a later B-to-A rollback
+# created a new inode at the same name, a crash during that inverse would make
+# the old receipt look like a hostile replacement instead of the independent
+# rollback transaction it really is.
+_INSTALL_PUBLICATION_JOURNAL_NAME = ".termdeck-publication-install.json"
+_ROLLBACK_PUBLICATION_JOURNAL_NAME = ".termdeck-publication-rollback.json"
 _RELEASE_ID = re.compile(r"^[0-9a-f]{64}$")
 _RELEASE_VERSION_PREFIX = re.compile(
     r"^([0-9]+)\.([0-9]+)\.([0-9]+)(?:[A-Za-z0-9.+-].*)?$"
 )
 _FROZEN_RELEASE_MIN_VERSION = (0, 2, 13)
 _CANONICAL_WHEEL_METADATA_MIN_VERSION = (0, 2, 14)
+# Current managed releases carry the service-wrapper and activation modules
+# inside their frozen wheel site.  Older rollback fixtures legitimately lack
+# those modules, so they retain their historical source-root wrappers.
+_IMMUTABLE_WRAPPER_EXECUTION_MIN_VERSION = (0, 2, 21)
 _ZIP_CENTRAL_SIGNATURE = b"PK\x01\x02"
 _ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
 _ZIP_CENTRAL_HEADER_BYTES = 46
@@ -112,6 +146,23 @@ _DEPLOYMENT_MANAGED_ROOT = Path(
     "/warp/runtime/termdeck/t1000-managed"
 )
 _DEPLOYMENT_STATE_ROOT = Path("/warp/state/termdeck")
+# Root owns the attestation endpoint; managed wrappers carry its canonical
+# path but never the HMAC/signing material.  Only the distinct
+# ``termdeck-preparer`` group can traverse its 0710 namespace; ``max`` is
+# explicitly excluded.  A runtime file owned by ``max`` cannot be a producer
+# authority because every same-UID service may replace it, regardless of a
+# 0600 mode.
+_CANONICAL_CONTROL_ROOT = Path("/etc/termdeck/control")
+_CONTROL_ATTEST_SOCKET_NAME = "runtime-attestd.sock"
+_CONTROL_ATTEST_OPERATION = "sign"
+_CONTROL_ATTEST_REQUEST_SCHEMA = "termdeck.lan-runtime-build.v2"
+_CONTROL_ATTEST_RESPONSE_SCHEMA = "termdeck.runtime-attestation.v1"
+_CONTROL_ATTEST_PRODUCER = "termdeck-preparer"
+_CONTROL_ATTEST_OWNER = "root"
+_CONTROL_ATTEST_GROUP = _CONTROL_ATTEST_PRODUCER
+_CONTROL_ATTEST_EXCLUDED_PRINCIPAL = "max"
+_CONTROL_ROOT_MODE = 0o710
+_CONTROL_ATTEST_SOCKET_MODE = 0o660
 # The source checkout is the deployment's canonical release identity. The
 # managed release files remain under _DEPLOYMENT_MANAGED_ROOT.
 _CANONICAL_SOURCE_ROOT = Path("/warp/projects/software/termdeck")
@@ -398,6 +449,38 @@ class _AutostartPublication:
     descriptor_preimage: _FileSnapshot
     receipt_preimage: _FileSnapshot
     repaired: bool
+
+
+@dataclass(frozen=True)
+class _ServiceWrapperPublication:
+    """One wrapper publication and the bytes needed to undo it.
+
+    ``service_wrappers`` owns rendering and destination validation.  The
+    release manager keeps the preimage here so a later activation failure can
+    put the complete wrapper set back before returning the error.
+    """
+
+    api: object
+    kwargs: dict[str, object]
+    target_release_id: str | None
+    preimage: object
+    legacy_preimage_path: Path
+    legacy_preimage_before: "_AnchoredFileSnapshot"
+    legacy_preimage_write: bytes | None
+    expected_paths: tuple[Path, ...]
+    parent_guards: object
+    plan: object
+    repaired: bool
+
+
+@dataclass(frozen=True)
+class _FirstInstallPreimagePublication:
+    """Durable proof that an initially empty activation can be undone safely."""
+
+    receipt_path: Path
+    receipt_preimage: _FileSnapshot
+    activation_preimages: dict[Path, _FileSnapshot]
+    parent_guards: object
 
 
 @dataclass(frozen=True)
@@ -1789,111 +1872,3180 @@ def verify_wheel(
     )
 
 
-def _fsync_directory(path: Path) -> None:
+@dataclass(frozen=True)
+class _DirectoryIdentity:
+    """The stable identity of one directory in a publication path."""
+
+    device: int
+    inode: int
+    mode: int
+
+
+@dataclass(frozen=True)
+class _FileIdentity:
+    """A file identity that also detects a hard-link or in-place replacement."""
+
+    device: int
+    inode: int
+    mode: int
+    nlink: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+@dataclass(frozen=True)
+class _DirectoryGuard:
+    """A path's complete, no-follow directory ancestry at preflight time."""
+
+    path: Path
+    chain: tuple[_DirectoryIdentity, ...]
+
+
+@dataclass(frozen=True)
+class _PublicationParentGuards:
+    """Reusable parent identities shared across wrapper preflight and rollback."""
+
+    guards: tuple[_DirectoryGuard, ...]
+
+    def for_path(self, path: Path) -> _DirectoryGuard | None:
+        parent = path.parent
+        for guard in self.guards:
+            if guard.path == parent:
+                return guard
+        return None
+
+
+@dataclass
+class _DirectoryAnchor:
+    """An opened parent directory plus the path identity it was opened from."""
+
+    path: Path
+    descriptor: int
+    chain: tuple[_DirectoryIdentity, ...]
+    label: str
+
+    @property
+    def guard(self) -> _DirectoryGuard:
+        return _DirectoryGuard(self.path, self.chain)
+
+    def assert_current(self, *, phase: str) -> None:
+        """Reject a renamed, replaced, or symlinked ancestor before mutation."""
+
+        try:
+            current = _directory_identity(os.fstat(self.descriptor), label=self.label)
+        except OSError as exc:
+            raise ReleaseError(
+                f"publication parent descriptor is unavailable {phase}: {self.path}: {exc}"
+            ) from exc
+        if current != self.chain[-1]:
+            raise ReleaseError(f"publication parent identity changed {phase}: {self.path}")
+        fresh = _open_directory_anchor(self.path, label=self.label, create_parents=False)
+        try:
+            if fresh.chain != self.chain:
+                raise ReleaseError(f"publication parent identity changed {phase}: {self.path}")
+        finally:
+            fresh.close()
+
+    def fsync(self, *, label: str) -> None:
+        _fsync_descriptor(self.descriptor, label=f"{label}: {self.path}")
+
+    def close(self) -> None:
+        if self.descriptor < 0:
+            return
+        descriptor = self.descriptor
+        self.descriptor = -1
+        try:
+            os.close(descriptor)
+        except OSError:
+            # Closing an owned descriptor is best effort only.  Publication
+            # decisions have already been made from its identity.
+            pass
+
+
+class _PublicationParents:
+    """Own descriptor-anchored parents for every file in one transaction."""
+
+    def __init__(self, anchors: Mapping[Path, _DirectoryAnchor]) -> None:
+        self._anchors = dict(anchors)
+
+    def for_path(self, path: Path) -> _DirectoryAnchor:
+        try:
+            return self._anchors[path.parent]
+        except KeyError as exc:  # pragma: no cover - built from the write set
+            raise ReleaseError(f"publication parent is unavailable: {path.parent}") from exc
+
+    def assert_current(self, *, phase: str) -> None:
+        for path in sorted(self._anchors, key=str):
+            self._anchors[path].assert_current(phase=phase)
+
+    def anchors(self) -> Mapping[Path, _DirectoryAnchor]:
+        return dict(self._anchors)
+
+    def close(self) -> None:
+        for anchor in self._anchors.values():
+            anchor.close()
+
+
+@dataclass(frozen=True)
+class _AnchoredFileSnapshot:
+    snapshot: _FileSnapshot
+    identity: _FileIdentity | None
+    sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class PublicationTransactionReceipt:
+    """A durable hand-off point for a descriptor publication transaction.
+
+    ``before_publish`` callbacks receive an ``intent`` receipt after the
+    create-exclusive journal and all authenticated preimages have reached
+    storage, but before the first public rename.  ``after_publish`` callbacks
+    receive a ``published`` receipt after exact postimages have been captured
+    and verified, while that same journal is still live.  Consumers can
+    persist either receipt and call :func:`recover_publication_transaction`
+    after an abrupt exit.  ``after_recovery`` receives ``recovered`` only
+    after a journaled inverse has restored exact current leaves, and before
+    that journal is terminalized.  The mappings are immutable so a callback
+    cannot silently alter the transaction's ownership proof.
+    """
+
+    journal_path: Path
+    journal_identity: _FileIdentity
+    state: str
+    parent_guards: _PublicationParentGuards
+    preimages: Mapping[Path, _AnchoredFileSnapshot]
+    postimages: Mapping[Path, _AnchoredFileSnapshot]
+
+
+@dataclass
+class _StagedPublicationFile:
+    parent: _DirectoryAnchor
+    temporary_name: str
+    descriptor: int
+    identity: _FileIdentity
+    label: str
+
+    def close(self) -> None:
+        if self.descriptor < 0:
+            return
+        descriptor = self.descriptor
+        self.descriptor = -1
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+@dataclass
+class _PublicationRecord:
+    path: Path
+    name: str
+    content: bytes | None
+    mode: int
+    label: str
+    snapshot: _AnchoredFileSnapshot
+    staged: _StagedPublicationFile | None = None
+    # For a replacement or removal, the former public leaf remains under a
+    # fresh private name until verification completes.  This makes rollback a
+    # descriptor-relative rename instead of a stale-name overwrite.
+    quarantine: _StagedPublicationFile | None = None
+    committed_identity: _FileIdentity | None = None
+    deleted: bool = False
+    # These names and identities deliberately outlive their open descriptors.
+    # They are the durable recovery vocabulary written to the transaction
+    # journal before each rename.
+    staged_name: str | None = None
+    staged_identity: _FileIdentity | None = None
+    quarantine_name: str | None = None
+    quarantine_identity: _FileIdentity | None = None
+    rollback_name: str | None = None
+    rollback_identity: _FileIdentity | None = None
+    rollback: _StagedPublicationFile | None = None
+    # A private leaf is never unlinked at its checked name.  It first moves to
+    # this registered disposal name, so restart recovery can finish or retain
+    # the obligation if a signal lands between the move and unlink/fsync.
+    disposal_name: str | None = None
+    disposal_identity: _FileIdentity | None = None
+    disposal_source: str | None = None
+    disposal: _StagedPublicationFile | None = None
+    phase: str = "prepared"
+
+
+def _fsync_descriptor(descriptor: int, *, label: str) -> None:
+    """Fsync one owned descriptor, retrying only bounded EINTR interruptions."""
+
+    for attempt in range(_PUBLICATION_EINTR_RETRIES):
+        try:
+            os.fsync(descriptor)
+            return
+        except InterruptedError:
+            pass
+        except OSError as exc:
+            if exc.errno != errno.EINTR:
+                raise ReleaseError(f"could not fsync {label}: {exc}") from exc
+        if attempt + 1 >= _PUBLICATION_EINTR_RETRIES:
+            break
+    raise ReleaseError(
+        f"could not fsync {label}: interrupted {_PUBLICATION_EINTR_RETRIES} times"
+    )
+
+
+_PUBLICATION_JOURNAL_FRAME = b"TDJ1:"
+
+
+def _journal_file_identity_payload(identity: _FileIdentity | None) -> dict[str, int] | None:
+    if identity is None:
+        return None
+    return {
+        "device": identity.device,
+        "inode": identity.inode,
+        "mode": identity.mode,
+        "nlink": identity.nlink,
+        "size": identity.size,
+        "mtime_ns": identity.mtime_ns,
+        "ctime_ns": identity.ctime_ns,
+    }
+
+
+def _journal_file_identity_from_payload(value: object, *, label: str) -> _FileIdentity | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {
+        "device", "inode", "mode", "nlink", "size", "mtime_ns", "ctime_ns"
+    }:
+        raise ReleaseError(f"{label} identity is malformed")
+    values: dict[str, int] = {}
+    for name in ("device", "inode", "mode", "nlink", "size", "mtime_ns", "ctime_ns"):
+        item = value[name]
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ReleaseError(f"{label} identity is malformed")
+        values[name] = item
+    identity = _FileIdentity(
+        values["device"],
+        values["inode"],
+        values["mode"],
+        values["nlink"],
+        values["size"],
+        values["mtime_ns"],
+        values["ctime_ns"],
+    )
+    if (
+        identity.device < 0
+        or identity.inode <= 0
+        or identity.nlink != 1
+        or identity.size < 0
+        or identity.mode < 0
+        or identity.mode > 0o7777
+    ):
+        raise ReleaseError(f"{label} identity is malformed")
+    return identity
+
+
+def _journal_snapshot_payload(snapshot: _AnchoredFileSnapshot) -> dict[str, object]:
+    value: dict[str, object] = {
+        "exists": snapshot.snapshot.exists,
+        "mode": snapshot.snapshot.mode,
+        "identity": _journal_file_identity_payload(snapshot.identity),
+        "sha256": snapshot.sha256,
+    }
+    if snapshot.snapshot.exists:
+        value["content_b64"] = base64.b64encode(snapshot.snapshot.content).decode("ascii")
+    else:
+        value["content_b64"] = None
+    return value
+
+
+def _journal_snapshot_from_payload(value: object, *, label: str) -> _AnchoredFileSnapshot:
+    expected = {"exists", "mode", "identity", "sha256", "content_b64"}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ReleaseError(f"{label} snapshot is malformed")
+    exists = value["exists"]
+    mode = value["mode"]
+    encoded = value["content_b64"]
+    digest = value["sha256"]
+    if not isinstance(exists, bool) or isinstance(mode, bool) or not isinstance(mode, int):
+        raise ReleaseError(f"{label} snapshot is malformed")
+    if mode < 0 or mode > 0o7777:
+        raise ReleaseError(f"{label} snapshot is malformed")
+    identity = _journal_file_identity_from_payload(value["identity"], label=label)
+    if not exists:
+        if encoded is not None or digest is not None or identity is not None:
+            raise ReleaseError(f"{label} absent snapshot is malformed")
+        return _AnchoredFileSnapshot(_FileSnapshot(False), None, None)
+    if not isinstance(encoded, str) or not isinstance(digest, str) or _RELEASE_ID.fullmatch(digest) is None:
+        raise ReleaseError(f"{label} snapshot is malformed")
     try:
-        mode = path.lstat().st_mode
-    except OSError as exc:
-        raise ReleaseError(f"could not inspect directory before fsync: {path}: {exc}") from exc
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-        raise ReleaseError(f"cannot fsync a symlink or non-directory: {path}")
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
+        content = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise ReleaseError(f"{label} snapshot is malformed") from exc
+    if identity is None or identity.size != len(content) or identity.mode != mode:
+        raise ReleaseError(f"{label} snapshot is malformed")
+    if sha256_bytes(content) != digest:
+        raise ReleaseError(f"{label} snapshot is malformed")
+    return _AnchoredFileSnapshot(_FileSnapshot(True, content, mode), identity, digest)
+
+
+def _journal_directory_guard_payload(anchor: _DirectoryAnchor) -> dict[str, object]:
+    return {
+        "path": str(anchor.path),
+        "chain": [
+            {"device": identity.device, "inode": identity.inode, "mode": identity.mode}
+            for identity in anchor.chain
+        ],
+    }
+
+
+def _journal_directory_guards_from_payload(value: object) -> _PublicationParentGuards:
+    if not isinstance(value, list) or not value:
+        raise ReleaseError("publication journal parent guards are malformed")
+    guards: list[_DirectoryGuard] = []
+    seen: set[Path] = set()
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != {"path", "chain"}:
+            raise ReleaseError("publication journal parent guards are malformed")
+        raw_path = item["path"]
+        if not isinstance(raw_path, str):
+            raise ReleaseError("publication journal parent guard path is malformed")
+        path = _canonical_publication_path(raw_path, label="publication journal parent")
+        chain_value = item["chain"]
+        if not isinstance(chain_value, list) or not chain_value:
+            raise ReleaseError("publication journal parent guard is malformed")
+        chain: list[_DirectoryIdentity] = []
+        for identity_value in chain_value:
+            if not isinstance(identity_value, Mapping) or set(identity_value) != {
+                "device", "inode", "mode"
+            }:
+                raise ReleaseError("publication journal parent guard is malformed")
+            numbers: list[int] = []
+            for name in ("device", "inode", "mode"):
+                number = identity_value[name]
+                if isinstance(number, bool) or not isinstance(number, int):
+                    raise ReleaseError("publication journal parent guard is malformed")
+                numbers.append(number)
+            directory = _DirectoryIdentity(numbers[0], numbers[1], numbers[2])
+            if directory.device < 0 or directory.inode <= 0 or directory.mode < 0 or directory.mode > 0o7777:
+                raise ReleaseError("publication journal parent guard is malformed")
+            chain.append(directory)
+        if path in seen:
+            raise ReleaseError("publication journal repeats a parent guard")
+        seen.add(path)
+        guards.append(_DirectoryGuard(path, tuple(chain)))
+    return _PublicationParentGuards(tuple(guards))
+
+
+def _journal_record_payload(record: _PublicationRecord) -> dict[str, object]:
+    return {
+        "path": str(record.path),
+        "name": record.name,
+        "content_b64": (
+            base64.b64encode(record.content).decode("ascii")
+            if record.content is not None
+            else None
+        ),
+        "mode": record.mode,
+        "label": record.label,
+        "snapshot": _journal_snapshot_payload(record.snapshot),
+        "staged_name": record.staged_name,
+        "staged_identity": _journal_file_identity_payload(record.staged_identity),
+        "quarantine_name": record.quarantine_name,
+        "quarantine_identity": _journal_file_identity_payload(record.quarantine_identity),
+        "rollback_name": record.rollback_name,
+        "rollback_identity": _journal_file_identity_payload(record.rollback_identity),
+        "disposal_name": record.disposal_name,
+        "disposal_identity": _journal_file_identity_payload(record.disposal_identity),
+        "disposal_source": record.disposal_source,
+        "committed_identity": _journal_file_identity_payload(record.committed_identity),
+        "deleted": record.deleted,
+        "phase": record.phase,
+    }
+
+
+def _publication_journal_name(name: str) -> str:
+    _safe_component(name, label="publication journal")
+    if (
+        not name.startswith(_PUBLICATION_JOURNAL_PREFIX)
+        or not name.endswith(_PUBLICATION_JOURNAL_SUFFIX)
+        or len(name) <= len(_PUBLICATION_JOURNAL_PREFIX) + len(_PUBLICATION_JOURNAL_SUFFIX)
+    ):
+        raise ReleaseError("publication journal name is invalid")
+    return name
+
+
+def _publication_journal_frame(payload: Mapping[str, object]) -> bytes:
+    encoded = canonical_json_bytes(payload)
+    if len(encoded) > _MAX_PUBLICATION_JOURNAL_FRAME_BYTES:
+        raise ReleaseError("publication journal is too large")
+    digest = sha256_bytes(encoded).encode("ascii")
+    return (
+        _PUBLICATION_JOURNAL_FRAME
+        + f"{len(encoded):08x}".encode("ascii")
+        + b":"
+        + digest
+        + b"\n"
+        + encoded
+    )
+
+
+def _publication_journal_latest_payload(content: bytes) -> dict[str, object]:
+    """Read the newest complete append-only journal frame after an interruption."""
+
+    latest: dict[str, object] | None = None
+    latest_generation = -1
+    seen_generations: set[int] = set()
+    offset = 0
+    header_size = len(_PUBLICATION_JOURNAL_FRAME) + 8 + 1 + 64 + 1
+    while offset < len(content):
+        if len(content) - offset < header_size:
+            # A torn append may stop in the header; its preceding frame is
+            # still authoritative.  Do not silently tolerate arbitrary tail
+            # bytes, however: a torn writer can only have begun the fixed
+            # frame marker at this offset.
+            if content[offset:].startswith(_PUBLICATION_JOURNAL_FRAME):
+                break
+            raise ReleaseError("publication journal frame order is malformed")
+        if content[offset:offset + len(_PUBLICATION_JOURNAL_FRAME)] != _PUBLICATION_JOURNAL_FRAME:
+            raise ReleaseError("publication journal frame order is malformed")
+        size_raw = content[offset + len(_PUBLICATION_JOURNAL_FRAME): offset + len(_PUBLICATION_JOURNAL_FRAME) + 8]
+        separator = content[offset + len(_PUBLICATION_JOURNAL_FRAME) + 8]
+        digest_start = offset + len(_PUBLICATION_JOURNAL_FRAME) + 9
+        digest = content[digest_start:digest_start + 64]
+        payload_start = digest_start + 65
+        if separator != ord(":") or content[payload_start - 1:payload_start] != b"\n":
+            raise ReleaseError("publication journal frame is malformed")
+        try:
+            size = int(size_raw.decode("ascii"), 16)
+        except (UnicodeDecodeError, ValueError):
+            raise ReleaseError("publication journal frame is malformed") from None
+        if size <= 0 or size > _MAX_PUBLICATION_JOURNAL_FRAME_BYTES:
+            raise ReleaseError("publication journal frame is malformed")
+        payload_end = payload_start + size
+        if payload_end > len(content):
+            # The final payload may be only partly appended.  Do not parse a
+            # later marker embedded in it as a second independent frame.
+            break
+        payload_raw = content[payload_start:payload_end]
+        if sha256_bytes(payload_raw).encode("ascii") != digest:
+            raise ReleaseError("publication journal frame digest is malformed")
+        try:
+            payload = json.loads(payload_raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ReleaseError("publication journal frame payload is malformed") from None
+        if not isinstance(payload, dict) or canonical_json_bytes(payload) != payload_raw:
+            raise ReleaseError("publication journal frame payload is malformed")
+        generation = payload.get("generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise ReleaseError("publication journal frame generation is malformed")
+        # A failed fsync can leave the writer unsure whether a complete frame
+        # reached stable storage.  Generation reuse would make the reader
+        # choose between two equally authoritative frames.  Treat duplicate
+        # or out-of-order complete frames as tampering/ambiguous recovery,
+        # rather than guessing which operation owned a leaf.
+        if generation in seen_generations or generation <= latest_generation:
+            raise ReleaseError("publication journal has ambiguous frame generation")
+        seen_generations.add(generation)
+        latest = payload
+        latest_generation = generation
+        offset = payload_end
+    if latest is None:
+        raise ReleaseError("publication journal has no complete durable record")
+    return latest
+
+
+@dataclass
+class _PublicationJournal:
+    """Append-only write-ahead record for one descriptor-rooted transaction.
+
+    A mutation is preceded by a fully fsynced intent frame.  An interrupted
+    append leaves a partial frame, while the preceding complete frame remains
+    parseable.  This avoids a truncate/rewrite window in the recovery record.
+    """
+
+    parent: _DirectoryAnchor
+    name: str
+    descriptor: int
+    records: list[_PublicationRecord]
+    anchors: Mapping[Path, _DirectoryAnchor]
+    generation: int = 0
+    # ``state`` is the latest state whose frame fsync completed.  An append
+    # can have reached storage before fsync reports an error, so the attempted
+    # state is deliberately separate and blocks all in-process conclusions
+    # until a fresh reader selects the ordered durable frame on restart.
+    state: str = "active"
+    attempted_state: str | None = None
+    durability_uncertain: bool = False
+
+    @property
+    def path(self) -> Path:
+        return self.parent.path / self.name
+
+    @classmethod
+    def create(
+        cls,
+        parents: _PublicationParents,
+        records: list[_PublicationRecord],
+        *,
+        journal_path: Path | str | os.PathLike[str] | None = None,
+    ) -> "_PublicationJournal":
+        if not records:
+            raise ReleaseError("publication journal has no records")
+        if journal_path is None:
+            parent = parents.for_path(records[0].path)
+            name = (
+                f"{_PUBLICATION_JOURNAL_PREFIX}{os.getpid()}-"
+                f"{uuid.uuid4().hex}{_PUBLICATION_JOURNAL_SUFFIX}"
+            )
+        else:
+            path = _canonical_publication_path(journal_path, label="publication journal")
+            parent = parents.for_path(path)
+            name = _publication_journal_name(path.name)
+        _publication_journal_name(name)
+        parent.assert_current(phase="before journal creation")
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_APPEND
+            | getattr(os, "O_CLOEXEC", 0)
+            | _nofollow_open_flag()
+        )
+        descriptor = _openat(
+            parent.descriptor,
+            name,
+            flags,
+            mode=0o600,
+            label="publication journal",
+        )
+        result: _PublicationJournal | None = None
+        created_identity: _FileIdentity | None = None
+
+        def authenticated_created_leaf() -> _FileIdentity:
+            """Return the exact O_EXCL leaf, never a later name occupant."""
+
+            nonlocal created_identity
+            parent.assert_current(phase="during journal creation failure handling")
+            descriptor_identity = _file_identity(
+                os.fstat(descriptor),
+                label="publication journal",
+            )
+            if descriptor_identity.nlink != 1:
+                raise ReleaseError("publication journal created leaf has unexpected hard links")
+            if created_identity is not None and not _same_created_journal_leaf(
+                descriptor_identity,
+                created_identity,
+            ):
+                raise ReleaseError("publication journal descriptor changed during creation")
+            named = _validate_regular_at(parent, name, label="publication journal")
+            if (
+                named is None
+                or not _same_created_journal_leaf(named, descriptor_identity)
+            ):
+                raise ReleaseError("publication journal changed during creation")
+            return descriptor_identity
+
+        def abort_pre_result_failure(cause: BaseException) -> NoReturn:
+            """Resolve a failed O_EXCL setup without leaving a blank journal.
+
+            ``O_CREAT|O_EXCL`` has already made a directory entry when any of
+            fchmod/fstat/name validation fails.  Do not close the FD and leave
+            a zero-byte journal behind.  We first authenticate the original
+            O_EXCL inode through the same anchored directory FD, then write a
+            valid active failure frame.  Once that frame and its parent have
+            been durably synchronized, cleanup is deliberately deferred to
+            restart recovery: moving the only named receipt to a disposal name
+            and then losing its directory fsync would otherwise leave no
+            stable path by which a caller could discover it.  A replacement
+            name is never adopted or unlinked.
+            """
+
+            failure_journal: _PublicationJournal | None = None
+            created_for_cleanup: _FileIdentity | None = None
+            try:
+                identity = authenticated_created_leaf()
+                created_for_cleanup = identity
+                # A failed fchmod must not leave a retained journal whose
+                # mode the restart reader cannot consume.  The exact
+                # O_EXCL descriptor remains available for descriptor-bound
+                # cleanup, so this pre-mutation path can fail closed.
+                if identity.mode & ~0o600 == 0:
+                    os.fchmod(descriptor, 0o600)
+                    identity = authenticated_created_leaf()
+                    if identity.mode != 0o600:
+                        raise ReleaseError("publication journal mode is unsafe during recovery setup")
+                    failure_journal = cls(
+                        parent,
+                        name,
+                        descriptor,
+                        records,
+                        parents.anchors(),
+                    )
+                    try:
+                        failure_journal.persist()
+                        parent.fsync(label="publication journal failure receipt parent")
+                    except BaseException as receipt_exc:
+                        # A complete frame may have reached storage despite a
+                        # failing fsync.  Retain the exact named leaf whenever
+                        # it still authenticates; restart parsing, rather than
+                        # this process, decides whether it is usable.
+                        try:
+                            authenticated_created_leaf()
+                        except BaseException:
+                            failure_journal.close()
+                            raise _PublicationJournalPreflightError(
+                                "publication journal setup failed before mutation; "
+                                "its failure receipt could not be authenticated",
+                                cause=cause,
+                            ) from receipt_exc
+                        else:
+                            raise _PublicationJournalCreateError(
+                                failure_journal,
+                                receipt_exc,
+                                original_cause=(
+                                    receipt_exc
+                                    if not isinstance(receipt_exc, Exception)
+                                    else cause
+                                ),
+                            ) from cause
+
+                    # The receipt itself is now the exact, durable recovery
+                    # handle.  Do not attempt a local rename/unlink of the
+                    # only known name: a post-unlink parent-fsync failure has
+                    # no reliable answer about whether that name will survive
+                    # a crash.  Recovery sees an active journal with no public
+                    # mutation, terminalizes it, and performs the same
+                    # descriptor-bound private cleanup after that decision.
+                    raise _PublicationJournalCreateError(failure_journal, cause)
+
+                staged = _StagedPublicationFile(
+                    parent,
+                    name,
+                    descriptor,
+                    identity,
+                    "publication journal",
+                )
+                try:
+                    _cleanup_staged_file(staged)
+                except BaseException as cleanup_exc:
+                    # An unsafe-mode O_EXCL leaf cannot hold a full receipt.
+                    # The exact cleanup helper nevertheless uses a parent FD,
+                    # compares the original inode, and fsyncs that parent;
+                    # a failure here is never described as a rollback.
+                    raise _PublicationJournalPreflightError(
+                        "publication journal setup failed before mutation and "
+                        "its cleanup durability is uncertain",
+                        cause=cause,
+                    ) from cleanup_exc
+                staged.close()
+            except _PublicationJournalCreateError:
+                raise
+            except _PublicationJournalPreflightError:
+                raise
+            except BaseException as cleanup_auth_exc:
+                # Without an exact FD/name identity, unlinking would be a
+                # stale-name delete.  Preserve any foreign replacement and
+                # report a pre-mutation failure instead of claiming rollback.
+                cleanup_error: BaseException | None = None
+                if created_for_cleanup is not None:
+                    try:
+                        _cleanup_staged_file(
+                            _StagedPublicationFile(
+                                parent,
+                                name,
+                                descriptor,
+                                created_for_cleanup,
+                                "publication journal",
+                            )
+                        )
+                    except BaseException as exc:
+                        cleanup_error = exc
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                if not isinstance(cause, Exception):
+                    raise cause
+                if cleanup_error is not None:
+                    raise _PublicationJournalPreflightError(
+                        "publication journal setup failed before mutation and "
+                        "its cleanup durability is uncertain",
+                        cause=cause,
+                    ) from cleanup_error
+                raise _PublicationJournalPreflightError(
+                    "publication journal setup failed before mutation; its "
+                    f"created leaf could not be authenticated for cleanup: {cleanup_auth_exc}",
+                    cause=cause,
+                ) from cause
+            if not isinstance(cause, Exception):
+                raise cause
+            raise _PublicationJournalPreflightError(
+                "publication journal setup failed before mutation; incomplete "
+                "journal cleanup completed",
+                cause=cause,
+            ) from cause
+        try:
+            created_identity = _file_identity(
+                os.fstat(descriptor),
+                label="publication journal",
+            )
+            if created_identity.nlink != 1:
+                raise ReleaseError("publication journal created leaf has unexpected hard links")
+            os.fchmod(descriptor, 0o600)
+            identity = authenticated_created_leaf()
+            if identity.mode != 0o600:
+                raise ReleaseError("publication journal mode is unsafe during creation")
+            try:
+                result = cls(parent, name, descriptor, records, parents.anchors())
+                result.persist()
+                parent.fsync(label="publication journal parent")
+            except BaseException as exc:
+                # The file, initial frame, or directory entry may be durable
+                # despite this error.  Keep the exact handle and never let a
+                # caller classify this as a normal pre-mutation rollback.
+                if result is None:  # pragma: no cover - construction above
+                    raise
+                raise _PublicationJournalCreateError(result, exc) from exc
+            return result
+        except _PublicationJournalCreateError:
+            raise
+        except BaseException as exc:
+            if result is not None:
+                result.close()
+                raise
+            abort_pre_result_failure(exc)
+
+    def _payload(self, *, state: str | None = None) -> dict[str, object]:
+        return {
+            "schema": _PUBLICATION_JOURNAL_SCHEMA,
+            "generation": self.generation,
+            "state": self.state if state is None else state,
+            "journal_parent": str(self.parent.path),
+            "parents": [
+                _journal_directory_guard_payload(anchor)
+                for _path, anchor in sorted(self._parents_for_payload().items(), key=lambda item: str(item[0]))
+            ],
+            "records": [_journal_record_payload(record) for record in self.records],
+        }
+
+    def _parents_for_payload(self) -> dict[Path, _DirectoryAnchor]:
+        return dict(self.anchors)
+
+    def persist(self, *, state: str | None = None) -> None:
+        if self.descriptor < 0:
+            raise ReleaseError("publication journal descriptor is unavailable")
+        if self.durability_uncertain:
+            raise ReleaseError(
+                "publication journal durability is uncertain; restart recovery is required"
+            )
+        next_state = self.state if state is None else state
+        if next_state not in {"active", "rolling-back", "committed", "rolled-back"}:
+            raise ReleaseError("publication journal state is invalid")
+        self.parent.assert_current(phase="before journal update")
+        named = _validate_regular_at(self.parent, self.name, label="publication journal")
+        opened = _file_identity(os.fstat(self.descriptor), label="publication journal")
+        if named is None or opened.nlink != 1 or not _same_file_object(named, opened):
+            raise ReleaseError("publication journal changed before update")
+        self.generation += 1
+        self.attempted_state = next_state
+        try:
+            _write_all(
+                self.descriptor,
+                _publication_journal_frame(self._payload(state=next_state)),
+                label="publication journal",
+            )
+            _fsync_descriptor(self.descriptor, label="publication journal")
+        except BaseException:
+            # Do not let a failed terminal-frame write trigger local disposal
+            # in ``finally``.  A complete frame might reach storage despite a
+            # failing fsync, but this process has no proof of that and must
+            # retain every rollback private leaf and the journal name.
+            # The append may have completed before a failing fsync.  Never
+            # reuse this generation and never infer the terminal outcome
+            # from the in-memory attempted state.  A restart parser, bound to
+            # the exact journal inode, is the only authority that can decide
+            # which complete ordered frame survived.
+            self.durability_uncertain = True
+            raise
+        self.state = next_state
+        self.attempted_state = None
+
+    def close(self) -> None:
+        if self.descriptor < 0:
+            return
+        descriptor = self.descriptor
+        self.descriptor = -1
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+    def finalize_terminal(self) -> bool:
+        """Best-effort private cleanup after a durable terminal frame.
+
+        A post-unlink directory-fsync failure cannot make a caller roll back a
+        transaction whose ``committed`` record was already durable.  Until
+        unlink succeeds, its exact journal remains recoverable at either its
+        original name or an inode-bound terminal disposal name.
+        """
+
+        if self.state not in {"committed", "rolled-back"}:
+            raise ReleaseError("publication journal is not terminal")
+        if self.descriptor < 0:
+            return False
+        # Do not erase the only durable handle while an open private leaf is
+        # still owed cleanup.  In particular, _cleanup_staged_file can move a
+        # leaf to a random disposal name and then lose its parent fsync; the
+        # live record keeps recovery from calling that unresolved residue a
+        # completed transaction.
+        if any(
+            record.staged is not None
+            or record.quarantine is not None
+            or record.rollback is not None
+            or record.disposal is not None
+            or record.staged_name is not None
+            or record.staged_identity is not None
+            or record.quarantine_name is not None
+            or record.quarantine_identity is not None
+            or record.rollback_name is not None
+            or record.rollback_identity is not None
+            or record.disposal_name is not None
+            or record.disposal_identity is not None
+            or record.disposal_source is not None
+            for record in self.records
+        ):
+            self.close()
+            return False
+        disposal_name: str | None = None
+        current: _FileIdentity | None = None
+        try:
+            current = _file_identity(os.fstat(self.descriptor), label="publication journal")
+            if current.mode != 0o600 or current.nlink != 1:
+                raise ReleaseError("publication journal is unsafe during terminal cleanup")
+            disposal_name = _terminal_journal_disposal_name(self.name, current)
+            staged = _StagedPublicationFile(
+                self.parent,
+                self.name,
+                self.descriptor,
+                current,
+                "publication journal",
+            )
+            _cleanup_staged_file(staged, disposal_name=disposal_name)
+        except BaseException as exc:
+            if disposal_name is not None and current is not None:
+                try:
+                    _restore_disposed_publication_journal(
+                        self.path,
+                        expected_identity=current,
+                    )
+                except BaseException:
+                    # A reoccupation or another cleanup interruption leaves
+                    # the exact terminal disposal discoverable for restart.
+                    pass
+            if isinstance(exc, Exception):
+                return False
+            raise
+        finally:
+            self.close()
+        return True
+
+
+def _terminal_journal_disposal_name(name: str, identity: _FileIdentity) -> str:
+    """Keep journal self-disposal discoverable without weakening ownership."""
+
+    _publication_journal_name(name)
+    stem = name[:-len(_PUBLICATION_JOURNAL_SUFFIX)]
+    return (
+        f"{stem}-dispose-{identity.device}-{identity.inode}-{identity.size}-{identity.mtime_ns}"
+        f"{_PUBLICATION_JOURNAL_SUFFIX}"
+    )
+
+
+def _restore_disposed_publication_journal(
+    path: Path,
+    *,
+    expected_identity: _FileIdentity | None = None,
+) -> bool:
+    """Restore one exact terminal receipt into an absent original name.
+
+    Journal cleanup can be interrupted after its no-replace move.  Its
+    discoverable name binds the moved inode, and only a terminal frame with
+    no outstanding private obligations permits this name recovery.  A
+    concurrently occupied original name always wins the no-replace restore.
+    """
+
+    _publication_journal_name(path.name)
+    if not _path_lexists(path.parent):
+        return False
+    parent = _open_directory_anchor(
+        path.parent,
+        label="publication journal disposal parent",
+        create_parents=False,
     )
     try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise ReleaseError(f"could not open directory for fsync: {path}: {exc}") from exc
+        parent.assert_current(phase="before journal disposal recovery")
+        try:
+            _lstat_at(parent.descriptor, path.name, label="publication journal")
+        except FileNotFoundError:
+            pass
+        else:
+            return False
+        stem = path.name[:-len(_PUBLICATION_JOURNAL_SUFFIX)]
+        pattern = re.compile(
+            re.escape(stem) + r"-dispose-([0-9]+)-([0-9]+)-([0-9]+)-(-?[0-9]+)"
+            + re.escape(_PUBLICATION_JOURNAL_SUFFIX)
+        )
+        candidates: list[tuple[str, _AnchoredFileSnapshot]] = []
+        for name in os.listdir(parent.descriptor):
+            match = pattern.fullmatch(name)
+            if match is None:
+                continue
+            named = _validate_regular_at(parent, name, label="terminal journal disposal")
+            if named is None:
+                continue
+            if name != _terminal_journal_disposal_name(path.name, named):
+                continue
+            if expected_identity is not None and not _same_renamed_file_identity(
+                named, expected_identity,
+            ):
+                continue
+            journal_read = _read_publication_journal(
+                path.parent / name,
+                recover_disposal=False,
+            )
+            if journal_read is None:
+                continue
+            _candidate_path, capture, payload = journal_read
+            if capture.identity != named:
+                raise ReleaseError("terminal journal disposal changed during recovery")
+            guards = _journal_directory_guards_from_payload(payload["parents"])
+            if guards.for_path(path) != parent.guard:
+                raise ReleaseError("terminal journal disposal parent changed")
+            records = [
+                _journal_record_from_payload(value, guards=guards)
+                for value in payload["records"]
+            ]
+            if payload["state"] not in {"committed", "rolled-back"} or any(
+                record.staged_name is not None
+                or record.quarantine_name is not None
+                or record.rollback_name is not None
+                or record.disposal_name is not None
+                for record in records
+            ):
+                raise ReleaseError("journal disposal is not terminally clean")
+            candidates.append((name, capture))
+        if not candidates:
+            return False
+        if len(candidates) != 1:
+            raise ReleaseError("multiple terminal journal disposals require exact recovery")
+        name, capture = candidates[0]
+        _restore_quarantined_leaf(
+            parent,
+            name,
+            path.name,
+            expected=capture,
+            label="terminal publication journal",
+        )
+        return True
+    finally:
+        parent.close()
+
+
+class _PublicationJournalCreateError(ReleaseError):
+    """Creation retained a parseable journal instead of claiming local cleanup."""
+
+    def __init__(
+        self,
+        journal: _PublicationJournal,
+        cause: BaseException,
+        *,
+        original_cause: BaseException | None = None,
+    ) -> None:
+        super().__init__(f"publication journal creation durability failed: {cause}")
+        self.journal = journal
+        self.cause = cause
+        # A parent-fsync error can occur while preserving an earlier
+        # KeyboardInterrupt from fchmod/fstat/validation.  The outer
+        # transaction must retain its recovery handle and still rethrow that
+        # initiating BaseException.
+        self.original_cause = original_cause if original_cause is not None else cause
+
+
+class _PublicationJournalPreflightError(ReleaseError):
+    """Journal setup stopped before any staged or canonical mutation.
+
+    This deliberately avoids the generic transaction's ``was rolled back``
+    wording.  There was no publication to undo, and the original setup error
+    may have left a foreign journal-name winner that must remain untouched.
+    """
+
+    def __init__(self, message: str, *, cause: BaseException) -> None:
+        super().__init__(message)
+        self.cause = cause
+
+
+def _publication_transaction_receipt(
+    journal: _PublicationJournal,
+    parents: _PublicationParents,
+    records: Sequence[_PublicationRecord],
+    *,
+    state: str,
+    postimages: Mapping[Path, _AnchoredFileSnapshot] | None = None,
+) -> PublicationTransactionReceipt:
+    """Freeze the exact ownership material handed to a durable callback."""
+
+    if state not in {"intent", "published", "recovered"}:
+        raise ReleaseError("publication receipt state is invalid")
+    parents.assert_current(phase=f"before {state} publication receipt")
+    journal_identity = _file_identity(
+        os.fstat(journal.descriptor),
+        label="publication journal",
+    )
+    if journal_identity.nlink != 1:
+        raise ReleaseError("publication journal is unsafe for callback receipt")
+    named = _validate_regular_at(journal.parent, journal.name, label="publication journal")
+    if named is None or not _same_file_object(named, journal_identity):
+        raise ReleaseError("publication journal changed before callback receipt")
+    preimages = {record.path: record.snapshot for record in records}
+    return PublicationTransactionReceipt(
+        journal_path=journal.path,
+        journal_identity=journal_identity,
+        state=state,
+        parent_guards=_PublicationParentGuards(
+            tuple(anchor.guard for _path, anchor in sorted(parents.anchors().items(), key=lambda item: str(item[0])))
+        ),
+        preimages=MappingProxyType(preimages),
+        postimages=MappingProxyType(dict(postimages or {})),
+    )
+
+
+def _capture_published_postimages(
+    parents: _PublicationParents,
+    records: Sequence[_PublicationRecord],
+) -> Mapping[Path, _AnchoredFileSnapshot]:
+    """Capture every current B identity before the journal becomes terminal."""
+
+    result: dict[Path, _AnchoredFileSnapshot] = {}
+    for record in records:
+        parent = parents.for_path(record.path)
+        observed = _capture_anchored_file(parent, record.name, label=record.label)
+        if record.content is None:
+            if observed.snapshot.exists:
+                raise ReleaseError(f"{record.label} reappeared before publication receipt")
+            result[record.path] = observed
+            continue
+        if record.committed_identity is None:
+            raise ReleaseError(f"{record.label} has no authenticated postimage")
+        expected = _staged_anchored_snapshot(record, record.committed_identity)
+        if not _anchored_snapshot_matches_after_rename(observed, expected):
+            raise ReleaseError(f"{record.label} changed before publication receipt")
+        result[record.path] = observed
+    return MappingProxyType(result)
+
+
+def _capture_recovered_postimages(
+    parents: _PublicationParents,
+    records: Sequence[_PublicationRecord],
+) -> Mapping[Path, _AnchoredFileSnapshot]:
+    """Capture exact canonical leaves after a journaled inverse completes.
+
+    A recovery may restore an original tombstone (whose preimage inode is
+    still authoritative), recreate a lost preimage from durable bytes (whose
+    new inode is journaled), or remove an explicitly absent preimage.  This
+    function never treats matching bytes as authority: each present leaf must
+    match one of those exact durable identities before it can be handed to an
+    outer transaction for strict adoption.
+    """
+
+    result: dict[Path, _AnchoredFileSnapshot] = {}
+    for record in records:
+        parent = parents.for_path(record.path)
+        observed = _capture_anchored_file(parent, record.name, label=record.label)
+        expected = record.snapshot
+        if not expected.snapshot.exists:
+            if observed.snapshot.exists:
+                raise ReleaseError(
+                    f"{record.label} reappeared before recovered postimage receipt"
+                )
+            result[record.path] = observed
+            continue
+        expected_digest = expected.sha256 or sha256_bytes(expected.snapshot.content)
+        if observed.snapshot != expected.snapshot or observed.sha256 != expected_digest:
+            raise ReleaseError(
+                f"{record.label} does not match its durable recovered preimage"
+            )
+        matches_original = _anchored_snapshot_matches_after_rename(observed, expected)
+        matches_recreated = False
+        if record.committed_identity is not None:
+            recreated = _AnchoredFileSnapshot(
+                expected.snapshot,
+                record.committed_identity,
+                expected_digest,
+            )
+            matches_recreated = _anchored_snapshot_matches_after_rename(observed, recreated)
+        if not matches_original and not matches_recreated:
+            raise ReleaseError(
+                f"{record.label} changed after restart recovery before exact receipt"
+            )
+        result[record.path] = observed
+    return MappingProxyType(result)
+
+
+def _publication_receipt_summary(
+    receipt: PublicationTransactionReceipt,
+) -> dict[str, object]:
+    """Return the stable JSON-safe portion of a callback receipt."""
+
+    def snapshot_item(path: Path, item: _AnchoredFileSnapshot) -> dict[str, object]:
+        return {
+            "path": str(path),
+            "exists": item.snapshot.exists,
+            "mode": item.snapshot.mode,
+            "sha256": item.sha256,
+            "identity": _journal_file_identity_payload(item.identity),
+        }
+
+    return {
+        "journal_path": str(receipt.journal_path),
+        "journal_identity": _journal_file_identity_payload(receipt.journal_identity),
+        "state": receipt.state,
+        "parents": [
+            {
+                "path": str(guard.path),
+                "chain": [
+                    {"device": item.device, "inode": item.inode, "mode": item.mode}
+                    for item in guard.chain
+                ],
+            }
+            for guard in receipt.parent_guards.guards
+        ],
+        "preimages": [
+            snapshot_item(path, item)
+            for path, item in sorted(receipt.preimages.items(), key=lambda pair: str(pair[0]))
+        ],
+        "postimages": [
+            snapshot_item(path, item)
+            for path, item in sorted(receipt.postimages.items(), key=lambda pair: str(pair[0]))
+        ],
+    }
+
+
+def _journal_record_phase(
+    journal: _PublicationJournal | None,
+    record: _PublicationRecord,
+    phase: str,
+) -> None:
+    record.phase = phase
+    if journal is not None:
+        journal.persist()
+
+
+def _unsupported_publication_operation(operation: str, exc: BaseException) -> ReleaseError:
+    return ReleaseError(
+        f"secure descriptor-relative {operation} is unavailable on this platform"
+    )
+
+
+def _canonical_publication_path(path: Path | str | os.PathLike[str], *, label: str) -> Path:
     try:
-        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            raise ReleaseError(f"directory changed type before fsync: {path}")
-        os.fsync(descriptor)
+        raw = os.fspath(path)
+    except TypeError as exc:
+        raise ReleaseError(f"{label} is not a path: {path!r}") from exc
+    if not isinstance(raw, str):
+        raw = os.fsdecode(raw)
+    if not raw or not os.path.isabs(raw) or raw != os.path.normpath(raw):
+        raise ReleaseError(f"{label} is not an absolute canonical path: {raw!r}")
+    candidate = Path(raw)
+    if any(part in (".", "..") for part in candidate.parts):
+        raise ReleaseError(f"{label} is not an absolute canonical path: {raw!r}")
+    return candidate
+
+
+def _directory_identity(info: os.stat_result, *, label: str) -> _DirectoryIdentity:
+    try:
+        device = int(info.st_dev)
+        inode = int(info.st_ino)
+        mode = int(info.st_mode)
+        nlink = int(info.st_nlink)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ReleaseError(f"filesystem identity is unsupported for {label}") from exc
+    if device < 0 or inode <= 0 or nlink <= 0 or not stat.S_ISDIR(mode):
+        raise ReleaseError(f"filesystem identity is unsupported for {label}")
+    return _DirectoryIdentity(device, inode, stat.S_IMODE(mode))
+
+
+def _file_identity(info: os.stat_result, *, label: str) -> _FileIdentity:
+    try:
+        device = int(info.st_dev)
+        inode = int(info.st_ino)
+        mode = int(info.st_mode)
+        nlink = int(info.st_nlink)
+        size = int(info.st_size)
+        mtime_ns = int(info.st_mtime_ns)
+        ctime_ns = int(info.st_ctime_ns)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ReleaseError(f"filesystem identity is unsupported for {label}") from exc
+    if device < 0 or inode <= 0 or nlink <= 0:
+        raise ReleaseError(f"filesystem identity is unsupported for {label}")
+    return _FileIdentity(
+        device,
+        inode,
+        stat.S_IMODE(mode),
+        nlink,
+        size,
+        mtime_ns,
+        ctime_ns,
+    )
+
+
+def _same_file_object(left: _FileIdentity, right: _FileIdentity) -> bool:
+    return (
+        left.device == right.device
+        and left.inode == right.inode
+        and left.mode == right.mode
+        and left.nlink == right.nlink
+    )
+
+
+def _same_created_journal_leaf(left: _FileIdentity, right: _FileIdentity) -> bool:
+    """Compare the immutable ownership facts of a just-created journal leaf.
+
+    An attempted fchmod legitimately changes mode and ctime before the setup
+    code sees its result.  The cleanup proof therefore binds the original
+    O_EXCL object by device/inode and requires both views to remain
+    single-linked; it never treats a later same-name inode as ours.
+    """
+
+    return (
+        left.device == right.device
+        and left.inode == right.inode
+        and left.nlink == 1
+        and right.nlink == 1
+    )
+
+
+def _safe_component(name: str, *, label: str) -> str:
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise ReleaseError(f"unsafe publication file name for {label}: {name!r}")
+    return name
+
+
+def _nofollow_open_flag() -> int:
+    """Return O_NOFOLLOW, refusing platforms which cannot prove the walk."""
+
+    flag = getattr(os, "O_NOFOLLOW", 0)
+    if isinstance(flag, bool) or not isinstance(flag, int) or flag == 0:
+        raise ReleaseError(
+            "secure descriptor-relative publication requires O_NOFOLLOW"
+        )
+    return flag
+
+
+def _directory_open_flags() -> int:
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if isinstance(directory, bool) or not isinstance(directory, int) or directory == 0:
+        raise ReleaseError(
+            "secure descriptor-relative publication requires O_DIRECTORY"
+        )
+    return (
+        os.O_RDONLY
+        | directory
+        | getattr(os, "O_CLOEXEC", 0)
+        | _nofollow_open_flag()
+    )
+
+
+def _file_open_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | _nofollow_open_flag()
+
+
+def _lstat_at(descriptor: int, name: str, *, label: str) -> os.stat_result:
+    _safe_component(name, label=label)
+    try:
+        return os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+    except (TypeError, NotImplementedError) as exc:
+        raise _unsupported_publication_operation("stat", exc) from exc
+
+
+def _openat(
+    descriptor: int,
+    name: str,
+    flags: int,
+    *,
+    mode: int = 0o600,
+    label: str,
+) -> int:
+    _safe_component(name, label=label)
+    try:
+        return os.open(name, flags, mode, dir_fd=descriptor)
+    except (TypeError, NotImplementedError) as exc:
+        raise _unsupported_publication_operation("open", exc) from exc
+
+
+def _mkdirat(descriptor: int, name: str, *, mode: int, label: str) -> None:
+    _safe_component(name, label=label)
+    try:
+        os.mkdir(name, mode=mode, dir_fd=descriptor)
+    except (TypeError, NotImplementedError) as exc:
+        raise _unsupported_publication_operation("mkdir", exc) from exc
+
+
+def _renameat2(
+    descriptor: int,
+    source: str,
+    destination: str,
+    *,
+    flags: int,
+    label: str,
+) -> None:
+    """Atomically move two entries beneath one validated directory FD.
+
+    Linux has no conditional unlink.  ``RENAME_NOREPLACE`` and
+    ``RENAME_EXCHANGE`` are therefore the leaf-level compare-and-swap
+    primitives for this transaction.  Do not silently fall back to
+    ``os.replace``: that fallback would reintroduce the stale-name overwrite
+    this helper exists to prevent.
+    """
+
+    _safe_component(source, label=label)
+    _safe_component(destination, label=label)
+    if flags not in {_RENAME_NOREPLACE, _RENAME_EXCHANGE}:
+        raise ReleaseError(f"unsupported secure rename flags for {label}")
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except (AttributeError, OSError) as exc:
+        raise ReleaseError(
+            "secure descriptor-relative publication requires "
+            "renameat2(RENAME_NOREPLACE/RENAME_EXCHANGE)"
+        ) from exc
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    for attempt in range(_PUBLICATION_EINTR_RETRIES):
+        result = renameat2(
+            descriptor,
+            os.fsencode(source),
+            descriptor,
+            os.fsencode(destination),
+            flags,
+        )
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error != errno.EINTR:
+            break
+        if attempt + 1 >= _PUBLICATION_EINTR_RETRIES:
+            raise ReleaseError(
+                f"secure descriptor-relative rename interrupted "
+                f"{_PUBLICATION_EINTR_RETRIES} times for {label}"
+            )
+    else:  # pragma: no cover - the bounded branch returns or raises above
+        raise ReleaseError(f"secure descriptor-relative rename was interrupted for {label}")
+    if error == errno.ENOENT:
+        raise FileNotFoundError(error, os.strerror(error), source)
+    if error == errno.EEXIST:
+        raise FileExistsError(error, os.strerror(error), destination)
+    if error in {
+        errno.ENOSYS,
+        errno.EINVAL,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+        errno.ENOTSUP,
+    }:
+        raise ReleaseError(
+            "secure descriptor-relative publication requires "
+            "renameat2(RENAME_NOREPLACE/RENAME_EXCHANGE)"
+        )
+    raise OSError(error, os.strerror(error), source, destination)
+
+
+def _unlinkat(descriptor: int, name: str, *, label: str) -> None:
+    _safe_component(name, label=label)
+    for attempt in range(_PUBLICATION_EINTR_RETRIES):
+        try:
+            os.unlink(name, dir_fd=descriptor)
+            return
+        except (TypeError, NotImplementedError) as exc:
+            raise _unsupported_publication_operation("unlink", exc) from exc
+        except InterruptedError:
+            pass
+        except OSError as exc:
+            if exc.errno != errno.EINTR:
+                raise
+        if attempt + 1 >= _PUBLICATION_EINTR_RETRIES:
+            break
+    raise ReleaseError(
+        f"could not unlink {label}: interrupted {_PUBLICATION_EINTR_RETRIES} times"
+    )
+
+
+def _open_directory_anchor(
+    path: Path | str | os.PathLike[str],
+    *,
+    label: str,
+    create_parents: bool,
+) -> _DirectoryAnchor:
+    """Walk an absolute directory path with no-follow, descriptor-relative opens."""
+
+    checked = _canonical_publication_path(path, label=label)
+    try:
+        current = os.open("/", _directory_open_flags())
     except OSError as exc:
-        raise ReleaseError(f"could not fsync directory: {path}: {exc}") from exc
+        raise ReleaseError(f"could not open publication filesystem root: {exc}") from exc
+    try:
+        chain: list[_DirectoryIdentity] = [
+            _directory_identity(os.fstat(current), label="publication filesystem root")
+        ]
+        prefix = Path("/")
+        for component in checked.parts[1:]:
+            _safe_component(component, label=label)
+            try:
+                before = _lstat_at(current, component, label=label)
+            except FileNotFoundError:
+                if not create_parents:
+                    raise ReleaseError(f"publication parent does not exist: {checked}") from None
+                # A descriptor alone keeps mutations in the original tree;
+                # this fresh identity comparison also rejects a replaced
+                # named ancestor before creating a new directory.
+                _assert_directory_prefix_current(prefix, tuple(chain), label=label)
+                try:
+                    _mkdirat(current, component, mode=0o700, label=label)
+                except FileExistsError:
+                    pass
+                else:
+                    _fsync_descriptor(
+                        current,
+                        label=f"created publication parent: {prefix}",
+                    )
+                before = _lstat_at(current, component, label=label)
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise ReleaseError(f"publication parent is not a real directory: {checked}")
+            child = _openat(current, component, _directory_open_flags(), label=label)
+            try:
+                after = _directory_identity(os.fstat(child), label=label)
+            except Exception:
+                os.close(child)
+                raise
+            observed = _directory_identity(before, label=label)
+            if observed != after:
+                os.close(child)
+                raise ReleaseError(f"publication parent changed while opening: {checked}")
+            os.close(current)
+            current = child
+            chain.append(after)
+            prefix = prefix / component
+        return _DirectoryAnchor(checked, current, tuple(chain), label)
+    except Exception:
+        try:
+            os.close(current)
+        except OSError:
+            pass
+        raise
+
+
+def _assert_directory_prefix_current(
+    path: Path,
+    expected: tuple[_DirectoryIdentity, ...],
+    *,
+    label: str,
+) -> None:
+    fresh = _open_directory_anchor(path, label=label, create_parents=False)
+    try:
+        if fresh.chain != expected:
+            raise ReleaseError(f"publication parent identity changed before directory creation: {path}")
+    finally:
+        fresh.close()
+
+
+def _coerce_parent_guards(value: object | None) -> _PublicationParentGuards | None:
+    if value is None:
+        return None
+    if not isinstance(value, _PublicationParentGuards):
+        raise ReleaseError("publication parent identities are unsupported")
+    return value
+
+
+def _capture_publication_parent_guards(
+    paths: Sequence[Path | str | os.PathLike[str]],
+    *,
+    create_parents: bool = False,
+) -> _PublicationParentGuards:
+    """Capture every output parent and every ancestor as a reusable guard."""
+
+    normalized = [_canonical_publication_path(path, label="publication path") for path in paths]
+    if not normalized:
+        raise ReleaseError("publication has no paths to anchor")
+    guards: list[_DirectoryGuard] = []
+    for parent in sorted({path.parent for path in normalized}, key=str):
+        anchor = _open_directory_anchor(
+            parent,
+            label=f"publication parent {parent}",
+            create_parents=create_parents,
+        )
+        try:
+            anchor.assert_current(phase="during preflight")
+            guards.append(anchor.guard)
+        finally:
+            anchor.close()
+    return _PublicationParentGuards(tuple(guards))
+
+
+def _open_publication_parents(
+    paths: Sequence[Path],
+    *,
+    parent_guards: object | None = None,
+    create_parents: bool = False,
+) -> _PublicationParents:
+    expected = _coerce_parent_guards(parent_guards)
+    anchors: dict[Path, _DirectoryAnchor] = {}
+    try:
+        for parent in sorted({path.parent for path in paths}, key=str):
+            anchor = _open_directory_anchor(
+                parent,
+                label=f"publication parent {parent}",
+                create_parents=create_parents,
+            )
+            if expected is not None:
+                guard = expected.for_path(parent / ".publication-anchor")
+                if guard is None or guard != anchor.guard:
+                    anchor.close()
+                    raise ReleaseError(f"publication parent identity changed before mutation: {parent}")
+            anchors[parent] = anchor
+        result = _PublicationParents(anchors)
+        result.assert_current(phase="before mutation")
+        return result
+    except Exception:
+        for anchor in anchors.values():
+            anchor.close()
+        raise
+
+
+def _validate_regular_at(
+    parent: _DirectoryAnchor,
+    name: str,
+    *,
+    label: str,
+) -> _FileIdentity | None:
+    try:
+        info = _lstat_at(parent.descriptor, name, label=label)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ReleaseError(f"{label} is not a regular file")
+    identity = _file_identity(info, label=label)
+    if identity.nlink != 1:
+        raise ReleaseError(f"{label} has unexpected hard links")
+    return identity
+
+
+def _read_regular_at(
+    parent: _DirectoryAnchor,
+    name: str,
+    *,
+    label: str,
+) -> tuple[bytes, _FileIdentity]:
+    before = _validate_regular_at(parent, name, label=label)
+    if before is None:
+        raise FileNotFoundError(name)
+    descriptor = _openat(parent.descriptor, name, _file_open_flags(), label=label)
+    try:
+        opened = _file_identity(os.fstat(descriptor), label=label)
+        if opened.nlink != 1 or before != opened:
+            raise ReleaseError(f"{label} changed while opening")
+        chunks: list[bytes] = []
+        while True:
+            try:
+                block = os.read(descriptor, 1024 * 1024)
+            except InterruptedError:
+                continue
+            if not block:
+                break
+            chunks.append(block)
+        after = _file_identity(os.fstat(descriptor), label=label)
+        if after.nlink != 1 or after != opened:
+            raise ReleaseError(f"{label} changed while reading")
+        # The opened inode alone does not prove that the public name still
+        # selects these bytes.  Retain the descriptor until both observations
+        # agree, including metadata changes made in place during capture.
+        named = _validate_regular_at(parent, name, label=label)
+        if named != after:
+            raise ReleaseError(f"{label} changed after reading")
+        return b"".join(chunks), after
     finally:
         os.close(descriptor)
 
 
-def _atomic_write_bytes(path: Path, content: bytes, *, mode: int = 0o644) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    parent_mode = path.parent.lstat().st_mode
-    if stat.S_ISLNK(parent_mode) or not stat.S_ISDIR(parent_mode):
-        raise ReleaseError(f"atomic-write parent is not a real directory: {path.parent}")
-    if _path_lexists(path):
-        destination_mode = path.lstat().st_mode
-        if stat.S_ISLNK(destination_mode) or not stat.S_ISREG(destination_mode):
-            raise ReleaseError(f"atomic-write destination is not a regular file: {path}")
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
+def _capture_anchored_file(
+    parent: _DirectoryAnchor,
+    name: str,
+    *,
+    label: str,
+) -> _AnchoredFileSnapshot:
+    identity = _validate_regular_at(parent, name, label=label)
+    if identity is None:
+        return _AnchoredFileSnapshot(_FileSnapshot(False), None, None)
+    content, observed = _read_regular_at(parent, name, label=label)
+    return _AnchoredFileSnapshot(
+        _FileSnapshot(True, content, observed.mode),
+        observed,
+        sha256_bytes(content),
+    )
+
+
+def _capture_anchored_files_safely(
+    paths: Sequence[tuple[Path, str]],
+    *,
+    parent_guards: object | None = None,
+    create_parents: bool = False,
+) -> dict[Path, _AnchoredFileSnapshot]:
+    """Capture file bytes and exact identities through validated parent FDs."""
+
+    normalized = [(_canonical_publication_path(path, label=label), label) for path, label in paths]
+    parents = _open_publication_parents(
+        [path for path, _label in normalized],
+        parent_guards=parent_guards,
+        create_parents=create_parents,
     )
     try:
-        descriptor = os.open(temporary, flags, mode)
-        with os.fdopen(descriptor, "wb") as handle:
-            os.fchmod(handle.fileno(), mode)
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
+        parents.assert_current(phase="before preimage capture")
+        result: dict[Path, _AnchoredFileSnapshot] = {}
+        for path, label in normalized:
+            parents.assert_current(phase="during preimage capture")
+            parent = parents.for_path(path)
+            result[path] = _capture_anchored_file(parent, path.name, label=label)
+        parents.assert_current(phase="after preimage capture")
+        for path, label in normalized:
+            observed = _validate_regular_at(parents.for_path(path), path.name, label=label)
+            if observed != result[path].identity:
+                raise ReleaseError(f"{label} changed after preimage capture")
+        return result
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        parents.close()
+
+
+def _capture_files_safely(
+    paths: Sequence[tuple[Path, str]],
+    *,
+    parent_guards: object | None = None,
+    create_parents: bool = False,
+) -> dict[Path, _FileSnapshot]:
+    """Capture regular-file preimages through validated parent descriptors."""
+
+    anchored = _capture_anchored_files_safely(
+        paths,
+        parent_guards=parent_guards,
+        create_parents=create_parents,
+    )
+    return {path: item.snapshot for path, item in anchored.items()}
+
+
+def _fsync_directory(path: Path) -> None:
+    anchor = _open_directory_anchor(path, label=f"directory {path}", create_parents=False)
+    try:
+        anchor.assert_current(phase="before fsync")
+        anchor.fsync(label="directory")
+        anchor.assert_current(phase="after fsync")
+    finally:
+        anchor.close()
 
 
 def _path_lexists(path: Path) -> bool:
     return os.path.lexists(os.fspath(path))
 
 
-def _capture_file(path: Path, *, label: str) -> _FileSnapshot:
-    if not _path_lexists(path):
-        return _FileSnapshot(False)
-    mode = path.lstat().st_mode
-    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-        raise ReleaseError(f"{label} is not a regular file: {path}")
-    return _FileSnapshot(
-        True,
-        path.read_bytes(),
-        stat.S_IMODE(mode),
+def _snapshot_from_object(value: object, *, label: str) -> _FileSnapshot:
+    exists = getattr(value, "exists", None)
+    content = getattr(value, "content", None)
+    mode = getattr(value, "mode", None)
+    if isinstance(value, Mapping):
+        required = {"exists", "content", "mode"}
+        if not required.issubset(value):
+            raise ReleaseError(f"{label} snapshot is malformed")
+        exists = value["exists"]
+        content = value["content"]
+        mode = value["mode"]
+    if not isinstance(exists, bool) or not isinstance(content, bytes):
+        raise ReleaseError(f"{label} snapshot is malformed")
+    if isinstance(mode, bool) or not isinstance(mode, int) or mode < 0 or mode > 0o7777:
+        raise ReleaseError(f"{label} snapshot mode is malformed")
+    if not exists and content:
+        raise ReleaseError(f"{label} absent snapshot contains bytes")
+    return _FileSnapshot(exists, content, mode)
+
+
+_MISSING_SNAPSHOT_FIELD = object()
+
+
+def _snapshot_field(value: object, name: str) -> object:
+    if isinstance(value, Mapping):
+        return value.get(name, _MISSING_SNAPSHOT_FIELD)
+    return getattr(value, name, _MISSING_SNAPSHOT_FIELD)
+
+
+def _anchored_identity_from_object(
+    value: object,
+    snapshot: _FileSnapshot,
+    *,
+    label: str,
+) -> tuple[_FileIdentity | None, str | None]:
+    """Recover a complete anchor emitted by ``service_wrappers``.
+
+    Older, explicitly content-only callers remain usable, but a partial
+    identity is never guessed.  A captured wrapper snapshot carries every
+    field below, so losing any one of them is an authentication failure rather
+    than an invitation to compare only bytes and mode.
+    """
+
+    names = ("device", "inode", "nlink", "size", "mtime_ns", "ctime_ns", "sha256")
+    values = {name: _snapshot_field(value, name) for name in names}
+    present = {name: item is not _MISSING_SNAPSHOT_FIELD for name, item in values.items()}
+    if not any(present.values()):
+        return None, None
+    if not all(present.values()):
+        raise ReleaseError(f"{label} snapshot identity is incomplete")
+    if snapshot.exists and all(values[name] is None for name in names):
+        # A manually constructed legacy FileSnapshot exposes dataclass fields
+        # with their ``None`` defaults.  Treat that explicit all-None form as
+        # content-only, never as a partly trusted identity.
+        return None, None
+    if not snapshot.exists:
+        if any(values[name] is not None for name in names):
+            raise ReleaseError(f"{label} absent snapshot has an identity")
+        return None, None
+
+    for name in ("device", "inode", "nlink", "size", "mtime_ns", "ctime_ns"):
+        item = values[name]
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ReleaseError(f"{label} snapshot {name} is malformed")
+    device = int(values["device"])
+    inode = int(values["inode"])
+    nlink = int(values["nlink"])
+    size = int(values["size"])
+    mtime_ns = int(values["mtime_ns"])
+    ctime_ns = int(values["ctime_ns"])
+    digest = values["sha256"]
+    if (
+        device < 0
+        or inode <= 0
+        or nlink != 1
+        or size < 0
+        or not isinstance(digest, str)
+        or _RELEASE_ID.fullmatch(digest) is None
+        or size != len(snapshot.content)
+        or digest != sha256_bytes(snapshot.content)
+    ):
+        raise ReleaseError(f"{label} snapshot identity is malformed")
+    return (
+        _FileIdentity(
+            device,
+            inode,
+            snapshot.mode,
+            nlink,
+            size,
+            mtime_ns,
+            ctime_ns,
+        ),
+        digest,
     )
 
 
-def _restore_file(path: Path, snapshot: _FileSnapshot, *, label: str) -> None:
-    if snapshot.exists:
-        _atomic_write_bytes(path, snapshot.content, mode=snapshot.mode)
+def _expected_anchored_snapshot_from_object(
+    value: object,
+    *,
+    label: str,
+) -> _AnchoredFileSnapshot:
+    """Normalize a preimage, retaining an identity when the caller has one."""
+
+    if isinstance(value, _AnchoredFileSnapshot):
+        return value
+    snapshot = _snapshot_from_object(value, label=label)
+    identity, digest = _anchored_identity_from_object(value, snapshot, label=label)
+    return _AnchoredFileSnapshot(snapshot, identity, digest)
+
+
+def _capture_file(
+    path: Path,
+    *,
+    label: str,
+    parent_guards: object | None = None,
+) -> _FileSnapshot:
+    return _capture_files_safely(
+        ((_canonical_publication_path(path, label=label), label),),
+        parent_guards=parent_guards,
+    )[_canonical_publication_path(path, label=label)]
+
+
+def _write_all(descriptor: int, content: bytes, *, label: str) -> None:
+    view = memoryview(content)
+    while view:
+        try:
+            written = os.write(descriptor, view)
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            raise ReleaseError(f"could not write {label}: {exc}") from exc
+        if written <= 0:
+            raise ReleaseError(f"could not write {label}: short write")
+        view = view[written:]
+
+
+def _stage_publication_file(
+    parent: _DirectoryAnchor,
+    name: str,
+    content: bytes,
+    *,
+    mode: int,
+    label: str,
+    temporary_name: str | None = None,
+    record: _PublicationRecord | None = None,
+    journal: _PublicationJournal | None = None,
+) -> _StagedPublicationFile:
+    """Write and fsync an unlinked-from-publication temporary through a dir FD."""
+
+    parent.assert_current(phase="before staging")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | _nofollow_open_flag()
+    )
+    supplied_name = temporary_name
+    for _attempt in range(32):
+        temporary_name = supplied_name or _new_private_publication_name(name, purpose="tmp")
+        _safe_component(temporary_name, label=f"{label} temporary")
+        try:
+            descriptor = _openat(
+                parent.descriptor,
+                temporary_name,
+                flags,
+                mode=mode,
+                label=label,
+            )
+        except FileExistsError:
+            if supplied_name is not None:
+                raise ReleaseError(f"{label} journal temporary name is already occupied") from None
+            continue
+        initial: _FileIdentity | None = None
+        staged: _StagedPublicationFile | None = None
+        try:
+            initial = _file_identity(os.fstat(descriptor), label=label)
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode) or initial.nlink != 1:
+                raise ReleaseError(f"{label} temporary file is unsafe")
+            try:
+                os.fchmod(descriptor, mode)
+            except (AttributeError, OSError) as exc:
+                raise ReleaseError(f"could not set mode for {label}: {exc}") from exc
+            _write_all(descriptor, content, label=label)
+            _fsync_descriptor(descriptor, label=label)
+            final = _file_identity(os.fstat(descriptor), label=label)
+            named = _validate_regular_at(parent, temporary_name, label=f"{label} temporary")
+            if (
+                final.nlink != 1
+                or named is None
+                or named.nlink != 1
+                or not _same_file_object(final, named)
+            ):
+                raise ReleaseError(f"{label} temporary file changed before commit")
+            staged = _StagedPublicationFile(parent, temporary_name, descriptor, final, label)
+            if record is not None:
+                if record.staged_name != temporary_name:
+                    raise ReleaseError(f"{label} staged name does not match its journal intent")
+                # Persist the full post-stage identity before returning to the
+                # caller.  This closes the ordinary Python signal window
+                # between a successful stage and the caller's assignment.
+                record.staged = staged
+                record.staged_identity = staged.identity
+                _journal_record_phase(journal, record, "staged")
+            return staged
+        except BaseException:
+            if record is not None and staged is not None and record.staged is staged:
+                # The outer transaction owns this still-open descriptor and
+                # will either clean the exact staged leaf or retain its
+                # journal.  Closing it here would turn a failed cleanup into
+                # an untracked private residue.
+                raise
+            if initial is not None:
+                try:
+                    _cleanup_staged_file(
+                        staged
+                        or _StagedPublicationFile(
+                            parent,
+                            temporary_name,
+                            descriptor,
+                            initial,
+                            label,
+                        )
+                    )
+                except Exception:
+                    pass
+            if staged is not None:
+                staged.close()
+            else:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise
+    raise ReleaseError(f"could not allocate a temporary file for {label}")
+
+
+def _cleanup_staged_file(
+    staged: _StagedPublicationFile,
+    *,
+    disposal_name: str | None = None,
+    after_dispose: Callable[[], None] | None = None,
+) -> None:
+    """Remove a private temporary without unlinking its public-style name.
+
+    ``unlinkat`` cannot compare an inode.  Move the checked temporary to a
+    fresh, no-replace disposal name first, so a leaf swapped into the original
+    temporary name is never unlinked by this transaction.  The final unlink is
+    intentionally limited to that random private name; see the transaction
+    docstring for the remaining kernel-level uncoordinated-writer boundary.
+    """
+
+    if staged.descriptor < 0:
         return
-    if not _path_lexists(path):
+    staged.parent.assert_current(phase="before temporary cleanup")
+    current = _validate_regular_at(
+        staged.parent,
+        staged.temporary_name,
+        label=f"{staged.label} temporary",
+    )
+    if current is None:
         return
-    mode = path.lstat().st_mode
-    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-        raise ReleaseError(f"cannot remove changed {label}: {path}")
-    path.unlink()
-    _fsync_directory(path.parent)
+    if (
+        current.nlink != 1
+        or current != staged.identity
+    ):
+        raise ReleaseError(f"{staged.label} temporary file changed during cleanup")
+    supplied_disposal_name = disposal_name
+    disposal_name = supplied_disposal_name or _new_private_publication_name(
+        staged.temporary_name,
+        purpose="dispose",
+    )
+    for _attempt in range(32):
+        try:
+            staged.parent.assert_current(phase="immediately before temporary cleanup")
+            _renameat2(
+                staged.parent.descriptor,
+                staged.temporary_name,
+                disposal_name,
+                flags=_RENAME_NOREPLACE,
+                label=f"{staged.label} temporary cleanup",
+            )
+            break
+        except FileExistsError:
+            if supplied_disposal_name is not None:
+                raise ReleaseError(
+                    f"{staged.label} registered disposal name is already occupied"
+                ) from None
+            disposal_name = _new_private_publication_name(
+                staged.temporary_name,
+                purpose="dispose",
+            )
+        except FileNotFoundError:
+            # A concurrent remover won the race.  It did not make us unlink
+            # a replacement, so leave the transaction fail-closed only when
+            # the caller still needs this temporary for recovery.
+            return
+    else:  # pragma: no cover - UUID collisions are not realistically reachable
+        raise ReleaseError(f"could not allocate a disposal name for {staged.label}")
+    moved = _validate_regular_at(
+        staged.parent,
+        disposal_name,
+        label=f"{staged.label} disposal",
+    )
+    if (
+        moved is None
+        or moved.nlink != 1
+        or not _same_renamed_file_identity(moved, staged.identity)
+    ):
+        # The public temporary name is now absent, so this no-replace move can
+        # restore whatever was moved without overwriting an intervening leaf.
+        try:
+            _renameat2(
+                staged.parent.descriptor,
+                disposal_name,
+                staged.temporary_name,
+                flags=_RENAME_NOREPLACE,
+                label=f"{staged.label} temporary cleanup restore",
+            )
+            staged.parent.fsync(label="publication parent")
+        except Exception as exc:
+            raise ReleaseError(
+                f"{staged.label} temporary changed during cleanup and could not be restored: {exc}"
+            ) from exc
+        raise ReleaseError(f"{staged.label} temporary file changed during cleanup")
+    if after_dispose is not None:
+        # The source name is now absent.  Persisting the exact disposal name
+        # before unlink makes an interruption here resumable without ever
+        # guessing whether a new private leaf belongs to this transaction.
+        after_dispose()
+    _unlinkat(staged.parent.descriptor, disposal_name, label=staged.label)
+    staged.parent.fsync(label="publication parent")
+
+
+def _dispose_record_private(
+    record: _PublicationRecord,
+    staged: _StagedPublicationFile,
+    *,
+    source: str,
+    journal: _PublicationJournal | None,
+) -> None:
+    """Durably remove a transaction-owned private leaf through a disposal name."""
+
+    if source not in {"staged", "quarantine", "rollback"}:
+        raise ReleaseError("publication private disposal source is invalid")
+    if journal is None:
+        _cleanup_staged_file(staged)
+        return
+    # The disposal intent is durable before the first move.  Do not reuse a
+    # partially attempted name: another writer could have occupied it after a
+    # failed no-replace attempt, so make a fresh intent in that case.
+    for _attempt in range(32):
+        record.disposal_name = _new_private_publication_name(
+            staged.temporary_name,
+            purpose="dispose",
+        )
+        record.disposal_identity = staged.identity
+        record.disposal_source = source
+        _journal_record_phase(journal, record, "cleanup-intent")
+        try:
+            _cleanup_staged_file(
+                staged,
+                disposal_name=record.disposal_name,
+                after_dispose=lambda: _journal_record_phase(
+                    journal,
+                    record,
+                    "cleanup-disposed",
+                ),
+            )
+            break
+        except ReleaseError as exc:
+            if "registered disposal name is already occupied" not in str(exc):
+                raise
+    else:  # pragma: no cover - UUID collisions are not realistically reachable
+        raise ReleaseError(f"could not allocate a disposal name for {record.label}")
+    record.disposal_name = None
+    record.disposal_identity = None
+    record.disposal_source = None
+    _journal_record_phase(journal, record, "cleanup-complete")
+
+
+def _new_private_publication_name(name: str, *, purpose: str) -> str:
+    _safe_component(name, label="publication temporary")
+    _safe_component(purpose, label="publication temporary purpose")
+    return f".{name}.{purpose}-{os.getpid()}-{uuid.uuid4().hex}"
+
+
+def _same_renamed_file_identity(
+    left: _FileIdentity,
+    right: _FileIdentity,
+) -> bool:
+    """Compare fields a directory-entry rename cannot legitimately change.
+
+    A rename updates ``ctime`` on Linux, but it must not update ``mtime``.
+    Keeping ``mtime`` in this comparison means the ctime concession does not
+    accidentally turn an in-place write into a content-only comparison.
+    """
+
+    return (
+        left.device == right.device
+        and left.inode == right.inode
+        and left.mode == right.mode
+        and left.nlink == right.nlink
+        and left.size == right.size
+        and left.mtime_ns == right.mtime_ns
+    )
+
+
+def _anchored_snapshot_matches_after_rename(
+    observed: _AnchoredFileSnapshot,
+    expected: _AnchoredFileSnapshot,
+) -> bool:
+    """Validate a renamed leaf while allowing its rename-updated ctime."""
+
+    if observed.snapshot != expected.snapshot:
+        return False
+    expected_digest = expected.sha256
+    if expected_digest is None and expected.snapshot.exists:
+        expected_digest = sha256_bytes(expected.snapshot.content)
+    if observed.sha256 != expected_digest:
+        return False
+    if expected.identity is None:
+        return observed.identity is None
+    return (
+        observed.identity is not None
+        and _same_renamed_file_identity(observed.identity, expected.identity)
+    )
+
+
+def _staged_anchored_snapshot(
+    record: _PublicationRecord,
+    identity: _FileIdentity,
+) -> _AnchoredFileSnapshot:
+    if record.content is None:  # pragma: no cover - only called for writes
+        raise ReleaseError(f"{record.label} has no staged bytes")
+    return _AnchoredFileSnapshot(
+        _FileSnapshot(True, record.content, record.mode),
+        identity,
+        sha256_bytes(record.content),
+    )
+
+
+def _adopt_interrupted_staged_publication(
+    record: _PublicationRecord,
+    staged: _StagedPublicationFile,
+    *,
+    journal: _PublicationJournal | None,
+) -> None:
+    """Record an exact B that a signal may have interrupted after rename.
+
+    ``renameat2`` can complete before Python receives a signal raised by a
+    later capture, fsync, or journal write.  The durable ``publish-intent``
+    frame already binds the staged inode; this best-effort adoption gives the
+    in-process BaseException rollback the same proof.  Failure to persist the
+    follow-up frame is safe: restart recovery still has the staged identity
+    from the preceding frame.
+    """
+
+    try:
+        observed = _capture_anchored_file(
+            staged.parent,
+            record.name,
+            label=record.label,
+        )
+        expected = _staged_anchored_snapshot(record, staged.identity)
+        if not _anchored_snapshot_matches_after_rename(observed, expected):
+            return
+        if observed.identity is None:  # pragma: no cover - exact staged B exists
+            return
+        record.committed_identity = observed.identity
+        try:
+            staged.parent.fsync(label="publication parent")
+            _journal_record_phase(journal, record, "published")
+        except BaseException:
+            # ``publish-intent`` + the durable staged identity remains the
+            # restart-safe source of truth when the follow-up write is cut
+            # short.  Preserve the original interruption for the caller.
+            pass
+        # This descriptor still refers to B but its temporary name was moved
+        # to the canonical destination.  Leaving it in ``record.staged``
+        # would make terminal finalization retain a non-existent temporary
+        # forever after a signal between rename and normal cleanup.
+        if record.staged is staged:
+            staged.close()
+            record.staged = None
+            record.staged_name = None
+            record.staged_identity = None
+            # Keep the journal's private-name vocabulary accurate even on
+            # the BaseException path.  If this append is uncertain the outer
+            # transaction retains the prior frame and asks restart recovery
+            # to resolve it rather than terminally deleting the journal.
+            _journal_record_phase(journal, record, "published")
+    except BaseException:
+        # The caller is already handling an interruption.  Do not replace it
+        # with a best-effort adoption failure; the durable intent frame still
+        # causes restart recovery to fail closed or recover the exact B.
+        pass
+
+
+def _open_named_staged_file(
+    parent: _DirectoryAnchor,
+    name: str,
+    *,
+    label: str,
+) -> _StagedPublicationFile:
+    """Open one already-named private leaf and bind it to its FD identity."""
+
+    named = _validate_regular_at(parent, name, label=label)
+    if named is None:
+        raise ReleaseError(f"{label} disappeared")
+    descriptor = _openat(parent.descriptor, name, _file_open_flags(), label=label)
+    try:
+        opened = _file_identity(os.fstat(descriptor), label=label)
+        if (
+            opened.nlink != 1
+            or not _same_file_object(named, opened)
+            or opened.size != named.size
+        ):
+            raise ReleaseError(f"{label} changed while opening")
+        return _StagedPublicationFile(parent, name, descriptor, opened, label)
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def _restore_quarantined_leaf(
+    parent: _DirectoryAnchor,
+    quarantine_name: str,
+    public_name: str,
+    *,
+    expected: _AnchoredFileSnapshot,
+    label: str,
+) -> None:
+    """Move a displaced leaf back only into an atomically empty public name."""
+
+    parent.assert_current(phase="before quarantine restore")
+    observed = _capture_anchored_file(parent, quarantine_name, label=f"{label} quarantine")
+    if not _anchored_snapshot_matches_after_rename(observed, expected):
+        raise ReleaseError(f"{label} quarantine changed before restore")
+    if _validate_regular_at(parent, public_name, label=label) is not None:
+        raise ReleaseError(f"{label} public name was concurrently reoccupied")
+    parent.assert_current(phase="immediately before quarantine restore")
+    _renameat2(
+        parent.descriptor,
+        quarantine_name,
+        public_name,
+        flags=_RENAME_NOREPLACE,
+        label=f"{label} quarantine restore",
+    )
+    restored = _capture_anchored_file(parent, public_name, label=label)
+    if not _anchored_snapshot_matches_after_rename(restored, observed):
+        raise ReleaseError(f"{label} quarantine changed during restore")
+    parent.fsync(label="publication parent")
+
+
+def _restore_untrusted_quarantined_leaf(
+    parent: _DirectoryAnchor,
+    quarantine_name: str,
+    public_name: str,
+    *,
+    label: str,
+) -> None:
+    """Preserve an unsafe displaced leaf without trusting its metadata.
+
+    This is used only after a post-move validation fails (for example because
+    the displaced file acquired a hard link).  Moving it into an absent public
+    name with ``RENAME_NOREPLACE`` cannot overwrite or unlink a foreign leaf.
+    """
+
+    parent.assert_current(phase="before untrusted quarantine restore")
+    try:
+        _lstat_at(parent.descriptor, public_name, label=label)
+    except FileNotFoundError:
+        pass
+    else:
+        raise ReleaseError(f"{label} public name was concurrently reoccupied")
+    parent.assert_current(phase="immediately before untrusted quarantine restore")
+    _renameat2(
+        parent.descriptor,
+        quarantine_name,
+        public_name,
+        flags=_RENAME_NOREPLACE,
+        label=f"{label} untrusted quarantine restore",
+    )
+    parent.fsync(label="publication parent")
+
+
+def _restore_uncommitted_replacement(record: _PublicationRecord) -> bool:
+    """Put a tombstoned preimage back only while its public name is empty.
+
+    A replacement first moves the old public leaf to a private quarantine with
+    ``RENAME_NOREPLACE``.  If publishing the stage later fails, restoring that
+    preimage is safe only when no other writer has occupied the public name.
+    Returning ``False`` deliberately leaves both entries intact in that case:
+    overwriting the foreign public entry would recreate the leaf race this
+    transaction is intended to close.
+    """
+
+    quarantine = record.quarantine
+    if quarantine is None:
+        return False
+    parent = quarantine.parent
+    parent.assert_current(phase="before replacement restore")
+    try:
+        _lstat_at(parent.descriptor, record.name, label=record.label)
+    except FileNotFoundError:
+        pass
+    else:
+        return False
+    try:
+        _restore_quarantined_leaf(
+            parent,
+            quarantine.temporary_name,
+            record.name,
+            expected=record.snapshot,
+            label=record.label,
+        )
+    except FileExistsError:
+        # A foreign leaf arrived between the absence check and the no-replace
+        # restore.  It is still public and the old preimage remains private.
+        return False
+    quarantine.close()
+    record.quarantine = None
+    return True
+
+
+def _require_destination_identity(
+    parent: _DirectoryAnchor,
+    name: str,
+    expected: _FileIdentity | None,
+    *,
+    label: str,
+) -> None:
+    observed = _validate_regular_at(parent, name, label=label)
+    if observed != expected:
+        raise ReleaseError(f"{label} changed before commit")
+
+
+def _commit_staged_file(
+    parents: _PublicationParents,
+    record: _PublicationRecord,
+    *,
+    expected: _FileIdentity | None,
+    journal: _PublicationJournal | None = None,
+) -> _FileIdentity:
+    """Publish a staged leaf through Linux no-replace tombstone operations.
+
+    An absent destination uses ``RENAME_NOREPLACE`` directly.  A replacement
+    first moves the verified old target to a private quarantine using the same
+    flag, then publishes the stage with another no-replace rename.  The old
+    leaf stays quarantined until transaction verification.  Thus an
+    intervening foreign destination either wins a no-replace operation or is
+    restored into an empty public name; this transaction never overwrites or
+    unlinks it.
+    """
+
+    staged = record.staged
+    if staged is None:  # pragma: no cover - caller constructs it immediately before commit
+        raise ReleaseError(f"{record.label} has no staged file")
+    parents.assert_current(phase="before commit")
+    _require_destination_identity(staged.parent, record.name, expected, label=record.label)
+    descriptor_identity = _file_identity(os.fstat(staged.descriptor), label=f"{record.label} temporary")
+    named_identity = _validate_regular_at(
+        staged.parent,
+        staged.temporary_name,
+        label=f"{record.label} temporary",
+    )
+    if (
+        descriptor_identity.nlink != 1
+        or named_identity is None
+        or named_identity.nlink != 1
+        or not _same_file_object(descriptor_identity, staged.identity)
+        or not _same_file_object(named_identity, staged.identity)
+    ):
+        raise ReleaseError(f"{record.label} temporary file changed before commit")
+    staged_expected = _staged_anchored_snapshot(record, staged.identity)
+    named_snapshot = _capture_anchored_file(
+        staged.parent,
+        staged.temporary_name,
+        label=f"{record.label} temporary",
+    )
+    if not _anchored_snapshot_matches_after_rename(named_snapshot, staged_expected):
+        raise ReleaseError(f"{record.label} temporary file changed before commit")
+
+    if expected is None:
+        try:
+            parents.assert_current(phase="immediately before absent publication")
+            _journal_record_phase(journal, record, "publish-intent")
+            _renameat2(
+                staged.parent.descriptor,
+                staged.temporary_name,
+                record.name,
+                flags=_RENAME_NOREPLACE,
+                label=record.label,
+            )
+        except FileExistsError as exc:
+            raise ReleaseError(f"{record.label} changed before commit") from exc
+        except BaseException:
+            _adopt_interrupted_staged_publication(record, staged, journal=journal)
+            raise
+        try:
+            observed_snapshot = _capture_anchored_file(
+                staged.parent,
+                record.name,
+                label=record.label,
+            )
+            if not _anchored_snapshot_matches_after_rename(observed_snapshot, staged_expected):
+                raise ReleaseError(f"{record.label} destination changed during commit")
+            observed = observed_snapshot.identity
+            if observed is None:  # pragma: no cover - staged publication is present
+                raise ReleaseError(f"{record.label} disappeared during commit")
+            record.committed_identity = observed
+            staged.parent.fsync(label="publication parent")
+            _journal_record_phase(journal, record, "published")
+            parents.assert_current(phase="after commit")
+            staged.close()
+            record.staged = None
+            # The durable published frame carries the exact public B
+            # identity.  The private stage name was consumed by rename and is
+            # no longer a cleanup obligation; clear it in a second durable
+            # frame so terminal finalization never mistakes a stale name for
+            # a private leaf that still holds A or B.
+            record.staged_name = None
+            record.staged_identity = None
+            _journal_record_phase(journal, record, "published")
+            return observed
+        except BaseException:
+            _adopt_interrupted_staged_publication(record, staged, journal=journal)
+            raise
+
+    # A public replacement is deliberately a tombstone sequence instead of a
+    # second unconditional exchange.  First move the verified old leaf to a
+    # fresh private name without replacing any public name.  Then materialize
+    # the stage only into an atomically absent destination.  A writer that
+    # wins either boundary remains at the public name; its file is never
+    # overwritten, unlinked, or exchanged into a later stale restore.
+    _commit_unlink(parents, record, expected=expected, journal=journal)
+    try:
+        parents.assert_current(phase="before replacement publication")
+        _journal_record_phase(journal, record, "publish-intent")
+        _renameat2(
+            staged.parent.descriptor,
+            staged.temporary_name,
+            record.name,
+            flags=_RENAME_NOREPLACE,
+            label=record.label,
+        )
+    except FileExistsError as exc:
+        try:
+            _restore_uncommitted_replacement(record)
+        except Exception as restore_exc:
+            raise ReleaseError(
+                f"{record.label} changed before commit and could not be safely restored: {restore_exc}"
+            ) from exc
+        raise ReleaseError(f"{record.label} changed before commit") from exc
+    except Exception as exc:
+        try:
+            _restore_uncommitted_replacement(record)
+        except Exception as restore_exc:
+            raise ReleaseError(
+                f"{record.label} could not publish its replacement and could not be safely restored: {restore_exc}"
+            ) from exc
+        raise ReleaseError(f"{record.label} could not publish its replacement") from exc
+    except BaseException:
+        _adopt_interrupted_staged_publication(record, staged, journal=journal)
+        raise
+
+    try:
+        try:
+            destination = _capture_anchored_file(staged.parent, record.name, label=record.label)
+            if not _anchored_snapshot_matches_after_rename(destination, staged_expected):
+                raise ReleaseError(f"{record.label} destination changed during commit")
+            observed = destination.identity
+            if observed is None:  # pragma: no cover - staged publication is present
+                raise ReleaseError(f"{record.label} disappeared during commit")
+        except Exception as exc:
+            try:
+                _restore_uncommitted_replacement(record)
+            except Exception as restore_exc:
+                raise ReleaseError(
+                    f"{record.label} changed during commit and could not be safely restored: {restore_exc}"
+                ) from exc
+            raise ReleaseError(f"{record.label} changed during commit") from exc
+
+        record.committed_identity = observed
+        staged.parent.fsync(label="publication parent")
+        _journal_record_phase(journal, record, "published")
+        parents.assert_current(phase="after commit")
+        staged.close()
+        record.staged = None
+        record.staged_name = None
+        record.staged_identity = None
+        _journal_record_phase(journal, record, "published")
+        return observed
+    except BaseException:
+        _adopt_interrupted_staged_publication(record, staged, journal=journal)
+        raise
+
+
+def _commit_unlink(
+    parents: _PublicationParents,
+    record: _PublicationRecord,
+    *,
+    expected: _FileIdentity,
+    expected_snapshot: _AnchoredFileSnapshot | None = None,
+    journal: _PublicationJournal | None = None,
+) -> None:
+    """Remove a public leaf by quarantining it through ``RENAME_NOREPLACE``."""
+
+    parent = parents.for_path(record.path)
+    parents.assert_current(phase="before commit")
+    _require_destination_identity(parent, record.name, expected, label=record.label)
+    anchored_expected = expected_snapshot or record.snapshot
+    if anchored_expected.identity is None:  # pragma: no cover - deletion caller guards this
+        raise ReleaseError(f"{record.label} has no deletion identity")
+    quarantine_name = record.quarantine_name or _new_private_publication_name(
+        record.name,
+        purpose="quarantine",
+    )
+    record.quarantine_name = quarantine_name
+    _journal_record_phase(journal, record, "quarantine-intent")
+    for _attempt in range(32):
+        try:
+            parents.assert_current(phase="immediately before removal")
+            _renameat2(
+                parent.descriptor,
+                record.name,
+                quarantine_name,
+                flags=_RENAME_NOREPLACE,
+                label=f"{record.label} removal",
+            )
+            break
+        except FileExistsError:
+            if journal is not None:
+                raise ReleaseError(
+                    f"{record.label} journal quarantine name is already occupied"
+                ) from None
+            quarantine_name = _new_private_publication_name(record.name, purpose="quarantine")
+            record.quarantine_name = quarantine_name
+        except FileNotFoundError as exc:
+            raise ReleaseError(f"{record.label} changed before removal") from exc
+        except BaseException:
+            # A signal can arrive after the kernel completed renameat2 but
+            # before Python observed its return.  Adopt a provably renamed A
+            # while the parent FD is still live so BaseException rollback has
+            # the same safe tombstone vocabulary as an ordinary failure.  If
+            # that inspection is itself interrupted, the prior durable intent
+            # frame remains sufficient for restart recovery.
+            try:
+                interrupted = _capture_anchored_file(
+                    parent,
+                    quarantine_name,
+                    label=f"{record.label} quarantine",
+                )
+                if _anchored_snapshot_matches_after_rename(interrupted, anchored_expected):
+                    adopted = _open_named_staged_file(
+                        parent,
+                        quarantine_name,
+                        label=f"{record.label} quarantine",
+                    )
+                    record.quarantine = adopted
+                    record.quarantine_identity = adopted.identity
+                    parent.fsync(label="publication parent")
+                    _journal_record_phase(journal, record, "quarantined")
+            except BaseException:
+                pass
+            raise
+    else:  # pragma: no cover - UUID collisions are not realistically reachable
+        raise ReleaseError(f"could not allocate a quarantine name for {record.label}")
+
+    try:
+        quarantined = _capture_anchored_file(
+            parent,
+            quarantine_name,
+            label=f"{record.label} quarantine",
+        )
+    except Exception as exc:
+        try:
+            _restore_untrusted_quarantined_leaf(
+                parent,
+                quarantine_name,
+                record.name,
+                label=record.label,
+            )
+        except Exception as restore_exc:
+            raise ReleaseError(
+                f"{record.label} changed before removal and could not be safely restored: {restore_exc}"
+            ) from exc
+        raise ReleaseError(f"{record.label} changed before removal") from exc
+    if not _anchored_snapshot_matches_after_rename(quarantined, anchored_expected):
+        # The public name is empty after the no-replace move.  Restore the
+        # displaced object without ever overwriting a concurrently created
+        # public leaf; a foreign same-name leaf therefore survives the error.
+        try:
+            _restore_quarantined_leaf(
+                parent,
+                quarantine_name,
+                record.name,
+                expected=quarantined,
+                label=record.label,
+            )
+        except Exception as exc:
+            try:
+                _restore_untrusted_quarantined_leaf(
+                    parent,
+                    quarantine_name,
+                    record.name,
+                    label=record.label,
+                )
+            except Exception as untrusted_restore_exc:
+                raise ReleaseError(
+                    f"{record.label} changed before removal and could not be safely restored: {untrusted_restore_exc}"
+                ) from exc
+            raise ReleaseError(
+                f"{record.label} changed before removal and could not be safely restored: {exc}"
+            ) from exc
+        raise ReleaseError(f"{record.label} changed before removal")
+    quarantine: _StagedPublicationFile | None = None
+    try:
+        quarantine = _open_named_staged_file(
+            parent,
+            quarantine_name,
+            label=f"{record.label} quarantine",
+        )
+        rechecked = _capture_anchored_file(
+            parent,
+            quarantine_name,
+            label=f"{record.label} quarantine",
+        )
+        if not _anchored_snapshot_matches_after_rename(rechecked, anchored_expected):
+            raise ReleaseError(f"{record.label} quarantine changed during removal")
+    except Exception as exc:
+        if quarantine is not None:
+            quarantine.close()
+        # As above, this restore is no-replace and can therefore never erase
+        # a foreign leaf that reoccupied the public name.
+        try:
+            _restore_quarantined_leaf(
+                parent,
+                quarantine_name,
+                record.name,
+                expected=quarantined,
+                label=record.label,
+            )
+        except Exception as restore_exc:
+            try:
+                _restore_untrusted_quarantined_leaf(
+                    parent,
+                    quarantine_name,
+                    record.name,
+                    label=record.label,
+                )
+            except Exception as untrusted_restore_exc:
+                raise ReleaseError(
+                    f"{record.label} quarantine changed and could not be safely restored: "
+                    f"{restore_exc}; {untrusted_restore_exc}"
+                ) from exc
+        raise ReleaseError(f"{record.label} quarantine changed during removal") from exc
+    record.quarantine = quarantine
+    record.quarantine_identity = quarantine.identity
+    parent.fsync(label="publication parent")
+    # This durable record is deliberately written *before* the public-name
+    # reoccupation check below.  If an uncoordinated writer has already won,
+    # restart recovery still knows that this exact private A belongs to us.
+    _journal_record_phase(journal, record, "quarantined")
+    if _validate_regular_at(parent, record.name, label=record.label) is not None:
+        # A leaf that appeared after the rename belongs to somebody else.  Do
+        # not overwrite it with our quarantine; leave both objects intact.
+        raise ReleaseError(f"{record.label} was concurrently reoccupied during removal")
+    if _validate_regular_at(parent, record.name, label=record.label) is not None:
+        raise ReleaseError(f"{record.label} remained after removal")
+    parents.assert_current(phase="after commit")
+
+
+def _finalize_record_quarantine(
+    record: _PublicationRecord,
+    *,
+    journal: _PublicationJournal | None = None,
+) -> None:
+    """Discard a verified displaced leaf only after transaction verification."""
+
+    quarantine = record.quarantine
+    if quarantine is None:
+        return
+    _dispose_record_private(record, quarantine, source="quarantine", journal=journal)
+    quarantine.close()
+    record.quarantine = None
+    record.quarantine_name = None
+    record.quarantine_identity = None
+    if journal is not None:
+        _journal_record_phase(journal, record, "cleanup-complete")
+
+
+def _adopt_recorded_rollback_tombstone(
+    parent: _DirectoryAnchor,
+    record: _PublicationRecord,
+    *,
+    journal: _PublicationJournal | None,
+) -> None:
+    """Bind an already-renamed B tombstone to its durable rollback intent.
+
+    A rollback writes ``rollback_name`` and B's pre-rename identity before it
+    moves B out of the canonical name.  A signal can land after that
+    ``renameat2`` succeeds but before the local helper returns its open
+    descriptor.  Reopen only an exact, single-link B at that recorded private
+    name so both in-process compensation and restart recovery can resume A's
+    no-replace restore.  A different private leaf is never adopted or
+    unlinked.
+    """
+
+    if record.rollback is not None or record.rollback_name is None:
+        return
+    expected = _recovery_expected_rollback(record)
+    if expected is None:
+        return
+    observed = _capture_anchored_file(
+        parent,
+        record.rollback_name,
+        label=f"{record.label} rollback tombstone",
+    )
+    if not observed.snapshot.exists:
+        return
+    if not _anchored_snapshot_matches_after_rename(observed, expected):
+        raise ReleaseError(f"{record.label} rollback tombstone changed before recovery")
+    rollback = _open_named_staged_file(
+        parent,
+        record.rollback_name,
+        label=f"{record.label} rollback tombstone",
+    )
+    if expected.identity is None or not _same_renamed_file_identity(
+        rollback.identity,
+        expected.identity,
+    ):
+        rollback.close()
+        raise ReleaseError(f"{record.label} rollback tombstone changed while opening")
+    record.rollback = rollback
+    record.rollback_identity = rollback.identity
+    _journal_record_phase(journal, record, "rollback-discarded")
+
+
+def _restore_record(
+    parents: _PublicationParents,
+    record: _PublicationRecord,
+    *,
+    journal: _PublicationJournal | None = None,
+) -> None:
+    """Undo one completed write/delete only if its postimage is still ours."""
+
+    parent = parents.for_path(record.path)
+    parents.assert_current(phase="before rollback")
+    _adopt_recorded_rollback_tombstone(parent, record, journal=journal)
+    if record.phase in {
+        "rollback-discard-intent",
+        "rollback-discarded",
+        "rollback-restore-intent",
+        "rollback-restored",
+    } and record.rollback is not None:
+        # B was already moved to its registered tombstone.  Resume A's
+        # no-replace restore before inspecting or disposing B; a signal here
+        # must not make the absent canonical name look like a foreign swap.
+        current = _capture_anchored_file(parent, record.name, label=record.label)
+        current_is_a = _anchored_snapshot_matches_after_rename(current, record.snapshot)
+        # An originally absent first-install target has no A quarantine.
+        # Its absence already satisfies rollback after B reached its tombstone.
+        if not current.snapshot.exists and record.snapshot.snapshot.exists:
+            original_quarantine = record.quarantine
+            if original_quarantine is None:
+                raise ReleaseError(
+                    f"{record.label} lost its original quarantine; rollback is incomplete"
+                )
+            _journal_record_phase(journal, record, "rollback-restore-intent")
+            _restore_quarantined_leaf(
+                parent,
+                original_quarantine.temporary_name,
+                record.name,
+                expected=record.snapshot,
+                label=f"rollback {record.label}",
+            )
+            original_quarantine.close()
+            record.quarantine = None
+            record.quarantine_name = None
+            record.quarantine_identity = None
+            record.committed_identity = None
+            current_is_a = True
+            _journal_record_phase(journal, record, "rollback-restored")
+        if not current_is_a:
+            raise ReleaseError(f"{record.label} has a foreign canonical leaf during rollback")
+        rollback = record.rollback
+        try:
+            _dispose_record_private(record, rollback, source="rollback", journal=journal)
+        finally:
+            rollback.close()
+            record.rollback = None
+        record.rollback_name = None
+        record.rollback_identity = None
+        record.committed_identity = None
+        _journal_record_phase(journal, record, "rolled-back")
+        return
+    if record.committed_identity is None and not record.deleted:
+        # A failed replacement can leave A durably quarantined before B ever
+        # reached its public name.  It is still a rollback participant: a
+        # foreign reoccupation must remain public, while the registered A
+        # tombstone remains available for a later retry/restart recovery.
+        if record.quarantine is not None:
+            _journal_record_phase(journal, record, "rollback-restore-intent")
+            if not _restore_uncommitted_replacement(record):
+                raise ReleaseError(f"{record.label} public name was concurrently reoccupied")
+            record.quarantine_name = None
+            record.quarantine_identity = None
+            _journal_record_phase(journal, record, "rolled-back")
+        if record.staged is not None:
+            _dispose_record_private(record, record.staged, source="staged", journal=journal)
+            record.staged.close()
+            record.staged = None
+            record.staged_name = None
+            record.staged_identity = None
+            _journal_record_phase(journal, record, "rolled-back")
+        return
+    if record.deleted:
+        if _validate_regular_at(parent, record.name, label=record.label) is not None:
+            raise ReleaseError(f"{record.label} changed before rollback")
+        quarantine = record.quarantine
+        if quarantine is not None:
+            _journal_record_phase(journal, record, "rollback-restore-intent")
+            _restore_quarantined_leaf(
+                parent,
+                quarantine.temporary_name,
+                record.name,
+                expected=record.snapshot,
+                label=record.label,
+            )
+            quarantine.close()
+            record.quarantine = None
+            record.quarantine_name = None
+            record.quarantine_identity = None
+            record.deleted = False
+            _journal_record_phase(journal, record, "rolled-back")
+            return
+        snapshot = record.snapshot.snapshot
+        if not snapshot.exists:
+            record.deleted = False
+            return
+        record.staged = _stage_publication_file(
+            parent,
+            record.name,
+            snapshot.content,
+            mode=snapshot.mode,
+            label=f"rollback {record.label}",
+        )
+        record.committed_identity = _commit_staged_file(
+            parents,
+            record,
+            expected=None,
+            journal=journal,
+        )
+        record.deleted = False
+        _journal_record_phase(journal, record, "rolled-back")
+        return
+    if record.committed_identity is None:
+        return
+    committed = _capture_anchored_file(parent, record.name, label=record.label)
+    if not _anchored_snapshot_matches_after_rename(
+        committed,
+        _staged_anchored_snapshot(record, record.committed_identity),
+    ):
+        raise ReleaseError(f"{record.label} changed before rollback")
+    snapshot = record.snapshot.snapshot
+    if record.quarantine is not None:
+        # Reverse a replacement with the same no-replace tombstone discipline
+        # used to publish it.  An exchange would make a second foreign leaf
+        # vulnerable to a stale rollback exchange; moving the current B to a
+        # private quarantine first leaves every foreign public name intact.
+        original_quarantine = record.quarantine
+        displaced = _capture_anchored_file(
+            parent,
+            original_quarantine.temporary_name,
+            label=f"{record.label} quarantine",
+        )
+        if not _anchored_snapshot_matches_after_rename(displaced, record.snapshot):
+            raise ReleaseError(f"{record.label} quarantine changed before rollback")
+        committed_snapshot = _staged_anchored_snapshot(
+            record,
+            record.committed_identity,
+        )
+        discarded_record = _PublicationRecord(
+            record.path,
+            record.name,
+            None,
+            record.mode,
+            f"rollback {record.label}",
+            committed_snapshot,
+        )
+        rollback_name = record.rollback_name or _new_private_publication_name(
+            record.name,
+            purpose="quarantine",
+        )
+        record.rollback_name = rollback_name
+        if (
+            record.rollback_identity is not None
+            and record.rollback_identity != record.committed_identity
+        ):
+            raise ReleaseError(f"{record.label} rollback tombstone identity changed")
+        # The intent frame must already bind B's exact inode before the
+        # no-replace tombstone rename.  If a signal follows that rename before
+        # ``discarded_record.quarantine`` is assigned below, recovery can
+        # still open and restore this specific B rather than orphaning it.
+        record.rollback_identity = record.committed_identity
+        discarded_record.quarantine_name = rollback_name
+        _journal_record_phase(journal, record, "rollback-discard-intent")
+        _commit_unlink(
+            parents,
+            discarded_record,
+            expected=record.committed_identity,
+            expected_snapshot=committed_snapshot,
+        )
+        discarded_quarantine = discarded_record.quarantine
+        if discarded_quarantine is None:  # pragma: no cover - commit invariant
+            raise ReleaseError(f"{record.label} current leaf was not quarantined for rollback")
+        record.rollback_identity = discarded_quarantine.identity
+        record.rollback = discarded_quarantine
+        _journal_record_phase(journal, record, "rollback-discarded")
+        try:
+            _journal_record_phase(journal, record, "rollback-restore-intent")
+            _restore_quarantined_leaf(
+                parent,
+                original_quarantine.temporary_name,
+                record.name,
+                expected=record.snapshot,
+                label=f"rollback {record.label}",
+            )
+        except Exception as exc:
+            # If the destination is still empty, put B back without replacing
+            # any leaf which might have appeared while A was being restored.
+            try:
+                _restore_quarantined_leaf(
+                    parent,
+                    discarded_quarantine.temporary_name,
+                    record.name,
+                    expected=committed_snapshot,
+                    label=f"rollback {record.label} restore current",
+                )
+            except FileExistsError:
+                # A foreign reoccupation is the reason rollback must stop;
+                # both quarantines remain available and no public foreign
+                # leaf has been overwritten.
+                pass
+            except Exception:
+                # Keep the primary error below.  The private B quarantine is
+                # intentionally retained instead of risking an unconditional
+                # cleanup or overwrite.
+                pass
+            discarded_quarantine.close()
+            record.rollback = None
+            raise ReleaseError(f"{record.label} changed during rollback") from exc
+
+        original_quarantine.close()
+        record.quarantine = None
+        record.quarantine_name = None
+        record.quarantine_identity = None
+        record.committed_identity = None
+        _journal_record_phase(journal, record, "rollback-restored")
+        try:
+            _dispose_record_private(record, discarded_quarantine, source="rollback", journal=journal)
+        finally:
+            discarded_quarantine.close()
+            record.rollback = None
+        record.rollback_name = None
+        record.rollback_identity = None
+        _journal_record_phase(journal, record, "rolled-back")
+        parent.fsync(label="publication parent")
+        parents.assert_current(phase="after rollback")
+        return
+    if not snapshot.exists:
+        committed_snapshot = _staged_anchored_snapshot(record, record.committed_identity)
+        discarded_record = _PublicationRecord(
+            record.path,
+            record.name,
+            None,
+            record.mode,
+            f"rollback {record.label}",
+            committed_snapshot,
+        )
+        record.rollback_name = record.rollback_name or _new_private_publication_name(
+            record.name,
+            purpose="quarantine",
+        )
+        if (
+            record.rollback_identity is not None
+            and record.rollback_identity != record.committed_identity
+        ):
+            raise ReleaseError(f"{record.label} rollback tombstone identity changed")
+        record.rollback_identity = record.committed_identity
+        discarded_record.quarantine_name = record.rollback_name
+        _journal_record_phase(journal, record, "rollback-discard-intent")
+        _commit_unlink(
+            parents,
+            discarded_record,
+            expected=record.committed_identity,
+            expected_snapshot=committed_snapshot,
+        )
+        discarded_quarantine = discarded_record.quarantine
+        if discarded_quarantine is None:  # pragma: no cover - commit invariant
+            raise ReleaseError(f"{record.label} current leaf was not quarantined for rollback")
+        record.rollback_identity = discarded_quarantine.identity
+        record.rollback = discarded_quarantine
+        _journal_record_phase(journal, record, "rollback-discarded")
+        record.committed_identity = None
+        try:
+            _dispose_record_private(record, discarded_quarantine, source="rollback", journal=journal)
+        finally:
+            discarded_quarantine.close()
+            record.rollback = None
+        record.rollback_name = None
+        record.rollback_identity = None
+        _journal_record_phase(journal, record, "rolled-back")
+        return
+    record.staged = _stage_publication_file(
+        parent,
+        record.name,
+        snapshot.content,
+        mode=snapshot.mode,
+        label=f"rollback {record.label}",
+    )
+    record.committed_identity = _commit_staged_file(
+        parents,
+        record,
+        expected=record.committed_identity,
+        journal=journal,
+    )
+    _finalize_record_quarantine(record, journal=journal)
+    _journal_record_phase(journal, record, "rolled-back")
+
+
+_PUBLICATION_WRITE_PROBE = threading.local()
+
+
+@contextmanager
+def _publication_write_probe() -> Iterator[None]:
+    """Retain the historical atomic-write fault-injection seam safely.
+
+    Release tests and integrators have long used ``_atomic_write_bytes`` to
+    inject a write failure.  The descriptor transaction now owns the real
+    staging/rename work, so calls made while this probe is active deliberately
+    do no filesystem work.  A replacement hook can still raise at the same
+    per-file boundary without recursing into a second transaction.
+    """
+
+    previous = bool(getattr(_PUBLICATION_WRITE_PROBE, "active", False))
+    _PUBLICATION_WRITE_PROBE.active = True
+    try:
+        yield
+    finally:
+        _PUBLICATION_WRITE_PROBE.active = previous
+
+
+@contextmanager
+def _atomic_write_transaction() -> Iterator[None]:
+    """Mark a transaction entered through the public atomic-write helper."""
+
+    previous = bool(getattr(_PUBLICATION_WRITE_PROBE, "atomic_write", False))
+    _PUBLICATION_WRITE_PROBE.atomic_write = True
+    try:
+        yield
+    finally:
+        _PUBLICATION_WRITE_PROBE.atomic_write = previous
+
+
+def _atomic_write_bytes(
+    path: Path,
+    content: bytes,
+    *,
+    mode: int = 0o644,
+    parent_guards: object | None = None,
+) -> None:
+    if bool(getattr(_PUBLICATION_WRITE_PROBE, "active", False)):
+        return
+    with _atomic_write_transaction():
+        _publish_files_transactionally(
+            ((path, content, mode, f"atomic write {path.name}"),),
+            parent_guards=parent_guards,
+        )
+
+
+def _restore_file(
+    path: Path,
+    snapshot: _FileSnapshot,
+    *,
+    label: str,
+    parent_guards: object | None = None,
+) -> None:
+    content = snapshot.content if snapshot.exists else None
+    _publish_files_transactionally(
+        ((path, content, snapshot.mode, label),),
+        parent_guards=parent_guards,
+    )
 
 
 def _publish_files_transactionally(
-    writes: Sequence[tuple[Path, bytes, int, str]],
+    writes: Sequence[tuple[Path, bytes | None, int, str]],
     *,
     verify: Callable[[], None] | None = None,
+    before_publish: Callable[[PublicationTransactionReceipt], None] | None = None,
+    after_publish: Callable[[PublicationTransactionReceipt], None] | None = None,
+    after_recovery: Callable[[PublicationTransactionReceipt], None] | None = None,
     descriptor_rooted: bool = False,
+    parent_guards: object | None = None,
+    expected_preimages: Mapping[Path, object] | None = None,
+    journal_path: Path | str | os.PathLike[str] | None = None,
 ) -> None:
-    """Publish a small activation set and restore every preimage on failure."""
+    """Publish a small activation set through stable parent directory FDs.
+
+    Every target parent is opened with a no-follow component walk.  The same
+    descriptors are used for staging, rename, unlink, directory fsync, and
+    rollback.  A fresh no-follow walk must still resolve to the original
+    ancestry before any mutation and before every commit or rollback step.
+
+    Canonical destination names are changed only with
+    ``renameat2(RENAME_NOREPLACE)``.  Replacement and removal first tombstone
+    the verified leaf under a fresh private name, so a foreign leaf that wins
+    a stale check is never overwritten or unlinked.  An uncoordinated writer
+    can still reoccupy the public name before a safe restore; that fails the
+    transaction and leaves the tombstone/quarantine in place rather than
+    overwriting the newer leaf.  Linux also has no inode-CAS ``unlinkat``:
+    after final cleanup validates a generated private disposal name, a
+    same-directory writer that can observe or guess that UUID can replace
+    *that private name* before ``unlinkat`` and have its private leaf
+    unlinked.  Neither boundary can cause this transaction to overwrite or
+    unlink a canonical destination, traverse a replacement ancestor, or touch
+    a name outside the anchored directory tree.
+
+    Before private staging or any public rename, this transaction writes a
+    create-exclusive, append-only journal and fsyncs each intent/identity
+    frame.  A partial append leaves the preceding complete frame parseable.
+    ``recover_publication_transaction`` restores only an exact B postimage or
+    exact renamed A tombstone; a foreign canonical reoccupation stays public
+    and the journal remains retryable.  After verification, a durable
+    ``committed`` frame makes cleanup best effort: a post-unlink directory
+    fsync failure can leave private residue, but can never make the caller
+    claim that A is still available for rollback.  Bounded EINTR retries apply
+    to renameat2, unlinkat, and directory/file fsync operations.
+
+    After successful local rollback, ``after_recovery`` receives the exact
+    restored identities while the terminal journal remains live.  Failed or
+    interrupted handoff retains that journal for restart recovery.
+    """
 
     if descriptor_rooted:
+        # The production desktop transaction has its own complete no-follow
+        # descriptor walk and parent revalidation.  Keep using that path for
+        # its established locking and fault-injection boundary, but bind an
+        # authenticated first-install receipt to the exact preimages it saw.
+        # Caller-provided anchors cannot be reused there: they belong to this
+        # transaction's FD set, so accepting them would weaken the proof.
+        if parent_guards is not None:
+            raise ReleaseError("descriptor-rooted publication cannot reuse parent guards")
+        if journal_path is not None:
+            raise ReleaseError("descriptor-rooted publication cannot use a local journal")
+        if (
+            before_publish is not None
+            or after_publish is not None
+            or after_recovery is not None
+        ):
+            raise ReleaseError("descriptor-rooted publication cannot expose a local journal receipt")
+        if any(content is None for _path, content, _mode, _label in writes):
+            raise ReleaseError("descriptor-rooted publication cannot remove files")
+        descriptor_expected: dict[Path, tuple[bool, bytes, int]] = {}
+        if expected_preimages is not None:
+            for raw_path, value in expected_preimages.items():
+                path = _canonical_publication_path(raw_path, label="expected preimage")
+                snapshot = _expected_anchored_snapshot_from_object(
+                    value,
+                    label=f"expected preimage {path}",
+                ).snapshot
+                descriptor_expected[path] = (
+                    snapshot.exists,
+                    snapshot.content,
+                    snapshot.mode,
+                )
         from .desktop_integration import (
             _publish_files_transactionally as publish_descriptor_rooted,
         )
 
         try:
-            publish_descriptor_rooted(tuple(writes), finalize=verify)
+            publish_descriptor_rooted(
+                tuple(writes),
+                finalize=verify,
+                expected_preimages=descriptor_expected or None,
+            )
         except Exception as exc:
             if "rollback was incomplete" in str(exc):
                 raise ReleaseError(f"activation publication failed: {exc}") from exc
@@ -1902,28 +5054,2984 @@ def _publish_files_transactionally(
             ) from exc
         return
 
-    snapshots = [
-        (path, _capture_file(path, label=label), label)
-        for path, _content, _mode, label in writes
-    ]
-    try:
-        for path, content, mode, _label in writes:
-            _atomic_write_bytes(path, content, mode=mode)
+    if not writes:
+        if (
+            before_publish is not None
+            or after_publish is not None
+            or after_recovery is not None
+        ):
+            raise ReleaseError("publication callbacks require at least one destination")
         if verify is not None:
             verify()
-    except Exception as exc:
-        rollback_errors: list[str] = []
-        for path, snapshot, label in reversed(snapshots):
+        return
+    normalized: list[tuple[Path, bytes | None, int, str]] = []
+    seen: set[Path] = set()
+    for raw_path, content, mode, label in writes:
+        path = _canonical_publication_path(raw_path, label=label)
+        _safe_component(path.name, label=label)
+        if path in seen:
+            raise ReleaseError(f"publication repeats destination: {path}")
+        seen.add(path)
+        if content is not None and not isinstance(content, bytes):
+            raise ReleaseError(f"publication bytes are invalid for {label}")
+        if isinstance(mode, bool) or not isinstance(mode, int) or mode < 0 or mode > 0o7777:
+            raise ReleaseError(f"publication mode is invalid for {label}")
+        normalized.append((path, content, mode, label))
+    expected_map: dict[Path, _AnchoredFileSnapshot] = {}
+    if expected_preimages is not None:
+        for raw_path, value in expected_preimages.items():
+            path = _canonical_publication_path(raw_path, label="expected preimage")
+            expected_map[path] = _expected_anchored_snapshot_from_object(
+                value,
+                label=f"expected preimage {path}",
+            )
+    parents = _open_publication_parents(
+        [path for path, _content, _mode, _label in normalized],
+        parent_guards=parent_guards,
+        create_parents=True,
+    )
+    records: list[_PublicationRecord] = []
+    journal: _PublicationJournal | None = None
+    journal_creation_unsettled = False
+    recovery_handoff_pending = False
+    try:
+        parents.assert_current(phase="before preimage capture")
+        for path, content, mode, label in normalized:
+            parents.assert_current(phase="during preimage capture")
+            snapshot = _capture_anchored_file(
+                parents.for_path(path),
+                path.name,
+                label=label,
+            )
+            expected = expected_map.get(path)
+            if expected is not None:
+                if snapshot.snapshot != expected.snapshot or (
+                    expected.identity is not None and snapshot.identity != expected.identity
+                ) or (
+                    expected.sha256 is not None and snapshot.sha256 != expected.sha256
+                ):
+                    raise ReleaseError(f"{label} changed after preflight")
+            records.append(_PublicationRecord(path, path.name, content, mode, label, snapshot))
+        if expected_map and set(expected_map) != {record.path for record in records}:
+            raise ReleaseError("expected publication preimages do not match destinations")
+
+        # The append-only journal exists and is fsynced before the first
+        # private stage, quarantine, or public rename.  Every later mutation
+        # has a durable intent frame, so a process death or KeyboardInterrupt
+        # can be resumed through _recover_publication_transaction().
+        try:
+            journal = _PublicationJournal.create(
+                parents,
+                records,
+                journal_path=journal_path,
+            )
+        except _PublicationJournalCreateError as exc:
+            journal = exc.journal
+            journal_creation_unsettled = True
+            # Nothing has been staged or renamed.  The exact journal leaf is
+            # intentionally retained for inspection/recovery instead of
+            # pretending a normal rollback could remove an incompletely
+            # durable create-exclusive record.
+            if not isinstance(exc.original_cause, Exception):
+                # The journal is now retained, but cancellation must preserve
+                # its BaseException semantics.  Do not turn KeyboardInterrupt
+                # or SystemExit into an ordinary publication failure.
+                raise exc.original_cause
+            raise ReleaseError(
+                "publication journal initialization was not durably resolved; "
+                f"recovery handle retained: {exc.journal.path}"
+            ) from exc
+        except _PublicationJournalPreflightError:
+            # No staging, tombstone, or canonical rename has started.  This
+            # is intentionally not routed through generic rollback wording:
+            # the setup failure may have preserved a foreign journal-name
+            # winner that we must not describe as our rolled-back work.
+            raise
+        if before_publish is not None:
+            before_publish(
+                _publication_transaction_receipt(
+                    journal,
+                    parents,
+                    records,
+                    state="intent",
+                )
+            )
+
+        # Do not call the compatibility hook again when this transaction was
+        # itself entered through _atomic_write_bytes.  Besides avoiding a
+        # recursive transaction, that preserves the one-call ordering contract
+        # for users which instrument that public helper.
+        use_write_probe = not bool(
+            getattr(_PUBLICATION_WRITE_PROBE, "atomic_write", False)
+        )
+        probe = _publication_write_probe() if use_write_probe else nullcontext()
+        with probe:
+            for record in records:
+                if record.content is None:
+                    continue
+                # Preserve the established failure-injection boundary while
+                # the actual write remains descriptor-relative below.
+                if use_write_probe:
+                    _atomic_write_bytes(record.path, record.content, mode=record.mode)
+                parents.assert_current(phase="before mutation")
+                _require_destination_identity(
+                    parents.for_path(record.path),
+                    record.name,
+                    record.snapshot.identity,
+                    label=record.label,
+                )
+                record.staged_name = _new_private_publication_name(
+                    record.name,
+                    purpose="tmp",
+                )
+                _journal_record_phase(journal, record, "stage-intent")
+                staged = _stage_publication_file(
+                    parents.for_path(record.path),
+                    record.name,
+                    record.content,
+                    mode=record.mode,
+                    label=record.label,
+                    temporary_name=record.staged_name,
+                    record=record,
+                    journal=journal,
+                )
+                # Third-party fault-injection hooks may retain the historical
+                # helper signature and return a staged file without the
+                # optional journal binding.  Preserve that seam while the
+                # native helper records the identity before it returns.
+                if record.staged is not staged:
+                    record.staged = staged
+                    record.staged_identity = staged.identity
+                    _journal_record_phase(journal, record, "staged")
+
+        parents.assert_current(phase="before commit")
+        # Preserve the caller's ordered transaction boundary.  State writers
+        # deliberately append their selecting state last; grouping all writes
+        # before all removals would otherwise publish state before an earlier
+        # legacy-wrapper deletion.  Every individual operation remains
+        # descriptor-journaled, so interleaving write and unlink records does
+        # not weaken the rollback proof.
+        for record in records:
+            if record.content is not None:
+                record.committed_identity = _commit_staged_file(
+                    parents,
+                    record,
+                    expected=record.snapshot.identity,
+                    journal=journal,
+                )
+                continue
+            if not record.snapshot.snapshot.exists:
+                continue
+            identity = record.snapshot.identity
+            if identity is None:  # pragma: no cover - snapshot invariants above
+                raise ReleaseError(f"{record.label} has no deletion identity")
+            _commit_unlink(parents, record, expected=identity, journal=journal)
+            record.deleted = True
+            _journal_record_phase(journal, record, "deleted")
+
+        parents.assert_current(phase="before verification")
+        if verify is not None:
+            verify()
+        parents.assert_current(phase="after verification")
+        if after_publish is not None:
+            after_publish(
+                _publication_transaction_receipt(
+                    journal,
+                    parents,
+                    records,
+                    state="published",
+                    postimages=_capture_published_postimages(parents, records),
+                )
+            )
+        parents.assert_current(phase="after publication receipt")
+        # From this durable point onward B is the committed outcome.  Cleanup
+        # can be retried after a crash but must never make this path claim that
+        # its discarded A preimage is still required for rollback.
+        journal.persist(state="committed")
+        for record in records:
             try:
-                _restore_file(path, snapshot, label=label)
-            except Exception as rollback_exc:
-                rollback_errors.append(f"{label}: {rollback_exc}")
+                _finalize_record_quarantine(record, journal=journal)
+            except Exception:
+                # Keep the committed journal and private preimage for restart
+                # cleanup.  A cleanup fsync error is not a failed publication.
+                pass
+        parents.assert_current(phase="after quarantine cleanup")
+    except BaseException as exc:
+        if isinstance(exc, _PublicationJournalPreflightError):
+            raise
+        if journal_creation_unsettled:
+            # The first journal frame may exist but its directory entry was
+            # not proven durable.  No transaction mutation has occurred, and
+            # this process must preserve the opaque handle rather than append
+            # a misleading rollback terminal frame or delete it.
+            if not isinstance(exc, Exception):
+                raise
+            raise ReleaseError(str(exc)) from exc
+        if journal is not None and journal.durability_uncertain:
+            # An append/fsync error can leave either the old frame or the
+            # attempted frame durable.  Do not publish a made-up local
+            # outcome and do not make another canonical mutation; the exact
+            # retained journal is the recovery handle for a fresh process.
+            if not isinstance(exc, Exception):
+                raise
+            raise ReleaseError(
+                "activation publication journal durability is uncertain; "
+                f"restart recovery is required: {journal.path}"
+            ) from exc
+        if journal is not None and journal.state == "committed":
+            # Never roll back a transaction after its committed frame.  An
+            # ordinary cleanup failure is reported accurately; cancellation
+            # keeps its original BaseException while recovery cleans residue.
+            if isinstance(exc, Exception):
+                raise ReleaseError(
+                    f"activation publication committed; cleanup deferred: {exc}"
+                ) from exc
+            raise
+        # Set this before any rollback terminal frame can become durable.
+        # A signal between that frame and callback entry must retain the
+        # journal just as a failed callback does.
+        recovery_handoff_pending = after_recovery is not None
+        rollback_errors: list[str] = []
+        rollback_interruption: BaseException | None = None
+        if journal is not None:
+            try:
+                journal.persist(state="rolling-back")
+            except BaseException as journal_exc:
+                rollback_errors.append(f"journal: {journal_exc}")
+                if not isinstance(journal_exc, Exception):
+                    rollback_interruption = journal_exc
+        try:
+            parents.assert_current(phase="before rollback")
+        except BaseException as rollback_exc:
+            rollback_errors.append(f"parent identity: {rollback_exc}")
+            if not isinstance(rollback_exc, Exception):
+                rollback_interruption = rollback_exc
+        else:
+            for record in records:
+                try:
+                    unknown_private = _unregistered_stage_intent_present(parents, record)
+                except BaseException as rollback_exc:
+                    rollback_errors.append(f"{record.label}: {rollback_exc}")
+                    if not isinstance(rollback_exc, Exception):
+                        rollback_interruption = rollback_exc
+                    continue
+                if unknown_private is not None:
+                    rollback_errors.append(f"{record.label}: {unknown_private}")
+                    continue
+                # A successful no-replace rename can be followed by a
+                # hard-link or foreign-leaf swap before the first capture
+                # records B's canonical identity.  In that interval the
+                # staged temporary name is already absent, so blindly
+                # cleaning it would otherwise let the transaction claim a
+                # completed rollback while unowned B remains public.
+                ambiguous = _untrusted_public_postimage_present(parents, record)
+                if ambiguous is not None:
+                    rollback_errors.append(f"{record.label}: {ambiguous}")
+            if not rollback_errors:
+                for record in reversed(records):
+                    if (
+                        record.committed_identity is None
+                        and not record.deleted
+                        and record.staged is None
+                        and record.quarantine is None
+                    ):
+                        continue
+                    try:
+                        _restore_record(parents, record, journal=journal)
+                    except BaseException as rollback_exc:
+                        rollback_errors.append(f"{record.label}: {rollback_exc}")
+                        if not isinstance(rollback_exc, Exception):
+                            rollback_interruption = rollback_exc
+        if not rollback_errors and journal is not None:
+            try:
+                journal.persist(state="rolled-back")
+            except BaseException as journal_exc:
+                rollback_errors.append(f"journal finalization: {journal_exc}")
+                if not isinstance(journal_exc, Exception):
+                    rollback_interruption = journal_exc
+        if not rollback_errors and journal is not None and after_recovery is not None:
+            try:
+                receipt = _publication_transaction_receipt(
+                    journal,
+                    parents,
+                    records,
+                    state="recovered",
+                    postimages=_capture_recovered_postimages(parents, records),
+                )
+                after_recovery(receipt)
+                parents.assert_current(phase="after rollback recovery receipt")
+            except BaseException as recovery_exc:
+                rollback_errors.append(f"recovery handoff pending: {recovery_exc}")
+                if not isinstance(recovery_exc, Exception):
+                    rollback_interruption = recovery_exc
+            else:
+                recovery_handoff_pending = False
         if rollback_errors:
+            if rollback_interruption is not None:
+                raise rollback_interruption
+            if not isinstance(exc, Exception):
+                raise
             raise ReleaseError(
                 f"activation publication failed: {exc}; rollback was incomplete: "
                 + "; ".join(rollback_errors)
             ) from exc
+        if not isinstance(exc, Exception):
+            raise
         raise ReleaseError(f"activation publication failed and was rolled back: {exc}") from exc
+    finally:
+        # Terminal records may be removed only after their fsynced terminal
+        # frame.  Failed private cleanup deliberately leaves a durable journal
+        # rather than converting a committed B into a misleading rollback.
+        if journal is not None:
+            if journal_creation_unsettled or recovery_handoff_pending:
+                journal.close()
+            elif (
+                not journal.durability_uncertain
+                and journal.state in {"committed", "rolled-back"}
+            ):
+                journal.finalize_terminal()
+            else:
+                journal.close()
+        for record in records:
+            if record.staged is not None:
+                record.staged.close()
+            if record.quarantine is not None:
+                record.quarantine.close()
+            if record.rollback is not None:
+                record.rollback.close()
+            if record.disposal is not None:
+                record.disposal.close()
+        parents.close()
+
+
+def _journal_optional_private_name(value: object, *, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ReleaseError(f"{label} is malformed")
+    return _safe_component(value, label=label)
+
+
+def _journal_private_name_matches(
+    private_name: str,
+    public_name: str,
+    *,
+    purpose: str,
+) -> bool:
+    """Accept only names this transaction's private-name generator can own."""
+
+    prefix = f".{public_name}.{purpose}-"
+    return private_name.startswith(prefix) and len(private_name) > len(prefix)
+
+
+def _journal_record_from_payload(
+    value: object,
+    *,
+    guards: _PublicationParentGuards,
+) -> _PublicationRecord:
+    expected = {
+        "path", "name", "content_b64", "mode", "label", "snapshot",
+        "staged_name", "staged_identity", "quarantine_name", "quarantine_identity",
+        "rollback_name", "rollback_identity", "disposal_name", "disposal_identity",
+        "disposal_source", "committed_identity", "deleted", "phase",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ReleaseError("publication journal record is malformed")
+    raw_path = value["path"]
+    name = value["name"]
+    content_b64 = value["content_b64"]
+    mode = value["mode"]
+    label = value["label"]
+    if not isinstance(raw_path, str) or not isinstance(name, str) or not isinstance(label, str):
+        raise ReleaseError("publication journal record is malformed")
+    path = _canonical_publication_path(raw_path, label="publication journal destination")
+    if name != path.name or guards.for_path(path) is None:
+        raise ReleaseError("publication journal destination is malformed")
+    _safe_component(name, label="publication journal destination")
+    if isinstance(mode, bool) or not isinstance(mode, int) or mode < 0 or mode > 0o7777:
+        raise ReleaseError("publication journal record is malformed")
+    if content_b64 is None:
+        content = None
+    elif isinstance(content_b64, str):
+        try:
+            content = base64.b64decode(content_b64.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, ValueError) as exc:
+            raise ReleaseError("publication journal record is malformed") from exc
+    else:
+        raise ReleaseError("publication journal record is malformed")
+    snapshot = _journal_snapshot_from_payload(value["snapshot"], label="publication journal")
+    phase = value["phase"]
+    if phase not in {
+        "prepared", "stage-intent", "staged", "quarantine-intent", "quarantined",
+        "publish-intent", "published", "deleted", "rollback-discard-intent",
+        "rollback-discarded", "rollback-restore-intent", "rollback-restored",
+        "cleanup-intent", "cleanup-disposed", "cleanup-complete", "rolled-back",
+    }:
+        raise ReleaseError("publication journal phase is malformed")
+    deleted = value["deleted"]
+    if not isinstance(deleted, bool):
+        raise ReleaseError("publication journal record is malformed")
+    result = _PublicationRecord(path, name, content, mode, label, snapshot)
+    result.staged_name = _journal_optional_private_name(value["staged_name"], label="journal stage name")
+    result.staged_identity = _journal_file_identity_from_payload(
+        value["staged_identity"], label="journal stage"
+    )
+    result.quarantine_name = _journal_optional_private_name(
+        value["quarantine_name"], label="journal quarantine name"
+    )
+    result.quarantine_identity = _journal_file_identity_from_payload(
+        value["quarantine_identity"], label="journal quarantine"
+    )
+    result.rollback_name = _journal_optional_private_name(
+        value["rollback_name"], label="journal rollback name"
+    )
+    result.rollback_identity = _journal_file_identity_from_payload(
+        value["rollback_identity"], label="journal rollback"
+    )
+    result.disposal_name = _journal_optional_private_name(
+        value["disposal_name"], label="journal disposal name"
+    )
+    result.disposal_identity = _journal_file_identity_from_payload(
+        value["disposal_identity"], label="journal disposal"
+    )
+    result.disposal_source = value["disposal_source"]
+    result.committed_identity = _journal_file_identity_from_payload(
+        value["committed_identity"], label="journal postimage"
+    )
+    if result.staged_identity is not None and result.staged_name is None:
+        raise ReleaseError("publication journal stage is malformed")
+    if result.quarantine_identity is not None and result.quarantine_name is None:
+        raise ReleaseError("publication journal quarantine is malformed")
+    if result.rollback_identity is not None and result.rollback_name is None:
+        raise ReleaseError("publication journal rollback is malformed")
+    if (result.disposal_name is None) != (result.disposal_identity is None):
+        raise ReleaseError("publication journal disposal is malformed")
+    if result.disposal_name is None:
+        if result.disposal_source is not None:
+            raise ReleaseError("publication journal disposal is malformed")
+    elif result.disposal_source not in {"staged", "quarantine", "rollback"}:
+        raise ReleaseError("publication journal disposal is malformed")
+    if result.staged_name is not None and (
+        content is None
+        or not _journal_private_name_matches(result.staged_name, name, purpose="tmp")
+    ):
+        raise ReleaseError("publication journal stage name is malformed")
+    if result.quarantine_name is not None and (
+        not snapshot.snapshot.exists
+        or not _journal_private_name_matches(result.quarantine_name, name, purpose="quarantine")
+    ):
+        raise ReleaseError("publication journal quarantine name is malformed")
+    if result.rollback_name is not None and (
+        content is None
+        or not _journal_private_name_matches(result.rollback_name, name, purpose="quarantine")
+    ):
+        raise ReleaseError("publication journal rollback name is malformed")
+    if result.disposal_name is not None:
+        source_name = {
+            "staged": result.staged_name,
+            "quarantine": result.quarantine_name,
+            "rollback": result.rollback_name,
+        }[str(result.disposal_source)]
+        if source_name is None or not _journal_private_name_matches(
+            result.disposal_name,
+            source_name,
+            purpose="dispose",
+        ):
+            raise ReleaseError("publication journal disposal name is malformed")
+    result.deleted = deleted
+    result.phase = phase
+    return result
+
+
+def _normalize_publication_journal_mode(path: Path) -> None:
+    """Restore a private journal to its authenticated reader mode.
+
+    The create-exclusive leaf can briefly inherit a restrictive umask before
+    its explicit fchmod.  Recovery must be able to consume that same inode,
+    while refusing any group/other-readable object under the journal name.
+    """
+
+    parent = _open_directory_anchor(
+        path.parent,
+        label="publication journal parent",
+        create_parents=False,
+    )
+    try:
+        parent.assert_current(phase="before journal mode normalization")
+        identity = _validate_regular_at(parent, path.name, label="publication journal")
+        if identity is None:
+            return
+        if identity.mode & ~0o600:
+            raise ReleaseError("publication journal has unsafe permissions")
+        if identity.mode != 0o600:
+            try:
+                os.chmod(
+                    path.name,
+                    0o600,
+                    dir_fd=parent.descriptor,
+                    follow_symlinks=False,
+                )
+            except (OSError, TypeError) as exc:
+                raise ReleaseError("publication journal mode could not be normalized") from exc
+            parent.fsync(label="publication journal mode")
+            updated = _validate_regular_at(parent, path.name, label="publication journal")
+            if updated is None or updated.device != identity.device or updated.inode != identity.inode:
+                raise ReleaseError("publication journal changed during mode normalization")
+    finally:
+        parent.close()
+
+
+def _consume_empty_publication_journal(
+    path: Path,
+    capture: _AnchoredFileSnapshot,
+) -> None:
+    """Consume an O_EXCL journal whose first frame never became durable."""
+
+    if capture.identity is None or capture.snapshot.content != b"":
+        raise ReleaseError("empty publication journal capture is invalid")
+    parent = _open_directory_anchor(
+        path.parent,
+        label="publication journal parent",
+        create_parents=False,
+    )
+    descriptor = -1
+    try:
+        parent.assert_current(phase="before empty journal cleanup")
+        descriptor = _openat(
+            parent.descriptor,
+            path.name,
+            _file_open_flags(),
+            label="publication journal",
+        )
+        opened = _file_identity(os.fstat(descriptor), label="publication journal")
+        named = _validate_regular_at(parent, path.name, label="publication journal")
+        if (
+            named is None
+            or not _same_file_object(opened, capture.identity)
+            or not _same_file_object(named, capture.identity)
+        ):
+            raise ReleaseError("empty publication journal changed before cleanup")
+        _unlinkat(parent.descriptor, path.name, label="empty publication journal")
+        parent.fsync(label="publication journal parent")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        parent.close()
+
+
+def _read_publication_journal(
+    journal_path: Path | str | os.PathLike[str],
+    *,
+    recover_disposal: bool = True,
+) -> tuple[Path, _AnchoredFileSnapshot, dict[str, object]] | None:
+    path = _canonical_publication_path(journal_path, label="publication journal")
+    _publication_journal_name(path.name)
+    _normalize_publication_journal_mode(path)
+    captures = _capture_anchored_files_safely(
+        ((path, "publication journal"),),
+        create_parents=False,
+    )
+    capture = captures[path]
+    if (
+        not capture.snapshot.exists
+        and recover_disposal
+        and _restore_disposed_publication_journal(path)
+    ):
+        return _read_publication_journal(path, recover_disposal=False)
+    if capture.snapshot.exists and capture.snapshot.content == b"":
+        _consume_empty_publication_journal(path, capture)
+        return None
+    if (
+        not capture.snapshot.exists
+        or capture.identity is None
+        or capture.snapshot.mode != 0o600
+        or len(capture.snapshot.content) > _MAX_PUBLICATION_JOURNAL_BYTES
+    ):
+        raise ReleaseError("publication journal is unavailable or unsafe")
+    payload = _publication_journal_latest_payload(capture.snapshot.content)
+    expected = {"schema", "generation", "state", "journal_parent", "parents", "records"}
+    if set(payload) != expected or payload.get("schema") != _PUBLICATION_JOURNAL_SCHEMA:
+        raise ReleaseError("publication journal is malformed")
+    generation = payload["generation"]
+    state = payload["state"]
+    journal_parent = payload["journal_parent"]
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation <= 0
+        or state not in {"active", "rolling-back", "committed", "rolled-back"}
+        or not isinstance(journal_parent, str)
+        or _canonical_publication_path(journal_parent, label="publication journal parent") != path.parent
+        or not isinstance(payload["records"], list)
+        or not payload["records"]
+    ):
+        raise ReleaseError("publication journal is malformed")
+    return path, capture, payload
+
+
+def _recovery_expected_stage(record: _PublicationRecord) -> _AnchoredFileSnapshot | None:
+    if record.content is None:
+        return None
+    identity = record.staged_identity
+    if identity is None:
+        return None
+    return _AnchoredFileSnapshot(
+        _FileSnapshot(True, record.content, record.mode),
+        identity,
+        sha256_bytes(record.content),
+    )
+
+
+def _recovery_expected_quarantine(record: _PublicationRecord) -> _AnchoredFileSnapshot | None:
+    if not record.snapshot.snapshot.exists:
+        return None
+    identity = record.quarantine_identity or record.snapshot.identity
+    if identity is None:
+        return None
+    return _AnchoredFileSnapshot(record.snapshot.snapshot, identity, record.snapshot.sha256)
+
+
+def _recovery_expected_rollback(record: _PublicationRecord) -> _AnchoredFileSnapshot | None:
+    """Return the exact B tombstone expected during an interrupted rollback."""
+
+    if record.rollback_name is None or record.content is None:
+        return None
+    identity = (
+        record.rollback_identity
+        or record.committed_identity
+        or record.staged_identity
+    )
+    if identity is None:
+        return None
+    return _AnchoredFileSnapshot(
+        _FileSnapshot(True, record.content, record.mode),
+        identity,
+        sha256_bytes(record.content),
+    )
+
+
+def _recovery_expected_disposal(record: _PublicationRecord) -> _AnchoredFileSnapshot | None:
+    """Return the exact private object moved to a registered disposal name."""
+
+    identity = record.disposal_identity
+    source = record.disposal_source
+    if identity is None or source is None:
+        return None
+    if source == "quarantine":
+        if not record.snapshot.snapshot.exists:
+            return None
+        return _AnchoredFileSnapshot(
+            record.snapshot.snapshot,
+            identity,
+            record.snapshot.sha256,
+        )
+    if record.content is None:
+        return None
+    return _AnchoredFileSnapshot(
+        _FileSnapshot(True, record.content, record.mode),
+        identity,
+        sha256_bytes(record.content),
+    )
+
+
+def _open_recovery_journal(
+    parents: _PublicationParents,
+    path: Path,
+    capture: _AnchoredFileSnapshot,
+    payload: Mapping[str, object],
+    records: list[_PublicationRecord],
+) -> _PublicationJournal:
+    """Reopen the exact append-only journal through its guarded parent FD."""
+
+    parent = parents.for_path(path)
+    descriptor = _openat(
+        parent.descriptor,
+        path.name,
+        os.O_WRONLY | os.O_APPEND | getattr(os, "O_CLOEXEC", 0) | _nofollow_open_flag(),
+        label="publication journal",
+    )
+    try:
+        opened = _file_identity(os.fstat(descriptor), label="publication journal")
+        named = _validate_regular_at(parent, path.name, label="publication journal")
+        if (
+            capture.identity is None
+            or opened.nlink != 1
+            or named is None
+            or not _same_file_object(opened, capture.identity)
+            or not _same_file_object(named, capture.identity)
+        ):
+            raise ReleaseError("publication journal changed before restart recovery")
+        generation = payload.get("generation")
+        state = payload.get("state")
+        if isinstance(generation, bool) or not isinstance(generation, int) or not isinstance(state, str):
+            raise ReleaseError("publication journal is malformed")
+        return _PublicationJournal(
+            parent,
+            path.name,
+            descriptor,
+            records,
+            parents.anchors(),
+            generation=generation,
+            state=state,
+        )
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def _open_recovery_private_file(
+    parent: _DirectoryAnchor,
+    name: str | None,
+    expected: _AnchoredFileSnapshot | None,
+    *,
+    label: str,
+) -> _StagedPublicationFile | None:
+    if name is None:
+        return None
+    if expected is None:
+        # An intent frame without a durable file identity never authorizes
+        # removing or restoring a private name that another writer may have
+        # occupied after the interruption.  If it exists, retain the journal
+        # as an explicit recovery obligation instead of deleting the journal
+        # and orphaning an unregistered staged leaf.
+        observed = _capture_anchored_file(parent, name, label=label)
+        if observed.snapshot.exists:
+            raise ReleaseError(
+                f"{label} is present without a durable identity; "
+                "restart recovery is incomplete"
+            )
+        return None
+    observed = _capture_anchored_file(parent, name, label=label)
+    if not observed.snapshot.exists:
+        return None
+    if not _anchored_snapshot_matches_after_rename(observed, expected):
+        raise ReleaseError(f"{label} changed before restart recovery")
+    opened = _open_named_staged_file(parent, name, label=label)
+    if not _same_renamed_file_identity(opened.identity, observed.identity):
+        opened.close()
+        raise ReleaseError(f"{label} changed while opening for restart recovery")
+    return opened
+
+
+def _unregistered_stage_intent_present(
+    parents: _PublicationParents,
+    record: _PublicationRecord,
+) -> str | None:
+    """Report a staged leaf created after its intent frame but before identity.
+
+    The native staging helper records identity before returning, but an abrupt
+    process death can still occur after the file reaches storage and before
+    the identity frame is fsynced.  The name is durable, but without the full
+    identity it is never safe to unlink.  Retaining the journal is preferable
+    to declaring the rollback complete and losing the only recovery handle.
+    """
+
+    if record.staged_name is None or record.staged_identity is not None:
+        return None
+    observed = _capture_anchored_file(
+        parents.for_path(record.path),
+        record.staged_name,
+        label=f"{record.label} staged temporary",
+    )
+    if not observed.snapshot.exists:
+        return None
+    return "staged temporary is present without a durable identity"
+
+
+def _recovery_committed_snapshot(
+    record: _PublicationRecord,
+    observed: _AnchoredFileSnapshot,
+) -> _FileIdentity | None:
+    if record.content is None or not observed.snapshot.exists or observed.identity is None:
+        return None
+    # A publish-intent frame already carries the exact staged inode.  Do not
+    # downcast an interrupted B publication to matching bytes/mode: a foreign
+    # same-content replacement must not gain rollback authority.
+    expected_identity = record.committed_identity or record.staged_identity
+    if expected_identity is None:
+        # A journal intent without an exact B identity cannot authorize a
+        # content/mode match at the public name.  That name may have been
+        # occupied by an uncoordinated writer after the interruption.
+        return None
+    expected = _AnchoredFileSnapshot(
+        _FileSnapshot(True, record.content, record.mode),
+        expected_identity,
+        sha256_bytes(record.content),
+    )
+    if not _anchored_snapshot_matches_after_rename(observed, expected):
+        return None
+    return observed.identity
+
+
+def _cleanup_recovery_private(staged: _StagedPublicationFile | None) -> None:
+    if staged is None:
+        return
+    try:
+        _cleanup_staged_file(staged)
+    finally:
+        staged.close()
+
+
+def _unlink_registered_disposal(staged: _StagedPublicationFile) -> None:
+    """Finish a previously journaled disposal without inventing another name."""
+
+    staged.parent.assert_current(phase="before registered disposal cleanup")
+    current = _validate_regular_at(
+        staged.parent,
+        staged.temporary_name,
+        label=f"{staged.label} registered disposal",
+    )
+    if current is None:
+        return
+    # Recovery opened this already-renamed disposal and captured its current
+    # identity.  No rename since that capture can justify ignoring ctime.
+    if current.nlink != 1 or current != staged.identity:
+        raise ReleaseError(f"{staged.label} registered disposal changed before cleanup")
+    staged.parent.assert_current(phase="immediately before registered disposal cleanup")
+    _unlinkat(staged.parent.descriptor, staged.temporary_name, label=staged.label)
+    staged.parent.fsync(label="publication parent")
+
+
+def _finish_recovery_disposal(
+    record: _PublicationRecord,
+    journal: _PublicationJournal,
+) -> None:
+    """Clear a durable disposal obligation only after its anchored cleanup."""
+
+    disposal = record.disposal
+    if disposal is not None:
+        try:
+            _unlink_registered_disposal(disposal)
+        finally:
+            disposal.close()
+            record.disposal = None
+    # A missing registered disposal is also terminally safe: it is a private
+    # leaf and the journal already declares either committed B or rollback A.
+    # Persisting the cleared obligation is what permits journal finalization.
+    record.disposal_name = None
+    record.disposal_identity = None
+    record.disposal_source = None
+    _journal_record_phase(journal, record, "cleanup-complete")
+
+
+def _untrusted_public_postimage_present(
+    parents: _PublicationParents,
+    record: _PublicationRecord,
+) -> str | None:
+    """Refuse a post-rename leaf which cannot be tied to a durable B inode."""
+
+    if record.content is None or record.committed_identity is not None:
+        return None
+    # Only a record that reached staging/publish intent could have placed B.
+    # Before that point an ordinary preimage A remains a valid canonical leaf.
+    if record.staged_identity is None and record.phase not in {"publish-intent", "published"}:
+        return None
+    parent = parents.for_path(record.path)
+    try:
+        observed = _validate_regular_at(parent, record.name, label=record.label)
+    except ReleaseError as exc:
+        return f"public postimage could not be authenticated: {exc}"
+    if observed is None:
+        return None
+    if record.snapshot.identity is not None and observed == record.snapshot.identity:
+        return None
+    return "foreign canonical leaf could not be authenticated"
+
+
+def _recover_publication_transaction(
+    journal_path: Path | str | os.PathLike[str],
+    *,
+    after_recovery: Callable[[PublicationTransactionReceipt], None] | None = None,
+) -> dict[str, object]:
+    """Resume one interrupted descriptor-rooted publication journal.
+
+    Recovery itself is journaled.  In particular, every rollback tombstone,
+    A restore, and private disposal is preceded by a durable record, so an
+    interrupt during recovery simply resumes from the last exact identity
+    rather than treating an already-moved B or A as an unowned leaf.
+    """
+
+    journal_read = _read_publication_journal(journal_path)
+    if journal_read is None:
+        return {
+            "ok": True,
+            "journal": str(_canonical_publication_path(journal_path, label="publication journal")),
+            "state": "empty-cleaned",
+        }
+    path, journal_capture, payload = journal_read
+    guards = _journal_directory_guards_from_payload(payload["parents"])
+    records = [
+        _journal_record_from_payload(item, guards=guards)
+        for item in payload["records"]
+    ]
+    if len({record.path for record in records}) != len(records):
+        raise ReleaseError("publication journal repeats a destination")
+    parents = _open_publication_parents(
+        [record.path for record in records],
+        parent_guards=guards,
+        create_parents=False,
+    )
+    journal: _PublicationJournal | None = None
+    private_handles: list[_StagedPublicationFile] = []
+    try:
+        parents.assert_current(phase="before restart recovery")
+        journal_parent = parents.for_path(path)
+        fresh_journal = _capture_anchored_file(
+            journal_parent,
+            path.name,
+            label="publication journal",
+        )
+        if (
+            fresh_journal.identity != journal_capture.identity
+            or fresh_journal.sha256 != journal_capture.sha256
+        ):
+            raise ReleaseError("publication journal changed before restart recovery")
+        journal = _open_recovery_journal(
+            parents,
+            path,
+            journal_capture,
+            payload,
+            records,
+        )
+        original_state = str(payload["state"])
+
+        def open_private(record: _PublicationRecord) -> None:
+            parent = parents.for_path(record.path)
+            record.staged = _open_recovery_private_file(
+                parent,
+                record.staged_name,
+                _recovery_expected_stage(record),
+                label=f"{record.label} staged temporary",
+            )
+            if record.staged is not None:
+                private_handles.append(record.staged)
+            record.quarantine = _open_recovery_private_file(
+                parent,
+                record.quarantine_name,
+                _recovery_expected_quarantine(record),
+                label=f"{record.label} quarantine",
+            )
+            if record.quarantine is not None:
+                private_handles.append(record.quarantine)
+            record.rollback = _open_recovery_private_file(
+                parent,
+                record.rollback_name,
+                _recovery_expected_rollback(record),
+                label=f"{record.label} rollback tombstone",
+            )
+            if record.rollback is not None:
+                private_handles.append(record.rollback)
+            record.disposal = _open_recovery_private_file(
+                parent,
+                record.disposal_name,
+                _recovery_expected_disposal(record),
+                label=f"{record.label} registered disposal",
+            )
+            if record.disposal is not None:
+                private_handles.append(record.disposal)
+
+        if original_state in {"committed", "rolled-back"}:
+            # A terminal journal never inspects a canonical destination as a
+            # rollback candidate.  It owns only exact private names recorded
+            # before their moves, and records each cleanup result before the
+            # terminal journal can disappear.
+            for record in records:
+                open_private(record)
+                if record.disposal is not None or record.disposal_name is not None:
+                    disposal = record.disposal
+                    _finish_recovery_disposal(record, journal)
+                    if disposal is not None and disposal in private_handles:
+                        private_handles.remove(disposal)
+                if record.staged is not None or record.staged_name is not None:
+                    staged = record.staged
+                    if staged is not None:
+                        _dispose_record_private(record, staged, source="staged", journal=journal)
+                        staged.close()
+                        if staged in private_handles:
+                            private_handles.remove(staged)
+                    record.staged = None
+                    record.staged_name = None
+                    record.staged_identity = None
+                    _journal_record_phase(journal, record, "cleanup-complete")
+                if record.quarantine is not None or record.quarantine_name is not None:
+                    quarantine = record.quarantine
+                    if quarantine is not None:
+                        _dispose_record_private(record, quarantine, source="quarantine", journal=journal)
+                        quarantine.close()
+                        if quarantine in private_handles:
+                            private_handles.remove(quarantine)
+                    record.quarantine = None
+                    record.quarantine_name = None
+                    record.quarantine_identity = None
+                    _journal_record_phase(journal, record, "cleanup-complete")
+                if record.rollback is not None or record.rollback_name is not None:
+                    rollback = record.rollback
+                    if rollback is not None:
+                        _dispose_record_private(record, rollback, source="rollback", journal=journal)
+                        rollback.close()
+                        if rollback in private_handles:
+                            private_handles.remove(rollback)
+                    record.rollback = None
+                    record.rollback_name = None
+                    record.rollback_identity = None
+                    _journal_record_phase(journal, record, "cleanup-complete")
+            outcome = "committed-cleaned" if original_state == "committed" else "rolled-back"
+        else:
+            # Durable before the first recovery mutation.  A SIGINT after B's
+            # tombstone or A's no-replace restore therefore resumes with the
+            # latest recorded exact identities rather than an old active frame.
+            journal.persist(state="rolling-back")
+            for record in reversed(records):
+                open_private(record)
+                unknown_private = _unregistered_stage_intent_present(parents, record)
+                if unknown_private is not None:
+                    raise ReleaseError(
+                        f"{record.label}: {unknown_private}; restart recovery is incomplete"
+                    )
+                ambiguous = _untrusted_public_postimage_present(parents, record)
+                if ambiguous is not None:
+                    raise ReleaseError(
+                        f"{record.label}: {ambiguous}; restart recovery is incomplete"
+                    )
+                parent = parents.for_path(record.path)
+                current = _capture_anchored_file(parent, record.name, label=record.label)
+                committed = _recovery_committed_snapshot(record, current)
+                if committed is not None:
+                    record.committed_identity = committed
+                elif current.snapshot.exists and not _anchored_snapshot_matches_after_rename(
+                    current, record.snapshot
+                ):
+                    raise ReleaseError(
+                        f"{record.label} has a foreign canonical leaf; restart recovery is incomplete"
+                    )
+                if (
+                    record.content is None
+                    and record.quarantine is not None
+                    and not current.snapshot.exists
+                ):
+                    record.deleted = True
+
+                # _restore_record journals rollback-discard, A-restore, and
+                # B-disposal transitions.  It is intentionally used for both
+                # ordinary active and previously rolling-back records; every
+                # operation is idempotent from the newest frame.
+                if (
+                    record.committed_identity is not None
+                    or record.deleted
+                    or record.staged is not None
+                    or record.quarantine is not None
+                    or record.rollback is not None
+                    or record.phase in {
+                        "rollback-discard-intent", "rollback-discarded",
+                        "rollback-restore-intent", "rollback-restored",
+                    }
+                ):
+                    _restore_record(parents, record, journal=journal)
+
+                # A disposal may have been registered by a previous recovery
+                # or by cleanup just before an interruption.  It is private
+                # and only removed through its exact recorded identity after
+                # canonical A has been restored (or shown absent by policy).
+                if record.disposal is not None or record.disposal_name is not None:
+                    disposal = record.disposal
+                    _finish_recovery_disposal(record, journal)
+                    if disposal is not None and disposal in private_handles:
+                        private_handles.remove(disposal)
+
+                for private_name, private in (
+                    ("staged", record.staged),
+                    ("quarantine", record.quarantine),
+                    ("rollback", record.rollback),
+                ):
+                    if private is None:
+                        # The latest recovery frame can still name a private
+                        # leaf which an earlier no-replace restore consumed
+                        # (or which was already absent after a completed
+                        # unlink/fsync boundary).  Canonical rollback has
+                        # finished above; retire that stale private reference
+                        # durably before allowing terminal journal cleanup.
+                        name_attribute = private_name + "_name"
+                        identity_attribute = private_name + "_identity"
+                        if getattr(record, name_attribute) is not None:
+                            setattr(record, name_attribute, None)
+                            setattr(record, identity_attribute, None)
+                            _journal_record_phase(journal, record, "cleanup-complete")
+                        continue
+                    _dispose_record_private(record, private, source=private_name, journal=journal)
+                    private.close()
+                    if private in private_handles:
+                        private_handles.remove(private)
+                    setattr(record, private_name, None)
+                    if private_name == "staged":
+                        record.staged_name = None
+                        record.staged_identity = None
+                    elif private_name == "quarantine":
+                        record.quarantine_name = None
+                        record.quarantine_identity = None
+                    else:
+                        record.rollback_name = None
+                        record.rollback_identity = None
+                    _journal_record_phase(journal, record, "cleanup-complete")
+
+            parents.assert_current(phase="before restart rollback terminal frame")
+            journal.persist(state="rolled-back")
+            outcome = "rolled-back"
+
+        parents.assert_current(phase="after restart recovery")
+        recovery_receipt: PublicationTransactionReceipt | None = None
+        if outcome == "rolled-back":
+            # Keep the exact journal leaf live until an outer owner has had a
+            # chance to persist the fresh identities.  This closes the
+            # inverse-recovery window where B was restored with new inodes
+            # but an outer receipt still named the superseded generation.
+            recovery_receipt = _publication_transaction_receipt(
+                journal,
+                parents,
+                records,
+                state="recovered",
+                postimages=_capture_recovered_postimages(parents, records),
+            )
+            if after_recovery is not None:
+                after_recovery(recovery_receipt)
+        if not journal.finalize_terminal():
+            result: dict[str, object] = {
+                "ok": True,
+                "journal": str(path),
+                "state": f"{outcome}-cleanup-deferred",
+            }
+            if recovery_receipt is not None:
+                result["recovery_receipt"] = _publication_receipt_summary(recovery_receipt)
+            return result
+        result = {"ok": True, "journal": str(path), "state": outcome}
+        if recovery_receipt is not None:
+            result["recovery_receipt"] = _publication_receipt_summary(recovery_receipt)
+        return result
+    finally:
+        if journal is not None:
+            journal.close()
+        for private in private_handles:
+            private.close()
+        parents.close()
+
+def recover_publication_transaction(
+    journal_path: Path | str | os.PathLike[str],
+    *,
+    after_recovery: Callable[[PublicationTransactionReceipt], None] | None = None,
+) -> dict[str, object]:
+    """Public restart-recovery entry point for an interrupted publication."""
+
+    return _recover_publication_transaction(journal_path, after_recovery=after_recovery)
+
+
+def _install_publication_journal_path(layout: ReleaseLayout) -> Path:
+    """Return the stable forward-install journal spanning wrappers and state."""
+
+    return layout.root / _INSTALL_PUBLICATION_JOURNAL_NAME
+
+
+def _rollback_publication_journal_path(layout: ReleaseLayout) -> Path:
+    """Return the independent journal used by every B-to-A release inverse."""
+
+    return layout.root / _ROLLBACK_PUBLICATION_JOURNAL_NAME
+
+
+def _release_publication_journal_paths(layout: ReleaseLayout) -> tuple[Path, Path]:
+    """Return every fixed journal path that can be owned by release-manager."""
+
+    return (
+        _install_publication_journal_path(layout),
+        _rollback_publication_journal_path(layout),
+    )
+
+
+def _selected_release_publication_journal_path(
+    layout: ReleaseLayout,
+    journal_path: Path | str | os.PathLike[str],
+) -> Path:
+    """Accept only an exact current release-manager journal pathname.
+
+    Outer activation receipts bind the inode as well as this pathname before
+    calling the public recovery entry point.  Constraining the optional path
+    to this small fixed set preserves that boundary while allowing a caller to
+    recover the precise retained transaction when a terminal cleanup residue
+    from the opposite direction is also present.
+    """
+
+    path = _canonical_publication_path(
+        journal_path,
+        label="managed release publication journal",
+    )
+    if path not in _release_publication_journal_paths(layout):
+        raise ReleaseError("managed release publication journal is not owned by this layout")
+    return path
+
+
+def _recover_install_publication_locked(
+    layout: ReleaseLayout,
+    *,
+    journal_path: Path | str | os.PathLike[str] | None = None,
+    after_recovery: Callable[[PublicationTransactionReceipt], None] | None = None,
+) -> dict[str, object] | None:
+    if journal_path is not None:
+        path = _selected_release_publication_journal_path(layout, journal_path)
+        if not _path_lexists(path):
+            if not _restore_disposed_publication_journal(path):
+                return None
+        return _recover_publication_transaction(path, after_recovery=after_recovery)
+
+    for path in _release_publication_journal_paths(layout):
+        if not _path_lexists(path):
+            _restore_disposed_publication_journal(path)
+    existing = [
+        path for path in _release_publication_journal_paths(layout)
+        if _path_lexists(path)
+    ]
+    if len(existing) > 1:
+        # There is no trustworthy ordering field shared by independent
+        # append-only journals.  Do not guess which transaction owns the
+        # canonical leaves; callers with a durable callback receipt must pass
+        # that exact path, while a human/operator can inspect and recover one
+        # authenticated journal at a time.
+        raise ReleaseError(
+            "multiple managed release publication journals are present; "
+            "recover an exact journal path"
+        )
+    if not existing:
+        return None
+    path = existing[0]
+    if not _path_lexists(path):
+        return None
+    return _recover_publication_transaction(path, after_recovery=after_recovery)
+
+
+def recover_install_publication(
+    *,
+    root: str | Path | None = None,
+    bin_dir: str | Path | None = None,
+    lock_timeout: float = 15.0,
+    journal_path: Path | str | os.PathLike[str] | None = None,
+    after_recovery: Callable[[PublicationTransactionReceipt], None] | None = None,
+) -> dict[str, object]:
+    """Recover a durable wrapper-plus-managed-state release journal.
+
+    ``journal_path`` is optional for ordinary command-line/startup recovery.
+    An outer transaction that retained a callback receipt should supply its
+    exact callback path; it is accepted only when it is one of this layout's
+    forward-install or inverse-rollback journals.  This is safe when
+    ``state.json`` is absent: recovery authenticates the descriptor journal
+    before deciding whether a first-install wrapper set is B to remove or an
+    already terminal publication to clean up.
+
+    ``after_recovery`` runs only after an inverse has restored its durable
+    preimages.  It receives a receipt with ``state == "recovered"`` and exact
+    descriptor-captured restored leaves in ``postimages`` while the source
+    journal is still live.  Callback failure retains that journal for an
+    idempotent retry instead of accepting a same-content replacement.
+    """
+
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    with release_lock(layout, timeout=lock_timeout):
+        result = _recover_install_publication_locked(
+            layout,
+            journal_path=journal_path,
+            after_recovery=after_recovery,
+        )
+    return result or {
+        "ok": True,
+        "recovered": False,
+        "journal": str(
+            _selected_release_publication_journal_path(layout, journal_path)
+            if journal_path is not None
+            else _install_publication_journal_path(layout)
+        ),
+    }
+
+
+def _service_wrapper_api() -> object:
+    """Load the managed-wrapper API without introducing an import cycle."""
+
+    try:
+        from . import service_wrappers
+    except Exception as exc:
+        raise ReleaseError(f"managed service-wrapper API is unavailable: {exc}") from exc
+    return service_wrappers
+
+
+def _release_requires_immutable_wrapper_execution(
+    build_info: Mapping[str, object],
+) -> bool:
+    """Return whether this release must execute wrappers from its wheel site."""
+
+    version = build_info.get("version")
+    if not isinstance(version, str):
+        return True
+    match = _RELEASE_VERSION_PREFIX.fullmatch(version)
+    if match is None:
+        return True
+    try:
+        numeric = tuple(int(component) for component in match.groups())
+    except ValueError:
+        return True
+    return numeric >= _IMMUTABLE_WRAPPER_EXECUTION_MIN_VERSION
+
+
+def _release_wrapper_execution_kwargs(
+    layout: ReleaseLayout,
+    release_id: str,
+) -> dict[str, object]:
+    """Build the verified immutable import binding for one selected release.
+
+    The release verification walks the frozen installed site and authenticates
+    every RECORD member.  Wrapper rendering copies only the two modules it
+    executes into a compact binding, then service_wrappers rechecks those
+    exact single-linked files before importing them at runtime.
+    """
+
+    if _RELEASE_ID.fullmatch(release_id) is None:
+        raise ReleaseError("wrapper execution release id is unsafe")
+    release_dir = layout.releases_dir / release_id
+    try:
+        manifest = validate_release_manifest(
+            read_json(release_dir / "manifest.json", label="release manifest")
+        )
+    except (BuildIdentityError, OSError, ValueError) as exc:
+        raise ReleaseError(f"could not read wrapper execution release: {exc}") from exc
+    build_info = manifest.get("build_info")
+    if not isinstance(build_info, Mapping):
+        raise ReleaseError("wrapper execution release has no build info")
+    verification, site_manifest = _verify_release_dir_details(layout, release_id)
+    required = (
+        "termdeck/__init__.py",
+        "termdeck/service_wrappers.py",
+        "termdeck/web_activation.py",
+    )
+    file_rows = {
+        str(name): (digest, size)
+        for name, digest, size in site_manifest["files"]
+    }
+    missing = [name for name in required if name not in file_rows]
+    frozen = verification.get("frozen_directories") is True
+    required_binding = _release_requires_immutable_wrapper_execution(build_info)
+    if missing or not frozen:
+        if required_binding:
+            detail = "missing " + ", ".join(missing) if missing else "site is not frozen"
+            raise ReleaseError(f"managed release cannot bind immutable wrapper execution: {detail}")
+        return {}
+    binding: dict[str, object] = {}
+    for name in required:
+        digest, size = file_rows[name]
+        if not isinstance(digest, str) or isinstance(size, bool) or not isinstance(size, int):
+            raise ReleaseError("managed release execution binding is malformed")
+        binding[name] = {"sha256": digest, "size": size}
+    return {
+        "execution_root": release_dir / "site",
+        "execution_binding": binding,
+    }
+
+
+def _wrapper_layout_kwargs(
+    layout: ReleaseLayout,
+    release_id: str | None = None,
+) -> dict[str, object]:
+    """Build the wrapper API layout for this release-manager root.
+
+    Production uses the canonical Warp roots.  Disposable release-manager
+    fixtures use sibling roots so their wrapper publication never reaches the
+    live service directories.  The lexical root check is intentional: tests
+    may patch production admission while still using a temporary root.
+    """
+
+    canonical = layout.root.resolve(strict=False) == _DEPLOYMENT_MANAGED_ROOT.resolve(
+        strict=False
+    )
+    if canonical:
+        source_root = _CANONICAL_SOURCE_ROOT
+        runtime_root = _DEPLOYMENT_MANAGED_ROOT.parent
+        state_root = _DEPLOYMENT_STATE_ROOT
+        unit_dir = Path("/home/arch/.config/systemd/user")
+        control_root = _CANONICAL_CONTROL_ROOT
+    else:
+        source_root = Path(__file__).resolve().parent.parent
+        runtime_root = layout.root.parent
+        state_root = layout.root.parent / "state"
+        unit_dir = layout.root.parent / "units"
+        # Tests and other disposable layouts must opt into an explicit
+        # sibling control namespace.  It is intentionally not created here:
+        # a same-UID fixture directory is API plumbing, never a substitute
+        # for the production root-owned attestation boundary.
+        control_root = layout.root.parent.with_name(
+            layout.root.parent.name + "-termdeck-control"
+        )
+    result: dict[str, object] = {
+        "source_root": source_root,
+        "control_root": control_root,
+        "runtime_root": runtime_root,
+        "state_root": state_root,
+        "managed_root": layout.root,
+        "managed_bin": layout.bin_dir,
+        "unit_dir": unit_dir,
+        "manifest_path": layout.root / "wrapper-manifest.json",
+    }
+    if release_id is not None:
+        result.update(_release_wrapper_execution_kwargs(layout, release_id))
+    return result
+
+
+def _wrapper_control_attestation_binding(wrapper_kwargs: Mapping[str, object]) -> dict[str, object]:
+    """Return the immutable wrapper's public root-attestor protocol binding.
+
+    The structure carries endpoint and schema metadata only.  Callers still
+    need a response authenticated by the root attestor; it is never a
+    credential or an authorization to sign arbitrary runtime receipts.
+    """
+
+    raw_root = wrapper_kwargs.get("control_root")
+    if not isinstance(raw_root, (str, Path)):
+        raise ReleaseError("managed service-wrapper control root is unavailable")
+    root = Path(raw_root)
+    return {
+        "socket": str(root / _CONTROL_ATTEST_SOCKET_NAME),
+        "operation": _CONTROL_ATTEST_OPERATION,
+        "request_schema": _CONTROL_ATTEST_REQUEST_SCHEMA,
+        "response_schema": _CONTROL_ATTEST_RESPONSE_SCHEMA,
+        "producer_principal": _CONTROL_ATTEST_PRODUCER,
+        "excluded_principal": _CONTROL_ATTEST_EXCLUDED_PRINCIPAL,
+        "control_root_owner": _CONTROL_ATTEST_OWNER,
+        "control_root_group": _CONTROL_ATTEST_GROUP,
+        "control_root_mode": _CONTROL_ROOT_MODE,
+        "socket_owner": _CONTROL_ATTEST_OWNER,
+        "socket_group": _CONTROL_ATTEST_GROUP,
+        "socket_mode": _CONTROL_ATTEST_SOCKET_MODE,
+    }
+
+
+def release_wrapper_execution_binding(
+    *,
+    release_id: str,
+    root: str | Path | None = None,
+    bin_dir: str | Path | None = None,
+    lock_timeout: float = 15.0,
+) -> dict[str, object]:
+    """Return a freshly verified immutable wrapper import binding.
+
+    Consumers use this before reading an existing managed wrapper set.  The
+    returned root and module rows come from the named release's verified site
+    manifest rather than from a mutable wrapper manifest.  Legacy releases
+    that predate the wheel-site modules report ``immutable=False``; current
+    releases fail closed when either required module is missing or unfrozen.
+    """
+
+    if not isinstance(release_id, str) or _RELEASE_ID.fullmatch(release_id) is None:
+        raise ReleaseError("wrapper execution release id is invalid")
+    layout = release_layout(root=root, bin_dir=bin_dir)
+    with release_lock(layout, timeout=lock_timeout):
+        wrapper_kwargs = _wrapper_layout_kwargs(layout, release_id)
+        binding = {
+            key: wrapper_kwargs[key]
+            for key in ("execution_root", "execution_binding")
+            if key in wrapper_kwargs
+        }
+        expected_attestation = _wrapper_control_attestation_binding(wrapper_kwargs)
+        try:
+            wrapper_api = _service_wrapper_api()
+            observed_attestation = wrapper_api.control_attestation_binding(  # type: ignore[attr-defined]
+                **wrapper_kwargs
+            )
+        except Exception as exc:
+            raise ReleaseError(
+                f"managed service-wrapper control attestation is invalid: {exc}"
+            ) from exc
+        if not isinstance(observed_attestation, Mapping) or dict(observed_attestation) != expected_attestation:
+            raise ReleaseError("managed service-wrapper control attestation differs from policy")
+    result: dict[str, object] = {
+        "release_id": release_id,
+        "immutable": bool(binding),
+        "control_root": str(wrapper_kwargs["control_root"]),
+        "control_socket": str(
+            Path(str(wrapper_kwargs["control_root"])) / _CONTROL_ATTEST_SOCKET_NAME
+        ),
+        "control_attestation": expected_attestation,
+    }
+    result.update(binding)
+    return result
+
+
+def _wrapper_path_set(api: object, kwargs: Mapping[str, object], release_id: str) -> tuple[Path, ...]:
+    """Return the complete path set rendered by the wrapper API."""
+
+    try:
+        rendered = api.render_wrappers(release_id, **dict(kwargs))  # type: ignore[attr-defined]
+        all_files = rendered.all_files()  # type: ignore[attr-defined]
+    except Exception as exc:
+        raise ReleaseError(f"could not render managed service wrappers: {exc}") from exc
+    if not isinstance(all_files, Mapping) or not all_files:
+        raise ReleaseError("managed service-wrapper render returned no files")
+    paths: list[Path] = []
+    for raw_path in all_files:
+        try:
+            path = Path(raw_path)
+        except TypeError as exc:
+            raise ReleaseError("managed service-wrapper render returned an invalid path") from exc
+        if not path.is_absolute() or path != Path(os.path.normpath(str(path))):
+            raise ReleaseError(f"managed service-wrapper path is not canonical: {path}")
+        paths.append(path)
+    return tuple(sorted(set(paths), key=str))
+
+
+def _wrapper_snapshot_item(item: object, *, path: Path) -> _AnchoredFileSnapshot:
+    """Normalize a wrapper preimage without dropping its anchored identity."""
+
+    try:
+        return _expected_anchored_snapshot_from_object(
+            item,
+            label=f"managed service-wrapper preimage {path}",
+        )
+    except ReleaseError as exc:
+        raise ReleaseError(f"managed service-wrapper preimage is invalid for {path}: {exc}") from exc
+
+
+def _wrapper_snapshots_equal(
+    left: object,
+    right: object,
+    paths: Sequence[Path],
+) -> bool:
+    try:
+        for path in paths:
+            left_item = left[path]  # type: ignore[index]
+            right_item = right[path]  # type: ignore[index]
+            if _wrapper_snapshot_item(left_item, path=path) != _wrapper_snapshot_item(
+                right_item, path=path
+            ):
+                return False
+    except (KeyError, TypeError, ReleaseError):
+        return False
+    try:
+        return set(left) == set(paths) and set(right) == set(paths)  # type: ignore[arg-type]
+    except TypeError:
+        return False
+
+
+def _wrapper_snapshot_payload(
+    snapshot: object,
+    *,
+    kwargs: Mapping[str, object],
+    paths: Sequence[Path],
+) -> bytes:
+    entries: list[dict[str, object]] = []
+    for path in paths:
+        try:
+            item = snapshot[path]  # type: ignore[index]
+        except (KeyError, TypeError) as exc:
+            raise ReleaseError(f"managed service-wrapper snapshot is incomplete: {path}") from exc
+        anchored = _wrapper_snapshot_item(item, path=path)
+        file_snapshot = anchored.snapshot
+        identity = anchored.identity
+        if file_snapshot.exists and (identity is None or anchored.sha256 is None):
+            raise ReleaseError(
+                f"managed service-wrapper snapshot lost its anchored identity: {path}"
+            )
+        if not file_snapshot.exists and (identity is not None or anchored.sha256 is not None):
+            raise ReleaseError(
+                f"managed service-wrapper absent snapshot has an anchored identity: {path}"
+            )
+        entries.append(
+            {
+                "path": str(path),
+                "exists": file_snapshot.exists,
+                "content": base64.b64encode(file_snapshot.content).decode("ascii"),
+                "mode": file_snapshot.mode,
+                "device": identity.device if identity is not None else None,
+                "inode": identity.inode if identity is not None else None,
+                "nlink": identity.nlink if identity is not None else None,
+                "size": identity.size if identity is not None else None,
+                "mtime_ns": identity.mtime_ns if identity is not None else None,
+                "ctime_ns": identity.ctime_ns if identity is not None else None,
+                "sha256": anchored.sha256,
+            }
+        )
+    layout_fields = {
+        key: str(kwargs[key])
+        for key in (
+            "source_root",
+            "control_root",
+            "runtime_root",
+            "state_root",
+            "managed_root",
+            "managed_bin",
+            "unit_dir",
+            "manifest_path",
+        )
+        if key in kwargs
+    }
+    return canonical_json_bytes(
+        {
+            "schema": _SERVICE_WRAPPER_PREIMAGE_SCHEMA,
+            "layout": layout_fields,
+            "paths": entries,
+        }
+    )
+
+
+def _wrapper_snapshot_from_payload(
+    content: bytes,
+    *,
+    kwargs: Mapping[str, object],
+    paths: Sequence[Path],
+) -> dict[Path, dict[str, object]]:
+    try:
+        value = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("managed service-wrapper preimage is not valid JSON") from exc
+    if not isinstance(value, Mapping) or set(value) != {"schema", "layout", "paths"}:
+        raise ReleaseError("managed service-wrapper preimage fields differ from schema")
+    if value.get("schema") != _SERVICE_WRAPPER_PREIMAGE_SCHEMA:
+        raise ReleaseError("unsupported managed service-wrapper preimage schema")
+    layout_value = value.get("layout")
+    expected_layout = {
+        key: str(kwargs[key])
+        for key in (
+            "source_root",
+            "control_root",
+            "runtime_root",
+            "state_root",
+            "managed_root",
+            "managed_bin",
+            "unit_dir",
+            "manifest_path",
+        )
+        if key in kwargs
+    }
+    if layout_value != expected_layout:
+        raise ReleaseError("managed service-wrapper preimage layout does not match")
+    raw_entries = value.get("paths")
+    if not isinstance(raw_entries, list) or len(raw_entries) != len(paths):
+        raise ReleaseError("managed service-wrapper preimage path set is incomplete")
+    expected = {str(path) for path in paths}
+    result: dict[Path, dict[str, object]] = {}
+    legacy_fields = {"path", "exists", "content", "mode"}
+    identity_fields = {"device", "inode", "nlink", "size", "mtime_ns", "ctime_ns", "sha256"}
+    for raw in raw_entries:
+        if not isinstance(raw, Mapping):
+            raise ReleaseError("managed service-wrapper preimage entry is malformed")
+        raw_fields = set(raw)
+        if raw_fields != legacy_fields and raw_fields != legacy_fields | identity_fields:
+            raise ReleaseError("managed service-wrapper preimage entry is malformed")
+        raw_path = raw.get("path")
+        if not isinstance(raw_path, str):
+            raise ReleaseError("managed service-wrapper preimage contains an unexpected path")
+        path = Path(raw_path)
+        if raw_path not in expected or path in result:
+            raise ReleaseError("managed service-wrapper preimage contains an unexpected path")
+        if not isinstance(raw.get("exists"), bool):
+            raise ReleaseError("managed service-wrapper preimage existence is invalid")
+        encoded = raw.get("content")
+        if not isinstance(encoded, str):
+            raise ReleaseError("managed service-wrapper preimage bytes are invalid")
+        try:
+            decoded = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except Exception as exc:
+            raise ReleaseError("managed service-wrapper preimage bytes are not base64") from exc
+        mode = raw.get("mode")
+        if isinstance(mode, bool) or not isinstance(mode, int) or mode < 0 or mode > 0o7777:
+            raise ReleaseError("managed service-wrapper preimage mode is invalid")
+        if not raw["exists"] and decoded:
+            raise ReleaseError("managed service-wrapper absent preimage contains bytes")
+        entry: dict[str, object] = {
+            "exists": raw["exists"],
+            "content": decoded,
+            "mode": mode,
+        }
+        if raw_fields == legacy_fields | identity_fields:
+            entry.update({name: raw[name] for name in identity_fields})
+        # Validate and retain a complete anchored identity where the receipt
+        # carries one.  A legacy content-only receipt remains readable for
+        # recovery, but a fresh receipt may only be emitted from a complete
+        # anchored capture and can never be mistaken for a partial proof.
+        _wrapper_snapshot_item(entry, path=path)
+        result[path] = entry
+    if {str(path) for path in result} != expected:
+        raise ReleaseError("managed service-wrapper preimage path set is incomplete")
+    if content != canonical_json_bytes(value):
+        raise ReleaseError("managed service-wrapper preimage is not canonical")
+    return result
+
+
+def _service_wrapper_manifest_path(kwargs: Mapping[str, object]) -> Path:
+    raw = kwargs.get("manifest_path")
+    if not isinstance(raw, (str, Path)):
+        raise ReleaseError("managed service-wrapper manifest path is unavailable")
+    return Path(raw)
+
+
+def _render_service_wrapper_files(
+    api: object,
+    kwargs: Mapping[str, object],
+    release_id: str,
+) -> Mapping[Path, bytes]:
+    try:
+        rendered = api.render_wrappers(release_id, **dict(kwargs))  # type: ignore[attr-defined]
+        files = rendered.all_files()  # type: ignore[attr-defined]
+    except Exception as exc:
+        raise ReleaseError(f"could not render managed service-wrapper files: {exc}") from exc
+    if not isinstance(files, Mapping) or not files:
+        raise ReleaseError("managed service-wrapper render returned no files")
+    normalized: dict[Path, bytes] = {}
+    for raw_path, content in files.items():
+        path = Path(raw_path)
+        if not path.is_absolute() or path != Path(os.path.normpath(str(path))):
+            raise ReleaseError(f"managed service-wrapper path is not canonical: {path}")
+        if not isinstance(content, bytes):
+            raise ReleaseError(f"managed service-wrapper render returned invalid bytes: {path}")
+        normalized[path] = content
+    return normalized
+
+
+def _wrapper_file_mode(api: object, path: Path) -> int:
+    return 0o755 if path.name in set(getattr(api, "WRAPPER_NAMES", ())) else 0o600
+
+
+def _wrapper_publication_needs_repair(
+    snapshot: object,
+    rendered_files: Mapping[Path, bytes],
+    *,
+    api: object,
+    paths: Sequence[Path],
+    manifest_path: Path,
+) -> bool:
+    """Report repairs for deterministic files and missing mutable configs."""
+
+    wrapper_names = set(getattr(api, "WRAPPER_NAMES", ()))
+    for path in paths:
+        try:
+            anchored = _wrapper_snapshot_item(snapshot[path], path=path)  # type: ignore[index]
+        except (KeyError, TypeError, ReleaseError):
+            return True
+        exists = anchored.snapshot.exists
+        content = anchored.snapshot.content
+        mode = anchored.snapshot.mode
+        if not exists:
+            return True
+        if mode != _wrapper_file_mode(api, path):
+            return True
+        if path.name in wrapper_names or path == manifest_path:
+            if content != rendered_files[path]:
+                return True
+    return False
+
+
+def _read_wrapper_manifest_bytes(path: Path) -> tuple[bytes, Mapping[str, object]]:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise ReleaseError(f"could not inspect managed service-wrapper manifest: {path}") from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise ReleaseError(f"managed service-wrapper manifest is unsafe: {path}")
+    try:
+        content = _read_regular_file_bytes(
+            path,
+            label="managed service-wrapper manifest",
+            maximum_bytes=_MAX_MANIFEST_BYTES,
+        )
+        value = json.loads(content.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"managed service-wrapper manifest is invalid: {path}") from exc
+    if not isinstance(value, Mapping):
+        raise ReleaseError("managed service-wrapper manifest is not an object")
+    if content != canonical_json_bytes(value):
+        raise ReleaseError("managed service-wrapper manifest is not canonical")
+    return content, value
+
+
+def _verify_service_wrapper_prepublication(
+    layout: ReleaseLayout,
+    expected_release_id: str | None,
+    *,
+    api: object,
+    kwargs: Mapping[str, object],
+    paths: Sequence[Path],
+) -> dict[str, object]:
+    """Authenticate the current set while allowing missing files to be repaired.
+
+    A missing destination is recoverable because the manifest and every
+    remaining destination still bind the current release.  Existing bytes are
+    checked against the deterministic render, so a changed destination fails
+    closed instead of being silently repaired.
+    """
+
+    # Existing A wrappers can have a different immutable site root from the
+    # B set we are about to render.  Their manifest must be checked against
+    # A's verified binding, never re-rendered through B's import root.
+    current_kwargs = (
+        _wrapper_layout_kwargs(layout, expected_release_id)
+        if expected_release_id is not None
+        else dict(kwargs)
+    )
+    manifest_path = _service_wrapper_manifest_path(current_kwargs)
+    present = {path for path in paths if _path_lexists(path)}
+    if not _path_lexists(manifest_path):
+        if present:
+            raise ReleaseError(
+                "managed service-wrapper destination has no authenticated manifest"
+            )
+        return {
+            "ok": True,
+            "release_id": None,
+            "manifest_path": str(manifest_path),
+            "managed": False,
+            "wrapper_names": [],
+        }
+    if len(present) == len(paths):
+        # Let the wrapper API perform its complete readback when no repair is
+        # needed.  This also preserves its handling of live config identity
+        # fields while keeping the missing-file repair path below narrow.
+        return _verify_service_wrappers(
+            layout,
+            expected_release_id,
+            api=api,
+            kwargs=current_kwargs,
+            expected_paths=paths,
+        )
+    manifest_bytes, manifest = _read_wrapper_manifest_bytes(manifest_path)
+    actual_release = manifest.get("release_id")
+    if not isinstance(actual_release, str) or not actual_release:
+        raise ReleaseError("managed service-wrapper manifest release id is invalid")
+    if expected_release_id is not None and actual_release != expected_release_id:
+        raise ReleaseError("managed service-wrapper release id does not match activation")
+    rendered_files = _render_service_wrapper_files(api, current_kwargs, actual_release)
+    if set(rendered_files) != set(paths):
+        raise ReleaseError("managed service-wrapper render path set changed")
+    if manifest_bytes != rendered_files[manifest_path]:
+        raise ReleaseError("managed service-wrapper manifest is not bound to its render")
+    wrapper_names = set(getattr(api, "WRAPPER_NAMES", ()))
+    for path in paths:
+        if not _path_lexists(path):
+            continue
+        try:
+            info = path.lstat()
+            observed = path.read_bytes()
+        except OSError as exc:
+            raise ReleaseError(f"could not read managed service-wrapper destination: {path}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ReleaseError(f"managed service-wrapper destination is unsafe: {path}")
+        if stat.S_IMODE(info.st_mode) != _wrapper_file_mode(api, path):
+            raise ReleaseError(f"managed service-wrapper destination mode is invalid: {path}")
+        if path.name in wrapper_names and observed != rendered_files[path]:
+            raise ReleaseError(f"managed service-wrapper bytes are not canonical: {path}")
+        if path.name not in wrapper_names and path != manifest_path:
+            try:
+                config = json.loads(observed.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ReleaseError(f"managed service-wrapper config is invalid: {path}") from exc
+            if not isinstance(config, Mapping):
+                raise ReleaseError(f"managed service-wrapper config is invalid: {path}")
+            unit = config.get("unit")
+            if config.get("schema") != getattr(api, "UNIT_CONFIG_SCHEMA", None):
+                raise ReleaseError(f"managed service-wrapper config schema is invalid: {path}")
+            if (
+                config.get("release_id") != actual_release
+                or not isinstance(unit, str)
+                or path.name != f"{unit}.conf"
+            ):
+                raise ReleaseError(f"managed service-wrapper config identity is invalid: {path}")
+    return {
+        "ok": True,
+        "release_id": actual_release,
+        "manifest_path": str(manifest_path),
+        "managed": True,
+        "wrapper_names": list(getattr(api, "WRAPPER_NAMES", ())),
+        "config_paths": [str(path) for path in paths if path.name not in wrapper_names and path != manifest_path],
+    }
+
+
+def _verify_service_wrappers(
+    layout: ReleaseLayout,
+    expected_release_id: str | None,
+    *,
+    api: object | None = None,
+    kwargs: Mapping[str, object] | None = None,
+    expected_paths: Sequence[Path] | None = None,
+) -> dict[str, object]:
+    """Verify wrapper files, manifest bytes, and release identity together."""
+
+    wrapper_api = api or _service_wrapper_api()
+    wrapper_kwargs = dict(
+        kwargs or _wrapper_layout_kwargs(layout, expected_release_id)
+    )
+    release_for_paths = expected_release_id or ("0" * 64)
+    paths = tuple(expected_paths or _wrapper_path_set(wrapper_api, wrapper_kwargs, release_for_paths))
+    manifest_path = _service_wrapper_manifest_path(wrapper_kwargs)
+    present = tuple(path for path in paths if _path_lexists(path))
+    if not _path_lexists(manifest_path):
+        if present:
+            raise ReleaseError(
+                "managed service-wrapper destination has no authenticated manifest"
+            )
+        return {
+            "ok": True,
+            "release_id": None,
+            "manifest_path": str(manifest_path),
+            "managed": False,
+            "wrapper_names": [],
+        }
+    _read_wrapper_manifest_bytes(manifest_path)
+    try:
+        readback = wrapper_api.readback_wrappers(  # type: ignore[attr-defined]
+            **wrapper_kwargs,
+            **({"expected_release_id": expected_release_id} if expected_release_id else {}),
+        )
+    except Exception as exc:
+        raise ReleaseError(f"managed service-wrapper verification failed: {exc}") from exc
+    if not isinstance(readback, Mapping) or readback.get("ok") is not True:
+        raise ReleaseError("managed service-wrapper readback did not succeed")
+    actual_release = readback.get("release_id")
+    if not isinstance(actual_release, str):
+        raise ReleaseError("managed service-wrapper manifest release id is invalid")
+    if expected_release_id is not None and actual_release != expected_release_id:
+        raise ReleaseError("managed service-wrapper release id does not match activation")
+    rendered_files = _render_service_wrapper_files(wrapper_api, wrapper_kwargs, actual_release)
+    if set(rendered_files) != set(paths):
+        raise ReleaseError("managed service-wrapper render path set changed")
+    wrapper_names = set(getattr(wrapper_api, "WRAPPER_NAMES", ()))
+    for raw_path, expected_bytes in rendered_files.items():
+        path = Path(raw_path)
+        # Config files carry live PID/argv identity and therefore may differ
+        # from their initial deterministic template.  readback_wrappers has
+        # already validated their schema, unit, release identity, and mode;
+        # wrappers and the manifest remain byte-for-byte deterministic.
+        if path.name not in wrapper_names and path != manifest_path:
+            continue
+        try:
+            observed = path.read_bytes()
+        except OSError as exc:
+            raise ReleaseError(f"could not read managed service-wrapper destination: {path}") from exc
+        if observed != expected_bytes:
+            raise ReleaseError(f"managed service-wrapper bytes are not canonical: {path}")
+    return {
+        "ok": True,
+        "release_id": actual_release,
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": readback.get("manifest_sha256"),
+        "managed": True,
+        "wrapper_names": readback.get("wrapper_names", []),
+        "config_paths": readback.get("config_paths", []),
+        "execution_root": readback.get("execution_root"),
+        "execution_binding": readback.get("execution_binding"),
+        "control_root": readback.get("control_root"),
+        "control_socket": readback.get("control_socket"),
+        "control_attestation": readback.get("control_attestation"),
+    }
+
+
+def _ensure_wrapper_ancestors(kwargs: Mapping[str, object]) -> None:
+    """Create fixture-only roots through descriptor-anchored parent walks."""
+
+    probes: list[Path] = []
+    for key in ("state_root", "unit_dir"):
+        value = kwargs.get(key)
+        if not isinstance(value, (str, Path)):
+            raise ReleaseError(f"managed service-wrapper {key} is unavailable")
+        path = Path(value)
+        probes.append(path / ".termdeck-wrapper-parent-anchor")
+    _capture_publication_parent_guards(probes, create_parents=True)
+
+
+def _legacy_wrapper_preimage_path(layout: ReleaseLayout) -> Path:
+    return layout.legacy_dir / _SERVICE_WRAPPER_PREIMAGE_NAME
+
+
+def _first_install_preimage_path(layout: ReleaseLayout) -> Path:
+    return layout.legacy_dir / _FIRST_INSTALL_PREIMAGE_NAME
+
+
+def _activation_publication_paths(layout: ReleaseLayout) -> tuple[Path, ...]:
+    """Return the small mutable activation set owned by one release install."""
+
+    return (layout.bootstrap_path, layout.state_path, layout.launcher_path)
+
+
+def _require_empty_wrapper_snapshot(
+    snapshot: object,
+    paths: Sequence[Path],
+    *,
+    label: str,
+) -> None:
+    """Require an explicit absent preimage for every managed wrapper target."""
+
+    try:
+        actual_paths = set(snapshot)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ReleaseError(f"{label} does not contain a wrapper snapshot") from exc
+    if actual_paths != set(paths):
+        raise ReleaseError(f"{label} does not cover the complete wrapper set")
+    for path in paths:
+        try:
+            exists = _wrapper_snapshot_item(snapshot[path], path=path).snapshot.exists  # type: ignore[index]
+        except (KeyError, TypeError) as exc:
+            raise ReleaseError(f"{label} is incomplete: {path}") from exc
+        if exists:
+            raise ReleaseError(f"{label} does not record an empty wrapper preimage")
+
+
+def _prepare_first_install_preimage_publication(
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    publication: _ServiceWrapperPublication,
+    *,
+    autostart_publication: _AutostartPublication | None = None,
+) -> _FirstInstallPreimagePublication | None:
+    """Capture an explicit empty baseline before the very first activation.
+
+    A legacy launcher receipt is sufficient for a conventional upgrade.  When
+    both the managed root and stable launcher begin empty, however, deleting
+    their installed files later is safe only when that absence was recorded
+    before B was published.  This receipt is intentionally created only for
+    that unambiguous case.
+    """
+
+    if (
+        state.get("current_release_id") is not None
+        or state.get("previous_release_id") is not None
+        or state.get("legacy_launcher") is not None
+        or state.get("generation") != 0
+        or publication.legacy_preimage_write is None
+    ):
+        return None
+    if publication.legacy_preimage_before.snapshot.exists:
+        raise ReleaseError("first-install wrapper preimage receipt was not absent")
+    if autostart_publication is not None and (
+        autostart_publication.descriptor_preimage.exists
+        or autostart_publication.receipt_preimage.exists
+    ):
+        # An empty-legacy inverse may remove only paths whose absence is
+        # explicit.  A pre-existing desktop descriptor has a different,
+        # separately backed-up recovery contract, so do not silently fold it
+        # into this empty baseline.
+        return None
+    _require_empty_wrapper_snapshot(
+        publication.preimage,
+        publication.expected_paths,
+        label="managed service-wrapper first-install preimage",
+    )
+    activation_paths = _activation_publication_paths(layout)
+    receipt_path = _first_install_preimage_path(layout)
+    guarded_paths = (*activation_paths, publication.legacy_preimage_path, receipt_path)
+    parent_guards = _capture_publication_parent_guards(
+        guarded_paths,
+        create_parents=True,
+    )
+    snapshots = _capture_files_safely(
+        tuple((path, f"first-install preimage {path.name}") for path in activation_paths)
+        + ((receipt_path, "first-install preimage receipt"),),
+        parent_guards=parent_guards,
+    )
+    activation_preimages = {path: snapshots[path] for path in activation_paths}
+    if any(snapshot.exists for snapshot in activation_preimages.values()):
+        return None
+    receipt_preimage = snapshots[receipt_path]
+    if receipt_preimage.exists:
+        raise ReleaseError("first-install preimage receipt is already present")
+    return _FirstInstallPreimagePublication(
+        receipt_path=receipt_path,
+        receipt_preimage=receipt_preimage,
+        activation_preimages=activation_preimages,
+        parent_guards=parent_guards,
+    )
+
+
+def _first_install_preimage_payload(
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    publication: _ServiceWrapperPublication,
+    first_install: _FirstInstallPreimagePublication,
+    *,
+    autostart_publication: _AutostartPublication | None = None,
+) -> bytes:
+    """Serialize the immutable absent baseline bound to the selected B state."""
+
+    current = state.get("current_release_id")
+    if not isinstance(current, str) or _RELEASE_ID.fullmatch(current) is None:
+        raise ReleaseError("first-install preimage has no selected release")
+    activation_paths = _activation_publication_paths(layout)
+    if set(first_install.activation_preimages) != set(activation_paths):
+        raise ReleaseError("first-install preimage does not cover activation destinations")
+    for path in activation_paths:
+        if first_install.activation_preimages[path].exists:
+            raise ReleaseError("first-install preimage is not empty")
+    wrapper_content = publication.legacy_preimage_write
+    if not isinstance(wrapper_content, bytes):  # pragma: no cover - guarded by preparation
+        raise ReleaseError("first-install wrapper preimage is unavailable")
+    wrapper_snapshot = _wrapper_snapshot_from_payload(
+        wrapper_content,
+        kwargs=publication.kwargs,
+        paths=publication.expected_paths,
+    )
+    _require_empty_wrapper_snapshot(
+        wrapper_snapshot,
+        publication.expected_paths,
+        label="managed service-wrapper first-install receipt",
+    )
+    autostart_preimage: list[dict[str, object]] = []
+    if autostart_publication is not None:
+        if (
+            autostart_publication.descriptor_preimage.exists
+            or autostart_publication.receipt_preimage.exists
+        ):
+            raise ReleaseError("first-install autostart preimage is not empty")
+        autostart_preimage = [
+            {"path": str(autostart_publication.descriptor_path), "exists": False},
+            {"path": str(autostart_publication.receipt_path), "exists": False},
+        ]
+    payload = {
+        "schema": _FIRST_INSTALL_PREIMAGE_SCHEMA,
+        "release_id": current,
+        "state_sha256": sha256_bytes(canonical_json_bytes(state)),
+        "activation_preimage": [
+            {"path": str(path), "exists": False}
+            for path in activation_paths
+        ],
+        # Both receipts are removed by an empty rollback.  Record their
+        # absence explicitly so their later names cannot be mistaken for an
+        # unrelated file that happened to share a managed directory.
+        "receipt_preimage": [
+            {"path": str(publication.legacy_preimage_path), "exists": False},
+            {"path": str(first_install.receipt_path), "exists": False},
+        ],
+        "autostart_preimage": autostart_preimage,
+        "wrapper_preimage_path": str(publication.legacy_preimage_path),
+        "wrapper_preimage_sha256": sha256_bytes(wrapper_content),
+    }
+    return canonical_json_bytes(payload)
+
+
+def _validate_first_install_preimage_payload(
+    content: bytes,
+    *,
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    wrapper_preimage_path: Path,
+    autostart_paths: Sequence[Path] = (),
+) -> str:
+    """Validate a durable empty baseline and return its wrapper payload hash."""
+
+    if len(content) > _MAX_FIRST_INSTALL_PREIMAGE_BYTES:
+        raise ReleaseError("first-install preimage receipt is oversized")
+    try:
+        value = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("first-install preimage receipt is not valid JSON") from exc
+    fields = {
+        "schema",
+        "release_id",
+        "state_sha256",
+        "activation_preimage",
+        "receipt_preimage",
+        "autostart_preimage",
+        "wrapper_preimage_path",
+        "wrapper_preimage_sha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ReleaseError("first-install preimage receipt fields differ from schema")
+    if value.get("schema") != _FIRST_INSTALL_PREIMAGE_SCHEMA:
+        raise ReleaseError("first-install preimage receipt schema is unsupported")
+    current = state.get("current_release_id")
+    if (
+        not isinstance(current, str)
+        or _RELEASE_ID.fullmatch(current) is None
+        or value.get("release_id") != current
+    ):
+        raise ReleaseError("first-install preimage receipt release does not match current B")
+    expected_state_hash = sha256_bytes(canonical_json_bytes(state))
+    if value.get("state_sha256") != expected_state_hash:
+        raise ReleaseError("first-install preimage receipt state does not match current B")
+    if value.get("wrapper_preimage_path") != str(wrapper_preimage_path):
+        raise ReleaseError("first-install preimage wrapper path is invalid")
+    wrapper_hash = value.get("wrapper_preimage_sha256")
+    if not isinstance(wrapper_hash, str) or re.fullmatch(r"[0-9a-f]{64}", wrapper_hash) is None:
+        raise ReleaseError("first-install preimage wrapper digest is invalid")
+    entries = value.get("activation_preimage")
+    paths = _activation_publication_paths(layout)
+    if not isinstance(entries, list) or len(entries) != len(paths):
+        raise ReleaseError("first-install preimage activation path set is incomplete")
+    for raw, expected_path in zip(entries, paths):
+        if (
+            not isinstance(raw, Mapping)
+            or set(raw) != {"path", "exists"}
+            or raw.get("path") != str(expected_path)
+            or raw.get("exists") is not False
+        ):
+            raise ReleaseError("first-install preimage does not explicitly record absence")
+    receipt_entries = value.get("receipt_preimage")
+    expected_receipt_paths = (wrapper_preimage_path, _first_install_preimage_path(layout))
+    if not isinstance(receipt_entries, list) or len(receipt_entries) != len(expected_receipt_paths):
+        raise ReleaseError("first-install preimage receipt path set is incomplete")
+    for raw, expected_path in zip(receipt_entries, expected_receipt_paths):
+        if (
+            not isinstance(raw, Mapping)
+            or set(raw) != {"path", "exists"}
+            or raw.get("path") != str(expected_path)
+            or raw.get("exists") is not False
+        ):
+            raise ReleaseError("first-install preimage does not explicitly record receipt absence")
+    autostart_entries = value.get("autostart_preimage")
+    if not isinstance(autostart_entries, list) or len(autostart_entries) != len(autostart_paths):
+        raise ReleaseError("first-install preimage autostart path set is incomplete")
+    for raw, expected_path in zip(autostart_entries, autostart_paths):
+        if (
+            not isinstance(raw, Mapping)
+            or set(raw) != {"path", "exists"}
+            or raw.get("path") != str(expected_path)
+            or raw.get("exists") is not False
+        ):
+            raise ReleaseError("first-install preimage does not explicitly record autostart absence")
+    if content != canonical_json_bytes(value):
+        raise ReleaseError("first-install preimage receipt is not canonical")
+    return wrapper_hash
+
+
+def _prepare_service_wrapper_publication(
+    layout: ReleaseLayout,
+    *,
+    current_release_id: str | None,
+    target_release_id: str,
+) -> _ServiceWrapperPublication:
+    """Capture and authenticate current wrappers before rendering a target set."""
+
+    api = _service_wrapper_api()
+    kwargs = _wrapper_layout_kwargs(layout, target_release_id)
+    _ensure_wrapper_ancestors(kwargs)
+    paths = _wrapper_path_set(api, kwargs, target_release_id)
+    backup_path = _legacy_wrapper_preimage_path(layout)
+    # Carry these identities through every later wrapper write and rollback.
+    # This is deliberately captured before rendering/publishing so a renamed
+    # root can never become a new publication destination between phases.
+    parent_guards = _capture_publication_parent_guards(
+        (*paths, backup_path),
+        create_parents=True,
+    )
+    _verify_service_wrapper_prepublication(
+        layout,
+        current_release_id,
+        api=api,
+        kwargs=kwargs,
+        paths=paths,
+    )
+    try:
+        snapshot = api.capture_wrapper_snapshot(  # type: ignore[attr-defined]
+            **kwargs,
+            _parent_guards=parent_guards,
+        )
+    except Exception as exc:
+        raise ReleaseError(f"could not capture managed service-wrapper preimages: {exc}") from exc
+    if not isinstance(snapshot, Mapping) or set(snapshot) != set(paths):
+        raise ReleaseError("managed service-wrapper preimage does not cover all destinations")
+
+    backup_before = _capture_anchored_files_safely(
+        ((backup_path, "managed service-wrapper legacy preimage"),),
+        parent_guards=parent_guards,
+    )[backup_path]
+    if backup_before.snapshot.exists:
+        try:
+                _wrapper_snapshot_from_payload(
+                backup_before.snapshot.content,
+                kwargs=kwargs,
+                paths=paths,
+            )
+        except ReleaseError:
+            raise
+        backup_write = None
+    else:
+        backup_before = _AnchoredFileSnapshot(_FileSnapshot(False), None, None)
+        backup_write = _wrapper_snapshot_payload(snapshot, kwargs=kwargs, paths=paths)
+
+    # The publication is a repair only when at least one target file differs
+    # from the authenticated current bytes (including a missing destination).
+    try:
+        rendered = api.render_wrappers(target_release_id, **kwargs)  # type: ignore[attr-defined]
+        rendered_files = rendered.all_files()  # type: ignore[attr-defined]
+        repaired = _wrapper_publication_needs_repair(
+            snapshot,
+            rendered_files,
+            api=api,
+            paths=paths,
+            manifest_path=Path(str(kwargs["manifest_path"])),
+        )
+    except Exception:
+        # The precise repair bit is informational.  Any rendering problem is
+        # still fatal before release publication.
+        raise
+    try:
+        plan = api.prepare_wrapper_publication(  # type: ignore[attr-defined]
+            rendered,
+            _parent_guards=parent_guards,
+            _snapshot=snapshot,
+        )
+        plan_paths = {
+            Path(path)
+            for path, _content, _mode, _label in getattr(plan, "writes")
+        }
+        if plan_paths != set(paths):
+            raise ReleaseError("managed service-wrapper plan path set is incomplete")
+        if getattr(plan, "snapshot", None) is None or getattr(plan, "parent_guards", None) != parent_guards:
+            raise ReleaseError("managed service-wrapper plan lost its anchored preimage")
+    except ReleaseError:
+        raise
+    except Exception as exc:
+        raise ReleaseError(f"could not prepare managed service-wrapper publication: {exc}") from exc
+    return _ServiceWrapperPublication(
+        api=api,
+        kwargs=kwargs,
+        target_release_id=target_release_id,
+        preimage=snapshot,
+        legacy_preimage_path=backup_path,
+        legacy_preimage_before=backup_before,
+        legacy_preimage_write=backup_write,
+        expected_paths=paths,
+        parent_guards=parent_guards,
+        plan=plan,
+        repaired=repaired,
+    )
+
+
+def _wrapper_rendered_summary(
+    value: Mapping[str, object] | None,
+    *,
+    fallback: Mapping[str, object],
+    repaired: bool,
+) -> dict[str, object]:
+    summary = dict(value or fallback)
+    summary.pop("snapshot", None)
+    summary.pop("rendered", None)
+    summary["repaired"] = repaired
+    return summary
+
+
+def _publish_service_wrappers(
+    publication: _ServiceWrapperPublication,
+) -> dict[str, object]:
+    """Publish target wrappers and return a JSON-safe summary."""
+
+    current_snapshot = None
+    try:
+        current_snapshot = publication.api.capture_wrapper_snapshot(  # type: ignore[attr-defined]
+            **publication.kwargs,
+            _parent_guards=publication.parent_guards,
+        )
+    except Exception as exc:
+        raise ReleaseError(f"could not recheck managed service-wrapper preimages: {exc}") from exc
+    if not _wrapper_snapshots_equal(
+        current_snapshot,
+        publication.preimage,
+        publication.expected_paths,
+    ):
+        raise ReleaseError("managed service-wrapper destination changed before publication")
+    backup_written = False
+    try:
+        if publication.legacy_preimage_write is not None:
+            _publish_files_transactionally(
+                (
+                    (
+                        publication.legacy_preimage_path,
+                        publication.legacy_preimage_write,
+                        0o600,
+                        "managed service-wrapper legacy preimage",
+                    ),
+                ),
+                parent_guards=publication.parent_guards,
+                expected_preimages={
+                    publication.legacy_preimage_path: publication.legacy_preimage_before,
+                },
+            )
+            backup_written = True
+        result = publication.api.publish_wrappers(  # type: ignore[attr-defined]
+            str(publication.target_release_id),
+            **publication.kwargs,
+            _parent_guards=publication.parent_guards,
+        )
+        if not isinstance(result, Mapping):
+            raise ReleaseError("managed service-wrapper publication returned an invalid result")
+        verified = _verify_service_wrappers(
+            release_layout(
+                root=Path(str(publication.kwargs["managed_root"])),
+                bin_dir=Path(str(publication.kwargs["managed_bin"])),
+            ),
+            publication.target_release_id,
+            api=publication.api,
+            kwargs=publication.kwargs,
+            expected_paths=publication.expected_paths,
+        )
+        return _wrapper_rendered_summary(
+            verified,
+            fallback=result,
+            repaired=publication.repaired,
+        )
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        try:
+            # The wrapper API guarantees its own transaction, but restoring the
+            # captured snapshot here also covers a failure after its verify.
+            publication.api.restore_wrappers(  # type: ignore[attr-defined]
+                publication.preimage,
+                **publication.kwargs,
+                _parent_guards=publication.parent_guards,
+            )
+        except Exception as restore_exc:
+            rollback_errors.append(f"wrapper bytes: {restore_exc}")
+        if backup_written:
+            try:
+                _restore_file(
+                    publication.legacy_preimage_path,
+                    publication.legacy_preimage_before.snapshot,
+                    label="managed service-wrapper legacy preimage",
+                    parent_guards=publication.parent_guards,
+                )
+            except Exception as restore_exc:
+                rollback_errors.append(f"wrapper legacy preimage: {restore_exc}")
+        detail = f"managed service-wrapper publication failed: {exc}"
+        if rollback_errors:
+            detail += "; rollback was incomplete: " + "; ".join(rollback_errors)
+        raise ReleaseError(detail) from exc
+
+
+def _restore_service_wrappers(
+    publication: _ServiceWrapperPublication,
+    snapshot: object,
+    *,
+    restore_legacy_preimage_file: bool = False,
+) -> None:
+    """Restore wrapper bytes and (optionally) the legacy snapshot metadata."""
+
+    errors: list[str] = []
+    try:
+        publication.api.restore_wrappers(  # type: ignore[attr-defined]
+            snapshot,
+            **publication.kwargs,
+            _parent_guards=publication.parent_guards,
+        )
+    except Exception as exc:
+        errors.append(f"wrapper bytes: {exc}")
+    if restore_legacy_preimage_file and publication.legacy_preimage_write is not None:
+        try:
+            _restore_file(
+                publication.legacy_preimage_path,
+                publication.legacy_preimage_before.snapshot,
+                label="managed service-wrapper legacy preimage",
+                parent_guards=publication.parent_guards,
+            )
+        except Exception as exc:
+            errors.append(f"wrapper legacy preimage: {exc}")
+    if errors:
+        raise ReleaseError("managed service-wrapper rollback was incomplete: " + "; ".join(errors))
+
+
+def _merge_publication_parent_guards(*values: object | None) -> _PublicationParentGuards:
+    """Combine independently captured anchors without accepting a new parent.
+
+    Wrapper preflight and activation preflight deliberately happen at separate
+    points in install planning.  A path common to both sets is meaningful: a
+    different chain there proves an ancestor was replaced in the gap, rather
+    than becoming a fresh destination for a combined write.
+    """
+
+    by_path: dict[Path, _DirectoryGuard] = {}
+    for value in values:
+        guards = _coerce_parent_guards(value)
+        if guards is None:
+            continue
+        for guard in guards.guards:
+            previous = by_path.get(guard.path)
+            if previous is not None and previous != guard:
+                raise ReleaseError(
+                    f"publication parent identity changed between preflight phases: {guard.path}"
+                )
+            by_path[guard.path] = guard
+    if not by_path:
+        raise ReleaseError("combined publication has no parent identities")
+    return _PublicationParentGuards(tuple(by_path[path] for path in sorted(by_path, key=str)))
+
+
+def _publish_install_wrapper_and_activation(
+    publication: _ServiceWrapperPublication,
+    activation_writes: Sequence[tuple[Path, bytes | None, int, str]],
+    *,
+    verify: Callable[[], None],
+    first_install_preimage: _FirstInstallPreimagePublication | None,
+    activation_expected_preimages: Mapping[Path, _FileSnapshot] | None = None,
+    wrapper_snapshot: object | None = None,
+    wrapper_expected_release_id: str | None = None,
+    journal_path: Path | None = None,
+    before_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
+    after_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
+    after_recovery: Callable[[PublicationTransactionReceipt], None] | None = None,
+) -> dict[str, object]:
+    """Publish wrappers and the selecting state through one durable journal.
+
+    The state file is appended last by the caller.  The generic transaction
+    writes its complete preimage/postimage journal before the first wrapper
+    rename, so a process death cannot leave a wrapper generation that has no
+    authenticated managed-state owner.
+    """
+
+    if wrapper_snapshot is None:
+        plan = publication.plan
+        raw_plan_writes = getattr(plan, "writes", None)
+        plan_snapshot = getattr(plan, "snapshot", None)
+        plan_guards = getattr(plan, "parent_guards", None)
+        plan_verify = getattr(plan, "verify", None)
+        if (
+            not isinstance(raw_plan_writes, tuple)
+            or not isinstance(plan_snapshot, Mapping)
+            or plan_guards != publication.parent_guards
+            or not callable(plan_verify)
+        ):
+            raise ReleaseError("managed service-wrapper publication plan is invalid")
+
+        wrapper_writes: list[tuple[Path, bytes | None, int, str]] = []
+        for raw_path, content, mode, label in raw_plan_writes:
+            path = _canonical_publication_path(raw_path, label="managed service-wrapper plan")
+            if content is not None and not isinstance(content, bytes):
+                raise ReleaseError("managed service-wrapper plan has invalid bytes")
+            wrapper_writes.append((path, content, mode, label))
+        if {path for path, _content, _mode, _label in wrapper_writes} != set(publication.expected_paths):
+            raise ReleaseError("managed service-wrapper publication plan path set is incomplete")
+        expected_wrapper_preimages: Mapping[Path, object] = plan_snapshot
+        verified_release_id = publication.target_release_id
+    else:
+        # Conventional legacy rollback restores the exact wrapper snapshot
+        # that was recorded before management began.  It cannot use
+        # ``restore_wrappers`` as a second independent transaction: an
+        # interrupt between that publication and state.json previously left
+        # an unowned legacy wrapper generation.  Turn the authenticated
+        # snapshot into the same descriptor-journaled write set instead.
+        try:
+            target_paths = set(wrapper_snapshot)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise ReleaseError("legacy service-wrapper snapshot is invalid") from exc
+        if target_paths != set(publication.expected_paths):
+            raise ReleaseError("legacy service-wrapper snapshot is incomplete")
+        wrapper_writes = []
+        for path in publication.expected_paths:
+            try:
+                desired = _wrapper_snapshot_item(wrapper_snapshot[path], path=path)  # type: ignore[index]
+            except (KeyError, TypeError, ReleaseError) as exc:
+                raise ReleaseError(f"legacy service-wrapper snapshot is invalid: {path}") from exc
+            wrapper_writes.append(
+                (
+                    path,
+                    desired.snapshot.content if desired.snapshot.exists else None,
+                    desired.snapshot.mode,
+                    f"legacy wrapper {path.name}",
+                )
+            )
+        expected_wrapper_preimages = publication.preimage  # type: ignore[assignment]
+        verified_release_id = wrapper_expected_release_id
+
+        def plan_verify() -> None:
+            _verify_service_wrappers(
+                release_layout(
+                    root=Path(str(publication.kwargs["managed_root"])),
+                    bin_dir=Path(str(publication.kwargs["managed_bin"])),
+                ),
+                verified_release_id,
+                api=publication.api,
+                kwargs=publication.kwargs,
+                expected_paths=publication.expected_paths,
+            )
+
+    normalized_activation: list[tuple[Path, bytes | None, int, str]] = []
+    for raw_path, content, mode, label in activation_writes:
+        normalized_activation.append(
+            (_canonical_publication_path(raw_path, label=label), content, mode, label)
+        )
+    activation_paths = tuple(path for path, _content, _mode, _label in normalized_activation)
+    if first_install_preimage is not None:
+        activation_guards = _merge_publication_parent_guards(
+            first_install_preimage.parent_guards,
+            _capture_publication_parent_guards(activation_paths, create_parents=True),
+        )
+    elif not activation_paths:
+        activation_guards = publication.parent_guards
+    else:
+        activation_guards = _capture_publication_parent_guards(
+            activation_paths,
+            create_parents=True,
+        )
+    parent_guards = _merge_publication_parent_guards(
+        publication.parent_guards,
+        activation_guards,
+    )
+    activation_preimages = (
+        _capture_anchored_files_safely(
+            tuple((path, label) for path, _content, _mode, label in normalized_activation),
+            parent_guards=parent_guards,
+        )
+        if normalized_activation
+        else {}
+    )
+    if activation_expected_preimages is not None:
+        for path, expected in activation_expected_preimages.items():
+            observed = activation_preimages.get(path)
+            if observed is None or observed.snapshot != expected:
+                raise ReleaseError(f"{path.name} changed after activation preflight")
+    if first_install_preimage is not None:
+        expected_first: dict[Path, _FileSnapshot] = {
+            **first_install_preimage.activation_preimages,
+            first_install_preimage.receipt_path: first_install_preimage.receipt_preimage,
+        }
+        for path, expected in (activation_expected_preimages or {}).items():
+            if path not in expected_first:
+                if expected.exists:
+                    raise ReleaseError("first-install additional activation preimage is not empty")
+                expected_first[path] = expected
+        if set(expected_first) != set(activation_paths):
+            raise ReleaseError("first-install preimage does not cover combined activation publication")
+        for path, expected in expected_first.items():
+            if activation_preimages[path].snapshot != expected:
+                raise ReleaseError(f"{path.name} changed after first-install preflight")
+
+    writes: list[tuple[Path, bytes | None, int, str]] = []
+    expected_preimages: dict[Path, object] = dict(expected_wrapper_preimages)
+    if publication.legacy_preimage_write is not None:
+        writes.append(
+            (
+                publication.legacy_preimage_path,
+                publication.legacy_preimage_write,
+                0o600,
+                "managed service-wrapper legacy preimage",
+            )
+        )
+        expected_preimages[publication.legacy_preimage_path] = publication.legacy_preimage_before
+    writes.extend(wrapper_writes)
+    writes.extend(normalized_activation)
+    expected_preimages.update(activation_preimages)
+    if len({path for path, _content, _mode, _label in writes}) != len(writes):
+        raise ReleaseError("combined install publication repeats a destination")
+
+    def verify_combined() -> None:
+        plan_verify()
+        verify()
+
+    published_receipt: PublicationTransactionReceipt | None = None
+
+    def capture_published(receipt: PublicationTransactionReceipt) -> None:
+        nonlocal published_receipt
+        if after_publication is not None:
+            after_publication(receipt)
+        published_receipt = receipt
+
+    _publish_files_transactionally(
+        tuple(writes),
+        verify=verify_combined,
+        parent_guards=parent_guards,
+        expected_preimages=expected_preimages,
+        journal_path=journal_path,
+        before_publish=before_publication,
+        after_publish=capture_published,
+        after_recovery=after_recovery,
+    )
+    verified = _verify_service_wrappers(
+        release_layout(
+            root=Path(str(publication.kwargs["managed_root"])),
+            bin_dir=Path(str(publication.kwargs["managed_bin"])),
+        ),
+        verified_release_id,
+        api=publication.api,
+        kwargs=publication.kwargs,
+        expected_paths=publication.expected_paths,
+    )
+    summary = _wrapper_rendered_summary(
+        verified,
+        fallback={},
+        repaired=publication.repaired,
+    )
+    if published_receipt is None:  # pragma: no cover - nonempty combined writes always callback
+        raise ReleaseError("combined install publication did not produce an authenticated receipt")
+    summary["publication_receipt"] = _publication_receipt_summary(published_receipt)
+    return summary
+
+
+def _load_legacy_wrapper_snapshot(
+    publication: _ServiceWrapperPublication,
+) -> object:
+    path = publication.legacy_preimage_path
+    snapshot = _capture_file(
+        path,
+        label="managed service-wrapper legacy preimage",
+        parent_guards=publication.parent_guards,
+    )
+    if not snapshot.exists:
+        # A root created by an older release-manager has no wrapper history;
+        # the safe legacy target is an absent wrapper set.
+        return {
+            item: {"exists": False, "content": b"", "mode": 0}
+            for item in publication.expected_paths
+        }
+    return _wrapper_snapshot_from_payload(
+        snapshot.content,
+        kwargs=publication.kwargs,
+        paths=publication.expected_paths,
+    )
+
+
+def _publish_service_wrapper_snapshot(
+    publication: _ServiceWrapperPublication,
+    snapshot: object,
+    *,
+    expected_release_id: str | None,
+) -> dict[str, object]:
+    """Publish a previously captured wrapper set for a legacy rollback."""
+
+    try:
+        current = publication.api.capture_wrapper_snapshot(  # type: ignore[attr-defined]
+            **publication.kwargs,
+            _parent_guards=publication.parent_guards,
+        )
+        if not _wrapper_snapshots_equal(current, publication.preimage, publication.expected_paths):
+            raise ReleaseError("managed service-wrapper destination changed before rollback")
+        publication.api.restore_wrappers(  # type: ignore[attr-defined]
+            snapshot,
+            **publication.kwargs,
+            _parent_guards=publication.parent_guards,
+        )
+        layout = release_layout(
+            root=Path(str(publication.kwargs["managed_root"])),
+            bin_dir=Path(str(publication.kwargs["managed_bin"])),
+        )
+        summary = _verify_service_wrappers(
+            layout,
+            expected_release_id,
+            api=publication.api,
+            kwargs=publication.kwargs,
+            expected_paths=publication.expected_paths,
+        )
+        summary["repaired"] = not _wrapper_snapshots_equal(
+            publication.preimage,
+            snapshot,
+            publication.expected_paths,
+        )
+        return summary
+    except Exception as exc:
+        try:
+            _restore_service_wrappers(publication, publication.preimage)
+        except Exception as restore_exc:
+            raise ReleaseError(
+                f"managed service-wrapper rollback failed: {exc}; {restore_exc}"
+            ) from exc
+        raise ReleaseError(f"managed service-wrapper rollback failed and was rolled back: {exc}") from exc
+
+
+def _rollback_first_install_to_empty_legacy(
+    layout: ReleaseLayout,
+    state: Mapping[str, object],
+    publication: _ServiceWrapperPublication,
+    *,
+    manage_autostart: bool = False,
+    after_remove: Callable[[], None] | None = None,
+    journal_path: Path | None = None,
+    before_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
+    after_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
+    after_recovery: Callable[[PublicationTransactionReceipt], None] | None = None,
+) -> dict[str, object]:
+    """Undo one authenticated first install whose recorded preimages are empty.
+
+    Unlike an ordinary legacy rollback, this path has no launcher bytes to
+    restore.  It therefore deletes only the exact B files that its persisted
+    first-install receipt and complete wrapper preimage prove were absent
+    before publication.  One descriptor-anchored transaction owns both the
+    removal and any rollback if verification fails.
+    """
+
+    if (
+        state.get("legacy_launcher") is not None
+        or state.get("previous_release_id") is not None
+        or state.get("generation") != 1
+    ):
+        raise ReleaseError("empty legacy rollback has an ambiguous managed-state preimage")
+    current = state.get("current_release_id")
+    if not isinstance(current, str) or _RELEASE_ID.fullmatch(current) is None:
+        raise ReleaseError("empty legacy rollback has no authenticated current B")
+
+    # Validate B before accepting its receipt as an authority.  This proves
+    # the selected release, bootstrap, launcher, and complete wrapper set all
+    # still agree rather than treating a state hash as self-authenticating.
+    _verify_managed_activation(layout, state, verify_release=True)
+
+    first_receipt_path = _first_install_preimage_path(layout)
+    autostart_paths: tuple[Path, ...] = ()
+    autostart_descriptor: bytes | None = None
+    if manage_autostart:
+        # Bind the external desktop pair to B before treating it as part of
+        # the empty transaction.  The first-install receipt below also proves
+        # both paths were absent before installation.
+        _verify_production_autostart(layout, state)
+        autostart_descriptor_path = _production_autostart_path()
+        autostart_receipt_path = _production_autostart_receipt_path(layout)
+        autostart_paths = (autostart_descriptor_path, autostart_receipt_path)
+        autostart_descriptor = _canonical_production_autostart_descriptor(layout)
+    # State is the externally visible selection pointer.  Remove its exact B
+    # instance last, after every executable/config/receipt it selects has
+    # been durably removed, so a crash cannot advertise an empty legacy state
+    # while the transaction is still deleting B-owned files.
+    removal_paths = (
+        *publication.expected_paths,
+        layout.bootstrap_path,
+        layout.launcher_path,
+        *autostart_paths,
+        publication.legacy_preimage_path,
+        first_receipt_path,
+        layout.state_path,
+    )
+    parent_guards = _capture_publication_parent_guards(
+        removal_paths,
+        create_parents=False,
+    )
+    current_anchored_files = _capture_anchored_files_safely(
+        tuple((path, f"empty legacy rollback {path.name}") for path in removal_paths),
+        parent_guards=parent_guards,
+    )
+    current_files = {
+        path: captured.snapshot for path, captured in current_anchored_files.items()
+    }
+    if any(not current_files[path].exists for path in removal_paths):
+        raise ReleaseError("empty legacy rollback is missing a transaction-owned B destination")
+    if current_files[first_receipt_path].mode != 0o600:
+        raise ReleaseError("first-install preimage receipt is not private")
+    if current_files[publication.legacy_preimage_path].mode != 0o600:
+        raise ReleaseError("managed service-wrapper preimage receipt is not private")
+
+    wrapper_hash = _validate_first_install_preimage_payload(
+        current_files[first_receipt_path].content,
+        layout=layout,
+        state=state,
+        wrapper_preimage_path=publication.legacy_preimage_path,
+        autostart_paths=autostart_paths,
+    )
+    wrapper_content = current_files[publication.legacy_preimage_path].content
+    if sha256_bytes(wrapper_content) != wrapper_hash:
+        raise ReleaseError("first-install preimage wrapper digest does not match")
+    wrapper_preimage = _wrapper_snapshot_from_payload(
+        wrapper_content,
+        kwargs=publication.kwargs,
+        paths=publication.expected_paths,
+    )
+    _require_empty_wrapper_snapshot(
+        wrapper_preimage,
+        publication.expected_paths,
+        label="managed service-wrapper first-install receipt",
+    )
+
+    current_wrappers = {
+        path: current_anchored_files[path] for path in publication.expected_paths
+    }
+    if not _wrapper_snapshots_equal(
+        current_wrappers,
+        publication.preimage,
+        publication.expected_paths,
+    ):
+        raise ReleaseError("managed service-wrapper destination changed before empty rollback")
+
+    # The authenticated state derives B's canonical bytes, and the secure
+    # snapshot above pins exactly the instances that the unlink transaction
+    # will remove.  Refuse a same-name residue instead of guessing ownership.
+    if sha256_bytes(current_files[layout.bootstrap_path].content) != state.get(
+        "bootstrap_sha256"
+    ):
+        raise ReleaseError("managed bootstrap changed before empty rollback")
+    if sha256_bytes(current_files[layout.launcher_path].content) != state.get(
+        "launcher_sha256"
+    ):
+        raise ReleaseError("managed launcher changed before empty rollback")
+    if current_files[layout.state_path].content != canonical_json_bytes(state):
+        raise ReleaseError("managed state changed before empty rollback")
+    if manage_autostart:
+        assert autostart_descriptor is not None  # guarded above
+        descriptor_path, receipt_path = autostart_paths
+        descriptor_snapshot = current_files[descriptor_path]
+        receipt_snapshot = current_files[receipt_path]
+        if descriptor_snapshot.content != autostart_descriptor or descriptor_snapshot.mode != 0o644:
+            raise ReleaseError("production autostart descriptor changed before empty rollback")
+        if receipt_snapshot.mode != 0o600:
+            raise ReleaseError("production autostart receipt is not private")
+        try:
+            receipt_value = json.loads(receipt_snapshot.content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReleaseError("production autostart receipt is invalid") from exc
+        if receipt_snapshot.content != canonical_json_bytes(receipt_value):
+            raise ReleaseError("production autostart receipt is not canonical")
+        validated_autostart = _validate_autostart_receipt(
+            receipt_value,
+            layout=layout,
+            state=state,
+            descriptor_path=descriptor_path,
+            descriptor=descriptor_snapshot.content,
+        )
+        if validated_autostart["prior_descriptor"] is not None:
+            raise ReleaseError("empty legacy rollback autostart preimage is not empty")
+
+    def verify_empty_publication() -> None:
+        observed = _capture_files_safely(
+            tuple((path, f"empty legacy rollback {path.name}") for path in removal_paths),
+            parent_guards=parent_guards,
+        )
+        if any(snapshot.exists for snapshot in observed.values()):
+            raise ReleaseError("empty legacy rollback left transaction-owned residue")
+        if load_managed_state(layout) != _default_state():
+            raise ReleaseError("empty legacy rollback did not restore the default state")
+        if after_remove is not None:
+            after_remove()
+
+    published_receipt: PublicationTransactionReceipt | None = None
+
+    def capture_published(receipt: PublicationTransactionReceipt) -> None:
+        nonlocal published_receipt
+        if after_publication is not None:
+            after_publication(receipt)
+        published_receipt = receipt
+
+    _publish_files_transactionally(
+        tuple(
+            (path, None, current_files[path].mode, f"empty legacy rollback {path.name}")
+            for path in removal_paths
+        ),
+        verify=verify_empty_publication,
+        parent_guards=parent_guards,
+        # Preserve the exact instances that were authenticated above.  Equal
+        # bytes alone are not enough authority to remove a same-name file that
+        # appeared between B verification and the unlink transaction.
+        expected_preimages=current_anchored_files,
+        journal_path=journal_path,
+        before_publish=before_publication,
+        after_publish=capture_published,
+        after_recovery=after_recovery,
+    )
+    if published_receipt is None:  # pragma: no cover - removal set is nonempty
+        raise ReleaseError("empty legacy rollback did not produce an authenticated receipt")
+    return {
+        "ok": True,
+        "target": "legacy-empty",
+        "previous_release_id": current,
+        "state_generation": 0,
+        "service_wrappers": {
+            "ok": True,
+            "release_id": None,
+            "restored": True,
+            "paths": [str(path) for path in publication.expected_paths],
+            # Keep the nested result aligned with the normal combined
+            # publication contract.  Callers which persist the callback
+            # receipt use this duplicate to detect an accidental hand-off to
+            # a different journal before accepting an empty first-install
+            # inverse as their own outer rollback boundary.
+            "publication_receipt": _publication_receipt_summary(published_receipt),
+        },
+        "publication_receipt": _publication_receipt_summary(published_receipt),
+    }
 
 
 def _regular_file_hash(
@@ -2112,91 +8220,154 @@ def _write_release_verification_receipt(
     release_dir: Path,
     verification: Mapping[str, object] | None = None,
     site_manifest: Mapping[str, object] | None = None,
+    *,
+    expected_release_guard: _DirectoryGuard | None = None,
 ) -> dict[str, object]:
     """Persist the result of one complete install-time tree verification.
 
     Launchers consume this immutable, release-bound receipt for a bounded,
     descriptor-directed site check instead of an unbounded recursive walk. The
     full verifier remains authoritative for install, explicit verify, and rollback.
+    Retain the exact final directory ancestry throughout receipt publication;
+    an already valid matching receipt is reused without replacing its inode.
     """
 
     if _RELEASE_ID.fullmatch(release_id) is None:
         raise ReleaseError("release verification release id is unsafe")
+    expected_release = _canonical_publication_path(
+        layout.releases_dir / release_id,
+        label="release verification target",
+    )
+    if _canonical_publication_path(
+        release_dir, label="release verification target"
+    ) != expected_release:
+        raise ReleaseError("release verification target is not the exact managed release")
+    release_anchor = _open_directory_anchor(
+        expected_release,
+        label="release verification target",
+        create_parents=False,
+    )
+    receipt_anchor: _DirectoryAnchor | None = None
     try:
-        releases_root = layout.releases_dir.resolve(strict=True)
-        resolved_release = release_dir.resolve(strict=True)
-        resolved_release.relative_to(releases_root)
-    except OSError as exc:
-        raise ReleaseError(f"could not resolve release verification target: {exc}") from exc
-    except ValueError as exc:
-        raise ReleaseError("release verification target escaped managed releases") from exc
-    manifest_path = resolved_release / "manifest.json"
-    manifest_bytes = _read_regular_file_bytes(
-        manifest_path,
-        label="release verification manifest",
-        maximum_bytes=_MAX_MANIFEST_BYTES,
-    )
-    try:
-        manifest = validate_release_manifest(json.loads(manifest_bytes.decode("utf-8")))
-    except (UnicodeDecodeError, json.JSONDecodeError, BuildIdentityError) as exc:
-        raise ReleaseError(f"release verification manifest is invalid: {exc}") from exc
-    if manifest_bytes != canonical_json_bytes(manifest):
-        raise ReleaseError("release verification manifest is not canonical")
-    if manifest["release_id"] != release_id:
-        raise ReleaseError("release verification manifest release id mismatch")
-    if verification is None or site_manifest is None:
-        verification, site_manifest = _verify_installed_tree_details(resolved_release)
-    validated_site_manifest = _validate_site_manifest(
-        site_manifest,
-        release_id=release_id,
-        wheel_sha256=str(manifest["wheel_sha256"]),
-        installed_members=int(verification.get("installed_members", 0)),
-    )
-    site_manifest_sha256 = sha256_bytes(canonical_json_bytes(validated_site_manifest))
-    if verification.get("site_manifest_sha256") != site_manifest_sha256:
-        raise ReleaseError("release verification site manifest changed after full verification")
-    receipt = _validate_release_verification_receipt(
-        {
-            "schema": _RELEASE_VERIFICATION_SCHEMA,
-            "release_id": release_id,
-            "manifest_sha256": sha256_bytes(manifest_bytes),
-            "wheel_sha256": manifest["wheel_sha256"],
-            "wheel_size": manifest["wheel_size"],
-            "installed_members": verification.get("installed_members"),
-            "installed_directories": verification.get("installed_directories"),
-            "site_directories": len(validated_site_manifest["directories"]),
-            "frozen_directories": verification.get("frozen_directories"),
-            "site_manifest": validated_site_manifest,
-            "site_manifest_sha256": site_manifest_sha256,
-            "method": "full-records-site-manifest-v2",
-        },
-        release_id=release_id,
-        manifest_sha256=sha256_bytes(manifest_bytes),
-        wheel_sha256=str(manifest["wheel_sha256"]),
-        wheel_size=int(manifest["wheel_size"]),
-        frozen_directories=_release_requires_frozen_directories(manifest["build_info"]),
-        site_manifest_sha256=site_manifest_sha256,
-    )
-    receipt_path = _release_verification_path(layout, release_id)
-    if _path_lexists(receipt_path):
-        mode = receipt_path.lstat().st_mode
-        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-            raise ReleaseError("release verification receipt is not a regular file")
-    _atomic_write_bytes(
-        receipt_path,
-        canonical_json_bytes(receipt),
-        mode=0o444,
-    )
-    written = _read_release_verification_receipt(
-        layout,
-        release_id,
-        manifest=manifest,
-        manifest_bytes=manifest_bytes,
-        site_manifest_sha256=site_manifest_sha256,
-    )
-    if written != receipt:
-        raise ReleaseError("release verification receipt changed while being written")
-    return written
+        if expected_release_guard is not None and release_anchor.guard != expected_release_guard:
+            raise ReleaseError("release verification target identity changed after verification")
+        release_anchor.assert_current(phase="before release verification manifest read")
+        manifest_identity = _validate_regular_at(
+            release_anchor, "manifest.json", label="release verification manifest"
+        )
+        manifest_bytes = _read_immutable_file_at(
+            release_anchor.descriptor,
+            "manifest.json",
+            label="release verification manifest",
+            maximum_bytes=_MAX_MANIFEST_BYTES,
+        )
+        try:
+            manifest = validate_release_manifest(json.loads(manifest_bytes.decode("utf-8")))
+        except (UnicodeDecodeError, json.JSONDecodeError, BuildIdentityError) as exc:
+            raise ReleaseError(f"release verification manifest is invalid: {exc}") from exc
+        if manifest_bytes != canonical_json_bytes(manifest):
+            raise ReleaseError("release verification manifest is not canonical")
+        if manifest["release_id"] != release_id:
+            raise ReleaseError("release verification manifest release id mismatch")
+        if verification is None or site_manifest is None:
+            verification, site_manifest = _verify_installed_tree_details(expected_release)
+        release_anchor.assert_current(phase="after full release verification")
+        validated_site_manifest = _validate_site_manifest(
+            site_manifest,
+            release_id=release_id,
+            wheel_sha256=str(manifest["wheel_sha256"]),
+            installed_members=int(verification.get("installed_members", 0)),
+        )
+        site_manifest_sha256 = sha256_bytes(canonical_json_bytes(validated_site_manifest))
+        if verification.get("site_manifest_sha256") != site_manifest_sha256:
+            raise ReleaseError("release verification site manifest changed after full verification")
+        receipt = _validate_release_verification_receipt(
+            {
+                "schema": _RELEASE_VERIFICATION_SCHEMA,
+                "release_id": release_id,
+                "manifest_sha256": sha256_bytes(manifest_bytes),
+                "wheel_sha256": manifest["wheel_sha256"],
+                "wheel_size": manifest["wheel_size"],
+                "installed_members": verification.get("installed_members"),
+                "installed_directories": verification.get("installed_directories"),
+                "site_directories": len(validated_site_manifest["directories"]),
+                "frozen_directories": verification.get("frozen_directories"),
+                "site_manifest": validated_site_manifest,
+                "site_manifest_sha256": site_manifest_sha256,
+                "method": "full-records-site-manifest-v2",
+            },
+            release_id=release_id,
+            manifest_sha256=sha256_bytes(manifest_bytes),
+            wheel_sha256=str(manifest["wheel_sha256"]),
+            wheel_size=int(manifest["wheel_size"]),
+            frozen_directories=_release_requires_frozen_directories(manifest["build_info"]),
+            site_manifest_sha256=site_manifest_sha256,
+        )
+        receipt_bytes = canonical_json_bytes(receipt)
+        receipt_path = _release_verification_path(layout, release_id)
+        receipt_anchor = _open_directory_anchor(
+            receipt_path.parent,
+            label="release verification receipt parent",
+            create_parents=False,
+        )
+        if (
+            receipt_anchor.path != expected_release.parent.parent
+            or receipt_anchor.chain != release_anchor.chain[:-2]
+        ):
+            raise ReleaseError("release verification receipt parent identity changed")
+
+        def assert_current(*, phase: str) -> None:
+            release_anchor.assert_current(phase=phase)
+            receipt_anchor.assert_current(phase=phase)
+            if _validate_regular_at(
+                release_anchor, "manifest.json", label="release verification manifest"
+            ) != manifest_identity:
+                raise ReleaseError("release verification manifest changed after verification")
+
+        def verify_receipt() -> None:
+            assert_current(phase="before release verification receipt read")
+            before = _validate_regular_at(
+                receipt_anchor, receipt_path.name, label="release verification receipt"
+            )
+            observed = _read_immutable_file_at(
+                receipt_anchor.descriptor,
+                receipt_path.name,
+                label="release verification receipt",
+                maximum_bytes=_MAX_RELEASE_VERIFICATION_BYTES,
+            )
+            if observed != receipt_bytes:
+                raise ReleaseError("existing release verification receipt differs from verified release")
+            if _validate_regular_at(
+                receipt_anchor, receipt_path.name, label="release verification receipt"
+            ) != before:
+                raise ReleaseError("release verification receipt changed while being read")
+            assert_current(phase="after release verification receipt read")
+
+        assert_current(phase="before release verification receipt publication")
+        if _validate_regular_at(
+            receipt_anchor, receipt_path.name, label="release verification receipt"
+        ) is not None:
+            # An immutable matching receipt is already authoritative.  Leave
+            # its exact inode intact on reinstall and rollback.
+            verify_receipt()
+            return receipt
+        _publish_files_transactionally(
+            ((receipt_path, receipt_bytes, 0o444, "release verification receipt"),),
+            verify=verify_receipt,
+            before_publish=lambda _receipt: assert_current(
+                phase="immediately before release verification receipt publication"
+            ),
+            parent_guards=_PublicationParentGuards((receipt_anchor.guard,)),
+            expected_preimages={
+                receipt_path: _AnchoredFileSnapshot(_FileSnapshot(False), None)
+            },
+        )
+        assert_current(phase="after release verification receipt publication")
+        return receipt
+    finally:
+        if receipt_anchor is not None:
+            receipt_anchor.close()
+        release_anchor.close()
 
 
 def _release_requires_frozen_directories(
@@ -3241,24 +9412,125 @@ def snapshot_identity(entry):
     )
 
 
-def discard_partial_snapshot(snapshot, descriptor, files, directories):
-    descriptor_root = Path(f"/proc/self/fd/{descriptor}")
+def _snapshot_components(name):
+    path = PurePosixPath(name)
+    if (
+        not name
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise RuntimeError(f"unsafe import snapshot path: {name}")
+    return path.parts
+
+
+def _open_snapshot_parent(descriptor, name):
+    components = _snapshot_components(name)
+    if not components:
+        raise RuntimeError(f"import snapshot path has no leaf: {name}")
+    current = os.dup(descriptor)
     try:
-        for name in sorted(directories, key=lambda value: (value.count("/"), value)):
-            target = descriptor_root if name == "." else descriptor_root.joinpath(*PurePosixPath(name).parts)
+        for component in components[:-1]:
+            child = os.open(component, _directory_open_flags(), dir_fd=current)
+            os.close(current)
+            current = child
+        return current, components[-1]
+    except Exception:
+        os.close(current)
+        raise
+
+
+def _remove_snapshot_file(descriptor, name, expected=None):
+    """Remove one materialized leaf through its retained root descriptor."""
+
+    parent, leaf = _open_snapshot_parent(descriptor, name)
+    file_descriptor = -1
+    try:
+        try:
+            observed = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+            raise RuntimeError(f"import snapshot member is unsafe during cleanup: {name}")
+        observed_identity = snapshot_identity(observed)
+        if expected is not None and observed_identity != expected:
+            raise RuntimeError(f"import snapshot member changed during cleanup: {name}")
+        file_descriptor = os.open(
+            leaf,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent,
+        )
+        if snapshot_identity(os.fstat(file_descriptor)) != observed_identity:
+            raise RuntimeError(f"import snapshot member changed during cleanup: {name}")
+        for _attempt in range(8):
+            disposal = f".termdeck-snapshot-dispose-{os.getpid()}-{uuid.uuid4().hex}"
             try:
-                entry = target.lstat()
-                if not stat.S_ISLNK(entry.st_mode) and stat.S_ISDIR(entry.st_mode):
-                    target.chmod(0o700)
-            except OSError:
-                pass
+                _renameat2(
+                    parent,
+                    leaf,
+                    disposal,
+                    flags=_RENAME_NOREPLACE,
+                    label="import snapshot member cleanup",
+                )
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise RuntimeError(f"could not allocate import snapshot disposal: {name}")
+        if snapshot_identity(os.stat(disposal, dir_fd=parent, follow_symlinks=False)) != observed_identity:
+            raise RuntimeError(f"import snapshot member changed during cleanup: {name}")
+        _unlinkat(parent, disposal, label="import snapshot member cleanup")
+        _fsync_descriptor(parent, label="import snapshot member cleanup parent")
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        os.close(parent)
+
+
+def _remove_snapshot_directory(descriptor, name, expected=None):
+    parent, leaf = _open_snapshot_parent(descriptor, name)
+    try:
+        try:
+            observed = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+            raise RuntimeError(f"import snapshot directory is unsafe during cleanup: {name}")
+        observed_identity = snapshot_identity(observed)
+        if expected is not None and observed_identity != expected:
+            raise RuntimeError(f"import snapshot directory changed during cleanup: {name}")
+        for _attempt in range(8):
+            disposal = f".termdeck-snapshot-dir-dispose-{os.getpid()}-{uuid.uuid4().hex}"
+            try:
+                _renameat2(
+                    parent,
+                    leaf,
+                    disposal,
+                    flags=_RENAME_NOREPLACE,
+                    label="import snapshot directory cleanup",
+                )
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise RuntimeError(f"could not allocate import snapshot directory disposal: {name}")
+        if snapshot_identity(os.stat(disposal, dir_fd=parent, follow_symlinks=False)) != observed_identity:
+            raise RuntimeError(f"import snapshot directory changed during cleanup: {name}")
+        os.rmdir(disposal, dir_fd=parent)
+        _fsync_descriptor(parent, label="import snapshot directory cleanup parent")
+    finally:
+        os.close(parent)
+
+
+def discard_partial_snapshot(snapshot, descriptor, files, directories, identities=None):
+    try:
         for name in reversed(files):
-            target = descriptor_root.joinpath(*PurePosixPath(name).parts)
             try:
-                entry = target.lstat()
-                if not stat.S_ISLNK(entry.st_mode) and stat.S_ISREG(entry.st_mode):
-                    target.unlink()
-            except OSError:
+                _remove_snapshot_file(
+                    descriptor,
+                    name,
+                    None if identities is None else identities.get(name),
+                )
+            except (OSError, RuntimeError):
                 pass
         for name in sorted(
             (value for value in directories if value != "."),
@@ -3266,15 +9538,19 @@ def discard_partial_snapshot(snapshot, descriptor, files, directories):
             reverse=True,
         ):
             try:
-                descriptor_root.joinpath(*PurePosixPath(name).parts).rmdir()
-            except OSError:
+                _remove_snapshot_directory(
+                    descriptor,
+                    name,
+                    None if identities is None else identities.get(name),
+                )
+            except (OSError, RuntimeError):
                 pass
         try:
             named = snapshot.lstat()
             opened = os.fstat(descriptor)
             if snapshot_identity(named) == snapshot_identity(opened):
                 snapshot.rmdir()
-        except OSError:
+        except (OSError, RuntimeError):
             pass
     finally:
         os.close(descriptor)
@@ -3299,15 +9575,15 @@ def cleanup_import_snapshot(snapshot, descriptor, files, directories, identities
             target = descriptor_root if name == "." else descriptor_root.joinpath(*PurePosixPath(name).parts)
             target.chmod(0o700)
         for name in files:
-            descriptor_root.joinpath(*PurePosixPath(name).parts).unlink()
+            _remove_snapshot_file(descriptor, name, identities[name])
         for name in sorted(
             (value for value in directories if value != "."),
             key=lambda value: (value.count("/"), value),
             reverse=True,
         ):
-            descriptor_root.joinpath(*PurePosixPath(name).parts).rmdir()
+            _remove_snapshot_directory(descriptor, name, identities[name])
         snapshot.rmdir()
-    except OSError:
+    except (OSError, RuntimeError):
         pass
     finally:
         os.close(descriptor)
@@ -3428,6 +9704,7 @@ def materialize_import_snapshot(root, release, site_manifest, pinned_members):
     descriptor_root = Path(f"/proc/self/fd/{descriptor}")
     created_directories = ["."]
     created_files = []
+    created_file_identities = {}
     try:
         for name in sorted(
             (value for value in directories if value != "."),
@@ -3457,6 +9734,7 @@ def materialize_import_snapshot(root, release, site_manifest, pinned_members):
             finally:
                 os.close(member_descriptor)
             created_files.append(name)
+            created_file_identities[name] = snapshot_identity(target.lstat())
         for name in sorted(
             created_directories,
             key=lambda value: (value.count("/"), value),
@@ -3482,7 +9760,13 @@ def materialize_import_snapshot(root, release, site_manifest, pinned_members):
             expected_device=release.lstat().st_dev,
         )
     except Exception:
-        discard_partial_snapshot(snapshot, descriptor, created_files, created_directories)
+        discard_partial_snapshot(
+            snapshot,
+            descriptor,
+            created_files,
+            created_directories,
+            created_file_identities,
+        )
         raise
     return snapshot, descriptor, import_root, tuple(files), directories, identities
 
@@ -4803,58 +11087,194 @@ def _verify_release_dir_details(
     return result, site_manifest
 
 
+def _staging_inode(info: os.stat_result) -> tuple[int, int, int]:
+    """Keep staging ownership stable across directory chmod and rename."""
+
+    return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)
+
+
+def _staged_release_guard(
+    parent: _DirectoryAnchor,
+    name: str,
+    descriptor: int,
+    *,
+    phase: str,
+) -> _DirectoryGuard:
+    parent.assert_current(phase=phase)
+    opened = os.fstat(descriptor)
+    named = _lstat_at(parent.descriptor, name, label="staged release directory")
+    if not stat.S_ISDIR(opened.st_mode) or _staging_inode(named) != _staging_inode(opened):
+        raise ReleaseError(f"staged release directory identity changed {phase}")
+    return _DirectoryGuard(
+        parent.path / name,
+        parent.chain + (_directory_identity(opened, label="staged release directory"),),
+    )
+
+
+def _restore_staging_entry(
+    descriptor: int,
+    source: str,
+    destination: str,
+    expected: os.stat_result,
+) -> None:
+    """Restore a displaced entry without overwriting a reoccupied name."""
+
+    observed = _lstat_at(descriptor, source, label="staging restore source")
+    if _staging_inode(observed) != _staging_inode(expected):
+        raise ReleaseError("staging restore source changed; preserving both names")
+    _renameat2(
+        descriptor,
+        source,
+        destination,
+        flags=_RENAME_NOREPLACE,
+        label="staging entry restoration",
+    )
+    restored = _lstat_at(descriptor, destination, label="restored staging entry")
+    if _staging_inode(restored) != _staging_inode(expected):
+        raise ReleaseError("restored staging entry changed; preserving the moved entry")
+    _fsync_descriptor(descriptor, label="restored staging entry parent")
+
+
+def _remove_staging_directory_contents(
+    descriptor: int,
+    *,
+    assert_owned: Callable[[], None],
+) -> None:
+    """Thaw opened directories and dispose children under private relative names.
+
+    Descendants are checked when opened; this is not a creation journal for
+    every extracted member. Unexpected types and observed inode changes are
+    preserved. As with publication cleanup, final unlink/rmdir consumes a
+    freshly randomized private name because Linux has no inode-conditional
+    deletion primitive.
+    """
+
+    assert_owned()
+    with os.scandir(descriptor) as entries:
+        names = [entry.name for entry in entries]
+    os.fchmod(descriptor, 0o700)
+    for name in names:
+        assert_owned()
+        before = _lstat_at(descriptor, name, label="failed staging member")
+        is_directory = stat.S_ISDIR(before.st_mode)
+        if not is_directory and (
+            not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+        ):
+            raise ReleaseError("failed staging tree contains an unexpected member; preserving it")
+        flags = (
+            _directory_open_flags()
+            if is_directory
+            else _file_open_flags() | getattr(os, "O_NONBLOCK", 0)
+        )
+        child_fd = _openat(descriptor, name, flags, label="failed staging member")
+        private_name: str | None = None
+        try:
+            opened = os.fstat(child_fd)
+            if _staging_inode(opened) != _staging_inode(before):
+                raise ReleaseError("failed staging member changed while opening; preserving it")
+            assert_owned()
+            private_name = f".cleanup-{uuid.uuid4().hex}"
+            _renameat2(
+                descriptor,
+                name,
+                private_name,
+                flags=_RENAME_NOREPLACE,
+                label="failed staging member quarantine",
+            )
+            moved = _lstat_at(descriptor, private_name, label="quarantined staging member")
+            if _staging_inode(moved) != _staging_inode(opened):
+                _restore_staging_entry(descriptor, private_name, name, moved)
+                private_name = None
+                raise ReleaseError("failed staging member changed before quarantine; preserving it")
+
+            def assert_child_owned() -> None:
+                assert_owned()
+                current = _lstat_at(descriptor, private_name, label="owned staging member")
+                if _staging_inode(current) != _staging_inode(os.fstat(child_fd)):
+                    raise ReleaseError("quarantined staging member changed; preserving it")
+
+            if is_directory:
+                _remove_staging_directory_contents(child_fd, assert_owned=assert_child_owned)
+                assert_child_owned()
+                os.rmdir(private_name, dir_fd=descriptor)
+            else:
+                current = os.fstat(child_fd)
+                if not _same_renamed_file_identity(
+                    _file_identity(current, label="failed staging member"),
+                    _file_identity(before, label="failed staging member preimage"),
+                ):
+                    raise ReleaseError("failed staging file changed; preserving it")
+                assert_child_owned()
+                _unlinkat(descriptor, private_name, label="failed staging member")
+            private_name = None
+        except BaseException as exc:
+            if private_name is not None:
+                try:
+                    _restore_staging_entry(descriptor, private_name, name, os.fstat(child_fd))
+                except Exception as restore_exc:
+                    exc.add_note(f"staging member was preserved after cleanup failed: {restore_exc}")
+            raise
+        finally:
+            os.close(child_fd)
+    _fsync_descriptor(descriptor, label="cleaned staging directory")
+
+
 def _remove_staging_tree(
     layout: ReleaseLayout,
     stage: Path,
     *,
     release_id: str,
+    parent: _DirectoryAnchor,
+    stage_descriptor: int,
 ) -> None:
-    """Remove only this installer's unique staging path, thawing directories safely."""
+    """Remove a created stage only while its name matches the retained descriptor."""
 
     expected_prefix = f".staging-{release_id}-"
     if stage.parent != layout.releases_dir or not stage.name.startswith(expected_prefix):
         raise ReleaseError(f"refusing to remove an unowned staging path: {stage}")
-    if not _path_lexists(stage):
-        return
-    mode = stage.lstat().st_mode
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-        stage.unlink()
-        _fsync_directory(layout.releases_dir)
-        return
-
-    def walk_error(error: OSError) -> None:
-        raise ReleaseError(f"could not inspect failed staging tree: {error}")
-
-    for current, directories, _files in os.walk(
-        stage,
-        topdown=True,
-        followlinks=False,
-        onerror=walk_error,
-    ):
-        directory = Path(current)
-        entry_mode = directory.lstat().st_mode
-        if stat.S_ISLNK(entry_mode) or not stat.S_ISDIR(entry_mode):
-            raise ReleaseError(f"failed staging tree contains an unsafe directory: {directory}")
-        directory.chmod(0o700)
-        for name in directories:
-            child = directory / name
-            child_mode = child.lstat().st_mode
-            if stat.S_ISLNK(child_mode):
-                continue
-            if not stat.S_ISDIR(child_mode):
-                raise ReleaseError(f"failed staging tree contains a non-directory: {child}")
-            child.chmod(0o700)
+    if parent.path != layout.releases_dir:
+        raise ReleaseError("failed staging parent does not match the managed releases directory")
     try:
-        shutil.rmtree(stage)
-    except OSError as exc:
-        raise ReleaseError(f"could not remove failed staging tree: {stage}: {exc}") from exc
-    _fsync_directory(layout.releases_dir)
+        _staged_release_guard(parent, stage.name, stage_descriptor, phase="before staging cleanup")
+    except FileNotFoundError:
+        return
+    private_name = f".staging-{release_id}-cleanup-{uuid.uuid4().hex}"
+    _renameat2(
+        parent.descriptor,
+        stage.name,
+        private_name,
+        flags=_RENAME_NOREPLACE,
+        label="failed staging tree quarantine",
+    )
+    moved = _lstat_at(parent.descriptor, private_name, label="quarantined staging tree")
+    if _staging_inode(moved) != _staging_inode(os.fstat(stage_descriptor)):
+        _restore_staging_entry(parent.descriptor, private_name, stage.name, moved)
+        raise ReleaseError("failed staging tree changed before quarantine; preserving it")
+
+    def assert_owned() -> None:
+        _staged_release_guard(parent, private_name, stage_descriptor, phase="during staging cleanup")
+
+    try:
+        _remove_staging_directory_contents(stage_descriptor, assert_owned=assert_owned)
+        assert_owned()
+        os.rmdir(private_name, dir_fd=parent.descriptor)
+        parent.fsync(label="removed failed staging tree")
+    except BaseException as exc:
+        try:
+            _restore_staging_entry(
+                parent.descriptor, private_name, stage.name, os.fstat(stage_descriptor)
+            )
+        except Exception as restore_exc:
+            exc.add_note(f"staging tree was preserved after cleanup failed: {restore_exc}")
+        raise
 
 
 def _stage_release(
     layout: ReleaseLayout,
     verified: VerifiedWheel,
     manifest_path: Path,
+    *,
+    capture_release_guard: Callable[[_DirectoryGuard], None] | None = None,
 ) -> Path:
     assert verified.manifest is not None
     _require_production_build(
@@ -4862,24 +11282,75 @@ def _stage_release(
         label="release artifact",
     )
     release_id = str(verified.manifest["release_id"])
-    layout.releases_dir.mkdir(parents=True, exist_ok=True)
+    if _RELEASE_ID.fullmatch(release_id) is None:
+        raise ReleaseError("release id is unsafe")
+    parent = _open_directory_anchor(
+        layout.releases_dir, label="managed releases directory", create_parents=True
+    )
     final = layout.releases_dir / release_id
-    if final.exists():
-        verification, site_manifest = _verify_release_dir_details(layout, release_id)
-        _write_release_verification_receipt(
-            layout,
-            release_id,
-            final,
-            verification,
-            site_manifest,
-        )
-        return final
     stage = layout.releases_dir / f".staging-{release_id}-{os.getpid()}-{uuid.uuid4().hex}"
-    wheel_content = _verified_wheel_bytes(verified)
+    stage_created = False
+    stage_descriptor: int | None = None
     try:
-        stage.mkdir(mode=0o755)
+        try:
+            existing = _lstat_at(parent.descriptor, release_id, label="existing release")
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if not stat.S_ISDIR(existing.st_mode):
+                raise ReleaseError("existing release is not a real directory")
+            try:
+                descriptor = _openat(
+                    parent.descriptor, release_id, _directory_open_flags(), label="existing release"
+                )
+            except OSError as exc:
+                raise ReleaseError(f"could not open existing release as a real directory: {exc}") from exc
+            try:
+                if _staging_inode(existing) != _staging_inode(os.fstat(descriptor)):
+                    raise ReleaseError("existing release changed while opening")
+                guard = _staged_release_guard(
+                    parent, release_id, descriptor, phase="before existing release verification"
+                )
+                verification, site_manifest = _verify_release_dir_details(layout, release_id)
+                if _staged_release_guard(
+                    parent, release_id, descriptor, phase="after existing release verification"
+                ) != guard:
+                    raise ReleaseError("existing release changed while being verified")
+                _write_release_verification_receipt(
+                    layout,
+                    release_id,
+                    final,
+                    verification,
+                    site_manifest,
+                    expected_release_guard=guard,
+                )
+                if _staged_release_guard(
+                    parent, release_id, descriptor, phase="after existing release receipt"
+                ) != guard:
+                    raise ReleaseError("existing release changed while writing its receipt")
+                if capture_release_guard is not None:
+                    capture_release_guard(guard)
+                return final
+            finally:
+                os.close(descriptor)
+        wheel_content = _verified_wheel_bytes(verified)
+        parent.assert_current(phase="before creating release stage")
+        _mkdirat(parent.descriptor, stage.name, mode=0o755, label="release stage")
+        stage_created = True
+        created = _lstat_at(parent.descriptor, stage.name, label="created release stage")
+        stage_descriptor = _openat(
+            parent.descriptor, stage.name, _directory_open_flags(), label="created release stage"
+        )
+        if _staging_inode(created) != _staging_inode(os.fstat(stage_descriptor)):
+            # The opened directory is not proven to be the one we observed
+            # after creation. Never give cleanup ownership of this descriptor.
+            os.close(stage_descriptor)
+            stage_descriptor = None
+            raise ReleaseError("created release stage changed while opening")
+        _staged_release_guard(parent, stage.name, stage_descriptor, phase="before extraction")
         site = stage / "site"
         _extract_verified_wheel(verified, site, content=wheel_content)
+        _staged_release_guard(parent, stage.name, stage_descriptor, phase="after extraction")
         artifacts = stage / "artifacts"
         artifacts.mkdir()
         _atomic_write_bytes(
@@ -4895,22 +11366,68 @@ def _stage_release(
         build_info = verified.manifest.get("build_info")
         if not isinstance(build_info, Mapping):
             raise ReleaseError("verified manifest has no build-info mapping")
+        _staged_release_guard(parent, stage.name, stage_descriptor, phase="before freezing release")
         if _release_requires_frozen_directories(build_info):
             _freeze_release_tree(stage)
+        frozen_guard = _staged_release_guard(
+            parent, stage.name, stage_descriptor, phase="before staged release verification"
+        )
         verification, site_manifest = _verify_installed_tree_details(stage)
-        os.replace(stage, final)
-        _fsync_directory(layout.releases_dir)
+        if _staged_release_guard(
+            parent, stage.name, stage_descriptor, phase="before release publication"
+        ) != frozen_guard:
+            raise ReleaseError("staged release changed while being verified")
+        try:
+            _renameat2(
+                parent.descriptor,
+                stage.name,
+                release_id,
+                flags=_RENAME_NOREPLACE,
+                label="release publication",
+            )
+        except FileExistsError as exc:
+            raise ReleaseError("release destination appeared before staging publication") from exc
+        published = _lstat_at(parent.descriptor, release_id, label="published release")
+        if _staging_inode(published) != _staging_inode(os.fstat(stage_descriptor)):
+            _restore_staging_entry(parent.descriptor, release_id, stage.name, published)
+            raise ReleaseError("release publication source changed; preserving the moved entry")
+        guard = _staged_release_guard(
+            parent, release_id, stage_descriptor, phase="after release publication"
+        )
+        if guard.chain != frozen_guard.chain:
+            raise ReleaseError("published release directory mode changed")
+        parent.fsync(label="published release")
         _write_release_verification_receipt(
             layout,
             release_id,
             final,
             verification,
             site_manifest,
+            expected_release_guard=guard,
         )
-    except Exception:
-        if _path_lexists(stage):
-            _remove_staging_tree(layout, stage, release_id=release_id)
+        if _staged_release_guard(
+            parent, release_id, stage_descriptor, phase="after release receipt"
+        ) != guard:
+            raise ReleaseError("published release changed while writing its receipt")
+        if capture_release_guard is not None:
+            capture_release_guard(guard)
+    except BaseException as exc:
+        if stage_created and stage_descriptor is not None:
+            try:
+                _remove_staging_tree(
+                    layout,
+                    stage,
+                    release_id=release_id,
+                    parent=parent,
+                    stage_descriptor=stage_descriptor,
+                )
+            except Exception as cleanup_exc:
+                exc.add_note(f"failed release stage was preserved: {cleanup_exc}")
         raise
+    finally:
+        if stage_descriptor is not None:
+            os.close(stage_descriptor)
+        parent.close()
     return final
 
 
@@ -4951,6 +11468,9 @@ def install_release(
     python: str | Path | None = None,
     lock_timeout: float = 15.0,
     production: bool | None = None,
+    before_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
+    after_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
+    after_recovery: Callable[[PublicationTransactionReceipt], None] | None = None,
 ) -> dict[str, object]:
     layout = release_layout(root=root, bin_dir=bin_dir)
     production = _resolve_production_intent(layout, production)
@@ -4986,6 +11506,10 @@ def install_release(
         raise ReleaseError(f"Python interpreter is not an executable regular file: {interpreter}")
 
     with release_lock(layout, timeout=lock_timeout):
+        # Resume a prior process's combined wrapper/state intent before any
+        # state-based decision.  This closes first-install's old state=None
+        # ownership gap without asking a caller to infer wrapper provenance.
+        _recover_install_publication_locked(layout)
         state = load_managed_state(layout)
         state_digest = _state_digest(layout.state_path)
         current = state.get("current_release_id")
@@ -5034,8 +11558,33 @@ def install_release(
                 storage_binding,
                 phase="inside the install lock before release mutation",
             )
-        release_dir = _stage_release(layout, verified, manifest_source)
+        release_guards: list[_DirectoryGuard] = []
+        release_dir = _stage_release(
+            layout,
+            verified,
+            manifest_source,
+            capture_release_guard=release_guards.append,
+        )
+        if len(release_guards) != 1 or release_guards[0].path != release_dir:
+            raise ReleaseError("staged release has no exact directory ownership guard")
+        release_guard = release_guards[0]
+
+        def assert_release_current() -> None:
+            anchor = _open_directory_anchor(
+                release_dir,
+                label="selected staged release",
+                create_parents=False,
+            )
+            try:
+                if anchor.guard != release_guard:
+                    raise ReleaseError("staged release directory changed before activation")
+                anchor.assert_current(phase="during staged release handoff")
+            finally:
+                anchor.close()
+
+        assert_release_current()
         _verify_staged_import(release_dir, interpreter)
+        assert_release_current()
         manifest_hash = _regular_file_hash(
             release_dir / "manifest.json",
             label="staged release manifest",
@@ -5053,6 +11602,12 @@ def install_release(
             mode = directory.lstat().st_mode
             if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
                 raise ReleaseError(f"{label} is not a real directory")
+
+        service_wrapper_publication = _prepare_service_wrapper_publication(
+            layout,
+            current_release_id=(str(current) if current is not None else None),
+            target_release_id=release_id,
+        )
 
         bootstrap_hash = _optional_regular_hash(
             layout.bootstrap_path,
@@ -5113,15 +11668,53 @@ def install_release(
             if manage_autostart
             else None
         )
+        autostart_writes, autostart_preimages = _autostart_publication_files(
+            autostart_publication
+        )
+        first_install_preimage = _prepare_first_install_preimage_publication(
+            layout,
+            state,
+            service_wrapper_publication,
+            autostart_publication=autostart_publication,
+        )
+        first_install_receipt = (
+            _first_install_preimage_payload(
+                layout,
+                new_state,
+                service_wrapper_publication,
+                first_install_preimage,
+                autostart_publication=autostart_publication,
+            )
+            if first_install_preimage is not None
+            else None
+        )
         if _state_digest(layout.state_path) != state_digest:
             raise ReleaseError("managed state changed during install; compare-and-swap refused")
 
-        writes: list[tuple[Path, bytes, int, str]] = []
+        writes: list[tuple[Path, bytes | None, int, str]] = []
+        if first_install_preimage is not None:
+            if first_install_receipt is None:  # pragma: no cover - construction invariant
+                raise ReleaseError("first-install preimage receipt is unavailable")
+            writes.append(
+                (
+                    first_install_preimage.receipt_path,
+                    first_install_receipt,
+                    0o600,
+                    "first-install preimage receipt",
+                )
+            )
         if repaired_bootstrap:
             writes.append(
                 (layout.bootstrap_path, expected_bootstrap, 0o755, "managed bootstrap")
             )
+        if repaired_launcher:
+            writes.append(
+                (layout.launcher_path, expected_launcher, 0o755, "t1000 launcher")
+            )
+        writes.extend(autostart_writes)
         if state_needs_update:
+            # The state pointer selects B.  Publish it last so a crash can
+            # never expose B without its durable empty-baseline receipt.
             writes.append(
                 (
                     layout.state_path,
@@ -5130,16 +11723,13 @@ def install_release(
                     "managed state",
                 )
             )
-        if repaired_launcher:
-            writes.append(
-                (layout.launcher_path, expected_launcher, 0o755, "t1000 launcher")
-            )
 
         autostart_verification: dict[str, object] | None = None
 
         def verify_publication() -> None:
             nonlocal storage_attestation
             nonlocal autostart_verification
+            assert_release_current()
             if storage_binding is not None:
                 storage_attestation = _revalidate_managed_storage(
                     layout,
@@ -5155,30 +11745,9 @@ def install_release(
                 verify_release=True,
             )
             if autostart_publication is not None:
-                def finalize_autostart() -> None:
-                    nonlocal storage_attestation
-                    if storage_binding is not None:
-                        storage_attestation = _revalidate_managed_storage(
-                            layout,
-                            storage_binding,
-                            phase="after production autostart publication",
-                        )
-                    final_state = load_managed_state(layout)
-                    if final_state != new_state:
-                        raise ReleaseError(
-                            "managed state changed during production autostart publication"
-                        )
-                    _verify_managed_activation(
-                        layout,
-                        final_state,
-                        verify_release=False,
-                    )
-
-                autostart_verification = _publish_production_autostart(
-                    autostart_publication,
-                    layout=layout,
-                    state=new_state,
-                    finalize=finalize_autostart,
+                autostart_verification = _verify_production_autostart(
+                    layout,
+                    observed_state,
                 )
 
         if storage_binding is not None:
@@ -5187,10 +11756,21 @@ def install_release(
                 storage_binding,
                 phase="immediately before install publication",
             )
-        _publish_files_transactionally(
+        # Wrapper files, their legacy preimage receipt, the desktop pair, and
+        # the state pointer are one descriptor-journaled set.  Do not let the
+        # wrapper API finish and discard its journal before ``state.json``
+        # selects the same generation: an interrupt in that old gap produced
+        # unowned B wrappers on a first install.
+        service_wrapper_result = _publish_install_wrapper_and_activation(
+            service_wrapper_publication,
             writes,
             verify=verify_publication,
-            descriptor_rooted=production,
+            first_install_preimage=first_install_preimage,
+            activation_expected_preimages=autostart_preimages,
+            journal_path=_install_publication_journal_path(layout),
+            before_publication=before_publication,
+            after_publication=after_publication,
+            after_recovery=after_recovery,
         )
 
         result = {
@@ -5202,6 +11782,7 @@ def install_release(
                 or repaired_launcher
                 or state_needs_update
                 or bool(autostart_publication and autostart_publication.repaired)
+                or service_wrapper_publication.repaired
             ),
             "release_id": release_id,
             "previous_release_id": new_state.get("previous_release_id"),
@@ -5211,11 +11792,45 @@ def install_release(
             "state_generation": new_state["generation"],
             "live_processes_restarted": False,
         }
+        result["service_wrappers"] = service_wrapper_result
+        result["publication_receipt"] = service_wrapper_result["publication_receipt"]
         if autostart_verification is not None:
             result["autostart"] = autostart_verification
         if storage_attestation is not None:
             result["storage_attestation"] = storage_attestation.as_dict()
         return result
+
+
+def _autostart_publication_files(
+    publication: _AutostartPublication | None,
+) -> tuple[
+    tuple[tuple[Path, bytes | None, int, str], ...],
+    dict[Path, _FileSnapshot],
+]:
+    """Keep desktop preimages and selecting state in one release journal."""
+
+    if publication is None:
+        return (), {}
+    return (
+        (
+            (
+                publication.descriptor_path,
+                publication.descriptor,
+                0o644,
+                "production autostart descriptor",
+            ),
+            (
+                publication.receipt_path,
+                publication.receipt,
+                0o600,
+                "production autostart receipt",
+            ),
+        ),
+        {
+            publication.descriptor_path: publication.descriptor_preimage,
+            publication.receipt_path: publication.receipt_preimage,
+        },
+    )
 
 
 def rollback_release(
@@ -5226,6 +11841,9 @@ def rollback_release(
     to_legacy: bool = False,
     lock_timeout: float = 15.0,
     production: bool | None = None,
+    before_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
+    after_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
+    after_recovery: Callable[[PublicationTransactionReceipt], None] | None = None,
 ) -> dict[str, object]:
     layout = release_layout(root=root, bin_dir=bin_dir)
     production = _resolve_production_intent(layout, production)
@@ -5242,6 +11860,7 @@ def rollback_release(
     if release_id is not None and to_legacy:
         raise ReleaseError("choose either a managed release or --legacy, not both")
     with release_lock(layout, timeout=lock_timeout):
+        _recover_install_publication_locked(layout)
         state = load_managed_state(layout)
         state_digest = _state_digest(layout.state_path)
         current = state.get("current_release_id")
@@ -5254,8 +11873,53 @@ def rollback_release(
                 phase="inside the rollback lock before release mutation",
             )
 
+        service_wrapper_publication = _prepare_service_wrapper_publication(
+            layout,
+            current_release_id=str(current),
+            target_release_id=str(current),
+        )
+
         if to_legacy:
             legacy = state.get("legacy_launcher")
+            if legacy is None:
+                if _state_digest(layout.state_path) != state_digest:
+                    raise ReleaseError("managed state changed during rollback")
+                if storage_binding is not None:
+                    storage_attestation = _revalidate_managed_storage(
+                        layout,
+                        storage_binding,
+                        phase="immediately before empty legacy rollback publication",
+                    )
+
+                def verify_empty_storage() -> None:
+                    nonlocal storage_attestation
+                    if storage_binding is not None:
+                        storage_attestation = _revalidate_managed_storage(
+                            layout,
+                            storage_binding,
+                            phase="during empty legacy rollback publication",
+                        )
+
+                result = _rollback_first_install_to_empty_legacy(
+                    layout,
+                    state,
+                    service_wrapper_publication,
+                    manage_autostart=manage_autostart,
+                    after_remove=verify_empty_storage,
+                    journal_path=_rollback_publication_journal_path(layout),
+                    before_publication=before_publication,
+                    after_publication=after_publication,
+                    after_recovery=after_recovery,
+                )
+                result.update(
+                    {
+                        "action": "release-rollback",
+                        "live_processes_restarted": False,
+                    }
+                )
+                if storage_attestation is not None:
+                    result["storage_attestation"] = storage_attestation.as_dict()
+                return result
             if not isinstance(legacy, Mapping):
                 raise ReleaseError("no pre-managed launcher was preserved")
             legacy_mode = int(legacy["mode"])
@@ -5300,6 +11964,9 @@ def rollback_release(
                 if manage_autostart
                 else None
             )
+            autostart_writes, autostart_preimages = _autostart_publication_files(
+                autostart_publication
+            )
             if _state_digest(layout.state_path) != state_digest:
                 raise ReleaseError("managed state changed during rollback")
 
@@ -5319,30 +11986,9 @@ def rollback_release(
                     raise ReleaseError("published legacy rollback state differs from transaction")
                 _verify_managed_activation(layout, observed, verify_release=False)
                 if autostart_publication is not None:
-                    def finalize_autostart() -> None:
-                        nonlocal storage_attestation
-                        if storage_binding is not None:
-                            storage_attestation = _revalidate_managed_storage(
-                                layout,
-                                storage_binding,
-                                phase="after legacy rollback autostart publication",
-                            )
-                        final_state = load_managed_state(layout)
-                        if final_state != new_state:
-                            raise ReleaseError(
-                                "managed state changed during legacy rollback autostart publication"
-                            )
-                        _verify_managed_activation(
-                            layout,
-                            final_state,
-                            verify_release=False,
-                        )
-
-                    autostart_verification = _publish_production_autostart(
-                        autostart_publication,
-                        layout=layout,
-                        state=new_state,
-                        finalize=finalize_autostart,
+                    autostart_verification = _verify_production_autostart(
+                        layout,
+                        observed,
                     )
 
             if storage_binding is not None:
@@ -5351,7 +11997,15 @@ def rollback_release(
                     storage_binding,
                     phase="immediately before legacy rollback publication",
                 )
-            _publish_files_transactionally(
+            legacy_wrapper_snapshot = _load_legacy_wrapper_snapshot(
+                service_wrapper_publication
+            )
+            # Keep the legacy wrapper inverse, launcher, desktop pair, and
+            # selecting state in one retained descriptor journal.  Interrupted
+            # publication restores only its exact B preimages, preserving any
+            # foreign winner and keeping the desktop receipt bound to state.
+            service_wrapper_result = _publish_install_wrapper_and_activation(
+                service_wrapper_publication,
                 [
                     (
                         layout.launcher_path,
@@ -5359,6 +12013,7 @@ def rollback_release(
                         legacy_mode,
                         "t1000 launcher",
                     ),
+                    *autostart_writes,
                     (
                         layout.state_path,
                         canonical_json_bytes(new_state),
@@ -5367,7 +12022,14 @@ def rollback_release(
                     ),
                 ],
                 verify=verify_legacy_publication,
-                descriptor_rooted=production,
+                first_install_preimage=None,
+                activation_expected_preimages=autostart_preimages,
+                wrapper_snapshot=legacy_wrapper_snapshot,
+                wrapper_expected_release_id=None,
+                journal_path=_rollback_publication_journal_path(layout),
+                before_publication=before_publication,
+                after_publication=after_publication,
+                after_recovery=after_recovery,
             )
             result = {
                 "ok": True,
@@ -5377,6 +12039,8 @@ def rollback_release(
                 "state_generation": new_state["generation"],
                 "live_processes_restarted": False,
             }
+            result["service_wrappers"] = service_wrapper_result
+            result["publication_receipt"] = service_wrapper_result["publication_receipt"]
             if autostart_verification is not None:
                 result["autostart"] = autostart_verification
             if storage_attestation is not None:
@@ -5442,6 +12106,9 @@ def rollback_release(
             if manage_autostart
             else None
         )
+        autostart_writes, autostart_preimages = _autostart_publication_files(
+            autostart_publication
+        )
         if _state_digest(layout.state_path) != state_digest:
             raise ReleaseError("managed state changed during rollback")
 
@@ -5466,31 +12133,9 @@ def rollback_release(
                 expected_activation=target_activation,
             )
             if autostart_publication is not None:
-                def finalize_autostart() -> None:
-                    nonlocal storage_attestation
-                    if storage_binding is not None:
-                        storage_attestation = _revalidate_managed_storage(
-                            layout,
-                            storage_binding,
-                            phase="after managed rollback autostart publication",
-                        )
-                    final_state = load_managed_state(layout)
-                    if final_state != new_state:
-                        raise ReleaseError(
-                            "managed state changed during managed rollback autostart publication"
-                        )
-                    _verify_managed_activation(
-                        layout,
-                        final_state,
-                        verify_release=False,
-                        expected_activation=target_activation,
-                    )
-
-                autostart_verification = _publish_production_autostart(
-                    autostart_publication,
-                    layout=layout,
-                    state=new_state,
-                    finalize=finalize_autostart,
+                autostart_verification = _verify_production_autostart(
+                    layout,
+                    observed,
                 )
 
         if storage_binding is not None:
@@ -5499,7 +12144,16 @@ def rollback_release(
                 storage_binding,
                 phase="immediately before managed rollback publication",
             )
-        _publish_files_transactionally(
+        # Bind B-to-A wrappers, activation files, desktop pair, and selecting
+        # state in the same descriptor journal so compensation also restores
+        # the desktop receipt to the generation selected by restored state.
+        service_wrapper_publication = _prepare_service_wrapper_publication(
+            layout,
+            current_release_id=str(current),
+            target_release_id=target,
+        )
+        service_wrapper_result = _publish_install_wrapper_and_activation(
+            service_wrapper_publication,
             [
                 (
                     layout.bootstrap_path,
@@ -5508,20 +12162,26 @@ def rollback_release(
                     "managed bootstrap",
                 ),
                 (
-                    layout.state_path,
-                    canonical_json_bytes(new_state),
-                    0o600,
-                    "managed state",
-                ),
-                (
                     layout.launcher_path,
                     target_activation.launcher,
                     0o755,
                     "t1000 launcher",
                 ),
+                *autostart_writes,
+                (
+                    layout.state_path,
+                    canonical_json_bytes(new_state),
+                    0o600,
+                    "managed state",
+                ),
             ],
             verify=verify_managed_publication,
-            descriptor_rooted=production,
+            first_install_preimage=None,
+            activation_expected_preimages=autostart_preimages,
+            journal_path=_rollback_publication_journal_path(layout),
+            before_publication=before_publication,
+            after_publication=after_publication,
+            after_recovery=after_recovery,
         )
         result = {
             "ok": True,
@@ -5532,6 +12192,8 @@ def rollback_release(
             "activation_origin": target_activation.origin,
             "live_processes_restarted": False,
         }
+        result["service_wrappers"] = service_wrapper_result
+        result["publication_receipt"] = service_wrapper_result["publication_receipt"]
         if autostart_verification is not None:
             result["autostart"] = autostart_verification
         if storage_attestation is not None:
@@ -5567,10 +12229,12 @@ def _verify_managed_activation(
 
     current = state.get("current_release_id")
     if current is None:
+        service_wrappers = _verify_service_wrappers(layout, None)
         return {
             "current_release_id": None,
             "launcher_sha256": launcher_hash,
             "legacy": True,
+            "service_wrappers": service_wrappers,
         }
     if not isinstance(current, str) or not _RELEASE_ID.fullmatch(current):
         raise ReleaseError("managed current release id is invalid")
@@ -5637,6 +12301,7 @@ def _verify_managed_activation(
             manifest_bytes=manifest_bytes,
             site_manifest_sha256=str(release["site_manifest_sha256"]),
         )
+    service_wrappers = _verify_service_wrappers(layout, current)
     return {
         "current_release_id": current,
         "python_executable": str(resolved_interpreter),
@@ -5645,6 +12310,7 @@ def _verify_managed_activation(
         "activation_origin": activation.origin,
         "release": release,
         "legacy": False,
+        "service_wrappers": service_wrappers,
     }
 
 

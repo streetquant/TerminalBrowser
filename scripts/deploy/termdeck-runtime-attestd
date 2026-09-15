@@ -1,0 +1,10 @@
+#!/usr/bin/python3 -I
+"""Distro launcher for the root-owned runtime attestation daemon."""
+
+from __future__ import annotations
+
+from termdeck.runtime_attestation import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

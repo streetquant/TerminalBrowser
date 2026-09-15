@@ -1,0 +1,21 @@
+[Unit]
+Description=TermDeck privileged preparer broker request socket
+Documentation=https://github.com/Rebel0789/t1000
+
+[Socket]
+ListenStream=/run/termdeck-preparer-broker/request.sock
+SocketUser=max
+# Omit SocketGroup deliberately.  systemd resolves the group from SocketUser's
+# NSS primary pw_gid; there is no required group named "max" on this host.
+# The broker repeats that numeric primary-gid check before accepting a request.
+SocketMode=0600
+DirectoryMode=0711
+Accept=no
+FileDescriptorName=termdeck-preparer-broker
+Service=termdeck-preparer-broker.service
+Backlog=8
+RemoveOnStop=yes
+FlushPending=yes
+
+[Install]
+WantedBy=sockets.target

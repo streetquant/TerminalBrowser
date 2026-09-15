@@ -1,0 +1,909 @@
+#!/usr/bin/python3 -I
+"""Socket-activated root-to-``termdeck-preparer`` execution boundary.
+
+The max-facing socket is only a one-request rendezvous point.  The broker
+authenticates the caller with Linux ``SO_PEERCRED``, accepts a closed restore
+request containing no path or descriptor, opens one fixed root-owned
+preparer image, drops supplementary groups and then GID/UID, replies once,
+and exits.  The preparer itself opens and validates its five fixed runtime
+sources.  It also creates the canonical receipt and passes that exact O_RDWR
+descriptor to the independent attestation service; neither kind of
+descriptor crosses this max-facing transport.
+
+Production installs this file as ``root:root`` mode 0755.  systemd supplies
+exactly one listening descriptor named ``termdeck-preparer-broker``.  No
+user manager, interactive session, caller environment, arbitrary executable,
+or caller-selected path is involved.
+
+The executable boundary is the separately packaged, root-owned
+``/usr/libexec/termdeck-web-prepare-runtime`` image.  The mutable copy below
+the managed runtime tree is never executed by this broker.
+"""
+
+from __future__ import annotations
+
+import grp
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import socket
+import stat
+import struct
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Callable, Final, Mapping, Sequence
+
+
+REQUEST_SCHEMA: Final = "termdeck.preparer-broker-request.v1"
+RESPONSE_SCHEMA: Final = "termdeck.preparer-broker-response.v1"
+OPERATION_PREPARE: Final = "prepare"
+RESTORE_NONE: Final = "none"
+RESTORE_GENERATION: Final = "generation"
+RESTORE_UNRECEIPTED: Final = "unreceipted"
+RESTORE_VERIFY: Final = "verify"
+SOCKET_FD_NAME: Final = "termdeck-preparer-broker"
+DEFAULT_SOCKET_PATH: Final = Path("/run/termdeck-preparer-broker/request.sock")
+DEFAULT_RUNTIME_ROOT: Final = Path("/warp/runtime/termdeck/termdeck-lan")
+DEFAULT_BROKER: Final = Path("/usr/libexec/termdeck-preparer-broker")
+DEFAULT_PREPARER: Final = Path("/usr/libexec/termdeck-web-prepare-runtime")
+PREPARER_ACCOUNT: Final = "termdeck-preparer"
+CALLER_ACCOUNT: Final = "max"
+MAX_FRAME_BYTES: Final = 16 * 1024
+MAX_REQUEST_BYTES: Final = 4096
+FRAME_HEADER_BYTES: Final = 4
+DEFAULT_REQUEST_TIMEOUT: Final = 8.0
+DEFAULT_PREPARER_TIMEOUT: Final = 180.0
+_GENERATION = re.compile(r"[0-9a-f]{32}\Z")
+_DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_MAX_EXECUTABLE_BYTES = 16 * 1024 * 1024
+_PEER_CREDENTIAL_BYTES = struct.calcsize("3i")
+
+
+class BrokerError(RuntimeError):
+    """The activation, peer, request, or child contract was unsafe."""
+
+
+@dataclass(frozen=True)
+class BrokerConfig:
+    """Fixed deployment bindings, injectable only by offline tests."""
+
+    broker_path: Path = DEFAULT_BROKER
+    preparer_path: Path = DEFAULT_PREPARER
+    runtime_root: Path = DEFAULT_RUNTIME_ROOT
+    socket_path: Path = DEFAULT_SOCKET_PATH
+    preparer_account: str = PREPARER_ACCOUNT
+    caller_account: str = CALLER_ACCOUNT
+    root_uid: int = 0
+    root_gid: int = 0
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT
+    preparer_timeout: float = DEFAULT_PREPARER_TIMEOUT
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.broker_path, "broker path"),
+            (self.preparer_path, "preparer path"),
+            (self.runtime_root, "runtime root"),
+            (self.socket_path, "broker socket path"),
+        ):
+            _absolute_canonical(value, label=label)
+        if (
+            self.broker_path.name != "termdeck-preparer-broker"
+            or self.preparer_path.name != "termdeck-web-prepare-runtime"
+            or self.preparer_path.parent != self.broker_path.parent
+        ):
+            raise BrokerError("broker images must use the fixed libexec layout")
+        if self.runtime_root == self.preparer_path or self.runtime_root in self.preparer_path.parents:
+            raise BrokerError("preparer image may not be inside the mutable runtime tree")
+        if not self.preparer_account or not self.caller_account:
+            raise BrokerError("broker principal names are invalid")
+        if self.preparer_account == self.caller_account:
+            raise BrokerError("broker principals must be distinct")
+        if self.root_uid < 0 or self.root_gid < 0:
+            raise BrokerError("broker root identity is invalid")
+        if not 0 < self.request_timeout <= 60:
+            raise BrokerError("broker request timeout is invalid")
+        if not 0 < self.preparer_timeout <= 900:
+            raise BrokerError("broker preparer timeout is invalid")
+
+
+@dataclass(frozen=True)
+class Principals:
+    preparer_uid: int
+    preparer_gid: int
+    caller_uid: int
+    caller_gid: int
+
+
+@dataclass(frozen=True)
+class PeerCredentials:
+    pid: int
+    uid: int
+    gid: int
+
+
+@dataclass(frozen=True)
+class PrepareRequest:
+    restore_mode: str
+    generation: str | None
+
+    @property
+    def child_arguments(self) -> tuple[str, ...]:
+        if self.restore_mode == RESTORE_NONE:
+            return ()
+        if self.restore_mode == RESTORE_VERIFY:
+            return ("--verify-existing",)
+        if self.restore_mode == RESTORE_UNRECEIPTED:
+            return ("--restore-unreceipted-tls-generation",)
+        assert self.restore_mode == RESTORE_GENERATION
+        assert self.generation is not None
+        return ("--restore-tls-generation", self.generation)
+
+
+@dataclass(frozen=True)
+class FileIdentity:
+    device: int
+    inode: int
+    mode: int
+    links: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    uid: int
+    gid: int
+
+
+def _absolute_canonical(path: Path, *, label: str) -> None:
+    value = os.fspath(path)
+    if (
+        not value
+        or not os.path.isabs(value)
+        or os.path.normpath(value) != value
+        or "//" in value
+    ):
+        raise BrokerError(f"{label} must be an absolute canonical path")
+
+
+def _resolve_principals(config: BrokerConfig) -> Principals:
+    try:
+        preparer = pwd.getpwnam(config.preparer_account)
+        preparer_group = grp.getgrnam(config.preparer_account)
+        caller = pwd.getpwnam(config.caller_account)
+    except (KeyError, OSError) as exc:
+        raise BrokerError("required TermDeck principal is unavailable") from exc
+    try:
+        preparer_uid = int(preparer.pw_uid)
+        preparer_primary_gid = int(preparer.pw_gid)
+        preparer_gid = int(preparer_group.gr_gid)
+        caller_uid = int(caller.pw_uid)
+        caller_gid = int(caller.pw_gid)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise BrokerError("required TermDeck principal identity is malformed") from exc
+    if min(preparer_uid, preparer_primary_gid, preparer_gid, caller_uid, caller_gid) < 0:
+        raise BrokerError("required TermDeck principal identity is invalid")
+    if preparer_primary_gid != preparer_gid:
+        raise BrokerError("termdeck-preparer must use its dedicated primary group")
+    if (
+        preparer_uid in {config.root_uid, caller_uid}
+        or preparer_gid == config.root_gid
+        or caller_uid == config.root_uid
+    ):
+        raise BrokerError("TermDeck broker principals are not separated")
+    try:
+        caller_groups = set(os.getgrouplist(config.caller_account, caller_gid))
+    except (AttributeError, OSError):
+        caller_groups = {caller_gid}
+    try:
+        caller_groups.update(
+            int(group.gr_gid)
+            for group in grp.getgrall()
+            if config.caller_account in group.gr_mem
+        )
+    except (KeyError, OSError, TypeError, ValueError, AttributeError) as exc:
+        raise BrokerError("could not resolve caller supplementary groups") from exc
+    if preparer_gid in caller_groups:
+        raise BrokerError("max may not join termdeck-preparer")
+    return Principals(preparer_uid, preparer_gid, caller_uid, caller_gid)
+
+
+def _assert_root_invoker(config: BrokerConfig) -> None:
+    try:
+        user_ids = tuple(int(value) for value in os.getresuid())
+        group_ids = tuple(int(value) for value in os.getresgid())
+    except (AttributeError, OSError) as exc:
+        raise BrokerError("broker requires Linux saved principal identities") from exc
+    if user_ids != (config.root_uid,) * 3 or group_ids != (config.root_gid,) * 3:
+        raise BrokerError("broker must run as the full root principal")
+
+
+def _regular_identity(info: os.stat_result, *, label: str) -> FileIdentity:
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_ino <= 0
+        or info.st_nlink != 1
+        or info.st_size < 0
+    ):
+        raise BrokerError(f"{label} is not a single-linked regular file")
+    return FileIdentity(
+        int(info.st_dev),
+        int(info.st_ino),
+        stat.S_IMODE(info.st_mode),
+        int(info.st_nlink),
+        int(info.st_size),
+        int(info.st_mtime_ns),
+        int(info.st_ctime_ns),
+        int(info.st_uid),
+        int(info.st_gid),
+    )
+
+
+def _validate_installed_file(
+    path: Path,
+    *,
+    label: str,
+    owner_uid: int,
+    owner_gid: int,
+    mode: int,
+    max_bytes: int,
+) -> FileIdentity:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise BrokerError(f"could not inspect {label}") from exc
+    identity = _regular_identity(info, label=label)
+    if (
+        identity.uid != owner_uid
+        or identity.gid != owner_gid
+        or identity.mode != mode
+        or identity.size <= 0
+        or identity.size > max_bytes
+    ):
+        raise BrokerError(f"{label} ownership, mode, or size is unsafe")
+    return identity
+
+
+def _open_preparer(config: BrokerConfig) -> tuple[int, FileIdentity]:
+    expected = _validate_installed_file(
+        config.preparer_path,
+        label="fixed preparer executable",
+        owner_uid=config.root_uid,
+        owner_gid=config.root_gid,
+        mode=0o755,
+        max_bytes=_MAX_EXECUTABLE_BYTES,
+    )
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise BrokerError("broker requires O_NOFOLLOW")
+    try:
+        descriptor = os.open(
+            config.preparer_path,
+            os.O_RDONLY | os.O_CLOEXEC | nofollow,
+        )
+    except OSError as exc:
+        raise BrokerError("could not open fixed preparer executable") from exc
+    try:
+        observed = _regular_identity(
+            os.fstat(descriptor), label="fixed preparer executable"
+        )
+        if observed != expected:
+            raise BrokerError("fixed preparer executable changed while opening")
+        return descriptor, observed
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def validate_request(value: object) -> PrepareRequest:
+    """Validate the closed request; paths and descriptors have no wire form."""
+
+    if not isinstance(value, dict) or set(value) != {"schema", "operation", "restore"}:
+        raise BrokerError("preparer broker request schema is invalid")
+    if value.get("schema") != REQUEST_SCHEMA or value.get("operation") != OPERATION_PREPARE:
+        raise BrokerError("preparer broker request schema is invalid")
+    restore = value.get("restore")
+    if not isinstance(restore, dict) or set(restore) != {"mode", "generation"}:
+        raise BrokerError("preparer broker restore request is invalid")
+    mode = restore.get("mode")
+    generation = restore.get("generation")
+    if mode == RESTORE_NONE and generation is None:
+        return PrepareRequest(RESTORE_NONE, None)
+    if mode == RESTORE_UNRECEIPTED and generation is None:
+        return PrepareRequest(RESTORE_UNRECEIPTED, None)
+    if mode == RESTORE_VERIFY and generation is None:
+        return PrepareRequest(RESTORE_VERIFY, None)
+    if (
+        mode == RESTORE_GENERATION
+        and isinstance(generation, str)
+        and _GENERATION.fullmatch(generation) is not None
+    ):
+        return PrepareRequest(RESTORE_GENERATION, generation)
+    raise BrokerError("preparer broker restore request is invalid")
+
+
+def _strict_json(content: bytes) -> object:
+    def pairs(values: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in values:
+            if key in result:
+                raise BrokerError("preparer broker request has duplicate fields")
+            result[key] = value
+        return result
+
+    try:
+        text = content.decode("utf-8")
+        value = json.loads(text, object_pairs_hook=pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BrokerError("preparer broker request is not strict JSON") from exc
+    canonical = _canonical_json(value)
+    if content != canonical and content != canonical + b"\n":
+        raise BrokerError("preparer broker request is not canonical JSON")
+    return value
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+def frame(value: object) -> bytes:
+    """Encode the stable bounded protocol used by the managed caller."""
+
+    payload = _canonical_json(value)
+    if not payload or len(payload) > MAX_FRAME_BYTES:
+        raise BrokerError("preparer broker frame size is invalid")
+    return struct.pack("!I", len(payload)) + payload
+
+
+def _receive_exact(connection: socket.socket, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    ancillary_size = socket.CMSG_SPACE(struct.calcsize("8i"))
+    while remaining:
+        try:
+            content, ancillary, flags, _address = connection.recvmsg(
+                remaining,
+                ancillary_size,
+            )
+        except socket.timeout as exc:
+            raise BrokerError("preparer broker request timed out") from exc
+        except OSError as exc:
+            raise BrokerError("could not read preparer broker request") from exc
+        for level, kind, data in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                width = struct.calcsize("i")
+                usable = len(data) - (len(data) % width)
+                if usable:
+                    for descriptor in struct.unpack(
+                        f"{usable // width}i", data[:usable]
+                    ):
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+        if flags & (getattr(socket, "MSG_TRUNC", 0) | getattr(socket, "MSG_CTRUNC", 0)):
+            raise BrokerError("preparer broker request was truncated")
+        if ancillary:
+            raise BrokerError("preparer broker request may not carry descriptors")
+        if not content:
+            raise BrokerError("preparer broker request ended early")
+        chunks.append(content)
+        remaining -= len(content)
+    return b"".join(chunks)
+
+
+def receive_request(connection: socket.socket, *, config: BrokerConfig) -> PrepareRequest:
+    connection.settimeout(config.request_timeout)
+    header = _receive_exact(connection, FRAME_HEADER_BYTES)
+    size = struct.unpack("!I", header)[0]
+    if size <= 0 or size > MAX_REQUEST_BYTES:
+        raise BrokerError("preparer broker frame size is invalid")
+    return validate_request(_strict_json(_receive_exact(connection, size)))
+
+
+def _peer_credentials(connection: socket.socket) -> PeerCredentials:
+    try:
+        raw = connection.getsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_PEERCRED,
+            _PEER_CREDENTIAL_BYTES,
+        )
+    except (AttributeError, OSError) as exc:
+        raise BrokerError("SO_PEERCRED is unavailable") from exc
+    if len(raw) != _PEER_CREDENTIAL_BYTES:
+        raise BrokerError("SO_PEERCRED is malformed")
+    pid, uid, gid = struct.unpack("3i", raw)
+    if pid <= 0 or uid < 0 or gid < 0:
+        raise BrokerError("SO_PEERCRED is invalid")
+    return PeerCredentials(pid, uid, gid)
+
+
+def _assert_peer(peer: PeerCredentials, *, principals: Principals) -> None:
+    if peer.uid != principals.caller_uid:
+        raise BrokerError("preparer broker peer is not max")
+
+
+def _child_environment(config: BrokerConfig) -> dict[str, str]:
+    return {
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "TERMDECK_PREPARER_BROKER": "1",
+        "TERMDECK_RUNTIME_ROOT": str(config.runtime_root),
+    }
+
+
+def run_preparer(
+    request: PrepareRequest,
+    *,
+    config: BrokerConfig,
+    principals: Principals,
+    run_process: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+    capture_output: bool = False,
+) -> int | tuple[int, bytes | None]:
+    """Execute only the fixed image under the dedicated numeric principal."""
+
+    _assert_root_invoker(config)
+    _validate_installed_file(
+        config.broker_path,
+        label="broker image",
+        owner_uid=config.root_uid,
+        owner_gid=config.root_gid,
+        mode=0o755,
+        max_bytes=_MAX_EXECUTABLE_BYTES,
+    )
+    if (
+        principals.preparer_uid in {config.root_uid, principals.caller_uid}
+        or principals.preparer_gid == config.root_gid
+    ):
+        raise BrokerError("termdeck-preparer is not a dedicated non-root principal")
+    executable_descriptor = -1
+    try:
+        executable_descriptor, expected = _open_preparer(config)
+        command = (
+            f"/proc/self/fd/{executable_descriptor}",
+            *request.child_arguments,
+        )
+        try:
+            process_options: dict[str, object] = {
+                "check": False,
+                "close_fds": True,
+                "cwd": "/",
+                "env": _child_environment(config),
+                "extra_groups": (),
+                "group": principals.preparer_gid,
+                "pass_fds": (executable_descriptor,),
+                "restore_signals": True,
+                "start_new_session": True,
+                "stdin": subprocess.DEVNULL,
+                "timeout": config.preparer_timeout,
+                "umask": 0o077,
+                "user": principals.preparer_uid,
+            }
+            if capture_output:
+                process_options.update(
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            result = run_process(
+                command,
+                **process_options,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise BrokerError("fixed TermDeck preparer timed out") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BrokerError("could not execute the fixed TermDeck preparer") from exc
+        if _regular_identity(
+            os.fstat(executable_descriptor), label="fixed preparer executable"
+        ) != expected:
+            raise BrokerError("fixed preparer executable changed during execution")
+        returncode = int(result.returncode)
+        if returncode < 0:
+            normalized = min(255, 128 + abs(returncode))
+        else:
+            normalized = min(255, returncode)
+        if capture_output:
+            output = getattr(result, "stdout", None)
+            if output is None:
+                return normalized, None
+            if isinstance(output, str):
+                output = output.encode("utf-8")
+            if not isinstance(output, bytes) or len(output) > MAX_FRAME_BYTES:
+                raise BrokerError("preparer restore result exceeds its bounded frame")
+            return normalized, output
+        return normalized
+    finally:
+        if executable_descriptor >= 0:
+            os.close(executable_descriptor)
+
+
+def _observe_receipt(
+    config: BrokerConfig,
+    principals: Principals,
+    output: bytes,
+) -> dict[str, object]:
+    """Bind a verified helper result to the fixed producer-owned receipt."""
+
+    if not output or len(output) > MAX_FRAME_BYTES:
+        raise BrokerError("preparer verification result is empty or oversized")
+    parsed = _strict_json(output)
+    if not isinstance(parsed, dict):
+        raise BrokerError("preparer verification result is not an object")
+    runtime_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    leaf_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    if not runtime_flags or not getattr(os, "O_DIRECTORY", 0) or not getattr(os, "O_NOFOLLOW", 0):
+        raise BrokerError("broker receipt observation requires O_DIRECTORY and O_NOFOLLOW")
+    runtime_descriptor = -1
+    receipt_descriptor = -1
+    try:
+        runtime_descriptor = os.open(config.runtime_root, runtime_flags)
+        runtime_info = os.fstat(runtime_descriptor)
+        if (
+            not stat.S_ISDIR(runtime_info.st_mode)
+            or stat.S_IMODE(runtime_info.st_mode) != 0o700
+            or int(runtime_info.st_uid) != principals.preparer_uid
+            or int(runtime_info.st_gid) != principals.preparer_gid
+        ):
+            raise BrokerError("producer runtime parent ownership or mode is unsafe")
+        receipt_descriptor = os.open("build-receipt.json", leaf_flags, dir_fd=runtime_descriptor)
+        receipt_info = os.fstat(receipt_descriptor)
+        named_info = os.stat("build-receipt.json", dir_fd=runtime_descriptor, follow_symlinks=False)
+        receipt_identity = _regular_identity(receipt_info, label="producer runtime receipt")
+        if (
+            receipt_identity != _regular_identity(named_info, label="producer runtime receipt")
+            or receipt_identity.mode != 0o644
+            or receipt_identity.uid != principals.preparer_uid
+            or receipt_identity.gid != principals.preparer_gid
+        ):
+            raise BrokerError("producer runtime receipt ownership, mode, or identity is unsafe")
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(receipt_descriptor, 65536)
+            if not block:
+                break
+            chunks.append(block)
+            if sum(map(len, chunks)) > MAX_FRAME_BYTES:
+                raise BrokerError("producer runtime receipt exceeds its bounded frame")
+        current = b"".join(chunks)
+        if current != output and current != output.rstrip(b"\n") + b"\n":
+            raise BrokerError("producer verification result changed before broker observation")
+        if _strict_json(current) != parsed:
+            raise BrokerError("producer verification result changed before broker observation")
+        publication = parsed.get("runtime_publication")
+        if not isinstance(publication, dict):
+            raise BrokerError("producer runtime receipt publication is invalid")
+        outputs = publication.get("outputs")
+        if not isinstance(outputs, dict) or set(outputs) != {
+            "current-lan-ip",
+            "nginx/allowed-hosts.map",
+        }:
+            raise BrokerError("producer runtime receipt outputs are invalid")
+
+        def output_identity(value: object, *, label: str) -> FileIdentity:
+            if (
+                not isinstance(value, list)
+                or len(value) != 7
+                or any(isinstance(item, bool) or not isinstance(item, int) for item in value)
+            ):
+                raise BrokerError(f"{label} identity is invalid")
+            device, inode, mode, links, size, mtime_ns, ctime_ns = value
+            if (
+                device < 0
+                or inode <= 0
+                or mode != 0o600
+                or links != 1
+                or size < 0
+                or mtime_ns < 0
+                or ctime_ns < 0
+            ):
+                raise BrokerError(f"{label} identity is invalid")
+            return FileIdentity(
+                device,
+                inode,
+                mode,
+                links,
+                size,
+                mtime_ns,
+                ctime_ns,
+                principals.preparer_uid,
+                principals.preparer_gid,
+            )
+
+        def observe_output(relative: str) -> None:
+            claim = outputs.get(relative)
+            if not isinstance(claim, dict) or set(claim) != {
+                "path",
+                "sha256",
+                "mode",
+                "identity",
+            }:
+                raise BrokerError(f"producer runtime output claim is invalid: {relative}")
+            if (
+                claim.get("path") != relative
+                or claim.get("mode") != 0o600
+                or not isinstance(claim.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", claim["sha256"]) is None
+            ):
+                raise BrokerError(f"producer runtime output claim is invalid: {relative}")
+            expected = output_identity(claim.get("identity"), label=relative)
+            pieces = relative.split("/")
+            if len(pieces) == 1:
+                parent_descriptor = runtime_descriptor
+                close_parent = False
+            else:
+                if len(pieces) != 2 or any(
+                    not part or part in {".", ".."} or "/" in part or "\\" in part
+                    for part in pieces
+                ):
+                    raise BrokerError(f"producer runtime output path is invalid: {relative}")
+                parent_descriptor = os.open(pieces[0], runtime_flags, dir_fd=runtime_descriptor)
+                close_parent = True
+            try:
+                parent_info = os.fstat(parent_descriptor)
+                if (
+                    not stat.S_ISDIR(parent_info.st_mode)
+                    or stat.S_IMODE(parent_info.st_mode) != 0o700
+                    or int(parent_info.st_uid) != principals.preparer_uid
+                    or int(parent_info.st_gid) != principals.preparer_gid
+                ):
+                    raise BrokerError(f"producer runtime output parent is unsafe: {relative}")
+                leaf = os.open(pieces[-1], leaf_flags, dir_fd=parent_descriptor)
+                try:
+                    leaf_info = _regular_identity(
+                        os.fstat(leaf), label=f"producer runtime output {relative}"
+                    )
+                    named_leaf = _regular_identity(
+                        os.stat(pieces[-1], dir_fd=parent_descriptor, follow_symlinks=False),
+                        label=f"producer runtime output {relative}",
+                    )
+                    if (
+                        leaf_info != named_leaf
+                        or leaf_info != expected
+                        or leaf_info.uid != principals.preparer_uid
+                        or leaf_info.gid != principals.preparer_gid
+                    ):
+                        raise BrokerError(f"producer runtime output identity changed: {relative}")
+                    content_chunks: list[bytes] = []
+                    while True:
+                        block = os.read(leaf, 65536)
+                        if not block:
+                            break
+                        content_chunks.append(block)
+                        if sum(map(len, content_chunks)) > MAX_FRAME_BYTES:
+                            raise BrokerError(f"producer runtime output is oversized: {relative}")
+                    content = b"".join(content_chunks)
+                    if hashlib.sha256(content).hexdigest() != claim["sha256"]:
+                        raise BrokerError(f"producer runtime output digest changed: {relative}")
+                    after = _regular_identity(
+                        os.fstat(leaf), label=f"producer runtime output {relative}"
+                    )
+                    named_after = _regular_identity(
+                        os.stat(pieces[-1], dir_fd=parent_descriptor, follow_symlinks=False),
+                        label=f"producer runtime output {relative}",
+                    )
+                    if after != leaf_info or named_after != leaf_info:
+                        raise BrokerError(f"producer runtime output changed while observing: {relative}")
+                finally:
+                    os.close(leaf)
+            finally:
+                if close_parent:
+                    os.close(parent_descriptor)
+
+        observe_output("current-lan-ip")
+        observe_output("nginx/allowed-hosts.map")
+        observed_after = _regular_identity(
+            os.fstat(receipt_descriptor), label="producer runtime receipt"
+        )
+        named_after = _regular_identity(
+            os.stat("build-receipt.json", dir_fd=runtime_descriptor, follow_symlinks=False),
+            label="producer runtime receipt",
+        )
+        if observed_after != receipt_identity or named_after != receipt_identity:
+            raise BrokerError("producer runtime receipt changed while observing")
+        return {
+            "identity": [
+                receipt_identity.device,
+                receipt_identity.inode,
+                receipt_identity.mode,
+                receipt_identity.links,
+                receipt_identity.size,
+                receipt_identity.mtime_ns,
+                receipt_identity.ctime_ns,
+            ],
+            "receipt": parsed,
+            "sha256": hashlib.sha256(current).hexdigest(),
+        }
+    except OSError as exc:
+        raise BrokerError("producer runtime receipt could not be observed") from exc
+    finally:
+        if receipt_descriptor >= 0:
+            os.close(receipt_descriptor)
+        if runtime_descriptor >= 0:
+            os.close(runtime_descriptor)
+
+
+def _response(
+    *,
+    returncode: int | None,
+    error: str | None,
+    result: object | None = None,
+) -> dict[str, object]:
+    response = {
+        "error": error,
+        "ok": error is None and returncode == 0,
+        "returncode": returncode,
+        "schema": RESPONSE_SCHEMA,
+    }
+    if result is not None:
+        response["result"] = result
+    return response
+
+
+def _send_response(connection: socket.socket, value: Mapping[str, object]) -> None:
+    try:
+        connection.sendall(frame(dict(value)))
+    except (OSError, socket.timeout) as exc:
+        raise BrokerError("could not send preparer broker response") from exc
+
+
+def _validate_listener(listener: socket.socket, *, config: BrokerConfig) -> None:
+    try:
+        family = listener.family
+        kind = listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+        accepting = listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+        address = listener.getsockname()
+    except OSError as exc:
+        raise BrokerError("could not inspect socket-activation listener") from exc
+    if (
+        family != socket.AF_UNIX
+        or kind != socket.SOCK_STREAM
+        or accepting != 1
+        or not isinstance(address, str)
+        or address != str(config.socket_path)
+    ):
+        raise BrokerError("socket-activation listener does not match the fixed endpoint")
+
+
+def _validate_socket_path(config: BrokerConfig, principals: Principals) -> None:
+    try:
+        info = config.socket_path.lstat()
+    except OSError as exc:
+        raise BrokerError("could not inspect socket-activation endpoint") from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISSOCK(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or int(info.st_uid) != principals.caller_uid
+        or int(info.st_gid) != principals.caller_gid
+    ):
+        raise BrokerError("socket-activation endpoint ownership or mode is unsafe")
+
+
+def activation_listener(
+    *,
+    config: BrokerConfig,
+    environ: Mapping[str, str] | None = None,
+    process_id: int | None = None,
+    descriptor: int = 3,
+) -> socket.socket:
+    """Consume exactly one systemd-named listener; arguments cannot select it."""
+
+    environment = os.environ if environ is None else environ
+    expected_pid = os.getpid() if process_id is None else process_id
+    supplied_pid = environment.get("LISTEN_PID")
+    if (
+        supplied_pid is None
+        or _DECIMAL.fullmatch(supplied_pid) is None
+        or int(supplied_pid) != expected_pid
+        or environment.get("LISTEN_FDS") != "1"
+        or environment.get("LISTEN_FDNAMES") != SOCKET_FD_NAME
+        or descriptor < 3
+    ):
+        raise BrokerError("broker requires one exact systemd activation descriptor")
+    listener: socket.socket | None = None
+    try:
+        listener = socket.socket(fileno=descriptor)
+        listener.set_inheritable(False)
+        _validate_listener(listener, config=config)
+        return listener
+    except BaseException:
+        if listener is not None:
+            listener.close()
+        raise
+
+
+def serve_once(
+    listener: socket.socket,
+    *,
+    config: BrokerConfig,
+    resolve_principals: Callable[[BrokerConfig], Principals] = _resolve_principals,
+    peer_credentials: Callable[[socket.socket], PeerCredentials] = _peer_credentials,
+    run_process: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+) -> int:
+    """Accept, authenticate, process, reply, and return after one connection."""
+
+    _assert_root_invoker(config)
+    principals = resolve_principals(config)
+    _validate_listener(listener, config=config)
+    _validate_socket_path(config, principals)
+    listener.settimeout(config.request_timeout)
+    try:
+        connection, _address = listener.accept()
+    except socket.timeout as exc:
+        raise BrokerError("preparer broker activation timed out") from exc
+    except OSError as exc:
+        raise BrokerError("could not accept preparer broker request") from exc
+    with connection:
+        connection.settimeout(config.request_timeout)
+        try:
+            _assert_peer(peer_credentials(connection), principals=principals)
+            request = receive_request(connection, config=config)
+            child_result = run_preparer(
+                request,
+                config=config,
+                principals=principals,
+                run_process=run_process,
+                capture_output=request.restore_mode != RESTORE_NONE,
+            )
+            if isinstance(child_result, tuple):
+                returncode, output = child_result
+                if returncode == 0 and output is not None:
+                    if request.restore_mode == RESTORE_VERIFY:
+                        result = _observe_receipt(config, principals, output)
+                    else:
+                        try:
+                            result = _strict_json(output)
+                        except BrokerError:
+                            raise BrokerError("preparer restore result is not canonical JSON")
+                        if not isinstance(result, dict):
+                            raise BrokerError("preparer restore result is not an object")
+                else:
+                    result = None
+            else:
+                returncode, result = child_result, None
+            if returncode == 0:
+                response = _response(returncode=0, error=None, result=result)
+            else:
+                response = _response(returncode=returncode, error="preparer-failed")
+        except BrokerError as exc:
+            if "timed out" in str(exc):
+                response = _response(returncode=None, error="timeout")
+            else:
+                response = _response(returncode=None, error="request-refused")
+        _send_response(connection, response)
+        return 0 if response["ok"] is True else 1
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = tuple(sys.argv[1:] if argv is None else argv)
+    if arguments:
+        sys.stderr.write("TermDeck preparer broker refused: arguments are not allowed\n")
+        return 2
+    config = BrokerConfig()
+    listener: socket.socket | None = None
+    try:
+        listener = activation_listener(config=config)
+        return serve_once(listener, config=config)
+    except BrokerError as exc:
+        sys.stderr.write(f"TermDeck preparer broker refused: {exc}\n")
+        return 2
+    finally:
+        if listener is not None:
+            listener.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
