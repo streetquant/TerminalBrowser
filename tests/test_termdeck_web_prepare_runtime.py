@@ -37,9 +37,11 @@ def _make_layout(tmp_path: Path) -> RuntimeLayout:
     tls.mkdir(parents=True)
     nginx.mkdir()
     binaries.mkdir()
-    (nginx / "nginx.conf").write_text(
+    nginx_conf = nginx / "nginx.conf"
+    nginx_conf.write_text(
         "server {\n    listen 0.0.0.0:7443 ssl;\n}\n", encoding="utf-8"
     )
+    nginx_conf.chmod(0o644)
     server = binaries / "termdeck-web-server"
     server.write_bytes(b"TermDeck test web server\n")
     server.chmod(0o755)
@@ -1871,46 +1873,86 @@ def test_prepare_runtime_restores_authenticated_prior_tls_generation(tmp_path: P
     assert json.loads(retried.stdout) == result
 
 
-def _tls_post_exchange_pre_receipt_kill_environment(tmp_path: Path, layout: RuntimeLayout) -> dict[str, str]:
-    """Kill the final publisher after B is complete but before its receipt."""
+def _tls_post_receipt_publication_failure_environment(
+    tmp_path: Path, layout: RuntimeLayout
+) -> dict[str, str]:
+    """Fail after the sealed B receipt rename while its owned stage is bound."""
     return _hook_environment(
         tmp_path,
         f"""
+import errno
+import json
 import os
-import signal
+import stat
 import sys
 
 runtime = {str(layout.runtime)!r}
 original_fsync = os.fsync
 injected = False
 
+def _is_runtime_parent(descriptor):
+    try:
+        descriptor_path = os.readlink(f"/proc/self/fd/{{descriptor}}")
+        descriptor_stat = os.fstat(descriptor)
+        runtime_stat = os.stat(runtime, follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        descriptor_path == runtime
+        and stat.S_ISDIR(descriptor_stat.st_mode)
+        and stat.S_ISDIR(runtime_stat.st_mode)
+        and descriptor_stat.st_dev == runtime_stat.st_dev
+        and descriptor_stat.st_ino == runtime_stat.st_ino
+        and stat.S_IMODE(descriptor_stat.st_mode) == stat.S_IMODE(runtime_stat.st_mode)
+    )
+
+def _sealed_public_receipt():
+    receipt_path = os.path.join(runtime, "build-receipt.json")
+    try:
+        receipt_stat = os.lstat(receipt_path)
+        if (
+            stat.S_ISLNK(receipt_stat.st_mode)
+            or not stat.S_ISREG(receipt_stat.st_mode)
+            or stat.S_IMODE(receipt_stat.st_mode) != 0o644
+            or receipt_stat.st_nlink != 1
+        ):
+            return False
+        with open(receipt_path, "rb") as stream:
+            value = json.load(stream)
+    except OSError:
+        return False
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(value, dict):
+        return False
+    publication = value.get("runtime_publication")
+    return (
+        value.get("schema") == "termdeck.lan-runtime-build.v2"
+        and value.get("ok") is True
+        and "producer_attestation" not in value
+        and "producer_commitment" not in value
+        and isinstance(publication, dict)
+        and set(publication) == {{"generation", "outputs"}}
+        and isinstance(publication.get("generation"), str)
+        and set(publication.get("outputs", {{}}))
+        == {{"current-lan-ip", "nginx/allowed-hosts.map"}}
+        and os.path.isfile(os.path.join(runtime, "current-lan-ip"))
+        and os.path.isfile(os.path.join(runtime, "nginx", "allowed-hosts.map"))
+    )
+
 def fsync(descriptor):
     global injected
-    try:
-        path = os.readlink(f"/proc/self/fd/{{descriptor}}")
-    except OSError:
-        path = ""
-    journals = [
-        name for name in os.listdir(runtime)
-        if (
-            name.startswith(".termdeck-tls-transaction-")
-            and os.path.isfile(os.path.join(runtime, name, "complete"))
-            and os.path.isdir(os.path.join(runtime, name, "prior-tls"))
-            and os.path.isfile(os.path.join(runtime, name, "prior-build-receipt.json"))
-        )
-    ] if os.path.isdir(runtime) else []
     if (
         not injected
-        # This is the final runtime-publisher Python helper, after the TLS
-        # helper has completed B and invalidated A's receipt.
         and len(sys.argv) == 5
         and sys.argv[1] == runtime
-        and not os.path.exists(os.path.join(runtime, "build-receipt.json"))
-        and len(journals) == 1
+        and _is_runtime_parent(descriptor)
+        and _sealed_public_receipt()
     ):
         injected = True
         original_fsync(descriptor)
-        os.kill(os.getpid(), signal.SIGKILL)
+        _record_runtime_fault("post-receipt-publication")
+        raise OSError(errno.EIO, "injected post-receipt publication failure")
     return original_fsync(descriptor)
 
 os.fsync = fsync
@@ -1928,9 +1970,12 @@ def test_prepare_runtime_discovers_unreceipted_tls_generation_for_outer_rollback
     }
     _set_fake_ip(layout, "192.168.50.10")
 
-    crashed = _run(layout, _tls_post_exchange_pre_receipt_kill_environment(tmp_path, layout))
+    environment = _tls_post_receipt_publication_failure_environment(tmp_path, layout)
+    crashed = _run(layout, environment)
 
-    assert crashed.returncode in {-signal.SIGKILL, 128 + signal.SIGKILL}
+    _assert_runtime_fault(environment, "post-receipt-publication")
+    assert crashed.returncode != 0
+    assert "injected post-receipt publication failure" in crashed.stderr
     assert not (layout.runtime / "build-receipt.json").exists()
     journals = [
         journal
@@ -1941,6 +1986,21 @@ def test_prepare_runtime_discovers_unreceipted_tls_generation_for_outer_rollback
     ]
     assert len(journals) == 1
     journal = journals[0]
+    failed_transactions = [
+        stage
+        for stage in layout.runtime.glob(".termdeck-runtime-transaction-*")
+        if (stage / "prior").is_file()
+    ]
+    assert len(failed_transactions) == 1
+    failed_receipt = json.loads((failed_transactions[0] / "prior").read_text(encoding="utf-8"))
+    failed_prior = failed_receipt["tls_publication"]["prior"]
+    assert failed_prior["journal"] == journal.name
+    assert tuple(failed_prior["journal_identity"]) == (
+        journal.stat().st_dev,
+        journal.stat().st_ino,
+        stat.S_IMODE(journal.stat().st_mode),
+        journal.stat().st_uid,
+    )
 
     restored = _run(layout, arguments=["--restore-unreceipted-tls-generation"])
 
@@ -2517,8 +2577,11 @@ def test_prepare_runtime_restores_authenticated_generation_without_network(
     }
     _set_fake_ip(layout, "192.168.50.10")
     if unreceipted:
-        rotated = _run(layout, _tls_post_exchange_pre_receipt_kill_environment(tmp_path, layout))
-        assert rotated.returncode in {-signal.SIGKILL, 128 + signal.SIGKILL}
+        environment = _tls_post_receipt_publication_failure_environment(tmp_path, layout)
+        rotated = _run(layout, environment)
+        _assert_runtime_fault(environment, "post-receipt-publication")
+        assert rotated.returncode != 0
+        assert "injected post-receipt publication failure" in rotated.stderr
         assert not (layout.runtime / "build-receipt.json").exists()
         arguments = ["--restore-unreceipted-tls-generation"]
     else:
@@ -2557,7 +2620,7 @@ def test_prepare_runtime_requires_binary_directory_before_changing_modes(tmp_pat
     }
 
     result = _run(
-        RuntimeLayout(layout.root, layout.runtime, direct_script),
+        RuntimeLayout(layout.root, layout.runtime, direct_script, layout.attest_helper),
         {"TERMDECK_RUNTIME_ROOT": str(layout.runtime)},
     )
 

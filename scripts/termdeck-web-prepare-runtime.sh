@@ -4706,9 +4706,13 @@ def completed_unreceipted_inverse_generation(context: Context, control_key: byte
     public, so rejecting every public receipt would make a harmless replay
     strand the retained B generation.  This recognises only the exact durable
     topology produced by the unreceipted branch: a completed forward journal,
-    a completed inverse, no retained B receipt, retained A receipt, current A
-    TLS, and retained B TLS.  The normal restore routine re-validates every
-    receipt/output identity before returning it to the caller.
+    a completed inverse, retained A receipt, current A TLS, and retained B
+    TLS.  A failed runtime finalization may retain an unsigned B core under
+    ``rollback-prior-build-receipt.json``; an authenticated B receipt instead
+    identifies an ordinary explicit inverse and is skipped.  The unsigned
+    core is checked against the journal's exact TLS and output postimages, and
+    the normal restore routine re-validates every receipt/output identity
+    before returning it to the caller.
     """
     try:
         names = tuple(os.listdir(context.runtime.descriptor))
@@ -4735,10 +4739,52 @@ def completed_unreceipted_inverse_generation(context: Context, control_key: byte
                 and marker_present(journal, _ROLLBACK_COMPLETE, b"rollback-complete\n", control_key)
             ):
                 continue
-            if safe_leaf(journal.descriptor, _ROLLBACK_PRIOR_RECEIPT, label=f"TLS journal {_ROLLBACK_PRIOR_RECEIPT}") is not None:
-                # A B receipt was public when the inverse began, so this is a
-                # normal explicit restore, never an unreceipted discovery.
-                continue
+            rollback_receipt = safe_leaf(
+                journal.descriptor,
+                _ROLLBACK_PRIOR_RECEIPT,
+                label=f"TLS journal {_ROLLBACK_PRIOR_RECEIPT}",
+                required_mode=0o644,
+            )
+            if rollback_receipt is not None:
+                b_receipt, _b_receipt_identity, b_outputs, b_publication = read_authenticated_runtime_receipt(
+                    journal,
+                    _ROLLBACK_PRIOR_RECEIPT,
+                    control_key,
+                    label=f"TLS journal {_ROLLBACK_PRIOR_RECEIPT}",
+                    allow_unattested=True,
+                )
+                b_current = b_publication["current"]
+                b_prior = b_publication["prior"]
+                assert isinstance(b_current, dict)
+                if (
+                    b_publication["generation"] != generation
+                    or tuple(b_current["identity"]) != candidate_identity
+                    or not isinstance(b_prior, dict)
+                    or b_prior.get("journal") != journal.name
+                    or tuple(b_prior.get("journal_identity", ())) != journal.identity
+                    or b_prior.get("path") != _PRIOR_TLS
+                    or tuple(b_prior.get("identity", ())) != old_identity
+                ):
+                    raise fail("retained B receipt does not bind the completed TLS inverse")
+                if "producer_attestation" in b_receipt or "producer_commitment" in b_receipt:
+                    # An authenticated B receipt identifies a normal explicit
+                    # inverse.  Discovery must never replay that candidate.
+                    continue
+                b_outputs = runtime_output_expectations(b_receipt)
+                for path, retained_name in (
+                    ("current-lan-ip", _PRIOR_CURRENT),
+                    ("nginx/allowed-hosts.map", _PRIOR_HOSTS),
+                ):
+                    expected, digest = b_outputs[path]
+                    if not leaf_matches(
+                        journal,
+                        retained_name,
+                        expected,
+                        digest,
+                        label=f"TLS journal {retained_name}",
+                        allow_renamed=True,
+                    ):
+                        raise fail(f"retained B {path} does not match its receipt")
             if safe_leaf(journal.descriptor, _PRIOR_RECEIPT, label=f"TLS journal {_PRIOR_RECEIPT}", required_mode=0o644) is None:
                 raise fail("completed unreceipted TLS inverse lost its retained A receipt")
             if (
