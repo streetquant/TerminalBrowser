@@ -582,6 +582,20 @@ def _write_all(descriptor: int, content: bytes) -> None:
         view = view[written:]
 
 
+def _write_journal_all(descriptor: int, content: bytes) -> None:
+    """Write a journal frame without sharing the receipt fault boundary."""
+
+    view = memoryview(content)
+    while view:
+        try:
+            written = os.write(descriptor, view)
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise ReceiptStateError("receipt journal write failed")
+        view = view[written:]
+
+
 def _assert_canonical_parent(
     descriptor: int,
     expected: DirectoryIdentity,
@@ -874,7 +888,7 @@ class ReceiptFinalizer:
                 identity=expected,
                 core=core,
             )
-            _write_all(descriptor, content)
+            _write_journal_all(descriptor, content)
             os.fsync(descriptor)
             observed = _identity(os.fstat(descriptor))
             named = _identity(
@@ -944,7 +958,7 @@ class ReceiptFinalizer:
         try:
             os.ftruncate(self._journal_descriptor, 0)
             os.lseek(self._journal_descriptor, 0, os.SEEK_SET)
-            _write_all(self._journal_descriptor, content)
+            _write_journal_all(self._journal_descriptor, content)
             os.fsync(self._journal_descriptor)
             updated = _identity(os.fstat(self._journal_descriptor))
             named = _identity(

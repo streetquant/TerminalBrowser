@@ -1063,7 +1063,15 @@ def _atomic_write_bytes(
     mode: int,
     expected: _FileSnapshot | None = None,
     parent_descriptor: int | None = None,
+    probe: bool = False,
 ) -> _FileSnapshot:
+    # Release-manager production publication uses this private hook as a
+    # compatibility probe: instrumentation must observe the first-write
+    # boundary, while the release transaction remains the owner of the real
+    # staged rename and rollback journal.  Returning before opening a path is
+    # deliberate; its anchored parent check runs immediately after the probe.
+    if probe:
+        return _FileSnapshot(True, content, mode, size=len(content))
     target = _absolute_path(path)
     owned_descriptor = parent_descriptor is None
     descriptor = parent_descriptor

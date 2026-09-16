@@ -347,6 +347,8 @@ _ROLLBACK_PRIOR_RECEIPT = "rollback-prior-build-receipt.json"
 _ROLLBACK_PRIOR_CURRENT = "rollback-prior-current-lan-ip"
 _ROLLBACK_PRIOR_HOSTS = "rollback-prior-allowed-hosts.map"
 _ROLLBACK_RESTORED_RECEIPT = "rollback-restored-build-receipt.json"
+_ROLLBACK_RESTORED_RECEIPT_STAGING_PREFIX = "rollback-restored-build-receipt.json.staging-"
+_RUNTIME_TRANSACTION_PREFIX = ".termdeck-runtime-transaction-"
 _RUNTIME_RECEIPT_SCHEMA = "termdeck.lan-runtime-build.v2"
 _RUNTIME_RECEIPT_DOMAIN = b"termdeck.lan-runtime-build.v2\x00"
 _ATTEST_HELPER = "/usr/libexec/termdeck-preparer-state"
@@ -2965,6 +2967,7 @@ def read_authenticated_runtime_receipt(
     control_key: bytes,
     *,
     label: str,
+    allow_unattested: bool = False,
 ) -> tuple[
     dict[str, object],
     tuple[int, int, int, int, int, int, int],
@@ -2986,7 +2989,10 @@ def read_authenticated_runtime_receipt(
     if opened != identity:
         raise fail(f"{label} changed while reading")
     try:
-        receipt = receipt_file_contract(json.loads(raw.decode("utf-8")))
+        receipt = receipt_file_contract(
+            json.loads(raw.decode("utf-8")),
+            allow_unsigned=allow_unattested,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise fail(f"{label} is not a managed TermDeck runtime receipt", exc) from exc
     if isinstance(parent, Anchor):
@@ -3004,7 +3010,7 @@ def read_authenticated_runtime_receipt(
             or tuple(attested_identity[:4]) != identity[:4]
         ):
             raise fail(f"{label} does not match its attested receipt identity")
-    else:
+    elif "producer_commitment" in receipt:
         commitment = producer_commitment(receipt)
         immutable = receipt_immutable_identity(commitment["receipt_identity"])
         if identity[:4] != immutable:
@@ -3013,6 +3019,8 @@ def read_authenticated_runtime_receipt(
         assert isinstance(mac, str)
         if not hmac.compare_digest(mac, producer_commitment_mac(control_key, receipt, commitment)):
             raise fail(f"{label} producer commitment authentication failed")
+    elif not allow_unattested:
+        raise fail(f"{label} lacks a producer attestation")
     outputs = runtime_output_expectations(receipt)
     publication = tls_publication_contract(receipt["tls_publication"])
     return receipt, identity, outputs, publication
@@ -3037,6 +3045,175 @@ def leaf_matches(
     ):
         raise fail(f"{label} changed while verifying its committed postimage")
     return True
+
+
+def adopt_failed_runtime_receipt(
+    context: Context,
+    journal: PrivateDir,
+    intent: dict[str, object],
+    control_key: bytes,
+) -> bool:
+    """Bind the failed B receipt to the TLS journal before inverse recovery.
+
+    Runtime publication retains an attestation target in a private
+    ``.termdeck-runtime-transaction-*`` directory when finalization fails.
+    The TLS inverse must consume that exact inode through descriptors; a
+    pathname or a newly copied receipt would allow a replayed B generation to
+    steer rollback.  Failed receipts may still be unsigned because the
+    attestor refused them, so their TLS and output provenance is checked here
+    and the normal inverse validates the A/B leaf topology afterward.
+    """
+    generation = intent["id"]
+    candidate_identity = intent["candidate_identity"]
+    old_identity = intent["tls_previous"]
+    assert isinstance(generation, str)
+    assert isinstance(candidate_identity, tuple)
+    assert isinstance(old_identity, tuple)
+    existing = safe_leaf(
+        journal.descriptor,
+        _ROLLBACK_PRIOR_RECEIPT,
+        label=f"TLS journal {_ROLLBACK_PRIOR_RECEIPT}",
+        required_mode=0o644,
+    )
+    try:
+        names = tuple(os.listdir(context.runtime.descriptor))
+    except OSError as exc:
+        raise fail("could not enumerate failed runtime receipt transactions", exc) from exc
+    matched = False
+    adopted = False
+    for name in names:
+        if re.fullmatch(re.escape(_RUNTIME_TRANSACTION_PREFIX) + r"[0-9a-f]{32}", name) is None:
+            continue
+        stage = open_private_dir(context.runtime, name, label="failed runtime receipt transaction")
+        try:
+            stage_identity = safe_leaf(
+                stage.descriptor,
+                "prior",
+                label="failed runtime receipt transaction receipt",
+                required_mode=0o644,
+            )
+            if stage_identity is None:
+                continue
+            try:
+                b_receipt, b_identity, b_outputs, b_publication = read_authenticated_runtime_receipt(
+                    stage,
+                    "prior",
+                    control_key,
+                    label="failed runtime receipt transaction receipt",
+                    allow_unattested=True,
+                )
+            except TlsError:
+                # A retained partial or malformed attestation postimage is
+                # still evidence, but it cannot authorize a B generation.
+                # Leave it private and let the caller fail closed if no other
+                # bound transaction can prove the rollback.
+                continue
+            current = b_publication["current"]
+            prior = b_publication["prior"]
+            assert isinstance(current, dict)
+            if (
+                b_publication["generation"] != generation
+                or tuple(current["identity"]) != candidate_identity
+                or not isinstance(prior, dict)
+                or prior.get("journal") != journal.name
+                or tuple(prior.get("journal_identity", ())) != journal.identity
+                or prior.get("path") != _PRIOR_TLS
+                or tuple(prior.get("identity", ())) != old_identity
+            ):
+                continue
+            if matched:
+                raise fail("multiple failed runtime receipts bind the current TLS generation")
+            matched = True
+            # The output postimages are part of the unsigned B core, but the
+            # live leaves must still be exactly those postimages before any
+            # inverse mutation.  This also prevents adopting an old private
+            # transaction whose receipt happens to name the current journal.
+            for path, parent, leaf in (
+                ("current-lan-ip", context.runtime, "current-lan-ip"),
+                ("nginx/allowed-hosts.map", context.nginx, "allowed-hosts.map"),
+            ):
+                expected, digest = b_outputs[path]
+                if not leaf_matches(parent, leaf, expected, digest, label=path):
+                    raise fail(f"failed runtime receipt does not match current {path}")
+            if existing is not None:
+                if not same_after_rename(existing, b_identity):
+                    raise fail("TLS journal already retains a different failed runtime receipt")
+                adopted = True
+                continue
+            context.assert_all(phase="before adopting failed runtime receipt")
+            journal.assert_current(phase="before adopting failed runtime receipt")
+            stage.assert_current(phase="before adopting failed runtime receipt")
+            try:
+                held_fd = os.open("prior", _READ_FLAGS, dir_fd=stage.descriptor)
+            except OSError as exc:
+                raise fail("could not hold failed runtime receipt", exc) from exc
+            try:
+                held = file_identity(os.fstat(held_fd), label="held failed runtime receipt")
+                if not same_object(held, b_identity) or held[3] != 1:
+                    raise fail("failed runtime receipt changed before adoption")
+                context.assert_all(phase="immediately before adopting failed runtime receipt")
+                journal.assert_current(phase="immediately before adopting failed runtime receipt")
+                stage.assert_current(phase="immediately before adopting failed runtime receipt")
+                try:
+                    rename_noreplace(
+                        stage.descriptor,
+                        "prior",
+                        journal.descriptor,
+                        _ROLLBACK_PRIOR_RECEIPT,
+                        label="adopt failed runtime receipt",
+                    )
+                except (FileExistsError, FileNotFoundError) as exc:
+                    raise fail("failed runtime receipt changed before adoption", exc) from exc
+                moved = safe_leaf(
+                    journal.descriptor,
+                    _ROLLBACK_PRIOR_RECEIPT,
+                    label=f"TLS journal {_ROLLBACK_PRIOR_RECEIPT}",
+                    required_mode=0o644,
+                )
+                if moved is None or not same_after_rename(moved, held):
+                    raise fail("failed runtime receipt changed during adoption")
+                fsync(stage.descriptor, label="runtime transaction after failed receipt adoption")
+                fsync(journal.descriptor, label="TLS journal after failed receipt adoption")
+                fsync(context.runtime.descriptor, label="runtime after failed receipt adoption")
+                context.assert_all(phase="after adopting failed runtime receipt")
+                journal.assert_current(phase="after adopting failed runtime receipt")
+                adopted = True
+                existing = moved
+            finally:
+                os.close(held_fd)
+        finally:
+            stage.close()
+    return adopted
+
+
+def quarantine_public_runtime_receipt(
+    context: Context,
+    journal: PrivateDir,
+) -> None:
+    """Move a foreign public receipt into the bound TLS journal as evidence."""
+    current = safe_leaf(context.runtime.descriptor, _RECEIPT, label=_RECEIPT, required_mode=0o644)
+    if current is None:
+        return
+    name = "rollback-foreign-build-receipt-" + secrets.token_hex(16) + ".json"
+    context.assert_all(phase="before quarantining foreign build receipt")
+    journal.assert_current(phase="before quarantining foreign build receipt")
+    try:
+        rename_noreplace(
+            context.runtime.descriptor,
+            _RECEIPT,
+            journal.descriptor,
+            name,
+            label="quarantine foreign build receipt",
+        )
+    except (FileExistsError, FileNotFoundError) as exc:
+        raise fail("build receipt changed before foreign receipt quarantine", exc) from exc
+    moved = safe_leaf(journal.descriptor, name, label=f"TLS journal {name}", required_mode=0o644)
+    if moved is None or not same_after_rename(moved, current):
+        raise fail("foreign build receipt changed during quarantine")
+    fsync(journal.descriptor, label="TLS journal after foreign receipt quarantine")
+    fsync(context.runtime.descriptor, label="runtime after foreign receipt quarantine")
+    context.assert_all(phase="after quarantining foreign build receipt")
+    journal.assert_current(phase="after quarantining foreign build receipt")
 
 
 def restore_unreceipted_prior_leaf(
@@ -3308,6 +3485,148 @@ def restored_runtime_output_snapshot(
     return values
 
 
+def _restore_receipt_staging_names(journal: PrivateDir) -> list[str]:
+    """List only descriptor-bound restored-receipt staging evidence."""
+
+    names: list[str] = []
+    try:
+        entries = os.listdir(journal.descriptor)
+    except OSError as exc:
+        raise fail("could not inspect TLS journal restored receipt staging", exc) from exc
+    for name in sorted(entries):
+        if not name.startswith(_ROLLBACK_RESTORED_RECEIPT_STAGING_PREFIX):
+            continue
+        component(name, label="restored receipt staging name")
+        if safe_leaf(
+            journal.descriptor,
+            name,
+            label=f"TLS journal {name}",
+            required_mode=0o644,
+        ) is not None:
+            names.append(name)
+    return names
+
+
+def _stage_restored_runtime_receipt(
+    journal: PrivateDir,
+    payload: bytes,
+) -> tuple[int, int, int, int, int, int, int]:
+    """Durably construct and promote a restored receipt through two names.
+
+    The initial newline is intentional: it creates a durable, recognizable
+    provisional inode before the full core is written.  A crash or injected
+    write failure therefore leaves its exact partial staging inode as private
+    evidence while a later process allocates a fresh staging inode and never
+    mutates the failed bytes.
+    """
+
+    for _attempt in range(32):
+        name = _ROLLBACK_RESTORED_RECEIPT_STAGING_PREFIX + secrets.token_hex(16)
+        try:
+            descriptor = os.open(name, _WRITE_FLAGS, 0o644, dir_fd=journal.descriptor)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise fail("could not create restored runtime receipt staging", exc) from exc
+        try:
+            os.fchmod(descriptor, 0o644)
+            if os.write(descriptor, b"\n") != 1:
+                raise fail("could not create restored runtime receipt provisional payload")
+            fsync(descriptor, label="restored runtime receipt provisional payload")
+            fsync(journal.descriptor, label="TLS journal after restored receipt provisional payload")
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise fail("could not write restored runtime receipt staging")
+                offset += written
+            fsync(descriptor, label="restored runtime receipt staging")
+            observed = file_identity(os.fstat(descriptor), label="restored runtime receipt staging")
+            named = safe_leaf(
+                journal.descriptor,
+                name,
+                label=f"TLS journal {name}",
+                required_mode=0o644,
+            )
+            if (
+                named is None
+                or not same_object(named, observed)
+                or observed[2] != 0o644
+                or observed[3] != 1
+                or observed[4] != len(payload)
+            ):
+                raise fail("restored runtime receipt staging changed while writing")
+            fsync(journal.descriptor, label="TLS journal after restored runtime receipt staging")
+            journal.assert_current(phase="before promoting restored runtime receipt staging")
+            rename_noreplace(
+                journal.descriptor,
+                name,
+                journal.descriptor,
+                _ROLLBACK_RESTORED_RECEIPT,
+                label="promote restored runtime receipt staging",
+            )
+            promoted = safe_leaf(
+                journal.descriptor,
+                _ROLLBACK_RESTORED_RECEIPT,
+                label=f"TLS journal {_ROLLBACK_RESTORED_RECEIPT}",
+                required_mode=0o644,
+            )
+            if promoted is None or not same_after_rename(promoted, observed):
+                raise fail("restored runtime receipt staging changed during promotion")
+            fsync(journal.descriptor, label="TLS journal after promoting restored runtime receipt")
+            return promoted
+        finally:
+            os.close(descriptor)
+    raise fail("could not allocate restored runtime receipt staging")
+
+
+def _promote_complete_restored_runtime_receipt_staging(
+    journal: PrivateDir,
+) -> tuple[int, int, int, int, int, int, int] | None:
+    """Promote one complete private staging core after a crash before rename."""
+
+    for name in _restore_receipt_staging_names(journal):
+        raw, identity = read_exact(
+            journal.descriptor,
+            name,
+            label=f"TLS journal {name}",
+            required_mode=0o644,
+        )
+        try:
+            receipt_file_contract(json.loads(raw.decode("utf-8")), allow_unsigned=True)
+        except (TlsError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        journal.assert_current(phase="before promoting recovered restored receipt staging")
+        try:
+            rename_noreplace(
+                journal.descriptor,
+                name,
+                journal.descriptor,
+                _ROLLBACK_RESTORED_RECEIPT,
+                label="promote recovered restored receipt staging",
+            )
+        except FileExistsError:
+            return safe_leaf(
+                journal.descriptor,
+                _ROLLBACK_RESTORED_RECEIPT,
+                label=f"TLS journal {_ROLLBACK_RESTORED_RECEIPT}",
+                required_mode=0o644,
+            )
+        promoted = safe_leaf(
+            journal.descriptor,
+            _ROLLBACK_RESTORED_RECEIPT,
+            label=f"TLS journal {_ROLLBACK_RESTORED_RECEIPT}",
+            required_mode=0o644,
+        )
+        if promoted is None or not same_after_rename(promoted, identity):
+            raise fail("recovered restored runtime receipt staging changed during promotion")
+        fsync(journal.descriptor, label="TLS journal after promoting recovered restored receipt")
+        return promoted
+    return None
+
+
 def restore_reissued_runtime_receipt(
     base_receipt: dict[str, object],
     context: Context,
@@ -3330,6 +3649,8 @@ def restore_reissued_runtime_receipt(
         label=f"TLS journal {_ROLLBACK_RESTORED_RECEIPT}",
         required_mode=0o644,
     )
+    if staged is None:
+        staged = _promote_complete_restored_runtime_receipt_staging(journal)
     if current is not None:
         try:
             receipt, identity, _outputs, _publication = read_authenticated_runtime_receipt(
@@ -3368,13 +3689,7 @@ def restore_reissued_runtime_receipt(
             outputs,
             tls_publication,
         )
-        staged = write_exclusive(
-            journal.descriptor,
-            _ROLLBACK_RESTORED_RECEIPT,
-            payload,
-            0o644,
-            label=f"TLS journal {_ROLLBACK_RESTORED_RECEIPT}",
-        )
+        staged = _stage_restored_runtime_receipt(journal, payload)
     core_raw, staged_identity = read_exact(
         journal.descriptor,
         _ROLLBACK_RESTORED_RECEIPT,
@@ -3770,6 +4085,7 @@ def restore_v2_runtime_generation(
                 _ROLLBACK_PRIOR_RECEIPT,
                 control_key,
                 label=f"TLS journal {_ROLLBACK_PRIOR_RECEIPT}",
+                allow_unattested=True,
             )
             b_current = b_publication["current"]
             assert isinstance(b_current, dict)
@@ -3819,6 +4135,7 @@ def restore_v2_runtime_generation(
             _ROLLBACK_PRIOR_RECEIPT,
             control_key,
             label=f"TLS journal {_ROLLBACK_PRIOR_RECEIPT}",
+            allow_unattested=True,
         )
         b_current = b_publication["current"]
         assert isinstance(b_current, dict)
@@ -3836,6 +4153,7 @@ def restore_v2_runtime_generation(
             _ROLLBACK_PRIOR_RECEIPT,
             control_key,
             label=f"TLS journal {_ROLLBACK_PRIOR_RECEIPT}",
+            allow_unattested=True,
         )
         if not same_after_rename(observed_b_receipt, b_receipt_identity):
             raise fail("retained B receipt changed during rollback invalidation")
@@ -4113,6 +4431,40 @@ def completed_unreceipted_inverse_generation(context: Context, control_key: byte
     return matches[0] if matches else None
 
 
+def open_current_tls_journal_for_restore(
+    context: Context,
+    control_key: bytes,
+) -> PrivateDir | None:
+    """Open the completed journal without trusting a possibly foreign receipt."""
+    try:
+        names = tuple(os.listdir(context.runtime.descriptor))
+    except OSError as exc:
+        raise fail("could not enumerate TLS journals for unreceipted restore", exc) from exc
+    found: PrivateDir | None = None
+    for name in names:
+        if re.fullmatch(re.escape(_JOURNAL_PREFIX) + r"[0-9a-f]{32}", name) is None:
+            continue
+        journal = open_private_dir(context.runtime, name, label="TLS exchange journal for restore")
+        keep = False
+        try:
+            intent = parse_intent(journal, control_key)
+            candidate_identity = intent["candidate_identity"]
+            assert isinstance(candidate_identity, tuple)
+            if (
+                candidate_identity != context.tls.chain[-1]
+                or not marker_present(journal, _COMPLETE, b"complete\n", control_key)
+            ):
+                continue
+            if found is not None:
+                raise fail("multiple completed TLS journals own the current restore generation")
+            found = journal
+            keep = True
+        finally:
+            if not keep:
+                journal.close()
+    return found
+
+
 def restore_unreceipted_tls_generation(context: Context, control_key: bytes) -> str:
     """Inverse the one proven B generation left before receipt publication.
 
@@ -4124,18 +4476,29 @@ def restore_unreceipted_tls_generation(context: Context, control_key: bytes) -> 
     generation, and has no public receipt is eligible.  The activation layer
     calls it while holding its own serialized rollback lock.
     """
-    if safe_leaf(context.runtime.descriptor, _RECEIPT, label=_RECEIPT) is not None:
+    public_receipt = safe_leaf(context.runtime.descriptor, _RECEIPT, label=_RECEIPT)
+    if public_receipt is not None:
         completed = completed_unreceipted_inverse_generation(context, control_key)
-        if completed is None:
-            raise fail("unreceipted TLS restore requires an absent build receipt")
+        if completed is not None:
+            try:
+                result = json.loads(restore_tls_generation(completed, context, control_key))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise fail("completed unreceipted TLS restore produced invalid result", exc) from exc
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                raise fail("completed unreceipted TLS restore did not prove its inverse")
+            result["discovered"] = True
+            return json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        # The public leaf may be a same-mode replacement left by a failed
+        # attestor.  Quarantine it before collecting TLS provenance so the
+        # provenance check never parses an untrusted receipt as if it were A.
+        foreign_journal = open_current_tls_journal_for_restore(context, control_key)
+        if foreign_journal is None:
+            raise fail("no authenticated unreceipted TLS generation is available")
         try:
-            result = json.loads(restore_tls_generation(completed, context, control_key))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise fail("completed unreceipted TLS restore produced invalid result", exc) from exc
-        if not isinstance(result, dict) or result.get("ok") is not True:
-            raise fail("completed unreceipted TLS restore did not prove its inverse")
-        result["discovered"] = True
-        return json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            quarantine_public_runtime_receipt(context, foreign_journal)
+        finally:
+            foreign_journal.close()
+        public_receipt = None
     try:
         publication = current_tls_publication(context, control_key)
     except NeedsRotation as exc:
@@ -4158,8 +4521,29 @@ def restore_unreceipted_tls_generation(context: Context, control_key: bytes) -> 
             sort_keys=True,
             separators=(",", ":"),
         )
+    assert isinstance(prior, dict)
+    journal_name = prior["journal"]
+    journal_identity = tuple(prior["journal_identity"])
+    assert isinstance(journal_name, str)
+    journal = open_private_dir(
+        context.runtime,
+        journal_name,
+        label="TLS exchange journal for unreceipted restore",
+        expected=journal_identity,
+    )
+    try:
+        intent = parse_intent(journal, control_key)
+        if not adopt_failed_runtime_receipt(context, journal, intent, control_key):
+            raise fail("no descriptor-bound failed runtime receipt is available")
+        if public_receipt is not None:
+            # A path/inode fault can leave a foreign replacement at the public
+            # name.  Preserve that inode privately before the normal inverse
+            # consumes the adopted B receipt.
+            quarantine_public_runtime_receipt(context, journal)
+    finally:
+        journal.close()
     if safe_leaf(context.runtime.descriptor, _RECEIPT, label=_RECEIPT) is not None:
-        raise fail("build receipt appeared during unreceipted TLS restore")
+        raise fail("build receipt remained public after unreceipted recovery preflight")
     try:
         result = json.loads(restore_tls_generation(generation, context, control_key))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -5165,11 +5549,81 @@ class ReceiptPublication:
         if observed is None:
             return
         held = _file_identity(os.fstat(self.descriptor), label="held published receipt")
-        if observed != held or (
-            observed != self.published if self.published is not None
-            else not _same_after_rename(observed, self.staged)
-        ):
-            raise _fail("build-receipt.json is no longer the owned publication; retained public evidence")
+        if not _same_object(observed, held):
+            # The attestor may have replaced or renamed the canonical leaf
+            # while it was finalizing the exact descriptor we supplied.  The
+            # held descriptor still identifies our receipt, so recover that
+            # inode by scanning only the anchored runtime directory, opening
+            # each matching name, and moving the FD-bound name into a private
+            # transaction stage.  A pathname-only lookup would accept the
+            # replacement and lose the failed publication evidence.
+            stage = _new_stage(
+                runtime,
+                label="displaced build-receipt.json",
+                anchors=anchors,
+                prefix=".termdeck-runtime-transaction-",
+            )
+            try:
+                try:
+                    names = tuple(os.listdir(runtime.descriptor))
+                except OSError as exc:
+                    raise _fail("could not enumerate displaced build receipt names", exc) from exc
+                recovered = False
+                for name in names:
+                    if name == "build-receipt.json":
+                        continue
+                    candidate = _lstat_at(runtime.descriptor, name, label="displaced build receipt")
+                    if candidate is None or stat.S_ISLNK(candidate.st_mode) or not stat.S_ISREG(candidate.st_mode):
+                        continue
+                    candidate_identity = _file_identity(candidate, label="displaced build receipt")
+                    if not _same_object(candidate_identity, held) or candidate_identity[3] != 1:
+                        continue
+                    try:
+                        candidate_fd = os.open(name, _READ_FLAGS, dir_fd=runtime.descriptor)
+                    except FileNotFoundError:
+                        continue
+                    try:
+                        opened = _file_identity(os.fstat(candidate_fd), label="displaced build receipt")
+                        if not _same_object(opened, held) or opened[3] != 1:
+                            continue
+                        _assert_mutation_ready(
+                            anchors,
+                            phase="immediately before retaining displaced build receipt",
+                            stage=stage,
+                        )
+                        try:
+                            _renameat2(
+                                runtime.descriptor,
+                                name,
+                                stage.descriptor,
+                                "prior",
+                                label="retain displaced build receipt",
+                            )
+                        except FileNotFoundError:
+                            continue
+                        retained = _trusted_leaf(
+                            stage.descriptor,
+                            "prior",
+                            label="private displaced build receipt",
+                        )
+                        if retained is None or not _same_after_rename(retained, held):
+                            raise _fail("displaced build receipt changed while retaining its owned inode")
+                        _fsync(stage.descriptor, label="private stage after retaining displaced build receipt")
+                        _fsync(runtime.descriptor, label="runtime after retaining displaced build receipt")
+                        _assert_all(anchors, phase="after retaining displaced build receipt")
+                        recovered = True
+                        break
+                    finally:
+                        os.close(candidate_fd)
+                if not recovered:
+                    raise _fail("build-receipt.json is no longer the owned publication; retained public evidence")
+            except BaseException:
+                stage.close()
+                raise
+            finally:
+                if stage.descriptor >= 0:
+                    stage.close()
+            return
         # An interruption can arrive after rename(2) or during the helper's
         # in-place final write.  The duplicated descriptor and exact named
         # inode prove this is still our publication even when its bytes are an

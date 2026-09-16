@@ -2544,6 +2544,33 @@ def _read_unit_config_snapshot(
     return config, _UnitConfigSnapshot(path, preimage, guards)
 
 
+def _assert_unit_config_snapshot(
+    snapshot: _UnitConfigSnapshot,
+    *,
+    spec: UnitSpec,
+    expected_release_id: str | None,
+) -> None:
+    """Reject a concurrent config replacement before acting on a PID.
+
+    The initial config read is the compare-and-swap token for a stop.  A
+    process identity check can race a concurrent start that publishes a new
+    record, so an unchanged PID check is insufficient on its own.  Re-read
+    the leaf through its anchored parent chain immediately before clearing
+    metadata or sending a signal and require the complete preimage to match.
+    """
+
+    try:
+        _config, current = _read_unit_config_snapshot(
+            snapshot.path,
+            spec=spec,
+            expected_release_id=expected_release_id,
+        )
+    except Exception as exc:
+        raise WrapperError(f"{spec.name} config changed after preflight") from exc
+    if current.preimage != snapshot.preimage:
+        raise WrapperError(f"{spec.name} config changed after preflight")
+
+
 def _validate_recorded_command(
     spec: UnitSpec,
     layout: WrapperLayout,
@@ -3238,6 +3265,11 @@ def stop_unit(
         else:
             raise
     if not matches:
+        _assert_unit_config_snapshot(
+            config_snapshot,
+            spec=spec,
+            expected_release_id=expected_release,
+        )
         try:
             same_process = proc_start_ticks(pid) == ticks
         except WrapperError as exc:
@@ -3283,6 +3315,11 @@ def stop_unit(
                 os.close(pidfd)
             except OSError:
                 pass
+    _assert_unit_config_snapshot(
+        config_snapshot,
+        spec=spec,
+        expected_release_id=expected_release,
+    )
     config.update({"pid": None, "start_ticks": None, "exe": None, "argv": [], "command_sha256": None, "state": "stopped"})
     _atomic_write_json(config_path, config, mode=UNIT_CONFIG_MODE, snapshot=config_snapshot)
     return 0

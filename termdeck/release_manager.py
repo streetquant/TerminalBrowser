@@ -4966,6 +4966,7 @@ def _publish_files_transactionally(
     parent_guards: object | None = None,
     expected_preimages: Mapping[Path, object] | None = None,
     journal_path: Path | str | os.PathLike[str] | None = None,
+    production_probe: bool = False,
 ) -> None:
     """Publish a small activation set through stable parent directory FDs.
 
@@ -5172,7 +5173,25 @@ def _publish_files_transactionally(
                 # Preserve the established failure-injection boundary while
                 # the actual write remains descriptor-relative below.
                 if use_write_probe:
-                    _atomic_write_bytes(record.path, record.content, mode=record.mode)
+                    if production_probe:
+                        # Production installs retain the release manager's
+                        # journal and descriptor transaction, but also cross
+                        # the desktop integration write boundary.  The
+                        # desktop helper's probe is intentionally inert; its
+                        # parent-swap fault seam still runs before the local
+                        # anchored identity check below.
+                        from .desktop_integration import (
+                            _atomic_write_bytes as desktop_atomic_write,
+                        )
+
+                        desktop_atomic_write(
+                            record.path,
+                            record.content,
+                            mode=record.mode,
+                            probe=True,
+                        )
+                    else:
+                        _atomic_write_bytes(record.path, record.content, mode=record.mode)
                 parents.assert_current(phase="before mutation")
                 _require_destination_identity(
                     parents.for_path(record.path),
@@ -7570,6 +7589,7 @@ def _publish_install_wrapper_and_activation(
     before_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
     after_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
     after_recovery: Callable[[PublicationTransactionReceipt], None] | None = None,
+    production_probe: bool = False,
 ) -> dict[str, object]:
     """Publish wrappers and the selecting state through one durable journal.
 
@@ -7735,6 +7755,7 @@ def _publish_install_wrapper_and_activation(
         before_publish=before_publication,
         after_publish=capture_published,
         after_recovery=after_recovery,
+        production_probe=production_probe,
     )
     verified = _verify_service_wrappers(
         release_layout(
@@ -11771,6 +11792,7 @@ def install_release(
             before_publication=before_publication,
             after_publication=after_publication,
             after_recovery=after_recovery,
+            production_probe=production,
         )
 
         result = {

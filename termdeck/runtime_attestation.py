@@ -539,20 +539,27 @@ def _validate_tls_publication(value: object) -> None:
 
 
 def _runtime_generation(receipt: Mapping[str, object]) -> str:
-    """Return the one generation identifier shared by runtime and TLS state."""
+    """Return the runtime transaction identifier bound to an attestation.
+
+    Runtime publication and TLS rotation are separate durable transactions.
+    Their identifiers are both covered by the signed receipt, but a retry can
+    legitimately republish runtime leaves against an unchanged TLS directory
+    (and therefore retain the TLS identifier).  The attestation transaction is
+    bound to the runtime identifier so a receipt cannot be replayed under a
+    different request; ``_validate_tls_publication`` independently validates
+    the TLS transaction identifier and its journal binding.
+    """
 
     publication = receipt.get("runtime_publication")
     tls_publication = receipt.get("tls_publication")
     if not isinstance(publication, Mapping) or not isinstance(tls_publication, Mapping):
         raise AttestationError("runtime receipt publication is invalid")
     runtime_generation = publication.get("generation")
-    tls_generation = tls_publication.get("generation")
     if (
         not isinstance(runtime_generation, str)
         or _TRANSACTION_ID.fullmatch(runtime_generation) is None
-        or runtime_generation != tls_generation
     ):
-        raise AttestationError("runtime and TLS publication generations do not match")
+        raise AttestationError("runtime publication generation is invalid")
     return runtime_generation
 
 

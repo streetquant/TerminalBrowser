@@ -2712,6 +2712,12 @@ def test_tls_review_resumes_interrupted_restored_receipt_staging(
     tmp_path: Path, phase: str, mode: str,
 ) -> None:
     layout, generation, journal = _tls_review_rotated_layout(tmp_path)
+    # The v2 inverse is reached only after activation has restored the
+    # authenticated A executable/config leaves.  Keep this focused recovery
+    # test at the receipt-staging boundary by supplying that proven
+    # preimage, rather than asking the TLS helper to invent source bytes that
+    # are intentionally retained by the activation layer.
+    _tls_review_restore_source_copies(layout, journal)
     fault_marker = tmp_path / "restored-receipt-fault"
     environment = _hook_environment(tmp_path / "restored-receipt-hook", f"""
 import errno

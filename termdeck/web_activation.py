@@ -861,6 +861,63 @@ def _release_wrapper_kwargs(
     }
 
 
+def _request_runtime_preparation(
+    paths: ActivationPaths,
+    *,
+    restore_mode: str,
+    generation: str | None = None,
+) -> Mapping[str, object]:
+    """Request the producer inverse through the appropriate testable boundary.
+
+    The installed production runtime is private to ``termdeck-preparer`` and
+    must be reached through its fixed broker.  Focused activation fixtures use
+    disposable runtime roots, where no broker is allowed to serve the custom
+    tree; those roots retain the copied wrapper command as their explicit
+    producer boundary.
+    """
+
+    if paths.runtime == service_wrappers.PREPARER_RUNTIME_ROOT:
+        try:
+            result = service_wrappers._request_lan_preparation(
+                restore_mode=restore_mode,
+                generation=generation,
+                runtime_root=paths.runtime,
+                timeout=90.0,
+            )
+        except service_wrappers.WrapperError as exc:
+            raise WebActivationError("LAN runtime TLS rollback broker request failed") from exc
+    else:
+        if restore_mode == "generation":
+            if not isinstance(generation, str):
+                raise WebActivationError("LAN runtime restore generation is missing")
+            arguments = [
+                str(paths.runtime / "bin" / "termdeck-web-prepare"),
+                "--restore-tls-generation",
+                generation,
+            ]
+        elif restore_mode == "unreceipted":
+            arguments = [
+                str(paths.runtime / "bin" / "termdeck-web-prepare"),
+                "--restore-unreceipted-tls-generation",
+            ]
+        else:
+            raise WebActivationError("LAN runtime restore mode is invalid")
+        try:
+            completed = _run(
+                arguments,
+                env={"TERMDECK_RUNTIME_ROOT": str(paths.runtime)},
+                timeout=90,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise WebActivationError("LAN runtime TLS rollback producer request failed") from exc
+        try:
+            result = json.loads(completed.stdout)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise WebActivationError("LAN runtime TLS rollback producer returned invalid JSON") from exc
+
+    if not isinstance(result, Mapping):
+        raise WebActivationError("LAN runtime TLS rollback producer returned no attested result")
+    return result
 def _wrapper_execution_identity(
     paths: ActivationPaths,
     release_id: str,
@@ -4363,17 +4420,11 @@ def _restore_tls_generation(
     if intent is None:
         record["runtime_rollback_intent"] = expected_intent
         checkpoint("intent:rollback:generated-runtime")
-    try:
-        response = service_wrappers._request_lan_preparation(
-            restore_mode=("generation" if normalized is not None else "unreceipted"),
-            generation=generation if normalized is not None else None,
-            runtime_root=paths.runtime,
-            timeout=90.0,
-        )
-    except service_wrappers.WrapperError as exc:
-        raise WebActivationError("LAN runtime TLS rollback broker request failed") from exc
-    if not isinstance(response, Mapping):
-        raise WebActivationError("LAN runtime TLS rollback broker returned no attested result")
+    response = _request_runtime_preparation(
+        paths,
+        restore_mode=("generation" if normalized is not None else "unreceipted"),
+        generation=generation if normalized is not None else None,
+    )
     if response.get("action") == "no-prior-tls-generation":
         raise WebActivationError("LAN runtime TLS publication has no authenticated prior generation")
     response = _parse_runtime_inverse_result(response, intent=expected_intent, publication=normalized)
