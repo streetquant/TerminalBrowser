@@ -2468,8 +2468,9 @@ class _PublicationJournal:
                 # O_EXCL descriptor remains available for descriptor-bound
                 # cleanup, so this pre-mutation path can fail closed.
                 if identity.mode & ~0o600 == 0:
-                    os.fchmod(descriptor, 0o600)
-                    identity = authenticated_created_leaf()
+                    if identity.mode != 0o600:
+                        os.fchmod(descriptor, 0o600)
+                        identity = authenticated_created_leaf()
                     if identity.mode != 0o600:
                         raise ReleaseError("publication journal mode is unsafe during recovery setup")
                     failure_journal = cls(
@@ -8990,6 +8991,8 @@ from __future__ import annotations
 import atexit
 import base64
 import csv
+import ctypes
+import errno
 import hashlib
 import io
 import importlib.abc
@@ -9000,6 +9003,7 @@ import re
 import stat
 import sys
 import tempfile
+import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -9015,6 +9019,8 @@ MAX_RUNTIME_BYTES = 512 * 1024 * 1024
 MAX_WHEEL_ENTRIES = 20_000
 MAX_WHEEL_PATH_COMPONENTS = 256
 MAX_SITE_DIRECTORIES = 100_000
+_RENAME_NOREPLACE = 1
+_PUBLICATION_EINTR_RETRIES = 8
 sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
@@ -9438,6 +9444,99 @@ def snapshot_identity(entry):
     )
 
 
+def _directory_open_flags():
+    directory = getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if (
+        isinstance(directory, bool)
+        or not isinstance(directory, int)
+        or directory == 0
+        or isinstance(nofollow, bool)
+        or not isinstance(nofollow, int)
+        or nofollow == 0
+    ):
+        raise RuntimeError(
+            "secure descriptor-relative import cleanup requires O_DIRECTORY and O_NOFOLLOW"
+        )
+    return os.O_RDONLY | directory | getattr(os, "O_CLOEXEC", 0) | nofollow
+
+
+def _fsync_descriptor(descriptor, *, label):
+    for attempt in range(_PUBLICATION_EINTR_RETRIES):
+        try:
+            os.fsync(descriptor)
+            return
+        except InterruptedError:
+            pass
+        except OSError as exc:
+            if exc.errno != errno.EINTR:
+                raise RuntimeError(f"could not fsync {label}: {exc}") from exc
+        if attempt + 1 >= _PUBLICATION_EINTR_RETRIES:
+            break
+    raise RuntimeError(
+        f"could not fsync {label}: interrupted {_PUBLICATION_EINTR_RETRIES} times"
+    )
+
+
+def _renameat2(descriptor, source, destination, *, flags, label):
+    if flags != _RENAME_NOREPLACE:
+        raise RuntimeError(f"unsupported secure rename flags for {label}")
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except (AttributeError, OSError) as exc:
+        raise RuntimeError(
+            "secure descriptor-relative import cleanup requires renameat2(RENAME_NOREPLACE)"
+        ) from exc
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    for attempt in range(_PUBLICATION_EINTR_RETRIES):
+        result = renameat2(
+            descriptor,
+            os.fsencode(source),
+            descriptor,
+            os.fsencode(destination),
+            flags,
+        )
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error == errno.EINTR:
+            if attempt + 1 >= _PUBLICATION_EINTR_RETRIES:
+                break
+            continue
+        if error == errno.ENOENT:
+            raise FileNotFoundError(error, os.strerror(error), source)
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), destination)
+        raise OSError(error, os.strerror(error), source, destination)
+    raise RuntimeError(
+        f"secure descriptor-relative rename interrupted {_PUBLICATION_EINTR_RETRIES} times"
+    )
+
+
+def _unlinkat(descriptor, name, *, label):
+    for attempt in range(_PUBLICATION_EINTR_RETRIES):
+        try:
+            os.unlink(name, dir_fd=descriptor)
+            return
+        except InterruptedError:
+            pass
+        except OSError as exc:
+            if exc.errno != errno.EINTR:
+                raise
+        if attempt + 1 >= _PUBLICATION_EINTR_RETRIES:
+            break
+    raise RuntimeError(
+        f"could not unlink {label}: interrupted {_PUBLICATION_EINTR_RETRIES} times"
+    )
+
+
 def _snapshot_components(name):
     path = PurePosixPath(name)
     if (
@@ -9599,7 +9698,16 @@ def cleanup_import_snapshot(snapshot, descriptor, files, directories, identities
                 return
         for name in sorted(directories, key=lambda value: (value.count("/"), value)):
             target = descriptor_root if name == "." else descriptor_root.joinpath(*PurePosixPath(name).parts)
+            expected = identities[name]
             target.chmod(0o700)
+            observed = (
+                snapshot_identity(os.fstat(descriptor))
+                if name == "."
+                else snapshot_identity(target.lstat())
+            )
+            expected_after_mode = expected[:3] + (0o700,) + expected[4:]
+            if observed != expected_after_mode:
+                return
         for name in files:
             _remove_snapshot_file(descriptor, name, identities[name])
         for name in sorted(
@@ -9607,7 +9715,22 @@ def cleanup_import_snapshot(snapshot, descriptor, files, directories, identities
             key=lambda value: (value.count("/"), value),
             reverse=True,
         ):
-            _remove_snapshot_directory(descriptor, name, identities[name])
+            target = descriptor_root.joinpath(*PurePosixPath(name).parts)
+            expected = identities[name]
+            observed = snapshot_identity(target.lstat())
+            if observed[:3] != expected[:3] or observed[3] != 0o700:
+                return
+            _remove_snapshot_directory(descriptor, name, observed)
+        expected_root = identities["."]
+        named_root = snapshot_identity(snapshot.lstat())
+        opened_root = snapshot_identity(os.fstat(descriptor))
+        if (
+            named_root[:3] != expected_root[:3]
+            or named_root[3] != 0o700
+            or opened_root[:3] != expected_root[:3]
+            or opened_root[3] != 0o700
+        ):
+            return
         snapshot.rmdir()
     except (OSError, RuntimeError):
         pass
