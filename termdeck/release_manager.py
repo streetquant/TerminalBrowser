@@ -6421,6 +6421,14 @@ def _release_wrapper_execution_kwargs(
     build_info = manifest.get("build_info")
     if not isinstance(build_info, Mapping):
         raise ReleaseError("wrapper execution release has no build info")
+    # Releases from before immutable wrapper execution never shipped the
+    # service-wrapper module in their wheel.  Their wrappers are therefore
+    # authenticated against the historical source-root contract, and their
+    # extracted site is not an authority for wrapper rendering.  Decide that
+    # compatibility path from the release identity before walking a possibly
+    # damaged historical site.
+    if not _release_requires_immutable_wrapper_execution(build_info):
+        return {}
     verification, site_manifest = _verify_release_dir_details(layout, release_id)
     required = (
         "termdeck/__init__.py",
@@ -6433,12 +6441,9 @@ def _release_wrapper_execution_kwargs(
     }
     missing = [name for name in required if name not in file_rows]
     frozen = verification.get("frozen_directories") is True
-    required_binding = _release_requires_immutable_wrapper_execution(build_info)
     if missing or not frozen:
-        if required_binding:
-            detail = "missing " + ", ".join(missing) if missing else "site is not frozen"
-            raise ReleaseError(f"managed release cannot bind immutable wrapper execution: {detail}")
-        return {}
+        detail = "missing " + ", ".join(missing) if missing else "site is not frozen"
+        raise ReleaseError(f"managed release cannot bind immutable wrapper execution: {detail}")
     binding: dict[str, object] = {}
     for name in required:
         digest, size = file_rows[name]

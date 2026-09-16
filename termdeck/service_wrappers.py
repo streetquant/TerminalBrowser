@@ -2789,22 +2789,24 @@ def _pidfd_is_exited(descriptor: int) -> bool:
         raise WrapperError("could not inspect the checkpoint process identity") from exc
 
 
-def _checkpoint_leader_was_reaped(pid: int) -> bool:
-    """Distinguish a waitable zombie from a leader already reaped elsewhere."""
+def _checkpoint_leader_was_reaped(descriptor: int) -> bool:
+    """Distinguish a waitable zombie from a reaped identity-bound leader."""
 
+    poller = select.poll()
     try:
-        result = os.waitid(
-            os.P_PID,
-            pid,
-            os.WEXITED | os.WNOHANG | os.WNOWAIT,
-        )
-    except (ChildProcessError, ProcessLookupError):
-        return True
-    except OSError as exc:
-        if exc.errno in {errno.ECHILD, errno.ESRCH}:
-            return True
+        poller.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
+        events = poller.poll(0)
+    except (OSError, ValueError) as exc:
         raise WrapperError("could not inspect the checkpoint leader identity") from exc
-    return result is None
+    for _descriptor, event_mask in events:
+        if event_mask & select.POLLNVAL:
+            raise WrapperError("could not inspect the checkpoint leader identity")
+        # A pidfd is readable once its process becomes a waitable zombie.  It
+        # gains POLLHUP only after that zombie is reaped, which is the point
+        # where the numeric process-group ID is no longer safe to signal.
+        if event_mask & select.POLLHUP:
+            return True
+    return False
 
 
 def _cleanup_checkpoint_process(process: subprocess.Popen[bytes]) -> bool:
@@ -2824,7 +2826,7 @@ def _cleanup_checkpoint_process(process: subprocess.Popen[bytes]) -> bool:
     identity_pidfd = getattr(process, "_termdeck_checkpoint_pidfd", None)
     identity_bound = isinstance(identity_pidfd, int) and identity_pidfd >= 0
     if private_group and identity_bound and _pidfd_is_exited(identity_pidfd):
-        if _checkpoint_leader_was_reaped(pid):
+        if _checkpoint_leader_was_reaped(identity_pidfd):
             return False
     if private_group and hasattr(process, "_termdeck_checkpoint_pidfd") and not identity_bound:
         return False
@@ -2846,7 +2848,7 @@ def _cleanup_checkpoint_process(process: subprocess.Popen[bytes]) -> bool:
         group_signalled = False
         group_gone = False
         if private_group and identity_bound and _pidfd_is_exited(identity_pidfd):
-            if _checkpoint_leader_was_reaped(pid):
+            if _checkpoint_leader_was_reaped(identity_pidfd):
                 break
         if private_group:
             try:
@@ -2869,10 +2871,9 @@ def _cleanup_checkpoint_process(process: subprocess.Popen[bytes]) -> bool:
                 continue
         try:
             if group_signalled and not _wait_checkpoint_group(pid, timeout=grace):
-                if identity_bound and _pidfd_is_exited(identity_pidfd):
-                    # The leader exited before its group drained.  Its group
-                    # number is no longer identity-bound, so do not escalate
-                    # with killpg; report incomplete cleanup safely.
+                if identity_bound and _checkpoint_leader_was_reaped(identity_pidfd):
+                    # Another waiter reaped the leader before its group
+                    # drained.  Do not escalate through a reusable group ID.
                     break
                 continue
             # Do not reap a leader while its group is still running: its exit
@@ -2989,7 +2990,7 @@ def _run_checkpoint(layout: WrapperLayout) -> int:
             isinstance(checkpoint_pidfd, int)
             and checkpoint_pidfd >= 0
             and _pidfd_is_exited(checkpoint_pidfd)
-        ) and _checkpoint_leader_was_reaped(process.pid):
+        ) and _checkpoint_leader_was_reaped(checkpoint_pidfd):
             # An external reaper released the leader.  Its old numeric group
             # can now belong to an unrelated process, so do not signal it.
             returncode = process.wait(timeout=CHECKPOINT_KILL_GRACE)
