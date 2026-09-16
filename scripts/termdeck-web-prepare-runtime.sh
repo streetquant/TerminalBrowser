@@ -277,6 +277,7 @@ tls_transaction() {
 from __future__ import annotations
 
 import ctypes
+import base64
 import errno
 import hashlib
 import hmac
@@ -349,6 +350,10 @@ _ROLLBACK_PRIOR_HOSTS = "rollback-prior-allowed-hosts.map"
 _ROLLBACK_RESTORED_RECEIPT = "rollback-restored-build-receipt.json"
 _ROLLBACK_RESTORED_RECEIPT_STAGING_PREFIX = "rollback-restored-build-receipt.json.staging-"
 _RUNTIME_TRANSACTION_PREFIX = ".termdeck-runtime-transaction-"
+_RECEIPT_JOURNAL_PREFIX = ".termdeck-receipt-transaction-"
+_RECEIPT_JOURNAL_EVIDENCE = "receipt-finalization-journal"
+_RECEIPT_JOURNAL_MODE = 0o600
+_RECEIPT_JOURNAL_MAX_BYTES = 256 * 1024
 _RUNTIME_RECEIPT_SCHEMA = "termdeck.lan-runtime-build.v2"
 _RUNTIME_RECEIPT_DOMAIN = b"termdeck.lan-runtime-build.v2\x00"
 _ATTEST_HELPER = "/usr/libexec/termdeck-preparer-state"
@@ -3047,6 +3052,283 @@ def leaf_matches(
     return True
 
 
+def _read_receipt_journal_descriptor(descriptor: int, *, label: str) -> bytes:
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+    except OSError as exc:
+        raise fail(f"{label} is not seekable", exc) from exc
+    chunks: list[bytes] = []
+    remaining = _RECEIPT_JOURNAL_MAX_BYTES + 1
+    while remaining:
+        try:
+            block = os.read(descriptor, min(65536, remaining))
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            raise fail(f"could not read {label}", exc) from exc
+        if not block:
+            break
+        chunks.append(block)
+        remaining -= len(block)
+    result = b"".join(chunks)
+    if len(result) > _RECEIPT_JOURNAL_MAX_BYTES:
+        raise fail(f"{label} exceeds its bounded size")
+    return result
+
+
+def _open_receipt_finalization_journal(
+    parent: Anchor | PrivateDir,
+    name: str,
+    expected_receipt: tuple[int, int, int, int, int, int, int],
+) -> dict[str, object] | None:
+    """Open one preparer journal and bind its core to the failed receipt FD."""
+    observed = safe_leaf(
+        parent.descriptor,
+        name,
+        label="receipt finalization journal",
+        required_mode=_RECEIPT_JOURNAL_MODE,
+    )
+    if observed is None:
+        return None
+    info = lstat_at(parent.descriptor, name, label="receipt finalization journal")
+    if info is None:
+        return None
+    owner = parent.identity[3] if isinstance(parent, PrivateDir) else parent.chain[-1][3]
+    parent_info = os.fstat(parent.descriptor)
+    if (
+        int(info.st_uid) != owner
+        or int(info.st_gid) != int(parent_info.st_gid)
+        or stat.S_IMODE(info.st_mode) != _RECEIPT_JOURNAL_MODE
+        or int(info.st_nlink) != 1
+    ):
+        raise fail("receipt finalization journal ownership or mode is unsafe")
+    try:
+        descriptor = os.open(name, _READ_FLAGS, dir_fd=parent.descriptor)
+    except OSError as exc:
+        raise fail("could not open receipt finalization journal", exc) from exc
+    try:
+        opened = file_identity(os.fstat(descriptor), label="receipt finalization journal")
+        if opened != observed:
+            raise fail("receipt finalization journal changed while opening")
+        raw = _read_receipt_journal_descriptor(
+            descriptor,
+            label="receipt finalization journal",
+        )
+        after = file_identity(os.fstat(descriptor), label="receipt finalization journal")
+        named = safe_leaf(
+            parent.descriptor,
+            name,
+            label="receipt finalization journal",
+            required_mode=_RECEIPT_JOURNAL_MODE,
+        )
+        if after != opened or named != opened:
+            raise fail("receipt finalization journal changed while reading")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise fail("receipt finalization journal is not canonical JSON", exc) from exc
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"core", "final_identity", "identity", "schema", "state"}
+            or value.get("schema") != "termdeck.receipt-finalization-journal.v1"
+            or value.get("state") != "prepared"
+            or value.get("final_identity") is not None
+        ):
+            raise fail("receipt finalization journal schema is invalid")
+        canonical = (
+            json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        if raw != canonical:
+            raise fail("receipt finalization journal is not canonical JSON")
+        receipt_identity = publication_identity(
+            value.get("identity"),
+            label="receipt finalization journal receipt identity",
+        )
+        if receipt_identity[2] != 0o644 or not same_object(receipt_identity, expected_receipt):
+            os.close(descriptor)
+            return None
+        encoded = value.get("core")
+        if not isinstance(encoded, str):
+            raise fail("receipt finalization journal core is invalid")
+        try:
+            core = base64.b64decode(encoded, validate=True)
+        except (ValueError, UnicodeError) as exc:
+            raise fail("receipt finalization journal core is invalid", exc) from exc
+        if not core:
+            raise fail("receipt finalization journal core is invalid")
+        try:
+            receipt = json.loads(core.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise fail("receipt finalization journal core is invalid", exc) from exc
+        canonical_core = (
+            json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        if core != canonical_core:
+            raise fail("receipt finalization journal core is not canonical JSON")
+        validated = receipt_file_contract(receipt, allow_unsigned=True)
+        return {
+            "descriptor": descriptor,
+            "parent": parent,
+            "name": name,
+            "identity": opened,
+            "receipt_identity": receipt_identity,
+            "core": core,
+            "receipt": validated,
+        }
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _find_failed_receipt_finalization_journal(
+    context: Context,
+    stage: PrivateDir,
+    expected_receipt: tuple[int, int, int, int, int, int, int],
+) -> dict[str, object] | None:
+    candidates: list[tuple[Anchor | PrivateDir, str]] = []
+    try:
+        names = tuple(os.listdir(context.runtime.descriptor))
+    except OSError as exc:
+        raise fail("could not enumerate receipt finalization journals", exc) from exc
+    for name in names:
+        if re.fullmatch(re.escape(_RECEIPT_JOURNAL_PREFIX) + r"[0-9a-f]{32}", name) is not None:
+            candidates.append((context.runtime, name))
+    if safe_leaf(
+        stage.descriptor,
+        _RECEIPT_JOURNAL_EVIDENCE,
+        label="retained receipt finalization journal",
+        required_mode=_RECEIPT_JOURNAL_MODE,
+    ) is not None:
+        candidates.append((stage, _RECEIPT_JOURNAL_EVIDENCE))
+    found: dict[str, object] | None = None
+    for parent, name in candidates:
+        record = _open_receipt_finalization_journal(parent, name, expected_receipt)
+        if record is None:
+            continue
+        if found is not None:
+            os.close(int(record["descriptor"]))
+            os.close(int(found["descriptor"]))
+            raise fail("multiple receipt finalization journals bind the failed receipt")
+        found = record
+    return found
+
+
+def _retain_receipt_finalization_journal(
+    context: Context,
+    stage: PrivateDir,
+    record: dict[str, object],
+) -> None:
+    parent = record["parent"]
+    name = record["name"]
+    assert isinstance(parent, (Anchor, PrivateDir))
+    assert isinstance(name, str)
+    if parent is stage and name == _RECEIPT_JOURNAL_EVIDENCE:
+        return
+    context.assert_all(phase="before retaining receipt finalization journal")
+    stage.assert_current(phase="before retaining receipt finalization journal")
+    if safe_leaf(
+        stage.descriptor,
+        _RECEIPT_JOURNAL_EVIDENCE,
+        label="retained receipt finalization journal",
+        required_mode=_RECEIPT_JOURNAL_MODE,
+    ) is not None:
+        raise fail("retained receipt finalization journal already exists")
+    try:
+        rename_noreplace(
+            parent.descriptor,
+            name,
+            stage.descriptor,
+            _RECEIPT_JOURNAL_EVIDENCE,
+            label="retain receipt finalization journal",
+        )
+    except (FileExistsError, FileNotFoundError) as exc:
+        raise fail("receipt finalization journal changed before retention", exc) from exc
+    moved = safe_leaf(
+        stage.descriptor,
+        _RECEIPT_JOURNAL_EVIDENCE,
+        label="retained receipt finalization journal",
+        required_mode=_RECEIPT_JOURNAL_MODE,
+    )
+    if moved is None or not same_after_rename(moved, record["identity"]):
+        raise fail("receipt finalization journal changed during retention")
+    fsync(parent.descriptor, label="receipt journal parent after retention")
+    fsync(stage.descriptor, label="runtime transaction after retaining receipt journal")
+    context.assert_all(phase="after retaining receipt finalization journal")
+    stage.assert_current(phase="after retaining receipt finalization journal")
+    record["parent"] = stage
+    record["name"] = _RECEIPT_JOURNAL_EVIDENCE
+
+
+def _materialize_failed_runtime_core(
+    context: Context,
+    journal: PrivateDir,
+    core: bytes,
+) -> tuple[int, int, int, int, int, int, int]:
+    """Publish a journal-bound unsigned core into the TLS rollback journal."""
+    existing = safe_leaf(
+        journal.descriptor,
+        _ROLLBACK_PRIOR_RECEIPT,
+        label=f"TLS journal {_ROLLBACK_PRIOR_RECEIPT}",
+        required_mode=0o644,
+    )
+    if existing is not None:
+        raw, observed = read_exact(
+            journal.descriptor,
+            _ROLLBACK_PRIOR_RECEIPT,
+            label=f"TLS journal {_ROLLBACK_PRIOR_RECEIPT}",
+            required_mode=0o644,
+        )
+        if raw != core:
+            raise fail("TLS journal retains a different failed runtime core")
+        return observed
+    context.assert_all(phase="before materializing failed runtime core")
+    journal.assert_current(phase="before materializing failed runtime core")
+    staging = ".rollback-prior-build-receipt.staging-" + secrets.token_hex(16)
+    staged = write_exclusive(
+        journal.descriptor,
+        staging,
+        core,
+        0o644,
+        label="staged failed runtime receipt",
+    )
+    try:
+        written, observed = read_exact(
+            journal.descriptor,
+            staging,
+            label="staged failed runtime receipt",
+            required_mode=0o644,
+        )
+        if written != core or not same_after_rename(observed, staged):
+            raise fail("staged failed runtime receipt changed before adoption")
+        context.assert_all(phase="immediately before adopting failed runtime core")
+        journal.assert_current(phase="immediately before adopting failed runtime core")
+        rename_noreplace(
+            journal.descriptor,
+            staging,
+            journal.descriptor,
+            _ROLLBACK_PRIOR_RECEIPT,
+            label="adopt failed runtime core",
+        )
+    except BaseException:
+        # The no-replace staging leaf is private evidence if a later step is
+        # interrupted; leave it for the next descriptor-bound retry.
+        raise
+    moved = safe_leaf(
+        journal.descriptor,
+        _ROLLBACK_PRIOR_RECEIPT,
+        label=f"TLS journal {_ROLLBACK_PRIOR_RECEIPT}",
+        required_mode=0o644,
+    )
+    if moved is None or not same_after_rename(moved, staged):
+        raise fail("failed runtime core changed during adoption")
+    fsync(journal.descriptor, label="TLS journal after adopting failed runtime core")
+    context.assert_all(phase="after adopting failed runtime core")
+    journal.assert_current(phase="after adopting failed runtime core")
+    return moved
+
+
 def adopt_failed_runtime_receipt(
     context: Context,
     journal: PrivateDir,
@@ -3085,6 +3367,7 @@ def adopt_failed_runtime_receipt(
         if re.fullmatch(re.escape(_RUNTIME_TRANSACTION_PREFIX) + r"[0-9a-f]{32}", name) is None:
             continue
         stage = open_private_dir(context.runtime, name, label="failed runtime receipt transaction")
+        journal_record: dict[str, object] | None = None
         try:
             stage_identity = safe_leaf(
                 stage.descriptor,
@@ -3103,11 +3386,22 @@ def adopt_failed_runtime_receipt(
                     allow_unattested=True,
                 )
             except TlsError:
-                # A retained partial or malformed attestation postimage is
-                # still evidence, but it cannot authorize a B generation.
-                # Leave it private and let the caller fail closed if no other
-                # bound transaction can prove the rollback.
-                continue
+                # A receipt interrupted after the preparer created its
+                # descriptor-bound journal is intentionally malformed.  The
+                # journal's core is the only complete B provenance available;
+                # bind it to this exact retained inode before adopting it.
+                journal_record = _find_failed_receipt_finalization_journal(
+                    context,
+                    stage,
+                    stage_identity,
+                )
+                if journal_record is None:
+                    continue
+                b_receipt = journal_record["receipt"]
+                b_identity = stage_identity
+                assert isinstance(b_receipt, dict)
+                b_outputs = runtime_output_expectations(b_receipt)
+                b_publication = tls_publication_contract(b_receipt["tls_publication"])
             current = b_publication["current"]
             prior = b_publication["prior"]
             assert isinstance(current, dict)
@@ -3135,6 +3429,33 @@ def adopt_failed_runtime_receipt(
                 expected, digest = b_outputs[path]
                 if not leaf_matches(parent, leaf, expected, digest, label=path):
                     raise fail(f"failed runtime receipt does not match current {path}")
+            if journal_record is not None:
+                context.assert_all(phase="before adopting interrupted runtime receipt")
+                journal.assert_current(phase="before adopting interrupted runtime receipt")
+                stage.assert_current(phase="before adopting interrupted runtime receipt")
+                try:
+                    held_fd = os.open("prior", _READ_FLAGS, dir_fd=stage.descriptor)
+                except OSError as exc:
+                    raise fail("could not hold interrupted runtime receipt", exc) from exc
+                try:
+                    held = file_identity(os.fstat(held_fd), label="held interrupted runtime receipt")
+                    if not same_object(held, stage_identity) or held[3] != 1:
+                        raise fail("interrupted runtime receipt changed before adoption")
+                    existing = _materialize_failed_runtime_core(
+                        context,
+                        journal,
+                        journal_record["core"],
+                    )
+                    _retain_receipt_finalization_journal(context, stage, journal_record)
+                    if not same_object(
+                        file_identity(os.fstat(held_fd), label="held interrupted runtime receipt"),
+                        held,
+                    ):
+                        raise fail("interrupted runtime receipt changed during adoption")
+                    adopted = True
+                finally:
+                    os.close(held_fd)
+                continue
             if existing is not None:
                 if not same_after_rename(existing, b_identity):
                     raise fail("TLS journal already retains a different failed runtime receipt")
@@ -3182,6 +3503,8 @@ def adopt_failed_runtime_receipt(
             finally:
                 os.close(held_fd)
         finally:
+            if journal_record is not None:
+                os.close(int(journal_record["descriptor"]))
             stage.close()
     return adopted
 
