@@ -382,14 +382,19 @@ def cmd_release_verify(args: argparse.Namespace) -> int:
 
 def cmd_release_install(args: argparse.Namespace) -> int:
     try:
+        install_kwargs = {
+            "root": getattr(args, "root", None),
+            "bin_dir": getattr(args, "bin_dir", None),
+            "python": getattr(args, "python", None),
+            "lock_timeout": float(getattr(args, "lock_timeout", 15.0)),
+            "production": True,
+        }
+        if bool(getattr(args, "recover_autostart", False)):
+            install_kwargs["recover_autostart"] = True
         payload = install_release(
             args.wheel,
             args.manifest,
-            root=getattr(args, "root", None),
-            bin_dir=getattr(args, "bin_dir", None),
-            python=getattr(args, "python", None),
-            lock_timeout=float(getattr(args, "lock_timeout", 15.0)),
-            production=True,
+            **install_kwargs,
         )
     except (BuildIdentityError, ReleaseError, OSError, ValueError) as exc:
         return _print_release_error("release-install", exc)
@@ -1839,6 +1844,11 @@ def build_parser() -> argparse.ArgumentParser:
     release_install.add_argument("--bin-dir", type=Path, default=None)
     release_install.add_argument("--python", type=Path, default=None)
     release_install.add_argument("--lock-timeout", type=float, default=15.0)
+    release_install.add_argument(
+        "--recover-autostart",
+        action="store_true",
+        help="repair an absent production autostart receipt for the selected release",
+    )
     release_install.set_defaults(func=cmd_release_install)
 
     release_rollback = release_sub.add_parser(

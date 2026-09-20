@@ -39,6 +39,10 @@ def test_release_parser_wires_all_read_and_mutation_subcommands() -> None:
     }
     for key, expected in cases.items():
         assert parser.parse_args(argv[key]).func is expected
+    assert parser.parse_args(
+        ["release", "install", "a.whl", "a.json", "--recover-autostart"]
+    ).recover_autostart is True
+    assert parser.parse_args(argv[("release", "install")]).recover_autostart is False
 
 
 def test_release_info_combines_runtime_and_managed_integrity() -> None:
@@ -98,6 +102,7 @@ def test_release_handlers_forward_exact_user_arguments() -> None:
                 bin_dir=Path("bin"),
                 python=None,
                 lock_timeout=2.5,
+                recover_autostart=True,
             ),
         )
     assert code == 0
@@ -109,6 +114,7 @@ def test_release_handlers_forward_exact_user_arguments() -> None:
         python=None,
         lock_timeout=2.5,
         production=True,
+        recover_autostart=True,
     )
 
     with mock.patch("termdeck.cli.rollback_release", return_value={"ok": True}) as rollback:

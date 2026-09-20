@@ -5954,6 +5954,148 @@ def test_production_install_repairs_descriptor_but_rejects_malformed_receipt(
     assert load_managed_state(layout)["current_release_id"] == manifest_a["release_id"]
 
 
+def test_production_install_recovers_missing_receipt_for_selected_release(
+    tmp_path: Path,
+) -> None:
+    wheel, manifest_path, manifest = artifact(tmp_path, "a")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    descriptor = tmp_path / "config" / "autostart" / "io.github.t1000.T1000.desktop"
+    descriptor.parent.mkdir(parents=True)
+    descriptor.write_bytes(
+        b"[Desktop Entry]\nExec=/opt/custom/t1000 gui\n"
+        b"X-T1000-Storage-Fabric=warp-drives-v1\n"
+    )
+    descriptor.chmod(0o644)
+
+    with production_autostart_environment(
+        bin_dir=bin_dir,
+        descriptor_path=descriptor,
+    ), mock.patch("termdeck.release_manager._verify_staged_import"):
+        first = install_release(
+            wheel,
+            manifest_path,
+            root=root,
+            bin_dir=bin_dir,
+            production=True,
+        )
+        layout = release_layout(root=root, bin_dir=bin_dir)
+        release_dir = Path(str(first["release_dir"]))
+        release_before = verify_installed_tree(release_dir)
+        release_files_before = {
+            path.relative_to(release_dir): (
+                stat.S_IMODE(path.lstat().st_mode),
+                sha256_file(path),
+            )
+            for path in release_dir.rglob("*")
+            if path.is_file()
+        }
+        state_before = layout.state_path.read_bytes()
+        stale_descriptor = (
+            b"[Desktop Entry]\nExec=/tmp/stale-t1000 gui\n"
+            b"X-T1000-Storage-Fabric=warp-drives-v1\n"
+        )
+        descriptor.write_bytes(stale_descriptor)
+        descriptor.chmod(0o644)
+        receipt_path = root / release_manager._AUTOSTART_RECEIPT_NAME
+        receipt_path.unlink()
+        assert not receipt_path.exists()
+
+        recovered = install_release(
+            wheel,
+            manifest_path,
+            root=root,
+            bin_dir=bin_dir,
+            production=True,
+            recover_autostart=True,
+        )
+
+        expected = release_manager._canonical_production_autostart_descriptor(layout)
+        state = load_managed_state(layout)
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        verified = release_manager._verify_production_autostart(layout, state)
+        status = managed_release_status(root=root, bin_dir=bin_dir, verify=True)
+        prior = receipt["prior_descriptor"]
+        backup = Path(prior["backup_path"])
+
+    assert recovered["idempotent"] is True
+    assert recovered["repaired"] is True
+    publication_preimages = {
+        item["path"]: item
+        for item in recovered["publication_receipt"]["preimages"]
+    }
+    assert publication_preimages[str(descriptor)]["sha256"] == sha256_bytes(stale_descriptor)
+    assert publication_preimages[str(receipt_path)]["exists"] is False
+    assert descriptor.read_bytes() == expected
+    assert stat.S_IMODE(descriptor.stat().st_mode) == 0o644
+    assert stat.S_IMODE(receipt_path.stat().st_mode) == 0o600
+    assert receipt["active_release_id"] == manifest["release_id"]
+    assert receipt["descriptor_sha256"] == sha256_bytes(expected)
+    assert receipt["state_sha256"] == sha256_bytes(canonical_json_bytes(state))
+    assert receipt["prior_descriptor"]["sha256"] == sha256_bytes(stale_descriptor)
+    assert receipt["prior_descriptor"]["size"] == len(stale_descriptor)
+    assert backup.read_bytes() == stale_descriptor
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+    assert verified == recovered["autostart"]
+    assert status["ok"] is True
+    assert status["autostart"] == verified
+    assert layout.state_path.read_bytes() == state_before
+    assert verify_installed_tree(release_dir) == release_before
+    release_files_after = {
+        path.relative_to(release_dir): (
+            stat.S_IMODE(path.lstat().st_mode),
+            sha256_file(path),
+        )
+        for path in release_dir.rglob("*")
+        if path.is_file()
+    }
+    assert release_files_after == release_files_before
+
+
+def test_production_autostart_recovery_rejects_new_release_and_noncanonical_root(
+    tmp_path: Path,
+) -> None:
+    wheel_a, manifest_a_path, _manifest_a = artifact(tmp_path, "a")
+    wheel_b, manifest_b_path, _manifest_b = artifact(tmp_path, "b")
+    root = tmp_path / "managed"
+    bin_dir = tmp_path / "bin"
+    descriptor = tmp_path / "config" / "autostart" / "io.github.t1000.T1000.desktop"
+
+    with production_autostart_environment(
+        bin_dir=bin_dir,
+        descriptor_path=descriptor,
+    ), mock.patch("termdeck.release_manager._verify_staged_import"):
+        install_release(
+            wheel_a,
+            manifest_a_path,
+            root=root,
+            bin_dir=bin_dir,
+            production=True,
+        )
+        receipt_path = root / release_manager._AUTOSTART_RECEIPT_NAME
+        receipt_path.unlink()
+        with pytest.raises(ReleaseError, match="idempotent managed release"):
+            install_release(
+                wheel_b,
+                manifest_b_path,
+                root=root,
+                bin_dir=bin_dir,
+                production=True,
+                recover_autostart=True,
+            )
+
+    isolated_root = tmp_path / "isolated"
+    with pytest.raises(ReleaseError, match="canonical production root"):
+        install_release(
+            wheel_a,
+            manifest_a_path,
+            root=isolated_root,
+            bin_dir=tmp_path / "isolated-bin",
+            production=False,
+            recover_autostart=True,
+        )
+
+
 def test_production_install_rejects_symlinked_autostart_without_publishing_activation(
     tmp_path: Path,
 ) -> None:

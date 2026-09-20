@@ -11029,6 +11029,7 @@ def _prepare_production_autostart_publication(
     *,
     prior_state: Mapping[str, object],
     state: Mapping[str, object],
+    recover_missing_receipt: bool = False,
 ) -> _AutostartPublication:
     descriptor_path = _production_autostart_path()
     receipt_path = _production_autostart_receipt_path(layout)
@@ -11056,9 +11057,18 @@ def _prepare_production_autostart_publication(
         prior_descriptor = existing_receipt["prior_descriptor"]
     else:
         if int(prior_state.get("generation", 0)) > 0:
-            raise ReleaseError(
-                "production autostart receipt is missing for an existing managed generation"
-            )
+            if not recover_missing_receipt:
+                raise ReleaseError(
+                    "production autostart receipt is missing for an existing managed generation"
+                )
+            # Receipt recovery is a cutover repair for the release that is
+            # already selected.  A new release must use the ordinary,
+            # receipt-authenticated install path so a missing receipt cannot
+            # be used to adopt an unrelated activation.
+            if prior_state.get("current_release_id") != state.get("current_release_id"):
+                raise ReleaseError(
+                    "autostart receipt recovery requires an idempotent managed release"
+                )
         prior_descriptor = _backup_autostart_descriptor(
             layout,
             descriptor_path,
@@ -11617,6 +11627,7 @@ def install_release(
     python: str | Path | None = None,
     lock_timeout: float = 15.0,
     production: bool | None = None,
+    recover_autostart: bool = False,
     before_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
     after_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
     after_recovery: Callable[[PublicationTransactionReceipt], None] | None = None,
@@ -11627,6 +11638,10 @@ def install_release(
         layout,
         production=production,
     )
+    if recover_autostart and not manage_autostart:
+        raise ReleaseError(
+            "autostart recovery requires the canonical production root"
+        )
     storage_attestation = _require_managed_storage(layout) if production else None
     storage_binding = (
         _storage_attestation_binding(storage_attestation)
@@ -11813,6 +11828,7 @@ def install_release(
                 layout,
                 prior_state=state,
                 state=new_state,
+                recover_missing_receipt=recover_autostart,
             )
             if manage_autostart
             else None
