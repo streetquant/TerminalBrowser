@@ -4,35 +4,39 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
+import palettePacks from "./terminal-palettes.json";
 
 const DEFAULT_FONT_SIZE = 13;
 const MIN_FONT_SIZE = 7;
 const TEXT_ENCODER = new TextEncoder();
 
-const DEFAULT_THEME = Object.freeze({
-  background: "#0a0d13",
-  foreground: "#dfe6f2",
-  cursor: "#82aaff",
-  cursorAccent: "#0a0d13",
-  selectionBackground: "#82aaff55",
-  selectionInactiveBackground: "#82aaff2f",
-  black: "#0a0d13",
-  red: "#f7768e",
-  green: "#4fd6be",
-  yellow: "#e0af68",
-  blue: "#82aaff",
-  magenta: "#c792ea",
-  cyan: "#73daca",
-  white: "#d8dee9",
-  brightBlack: "#94a0b8",
-  brightRed: "#ff8b96",
-  brightGreen: "#9af0bd",
-  brightYellow: "#ffe08a",
-  brightBlue: "#9bbcff",
-  brightMagenta: "#ddb0ff",
-  brightCyan: "#9ce7dc",
-  brightWhite: "#ffffff",
+const FONTS = Object.freeze({
+  auto: ['Automatic monospace', '"Cascadia Mono", "JetBrains Mono", "Iosevka Term", "SFMono-Regular", Consolas, "Liberation Mono", monospace'],
+  system: ['System monospace', 'monospace'],
+  jetbrains: ['JetBrains Mono', '"JetBrains Mono", monospace'],
+  cascadia: ['Cascadia Mono', '"Cascadia Mono", monospace'],
+  iosevka: ['Iosevka Term', '"Iosevka Term", monospace'],
+  liberation: ['Liberation Mono', '"Liberation Mono", monospace'],
 });
+const ANSI_COLORS = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white',
+  'brightBlack', 'brightRed', 'brightGreen', 'brightYellow', 'brightBlue', 'brightMagenta', 'brightCyan', 'brightWhite'];
+
+function paletteTheme(name) {
+  const pack = palettePacks[Object.hasOwn(palettePacks, name) ? name : 't1000'];
+  return {
+    background: pack.background, foreground: pack.foreground, cursor: pack.cursor,
+    cursorAccent: pack.background, selectionBackground: `${pack.cursor}55`,
+    selectionInactiveBackground: `${pack.cursor}2f`,
+    ...Object.fromEntries(ANSI_COLORS.map((color, index) => [color, pack.palette[index]])),
+  };
+}
+
+export function appearanceOptions() {
+  return {
+    palettes: Object.entries(palettePacks).map(([value, pack]) => ({ value, label: pack.label })),
+    fonts: Object.entries(FONTS).map(([value, font]) => ({ value, label: font[0] })),
+  };
+}
 
 function byteStringToUint8Array(value) {
   const bytes = new Uint8Array(value.length);
@@ -50,14 +54,14 @@ export function createTerminal(element, options = {}) {
     allowProposedApi: false,
     allowTransparency: false,
     convertEol: false,
-    cursorBlink: true,
-    cursorStyle: "block",
+    cursorBlink: options.cursorBlink !== false,
+    cursorStyle: ["block", "bar", "underline"].includes(options.cursorStyle) ? options.cursorStyle : "block",
     disableStdin: false,
     drawBoldTextInBrightColors: true,
     fastScrollModifier: "alt",
     fontFamily:
       options.fontFamily ||
-      '"Cascadia Mono", "JetBrains Mono", "Iosevka Term", "SFMono-Regular", Consolas, "Liberation Mono", monospace',
+      FONTS[Object.hasOwn(FONTS, options.font) ? options.font : 'auto'][1],
     fontSize: Number.isFinite(options.fontSize) ? options.fontSize : DEFAULT_FONT_SIZE,
     fontWeight: "400",
     fontWeightBold: "700",
@@ -69,10 +73,12 @@ export function createTerminal(element, options = {}) {
     rightClickSelectsWord: false,
     scrollback: Number.isSafeInteger(options.scrollback) ? options.scrollback : 10000,
     smoothScrollDuration: 0,
-    theme: { ...DEFAULT_THEME, ...(options.theme || {}) },
+    theme: { ...paletteTheme(options.palette), ...(options.cursorColor ? {cursor: options.cursorColor} : {}), ...(options.theme || {}) },
     windowsMode: false,
   });
   const fitAddon = new FitAddon();
+  const syncBackground = () => element.style.setProperty("--td-terminal-bg", terminal.options.theme.background);
+  syncBackground();
   const searchAddon = new SearchAddon();
   const webLinksAddon = new WebLinksAddon(undefined, (_event, uri) => {
     const parsed = new URL(uri, window.location.href);
@@ -287,6 +293,34 @@ export function createTerminal(element, options = {}) {
     },
     searchPrevious(query, searchOptions) {
       return searchAddon.findPrevious(String(query), searchOptions || {});
+    },
+    clearSearch() {
+      searchAddon.clearDecorations();
+    },
+    setAppearance(value) {
+      if (!Number.isInteger(value.fontSize) || value.fontSize < 10 || value.fontSize > 72
+          || !["block", "bar", "underline"].includes(value.cursorStyle)
+          || typeof value.cursorBlink !== "boolean"
+          || (value.palette !== undefined && !Object.hasOwn(palettePacks, value.palette))
+          || (value.font !== undefined && !Object.hasOwn(FONTS, value.font))
+          || (value.fontFamily !== undefined && (typeof value.fontFamily !== "string" || value.fontFamily.length > 128))
+          || (value.cursorColor && !/^#[0-9a-f]{6}$/i.test(value.cursorColor))
+          || (value.scrollback !== undefined && (!Number.isInteger(value.scrollback) || value.scrollback < 100 || value.scrollback > 500000))) {
+        throw new TypeError("Invalid terminal appearance.");
+      }
+      const grid = lastGridFit && { columns: lastGridFit.columns, rows: lastGridFit.rows };
+      options.fontSize = value.fontSize;
+      terminal.options.cursorStyle = value.cursorStyle;
+      terminal.options.cursorBlink = value.cursorBlink;
+      if (value.palette !== undefined) terminal.options.theme = paletteTheme(value.palette);
+      if (value.font !== undefined) terminal.options.fontFamily = FONTS[value.font][1];
+      if (value.fontFamily) terminal.options.fontFamily = `${value.fontFamily}, monospace`;
+      if (value.cursorColor) terminal.options.theme = {...terminal.options.theme, cursor: value.cursorColor};
+      syncBackground();
+      if (value.scrollback !== undefined) terminal.options.scrollback = value.scrollback;
+      invalidateFontMetrics();
+      if (grid) fitGrid(grid.columns, grid.rows);
+      else terminal.options.fontSize = value.fontSize;
     },
     onData(callback) {
       const dataSubscription = terminal.onData((value) => callback(TEXT_ENCODER.encode(value)));

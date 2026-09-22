@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::error::Error;
 use std::ffi::OsString;
@@ -133,7 +133,124 @@ pub(crate) struct TabActionResult {
     pub payload: Value,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct HiddenTab {
+    pub id: String,
+    pub name: String,
+    pub cwd: String,
+    pub status: String,
+    pub visible: bool,
+    pub window_id: String,
+}
+
+fn hidden_tabs(payload: Value, window_id: &str) -> Result<Vec<HiddenTab>, TabActionError> {
+    let records: Vec<HiddenTab> = serde_json::from_value(payload)?;
+    if records.len() > 16_384 {
+        return Err(TabActionError::InvalidIdentity);
+    }
+    let mut result = Vec::new();
+    for tab in records {
+        validate_identity(&tab.id)?;
+        if tab.window_id != window_id {
+            return Err(TabActionError::InvalidIdentity);
+        }
+        validate_text(&tab.name, 2_048, true).map_err(|_| TabActionError::InvalidName)?;
+        validate_text(&tab.cwd, MAX_TAB_CWD_BYTES, false)
+            .map_err(|_| TabActionError::InvalidCwd)?;
+        if !tab.visible
+            && matches!(
+                tab.status.as_str(),
+                "running" | "paused" | "missing" | "recovery-pending" | "new"
+            )
+        {
+            result.push(tab);
+        }
+    }
+    Ok(result)
+}
+
 impl TabActionService {
+    pub(crate) async fn manage(&self, request: Value) -> Result<Value, TabActionError> {
+        let operation = request.get("operation").and_then(Value::as_str);
+        if !matches!(
+            operation,
+            Some(
+                "list"
+                    | "create-window"
+                    | "rename-window"
+                    | "reorder"
+                    | "move"
+                    | "bulk"
+                    | "rename"
+                    | "capture"
+                    | "appearance"
+            )
+        ) {
+            return Err(TabActionError::InvalidAction);
+        }
+        let encoded = serde_json::to_string(&request)?;
+        if encoded.len() > 65_536 {
+            return Err(TabActionError::InvalidCommand);
+        }
+        self.run(&[
+            OsString::from("web-manage"),
+            OsString::from("--db"),
+            self.database_path.as_os_str().to_owned(),
+            OsString::from("--request"),
+            OsString::from(encoded),
+        ])
+        .await
+    }
+
+    pub(crate) async fn hidden(&self, window_id: &str) -> Result<Vec<HiddenTab>, TabActionError> {
+        validate_identity(window_id)?;
+        let payload = self
+            .run(&[
+                OsString::from("sessions"),
+                OsString::from("--db"),
+                self.database_path.as_os_str().to_owned(),
+                OsString::from("--window-id"),
+                OsString::from(window_id),
+            ])
+            .await?;
+        hidden_tabs(payload, window_id)
+    }
+
+    pub(crate) async fn restore(
+        &self,
+        window_id: &str,
+        window_title: &str,
+        session_id: &str,
+    ) -> Result<TabActionResult, TabActionError> {
+        validate_identity(session_id)?;
+        validate_text(window_title, 2_048, false).map_err(|_| TabActionError::InvalidIdentity)?;
+        if !self
+            .hidden(window_id)
+            .await?
+            .iter()
+            .any(|tab| tab.id == session_id)
+        {
+            return Err(TabActionError::InvalidIdentity);
+        }
+        let payload = self
+            .run(&[
+                OsString::from("show"),
+                OsString::from("--db"),
+                self.database_path.as_os_str().to_owned(),
+                OsString::from("--window-id"),
+                OsString::from(window_id),
+                OsString::from("--window-title"),
+                OsString::from(window_title),
+                OsString::from(session_id),
+            ])
+            .await?;
+        Ok(TabActionResult {
+            schema: "termdeck.tab-action.v1",
+            action: "show",
+            payload,
+        })
+    }
+
     pub(crate) fn new(
         executable: PathBuf,
         database_path: PathBuf,
@@ -339,8 +456,61 @@ fn bounded_lossy(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExistingTabAction, TabActionError, validate_cwd, validate_identity, validate_text,
+        ExistingTabAction, TabActionError, hidden_tabs, validate_cwd, validate_identity,
+        validate_text,
     };
+
+    #[test]
+    fn management_rejects_unknown_operations_and_oversize_before_spawning() {
+        let service = super::TabActionService::new(
+            std::path::PathBuf::from("/no-such-t1000-fixture"),
+            std::path::PathBuf::from("/tmp/no-such-registry-fixture"),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_or_else(|error| panic!("fixture: {error}"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("runtime: {error}"));
+        runtime.block_on(async {
+            for payload in [
+                serde_json::json!({"operation":"run-shell"}),
+                serde_json::json!([]),
+                serde_json::json!({"operation":[]}),
+            ] {
+                assert!(matches!(
+                    service.manage(payload).await,
+                    Err(TabActionError::InvalidAction)
+                ));
+            }
+            let oversized = serde_json::json!({"operation":"list", "query":"x".repeat(65_536)});
+            assert!(matches!(
+                service.manage(oversized).await,
+                Err(TabActionError::InvalidCommand)
+            ));
+        });
+    }
+
+    #[test]
+    fn hidden_list_is_window_scoped_and_excludes_killed_tabs() {
+        let payload = serde_json::json!([
+            {"id":"td-hidden","name":"Hidden","cwd":"/tmp","status":"running","visible":false,"window_id":"main","command":"not returned"},
+            {"id":"td-visible","name":"Visible","cwd":"/tmp","status":"running","visible":true,"window_id":"main"},
+            {"id":"td-killed","name":"Killed","cwd":"/tmp","status":"stopped","visible":false,"window_id":"main"}
+        ]);
+        let hidden = hidden_tabs(payload.clone(), "main")
+            .unwrap_or_else(|error| panic!("valid hidden tabs: {error}"));
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].id, "td-hidden");
+        assert!(
+            !serde_json::to_string(&hidden)
+                .unwrap_or_else(|error| panic!("serialize: {error}"))
+                .contains("command")
+        );
+        assert!(hidden_tabs(payload, "other-window").is_err());
+        assert!(hidden_tabs(serde_json::json!({}), "main").is_err());
+        assert!(hidden_tabs(serde_json::json!([{"id":"td-missing-fields"}]), "main").is_err());
+    }
 
     #[test]
     fn action_parser_is_a_fixed_allowlist() {

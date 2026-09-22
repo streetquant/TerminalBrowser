@@ -95,7 +95,9 @@ class CliTests(unittest.TestCase):
         parser = build_parser()
         subparsers = [action for action in parser._actions if isinstance(action, argparse._SubParsersAction)]
         self.assertEqual(len(subparsers), 1)
-        choices = sorted(subparsers[0].choices)
+        choices = sorted(name for name in subparsers[0].choices if name != "web-manage")
+        management = parser.parse_args(["web-manage", "--request", '{"operation":"list"}'])
+        self.assertTrue(management._uses_session_db)
         self.assertEqual(choices, ['activity', 'adopt-tmux', 'archive', 'auth', 'auth-gc', 'budget-plan', 'capture', 'checkpoint', 'control-plan', 'diagnose-freeze', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-checkpoint-service', 'install-desktop', 'kill', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'quickstart', 'recently-closed', 'reconcile', 'recovery-intent', 'recovery-qualification', 'release', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'terminator-workspace', 'uninstall-checkpoint-service', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
 
 

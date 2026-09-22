@@ -187,6 +187,33 @@ class PaneStreamControllerTests(unittest.TestCase):
         self.assertIn(b"prompt$", data)
         self.assertEqual(client.count("-S -120 -E -1"), 1)
 
+    def test_normal_replay_avoids_hard_blank_padding_that_breaks_resize(self) -> None:
+        controller, client, outputs = self.make_controller()
+        client.script("list-panes", CommandResult(True, (state_line(cursor_y="1"),), None))
+        client.script("capture-pane", CommandResult(True, ("prompt$", "", "    ", ""), None))
+        controller.start(columns=80, rows=24)
+        client.connect()
+        wait_until(lambda: outputs)
+        replay = b"".join(outputs)
+        self.assertIn(b"prompt$", replay)
+        self.assertIn(b"\x1b[2;1H", replay)
+        self.assertNotIn(b"\x1b[2K", replay)
+        self.assertNotIn(b"\r\n", replay)
+
+    def test_replay_retains_styled_blanks_and_alternate_screen_padding(self) -> None:
+        for alternate in ("0", "1"):
+            with self.subTest(alternate=alternate):
+                controller, client, outputs = self.make_controller()
+                client.script("list-panes", CommandResult(True, (state_line(alternate_on=alternate),), None))
+                client.script("capture-pane", CommandResult(True, ("prompt$", "\x1b[44m   ", ""), None))
+                controller.start(columns=80, rows=24)
+                client.connect()
+                wait_until(lambda: outputs)
+                replay = b"".join(outputs)
+                self.assertIn(b"\x1b[44m   ", replay)
+                self.assertEqual(replay.count(b"\r\n"), 2 if alternate == "1" else 1)
+                self.assertEqual(b"\x1b[2K" in replay, alternate == "1")
+
     def test_capture_replay_restores_utf8_and_escape_bytes_exactly(self) -> None:
         controller, client, outputs = self.make_controller()
         history = "• Explored └ history".encode()
@@ -692,7 +719,12 @@ class PaneStreamControllerTests(unittest.TestCase):
 
         paint_prefix = b"\x1b[0m\x1b[?6l\x1b[4l\x1b[?7l"
         self.assertIn(paint_prefix, replay)
-        self.assertGreaterEqual(replay.count(b"\x1b[0m\r\x1b[2K"), 2)
+        # Normal-screen replay clears once before painting. Per-row EL makes
+        # hard blank padding in VTE and breaks subsequent narrow-window reflow.
+        self.assertLess(replay.index(b"\x1b[2J\x1b[H"), replay.index(b"A" * 80))
+        self.assertGreaterEqual(replay.count(b"\x1b[0m\r"), 2)
+        self.assertNotIn(b"\x1b[2K", replay)
+        self.assertIn(b"A" * 80 + b"\x1b[0m\r\n\x1b[0m\r\x1b[48;5;237m" + b"B" * 80, replay)
         absolute_cursor = b"\x1b[2;8H"
         self.assertIn(absolute_cursor, replay)
         self.assertLess(replay.rfind(b"\x1b[?6h"), replay.rfind(absolute_cursor))

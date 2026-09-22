@@ -1763,6 +1763,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"t1000 {__version__}")
     sub = parser.add_subparsers(dest="command")
 
+    from .web_management import command as web_management_command
+    management = sub.add_parser("web-manage", help="exact-identity window and tab management")
+    management.add_argument("--db", type=Path, default=None)
+    management.add_argument("--request", required=True)
+    management.set_defaults(func=web_management_command)
+
     doctor = sub.add_parser("doctor", help="check system dependencies")
     doctor.set_defaults(func=cmd_doctor)
 

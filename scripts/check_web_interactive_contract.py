@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FILES = {
     "app": ROOT / "web/crates/termdeck-web-server/assets/app.js",
+    "workspace_ui": ROOT / "web/crates/termdeck-web-server/assets/workspace-ui.js",
     "css": ROOT / "web/crates/termdeck-web-server/assets/app.css",
     "server": ROOT / "web/crates/termdeck-web-server/src/lib.rs",
     "stream": ROOT / "web/crates/termdeck-web-server/src/terminal_stream.rs",
@@ -85,7 +86,7 @@ def main() -> None:
         'data-termdeck-pane=\\"',
         ".active_pane_id()",
         ".or_else(|| window.panes().first().map(PaneSnapshot::id))",
-        "/_termdeck/assets/v5/app.css",
+        "/_termdeck/assets/v6/app.css",
         "public, max-age=86400, immutable",
     ):
         require(server_production, needle, "immediate pane bootstrap")

@@ -629,8 +629,15 @@ impl TerminalService {
         let mut stdin = child.stdin.take().ok_or_else(|| {
             TerminalError::Io(std::io::Error::other("tmux stdin was unavailable"))
         })?;
-        stdin.write_all(bytes).await?;
-        stdin.shutdown().await?;
+        timeout(self.command_timeout, async {
+            stdin.write_all(bytes).await?;
+            stdin.shutdown().await
+        })
+        .await
+        .map_err(|_| TerminalError::TmuxTimeout)??;
+        // tmux load-buffer reads until EOF. AsyncWrite::shutdown does not close
+        // this pipe; retaining the taken handle makes both processes wait.
+        drop(stdin);
         let output = timeout(self.command_timeout, child.wait_with_output())
             .await
             .map_err(|_| TerminalError::TmuxTimeout)??;
@@ -776,6 +783,58 @@ mod tests {
             std::time::Duration::from_millis(100),
         )
         .unwrap_or_else(|error| panic!("service: {error}"))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn text_paste_closes_stdin_before_waiting_and_does_not_repeat_input() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _result = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = Directory(std::env::temp_dir().join(format!(
+            "t1000-paste-test-{}",
+            super::random_lease_id().unwrap_or_else(|error| panic!("random: {error}"))
+        )));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory.0)
+            .unwrap_or_else(|error| panic!("directory: {error}"));
+        let executable = directory.0.join("tmux-fixture");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nset -eu\ncase \"$1\" in\nload-buffer) cat > \"$0.buffer\";;\npaste-buffer) cat \"$0.buffer\" >> \"$0.pasted\";;\n*) exit 1;;\nesac\n",
+        )
+        .unwrap_or_else(|error| panic!("fixture: {error}"));
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|error| panic!("permissions: {error}"));
+        let service = TerminalService::new(
+            OwnerId::new("owner-test").unwrap_or_else(|error| panic!("owner: {error}")),
+            executable,
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap_or_else(|error| panic!("service: {error}"));
+        service
+            .acquire("pane-1", "device-1", 10, false)
+            .await
+            .unwrap_or_else(|error| panic!("acquire: {error}"));
+        let text = "x".repeat(super::MAX_TERMINAL_INPUT_BYTES);
+        for now in [11, 12] {
+            let view = service
+                .send_text("pane-1", "device-1", "fixture", 1, &text, now)
+                .await
+                .unwrap_or_else(|error| panic!("paste: {error}"));
+            assert_eq!(view.next_sequence, Some(2));
+            assert!(!view.indeterminate);
+        }
+        assert_eq!(
+            std::fs::read(directory.0.join("tmux-fixture.pasted"))
+                .unwrap_or_else(|error| panic!("pasted input: {error}")),
+            text.as_bytes()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

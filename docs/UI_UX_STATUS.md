@@ -1,144 +1,218 @@
-# Desktop and web UI/UX work
+# t1000 UI/UX and performance status
 
-Audit date: 22 September 2026. This checklist concerns the source checkout;
-production installation and validation are separate outcomes. Existing terminal
-sessions, remembered tabs, authentication scopes, and working directories must
-survive any release.
+Updated 22 September 2026. This reports source changes, not a live deployment.
+The user subsequently approved safe live repair. Installation is blocked by the
+privileged preparation and ownership issues below, not by missing user approval.
+Cloudflare remains deferred in BR (`t1000-cloud-tunnel-tw9`); see the
+[BR/BV handoff guide](BEADS_WORKFLOW.md). This work has not changed
+production services or saved session state.
 
-The cross-session handoff is [todo.md](../todo.md). Its active UI-session ID
-matched this audit session. Completed colocated-path checks in that handoff are
-not rerun here, and storage cutover is not part of UI validation.
+## Current interface
 
-## Commit and installation status
+The desktop app is the visual and interaction reference. The web app now uses
+its exact chrome/terminal token families, a compact searchable window list, and a desktop-style
+Tabs pane. The default is flat charcoal with an emerald accent; ink/blue,
+paper/cobalt and system themes are also available. Rust/xterm and GTK/VTE were retained:
+the measured problems did not require a stack replacement. Real interaction
+checks qualify behavior; screenshots qualify only the observed layout.
 
-The implementation is committed: `ca1b34a` contains the colocated deployment
-migration, `1c1e4fb` the desktop/web UI and performance work, and `69dcb40` the
-release smoke and verification documentation. The clean v0.2.21 wheel builds
-reproducibly and verifies all 78 members. No remote push was requested.
+Design self-review: **8/10, subjective, not user approval**. The refactoring-ui
+skill informed the restrained color/spacing hierarchy, flat tabs, visible focus,
+responsive controls and confirmation defaults. The remaining gap to 10 is
+physical-client font/contrast and interaction review with the user, plus live
+deployment validation. Feature tests and screenshots are not a design acceptance
+score. No overall production completion is claimed.
 
-Installation is blocked before live activation. The migrated managed-state
-file still identifies `/warp/runtime/termdeck/bin/t1000` as its stable launcher;
-the installer explicitly rejects changing that binding in place. Recovery,
-runtime-attestation, and preparer-broker services are absent. The privileged
-tmpfiles template also needs an ownership review before applying it to the
-now-shared `.termdeck` directory containing user state and managed releases.
-Do not edit authenticated state hashes or apply that ownership change blindly.
-The running backend and HTTPS edge remain healthy and unchanged. Complete
-canonical production qualification and guarded activation remain outstanding.
+## Desktop/web parity
 
-## Current implementation checklist
+| Capability | Current source result |
+| --- | --- |
+| Password-only login | One password field; automatic browser name. Initial setup confirms the password. Real form submission, incorrect passwords and mobile layout verified |
+| Terminal I/O | Real tmux/WebSocket input, ANSI, alternate screen, Unicode buffer state, paste, mouse, replay and reconnect qualified |
+| New tab | Working directory, optional name/command and pin state; opens the real new terminal |
+| Rename / kill | In-app dialogs with keyboard focus, safe Cancel default for kill and persistent failures; successful kill removes the tab and stops its process |
+| Pause / resume | Real fixture process status changes; status-correct menu |
+| Pin / unpin | One correct action, pin indicator, additive snapshot field and revision binding |
+| Hide / reopen | Hide preserves the process. Hidden tabs are scoped to this window; reopening preserves the exact pane PID and requires CSRF |
+| Search tabs | Name/directory filter with keyboard navigation and direct selection |
+| Command palette | New tab, hidden tabs, find, appearance, shortcuts, rename, hide and tab results |
+| Find in terminal | Actual xterm search, previous/next, selected match and no-match feedback |
+| Appearance | All seven exact desktop terminal palettes; installed/custom fonts, maximum text size, cursor color/shape/blink, scrollback, reset and persistence; canonical desktop grid unchanged |
+| Shortcut help | New tab, search, palette, find, switching, rename, context actions and Escape |
+| Window overview | Searchable list; refresh preserves query and keyboard focus |
+| Create / rename windows | Durable empty-window creation and rename, resolved through canonical routes; no process restart |
+| Move / reorder tabs; bulk hide | Cross-window moves preserve PID/tmux identities; drag and Ctrl+Shift+PageUp/PageDown reorder; stale edits fail without partial changes; Hide others/right with Cancel and pin protection |
+| Desktop Tabs sidebar | Basic single-tab pane implemented: filter, tab/cwd details, navigation, rename/pin/hide, left/right placement, hide/show and layout persistence; compact screens use an overlay |
+| Tab manager | Multi-selection, global sorting/search, window/history filters, 100-row pages, live PID/state/health/CPU/RAM/process-count/runtime/shortcut/command/directory columns, redacted preview, open/rename/move and bulk lifecycle actions |
+| Manager input | Explicitly confirmed Send text, Send + Enter and Status request; exact targets, controller/sequence receipts, no uncertain-input retry, normal keyboard control returns afterwards |
+| Interface settings | Four chrome themes, density, interface font/scale, sidebar placement/visibility and reduced motion |
+| Desktop settings exchange | Explicit import and consent-gated save, revision checks and preservation of unrelated config. Defaults apply on next desktop launch; no running session is restarted. Client-installed fonts still determine browser rendering |
 
-| Priority | Work | State and evidence |
-|---|---|---|
-| 1 | Use `t1000` consistently in visible desktop and browser branding | Implemented in source, including window/menu titles, desktop launchers, browser login/recovery pages, accessibility labels, help and current documentation. Internal IDs, service/path names, authentication headers and cookies are unchanged by explicit user choice |
-| 1 | Ask only for a password when signing in | Implemented in source; device names are automatic (`Browser`). Initial password setup still confirms the password. The regression verifies field counts, password-manager autocomplete, independent sessions and rejected submissions. The live form remains unchanged pending guarded activation |
-| 1 | Desktop layout, controls, focus visibility and compact-window usability | Implemented; long-label account selector bounded to 148 px (previously 328 px); visible keyboard focus; focused GTK tests pass. Actual terminal screenshots pass at 693×480, 1290×848 and 1440×900. The verified desktop minimum remains 693 px |
-| 1 | Responsive browser shell, accessible navigation and narrow-screen controls | Implemented and qualified; mobile safe areas and touch targets, keyboard tab navigation, click-to-type and stable refresh DOM. All 22 integrated Chromium assertions pass, including desktop, compact and mobile layout |
-| 1 | Reduce redundant browser terminal layout/rendering work | Implemented; redundant resize suppression, fit caching with font/layout invalidation, shared input encoder and listener cleanup. Three frontend regression tests and the integrated browser proof pass |
-| 1 | Repair the performance CI command and make measurement failures fail the gate | Implemented; `tests/test_perf_probe.py` exercises workload selection, errors, invalid samples and budget failures |
-| 2 | Prevent browser terminal performance and bundle regressions | Implemented; `npm test` and deterministic asset rebuild checks added to CI |
-| 1 | Repair the release smoke's dirty-candidate installation failure | Implemented and verified end to end using a disposable committed source snapshot; the production clean-source gate remains enforced |
-| 2 | Validate rendering and terminal behavior without touching live sessions | Complete for this source pass; isolated desktop, recovery, release and browser checks pass. Installed-release qualification remains separate |
+The requested management and appearance controls are implemented, not placeholders.
+Production activation and physical-client validation remain open in BR
+(`t1000-deploy-xeh` and `t1000-physical-qzr`). `todo.md` is retired.
+This does not claim parity with unrelated desktop process-monitor, recovery or
+Codex-captain subsystems; those are outside this UI/UX task.
 
-## Performance evidence and limits
+## Root causes repaired
 
-The former CI command supplied `--sessions` and `--assert-thresholds`, which the
-probe did not accept. The probe now accepts both options, reports its workload and
-scope, rejects missing or invalid measurements, and exits unsuccessfully on probe
-errors or requested budget failures. CI measures 100 synthetic sessions over 200
-iterations instead of attempting five iterations with unsupported arguments.
+- `Referrer-Policy: no-referrer` stripped Chromium native password POST Origin,
+  causing authority rejection. `same-origin` preserves local form provenance
+  while suppressing cross-origin referrers. Host/origin/CSRF gates remain strict.
+- Native browser Rename/Kill prompts were replaced with accessible dialogs.
+  Action failures now survive metadata refresh and reconnect instead of vanishing.
+- Search inputs consumed Escape without closing the dialog. Explicit handling
+  now closes it; tool shortcuts are verified not to leak bytes into the PTY.
+  Search results wrap correctly with Up/Down, and selecting or reopening a tab
+  returns focus to its terminal rather than the toolbar.
+- Missing pin metadata caused simultaneous contradictory Pin/Unpin controls.
+- HTTP text paste held its stdin pipe open while waiting for `tmux load-buffer`
+  to exit. Closing the pipe after the bounded write fixes the deadlock. A 64 KiB
+  subprocess regression verifies EOF and duplicate acknowledgment without
+  repeated input; real browser checks verify two actual fixture terminals.
+- Manager CPU sampling previously had no preceding counter in a fresh helper
+  process. Two bounded samples now provide a real delta instead of permanent
+  misleading zero. Telemetry refresh runs only while the manager is open/visible.
+- Large interface scale now expands chrome rows; tabs fit the strip instead of
+  clipping their active underline. Terminal host backgrounds follow the terminal
+  palette, eliminating mismatched blocks after appearance changes.
+- Refreshes that changed selected-tab metadata rebuilt the action menu and
+  discarded its focused control. Menu nodes now remain mounted and update in
+  place; the browser regression changes pin state externally through the
+  disposable CLI while verifying exact focus/node preservation.
+- Web ANSI colors had drifted from the desktop palette. Every built-in palette
+  now matches the desktop definitions, guarded by an exact cross-client test.
+- Desktop compact replay materialized full-row padding and trailing empty lines,
+  causing VTE reflow to move visible content away. Normal replay now uses its
+  existing full-screen clear and trims synthetic trailing blank rows. Styled
+  blanks and alternate-screen behavior remain preserved. The hidden rename entry
+  no longer imposes the old 693 px minimum.
 
-The headless p95 CPU/model budgets are 8 ms for snapshot construction, 0.1 ms for
-the frame monitor, and 8 ms for the synthetic line-buffer operation. These are
-absolute regression budgets; they do not assert terminal, network or display
-latency and do not establish that this application is faster than other terminals.
+## Performance work
 
-Current 200-sample measurement: snapshot construction 0.762104 ms p95; frame monitor
-0.000360 ms p95; synthetic line buffer 0.486355 ms p95. No model optimization is
-claimed from this run. Host storage pressure was high during this audit, so
-interactive benchmarks must include their environment and sample counts.
+- Repeated unchanged window snapshots skip row construction and DOM replacement.
+- Tabs-pane, tab-picker and hidden-tab results are bounded to 100 rendered matches, with
+  search over the full bounded list, rather than thousands of controls at once.
+- Workspace tools are a separate same-origin immutable v6 asset; each small
+  frontend asset retains the 64 KiB cap. Transport/auth code still does not use
+  browser storage; only non-sensitive appearance and pane-layout preferences are persisted.
+- Existing terminal layout caching, redundant resize suppression, shared input
+  encoding, bounded input/output queues and subscription cleanup are preserved.
+- Appearance changes invalidate font metrics without changing canonical geometry.
+- Management work is outside the terminal transport path. Tables render 100 rows
+  per page, search is debounced, and automatic refresh preserves selection/focus.
+  Moves and reorder use exact IDs and a database transaction, not terminal respawns.
 
-The final disposable Chromium run measured eight tab switches: 128.466 ms p50
-and 139.404 ms p95. One keyboard-dispatch-to-terminal-buffer echo took 66.236 ms;
-terminal-buffer readiness took 1591.425 ms from navigation. These timings include
-browser automation and fixture overhead. They are not physical display latency,
-a broad performance distribution, or a before/after speed comparison.
+## Verification and evidence limits
 
-## Larger remaining work
+Two complete browser runs passed **39 assertions each**, with zero page errors,
+after the final application-source change:
 
-- Support desktop windows below 693 px without degrading VTE rendering. The
-  hidden inline-rename entry contributes to the header minimum. A smaller
-  requisition admitted a real 640 px window but produced blank terminal output
-  in the compact smoke; that experiment was discarded. The current layout
-  preserves the verified terminal rendering instead.
-- Repair and recheck the installed release identity before promotion. The source
-  deployment-path gate now passes after concurrent migration edits in the shared
-  worktree. However, the current `.termdeck/bin/t1000 release info --verify`
-  exits 78: `managed bootstrap path mismatch`. The backend and LAN services are
-  running, but `termdeck-web-recovery.service` is not installed. Source-path
-  consistency is not evidence of a repaired installed release or rollback path.
-- Complete representative end-to-end latency measurement for local GTK and web:
-  typing-to-rendered-output, tab switching, new-tab readiness, scrolling, resizing,
-  and idle CPU with many tabs. Headless model probes are only one part of this.
-- Qualify a GTK4/VTE migration separately. GTK4 is available on this host, but
-  `gi.require_version("Vte", "3.91")` currently fails because the GTK4 VTE binding
-  is unavailable. Installing that dependency alone would not complete a port.
-- Stage and validate an installed release through the managed release workflow,
-  including rollback and unchanged live-session identities, before switching the
-  running desktop or browser service to the new build.
+- `/tmp/t1000-ui-web-proof-20260922-parity-qualified/result.json`
+  SHA-256 `de001437026a104701c906f4257525daecf8a60cf42e2b566acb076166f2f880`
+- `/tmp/t1000-ui-web-proof-20260922-parity-qualified-repeat/result.json`
+  SHA-256 `e043286b6d1951d97cb2e81b5acce65c592845221fe36bf5c5c4e47316cdd312`
 
-## Verification
+Both used debug server SHA-256
+`225f94a00ce2a184314d35c733c72ff8a93754242c012f00b14d18bb7315fd2a`,
+private authenticated backends, tmux sockets, registries, desktop configuration
+and browser profiles. All send/kill/remove tests target disposable Python terminal
+fixtures, never production work or a real nested Codex process.
 
-The password-only follow-up passes all 38 web-server tests, 29 authentication
-tests (including the auth-directory-move integration test), and 11 branding
-tests. Existing explicit-label clients remain compatible. The new regression
-failed against the old form before the device field was removed. This is source
-verification, not evidence that the live login page has been replaced.
+The matrix covers the original terminal/reconnect/ownership checks plus actual
+window creation/rename, move/reorder, bulk lifecycle, pin protection, cancel,
+preview, text/Enter delivery, keyboard handoff, settings import/save/persistence,
+and 320 px/max-scale layout. Moves/reopens preserve actual process identities.
+The settings write test reads the fixture's real desktop config afterwards.
 
-The combined focused run under Xvfb and a disposable D-Bus session passes:
-195 unique tests and 32 subtests covering performance instrumentation, actual GTK
-long-label allocation, lifecycle, recovery, focus, clipboard, resize and theme
-behavior. The corrected CI performance command also passes.
-`npm test --prefix web/frontend` passes all three terminal-layout and listener
-lifecycle tests. Their fit-call counts demonstrate avoided model work, not a
-measured improvement in physical display latency.
-Rebuilding the embedded terminal assets reproduces all three files byte for byte;
-the source asset-size, dependency-pin and manifest-hash checks pass.
-The disposable Tabs-pane and window-restore smokes pass, including 30/30 restored
-tabs across ten windows, foreground working-directory preservation and dead-pane
-recovery. An additional focused run of performance-probe, visual-smoke-harness and
-release-workflow tests passes 39 tests and six subtests; this overlaps the earlier
-run and is not an additive total. `check_visual_polish_smoke.py` passes.
+Expected offline/denied-action console errors, intentional killed-pane disconnects
+and headless software-WebGL warnings remain in the evidence. Each full run records
+one cancelled manager `list` read during navigation. Only exact `ERR_ABORTED`
+telemetry reads receive that classification; failed reads and cancelled writes
+still fail acceptance. Seven negative/positive contract tests protect this rule.
+This is not an empty-console or zero-network-cancellation claim.
 
-The final desktop screenshots use an isolated runtime directory and wait for
-three actual tmux panes to emit fixture markers. This fixes the previous smoke
-harness's false readiness signal.
+Inspected screenshots include `workspace-charcoal.png`, `tab-manager-desktop.png`,
+`tab-manager-mobile.png`, `settings-light.png` and the 320 px/1.75-scale layout.
+The host lacks a normal scalable CJK font: Unicode buffer correctness is verified,
+but screenshots do not prove complete CJK glyph coverage on all clients.
 
-A fresh Chromium layout probe verifies that inserting a refresh-error notice
-does not change terminal geometry or introduce page overflow at 1440×900,
-980×620, 430×740 and 320×568. It exercises the actual stylesheet with a small DOM
-fixture, not live terminal transport. The former error notice became an extra
-grid row and collapsed the terminal despite its connection remaining live.
-The corrected notice is positioned over the existing terminal grid area.
-The browser runner initially timed out using its bundled Node executable; the
-same probe passes with `PLAYWRIGHT_NODEJS_PATH=/usr/bin/node`.
+Earlier focused Python run: **216 tests + 23 subtests passed**, covering replay, actual GTK
+layout, tabs, terminal mouse/focus, VTE attachment, shortcuts, themes, branding and
+contained resize. Actual visible VTE text survives 640×480 → 980×620 → 640×480.
+GTK visual-polish, scrolling and Unicode/replay smokes pass under isolated
+Xvfb/D-Bus/private runtime directories. Backing tmux output alone is not accepted
+as proof that the VTE is visibly rendered.
 
-The final integrated Chromium proof passes all 22 assertions against the rebuilt
-server. It covers real tmux/WebSocket terminal I/O, keyboard control bytes,
-bracketed paste, mouse protocol, alternate-screen and Unicode buffer state,
-canonical geometry isolation, desktop/compact/mobile layout, reload and server
-restart recovery, writer ownership, and the complete disposable tab lifecycle.
-New persistent checks verify keyboard tab focus after terminal readiness,
-click-to-type focus after repeated pointer selections, and open-menu focus across
-metadata refresh. They caught and protected two additional focus-race fixes.
+Latest focused Python run: **253 tests + 14 subtests passed**. It covers management transactions, stale edits,
+partial-action failures, pin protection, stopped-record safety, desktop settings
+revision checks, malformed settings, palette parity, contrast, replay, CLI,
+session lifecycle and smoke contracts. The only warning was an existing GLib
+deprecation.
 
-Proof artifact: `/tmp/td-ui-qualified-S4owuB/result.json`.
-Screenshot: `/tmp/td-ui-qualified-S4owuB/terminal-browser-proof.png`.
-Qualified server SHA-256:
-`c888e8576e6015db33843d5cc55b462e2e3a1167269987315d2d45c4cd9c2265`.
-These are disposable local proof artifacts, not a production installation.
+Rust core/state/server/authentication: **102 tests passed** (27 + 5 + 41 + 28 unit
+tests and one auth-directory-move integration test). Strict workspace Clippy
+passes. Three frontend tests pass, including palette/font validation, appearance bounds and grid
+preservation. The full web smoke passes after the last application change and
+recognizes existing Cargo integration tests
+as qualification targets, while still rejecting binary/build-script/proc-macro
+authentication targets; focused tests protect that distinction. Its
+workspace-tools asset hash matches the final source:
+`4bce903560738e649a2a2e369c4b332fe52a6582d611cd4ef59bba2afd98315b`.
 
-The release workflow smoke passes with 78 verified installed members, tamper
-rejection, launcher repair, doctor identity and legacy rollback. Its install and
-rollback operate only inside a temporary fixture; they do not establish that the
-running installation is repaired. All 28 focused release-workflow tests pass.
+The final fixture measured one keyboard-to-terminal-buffer echo at 68.631 ms;
+eight switches had p50 127.876 ms / p95 144.690 ms. Terminal readiness was
+719.265 ms. A 190-byte typing burst with deliberately delayed 120 ms acknowledgments
+completed in 188.651 ms. These include automation/fixture overhead, not physical
+display latency or a before/after speed comparison.
+
+The 200-sample/100-session model probe passed: snapshot p95 0.755462 ms, frame
+monitor 0.000340 ms, synthetic line buffer 0.487017 ms. Broad local/physical-LAN
+typing, scroll, resize and idle-CPU distributions remain unmeasured. No claim of
+universally fastest performance or full application-wide regression coverage.
+
+### Reproduction
+
+Run from the repository root; browser fixtures clean up only their own processes
+and temporary state:
+
+```sh
+python3 -m pytest -q tests/test_web_management.py tests/test_web_appearance.py tests/test_web_desktop_parity.py tests/test_web_smoke_contract.py tests/test_ui_theme.py tests/test_ui_theme_contrast.py tests/test_settings.py tests/test_pane_stream.py tests/test_session_lifecycle.py tests/test_master_tasks.py tests/test_task_snapshot.py tests/test_window_tab_model.py tests/test_cli.py
+npm test --prefix web/frontend
+python3 scripts/check_web_readonly_smoke.py
+cargo build --manifest-path web/Cargo.toml -p termdeck-web-server
+python3 scripts/check_web_terminal_browser.py --server-binary web/target/debug/termdeck-web-server --output /tmp/t1000-ui-web-proof-new-run
+python3 scripts/perf_probe.py --iterations 200 --sessions 100 --assert-thresholds
+git diff --check
+```
+
+The full web smoke includes locked workspace tests, formatting, strict Clippy,
+frontend syntax/asset limits, dependency and authentication-contract checks.
+For just the manager/settings fixture, add `--manager-only` to the browser command.
+
+## Approved repair blocked before activation
+
+The live login was rechecked and still serves v5 and asks for a device name.
+`.termdeck/bin/t1000 release info --verify` still exits 78 with
+`managed bootstrap path mismatch`. The installed managed
+launcher has a retired path binding, privileged preparation services are absent,
+and the shared-runtime ownership template would assign the entire user runtime
+parent to the preparer account at mode 0700. Applying it as-is would make user
+state/authentication/releases inaccessible. The signer requires a preparer-owned
+tree, so changing only that ownership line is not a valid repair. The preparation
+tree and consumer publication must be separated and qualified together.
+
+Host sudo was rejected in this execution environment. An administrator-enabled
+execution path is required after the ownership design is fixed; no root-only
+contract was bypassed. The install plan now explicitly blocks applying the unsafe
+template to the migrated runtime.
+
+A private pre-repair backup exists at
+`.termdeck/repair-backup-20260922-DqqNWH`. It contains coherent session/auth database
+backups, all 304 saved tab records, installed binaries and launcher, password/TLS
+state, and both user service definitions. Both SQLite integrity checks and all
+four checksums in `SHA256SUMS` passed when captured. The latest read-only service
+check reports backend/proxy PIDs 1921209/1921259, both active/running with zero
+recorded restarts. These differ from the earlier snapshot; this UI work did not
+restart either service. No production terminal recovery or session launch was
+attempted; no Codex runtime or Cloudflare changes were made.

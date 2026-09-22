@@ -5050,11 +5050,14 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         # so renaming happens where the name lives (no modal dialog).
         title_entry = Gtk.Entry()
         title_entry.set_alignment(0.5)
-        title_entry.set_width_chars(28)
+        title_entry.set_width_chars(10)
         title_entry.set_max_width_chars(28)
         _style(title_entry, "td-title-entry")
         self._window_title_entry = title_entry
         title_stack = Gtk.Stack()
+        # A hidden 28-character rename field must not set the whole window's
+        # minimum width. Size to the visible child, including during editing.
+        title_stack.set_hhomogeneous(False)
         # Crossfade between the title label and its inline rename entry; GTK
         # globally disables this when gtk-enable-animations is off.
         title_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)

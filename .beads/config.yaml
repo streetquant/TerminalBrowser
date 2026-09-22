@@ -1,0 +1,5 @@
+# Portable t1000 coordination settings. Do not bind this to an absolute path.
+issue_prefix: t1000
+default_priority: 2
+default_type: task
+claim_exclusive: true

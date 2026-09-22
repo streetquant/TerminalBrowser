@@ -1323,9 +1323,9 @@ class PaneStreamController:
         SGR state. Feeding them with autowrap enabled lets the right margin wrap
         into the next row, while an unterminated background style makes adjacent
         rows appear as overlapping rectangles. Replay therefore paints in a
-        temporary reset/origin-off/insert-off/wrap-off state, erases and resets
-        each row independently, restores application modes, positions the cursor
-        absolutely, and restores cursor visibility last.
+        temporary reset/origin-off/insert-off/wrap-off state, clears the screen,
+        resets each row's attributes, restores application modes, positions the
+        cursor absolutely, and restores cursor visibility last.
         """
 
         pane_id = pane_state["pane_id"]
@@ -1333,10 +1333,14 @@ class PaneStreamController:
         first_attach = not self._replayed_history
         parts: list[bytes] = [b"\x1b[0m\x1b[?6l\x1b[4l\x1b[?7l\x1b[?25l"]
 
-        def painted_rows(lines: list[bytes], *, final_newline: bool) -> bytes:
+        def painted_rows(
+            lines: list[bytes], *, final_newline: bool, clear_rows: bool = True
+        ) -> bytes:
             painted: list[bytes] = []
             for index, line in enumerate(lines):
-                painted.extend((b"\x1b[0m\r\x1b[2K", line, b"\x1b[0m"))
+                painted.extend(
+                    (b"\x1b[0m\r", b"\x1b[2K" if clear_rows else b"", line, b"\x1b[0m")
+                )
                 if final_newline or index + 1 < len(lines):
                     painted.append(b"\r\n")
             return b"".join(painted)
@@ -1369,8 +1373,15 @@ class PaneStreamController:
             return None
         if len(visible) > rows:
             visible = visible[:rows]
+        if not alternate:
+            # The screen is already erased. Re-erasing each row fills it with
+            # hard spaces in VTE, and trailing CRLF invents empty content below
+            # the cursor. Both can scroll the prompt away on shrink/reflow.
+            # Preserve styled blanks and full-screen application frames.
+            while visible and not visible[-1].strip(b" "):
+                visible.pop()
         if visible:
-            parts.append(painted_rows(visible, final_newline=False))
+            parts.append(painted_rows(visible, final_newline=False, clear_rows=alternate))
 
         try:
             cursor_x = max(0, int(pane_state.get("cursor_x", "0")))

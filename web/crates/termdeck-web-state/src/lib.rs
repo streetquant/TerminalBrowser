@@ -353,15 +353,18 @@ impl ReadOnlyStateMirror {
                     .pane_target
                     .filter(|value| !value.is_empty())
                     .or_else(|| Some(format!("{}:0.0", pane.tmux_name)));
-                panes.push(PaneSnapshot::new(
-                    PaneId::new(pane.id.clone())?,
-                    Some(SessionId::new(pane.id)?),
-                    pane.name,
-                    cwd,
-                    project_status(&pane.status, live, inventory.is_complete()),
-                    target,
-                    None,
-                )?);
+                panes.push(
+                    PaneSnapshot::new(
+                        PaneId::new(pane.id.clone())?,
+                        Some(SessionId::new(pane.id)?),
+                        pane.name,
+                        cwd,
+                        project_status(&pane.status, live, inventory.is_complete()),
+                        target,
+                        None,
+                    )?
+                    .with_pinned(pane.pinned),
+                );
             }
             projected.push(WindowSnapshot::new(
                 window_id,
@@ -638,6 +641,7 @@ fn stable_revision(
             hash.text(pane.title());
             hash.text(pane.cwd());
             hash.text(pane_status_name(pane.status()));
+            hash.byte(u8::from(pane.pinned()));
             hash.text(pane.tmux_target().unwrap_or(""));
         }
     }
@@ -832,6 +836,8 @@ mod tests {
         assert_eq!(snapshot.windows()[1].route().path(), "/random");
         assert_eq!(snapshot.windows()[1].panes().len(), 2);
         assert_eq!(snapshot.windows()[1].panes()[0].title(), "Pinned");
+        assert!(snapshot.windows()[1].panes()[0].pinned());
+        assert!(!snapshot.windows()[1].panes()[1].pinned());
         assert_eq!(snapshot.windows()[1].panes()[0].cwd(), "/live/pinned");
         assert_eq!(
             snapshot.windows()[1].panes()[0].tmux_target(),

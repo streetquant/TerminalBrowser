@@ -27,12 +27,15 @@ def main() -> int:
         home = root_dir / "home"
         tmux_tmp = root_dir / "tmux"
         project = root_dir / "client-api"
+        runtime_dir = root_dir / "runtime"
         home.mkdir()
         tmux_tmp.mkdir(mode=0o700)
         project.mkdir()
+        runtime_dir.mkdir(mode=0o700)
         os.environ["HOME"] = str(home)
         os.environ["TMUX_TMPDIR"] = str(tmux_tmp)
         os.environ["NO_AT_BRIDGE"] = "1"
+        os.environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
 
         workspace = root_dir / "workspace.json"
         workspace.write_text(
@@ -46,7 +49,7 @@ def main() -> int:
                                 {
                                     "name": "client-api",
                                     "tag": "terminal",
-                                    "command": "{shell}",
+                                    "command": "printf 'T1000_VISIBLE_TERMINAL\\n'; exec sleep 60",
                                     "cwd": str(project),
                                 }
                             ],
@@ -57,7 +60,7 @@ def main() -> int:
             encoding="utf-8",
         )
 
-        from termdeck.gtk_app import Gtk, TermDeckApplication
+        from termdeck.gtk_app import Gtk, Vte, TermDeckApplication
 
         app = TermDeckApplication(
             db_path=root_dir / "tabs.sqlite3",
@@ -79,6 +82,21 @@ def main() -> int:
             attach = window._current_attach_terminal()
             if attach is None:
                 raise AssertionError("active terminal is missing")
+
+            def terminal_text() -> str:
+                return attach.terminal.get_text_format(Vte.Format.TEXT) or ""
+
+            _drain_gtk(Gtk, until=lambda: "T1000_VISIBLE_TERMINAL" in terminal_text(), timeout=12)
+            for width, height in ((640, 480), (980, 620), (640, 480)):
+                previous_grid = (attach.terminal.get_column_count(), attach.terminal.get_row_count())
+                window.resize(width, height)
+                _drain_gtk(Gtk, until=lambda: (
+                    window.get_size() == (width, height)
+                    and (attach.terminal.get_column_count(), attach.terminal.get_row_count()) != previous_grid
+                    and not window._terminal_layout_sync_source_id
+                    and not attach._resize_sync_source_id
+                ))
+                _drain_gtk(Gtk, until=lambda: "T1000_VISIBLE_TERMINAL" in terminal_text(), timeout=8)
             main_root = window.get_child()
             notebook = window.notebook
             root_context = main_root.get_style_context()
@@ -205,6 +223,8 @@ def main() -> int:
                             f"{notebook_allocation.width}x{notebook_allocation.height}"
                         ),
                         "new_tab_action_count": len(new_tab_buttons),
+                        "compact_size": list(window.get_size()),
+                        "visible_terminal_marker": "T1000_VISIBLE_TERMINAL" in terminal_text(),
                         "terminal_scrollbar_visible": True,
                         "terminal_scrollbar_size": (
                             f"{scrollbar_allocation.width}x{scrollbar_allocation.height}"

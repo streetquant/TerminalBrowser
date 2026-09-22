@@ -40,7 +40,7 @@ web/target/
 
 # Local/generated files
 user-prompt.md
-.beads/
+# Portable BR ledger is Git-visible; .beads/.gitignore excludes local state.
 codex-session-id.txt
 .ai-bridge/
 .codex-workspace-id.json

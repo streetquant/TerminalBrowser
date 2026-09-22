@@ -12,6 +12,10 @@ Each tab is a live shell. Each window is a named workspace. Sessions survive res
 
 ## How it's structured
 
+Development work is tracked in BR, with BV for planning. Agents and contributors
+should start with [AGENTS.md](AGENTS.md) and the
+[BR/BV handoff guide](docs/BEADS_WORKFLOW.md); `todo.md` is retired.
+
 ```mermaid
 flowchart TD
     App(["t1000"])

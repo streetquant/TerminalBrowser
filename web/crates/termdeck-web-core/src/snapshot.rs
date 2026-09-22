@@ -71,6 +71,7 @@ pub struct PaneSnapshot {
     title: String,
     cwd: String,
     status: PaneStatus,
+    pinned: bool,
     tmux_target: Option<String>,
     controller: Option<ControllerView>,
 }
@@ -98,6 +99,7 @@ impl PaneSnapshot {
             title,
             cwd,
             status,
+            pinned: false,
             tmux_target,
             controller,
         })
@@ -126,6 +128,17 @@ impl PaneSnapshot {
     #[must_use]
     pub fn status(&self) -> PaneStatus {
         self.status
+    }
+
+    #[must_use]
+    pub fn with_pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
+        self
+    }
+
+    #[must_use]
+    pub fn pinned(&self) -> bool {
+        self.pinned
     }
 
     #[must_use]

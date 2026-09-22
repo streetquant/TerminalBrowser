@@ -163,11 +163,13 @@ test("canonical fit suppresses stable remeasurement and invalidates font/layout 
       this.clientWidth = 800;
       this.clientHeight = 600;
       this.dataset = {};
+      this.style = { setProperty(name, value) { this[name] = value; } };
     }
   }
 
   const host = new Host();
   const api = createTerminal(host, { webgl: false });
+  assert.equal(host.style["--td-terminal-bg"], api.terminal.options.theme.background);
   const beforeFirstFit = globalThis.__termdeckFitProposals;
   api.fitGrid(80, 24);
   const firstFitProposals = globalThis.__termdeckFitProposals - beforeFirstFit;
@@ -204,6 +206,39 @@ test("canonical fit suppresses stable remeasurement and invalidates font/layout 
   api.fitGrid(80, 24);
   const layoutChangeProposals = globalThis.__termdeckFitProposals - beforeLayoutChange;
   assert.ok(layoutChangeProposals > 0);
+  const beforeAppearance = globalThis.__termdeckFitProposals;
+  api.setAppearance({ fontSize: 16, cursorStyle: "bar", cursorBlink: false });
+  assert.deepEqual(api.dimensions(), { cols: 80, rows: 24 });
+  assert.equal(api.terminal.options.fontSize, 16);
+  assert.equal(api.terminal.options.cursorStyle, "bar");
+  assert.equal(api.terminal.options.cursorBlink, false);
+  assert.ok(globalThis.__termdeckFitProposals > beforeAppearance);
+  for (const fontSize of [-1, 0, 9, 73, Infinity, NaN, 12.5, "16"]) {
+    assert.throws(() => api.setAppearance({ fontSize, cursorStyle: "bar", cursorBlink: true }), /Invalid terminal appearance/);
+  }
+  const originalPalette = { ...api.terminal.options.theme };
+  const appearance = { fontSize: 16, cursorStyle: "bar", cursorBlink: false };
+  api.setAppearance({ ...appearance, palette: "nord", font: "liberation" });
+  assert.equal(host.style["--td-terminal-bg"], api.terminal.options.theme.background);
+  assert.equal(api.terminal.options.theme.background, "#2e3440");
+  assert.equal(api.terminal.options.theme.red, "#bf616a");
+  assert.equal(api.terminal.options.fontFamily, '"Liberation Mono", monospace');
+  assert.deepEqual([api.terminal.cols, api.terminal.rows], [80, 24]);
+  api.setAppearance({ ...appearance, palette: "nord", fontFamily: "Test Mono", cursorColor: "#abcdef", scrollback: 30000 });
+  assert.equal(api.terminal.options.fontFamily, "Test Mono, monospace");
+  assert.equal(api.terminal.options.theme.cursor, "#abcdef");
+  assert.equal(api.terminal.options.scrollback, 30000);
+  assert.deepEqual([api.terminal.cols, api.terminal.rows], [80, 24]);
+  for (const invalid of [{scrollback: -1}, {scrollback: true}, {scrollback: 500001}, {fontFamily: "x".repeat(129)}, {cursorColor: "red"}]) {
+    assert.throws(() => api.setAppearance({...appearance, ...invalid}), /Invalid terminal appearance/);
+  }
+  for (const field of ["palette", "font"]) {
+    for (const invalid of ["__proto__", "constructor", "missing", null]) {
+      assert.throws(() => api.setAppearance({ ...appearance, [field]: invalid }), /Invalid terminal appearance/);
+    }
+  }
+  api.setAppearance({ ...appearance, palette: "t1000", font: "auto" });
+  assert.deepEqual(api.terminal.options.theme, originalPalette);
   t.diagnostic(
     `fit proposals: first=${firstFitProposals}, stable=${cachedFitProposals}, `
       + `metric=${metricChangeProposals}, layout=${layoutChangeProposals}, `
@@ -234,6 +269,7 @@ test("terminal listeners are removed exactly once across individual and owner di
   host.clientWidth = 800;
   host.clientHeight = 600;
   host.dataset = {};
+  host.style = { setProperty(name, value) { this[name] = value; } };
   const api = createTerminal(host, { webgl: false });
   const resizeSubscription = api.onResize(() => {});
   const dataSubscription = api.onData(() => {});

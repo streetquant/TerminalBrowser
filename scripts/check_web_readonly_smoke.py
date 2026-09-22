@@ -240,6 +240,31 @@ def _run(
     return receipt
 
 
+def _validate_workspace_contract(workspace: str) -> None:
+    # HTTP input is intentional only in the explicitly confirmed multi-tab
+    # manager action. The normal terminal remains WebSocket-only with no
+    # protocol buttons. Behavioral confirmation/receipt tests run in Chromium.
+    start = workspace.find("  async function sendSelected(")
+    end = workspace.find("  async function manager()", start)
+    if start < 0 or end < start:
+        raise RuntimeError("workspace is missing the bounded manager send action")
+    send = workspace[start:end]
+    outside_send = workspace[:start] + workspace[end:]
+    input_paths = {"/control/release", "/input/text", "/input/key"}
+    for value in FRONTEND_FORBIDDEN_TEXT:
+        if value == "localStorage":
+            continue
+        if value in (outside_send if value in input_paths else workspace):
+            raise RuntimeError(f"workspace tools use forbidden contract: {value}")
+    for required in ("if (!accepted) return", "rows.length > 128", "checkedSequence",
+                     "control.indeterminate", "control.next_sequence", "not retried",
+                     "confirm.showModal()", "cancel.focus()"):
+        if required not in send:
+            raise RuntimeError(f"manager send is missing its safety contract: {required}")
+    if "http://" in workspace or "https://" in workspace:
+        raise RuntimeError("workspace tools must not contain an external origin")
+
+
 def _validate_frontend_assets(
     javascript_path: Path,
     stylesheet_path: Path,
@@ -253,11 +278,14 @@ def _validate_frontend_assets(
     notices_path: Path,
 ) -> dict[str, object]:
     app_javascript_bytes = javascript_path.read_bytes()
+    workspace_path = javascript_path.with_name("workspace-ui.js")
+    workspace_bytes = workspace_path.read_bytes()
     app_stylesheet_bytes = stylesheet_path.read_bytes()
     terminal_javascript_bytes = terminal_javascript_path.read_bytes()
     terminal_stylesheet_bytes = terminal_stylesheet_path.read_bytes()
     for label, data in (
         ("application JavaScript", app_javascript_bytes),
+        ("workspace tools JavaScript", workspace_bytes),
         ("application stylesheet", app_stylesheet_bytes),
     ):
         if len(data) > MAX_FRONTEND_ASSET_BYTES:
@@ -274,6 +302,7 @@ def _validate_frontend_assets(
             )
     try:
         javascript = app_javascript_bytes.decode("utf-8")
+        workspace = workspace_bytes.decode("utf-8")
         app_stylesheet_bytes.decode("utf-8")
         terminal_javascript = terminal_javascript_bytes.decode("utf-8")
         terminal_stylesheet_bytes.decode("utf-8")
@@ -285,6 +314,9 @@ def _validate_frontend_assets(
         raise RuntimeError(f"frontend JavaScript is missing required contracts: {missing}")
     if forbidden:
         raise RuntimeError(f"frontend JavaScript uses forbidden or obsolete contracts: {forbidden}")
+    # Only non-sensitive appearance preferences may use browser storage. The
+    # transport/authentication bundle retains its no-storage contract.
+    _validate_workspace_contract(workspace)
     if "http://" in javascript or "https://" in javascript:
         raise RuntimeError("application JavaScript must not contain an external origin")
     if "TermDeckTerminal" not in terminal_javascript or "termdeck-xterm-v2" not in terminal_javascript:
@@ -370,6 +402,8 @@ def _validate_frontend_assets(
     return {
         "application_javascript_bytes": len(app_javascript_bytes),
         "application_javascript_sha256": _sha256(app_javascript_bytes),
+        "workspace_javascript_bytes": len(workspace_bytes),
+        "workspace_javascript_sha256": _sha256(workspace_bytes),
         "application_stylesheet_bytes": len(app_stylesheet_bytes),
         "application_stylesheet_sha256": _sha256(app_stylesheet_bytes),
         "terminal_javascript_bytes": len(terminal_javascript_bytes),
@@ -553,6 +587,13 @@ def _validate_interactive_terminal(server_root: Path) -> dict[str, object]:
     }
 
 
+def _validate_auth_target_kinds(target_kinds: list[list[str]]) -> None:
+    # Cargo lists integration-test executables alongside the library. Those
+    # are qualification targets, not shipped authentication entry points.
+    if target_kinds.count(["lib"]) != 1 or any(kind not in (["lib"], ["test"]) for kind in target_kinds):
+        raise RuntimeError(f"authentication package must remain library-only: {target_kinds}")
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     web_root = root / "web"
@@ -581,6 +622,7 @@ def main() -> int:
         server_root / "src" / "tab_actions.rs",
         server_root / "assets" / "app.css",
         server_root / "assets" / "app.js",
+        server_root / "assets" / "workspace-ui.js",
         server_root / "assets" / "terminal.css",
         server_root / "assets" / "terminal.js",
         server_root / "assets" / "terminal-assets.json",
@@ -588,6 +630,7 @@ def main() -> int:
         web_root / "frontend" / "package-lock.json",
         web_root / "frontend" / "build.mjs",
         web_root / "frontend" / "src" / "terminal-entry.js",
+        web_root / "frontend" / "src" / "terminal-palettes.json",
         web_root / "THIRD_PARTY_NOTICES.md",
     ]
     missing = [str(path.relative_to(root)) for path in required if not path.is_file()]
@@ -659,7 +702,7 @@ def main() -> int:
         ]
         node = shutil.which("node")
         if node is not None:
-            for asset in (server_root / "assets" / "app.js", server_root / "assets" / "terminal.js"):
+            for asset in (server_root / "assets" / "app.js", server_root / "assets" / "workspace-ui.js", server_root / "assets" / "terminal.js"):
                 receipts.append(
                     _run(
                         [node, "--check", str(asset)],
@@ -667,7 +710,7 @@ def main() -> int:
                         environment=environment,
                     )
                 )
-            frontend["syntax_check"] = "node --check app.js and terminal.js"
+            frontend["syntax_check"] = "node --check app.js, workspace-ui.js and terminal.js"
         else:
             frontend["syntax_check"] = "static and Rust-embedded checks only"
 
@@ -701,10 +744,7 @@ def main() -> int:
                 f"{sorted(auth_dependencies)}"
             )
         target_kinds = [list(target["kind"]) for target in auth_package.get("targets", [])]
-        if target_kinds != [["lib"]]:
-            raise RuntimeError(
-                f"authentication package must remain library-only: {target_kinds}"
-            )
+        _validate_auth_target_kinds(target_kinds)
         consumers = sorted(
             str(item["name"])
             for item in metadata["packages"]

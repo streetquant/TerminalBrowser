@@ -152,7 +152,7 @@ TERMINAL_PALETTE_PACKS: Mapping[str, dict[str, object]] = {
     "t1000": {
         # Signature pack: deep ink surface shared with the dark chrome, plus
         # luminous accents drawn from the same family as the chrome tokens.
-        "label": "T1000 Ink (signature)",
+        "label": "t1000 Ink (signature)",
         "foreground": "#dfe6f2",
         "background": "#0a0d13",
         "cursor": "#82aaff",

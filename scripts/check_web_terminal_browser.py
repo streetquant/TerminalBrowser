@@ -387,7 +387,7 @@ def database_row(database: Path, session_id: str) -> dict[str, Any] | None:
     connection.row_factory = sqlite3.Row
     try:
         row = connection.execute(
-            "SELECT id,name,status,visible,pinned,window_id,window_title,tmux_name FROM sessions WHERE id=?",
+            "SELECT id,name,status,visible,pinned,window_id,window_title,tmux_name,last_pid,tab_index FROM sessions WHERE id=?",
             (session_id,),
         ).fetchone()
         return dict(row) if row else None
@@ -397,7 +397,7 @@ def database_row(database: Path, session_id: str) -> dict[str, Any] | None:
 
 def click_action(page: Page, action: str) -> None:
     page.locator('summary[aria-label="Tab actions"]').click()
-    page.get_by_role("button", name=action, exact=True).click()
+    page.locator(".workspace-action-panel").get_by_role("button", name=action, exact=True).click()
 
 
 def terminal_state(page: Page) -> dict[str, Any]:
@@ -453,6 +453,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-live-ms", type=float, default=5000.0)
     parser.add_argument("--keep-temp", action="store_true")
+    parser.add_argument("--manager-only", action="store_true", help="run only the disposable manager/settings interaction matrix")
     args = parser.parse_args()
 
     binary = args.server_binary.resolve()
@@ -695,6 +696,43 @@ def main() -> int:
                 headless=True,
                 args=["--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check"],
             )
+            auth_context = browser.new_context(viewport={"width": 320, "height": 568})
+            auth_page = auth_context.new_page()
+            auth_page.goto(f"{origin}/_termdeck/login")
+            auth_page.wait_for_url("**/_termdeck/setup")
+            if auth_page.locator("input").count() != 2:
+                raise AssertionError("initial setup must ask only for password and confirmation")
+            auth_page.screenshot(path=str(output / "password-setup-mobile.png"))
+            fixture_password = "t1000-disposable-ui-password-123"
+            auth_page.get_by_label("Password", exact=True).fill(fixture_password)
+            auth_page.get_by_label("Confirm password", exact=True).fill(fixture_password)
+            auth_page.get_by_role("button", name="Set password and open t1000").click()
+            try:
+                auth_page.wait_for_url(f"{origin}/", timeout=10_000)
+            except Exception as exc:
+                auth_page.screenshot(path=str(output / "password-setup-failure.png"))
+                raise AssertionError(f"password setup did not open workspace: {auth_page.url}; {auth_page.locator('body').inner_text()[:800]}") from exc
+            auth_context.clear_cookies()
+            auth_page.goto(f"{origin}/_termdeck/login")
+            if auth_page.locator("input").count() != 1:
+                raise AssertionError("sign-in must ask only for the password")
+            if not auth_page.get_by_label("Password", exact=True).evaluate("el => el === document.activeElement"):
+                raise AssertionError("password field did not receive initial focus")
+            if auth_page.evaluate("document.documentElement.scrollWidth > innerWidth"):
+                raise AssertionError("password form overflows mobile viewport")
+            auth_page.screenshot(path=str(output / "password-login-mobile.png"))
+            auth_page.set_viewport_size({"width": 1440, "height": 900})
+            auth_page.screenshot(path=str(output / "password-login-desktop.png"))
+            auth_page.get_by_label("Password", exact=True).fill("incorrect-fixture-password")
+            auth_page.get_by_role("button", name="Sign in", exact=True).click()
+            auth_page.locator('#auth-error[role="alert"]').wait_for(state="visible")
+            if auth_page.get_by_label("Password", exact=True).get_attribute("aria-invalid") != "true":
+                raise AssertionError("password error is not associated with its field")
+            auth_page.get_by_label("Password", exact=True).fill(fixture_password)
+            auth_page.get_by_role("button", name="Sign in", exact=True).click()
+            auth_page.wait_for_url(f"{origin}/")
+            auth_context.close()
+            result["assertions"]["password_only_accessible_responsive_auth"] = True
             context_one = browser.new_context(viewport={"width": 1440, "height": 900})
             context_two = browser.new_context(viewport={"width": 1280, "height": 800})
             context_one.add_init_script(SOCKET_CAPTURE_INIT)
@@ -718,12 +756,16 @@ def main() -> int:
                         {"page": label, "error": str(error)[:4000]}
                     ),
                 )
-                page.on(
-                    "requestfailed",
-                    lambda request: result["request_failures"].append(
-                        {"page": label, "url": request.url, "failure": str(request.failure)}
-                    ),
-                )
+                def failed_request(request):
+                    record = {"page": label, "url": request.url, "failure": str(request.failure)}
+                    if request.url.endswith("/_termdeck/api/v1/management"):
+                        try:
+                            payload = request.post_data_json
+                            record["management_operation"] = payload.get("operation") if isinstance(payload, dict) else None
+                        except Exception:
+                            record["management_operation"] = None
+                    result["request_failures"].append(record)
+                page.on("requestfailed", failed_request)
 
                 def on_websocket(websocket: Any) -> None:
                     record: dict[str, Any] = {
@@ -943,6 +985,25 @@ def main() -> int:
 
             instrument(page_one, "one")
             instrument(page_two, "two")
+
+            if args.manager_only:
+                created = run_json([str(t1000), "new", "--db", str(database), "--cwd", str(run_root),
+                                    "--window-id", "win-random", "--window-title", "Random", "--name", "Browser Created",
+                                    "--command", shlex.join([str(args.python.resolve()), "-u", str(fixture), str(created_raw), str(created_events), "SECOND"])], env=base_env, timeout=40)
+                page_two.goto(f"{origin}/random")
+                page_two.wait_for_function("() => document.querySelectorAll('[role=tab]').length === 2")
+                from web_management_browser_checks import check_management
+                check_management(page_two, origin=origin, database=database,
+                                 initial_id=initial_id, created_id=created["tabs"][0]["id"], output=output,
+                                 result=result, database_row=database_row,
+                                 wait_until=wait_until, click_action=click_action)
+                result["scope"] = "manager-settings-only"
+                result["assertions"]["no_browser_errors"] = not result["page_errors"]
+                result["ok"] = all(result["assertions"].values())
+                (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+                browser.close()
+                print(json.dumps({"ok": result["ok"], "assertions": result["assertions"]}))
+                return 0 if result["ok"] else 1
 
             api_url = f"{origin}/_termdeck/api/v1/windows/random"
             page_one.route(api_url, lambda route: route.abort("failed"))
@@ -1415,7 +1476,25 @@ def main() -> int:
             if not page_two.evaluate(
                 "() => document.querySelector('.workspace-actions').open && document.activeElement === window.__termdeckFocusedAction && document.activeElement.isConnected"
             ):
-                raise AssertionError("metadata refresh replaced or defocused the open More menu")
+                focus_state = page_two.evaluate("""() => ({
+                    open: document.querySelector('.workspace-actions').open,
+                    active: document.activeElement.outerHTML.slice(0, 500),
+                    previous: window.__termdeckFocusedAction.outerHTML,
+                    connected: window.__termdeckFocusedAction.isConnected,
+                    status: document.querySelector('.workspace-status').textContent,
+                })""")
+                raise AssertionError(f"metadata refresh replaced or defocused the open More menu: {focus_state}")
+            # Force a real metadata change through the disposable CLI while its
+            # action remains focused, not merely an unchanged cache refresh.
+            page_two.locator(".workspace-action-panel").get_by_role("button", name="Pin", exact=True).focus()
+            page_two.evaluate("window.__termdeckFocusedAction = document.activeElement")
+            for command, label in (("pin", "Unpin"), ("unpin", "Pin")):
+                run_json([str(t1000), command, "--db", str(database), created_id], env=base_env)
+                page_two.locator(".workspace-action-panel").get_by_role("button", name=label, exact=True).wait_for()
+                if not page_two.evaluate(
+                    "() => document.activeElement === window.__termdeckFocusedAction && document.activeElement.isConnected"
+                ):
+                    raise AssertionError("changed tab metadata replaced the focused action control")
             result["assertions"]["refresh_preserves_open_menu_focus"] = True
             page_two.keyboard.press("Escape")
 
@@ -1462,8 +1541,137 @@ def main() -> int:
             result["assertions"]["repeated_tab_switch_latency"] = True
             result["assertions"]["pointer_tab_switch_preserves_typing_focus"] = True
 
-            page_two.once("dialog", lambda dialog: dialog.accept("Renamed Browser Tab"))
+            # Desktop-parity tools must operate on the real terminal, not just
+            # open decorative panels. Shortcuts must never leak into the PTY.
+            before_tools = initial_raw.read_bytes()
+            click_action(page_two, "Show/hide Tabs pane")
+            sidebar = page_two.get_by_role("complementary", name="Tabs pane")
+            sidebar.wait_for(state="visible")
+            sidebar.get_by_role("searchbox").fill("no-such-sidebar-tab")
+            sidebar.get_by_text("No matching tabs", exact=True).wait_for()
+            sidebar.get_by_role("searchbox").fill("")
+            sidebar.locator(f'button[data-pane-id="{initial_id}"]').click()
+            page_two.wait_for_url(f"**/random/t/{urllib.parse.quote(initial_id)}")
+            page_two.wait_for_function("() => document.querySelector('#terminal-status')?.textContent === 'Live'")
+            page_two.wait_for_function("() => document.querySelector('#terminal-xterm')?.contains(document.activeElement)")
+            sidebar.get_by_role("button", name="Move Tabs pane to left", exact=True).click()
+            page_two.wait_for_function("() => document.querySelector('.workspace-shell').dataset.sidebarSide === 'left'")
+            sidebar.get_by_role("button", name="Rename", exact=True).click()
+            page_two.locator("#workspace-action-dialog").get_by_role("button", name="Cancel", exact=True).click()
+            page_two.screenshot(path=str(output / "desktop-style-tabs-pane.png"))
+            page_two.reload(wait_until="domcontentloaded")
+            page_two.wait_for_function("() => document.querySelector('#terminal-status')?.textContent === 'Live'")
+            sidebar.wait_for(state="visible")
+            if page_two.locator(".workspace-shell").get_attribute("data-sidebar-side") != "left":
+                raise AssertionError("Tabs pane position did not survive reload")
+            page_two.set_viewport_size({"width": 320, "height": 568})
+            sidebar.get_by_role("button", name="Move Tabs pane to right", exact=True).click()
+            bounds = sidebar.bounding_box()
+            if not bounds or bounds["x"] < 0 or bounds["x"] + bounds["width"] > 321:
+                raise AssertionError("mobile Tabs pane overflows the viewport")
+            page_two.screenshot(path=str(output / "desktop-style-tabs-pane-mobile.png"))
+            sidebar.get_by_role("button", name="Hide Tabs pane", exact=True).click()
+            sidebar.wait_for(state="hidden")
+            page_two.set_viewport_size({"width": 1280, "height": 800})
+            if tmux_geometry(tmux, base_env, initial_tmux_name) != geometry_before:
+                raise AssertionError("Tabs pane changed canonical tmux geometry")
+            result["assertions"]["desktop_tabs_pane_navigation_layout_and_persistence"] = True
+            page_two.keyboard.press("Control+Shift+k")
+            tools_dialog = page_two.locator("#workspace-tools-dialog")
+            tools_dialog.wait_for(state="visible")
+            page_two.keyboard.press("ArrowUp")
+            if not tools_dialog.locator(".workspace-picker-results button").last.evaluate("el => el === document.activeElement"):
+                raise AssertionError("Up Arrow from the search field did not select the last tab")
+            page_two.keyboard.press("ArrowDown")
+            if not tools_dialog.locator(".workspace-picker-results button").first.evaluate("el => el === document.activeElement"):
+                raise AssertionError("Down Arrow did not wrap from the last tab to the first")
+            tools_dialog.get_by_role("searchbox").fill("no-such-t1000-tab")
+            tools_dialog.get_by_text("No matches", exact=True).wait_for()
+            tools_dialog.get_by_role("searchbox").fill("PRIMARY")
+            # The primary fixture's title is read from the registry, not its
+            # terminal output, so search by the actual session title.
+            tools_dialog.get_by_role("searchbox").fill(str(database_row(database, initial_id)["name"]))
+            page_two.keyboard.press("Enter")
+            page_two.wait_for_url(f"**/random/t/{urllib.parse.quote(initial_id)}")
+            page_two.wait_for_function("() => document.querySelector('#terminal-status')?.textContent === 'Live'")
+            page_two.wait_for_function("() => document.querySelector('#terminal-xterm')?.contains(document.activeElement)")
+            page_two.keyboard.press("Control+Shift+f")
+            tools_dialog.get_by_role("searchbox").fill("UNICODE_OK")
+            tools_dialog.get_by_text("Match selected in terminal", exact=True).wait_for()
+            if not page_two.evaluate("() => document.querySelector('#terminal-xterm').termdeckTerminal.selection().includes('UNICODE_OK')"):
+                raise AssertionError("Find in terminal did not select the real terminal text")
+            tools_dialog.get_by_role("searchbox").fill("no-such-terminal-text")
+            tools_dialog.get_by_text("No matches", exact=True).wait_for()
+            page_two.keyboard.press("Escape")
+            page_two.keyboard.press("Control+Shift+p")
+            tools_dialog.get_by_role("searchbox").fill("Terminal appearance")
+            page_two.keyboard.press("Enter")
+            try:
+                tools_dialog.get_by_label("Maximum text size (px)").wait_for(timeout=3000)
+            except Exception as exc:
+                page_two.screenshot(path=str(output / "palette-transition-failure.png"))
+                raise AssertionError(f"palette transition failed: {tools_dialog.evaluate('el => el.outerHTML')}; errors={result['page_errors']}") from exc
+            tools_dialog.get_by_label("Maximum text size (px)").fill("16")
+            tools_dialog.get_by_label("Maximum text size (px)").press("Tab")
+            tools_dialog.get_by_label("Cursor shape").select_option("bar")
+            tools_dialog.get_by_label("Blink cursor").uncheck()
+            tools_dialog.get_by_label("Terminal palette").select_option("nord")
+            tools_dialog.get_by_label("Terminal font", exact=True).select_option("liberation")
+            page_two.screenshot(path=str(output / "terminal-appearance.png"))
+            page_two.keyboard.press("Escape")
+            page_two.reload(wait_until="domcontentloaded")
+            page_two.wait_for_function("() => document.querySelector('#terminal-status')?.textContent === 'Live'")
+            options = page_two.evaluate("""() => {
+                const terminal = document.querySelector('#terminal-xterm').termdeckTerminal.terminal;
+                return {cursor: terminal.options.cursorStyle, blink: terminal.options.cursorBlink, cols: terminal.cols, rows: terminal.rows,
+                  background: terminal.options.theme.background, red: terminal.options.theme.red, font: terminal.options.fontFamily};
+            }""")
+            if options != {"cursor": "bar", "blink": False, "cols": canonical[0], "rows": canonical[1],
+                           "background": "#2e3440", "red": "#bf616a", "font": '"Liberation Mono", monospace'}:
+                raise AssertionError(f"appearance did not persist or changed canonical geometry: {options}")
+            click_action(page_two, "Terminal appearance")
+            palette_backgrounds = {"t1000": "#0a0d13", "terminator": "#000000", "catppuccin": "#1e1e2e",
+                                   "tokyo-night": "#1a1b26", "nord": "#2e3440", "one-dark": "#282c34", "solarized-dark": "#002b36"}
+            for palette, background in palette_backgrounds.items():
+                tools_dialog.get_by_label("Terminal palette").select_option(palette)
+                page_two.wait_for_function(
+                    "bg => document.querySelector('#terminal-xterm').termdeckTerminal.terminal.options.theme.background === bg",
+                    arg=background,
+                )
+            tools_dialog.get_by_role("button", name="Reset to defaults").click()
+            if tools_dialog.get_by_label("Terminal palette").input_value() != "t1000" or tools_dialog.get_by_label("Terminal font", exact=True).input_value() != "auto":
+                raise AssertionError("terminal palette or font did not reset")
+            result["assertions"]["desktop_palette_and_font_preferences_preserve_geometry"] = True
+            page_two.keyboard.press("Escape")
+            click_action(page_two, "Keyboard shortcuts")
+            tools_dialog.get_by_text("Ctrl + Alt + T", exact=True).wait_for()
+            page_two.keyboard.press("Escape")
+            if initial_raw.read_bytes() != before_tools:
+                raise AssertionError("workspace tool shortcuts leaked input into the terminal")
+            switch_pane_timed(created_id, "CODEX COMPOSER › CREATED")
+            result["assertions"]["search_palette_find_appearance_and_shortcuts"] = True
+
+            home_page = context_two.new_page()
+            home_page.goto(f"{origin}/")
+            home_page.locator(".window-list-row").first.wait_for()
+            home_page.get_by_role("searchbox").fill("no-such-window")
+            home_page.get_by_text("No matching windows or tabs.", exact=True).wait_for()
+            home_page.get_by_role("searchbox").fill("random")
+            home_page.locator('.window-list-row[href="/random"]').wait_for()
+            with home_page.expect_response(lambda response: response.url.endswith("/_termdeck/api/v1/snapshot")):
+                home_page.wait_for_timeout(2200)
+            if not home_page.get_by_role("searchbox").evaluate("el => el === document.activeElement && el.value === 'random'"):
+                raise AssertionError("window refresh lost search or focus")
+            home_page.screenshot(path=str(output / "window-list.png"))
+            home_page.close()
+            result["assertions"]["searchable_window_list_preserves_focus"] = True
+
             click_action(page_two, "Rename tab")
+            action_dialog = page_two.locator("#workspace-action-dialog")
+            action_dialog.wait_for(state="visible")
+            action_dialog.screenshot(path=str(output / "rename-dialog.png"))
+            action_dialog.locator('input[name="rename"]').fill("Renamed Browser Tab")
+            action_dialog.get_by_role("button", name="Save name", exact=True).click()
             wait_until(
                 lambda: (database_row(database, created_id) or {}).get("name") == "Renamed Browser Tab",
                 timeout=8,
@@ -1530,6 +1738,34 @@ def main() -> int:
             ).returncode != 0:
                 raise AssertionError("hiding the browser tab killed its tmux process")
 
+            hidden_pid = subprocess.check_output(
+                [str(tmux), "display-message", "-p", "-t", hidden_tmux_name, "#{pane_pid}"],
+                env=base_env, text=True, timeout=5,
+            ).strip()
+            rejected_restore = page_two.request.post(
+                f"{origin}/_termdeck/api/v1/windows/random/hidden-tabs/{created_id}/restore", data={}
+            )
+            if rejected_restore.status != 403 or database_row(database, created_id)["visible"] != 0:
+                raise AssertionError("hidden-tab restoration bypassed CSRF protection")
+            click_action(page_two, "Hidden tabs")
+            tools_dialog.get_by_role("button", name="Renamed Browser Tab", exact=False).click()
+            tools_dialog.wait_for(state="hidden", timeout=20000)
+            page_two.wait_for_url(f"**/random/t/{created_id}")
+            page_two.wait_for_function("() => document.querySelector('#terminal-status')?.textContent === 'Live'")
+            page_two.wait_for_function("() => document.querySelector('#terminal-xterm')?.contains(document.activeElement)")
+            restored_pid = subprocess.check_output(
+                [str(tmux), "display-message", "-p", "-t", hidden_tmux_name, "#{pane_pid}"],
+                env=base_env, text=True, timeout=5,
+            ).strip()
+            if restored_pid != hidden_pid or database_row(database, created_id)["visible"] != 1:
+                raise AssertionError(f"reopening a hidden tab restarted or failed to restore it: before_pid={hidden_pid}, after_pid={restored_pid}, row={database_row(database, created_id)}")
+            click_action(page_two, "Hide tab")
+            page_two.wait_for_function(
+                "id => ![...document.querySelectorAll('.workspace-tab')].some(tab => tab.dataset.paneId === id)",
+                arg=created_id,
+            )
+            result["assertions"]["hidden_tab_restore_preserves_process_and_csrf"] = True
+
             kill_command = shlex.join(
                 [
                     str(args.python.resolve()),
@@ -1563,8 +1799,53 @@ def main() -> int:
             if not kill_row or kill_row["status"] != "running":
                 raise AssertionError(f"kill target was not running: {kill_row!r}")
             kill_tmux_name = str(kill_row["tmux_name"])
-            page_two.once("dialog", lambda dialog: dialog.accept())
             click_action(page_two, "Kill process…")
+            action_dialog.wait_for(state="visible")
+            if not action_dialog.get_by_role("button", name="Cancel", exact=True).evaluate("el => el === document.activeElement"):
+                raise AssertionError("destructive dialog did not default focus to Cancel")
+            action_dialog.screenshot(path=str(output / "kill-dialog.png"))
+            for _ in range(5):
+                page_two.keyboard.press("Tab")
+                if not action_dialog.evaluate("el => el.contains(document.activeElement)"):
+                    raise AssertionError("keyboard focus escaped the modal")
+            page_two.set_viewport_size({"width": 320, "height": 568})
+            box = action_dialog.bounding_box()
+            if not box or box["x"] < 0 or box["x"] + box["width"] > 320 or box["height"] > 568:
+                raise AssertionError(f"destructive dialog escaped mobile viewport: {box}")
+            page_two.screenshot(path=str(output / "kill-dialog-mobile.png"))
+            page_two.keyboard.press("Escape")
+            action_dialog.wait_for(state="hidden")
+            page_two.set_viewport_size({"width": 1280, "height": 800})
+            if (database_row(database, kill_id) or {}).get("status") != "running":
+                raise AssertionError("cancelling Kill changed the terminal")
+
+            # An action failure must remain visible after terminal reconnects
+            # and metadata refreshes, and must not optimistically remove a tab.
+            action_url = f"{origin}/_termdeck/api/v1/windows/random/panes/{kill_id}/tab"
+            page_two.route(action_url, lambda route: route.fulfill(
+                status=409, content_type="application/json",
+                body='{"error":"tab-action-failed"}',
+            ))
+            click_action(page_two, "Kill process…")
+            action_dialog.get_by_role("button", name="Kill process", exact=True).click()
+            action_notice = page_two.locator(".workspace-action-notice")
+            action_notice.wait_for(state="visible")
+            if "launcher may need repair" not in action_notice.inner_text():
+                raise AssertionError("tab action error did not explain recovery")
+            page_two.evaluate("window.dispatchEvent(new Event('online'))")
+            with page_two.expect_response(api_url, timeout=10_000):
+                page_two.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+            if not action_notice.is_visible():
+                raise AssertionError("terminal refresh erased the tab action error")
+            page_two.screenshot(path=str(output / "action-error.png"))
+            if (database_row(database, kill_id) or {}).get("status") != "running":
+                raise AssertionError("rejected Kill changed the terminal")
+            action_notice.get_by_role("button", name="Dismiss").click()
+            page_two.unroute(action_url)
+            result["assertions"]["destructive_dialog_cancel_and_persistent_errors"] = True
+
+            click_action(page_two, "Kill process…")
+            action_dialog.get_by_role("button", name="Kill process", exact=True).click()
             wait_until(
                 lambda: (
                     (row := database_row(database, kill_id)) is not None
@@ -1603,6 +1884,12 @@ def main() -> int:
             )
             result["assertions"]["complete_tab_lifecycle"] = True
 
+            from web_management_browser_checks import check_management
+            check_management(page_two, origin=origin, database=database,
+                             initial_id=initial_id, created_id=created_id, output=output,
+                             result=result, database_row=database_row,
+                             wait_until=wait_until, click_action=click_action)
+
             screenshot = output / "terminal-browser-proof.png"
             page_two.screenshot(path=str(screenshot), full_page=True)
             result["screenshot"] = {
@@ -1615,10 +1902,13 @@ def main() -> int:
             browser.close()
 
         errors = result["page_errors"]
+        from web_management_browser_checks import is_cancelled_manager_read
+        result["cancelled_manager_reads"] = [item for item in result["request_failures"] if is_cancelled_manager_read(item)]
         failures = [
             item
             for item in result["request_failures"]
             if "/_termdeck/api/v1/windows/random" not in item.get("url", "")
+            and not is_cancelled_manager_read(item)
         ]
         if errors:
             raise AssertionError(f"browser page errors: {errors!r}")

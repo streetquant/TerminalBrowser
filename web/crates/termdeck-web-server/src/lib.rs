@@ -80,10 +80,11 @@ pub const MAX_FRONTEND_ASSET_BYTES: usize = 64 * 1024;
 pub const MAX_TERMINAL_ASSET_BYTES: usize = 1024 * 1024;
 pub const MAX_HTTP_REQUEST_BYTES: usize = MAX_TERMINAL_INPUT_BYTES + 1_024;
 
-const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v5/app.css";
-const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v5/app.js";
-const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v5/terminal.css";
-const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v5/terminal.js";
+const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v6/app.css";
+const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v6/app.js";
+const WORKSPACE_UI_PATH: &str = "/_termdeck/assets/v6/workspace-ui.js";
+const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v6/terminal.css";
+const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v6/terminal.js";
 const EXTERNAL_BASE_PATH: &str = "/t1000";
 const ROOT_COOKIE_PATH: &str = "; Path=/;";
 const EXTERNAL_COOKIE_PATH: &str = "; Path=/t1000;";
@@ -93,11 +94,13 @@ const FORWARDED_HOST_HEADER: &str = "x-forwarded-host";
 const BASE_PATH_PLACEHOLDER: &str = "__TERMDECK_BASE_PATH__";
 const APP_CSS: &[u8] = include_bytes!("../assets/app.css");
 const APP_JS: &[u8] = include_bytes!("../assets/app.js");
+const WORKSPACE_UI_JS: &[u8] = include_bytes!("../assets/workspace-ui.js");
 const TERMINAL_CSS: &[u8] = include_bytes!("../assets/terminal.css");
 const TERMINAL_JS: &[u8] = include_bytes!("../assets/terminal.js");
 const _: () = {
     assert!(APP_CSS.len() <= MAX_FRONTEND_ASSET_BYTES);
     assert!(APP_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+    assert!(WORKSPACE_UI_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
     assert!(TERMINAL_CSS.len() <= MAX_TERMINAL_ASSET_BYTES);
     assert!(TERMINAL_JS.len() <= MAX_TERMINAL_ASSET_BYTES);
 };
@@ -923,6 +926,7 @@ fn build_router(state: AppState) -> Router {
         .route("/", get(homepage))
         .route(FRONTEND_CSS_PATH, get(frontend_css))
         .route(FRONTEND_JS_PATH, get(frontend_js))
+        .route(WORKSPACE_UI_PATH, get(workspace_ui_js))
         .route(TERMINAL_CSS_PATH, get(terminal_css))
         .route(TERMINAL_JS_PATH, get(terminal_js))
         .route("/_termdeck/healthz", get(healthz))
@@ -938,7 +942,19 @@ fn build_router(state: AppState) -> Router {
             axum::routing::post(revoke_device),
         )
         .route("/_termdeck/api/v1/snapshot", get(api_snapshot))
+        .route(
+            "/_termdeck/api/v1/management",
+            axum::routing::post(management),
+        )
         .route("/_termdeck/api/v1/windows/{slug}", get(api_window))
+        .route(
+            "/_termdeck/api/v1/windows/{slug}/hidden-tabs",
+            get(tab_hidden),
+        )
+        .route(
+            "/_termdeck/api/v1/windows/{slug}/hidden-tabs/{session_id}/restore",
+            axum::routing::post(tab_restore),
+        )
         .route(
             "/_termdeck/api/v1/windows/{slug}/tabs",
             axum::routing::post(tab_create),
@@ -1123,6 +1139,7 @@ fn public_auth_route(path: &str) -> bool {
         path,
         FRONTEND_CSS_PATH
             | FRONTEND_JS_PATH
+            | WORKSPACE_UI_PATH
             | TERMINAL_CSS_PATH
             | TERMINAL_JS_PATH
             | "/_termdeck/healthz"
@@ -1136,7 +1153,11 @@ fn public_auth_route(path: &str) -> bool {
 async fn security_headers(request: Request, next: Next) -> Response {
     let versioned_asset = matches!(
         request.uri().path(),
-        FRONTEND_CSS_PATH | FRONTEND_JS_PATH | TERMINAL_CSS_PATH | TERMINAL_JS_PATH
+        FRONTEND_CSS_PATH
+            | FRONTEND_JS_PATH
+            | WORKSPACE_UI_PATH
+            | TERMINAL_CSS_PATH
+            | TERMINAL_JS_PATH
     );
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
@@ -1162,7 +1183,10 @@ async fn security_headers(request: Request, next: Next) -> Response {
     );
     headers.insert(
         HeaderName::from_static("referrer-policy"),
-        HeaderValue::from_static("no-referrer"),
+        // Chromium also strips the Origin on native POST forms under
+        // no-referrer. Keep same-origin form provenance without disclosing
+        // paths to other origins; the request/CSRF gates remain strict.
+        HeaderValue::from_static("same-origin"),
     );
     headers.insert(
         HeaderName::from_static("permissions-policy"),
@@ -1204,6 +1228,14 @@ async fn frontend_js() -> Response {
         StatusCode::OK,
         "text/javascript; charset=utf-8",
         Bytes::from_static(APP_JS),
+    )
+}
+
+async fn workspace_ui_js() -> Response {
+    text_response(
+        StatusCode::OK,
+        "text/javascript; charset=utf-8",
+        Bytes::from_static(WORKSPACE_UI_JS),
     )
 }
 
@@ -1787,6 +1819,21 @@ fn tab_action_context(
     Ok(Arc::clone(actions))
 }
 
+async fn management(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    let actions = match tab_action_context(&state, context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    match actions.manage(request).await {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(error) => tab_action_error_response(error),
+    }
+}
+
 async fn tab_create(
     State(state): State<AppState>,
     context: Option<Extension<SessionContext>>,
@@ -1813,6 +1860,44 @@ async fn tab_create(
         .await
     {
         Ok(value) => json_response(StatusCode::CREATED, &value),
+        Err(error) => tab_action_error_response(error),
+    }
+}
+
+async fn tab_hidden(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath(slug): AxumPath<String>,
+) -> Response {
+    let actions = match tab_action_context(&state, context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let window = match resolve_window(&state.cache, &slug) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    match actions.hidden(&window.id).await {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(error) => tab_action_error_response(error),
+    }
+}
+
+async fn tab_restore(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath((slug, session_id)): AxumPath<(String, String)>,
+) -> Response {
+    let actions = match tab_action_context(&state, context) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let window = match resolve_window(&state.cache, &slug) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    match actions.restore(&window.id, &window.name, &session_id).await {
+        Ok(value) => json_response(StatusCode::OK, &value),
         Err(error) => tab_action_error_response(error),
     }
 }
@@ -1908,6 +1993,8 @@ async fn terminal_page(
     output.push_str(TERMINAL_CSS_PATH);
     output.push_str("\"><script defer src=\"");
     output.push_str(TERMINAL_JS_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(WORKSPACE_UI_PATH);
     output.push_str("\"></script><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
     output.push_str("\"></script></head><body class=\"terminal-page\"><main id=\"termdeck-app\" class=\"terminal-page-main\" data-termdeck-page=\"terminal\" data-termdeck-slug=\"");
@@ -2324,23 +2411,26 @@ fn password_page_response(
     let mut output = String::with_capacity(2_048);
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>");
     escape_html_into(&mut output, title);
-    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><p class=\"eyebrow\">t1000 owner authentication</p><h1>");
+    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v6/app.css\"></head><body class=\"auth-page\"><main class=\"auth-main\"><p class=\"auth-brand\"><span class=\"auth-mark\" aria-hidden=\"true\">&gt;_</span>t1000</p><h1>");
     escape_html_into(&mut output, heading);
     output.push_str("</h1><p class=\"subtle\">");
     escape_html_into(&mut output, description);
     output.push_str("</p>");
     if let Some(error) = error {
-        output.push_str("<p role=\"alert\"><strong>");
+        output.push_str("<p id=\"auth-error\" class=\"auth-error\" role=\"alert\"><strong>");
         escape_html_into(&mut output, error);
         output.push_str("</strong></p>");
     }
     output.push_str("<form method=\"post\" action=\"");
     escape_html_into(&mut output, action);
-    output.push_str("\" autocomplete=\"on\"><label>Password<input name=\"password\" type=\"password\" required autocomplete=\"");
+    output.push_str("\" autocomplete=\"on\"><label>Password<input name=\"password\" type=\"password\" required autofocus autocomplete=\"");
     escape_html_into(&mut output, autocomplete);
     output.push_str("\" maxlength=\"");
     output.push_str(MAX_OWNER_PASSWORD_BYTES.to_string().as_str());
     output.push('"');
+    if error.is_some() {
+        output.push_str(" aria-invalid=\"true\" aria-describedby=\"auth-error\"");
+    }
     if page == PasswordPage::Setup {
         output.push_str(" minlength=\"");
         output.push_str(MIN_OWNER_PASSWORD_BYTES.to_string().as_str());
@@ -2421,7 +2511,7 @@ fn password_error_response(
 
 fn render_pairing_page(base_path: RequestBasePath) -> String {
     let output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Recovery pairing · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><p class=\"eyebrow\">t1000 recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Recovery pairing · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v6/app.css\"></head><body><main><p class=\"eyebrow\">t1000 recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
     );
     html_for_base(prefix_html_template(output), base_path)
 }
@@ -2891,6 +2981,7 @@ struct PaneDto<'a> {
     title: &'a str,
     cwd: &'a str,
     status: &'static str,
+    pinned: bool,
     tmux_target: Option<&'a str>,
     controller: Option<ControllerDto<'a>>,
 }
@@ -2935,6 +3026,7 @@ fn pane_dto(pane: &PaneSnapshot) -> PaneDto<'_> {
         title: pane.title(),
         cwd: pane.cwd(),
         status: pane_status_name(pane.status()),
+        pinned: pane.pinned(),
         tmux_target: pane.tmux_target(),
         controller: pane.controller().map(controller_dto),
     }
@@ -2971,6 +3063,8 @@ fn render_homepage(
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>t1000</title><link rel=\"stylesheet\" href=\"");
     output.push_str(FRONTEND_CSS_PATH);
     output.push_str("\"><script defer src=\"");
+    output.push_str(WORKSPACE_UI_PATH);
+    output.push_str("\"></script><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
     output.push_str("\"></script></head><body><main id=\"termdeck-app\" aria-busy=\"false\" data-termdeck-page=\"home\"><header class=\"host-header\"><p class=\"eyebrow\">t1000 host</p><h1>Windows</h1><p class=\"subtle\">");
     output.push_str(&snapshot.windows().len().to_string());
@@ -3030,6 +3124,8 @@ fn render_window_page(
     output.push_str(TERMINAL_CSS_PATH);
     output.push_str("\"><script defer src=\"");
     output.push_str(TERMINAL_JS_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(WORKSPACE_UI_PATH);
     output.push_str("\"></script><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
     output.push_str("\"></script></head><body><main id=\"termdeck-app\" aria-busy=\"false\" data-termdeck-page=\"window\" data-termdeck-slug=\"");
@@ -3093,7 +3189,7 @@ fn render_window_page(
 
 fn render_not_found_page(slug: &str, base_path: RequestBasePath) -> String {
     let mut output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Not found · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored t1000 window owns this route",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Not found · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v6/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored t1000 window owns this route",
     );
     if !slug.is_empty() {
         output.push_str(": <code>/");
@@ -3294,8 +3390,8 @@ mod tests {
         APP_CSS, APP_JS, AppState, CONTENT_SECURITY_POLICY, CacheAvailability, ConfigAction,
         EXTERNAL_BASE_PATH, FORWARDED_HOST_HEADER, FORWARDED_PREFIX_HEADER, FORWARDED_PROTO_HEADER,
         FRONTEND_CSS_PATH, FRONTEND_JS_PATH, MAX_FRONTEND_ASSET_BYTES, MAX_PASSWORD_OPERATIONS,
-        RenderedSnapshot, ServerConfig, ServerError, SnapshotCache, TERMINAL_JS_PATH, build_router,
-        unix_ms,
+        RenderedSnapshot, ServerConfig, ServerError, SnapshotCache, TERMINAL_JS_PATH,
+        WORKSPACE_UI_JS, WORKSPACE_UI_PATH, build_router, unix_ms,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
@@ -3465,6 +3561,12 @@ mod tests {
             );
             assert_eq!(
                 home.headers()
+                    .get("referrer-policy")
+                    .and_then(|value| value.to_str().ok()),
+                Some("same-origin")
+            );
+            assert_eq!(
+                home.headers()
                     .get(header::CACHE_CONTROL)
                     .and_then(|value| value.to_str().ok()),
                 Some("no-store, max-age=0")
@@ -3530,8 +3632,8 @@ mod tests {
             );
             let home_text = body_text(home).await;
             assert!(home_text.contains(r#"data-termdeck-base="/t1000""#));
-            assert!(home_text.contains(r#"href="/t1000/_termdeck/assets/v5/app.css""#));
-            assert!(home_text.contains(r#"src="/t1000/_termdeck/assets/v5/app.js""#));
+            assert!(home_text.contains(r#"href="/t1000/_termdeck/assets/v6/app.css""#));
+            assert!(home_text.contains(r#"src="/t1000/_termdeck/assets/v6/app.js""#));
             assert!(home_text.contains(r#"href="/t1000/random""#));
             assert!(!home_text.contains("__TERMDECK_BASE_PATH__"));
             assert!(!home_text.contains(r#"href="/_termdeck/"#));
@@ -3545,7 +3647,7 @@ mod tests {
             let window_text = body_text(window).await;
             assert!(window_text.contains(r#"data-termdeck-base="/t1000""#));
             assert!(window_text.contains(r#"href="/t1000/random/t/session-one""#));
-            assert!(window_text.contains(r#"href="/t1000/_termdeck/assets/v5/app.css""#));
+            assert!(window_text.contains(r#"href="/t1000/_termdeck/assets/v6/app.css""#));
 
             let asset = router
                 .clone()
@@ -3596,6 +3698,7 @@ mod tests {
         runtime().block_on(async {
             assert!(APP_CSS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(APP_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+            assert!(WORKSPACE_UI_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(CONTENT_SECURITY_POLICY.contains("script-src 'self'"));
             assert!(CONTENT_SECURITY_POLICY.contains("style-src 'self' 'unsafe-inline'"));
             assert!(CONTENT_SECURITY_POLICY.contains("connect-src 'self'"));
@@ -3628,6 +3731,7 @@ mod tests {
             assert_eq!(css_text.as_bytes(), APP_CSS);
 
             let javascript = match router
+                .clone()
                 .oneshot(request(Method::GET, FRONTEND_JS_PATH, "localhost:7391"))
                 .await
             {
@@ -3644,11 +3748,31 @@ mod tests {
             );
             let script = body_text(javascript).await;
             assert_eq!(script.as_bytes(), APP_JS);
+            let workspace = router
+                .oneshot(request(Method::GET, WORKSPACE_UI_PATH, "localhost:7391"))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(workspace.status(), StatusCode::OK);
+            assert_eq!(
+                workspace
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("public, max-age=86400, immutable")
+            );
+            let workspace = body_text(workspace).await;
+            assert_eq!(workspace.as_bytes(), WORKSPACE_UI_JS);
+            assert!(!workspace.contains("innerHTML"));
+            assert!(!workspace.contains("eval("));
             assert!(script.contains("/_termdeck/api/v1/snapshot"));
             assert!(script.contains("/_termdeck/api/v1/windows/"));
             assert!(script.contains("textContent"));
             assert!(script.contains("replaceChildren"));
-            assert!(script.contains("Open terminal"));
+            assert!(script.contains("workspace-action-dialog"));
+            assert!(script.contains("workspace-action-notice"));
+            assert!(script.contains("workspace-statusbar"));
+            assert!(!script.contains("window.confirm("));
+            assert!(!script.contains("window.prompt("));
             assert!(script.contains("termdeck.terminal-control.v1"));
             assert!(script.contains("/_termdeck/ws/v1/windows/"));
             assert!(script.contains("new WebSocket"));
@@ -4346,7 +4470,7 @@ mod auth_integration_tests {
                 .unwrap_or_else(|error| match error {});
             assert_eq!(setup_page.status(), StatusCode::OK);
             let setup_text = body_text(setup_page).await;
-            assert!(setup_text.contains(r#"href="/t1000/_termdeck/assets/v5/app.css""#));
+            assert!(setup_text.contains(r#"href="/t1000/_termdeck/assets/v6/app.css""#));
             assert!(setup_text.contains(r#"action="/t1000/_termdeck/setup""#));
             assert!(!setup_text.contains("__TERMDECK_BASE_PATH__"));
 
@@ -4420,6 +4544,9 @@ mod auth_integration_tests {
                 assert_eq!(html.matches("<input ").count(), input_count);
                 assert_eq!(html.matches(r#"type="password""#).count(), input_count);
                 assert!(html.contains(format!(r#"autocomplete="{autocomplete}""#).as_str()));
+                assert!(html.contains(r#"class="auth-page""#));
+                assert!(html.contains("required autofocus"));
+                assert!(!html.contains(r#"aria-invalid="true""#));
                 assert!(!html.contains("Device name"));
                 assert!(!html.contains(r#"name="label""#));
 
@@ -4464,6 +4591,8 @@ mod auth_integration_tests {
                 assert!(!response.headers().contains_key(header::SET_COOKIE));
                 let html = body_text(response).await;
                 assert_eq!(html.matches("<input ").count(), 1);
+                assert!(html.contains(r#"aria-invalid="true" aria-describedby="auth-error""#));
+                assert!(html.contains(r#"class="auth-error" role="alert""#));
                 assert!(!html.to_ascii_lowercase().contains("device name"));
                 assert!(!html.contains(r#"name="label""#));
             }
@@ -4702,7 +4831,7 @@ mod auth_integration_tests {
                 .clone()
                 .oneshot(request(
                     Method::GET,
-                    "/_termdeck/assets/v5/app.css",
+                    "/_termdeck/assets/v6/app.css",
                     Body::empty(),
                 ))
                 .await

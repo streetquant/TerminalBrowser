@@ -116,11 +116,11 @@ def _wait_for_smoke_panes(
     *,
     timeout: float = 12.0,
 ) -> dict[str, object]:
-    """Wait until all workspace panes have rendered visible, known text.
+    """Wait until the backing tmux panes contain known text.
 
-    A mapped GTK window with a blank terminal is not a useful visual result.
-    This bounded readiness check catches failed tmux startup and prevents the
-    harness from declaring an error toast or empty pane a passing screenshot.
+    This catches failed process startup, but is not a VTE rendering oracle.
+    Inspect the captured image and use check_visual_polish_smoke.py for the
+    actual VTE text/resize regression; tmux can be ready behind a blank VTE.
     """
 
     deadline = time.monotonic() + timeout

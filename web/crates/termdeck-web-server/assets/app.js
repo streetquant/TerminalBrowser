@@ -11,12 +11,8 @@
   const MAX_ID_CHARS = 256;
   const MAX_NAME_CHARS = 2048;
   const MAX_CWD_CHARS = 8192;
-  const MAX_TERMINAL_TEXT_CHARS = 2 * 1024 * 1024;
   const REFRESH_VISIBLE_MS = 2000;
   const REFRESH_HIDDEN_MS = 15000;
-  const TERMINAL_REFRESH_VISIBLE_MS = 1000;
-  const TERMINAL_REFRESH_HIDDEN_MS = 5000;
-  const HEARTBEAT_MS = 10000;
   const REQUEST_TIMEOUT_MS = 5000;
   const STATUS_NAMES = new Set([
     "new",
@@ -102,16 +98,6 @@
     );
   }
 
-  function apiEndpoint(pageName, slug) {
-    if (pageName === "home") {
-      return appPath("/_termdeck/api/v1/snapshot");
-    }
-    if (pageName === "window" && validSlug(slug)) {
-      return appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(slug)}`);
-    }
-    return "";
-  }
-
   function normalizeController(value) {
     if (value === null || value === undefined) {
       return false;
@@ -138,6 +124,7 @@
       title: requiredString(value.title, MAX_NAME_CHARS, "pane title"),
       cwd: requiredString(value.cwd, MAX_CWD_CHARS, "pane cwd"),
       status,
+      pinned: value.pinned === true,
       controllerActive: normalizeController(value.controller),
     };
   }
@@ -220,128 +207,12 @@
     return element;
   }
 
-  function hostHeader(title, summary, identity) {
-    const header = node("header", "host-header");
-    header.append(
-      node("p", "eyebrow", "t1000 web host"),
-      node("h1", "", title),
-      node("p", "subtle", summary),
-    );
-    if (identity) {
-      header.append(node("p", "identity", identity));
-    }
-    return header;
-  }
-
-  function footer(apiHref, stale) {
-    const footerElement = node("footer", "footer-row");
-    footerElement.append(
-      link("Versioned JSON", apiHref, "footer-link"),
-      node(
-        "p",
-        "refresh-state",
-        stale
-          ? "Showing saved windows · reconnecting"
-          : "Live refresh enabled · authenticated browser session",
-      ),
-    );
-    return footerElement;
-  }
-
   function renderHome(value, stale) {
     const host = normalizeHost(value);
-    const fragment = document.createDocumentFragment();
-    fragment.append(
-      hostHeader(
-        "Windows",
-        `${host.windows.length} windows · ${host.totalPanes} visible panes · revision ${host.revision}`,
-        "Open any window to work with its live terminals.",
-      ),
-    );
-    if (stale) {
-      fragment.append(
-        notice("The most recent host refresh failed. Showing a bounded stale snapshot.", "notice-stale"),
-      );
-    }
-    const grid = node("section", "grid");
-    grid.setAttribute("aria-label", "t1000 windows");
-    for (const windowData of host.windows) {
-      const running = windowData.panes.filter((pane) => pane.status === "running").length;
-      const card = link("", appPath(windowData.path), "card");
-      card.replaceChildren(
-        node("span", "card-title", windowData.name),
-        node("span", "card-meta", `${windowData.panes.length} panes · ${running} running`),
-        node("span", "identity", `Window ${windowData.id}`),
-        node("code", "", appPath(windowData.path)),
-      );
-      grid.append(card);
-    }
-    if (host.windows.length === 0) {
-      grid.append(node("div", "empty", "No remembered t1000 windows are currently available."));
-    }
-    fragment.append(grid, footer(appPath("/_termdeck/api/v1/snapshot"), stale));
-    root.replaceChildren(fragment);
+    window.T1000UI.renderHome(root, host, stale, appPath);
     root.dataset.termdeckState = stale ? "stale" : "ready";
     root.setAttribute("aria-busy", "false");
     document.title = "t1000";
-  }
-
-  function paneArticle(windowSlug, pane) {
-    const path = appPath(`/${encodeURIComponent(windowSlug)}/t/${encodeURIComponent(pane.id)}`);
-    const article = link("", path, "pane pane-link");
-    const main = node("div", "pane-main");
-    main.append(node("h2", "", pane.title), node("p", "path", pane.cwd));
-    const identity = pane.sessionId
-      ? `Pane ${pane.id} · session ${pane.sessionId}`
-      : `Pane ${pane.id}`;
-    main.append(node("p", "identity", identity));
-    const aside = node("div", "pane-aside");
-    aside.append(
-      node("span", `status status-${pane.status}`, pane.status),
-      node("span", "mode", "Open terminal"),
-    );
-    article.append(main, aside);
-    return article;
-  }
-
-  function renderWindow(value, stale) {
-    const envelope = normalizeWindowEnvelope(value);
-    const windowData = envelope.window;
-    if (routeSlug && windowData.slug !== routeSlug) {
-      throw new Error("Window route identity changed unexpectedly.");
-    }
-    const fragment = document.createDocumentFragment();
-    const navigation = node("nav", "page-nav");
-    navigation.append(link("← All windows", appPath("/"), "back-link"));
-    fragment.append(
-      navigation,
-      hostHeader(
-        windowData.name,
-        `${windowData.panes.length} visible panes · revision ${envelope.revision}`,
-        `Window ${windowData.id} · ${windowData.path}`,
-      ),
-    );
-    if (stale) {
-      fragment.append(
-        notice("Live host observation is temporarily degraded.", "notice-stale"),
-      );
-    }
-    const panes = node("section", "panes");
-    panes.setAttribute("aria-label", "Terminal panes");
-    for (const pane of windowData.panes) {
-      panes.append(paneArticle(windowData.slug, pane));
-    }
-    if (windowData.panes.length === 0) {
-      panes.append(node("div", "empty", "This remembered window currently has no visible panes."));
-    }
-    fragment.append(
-      panes,
-      footer(appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(windowData.slug)}`), stale),
-    );
-    root.replaceChildren(fragment);
-    root.dataset.termdeckState = stale ? "stale" : "ready";
-    root.setAttribute("aria-busy", "false");
-    document.title = `${windowData.name} · t1000`;
   }
 
   function currentClientNotice() {
@@ -372,6 +243,15 @@
 
   function errorMessage(error) {
     if (error instanceof Error && error.message) {
+      const explanations = {
+        "tab-action-failed": "The server could not complete this action. Its t1000 launcher may need repair. Your tab has not been removed from this view.",
+        "tab-action-timeout": "The server took too long to respond. Check the tab before trying again; the action may still have completed.",
+        "tab-action-busy": "Other tab actions are still running. Wait for them to finish, then try again.",
+        "tab-action-internal": "The tab service is unavailable. Check the server before trying again.",
+      };
+      if (explanations[error.message]) {
+        return explanations[error.message];
+      }
       return error.message.slice(0, 240);
     }
     return "Request failed.";
@@ -440,11 +320,14 @@
     });
   }
 
+  window.T1000Management.configure({root, appPath,
+    postTerminal: async (path, data) => (await mutateJson(appPath(path), data, 10000)).payload,
+    post: async data => (await mutateJson(appPath("/_termdeck/api/v1/management"), data, 180000)).payload,
+    snapshot: async () => normalizeHost((await fetchJson(appPath("/_termdeck/api/v1/snapshot"))).payload),
+  });
+
   function startSnapshotRefresh() {
-    const endpoint = apiEndpoint(page, routeSlug);
-    if (!endpoint) {
-      return;
-    }
+    const endpoint = appPath("/_termdeck/api/v1/snapshot");
     let requestInFlight = false;
     let refreshTimer = 0;
     let failureCount = 0;
@@ -477,11 +360,7 @@
           method: "GET",
         });
         const stale = response.headers.get("x-termdeck-stale") === "1";
-        if (page === "home") {
-          renderHome(payload, stale);
-        } else {
-          renderWindow(payload, stale);
-        }
+        renderHome(payload, stale);
         failureCount = 0;
         if (!stale) {
           clearClientNotice();
@@ -525,7 +404,7 @@
     const MAX_COLUMNS = 1000;
     const MIN_ROWS = 2;
     const MAX_ROWS = 500;
-    const terminalApi = library.createTerminal(host, { scrollback: 20000 });
+    const terminalApi = library.createTerminal(host, { scrollback: 20000, ...window.T1000UI.preferences() });
     Object.defineProperty(host, "termdeckTerminal", {
       configurable: true,
       value: terminalApi,
@@ -917,10 +796,7 @@
         return;
       }
       if (event.type === "ready" || event.type === "resynced") {
-        // The protocol is ready as soon as control/sequence state arrives. The
-        // replay bytes are already ordered ahead of subsequent output by the
-        // bounded output chain, so do not make typing wait for xterm to finish
-        // painting a large history snapshot.
+        // Ordered replay must not delay the ready input pipeline.
         finishReady(event);
         flushTerminalOutput();
         return;
@@ -1112,9 +988,7 @@
       if (document.visibilityState !== "visible" || !networkOnline) {
         return;
       }
-      // Background tabs and suspended laptops may pause JavaScript timers for
-      // minutes. Treat resume as a new liveness epoch rather than closing a
-      // healthy server-side WebSocket because an old client timer fired late.
+      // Resume starts a fresh liveness epoch after background timer suspension.
       lastPongAt = Date.now();
       reconnectAttempt = 0;
       window.clearTimeout(reconnectTimer);
@@ -1134,9 +1008,7 @@
         return;
       }
       if (document.hidden) {
-        // Browsers throttle or freeze hidden-page timers. Keep the application
-        // socket open and let the proxy/server TCP keepalive own dead-peer
-        // detection; probe immediately when the page becomes visible again.
+        // Keep hidden sockets alive; probe liveness again on resume.
         sendJson({ type: "ping" });
         return;
       }
@@ -1232,7 +1104,7 @@
     actionSummary.setAttribute("aria-label", "Tab actions");
     const actionPanel = node("div", "workspace-action-panel");
     actionMenu.append(actionSummary, actionPanel);
-    rightTools.append(workspaceStatus, terminalStatus, actionMenu);
+    rightTools.append(workspaceStatus, actionMenu);
     topbar.append(leftTools, titleGroup, rightTools);
 
     const tabbar = node("div", "workspace-tabbar");
@@ -1245,6 +1117,9 @@
     shellStatus.setAttribute("role", "status");
     shellStatus.setAttribute("aria-live", "polite");
     const terminalIdentity = node("span", "workspace-terminal-identity", "No tab selected");
+    const statusbar = node("footer", "workspace-statusbar");
+    const shortcutHint = node("span", "workspace-shortcut-hint", "New tab  Ctrl+Alt+T");
+    statusbar.append(terminalStatus, terminalIdentity, shortcutHint);
     const xtermShell = node("div", "xterm-shell");
     xtermShell.id = "terminal-shell";
     const terminalHost = node("div", "xterm-host");
@@ -1254,13 +1129,29 @@
     terminalOverlay.id = "terminal-overlay";
     terminalOverlay.hidden = true;
     xtermShell.append(terminalHost, terminalOverlay);
-    shell.append(shellStatus, terminalIdentity, xtermShell);
+    const emptyNewButton = node("button", "workspace-empty-action", "Create a new tab");
+    emptyNewButton.type = "button";
+    emptyNewButton.addEventListener("click", () => newButton.click());
+    const actionNotice = node("div", "workspace-action-notice");
+    actionNotice.hidden = true;
+    const actionNoticeText = node("p", "");
+    actionNoticeText.setAttribute("role", "alert");
+    const dismissNotice = node("button", "", "Dismiss");
+    dismissNotice.type = "button";
+    dismissNotice.addEventListener("click", () => {
+      actionNotice.hidden = true;
+      terminalMount?.focus();
+    });
+    actionNotice.append(actionNoticeText, dismissNotice);
+    shell.append(shellStatus, emptyNewButton, xtermShell, actionNotice);
 
     const dialog = document.createElement("dialog");
     dialog.className = "workspace-dialog";
     const newForm = document.createElement("form");
     newForm.method = "dialog";
     const dialogTitle = node("h2", "", "New tab");
+    dialogTitle.id = "workspace-new-title";
+    dialog.setAttribute("aria-labelledby", dialogTitle.id);
     const cwdInput = document.createElement("input");
     cwdInput.name = "cwd";
     cwdInput.required = true;
@@ -1275,6 +1166,7 @@
     pinnedInput.type = "checkbox";
     pinnedInput.name = "pinned";
     const dialogStatus = node("p", "workspace-dialog-status", "");
+    dialogStatus.setAttribute("role", "status");
     const cancelButton = node("button", "secondary", "Cancel");
     cancelButton.type = "button";
     const createButton = node("button", "", "Create tab");
@@ -1299,7 +1191,94 @@
     );
     dialog.append(newForm);
 
-    root.replaceChildren(topbar, tabbar, shell, dialog);
+    const actionDialog = document.createElement("dialog");
+    actionDialog.id = "workspace-action-dialog";
+    actionDialog.className = "workspace-dialog";
+    const actionForm = document.createElement("form");
+    actionForm.method = "dialog";
+    const actionTitle = node("h2", "");
+    actionTitle.id = "workspace-action-title";
+    const actionDescription = node("p", "workspace-dialog-description");
+    actionDescription.id = "workspace-action-description";
+    actionDialog.setAttribute("aria-labelledby", actionTitle.id);
+    actionDialog.setAttribute("aria-describedby", actionDescription.id);
+    const renameInput = document.createElement("input");
+    renameInput.name = "rename";
+    renameInput.autocomplete = "off";
+    renameInput.maxLength = 256;
+    const renameField = labeled("Tab name", renameInput);
+    const actionCancel = node("button", "secondary", "Cancel");
+    actionCancel.type = "button";
+    const actionConfirm = node("button", "", "Confirm");
+    actionConfirm.type = "submit";
+    const actionButtons = node("div", "workspace-dialog-actions");
+    actionButtons.append(actionCancel, actionConfirm);
+    actionForm.append(actionTitle, actionDescription, renameField, actionButtons);
+    actionDialog.append(actionForm);
+    for (const modal of [dialog, actionDialog]) {
+      modal.addEventListener("keydown", (event) => {
+        if (event.key !== "Tab") return;
+        const controls = [...modal.querySelectorAll("input:not(:disabled), button:not(:disabled)")];
+        const edge = event.shiftKey ? controls[0] : controls.at(-1);
+        if (document.activeElement === edge) {
+          event.preventDefault();
+          (event.shiftKey ? controls.at(-1) : controls[0]).focus();
+        }
+      });
+    }
+    let finishActionDialog = null;
+    let dialogTrigger = null;
+    actionCancel.addEventListener("click", () => actionDialog.close());
+    actionForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (renameInput.required && !renameInput.value.trim()) {
+        renameInput.setCustomValidity("Enter a tab name.");
+        renameInput.reportValidity();
+        return;
+      }
+      actionDialog.close("confirm");
+    });
+    renameInput.addEventListener("input", () => renameInput.setCustomValidity(""));
+    actionDialog.addEventListener("close", () => {
+      const resolve = finishActionDialog;
+      finishActionDialog = null;
+      if (dialogTrigger?.isConnected) {
+        dialogTrigger.focus();
+      } else {
+        actionSummary.focus();
+      }
+      resolve?.(actionDialog.returnValue === "confirm" ? renameInput.value.trim() : null);
+    });
+
+    function askTabAction(action, pane) {
+      const rename = action === "rename";
+      actionTitle.textContent = rename ? "Rename tab" : "Kill process and close tab?";
+      actionDescription.textContent = rename
+        ? "Give this tab a name you can find quickly. Its process will keep running."
+        : `This stops “${pane.title}” and removes its tab. Unsaved terminal work may be lost. To keep the process running, cancel and choose Hide tab instead.`;
+      renameField.hidden = !rename;
+      renameInput.required = rename;
+      renameInput.disabled = !rename;
+      renameInput.value = pane.title;
+      renameInput.setCustomValidity("");
+      actionConfirm.textContent = rename ? "Save name" : "Kill process";
+      actionConfirm.className = rename ? "" : "danger";
+      actionDialog.returnValue = "";
+      dialogTrigger = actionMenu.open ? actionSummary : document.activeElement;
+      actionMenu.open = false;
+      return new Promise((resolve) => {
+        finishActionDialog = resolve;
+        actionDialog.showModal();
+        if (rename) {
+          renameInput.focus();
+          renameInput.select();
+        } else {
+          actionCancel.focus();
+        }
+      });
+    }
+
+    root.replaceChildren(topbar, tabbar, shell, statusbar, dialog, actionDialog);
 
     let envelope = null;
     let activePaneId = initialPaneId || "";
@@ -1310,6 +1289,31 @@
     let disposed = false;
     let lastTabSignature = "";
     let lastActionSignature = "";
+    let pendingAction = "";
+    const workspaceTools = window.T1000UI.attachWorkspace({
+      root, toolbar: leftTools, menu: actionMenu,
+      getPanes: () => envelope?.window.panes || [],
+      selectPane: (id) => switchPane(id, true),
+      getTerminal: () => terminalHost.termdeckTerminal,
+      newTab: () => newButton.click(), runAction: runTabAction,
+      getWindow: () => envelope?.window, refresh: () => refreshWindow(),
+      loadHidden: async () => (await fetchJson(appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(routeSlug)}/hidden-tabs`), { method: "GET" })).payload,
+      restoreHidden: async (id) => {
+        if (pendingAction) throw new Error("Wait for the current tab action to finish.");
+        pendingAction = "restore";
+        newButton.disabled = true;
+        try {
+          await mutateJson(appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(routeSlug)}/hidden-tabs/${encodeURIComponent(id)}/restore`), {}, 180000);
+          if (!await waitForPane(id)) throw new Error("The tab was restored, but live refresh has not caught up. Do not retry yet.");
+          switchPane(id, true);
+        } finally {
+          pendingAction = "";
+          newButton.disabled = false;
+          renderTabs();
+          renderActions();
+        }
+      },
+    });
 
     function updateShellState(state, message) {
       shell.dataset.state = state;
@@ -1370,6 +1374,7 @@
       terminalIdentity.textContent = pane
         ? `${pane.title} · ${pane.cwd}`
         : `Pane ${paneId} · connecting`;
+      terminalIdentity.title = terminalIdentity.textContent;
       renderTabs(false);
       renderActions();
       if (samePane) {
@@ -1415,10 +1420,15 @@
       select.id = `termdeck-tab-${pane.id}`;
       select.setAttribute("aria-controls", "terminal-shell");
       select.append(node("span", "workspace-tab-title", pane.title));
+      if (pane.pinned) {
+        select.prepend(node("span", "workspace-tab-pin", "◆"));
+        select.title = "Pinned tab";
+      }
       const close = node("button", "workspace-tab-close", "×");
       close.type = "button";
       close.title = `Hide ${pane.title} without stopping it`;
       close.setAttribute("aria-label", `Hide ${pane.title}`);
+      close.disabled = Boolean(pendingAction);
       tab.append(select, close);
       tab.title = `${pane.title}
 ${pane.cwd}`;
@@ -1451,12 +1461,14 @@ ${pane.cwd}`;
       workspaceStatus.textContent = `${envelope.window.panes.length} tabs`;
       const signature = JSON.stringify({
         activePaneId,
+        pendingAction,
         windowName: envelope.window.name,
         panes: envelope.window.panes.map((pane) => ({
           id: pane.id,
           title: pane.title,
           cwd: pane.cwd,
           status: pane.status,
+          pinned: pane.pinned,
           sessionId: pane.sessionId,
           controllerActive: pane.controllerActive,
         })),
@@ -1464,6 +1476,7 @@ ${pane.cwd}`;
       if (signature === lastTabSignature) {
         return;
       }
+      workspaceTools.updateTabs(envelope.window.panes, activePaneId);
       const focusedPaneId = preserveFocus && document.activeElement?.getAttribute("role") === "tab"
         ? document.activeElement.dataset.paneId
         : "";
@@ -1474,10 +1487,11 @@ ${pane.cwd}`;
       }
     }
 
-    function actionButton(label, action, destructive) {
-      const button = node("button", destructive ? "danger" : "", label);
+    function actionButton(action) {
+      const button = node("button", action === "kill" ? "danger" : "");
       button.type = "button";
-      button.addEventListener("click", () => runTabAction(action));
+      button.dataset.action = action;
+      button.addEventListener("click", () => runTabAction(button.dataset.action));
       return button;
     }
 
@@ -1493,53 +1507,55 @@ ${pane.cwd}`;
       const pane = currentPane();
       const signature = JSON.stringify({
         id: pane?.id || "",
+        pendingAction,
         sessionId: pane?.sessionId || null,
         status: pane?.status || "",
+        pinned: pane?.pinned || false,
       });
       if (signature === lastActionSignature) {
         return;
       }
       lastActionSignature = signature;
-      actionPanel.replaceChildren();
-      actionPanel.append(actionLink("All windows", appPath("/")));
-      if (!pane || !pane.sessionId) {
-        actionPanel.append(node("p", "subtle", "This tab has no mutable session identity."));
-        return;
+      if (!actionPanel.firstChild) {
+        actionPanel.append(actionLink("All windows", appPath("/")), ...workspaceTools.menuItems(), node("hr", ""));
+        actionPanel.append(...["rename", "pause", "pin", "hide", "kill"].map(actionButton));
       }
-      actionPanel.append(
-        actionButton("Rename tab", "rename", false),
-        actionButton(pane.status === "paused" ? "Resume" : "Pause", pane.status === "paused" ? "resume" : "pause", false),
-        actionButton("Pin", "pin", false),
-        actionButton("Unpin", "unpin", false),
-        actionButton("Hide tab", "hide", false),
-        actionButton("Kill process…", "kill", true),
-      );
+      const actions = [["Rename tab", "rename"],
+        pane?.status === "paused" ? ["Resume", "resume"] : ["Pause", "pause"],
+        pane?.pinned ? ["Unpin", "unpin"] : ["Pin", "pin"],
+        ["Hide tab", "hide"], ["Kill process…", "kill"]];
+      actionPanel.querySelectorAll("[data-action]").forEach((button, index) => {
+        [button.textContent, button.dataset.action] = actions[index];
+        button.disabled = Boolean(pendingAction) || !pane?.sessionId;
+      });
     }
 
     async function runTabAction(action, targetPane = currentPane()) {
       const pane = targetPane;
-      if (!pane || !pane.sessionId) {
+      if (!pane || !pane.sessionId || pendingAction || actionDialog.open || dialog.open) {
         return;
       }
       const removedIndex = (action === "hide" || action === "kill") && envelope
         ? envelope.window.panes.findIndex((candidate) => candidate.id === pane.id)
         : -1;
       const request = { action, name: null, confirmation: null };
-      if (action === "rename") {
-        const name = window.prompt("New tab name", pane.title);
-        if (name === null) {
+      if (action === "rename" || action === "kill") {
+        const value = await askTabAction(action, pane);
+        if (value === null || disposed) {
           return;
         }
-        request.name = name;
-      }
-      if (action === "kill") {
-        const accepted = window.confirm(`Kill ${pane.title}? The terminal process will be stopped.`);
-        if (!accepted) {
-          return;
+        if (action === "rename") {
+          request.name = value;
+        } else {
+          request.confirmation = pane.sessionId;
         }
-        request.confirmation = pane.sessionId;
       }
       actionMenu.open = false;
+      pendingAction = action;
+      newButton.disabled = true;
+      actionNotice.hidden = true;
+      renderTabs();
+      renderActions();
       workspaceStatus.textContent = `${action}…`;
       const removesTab = action === "hide" || action === "kill";
       const removedActive = removesTab && pane.id === activePaneId;
@@ -1571,8 +1587,13 @@ ${pane.cwd}`;
           }
         }
       } catch (error) {
-        terminalOverlay.hidden = false;
-        terminalOverlay.textContent = `Tab action failed. ${errorMessage(error)}`;
+        actionNoticeText.textContent = `Could not ${action} “${pane.title}”. ${errorMessage(error)}`;
+        actionNotice.hidden = false;
+      } finally {
+        pendingAction = "";
+        newButton.disabled = false;
+        renderTabs();
+        renderActions();
       }
     }
 
@@ -1588,6 +1609,9 @@ ${pane.cwd}`;
     }
 
     async function createTab() {
+      if (createButton.disabled) {
+        return;
+      }
       dialogStatus.textContent = "Creating…";
       createButton.disabled = true;
       const payload = {
@@ -1658,6 +1682,7 @@ ${pane.cwd}`;
           terminalIdentity.textContent = pane
             ? `${pane.title} · ${pane.cwd}`
             : `Pane ${selected}`;
+          terminalIdentity.title = terminalIdentity.textContent;
           renderActions();
           if (pane) {
             document.title = `${pane.title} · ${next.window.name} · t1000`;
@@ -1670,10 +1695,12 @@ ${pane.cwd}`;
           activePaneId = "";
           terminalHost.replaceChildren();
           terminalIdentity.textContent = "No tab selected";
+          terminalStatus.textContent = "No active terminal";
+          terminalStatus.dataset.state = "offline";
           renderActions();
           updateShellState("empty");
         }
-        workspaceStatus.textContent = response.headers.get("x-termdeck-stale") === "1"
+        workspaceStatus.textContent = pendingAction ? `${pendingAction}…` : response.headers.get("x-termdeck-stale") === "1"
           ? `${next.window.panes.length} tabs · reconnecting`
           : `${next.window.panes.length} tabs`;
         clearClientNotice();
@@ -1699,6 +1726,9 @@ ${pane.cwd}`;
     }
 
     newButton.addEventListener("click", () => {
+      if (dialog.open || actionDialog.open || pendingAction) {
+        return;
+      }
       const pane = currentPane();
       cwdInput.value = pane?.cwd || "/";
       dialogStatus.textContent = "";
@@ -1725,6 +1755,9 @@ ${pane.cwd}`;
     }
 
     window.addEventListener("keydown", (event) => {
+      if (event.defaultPrevented || dialog.open || actionDialog.open || workspaceTools.isOpen()) {
+        return;
+      }
       if (event.ctrlKey && event.altKey && event.key.toLowerCase() === "t") {
         event.preventDefault();
         newButton.click();

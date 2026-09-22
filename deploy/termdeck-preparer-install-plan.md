@@ -4,6 +4,16 @@ This repository only prepares the privileged assets.  Do not run these steps
 until an operator approves the live installation gate and records the current
 unit, executable, account, runtime, and key preimages.
 
+**Current colocated deployment gate (2026-09-22): blocked.** Live repair is
+approved, but the checked-in tmpfiles definition assigns the entire shared
+`.termdeck` parent to the preparer account at mode 0700. That parent also holds
+the user's state, authentication data, binaries and managed releases. Do not
+apply this definition to the migrated installation. Split the privileged
+preparation tree from the user-owned runtime and qualify the broker, signer,
+receipt verifier and consumer publication together before following the steps
+below. Simply changing the tmpfiles owner breaks the signer's ownership contract
+and is not a repair. This execution environment cannot perform host sudo work.
+
 1. Run `scripts/deploy/install-preparer-assets.py --check` from the selected,
    immutable source tree.  Stage the exact manifest into an empty package root
    with `--destdir`; compare every staged file with its manifest source and
