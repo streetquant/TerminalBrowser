@@ -214,13 +214,14 @@
 
   function notice(text, kind) {
     const element = node("div", `notice ${kind || ""}`.trim(), text);
-    element.setAttribute("role", "status");
-    element.setAttribute("aria-live", "polite");
+    const urgent = kind === "notice-error";
+    element.setAttribute("role", urgent ? "alert" : "status");
+    element.setAttribute("aria-live", urgent ? "assertive" : "polite");
     return element;
   }
 
   function hostHeader(title, summary, identity) {
-    const header = node("header");
+    const header = node("header", "host-header");
     header.append(
       node("p", "eyebrow", "TermDeck web host"),
       node("h1", "", title),
@@ -232,11 +233,17 @@
     return header;
   }
 
-  function footer(apiHref) {
+  function footer(apiHref, stale) {
     const footerElement = node("footer", "footer-row");
     footerElement.append(
-      link("Versioned JSON", apiHref),
-      node("p", "refresh-state", "Live refresh enabled · authenticated browser session"),
+      link("Versioned JSON", apiHref, "footer-link"),
+      node(
+        "p",
+        "refresh-state",
+        stale
+          ? "Showing saved windows · reconnecting"
+          : "Live refresh enabled · authenticated browser session",
+      ),
     );
     return footerElement;
   }
@@ -272,8 +279,10 @@
     if (host.windows.length === 0) {
       grid.append(node("div", "empty", "No remembered TermDeck windows are currently available."));
     }
-    fragment.append(grid, footer(appPath("/_termdeck/api/v1/snapshot")));
+    fragment.append(grid, footer(appPath("/_termdeck/api/v1/snapshot"), stale));
     root.replaceChildren(fragment);
+    root.dataset.termdeckState = stale ? "stale" : "ready";
+    root.setAttribute("aria-busy", "false");
     document.title = "TermDeck";
   }
 
@@ -302,8 +311,8 @@
       throw new Error("Window route identity changed unexpectedly.");
     }
     const fragment = document.createDocumentFragment();
-    const navigation = node("nav");
-    navigation.append(link("← All windows", appPath("/")));
+    const navigation = node("nav", "page-nav");
+    navigation.append(link("← All windows", appPath("/"), "back-link"));
     fragment.append(
       navigation,
       hostHeader(
@@ -327,9 +336,11 @@
     }
     fragment.append(
       panes,
-      footer(appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(windowData.slug)}`)),
+      footer(appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(windowData.slug)}`), stale),
     );
     root.replaceChildren(fragment);
+    root.dataset.termdeckState = stale ? "stale" : "ready";
+    root.setAttribute("aria-busy", "false");
     document.title = `${windowData.name} · TermDeck`;
   }
 
@@ -347,6 +358,9 @@
     }
     element.className = `notice ${kind}`;
     element.textContent = message;
+    const urgent = kind === "notice-error";
+    element.setAttribute("role", urgent ? "alert" : "status");
+    element.setAttribute("aria-live", urgent ? "assertive" : "polite");
   }
 
   function clearClientNotice() {
@@ -455,6 +469,8 @@
         return;
       }
       requestInFlight = true;
+      root.dataset.termdeckState = "refreshing";
+      root.setAttribute("aria-busy", "true");
       try {
         const { payload, response } = await fetchJson(endpoint, {
           headers: { Accept: "application/json" },
@@ -472,6 +488,8 @@
         }
       } catch (error) {
         failureCount = Math.min(failureCount + 1, 6);
+        root.dataset.termdeckState = "error";
+        root.setAttribute("aria-busy", "false");
         showClientNotice(`Live refresh unavailable. ${errorMessage(error)} Retrying.`, "notice-error");
       } finally {
         requestInFlight = false;
@@ -878,7 +896,9 @@
       setOverlay("");
       ready = true;
       window.requestAnimationFrame(() => {
-        if (!disposed && document.visibilityState === "visible" && document.hasFocus()) {
+        const focused = document.activeElement;
+        if (!disposed && document.visibilityState === "visible" && document.hasFocus()
+          && (!focused || focused === document.body || host.contains(focused))) {
           terminalApi.focus();
         }
       });
@@ -1218,7 +1238,12 @@
     const tabbar = node("div", "workspace-tabbar");
     tabbar.setAttribute("role", "tablist");
     tabbar.setAttribute("aria-label", "TermDeck tabs");
+    tabbar.append(node("span", "workspace-tabs-loading", "Syncing tabs…"));
     const shell = node("section", "workspace-shell");
+    shell.dataset.state = "loading";
+    const shellStatus = node("p", "workspace-state-message", "Syncing TermDeck…");
+    shellStatus.setAttribute("role", "status");
+    shellStatus.setAttribute("aria-live", "polite");
     const terminalIdentity = node("span", "workspace-terminal-identity", "No tab selected");
     const xtermShell = node("div", "xterm-shell");
     xtermShell.id = "terminal-shell";
@@ -1229,7 +1254,7 @@
     terminalOverlay.id = "terminal-overlay";
     terminalOverlay.hidden = true;
     xtermShell.append(terminalHost, terminalOverlay);
-    shell.append(terminalIdentity, xtermShell);
+    shell.append(shellStatus, terminalIdentity, xtermShell);
 
     const dialog = document.createElement("dialog");
     dialog.className = "workspace-dialog";
@@ -1283,6 +1308,19 @@
     let refreshInFlight = false;
     let refreshRequested = false;
     let disposed = false;
+    let lastTabSignature = "";
+    let lastActionSignature = "";
+
+    function updateShellState(state, message) {
+      shell.dataset.state = state;
+      const messages = {
+        loading: "Syncing TermDeck…",
+        empty: "No visible tabs",
+        error: "Live refresh unavailable",
+      };
+      shellStatus.textContent = message || messages[state] || "";
+      shellStatus.hidden = state === "ready" || state === "degraded";
+    }
 
     function currentPane() {
       return envelope?.window.panes.find((pane) => pane.id === activePaneId) || null;
@@ -1304,7 +1342,18 @@
       }
     }
 
-    function switchPane(paneId, updateHistory) {
+    function focusTabButton(paneId) {
+      window.requestAnimationFrame(() => {
+        for (const tab of tabbar.querySelectorAll("[role=tab]")) {
+          if (tab.dataset.paneId === paneId) {
+            tab.focus();
+            return;
+          }
+        }
+      });
+    }
+
+    function switchPane(paneId, updateHistory, focusTab = false) {
       if (typeof paneId !== "string" || paneId.length === 0 || paneId.length > MAX_ID_CHARS) {
         return;
       }
@@ -1317,16 +1366,20 @@
         window.history.pushState({ paneId }, "", panePath(paneId));
       }
       const pane = currentPane();
+      updateShellState(pane || activePaneId ? "ready" : "empty");
       terminalIdentity.textContent = pane
         ? `${pane.title} · ${pane.cwd}`
         : `Pane ${paneId} · connecting`;
-      renderTabs();
+      renderTabs(false);
       renderActions();
       if (samePane) {
         if (pane && envelope) {
           document.title = `${pane.title} · ${envelope.window.name} · TermDeck`;
         }
         terminalMount.focus();
+        if (focusTab) {
+          focusTabButton(paneId);
+        }
         return;
       }
       if (terminalMount) {
@@ -1335,14 +1388,21 @@
       }
       terminalHost.replaceChildren();
       terminalMount = mountTerminal(routeSlug, paneId, terminalHost, terminalStatus, terminalOverlay);
+      if (!focusTab) {
+        terminalMount.focus();
+      }
       if (pane && envelope) {
         document.title = `${pane.title} · ${envelope.window.name} · TermDeck`;
       }
+      if (focusTab) {
+        focusTabButton(paneId);
+      }
     }
 
-    function tabButton(pane) {
+    function tabButton(pane, index) {
       const tab = node("div", "workspace-tab", "");
       tab.dataset.paneId = pane.id;
+      tab.setAttribute("role", "presentation");
       if (pane.id === activePaneId) {
         tab.classList.add("workspace-tab-active");
       }
@@ -1350,6 +1410,10 @@
       select.type = "button";
       select.setAttribute("role", "tab");
       select.setAttribute("aria-selected", pane.id === activePaneId ? "true" : "false");
+      select.setAttribute("tabindex", pane.id === activePaneId || (!activePaneId && index === 0) ? "0" : "-1");
+      select.dataset.paneId = pane.id;
+      select.id = `termdeck-tab-${pane.id}`;
+      select.setAttribute("aria-controls", "terminal-shell");
       select.append(node("span", "workspace-tab-title", pane.title));
       const close = node("button", "workspace-tab-close", "×");
       close.type = "button";
@@ -1379,13 +1443,35 @@ ${pane.cwd}`;
       return tab;
     }
 
-    function renderTabs() {
+    function renderTabs(preserveFocus = true) {
       if (!envelope) {
         return;
       }
-      tabbar.replaceChildren(...envelope.window.panes.map(tabButton));
       windowTitle.textContent = envelope.window.name;
       workspaceStatus.textContent = `${envelope.window.panes.length} tabs`;
+      const signature = JSON.stringify({
+        activePaneId,
+        windowName: envelope.window.name,
+        panes: envelope.window.panes.map((pane) => ({
+          id: pane.id,
+          title: pane.title,
+          cwd: pane.cwd,
+          status: pane.status,
+          sessionId: pane.sessionId,
+          controllerActive: pane.controllerActive,
+        })),
+      });
+      if (signature === lastTabSignature) {
+        return;
+      }
+      const focusedPaneId = preserveFocus && document.activeElement?.getAttribute("role") === "tab"
+        ? document.activeElement.dataset.paneId
+        : "";
+      lastTabSignature = signature;
+      tabbar.replaceChildren(...envelope.window.panes.map(tabButton));
+      if (focusedPaneId && envelope.window.panes.some((pane) => pane.id === focusedPaneId)) {
+        focusTabButton(focusedPaneId);
+      }
     }
 
     function actionButton(label, action, destructive) {
@@ -1395,9 +1481,27 @@ ${pane.cwd}`;
       return button;
     }
 
+    function actionLink(label, href) {
+      const element = link(label, href, "workspace-action-link");
+      element.addEventListener("click", () => {
+        actionMenu.open = false;
+      });
+      return element;
+    }
+
     function renderActions() {
-      actionPanel.replaceChildren();
       const pane = currentPane();
+      const signature = JSON.stringify({
+        id: pane?.id || "",
+        sessionId: pane?.sessionId || null,
+        status: pane?.status || "",
+      });
+      if (signature === lastActionSignature) {
+        return;
+      }
+      lastActionSignature = signature;
+      actionPanel.replaceChildren();
+      actionPanel.append(actionLink("All windows", appPath("/")));
       if (!pane || !pane.sessionId) {
         actionPanel.append(node("p", "subtle", "This tab has no mutable session identity."));
         return;
@@ -1417,6 +1521,9 @@ ${pane.cwd}`;
       if (!pane || !pane.sessionId) {
         return;
       }
+      const removedIndex = (action === "hide" || action === "kill") && envelope
+        ? envelope.window.panes.findIndex((candidate) => candidate.id === pane.id)
+        : -1;
       const request = { action, name: null, confirmation: null };
       if (action === "rename") {
         const name = window.prompt("New tab name", pane.title);
@@ -1450,7 +1557,17 @@ ${pane.cwd}`;
         if (removedActive) {
           const replacement = envelope?.window.panes[0];
           if (replacement) {
-            switchPane(replacement.id, true);
+            switchPane(replacement.id, true, true);
+          } else {
+            newButton.focus();
+          }
+        } else if (removedIndex >= 0) {
+          const remaining = orderedPaneIds();
+          const focusId = remaining[Math.min(removedIndex, remaining.length - 1)];
+          if (focusId) {
+            focusTabButton(focusId);
+          } else {
+            newButton.focus();
           }
         }
       } catch (error) {
@@ -1521,6 +1638,8 @@ ${pane.cwd}`;
       }
       refreshInFlight = true;
       try {
+        root.dataset.termdeckState = "refreshing";
+        root.setAttribute("aria-busy", "true");
         const { payload, response } = await fetchJson(
           appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(routeSlug)}`),
           { headers: { Accept: "application/json" }, method: "GET" },
@@ -1552,16 +1671,21 @@ ${pane.cwd}`;
           terminalHost.replaceChildren();
           terminalIdentity.textContent = "No tab selected";
           renderActions();
+          updateShellState("empty");
         }
         workspaceStatus.textContent = response.headers.get("x-termdeck-stale") === "1"
           ? `${next.window.panes.length} tabs · reconnecting`
           : `${next.window.panes.length} tabs`;
         clearClientNotice();
+        root.dataset.termdeckState = "ready";
       } catch (error) {
         workspaceStatus.textContent = "Refresh failed";
+        updateShellState(terminalMount ? "degraded" : "error");
+        root.dataset.termdeckState = "error";
         showClientNotice(`Window refresh failed. ${errorMessage(error)}`, "notice-error");
       } finally {
         refreshInFlight = false;
+        root.setAttribute("aria-busy", "false");
         window.clearTimeout(refreshTimer);
         if (!disposed) {
           const queued = refreshRequested;
@@ -1637,6 +1761,34 @@ ${pane.cwd}`;
       event.preventDefault();
       tabbar.scrollLeft += event.deltaY;
     }, { passive: false });
+    tabbar.addEventListener("keydown", (event) => {
+      const target = event.target instanceof Element ? event.target.closest("[role=tab]") : null;
+      if (!target || !tabbar.contains(target)) {
+        return;
+      }
+      if (event.altKey || event.ctrlKey || event.metaKey) {
+        return;
+      }
+      const paneIds = orderedPaneIds();
+      if (paneIds.length === 0) {
+        return;
+      }
+      const currentIndex = Math.max(0, paneIds.indexOf(target.dataset.paneId));
+      let nextIndex = currentIndex;
+      if (event.key === "ArrowRight") {
+        nextIndex = (currentIndex + 1) % paneIds.length;
+      } else if (event.key === "ArrowLeft") {
+        nextIndex = (currentIndex - 1 + paneIds.length) % paneIds.length;
+      } else if (event.key === "Home") {
+        nextIndex = 0;
+      } else if (event.key === "End") {
+        nextIndex = paneIds.length - 1;
+      } else {
+        return;
+      }
+      event.preventDefault();
+      switchPane(paneIds[nextIndex], true, true);
+    });
     document.addEventListener("pointerdown", (event) => {
       if (actionMenu.open && !actionMenu.contains(event.target)) {
         actionMenu.open = false;

@@ -23,11 +23,25 @@ class VisualSmokeHarnessTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be provided together"):
                 HARNESS.render(Path(tmp) / "frame.png", window_width=640)
 
+    def test_gtk_minimum_size_expansion_is_reported_without_failing_capture(self) -> None:
+        errors, warnings = HARNESS._classify_window_size((640, 480), (693, 480))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("minimum window geometry", warnings[0])
+
+    def test_capture_smaller_than_requested_remains_a_failure(self) -> None:
+        errors, warnings = HARNESS._classify_window_size((640, 480), (639, 480))
+        self.assertEqual(warnings, [])
+        self.assertEqual(errors, ["requested 640x480, captured 639x480"])
+
     def test_compact_capture_uses_synchronous_x_window_resize(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('"windowsize", "--sync"', source)
         self.assertIn('"requested_window_size"', source)
         self.assertIn('"layout_error_lines"', source)
+        self.assertIn('"layout_warning_lines"', source)
+        self.assertIn('"XDG_RUNTIME_DIR": str(runtime_dir)', source)
+        self.assertIn("_wait_for_smoke_panes(tmux, env)", source)
         self.assertIn('parser.add_argument("--window-width"', source)
         self.assertIn('parser.add_argument("--window-height"', source)
 

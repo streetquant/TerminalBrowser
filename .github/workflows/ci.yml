@@ -107,18 +107,38 @@ jobs:
           path: validation-smokes
           if-no-files-found: error
 
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/frontend/package-lock.json
+      - name: Install pinned frontend build dependencies
+        run: npm ci --ignore-scripts --prefix web/frontend
+      - name: Check terminal layout and listener lifecycle
+        run: npm test --prefix web/frontend
+      - name: Verify reproducible embedded terminal assets
+        run: |
+          npm run build --prefix web/frontend
+          git diff --exit-code -- \
+            web/crates/termdeck-web-server/assets/terminal.js \
+            web/crates/termdeck-web-server/assets/terminal.css \
+            web/crates/termdeck-web-server/assets/terminal-assets.json
+
   performance:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Install tmux and package
+      - name: Install package
         run: |
-          sudo apt-get update
-          sudo apt-get install -y tmux
           python -m venv .venv
           .venv/bin/python -m pip install --upgrade pip
           .venv/bin/python -m pip install -e .
-      - name: Enforce backend latency thresholds
+      - name: Enforce headless model performance budgets
         run: |
-          .venv/bin/python scripts/perf_probe.py --sessions 36 --iterations 5 --assert-thresholds
+          .venv/bin/python scripts/perf_probe.py --sessions 100 --iterations 200 --assert-thresholds

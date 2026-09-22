@@ -21,6 +21,13 @@ import time
 from pathlib import Path
 
 
+_SMOKE_MARKERS = (
+    "TERMDECK_UI_SMOKE_SHELL",
+    "TERMDECK_UI_SMOKE_TESTS",
+    "TERMDECK_UI_SMOKE_SERVER",
+)
+
+
 def _require(name: str) -> str:
     path = shutil.which(name)
     if not path:
@@ -42,6 +49,99 @@ def _parse_identify_size(value: str) -> tuple[int, int]:
     if not match:
         raise RuntimeError(f"could not parse screenshot dimensions from identify output: {value!r}")
     return int(match.group(1)), int(match.group(2))
+
+
+def _classify_window_size(
+    requested: tuple[int, int] | None,
+    actual: tuple[int, int],
+) -> tuple[list[str], list[str]]:
+    """Separate a GTK minimum-size adjustment from a clipped capture.
+
+    ``xdotool windowsize`` is a request.  GTK is allowed to keep a larger
+    window when the header/terminal layout has a real minimum width, so an
+    expansion is useful evidence rather than a harness failure.  A capture
+    smaller than requested is different: it means the screenshot was clipped
+    and should fail the smoke.
+    """
+
+    if requested is None or actual == requested:
+        return [], []
+    requested_width, requested_height = requested
+    actual_width, actual_height = actual
+    if actual_width < requested_width or actual_height < requested_height:
+        return [f"requested {requested_width}x{requested_height}, captured {actual_width}x{actual_height}"], []
+    return [], [
+        "GTK kept its minimum window geometry: "
+        f"requested {requested_width}x{requested_height}, captured {actual_width}x{actual_height}"
+    ]
+
+
+def _tmux_pane_state(tmux: str, env: dict[str, str]) -> tuple[list[str], set[str], str]:
+    """Return pane ids and visible smoke markers from the isolated tmux server."""
+
+    panes_result = subprocess.run(
+        [tmux, "list-panes", "-a", "-F", "#{pane_id}"],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=5,
+    )
+    if panes_result.returncode != 0:
+        detail = panes_result.stderr.strip() or panes_result.stdout.strip() or "no tmux panes"
+        raise RuntimeError(f"isolated tmux pane query failed: {detail}")
+    pane_ids = [line.strip() for line in panes_result.stdout.splitlines() if line.strip()]
+    captured: list[str] = []
+    for pane_id in pane_ids:
+        capture_result = subprocess.run(
+            [tmux, "capture-pane", "-p", "-t", pane_id, "-S", "-30"],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        if capture_result.returncode == 0:
+            captured.append(capture_result.stdout)
+    visible = "\n".join(captured)
+    markers = {marker for marker in _SMOKE_MARKERS if marker in visible}
+    return pane_ids, markers, visible
+
+
+def _wait_for_smoke_panes(
+    tmux: str,
+    env: dict[str, str],
+    *,
+    timeout: float = 12.0,
+) -> dict[str, object]:
+    """Wait until all workspace panes have rendered visible, known text.
+
+    A mapped GTK window with a blank terminal is not a useful visual result.
+    This bounded readiness check catches failed tmux startup and prevents the
+    harness from declaring an error toast or empty pane a passing screenshot.
+    """
+
+    deadline = time.monotonic() + timeout
+    last_pane_ids: list[str] = []
+    last_markers: set[str] = set()
+    while time.monotonic() < deadline:
+        pane_ids, markers, _visible = _tmux_pane_state(tmux, env)
+        last_pane_ids = pane_ids
+        last_markers = markers
+        if len(pane_ids) >= len(_SMOKE_MARKERS) and markers == set(_SMOKE_MARKERS):
+            return {
+                "pane_count": len(pane_ids),
+                "markers": sorted(markers),
+            }
+        time.sleep(0.2)
+    expected = ", ".join(_SMOKE_MARKERS)
+    observed = ", ".join(sorted(last_markers)) or "none"
+    raise RuntimeError(
+        "visual smoke terminal panes did not become ready: "
+        f"panes={len(last_pane_ids)}, markers={observed}, expected={expected}"
+    )
 
 
 def _terminate(process: subprocess.Popen[str] | None) -> None:
@@ -158,8 +258,10 @@ def render(
         temp = Path(temp_dir)
         home = temp / "home"
         tmux_tmp = temp / "tmux"
+        runtime_dir = temp / "runtime"
         home.mkdir()
         tmux_tmp.mkdir(mode=0o700)
+        runtime_dir.mkdir(mode=0o700)
         db_path = temp / "sessions.sqlite3"
         workspace_path = temp / "workspace.json"
         workspace_path.write_text(
@@ -171,23 +273,27 @@ def render(
                             "title": "Design Review",
                             "tabs": [
                                 {
-                                    "name": "shell",
-                                    "tag": "workspace",
-                                    "command": "{shell}",
-                                    "cwd": str(Path.cwd()),
-                                    "pinned": True,
-                                },
-                                {
                                     "name": "ui tests",
                                     "tag": "quality",
-                                    "command": f"{sys.executable} -c 'import time; print(\"UI smoke session\"); time.sleep(60)'",
+                                    "command": f"{sys.executable} -c 'import time; print(\"TERMDECK_UI_SMOKE_TESTS\", flush=True); time.sleep(60)'",
                                     "cwd": str(Path.cwd()),
                                 },
                                 {
                                     "name": "dev server",
                                     "tag": "frontend",
-                                    "command": "sh -c 'echo Ready on http://127.0.0.1:4173; sleep 60'",
+                                    "command": "printf 'TERMDECK_UI_SMOKE_SERVER\\n'; echo 'Ready on http://127.0.0.1:4173'; sleep 60",
                                     "cwd": str(Path.cwd()),
+                                },
+                                {
+                                    "name": "shell",
+                                    "tag": "workspace",
+                                    # Leave a real shell command selected for
+                                    # the screenshot so the compact smoke
+                                    # proves terminal text is painted, not
+                                    # merely present in a detached tmux pane.
+                                    "command": "printf 'TERMDECK_UI_SMOKE_SHELL\\n'; sleep 60",
+                                    "cwd": str(Path.cwd()),
+                                    "pinned": True,
                                 },
                             ],
                         }
@@ -203,6 +309,11 @@ def render(
             {
                 "HOME": str(home),
                 "TMUX_TMPDIR": str(tmux_tmp),
+                # Keep this smoke independent from the host user manager.  The
+                # application deliberately falls back to direct tmux when the
+                # user-systemd private socket is absent; inheriting the host
+                # XDG_RUNTIME_DIR made systemd-run race the disposable smoke.
+                "XDG_RUNTIME_DIR": str(runtime_dir),
                 "GTK_CSD": "1",
                 "GDK_BACKEND": "x11",
                 "NO_AT_BRIDGE": "1",
@@ -268,6 +379,11 @@ def render(
                         timeout=10,
                     )
                 time.sleep(0.8)
+                smoke_state = _wait_for_smoke_panes(tmux, env)
+                # Give the VTE paint pass one frame after tmux readiness.  At
+                # the compact minimum, the final GTK resize can finish just
+                # after the pane output is observable through tmux.
+                time.sleep(0.35)
 
                 subprocess.run(
                     [imagemagick_import, "-display", active_display, "-window", window_id, str(output)],
@@ -302,12 +418,15 @@ def render(
                 for line in diagnostic_lines
                 if not any(marker in line.casefold() for marker in external_markers)
             ]
-            layout_error_lines: list[str] = []
-            if window_width is not None and window_height is not None:
-                if (actual_width, actual_height) != (window_width, window_height):
-                    layout_error_lines.append(
-                        f"requested {window_width}x{window_height}, captured {actual_width}x{actual_height}"
-                    )
+            requested_size = (
+                (window_width, window_height)
+                if window_width is not None and window_height is not None
+                else None
+            )
+            layout_error_lines, layout_warning_lines = _classify_window_size(
+                requested_size,
+                (actual_width, actual_height),
+            )
             return {
                 "ok": not application_error_lines and not layout_error_lines,
                 "display": active_display,
@@ -320,6 +439,9 @@ def render(
                 "actual_window_size": f"{actual_width}x{actual_height}",
                 "application_error_lines": application_error_lines,
                 "layout_error_lines": layout_error_lines,
+                "layout_warning_lines": layout_warning_lines,
+                "smoke_pane_count": smoke_state["pane_count"],
+                "smoke_markers": smoke_state["markers"],
                 "environment_warning_count": len(diagnostic_lines) - len(application_error_lines),
             }
         finally:

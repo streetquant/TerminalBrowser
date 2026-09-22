@@ -1900,7 +1900,7 @@ async fn terminal_page(
         Err(response) => return *response,
     };
     let mut output = String::with_capacity(4_096);
-    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,interactive-widget=resizes-content\"><title>");
+    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,interactive-widget=resizes-content,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#070a10\"><title>");
     escape_html_into(&mut output, pane.pane_title.as_str());
     output.push_str(" · TermDeck</title><link rel=\"stylesheet\" href=\"");
     output.push_str(FRONTEND_CSS_PATH);
@@ -2322,7 +2322,7 @@ fn password_page_response(
         ),
     };
     let mut output = String::with_capacity(2_048);
-    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
+    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>");
     escape_html_into(&mut output, title);
     output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck owner authentication</p><h1>");
     escape_html_into(&mut output, heading);
@@ -2423,7 +2423,7 @@ fn password_error_response(
 
 fn render_pairing_page(base_path: RequestBasePath) -> String {
     let output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Recovery pairing · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Recovery pairing · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
     );
     html_for_base(prefix_html_template(output), base_path)
 }
@@ -2970,11 +2970,11 @@ fn render_homepage(
     tmux_warning: Option<&str>,
 ) -> Result<String, ServerError> {
     let mut output = String::with_capacity(8_192 + snapshot.total_panes().saturating_mul(32));
-    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>TermDeck</title><link rel=\"stylesheet\" href=\"");
+    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>TermDeck</title><link rel=\"stylesheet\" href=\"");
     output.push_str(FRONTEND_CSS_PATH);
     output.push_str("\"><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
-    output.push_str("\"></script></head><body><main id=\"termdeck-app\" data-termdeck-page=\"home\"><header><p class=\"eyebrow\">TermDeck host</p><h1>Windows</h1><p class=\"subtle\">");
+    output.push_str("\"></script></head><body><main id=\"termdeck-app\" aria-busy=\"false\" data-termdeck-page=\"home\"><header class=\"host-header\"><p class=\"eyebrow\">TermDeck host</p><h1>Windows</h1><p class=\"subtle\">");
     output.push_str(&snapshot.windows().len().to_string());
     output.push_str(" windows · ");
     output.push_str(&snapshot.total_panes().to_string());
@@ -3012,7 +3012,7 @@ fn render_homepage(
             "<div class=\"empty\">No remembered TermDeck windows are currently available.</div>",
         );
     }
-    output.push_str("</section><noscript><div class=\"notice\">Window navigation remains available; live refresh and terminal control require JavaScript.</div></noscript><footer class=\"footer-row\"><a href=\"/_termdeck/api/v1/snapshot\">Versioned JSON</a><p class=\"refresh-state\">Server-rendered snapshot</p></footer></main></body></html>");
+    output.push_str("</section><noscript><div class=\"notice\">Window navigation remains available; live refresh and terminal control require JavaScript.</div></noscript><footer class=\"footer-row\"><a class=\"footer-link\" href=\"/_termdeck/api/v1/snapshot\">Versioned JSON</a><p class=\"refresh-state\">Server-rendered snapshot</p></footer></main></body></html>");
     let output = prefix_html_template(output);
     ensure_response_bound(output.len())?;
     Ok(output)
@@ -3024,7 +3024,7 @@ fn render_window_page(
     tmux_warning: Option<&str>,
 ) -> Result<String, ServerError> {
     let mut output = String::with_capacity(8_192 + window.panes().len().saturating_mul(512));
-    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
+    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>");
     escape_html_into(&mut output, window.name());
     output.push_str(" · TermDeck</title><link rel=\"stylesheet\" href=\"");
     output.push_str(FRONTEND_CSS_PATH);
@@ -3034,7 +3034,7 @@ fn render_window_page(
     output.push_str(TERMINAL_JS_PATH);
     output.push_str("\"></script><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
-    output.push_str("\"></script></head><body><main id=\"termdeck-app\" data-termdeck-page=\"window\" data-termdeck-slug=\"");
+    output.push_str("\"></script></head><body><main id=\"termdeck-app\" aria-busy=\"false\" data-termdeck-page=\"window\" data-termdeck-slug=\"");
     escape_html_into(&mut output, window.route().slug());
     if let Some(initial_pane) = window
         .active_pane_id()
@@ -3043,7 +3043,7 @@ fn render_window_page(
         output.push_str("\" data-termdeck-pane=\"");
         escape_html_into(&mut output, initial_pane.as_str());
     }
-    output.push_str("\"><nav><a href=\"/\">← All windows</a></nav><header><p class=\"eyebrow\">TermDeck window</p><h1>");
+    output.push_str("\"><nav class=\"page-nav\"><a class=\"back-link\" href=\"/\">← All windows</a></nav><header class=\"host-header\"><p class=\"eyebrow\">TermDeck window</p><h1>");
     escape_html_into(&mut output, window.name());
     output.push_str("</h1><p class=\"subtle\">");
     output.push_str(&window.panes().len().to_string());
@@ -3085,7 +3085,7 @@ fn render_window_page(
         output.push_str("</span><span class=\"mode\">Open terminal</span>");
         output.push_str("</div></a>");
     }
-    output.push_str("</section><noscript><div class=\"notice\">Pane navigation remains available; live refresh and terminal control require JavaScript.</div></noscript><footer class=\"footer-row\"><a href=\"/_termdeck/api/v1/windows/");
+    output.push_str("</section><noscript><div class=\"notice\">Pane navigation remains available; live refresh and terminal control require JavaScript.</div></noscript><footer class=\"footer-row\"><a class=\"footer-link\" href=\"/_termdeck/api/v1/windows/");
     output.push_str(window.route().slug());
     output.push_str("\">Versioned JSON</a><p class=\"refresh-state\">Server-rendered snapshot</p></footer></main></body></html>");
     let output = prefix_html_template(output);
@@ -3095,7 +3095,7 @@ fn render_window_page(
 
 fn render_not_found_page(slug: &str, base_path: RequestBasePath) -> String {
     let mut output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Not found · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored TermDeck window owns this route",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Not found · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored TermDeck window owns this route",
     );
     if !slug.is_empty() {
         output.push_str(": <code>/");

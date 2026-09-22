@@ -122,6 +122,18 @@ def wait_until(predicate: Callable[[], bool], *, timeout: float, detail: str) ->
     raise AssertionError(f"timed out waiting for {detail}{suffix}")
 
 
+def percentile(values: list[float], quantile: float) -> float:
+    """Return an interpolated percentile for a bounded timing sample."""
+    if not values or not 0.0 <= quantile <= 1.0:
+        raise ValueError("percentile requires a non-empty sample and a [0, 1] quantile")
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
+
+
 def wait_http(url: str, *, timeout: float = 20.0) -> None:
     def ready() -> bool:
         with urllib.request.urlopen(url, timeout=1.0) as response:
@@ -175,6 +187,8 @@ def write_fixture(path: Path) -> None:
             raw_log = Path(sys.argv[1])
             event_log = Path(sys.argv[2])
             label = sys.argv[3]
+            echo_window = bytearray()
+            echo_rendered = False
             raw_log.parent.mkdir(parents=True, exist_ok=True)
             event_log.parent.mkdir(parents=True, exist_ok=True)
             fd = sys.stdin.fileno()
@@ -217,6 +231,16 @@ def write_fixture(path: Path) -> None:
                     with raw_log.open("ab", buffering=0) as handle:
                         handle.write(data)
                         os.fsync(handle.fileno())
+                    if not echo_rendered:
+                        echo_window.extend(data)
+                        if len(echo_window) > 128:
+                            del echo_window[:-128]
+                        if b"UX_ECHO_REQUEST" in echo_window:
+                            os.write(
+                                sys.stdout.fileno(),
+                                b"\r\nUX_ECHO_RENDERED\r\n",
+                            )
+                            echo_rendered = True
             finally:
                 try:
                     os.write(
@@ -629,6 +653,18 @@ def main() -> int:
         },
         "assertions": {},
         "timings_ms": {},
+        "timing_notes": {
+            "workspace_ready": "navigation start to the mounted workspace shell and visible terminal host",
+            "terminal_ready": "navigation start to the fixture marker in the xterm terminal buffer",
+            "keyboard_to_terminal_buffer_echo": (
+                "Playwright keyboard dispatch through the fixture and WebSocket to an xterm buffer marker; "
+                "does not measure physical display latency"
+            ),
+            "tab_switch": (
+                "Playwright tab click through route, Live status, and fixture marker in the xterm buffer; "
+                "includes browser automation overhead"
+            ),
+        },
         "lifecycle": {},
         "control": {},
         "geometry": {},
@@ -912,7 +948,69 @@ def main() -> int:
             page_one.route(api_url, lambda route: route.abort("failed"))
             started = time.monotonic_ns()
             page_one.goto(f"{origin}/random", wait_until="domcontentloaded", timeout=15_000)
-            page_one.locator("#terminal-xterm .xterm").wait_for(state="visible", timeout=20_000)
+            page_one.wait_for_function(
+                """() => {
+                  const root = document.querySelector('#termdeck-app');
+                  const shell = document.querySelector('.workspace-shell');
+                  const host = document.querySelector('#terminal-xterm');
+                  if (!root || !shell || !host) {
+                    return false;
+                  }
+                  const shellBox = shell.getBoundingClientRect();
+                  const hostBox = host.getBoundingClientRect();
+                  return root.classList.contains('workspace-main')
+                    && shellBox.width > 0 && shellBox.height > 0
+                    && hostBox.width > 0 && hostBox.height > 0;
+                }""",
+                timeout=10_000,
+            )
+            workspace_ready_ms = (time.monotonic_ns() - started) / 1_000_000
+            result["timings_ms"]["workspace_ready"] = round(workspace_ready_ms, 3)
+            try:
+                page_one.locator("#terminal-xterm .xterm").wait_for(state="visible", timeout=20_000)
+            except Exception:
+                result["initial_visibility_diagnostic"] = page_one.evaluate(
+                    r"""() => {
+                      const shell = document.querySelector('.workspace-shell');
+                      const host = document.querySelector('#terminal-xterm');
+                      const terminal = host?.querySelector('.xterm');
+                      const box = element => element ? {
+                        width: element.getBoundingClientRect().width,
+                        height: element.getBoundingClientRect().height,
+                        top: element.getBoundingClientRect().top,
+                        bottom: element.getBoundingClientRect().bottom,
+                      } : null;
+                      const style = element => element ? {
+                        display: getComputedStyle(element).display,
+                        visibility: getComputedStyle(element).visibility,
+                        opacity: getComputedStyle(element).opacity,
+                        width: element.getBoundingClientRect().width,
+                        height: element.getBoundingClientRect().height,
+                      } : null;
+                      return {
+                        rootState: document.querySelector('#termdeck-app')?.dataset.termdeckState,
+                        rootBusy: document.querySelector('#termdeck-app')?.getAttribute('aria-busy'),
+                        shellState: shell?.dataset.state,
+                        shellStatus: document.querySelector('.workspace-state-message')?.textContent,
+                        terminalStatus: document.querySelector('#terminal-status')?.textContent,
+                        viewport: { width: innerWidth, height: innerHeight },
+                        body: box(document.body),
+                        root: box(document.querySelector('#termdeck-app')),
+                        shell: box(shell),
+                        gridRows: getComputedStyle(document.querySelector('#termdeck-app')).gridTemplateRows,
+                        children: [...(document.querySelector('#termdeck-app')?.children || [])].map(element => ({
+                          tag: element.tagName,
+                          className: element.className,
+                          display: getComputedStyle(element).display,
+                          rect: box(element),
+                        })),
+                        host: style(host),
+                        terminal: style(terminal),
+                        bodyClass: document.body.className,
+                      };
+                    }"""
+                )
+                raise
             xterm_ms = (time.monotonic_ns() - started) / 1_000_000
             try:
                 page_one.wait_for_function(
@@ -935,19 +1033,15 @@ def main() -> int:
                 raise AssertionError(f"window route changed unexpectedly: {page_one.url}")
             page_one.unroute(api_url)
             page_one.wait_for_function(
-                "() => document.querySelectorAll('.workspace-tab').length === 1",
+                """() => {
+                  const shell = document.querySelector('.workspace-shell');
+                  const terminal = document.querySelector('#terminal-xterm .xterm');
+                  return (shell?.dataset.state === 'ready' || shell?.dataset.state === 'degraded') && terminal
+                    && getComputedStyle(terminal).visibility !== 'hidden';
+                }""",
                 timeout=10_000,
             )
             result["assertions"]["terminal_starts_without_window_api"] = True
-            result["layout"] = {
-                "desktop": assert_workspace_layout(page_one, width=1440, height=900, label="desktop"),
-                "compact": assert_workspace_layout(page_one, width=980, height=620, label="compact"),
-                "mobile": assert_workspace_layout(page_one, width=430, height=740, label="mobile"),
-            }
-            page_one.set_viewport_size({"width": 1440, "height": 900})
-            page_one.wait_for_timeout(180)
-            result["assertions"]["responsive_workspace_layout"] = True
-
             try:
                 page_one.wait_for_function(
                     "() => document.querySelector('#terminal-xterm')?.termdeckTerminal?.readBuffer().includes('KEYBOARD_PASTE_MOUSE_RESIZE_READY')",
@@ -956,6 +1050,8 @@ def main() -> int:
             except Exception:
                 result["initial_terminal_diagnostic"] = terminal_state(page_one)
                 raise
+            terminal_ready_ms = (time.monotonic_ns() - started) / 1_000_000
+            result["timings_ms"]["terminal_ready"] = round(terminal_ready_ms, 3)
             state = terminal_state(page_one)
             if state.get("type") != "alternate":
                 raise AssertionError(f"xterm did not restore alternate screen: {state!r}")
@@ -974,6 +1070,15 @@ def main() -> int:
                     "codex_composer_rendering": True,
                 }
             )
+
+            result["layout"] = {
+                "desktop": assert_workspace_layout(page_one, width=1440, height=900, label="desktop"),
+                "compact": assert_workspace_layout(page_one, width=980, height=620, label="compact"),
+                "mobile": assert_workspace_layout(page_one, width=430, height=740, label="mobile"),
+            }
+            page_one.set_viewport_size({"width": 1440, "height": 900})
+            page_one.wait_for_timeout(180)
+            result["assertions"]["responsive_workspace_layout"] = True
 
             html = page_one.content()
             present = [value for value in REJECTED_UI if value in html]
@@ -1000,6 +1105,17 @@ def main() -> int:
                 )
             wait_bytes(initial_raw, b"\t")
             result["assertions"]["keyboard_control_bytes"] = True
+
+            render_echo_started = time.monotonic_ns()
+            page_one.keyboard.type("UX_ECHO_REQUEST")
+            page_one.keyboard.press("Enter")
+            page_one.wait_for_function(
+                "() => document.querySelector('#terminal-xterm')?.termdeckTerminal?.readBuffer().includes('UX_ECHO_RENDERED')",
+                timeout=5_000,
+            )
+            render_echo_ms = (time.monotonic_ns() - render_echo_started) / 1_000_000
+            result["timings_ms"]["keyboard_to_terminal_buffer_echo"] = round(render_echo_ms, 3)
+            result["assertions"]["keyboard_to_terminal_buffer_echo"] = True
 
             latency_text = "PIPELINED_" + ("abcdefghijklmnopqrstuvwxyz0123456789" * 5)
             latency_offset = len(initial_raw.read_bytes())
@@ -1263,6 +1379,88 @@ def main() -> int:
             if not created or created["status"] != "running" or created["visible"] != 1:
                 raise AssertionError(f"browser-created tab is not running: {created!r}")
             result["lifecycle"]["created_id"] = created_id
+
+            # Keyboard tab navigation must retain focus after asynchronous
+            # terminal readiness, while pointer selection must remain click-to-type.
+            page_two.locator(f'[role="tab"][data-pane-id="{created_id}"]').focus()
+            for key, pane_id in (("Home", initial_id), ("End", created_id)):
+                page_two.keyboard.press(key)
+                page_two.wait_for_url(f"**/random/t/{urllib.parse.quote(pane_id)}")
+                page_two.wait_for_function(
+                    "() => document.querySelector('#terminal-status')?.textContent === 'Live'",
+                    timeout=10_000,
+                )
+                page_two.evaluate(
+                    "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+                )
+                if not page_two.evaluate(
+                    "id => document.activeElement?.getAttribute('role') === 'tab' && document.activeElement.dataset.paneId === id",
+                    pane_id,
+                ):
+                    raise AssertionError(f"terminal readiness stole keyboard tab focus after {key}")
+            result["assertions"]["keyboard_tab_focus_survives_terminal_ready"] = True
+
+            page_two.locator(".workspace-actions summary").click()
+            page_two.locator(".workspace-action-panel button").first.focus()
+            page_two.evaluate("window.__termdeckFocusedAction = document.activeElement")
+            with page_two.expect_response(
+                lambda response: response.url.endswith("/_termdeck/api/v1/windows/random"),
+                timeout=10_000,
+            ):
+                page_two.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+            page_two.wait_for_function(
+                "() => document.querySelector('#termdeck-app')?.getAttribute('aria-busy') === 'false'",
+                timeout=5_000,
+            )
+            if not page_two.evaluate(
+                "() => document.querySelector('.workspace-actions').open && document.activeElement === window.__termdeckFocusedAction && document.activeElement.isConnected"
+            ):
+                raise AssertionError("metadata refresh replaced or defocused the open More menu")
+            result["assertions"]["refresh_preserves_open_menu_focus"] = True
+            page_two.keyboard.press("Escape")
+
+            def switch_pane_timed(pane_id: str, marker: str) -> float:
+                selector = f'.workspace-tab[data-pane-id="{pane_id}"] .workspace-tab-select'
+                page_two.locator(selector).wait_for(state="visible", timeout=10_000)
+                switch_started = time.monotonic_ns()
+                page_two.locator(selector).click()
+                page_two.wait_for_url(
+                    f"**/random/t/{urllib.parse.quote(pane_id)}",
+                    timeout=10_000,
+                )
+                page_two.wait_for_function(
+                    "() => document.querySelector('#terminal-status')?.textContent === 'Live'",
+                    timeout=10_000,
+                )
+                page_two.wait_for_function(
+                    "marker => document.querySelector('#terminal-xterm')?.termdeckTerminal?.readBuffer().includes(marker)",
+                    arg=marker,
+                    timeout=10_000,
+                )
+                page_two.wait_for_function(
+                    "() => document.querySelector('#terminal-xterm')?.contains(document.activeElement)",
+                    timeout=5_000,
+                )
+                return (time.monotonic_ns() - switch_started) / 1_000_000
+
+            tab_switch_samples: list[float] = []
+            for _sample in range(4):
+                tab_switch_samples.append(
+                    switch_pane_timed(initial_id, "CODEX COMPOSER › PRIMARY")
+                )
+                tab_switch_samples.append(
+                    switch_pane_timed(created_id, "CODEX COMPOSER › CREATED")
+                )
+            result["timings_ms"].update(
+                {
+                    "tab_switch_count": len(tab_switch_samples),
+                    "tab_switch_samples": [round(sample, 3) for sample in tab_switch_samples],
+                    "tab_switch_p50": round(percentile(tab_switch_samples, 0.50), 3),
+                    "tab_switch_p95": round(percentile(tab_switch_samples, 0.95), 3),
+                }
+            )
+            result["assertions"]["repeated_tab_switch_latency"] = True
+            result["assertions"]["pointer_tab_switch_preserves_typing_focus"] = True
 
             page_two.once("dialog", lambda dialog: dialog.accept("Renamed Browser Tab"))
             click_action(page_two, "Rename tab")

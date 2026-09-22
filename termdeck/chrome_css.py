@@ -348,6 +348,30 @@ headerbar button.td-new-tab.td-header-icon {{
   padding: 0;
   border-radius: 8px;
 }}
+combobox.td-auth-account {{
+  background-color: {t.bg_sunken};
+  background-image: none;
+  color: {t.fg};
+  border: 1px solid {hairline_soft};
+  border-radius: 8px;
+  min-height: 30px;
+  padding: 0;
+}}
+combobox.td-auth-account:hover {{
+  background-color: {hov_bg};
+  border-color: {btn_hov_b};
+}}
+combobox.td-auth-account:focus {{
+  border-color: {t.accent};
+  outline: 2px solid {foc_ring};
+  outline-offset: 1px;
+}}
+headerbar button.td-header-icon:focus {{
+  border-color: {t.accent};
+  outline: 2px solid {foc_ring};
+  outline-offset: 1px;
+  background-color: {hov_bg};
+}}
 headerbar button.td-header-group-end {{ margin-left: 8px; }}
 button.td-tabstrip-new {{
   min-width: 28px;
@@ -509,6 +533,11 @@ notebook.td-terminal-notebook tab {{
 notebook.td-terminal-notebook tab:hover {{
   background-color: {tab_hov_bg};
   color: {t.fg};
+}}
+notebook.td-terminal-notebook tab:focus {{
+  border-color: {t.accent};
+  outline: 2px solid {foc_ring};
+  outline-offset: -2px;
 }}
 notebook.td-terminal-notebook tab:checked {{
   background-color: {tab_sel_bg};

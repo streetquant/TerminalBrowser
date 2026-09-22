@@ -11,6 +11,7 @@ from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import statistics
 import sys
@@ -24,6 +25,15 @@ if str(REPO_ROOT) not in sys.path:
 from termdeck.frame_budget import FrameBudgetMonitor
 
 ProbeResult = dict[str, float | int] | dict[str, str]
+
+# These are CPU/model budgets, not keyboard-to-display or tmux latency claims.
+# A 100-session snapshot should leave at least half of a 16 ms frame available
+# for rendering. CI uses enough samples for a meaningful nearest-rank p95.
+P95_BUDGETS_MS = {
+    "snapshot_build": 8.0,
+    "frame_budget_overhead": 0.1,
+    "line_buffer_append": 8.0,
+}
 
 
 def _summarize(samples_ms: list[float]) -> dict[str, float | int]:
@@ -48,12 +58,12 @@ def _time_iterations(iterations: int, operation: Callable[[], None]) -> ProbeRes
             started = time.perf_counter_ns()
             operation()
             samples_ms.append((time.perf_counter_ns() - started) / 1_000_000.0)
-    except Exception as exc:  # A baseline tool must report probe failures, not fail CI.
+    except Exception as exc:  # Keep the error in the report; main fails the gate.
         return {"error": f"{type(exc).__name__}: {exc}"}
     return _summarize(samples_ms)
 
 
-def _snapshot_build_probe(iterations: int) -> ProbeResult:
+def _snapshot_build_probe(iterations: int, sessions: int) -> ProbeResult:
     """Time the real task-snapshot builder over synthetic offline records.
 
     Uses an unavailable backend and a no-op sampler so the measurement isolates
@@ -93,7 +103,7 @@ def _snapshot_build_probe(iterations: int) -> ProbeResult:
             tab_index=index % 12,
             visible=index % 3 != 0,
         )
-        for index in range(100)
+        for index in range(sessions)
     ]
     backend = ProbeBackend()
     sampler = ProbeSampler()
@@ -121,23 +131,59 @@ def _line_buffer_append_probe(iterations: int) -> ProbeResult:
     return _time_iterations(iterations, append_lines)
 
 
-def run_probes(iterations: int) -> dict[str, Any]:
+def run_probes(iterations: int, sessions: int = 100) -> dict[str, Any]:
     """Build the complete JSON-ready document so stdout and files always agree."""
     return {
+        "schema": "termdeck.headless-performance.v1",
+        "scope": "headless CPU/model costs; excludes tmux, GTK and browser rendering",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "python": sys.version,
+        "workload": {"sessions": sessions, "iterations": iterations},
         "probes": {
-            "snapshot_build": _snapshot_build_probe(iterations),
+            "snapshot_build": _snapshot_build_probe(iterations, sessions),
             "frame_budget_overhead": _frame_budget_overhead_probe(iterations),
             "line_buffer_append": _line_buffer_append_probe(iterations),
         },
     }
 
 
+def evaluate_probes(result: dict[str, Any], *, assert_thresholds: bool) -> list[str]:
+    """Never let a failed or non-finite measurement produce a green CI result."""
+    failures = []
+    for name, budget in P95_BUDGETS_MS.items():
+        probe = result["probes"].get(name, {})
+        if "error" in probe:
+            failures.append(f"{name}: {probe['error']}")
+            continue
+        p95 = probe.get("p95_ms")
+        count = probe.get("n")
+        if (
+            not isinstance(p95, (int, float))
+            or isinstance(p95, bool)
+            or not math.isfinite(p95)
+            or p95 < 0
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 1
+        ):
+            failures.append(f"{name}: invalid or missing measurement")
+        elif assert_thresholds and p95 > budget:
+            failures.append(f"{name}: p95 {p95:.6f} ms exceeds {budget:g} ms budget")
+    return failures
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Keep CLI validation upfront to avoid silently generating misleading data."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json-out", type=Path, help="Also write JSON to this path.")
+    parser.add_argument(
+        "--sessions", type=int, default=100,
+        help="Synthetic session count for snapshot construction (default: 100).",
+    )
+    parser.add_argument(
+        "--assert-thresholds", action="store_true",
+        help="Fail if a headless CPU/model p95 exceeds its documented budget.",
+    )
     parser.add_argument(
         "--iterations",
         type=int,
@@ -147,18 +193,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.iterations < 1:
         parser.error("--iterations must be at least 1")
+    if args.sessions < 1:
+        parser.error("--sessions must be at least 1")
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run all probes and always return success for expected probe-level errors."""
+    """Emit measurements and return failure for errors or requested budget misses."""
     args = _parse_args(argv)
-    result = run_probes(args.iterations)
+    result = run_probes(args.iterations, args.sessions)
+    result["thresholds_enforced"] = args.assert_thresholds
+    result["p95_budgets_ms"] = P95_BUDGETS_MS
+    result["failures"] = evaluate_probes(result, assert_thresholds=args.assert_thresholds)
+    result["ok"] = not result["failures"]
     rendered = json.dumps(result, sort_keys=True, indent=2)
     print(rendered)
     if args.json_out is not None:
         args.json_out.write_text(rendered + "\n", encoding="utf-8")
-    return 0
+    return 0 if result["ok"] else 1
 
 
 if __name__ == "__main__":

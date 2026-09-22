@@ -246,6 +246,48 @@ def _icon_button(label, icon_name, tooltip, handler, *, suggested=False, show_la
     return button
 
 
+def _configure_header_account_combo(combo: Gtk.ComboBoxText) -> Gtk.ComboBoxText:
+    """Keep the optional account control readable without stealing header space.
+
+    Account labels include recovery state (for example ``pending`` or
+    ``choose account · upgrades terminal``) and provider labels can be long.
+    Letting the cell renderer determine the natural width makes the centered
+    window title jump or disappear on narrow windows.  The full state remains
+    available through the tooltip; the selected row is deliberately bounded to
+    a compact, keyboard-friendly control in the header.
+    """
+
+    combo.set_size_request(136, -1)
+    combo.set_hexpand(False)
+    combo.set_halign(Gtk.Align.CENTER)
+    try:
+        combo.get_accessible().set_name("Codex account")
+    except Exception:
+        pass
+    try:
+        cells = combo.get_cells()
+    except Exception:
+        cells = ()
+    for cell in cells:
+        try:
+            # Gtk.CellRendererText accepts Pango's END ellipsis and keeps the
+            # active label aligned with the rest of the compact header chrome.
+            cell.set_property("ellipsize", Pango.EllipsizeMode.END)
+            cell.set_property("ellipsize-set", True)
+            # ``max-width-chars`` only limits the ellipsis point once a cell
+            # has been allocated.  A pixel width is also needed to keep GTK's
+            # natural-size negotiation from expanding the header for a long
+            # account label before that allocation happens.
+            cell.set_property("width", 112)
+            cell.set_property("width-chars", 14)
+            cell.set_property("max-width-chars", 18)
+        except Exception:
+            # A platform theme may supply a renderer without text properties;
+            # the fixed widget width still gives the header its bounded layout.
+            pass
+    return combo
+
+
 def _wire_auxiliary_close(window: Gtk.Window) -> None:
     # Make helper windows closable even on minimal/tiled window managers.
     try:
@@ -5051,6 +5093,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         header.pack_start(header_new_tab)
 
         auth_combo = Gtk.ComboBoxText()
+        _configure_header_account_combo(auth_combo)
         auth_combo.append("__none__", "Codex: no account")
         auth_combo.set_active_id("__none__")
         auth_combo.set_tooltip_text("Codex account for the current terminal")

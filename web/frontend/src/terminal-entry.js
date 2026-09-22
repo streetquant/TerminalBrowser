@@ -7,6 +7,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 
 const DEFAULT_FONT_SIZE = 13;
 const MIN_FONT_SIZE = 7;
+const TEXT_ENCODER = new TextEncoder();
 
 const DEFAULT_THEME = Object.freeze({
   background: "#0a0d13",
@@ -119,11 +120,27 @@ export function createTerminal(element, options = {}) {
   };
   const fit = () => {
     const dimensions = proposedDimensions();
-    if (dimensions) {
+    if (
+      dimensions
+      && (terminal.cols !== dimensions.cols || terminal.rows !== dimensions.rows)
+    ) {
       terminal.resize(dimensions.cols, dimensions.rows);
     }
     return { cols: terminal.cols, rows: terminal.rows };
   };
+  let lastGridFit = null;
+  const invalidateFontMetrics = () => {
+    lastGridFit = null;
+  };
+  const fontMetrics = () => ({
+    family: terminal.options.fontFamily,
+    size: terminal.options.fontSize,
+    weight: terminal.options.fontWeight,
+    boldWeight: terminal.options.fontWeightBold,
+    letterSpacing: terminal.options.letterSpacing,
+    lineHeight: terminal.options.lineHeight,
+    fontsStatus: document.fonts?.status || "unavailable",
+  });
   const fitGrid = (columns, rows) => {
     if (
       !Number.isInteger(columns)
@@ -132,6 +149,52 @@ export function createTerminal(element, options = {}) {
       || rows < 2
     ) {
       throw new TypeError("A canonical terminal grid is required.");
+    }
+    const getComputedStyle = typeof window.getComputedStyle === "function"
+      ? window.getComputedStyle.bind(window)
+      : null;
+    const parentStyle = getComputedStyle ? getComputedStyle(element) : null;
+    const terminalStyle = getComputedStyle && terminal.element
+      ? getComputedStyle(terminal.element)
+      : null;
+    const layout = {
+      width: element.clientWidth,
+      height: element.clientHeight,
+      devicePixelRatio: window.devicePixelRatio || 1,
+      parentWidth: parentStyle?.width || "",
+      parentHeight: parentStyle?.height || "",
+      terminalPaddingTop: terminalStyle?.paddingTop || "",
+      terminalPaddingBottom: terminalStyle?.paddingBottom || "",
+      terminalPaddingLeft: terminalStyle?.paddingLeft || "",
+      terminalPaddingRight: terminalStyle?.paddingRight || "",
+    };
+    const metrics = fontMetrics();
+    if (
+      lastGridFit
+      && lastGridFit.columns === columns
+      && lastGridFit.rows === rows
+      && lastGridFit.layout.width === layout.width
+      && lastGridFit.layout.height === layout.height
+      && lastGridFit.layout.devicePixelRatio === layout.devicePixelRatio
+      && lastGridFit.layout.parentWidth === layout.parentWidth
+      && lastGridFit.layout.parentHeight === layout.parentHeight
+      && lastGridFit.layout.terminalPaddingTop === layout.terminalPaddingTop
+      && lastGridFit.layout.terminalPaddingBottom === layout.terminalPaddingBottom
+      && lastGridFit.layout.terminalPaddingLeft === layout.terminalPaddingLeft
+      && lastGridFit.layout.terminalPaddingRight === layout.terminalPaddingRight
+      && lastGridFit.metrics.family === metrics.family
+      && lastGridFit.metrics.size === metrics.size
+      && lastGridFit.metrics.weight === metrics.weight
+      && lastGridFit.metrics.boldWeight === metrics.boldWeight
+      && lastGridFit.metrics.letterSpacing === metrics.letterSpacing
+      && lastGridFit.metrics.lineHeight === metrics.lineHeight
+      && lastGridFit.metrics.fontsStatus === metrics.fontsStatus
+      && metrics.fontsStatus !== "loading"
+      && terminal.cols === columns
+      && terminal.rows === rows
+      && terminal.options.fontSize === lastGridFit.fontSize
+    ) {
+      return { ...lastGridFit.result };
     }
     const maximum = Number.isFinite(options.fontSize)
       ? Math.max(MIN_FONT_SIZE, Math.floor(options.fontSize))
@@ -148,14 +211,51 @@ export function createTerminal(element, options = {}) {
       }
     }
     terminal.options.fontSize = chosen;
-    terminal.resize(columns, rows);
+    if (terminal.cols !== columns || terminal.rows !== rows) {
+      terminal.resize(columns, rows);
+    }
     element.dataset.termdeckColumns = String(columns);
     element.dataset.termdeckRows = String(rows);
     element.dataset.termdeckFontSize = String(chosen);
     element.dataset.termdeckOverflow = fits ? "false" : "true";
-    return { cols: columns, rows, fontSize: chosen, fits };
+    const result = { cols: columns, rows, fontSize: chosen, fits };
+    lastGridFit = {
+      columns,
+      rows,
+      fontSize: chosen,
+      layout,
+      metrics: fontMetrics(),
+      result,
+    };
+    return { ...result };
   };
-  const subscriptions = [];
+  const subscriptions = new Set();
+  const trackSubscription = (subscription) => {
+    let active = true;
+    const tracked = {
+      dispose() {
+        if (!active) {
+          return;
+        }
+        active = false;
+        subscriptions.delete(tracked);
+        subscription.dispose();
+      },
+    };
+    subscriptions.add(tracked);
+    return tracked;
+  };
+  const fontSet = document.fonts;
+  if (fontSet?.addEventListener) {
+    fontSet.addEventListener("loadingdone", invalidateFontMetrics);
+    fontSet.addEventListener("loadingerror", invalidateFontMetrics);
+    trackSubscription({
+      dispose() {
+        fontSet.removeEventListener?.("loadingdone", invalidateFontMetrics);
+        fontSet.removeEventListener?.("loadingerror", invalidateFontMetrics);
+      },
+    });
+  }
   const api = {
     terminal,
     fit,
@@ -189,20 +289,20 @@ export function createTerminal(element, options = {}) {
       return searchAddon.findPrevious(String(query), searchOptions || {});
     },
     onData(callback) {
-      const dataSubscription = terminal.onData((value) => callback(new TextEncoder().encode(value)));
+      const dataSubscription = terminal.onData((value) => callback(TEXT_ENCODER.encode(value)));
       const binarySubscription = terminal.onBinary((value) => callback(byteStringToUint8Array(value)));
-      subscriptions.push(dataSubscription, binarySubscription);
-      return {
+      return trackSubscription({
         dispose() {
-          dataSubscription.dispose();
-          binarySubscription.dispose();
+          try {
+            dataSubscription.dispose();
+          } finally {
+            binarySubscription.dispose();
+          }
         },
-      };
+      });
     },
     onResize(callback) {
-      const subscription = terminal.onResize(callback);
-      subscriptions.push(subscription);
-      return subscription;
+      return trackSubscription(terminal.onResize(callback));
     },
     readBuffer() {
       const active = terminal.buffer.active;
@@ -213,13 +313,14 @@ export function createTerminal(element, options = {}) {
       return lines.join("\n");
     },
     dispose() {
-      for (const subscription of subscriptions.splice(0)) {
+      for (const subscription of subscriptions) {
         try {
           subscription.dispose();
         } catch (_ignored) {
           // Disposal is best effort during navigation.
         }
       }
+      subscriptions.clear();
       if (webglAddon) {
         try {
           webglAddon.dispose();
