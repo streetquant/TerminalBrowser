@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import stat
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +22,17 @@ from test_release_manager import (
 )
 
 
+_ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_WORKFLOW_SPEC = importlib.util.spec_from_file_location(
+    "termdeck_check_release_workflow",
+    _ROOT / "scripts" / "check_release_workflow.py",
+)
+assert _RELEASE_WORKFLOW_SPEC is not None
+assert _RELEASE_WORKFLOW_SPEC.loader is not None
+_RELEASE_WORKFLOW = importlib.util.module_from_spec(_RELEASE_WORKFLOW_SPEC)
+_RELEASE_WORKFLOW_SPEC.loader.exec_module(_RELEASE_WORKFLOW)
+
+
 def _preserved_path(path: Path) -> tuple[int, int, int, bytes | None]:
     entry = path.lstat()
     return (
@@ -32,6 +45,89 @@ def _preserved_path(path: Path) -> tuple[int, int, int, bytes | None]:
 
 def _preserved_release_tree(path: Path) -> dict[Path, tuple[int, int, int, bytes | None]]:
     return {item: _preserved_path(item) for item in [path, *path.rglob("*")]}
+
+
+def test_release_smoke_uses_clean_disposable_committed_snapshot(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    for args in (
+        ["git", "init", "--quiet"],
+        ["git", "config", "user.name", "release-workflow-test"],
+        ["git", "config", "user.email", "release-workflow-test@invalid"],
+    ):
+        subprocess.run(args, cwd=repository, check=True)
+    (repository / "tracked.txt").write_text("committed\n", encoding="utf-8")
+    (repository / "deleted.txt").write_text("remove me\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--all"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "--quiet", "-m", "fixture"],
+        cwd=repository,
+        check=True,
+    )
+    (repository / "tracked.txt").write_text("modified\n", encoding="utf-8")
+    (repository / "deleted.txt").unlink()
+    (repository / "untracked.txt").write_text("new\n", encoding="utf-8")
+    destination = tmp_path / "source"
+    source_head_before = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    ).stdout.strip()
+    source_status_before = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=repository,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    ).stdout
+    _RELEASE_WORKFLOW._clone_clean_source_snapshot(repository, destination)
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=destination,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert status.returncode == 0, status.stderr
+    assert status.stdout == ""
+
+    source_head_after = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    ).stdout.strip()
+    source_status_after = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=repository,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    ).stdout
+    assert source_head_after == source_head_before
+    assert source_status_after == source_status_before
+
+    actual = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=destination,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    ).stdout.strip()
+    assert len(actual) == 40
+    assert (destination / "tracked.txt").read_text(encoding="utf-8") == "modified\n"
+    assert not (destination / "deleted.txt").exists()
+    assert (destination / "untracked.txt").read_text(encoding="utf-8") == "new\n"
 
 
 @pytest.fixture()

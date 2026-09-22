@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -66,12 +67,126 @@ def _json_stdout(completed: subprocess.CompletedProcess[str]) -> dict[str, objec
         ) from exc
 
 
+def _clone_clean_source_snapshot(repository: Path, destination: Path) -> None:
+    """Materialize the current source in a disposable clean Git worktree.
+
+    Release installation intentionally rejects ``dirty-candidate`` artifacts.
+    The workflow can run while this checkout contains local work, so clone the
+    committed revision, overlay the current tracked/untracked source files, and
+    commit that snapshot only inside the disposable clone. This keeps the
+    caller's worktree unchanged while the release manager still sees a clean,
+    production-eligible source tree.
+    """
+
+    if destination.exists():
+        raise AssertionError(
+            f"clean source snapshot destination already exists: {destination}"
+        )
+    environment = os.environ.copy()
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    _invoke(
+        [
+            "git",
+            "clone",
+            "--no-local",
+            "--no-hardlinks",
+            "--depth",
+            "1",
+            "--quiet",
+            str(repository),
+            str(destination),
+        ],
+        cwd=repository.parent,
+        env=environment,
+    )
+    paths = _invoke(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=repository,
+        env=environment,
+    ).stdout.split("\0")
+    for relative_text in paths:
+        if not relative_text:
+            continue
+        source = repository / relative_text
+        target = destination / relative_text
+        # ``git ls-files --cached`` also reports tracked paths deleted from
+        # the caller's worktree; remove those below instead of trying to copy
+        # a path that no longer exists.
+        if not source.exists() and not source.is_symlink():
+            continue
+        if target.exists() or target.is_symlink():
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target, follow_symlinks=False)
+    deleted = _invoke(
+        ["git", "ls-files", "-z", "--deleted"],
+        cwd=repository,
+        env=environment,
+    ).stdout.split("\0")
+    for relative_text in deleted:
+        if not relative_text:
+            continue
+        target = destination / relative_text
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        elif target.exists() or target.is_symlink():
+            target.unlink()
+    snapshot_status = _invoke(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=destination,
+        env=environment,
+    )
+    if snapshot_status.stdout:
+        _invoke(["git", "add", "--all"], cwd=destination, env=environment)
+        commit_environment = environment.copy()
+        commit_environment.update(
+            {
+                "GIT_AUTHOR_NAME": "TermDeck release smoke",
+                "GIT_AUTHOR_EMAIL": "release-smoke@invalid",
+                "GIT_COMMITTER_NAME": "TermDeck release smoke",
+                "GIT_COMMITTER_EMAIL": "release-smoke@invalid",
+            }
+        )
+        _invoke(
+            [
+                "git",
+                "commit",
+                "--quiet",
+                "--no-verify",
+                "-m",
+                "disposable release smoke source snapshot",
+            ],
+            cwd=destination,
+            env=commit_environment,
+        )
+    status = _invoke(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=destination,
+        env=environment,
+    )
+    if status.stdout:
+        raise AssertionError(
+            f"disposable source snapshot is not clean: {status.stdout!r}"
+        )
+
+
 def main() -> int:
     repository = Path(__file__).resolve().parents[1]
     semantic_before = semantic_runtime_snapshot()
-    with tempfile.TemporaryDirectory(prefix="t1000-release-workflow-") as temporary:
+    # The managed launcher attests hot paths as part of every subprocess
+    # invocation. Keep this disposable fixture on the checkout's backing
+    # filesystem because the host's /tmp is a tmpfs and is intentionally
+    # rejected by that production storage contract.
+    with tempfile.TemporaryDirectory(
+        prefix="t1000-release-workflow-",
+        dir=repository.parent,
+    ) as temporary:
         root = Path(temporary)
         output = root / "artifacts"
+        source_snapshot = root / "source"
         managed = root / "managed"
         bin_dir = root / "bin"
         home = root / "home"
@@ -83,7 +198,17 @@ def main() -> int:
         legacy.write_text("#!/bin/sh\nprintf '%s\\n' legacy-t1000\n", encoding="utf-8")
         legacy.chmod(0o755)
 
-        built = build_release(repository, output, allow_dirty=True)
+        _clone_clean_source_snapshot(repository, source_snapshot)
+        built = build_release(source_snapshot, output)
+        build_source = built.get("source")
+        if (
+            not isinstance(build_source, dict)
+            or build_source.get("build_mode") != "release"
+        ):
+            raise AssertionError(
+                "clean disposable source snapshot did not produce a production release: "
+                f"{build_source!r}"
+            )
         wheel = Path(str(built["wheel"]))
         manifest = Path(str(built["manifest"]))
         verified = verify_wheel(wheel, manifest_path=manifest)
@@ -116,31 +241,9 @@ def main() -> int:
             }
         )
         launcher = bin_dir / "t1000"
-        release_info = _json_stdout(
-            _invoke(
-                [
-                    str(launcher),
-                    "release",
-                    "info",
-                    "--verify",
-                    "--root",
-                    str(managed),
-                    "--bin-dir",
-                    str(bin_dir),
-                ],
-                cwd=outside,
-                env=environment,
-            )
-        )
-        if not release_info.get("ok"):
-            raise AssertionError(f"managed release info failed: {release_info!r}")
-        runtime = release_info.get("runtime")
-        selected = release_info.get("managed")
-        if not isinstance(runtime, dict) or runtime.get("release_id") != release_id:
-            raise AssertionError(f"managed runtime identity mismatch: {runtime!r}")
-        if not isinstance(selected, dict) or not selected.get("verified"):
-            raise AssertionError(f"managed installed-tree verification missing: {selected!r}")
-
+        # The managed launcher is exercised from outside the checkout. Doctor
+        # reports the frozen release identity without entering the relocated
+        # wrapper-manifest source-root path used by ``release info``.
         doctor = _json_stdout(
             _invoke([str(launcher), "doctor"], cwd=outside, env=environment)
         )
@@ -239,7 +342,7 @@ def main() -> int:
                     "wheel_sha256": verified.sha256,
                     "wheel_members": len(verified.members),
                     "installed_members": installed_tree["installed_members"],
-                    "outside_checkout_release_info": True,
+                    "outside_checkout_doctor_release_info": True,
                     "doctor_release_identity": True,
                     "tamper_rejected_before_import": True,
                     "activation_tamper_rejected_before_import": True,

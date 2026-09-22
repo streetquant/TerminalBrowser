@@ -1,6 +1,12 @@
 # TermDeck UI/UX SOTA Plan
 
-Status: implemented (Phases 0–5, 7) · Scope: UI smoothness, latency, and visual polish · Basis: code audit of
+Historical plan: the phase statuses below describe the August 2026 snapshot, not
+current completion evidence. See [the September audit and implementation checklist](UI_UX_STATUS.md)
+for verified changes, measurement limits, and remaining work. In particular, the
+headless probe does not measure input-to-display latency, and the presence of the
+history-mirror module does not demonstrate its integration into the terminal UI.
+
+Scope: UI smoothness, latency, and visual polish · Original basis: code audit of
 `termdeck/gtk_app.py` (8,400 lines), `tmux_backend.py`, `history_control.py`, `chrome_css.py`,
 `ui_theme.py`, `resources.py`, `settings.py`, and the smoke/regression test suite.
 
