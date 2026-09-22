@@ -43,6 +43,7 @@ user-prompt.md
 .beads/
 codex-session-id.txt
 .ai-bridge/
+.codex-workspace-id.json
 
 # bv (beads viewer) local config and caches
 .bv/

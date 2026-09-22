@@ -4,17 +4,17 @@ Documentation=https://github.com/Rebel0789/t1000
 After=warp.mount user@1000.service local-fs.target
 Before=umount.target shutdown.target
 ConditionPathIsMountPoint=/warp
-ConditionPathIsDirectory=/warp/state/termdeck
-ConditionPathIsDirectory=/warp/runtime/termdeck/t1000-managed
-RequiresMountsFor=/warp/projects/software/termdeck /warp/runtime/termdeck /warp/state/termdeck
+ConditionPathIsDirectory=/warp/projects/softwares/termdeck/.termdeck/state
+ConditionPathIsDirectory=/warp/projects/softwares/termdeck/.termdeck/t1000-managed
+RequiresMountsFor=/warp/projects/softwares/termdeck /warp/projects/softwares/termdeck/.termdeck /warp/projects/softwares/termdeck/.termdeck/state
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 KillMode=control-group
-Environment=HOME=/warp/state/termdeck
-ExecStart=/warp/runtime/termdeck/t1000-managed/termdeck-checkpoint
-ExecStop=/warp/runtime/termdeck/t1000-managed/termdeck-checkpoint-stop
+Environment=HOME=/warp/projects/softwares/termdeck/.termdeck/state
+ExecStart=/warp/projects/softwares/termdeck/.termdeck/t1000-managed/termdeck-checkpoint
+ExecStop=/warp/projects/softwares/termdeck/.termdeck/t1000-managed/termdeck-checkpoint-stop
 Restart=on-failure
 RestartMode=direct
 TimeoutStopSec=15min

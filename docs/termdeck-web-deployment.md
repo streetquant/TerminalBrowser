@@ -4,13 +4,13 @@ The browser client is served by a loopback-only Rust backend and a persistent ng
 
 ## Local service
 
-Install `scripts/termdeck-web-prepare-runtime.sh` as `/warp/runtime/termdeck/termdeck-lan/bin/termdeck-web-prepare`, install the user units from `deploy/systemd`, run `systemctl --user daemon-reload`, and enable `termdeck-web-backend.service` plus `termdeck-web-lan.service`. The user must have lingering enabled. The backend remains bound to `127.0.0.1:7391`; only nginx binds port 7443.
+Install `scripts/termdeck-web-prepare-runtime.sh` as `/warp/projects/softwares/termdeck/.termdeck/bin/termdeck-web-prepare`, install the user units from `deploy/systemd`, run `systemctl --user daemon-reload`, and enable `termdeck-web-backend.service` plus `termdeck-web-lan.service`. The user must have lingering enabled. The backend remains bound to `127.0.0.1:7391`; only nginx binds port 7443.
 
 The certificate is signed by the existing TermDeck LAN CA and includes the current DHCP address, `127.0.0.1`, `termdeck.local`, and `max.local`. Re-running the preparation script is idempotent and rotates only when the address changes or the certificate approaches expiry.
 
 ## Activation recovery evidence
 
-The web activation helper stores transaction receipts and rollback markers by default under `/warp/state/termdeck/recovery/activation-v2`. This state-root recovery hierarchy is separate from the TermDeck runtime and session-state directories. Historical recovery artifacts under `/var/lib/cloudmcp-exec` are evidence only; use an explicit reviewed `--evidence` path when replaying a historical transaction.
+The web activation helper stores transaction receipts and rollback markers by default under `/warp/projects/softwares/termdeck/.termdeck/state/recovery/activation-v2`. This state-root recovery hierarchy is separate from the TermDeck runtime and session-state directories. Historical recovery artifacts under `/var/lib/cloudmcp-exec` are evidence only; use an explicit reviewed `--evidence` path when replaying a historical transaction.
 
 ## Cloudflare
 

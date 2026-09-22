@@ -142,10 +142,10 @@ _MANAGED_BIN_DIR_ENV = "T1000_MANAGED_BIN_DIR"
 # physical TermDeck state directory. This keeps the generated CLI launcher,
 # web service, and auth-scope defaults on one database without copying or
 # merging an alternate registry.
-_DEPLOYMENT_MANAGED_ROOT = Path(
-    "/warp/runtime/termdeck/t1000-managed"
-)
-_DEPLOYMENT_STATE_ROOT = Path("/warp/state/termdeck")
+_DEPLOYMENT_SOURCE_ROOT = Path("/warp/projects/softwares/termdeck")
+_DEPLOYMENT_RUNTIME_ROOT = _DEPLOYMENT_SOURCE_ROOT / ".termdeck"
+_DEPLOYMENT_MANAGED_ROOT = _DEPLOYMENT_RUNTIME_ROOT / "t1000-managed"
+_DEPLOYMENT_STATE_ROOT = _DEPLOYMENT_RUNTIME_ROOT / "state"
 # Root owns the attestation endpoint; managed wrappers carry its canonical
 # path but never the HMAC/signing material.  Only the distinct
 # ``termdeck-preparer`` group can traverse its 0710 namespace; ``max`` is
@@ -165,7 +165,7 @@ _CONTROL_ROOT_MODE = 0o710
 _CONTROL_ATTEST_SOCKET_MODE = 0o660
 # The source checkout is the deployment's canonical release identity. The
 # managed release files remain under _DEPLOYMENT_MANAGED_ROOT.
-_CANONICAL_SOURCE_ROOT = Path("/warp/projects/software/termdeck")
+_CANONICAL_SOURCE_ROOT = _DEPLOYMENT_SOURCE_ROOT
 _UUID = re.compile(
     r"(?<![0-9a-f])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f])",
     re.IGNORECASE,

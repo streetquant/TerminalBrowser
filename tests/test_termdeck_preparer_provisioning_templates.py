@@ -56,7 +56,7 @@ def test_tmpfiles_separates_preparer_state_from_root_signing_state() -> None:
         ["d", "/var/lib/termdeck-preparer", "0700", "termdeck-preparer", "termdeck-preparer", "-"],
         [
             "d",
-            "/warp/runtime/termdeck/termdeck-lan",
+            "/warp/projects/softwares/termdeck/.termdeck",
             "0700",
             "termdeck-preparer",
             "termdeck-preparer",
@@ -64,7 +64,7 @@ def test_tmpfiles_separates_preparer_state_from_root_signing_state() -> None:
         ],
         [
             "z",
-            "/warp/runtime/termdeck/.termdeck-tls-recovery-key",
+            "/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key",
             "0600",
             "termdeck-preparer",
             "termdeck-preparer",
@@ -94,14 +94,14 @@ def test_attestor_is_root_only_and_sees_only_the_canonical_receipt() -> None:
     ]
     assert values["TemporaryFileSystem"] == ["/warp:ro"]
     assert values["BindReadOnlyPaths"] == [
-        "/warp/runtime/termdeck/termdeck-lan"
+        "/warp/projects/softwares/termdeck/.termdeck"
     ]
     assert values["ConditionPathIsDirectory"] == [
         "/etc/termdeck/control",
         "/etc/termdeck/control/records",
-        "/warp/runtime/termdeck/termdeck-lan",
+        "/warp/projects/softwares/termdeck/.termdeck",
     ]
-    assert "/warp/runtime/termdeck/termdeck-lan/build-receipt.json" not in values.get(
+    assert "/warp/projects/softwares/termdeck/.termdeck/build-receipt.json" not in values.get(
         "ConditionPathExists", []
     )
     assert values["RestrictAddressFamilies"] == ["AF_UNIX"]
@@ -146,16 +146,16 @@ def test_broker_is_socket_only_root_dispatch_with_fixed_child_state_paths() -> N
     assert values["RuntimeDirectory"] == ["termdeck-preparer-broker"]
     assert values["RuntimeDirectoryMode"] == ["0711"]
     assert values["ReadWritePaths"] == [
-        "/var/lib/termdeck-preparer /warp/runtime/termdeck/termdeck-lan "
-        "-/warp/runtime/termdeck/.termdeck-tls-recovery-key"
+        "/var/lib/termdeck-preparer /warp/projects/softwares/termdeck/.termdeck "
+        "-/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key"
     ]
     assert values["TemporaryFileSystem"] == ["/warp:ro"]
     assert values["BindPaths"] == [
-        "/warp/runtime/termdeck/termdeck-lan "
-        "-/warp/runtime/termdeck/.termdeck-tls-recovery-key"
+        "/warp/projects/softwares/termdeck/.termdeck "
+        "-/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key"
     ]
     assert values["ConditionPathExists"] == [
-        "/warp/runtime/termdeck/.termdeck-tls-recovery-key"
+        "/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key"
     ]
     assert values["CapabilityBoundingSet"] == ["CAP_SETUID CAP_SETGID CAP_KILL"]
     assert values["AmbientCapabilities"] == [""]

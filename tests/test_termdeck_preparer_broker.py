@@ -93,7 +93,7 @@ def test_request_contract_has_only_allowlisted_restore_modes():
         "/usr/libexec/termdeck-web-prepare-runtime"
     )
     assert broker.DEFAULT_RUNTIME_ROOT == Path(
-        "/warp/runtime/termdeck/termdeck-lan"
+        "/warp/projects/softwares/termdeck/.termdeck"
     )
     assert broker.validate_request(_request()) == broker.PrepareRequest("none", None)
     assert broker.validate_request(_request("unreceipted")) == broker.PrepareRequest(

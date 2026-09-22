@@ -2,10 +2,10 @@
 Description=TermDeck root runtime attestation signer
 Documentation=https://github.com/Rebel0789/t1000
 After=local-fs.target systemd-tmpfiles-setup.service
-RequiresMountsFor=/warp/runtime/termdeck/termdeck-lan
+RequiresMountsFor=/warp/projects/softwares/termdeck/.termdeck
 ConditionPathIsDirectory=/etc/termdeck/control
 ConditionPathIsDirectory=/etc/termdeck/control/records
-ConditionPathIsDirectory=/warp/runtime/termdeck/termdeck-lan
+ConditionPathIsDirectory=/warp/projects/softwares/termdeck/.termdeck
 ConditionPathExists=/etc/termdeck/control/runtime-attestd.key
 ConditionPathExists=/etc/termdeck/runtime-attestd.pub
 StartLimitIntervalSec=30s
@@ -33,7 +33,7 @@ ProtectSystem=strict
 ReadWritePaths=/etc/termdeck/control
 ReadOnlyPaths=/etc/termdeck/control/runtime-attestd.key /etc/termdeck/runtime-attestd.pub
 TemporaryFileSystem=/warp:ro
-BindReadOnlyPaths=/warp/runtime/termdeck/termdeck-lan
+BindReadOnlyPaths=/warp/projects/softwares/termdeck/.termdeck
 
 NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_CHOWN

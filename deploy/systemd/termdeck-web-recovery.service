@@ -2,30 +2,30 @@
 Description=TermDeck web activation recovery watchdog
 After=warp.mount default.target
 ConditionPathIsMountPoint=/warp
-ConditionPathIsDirectory=/warp/projects/software/termdeck
-ConditionPathIsDirectory=/warp/runtime/termdeck/t1000-managed
-ConditionPathIsDirectory=/warp/runtime/termdeck/bin
+ConditionPathIsDirectory=/warp/projects/softwares/termdeck
+ConditionPathIsDirectory=/warp/projects/softwares/termdeck/.termdeck/t1000-managed
+ConditionPathIsDirectory=/warp/projects/softwares/termdeck/.termdeck/bin
 # No pending activation is a successful inactive condition; a present LATEST
 # is watched until it reaches a terminal state.
-ConditionPathExists=/warp/state/termdeck/recovery/activation-v2/LATEST
-RequiresMountsFor=/warp/projects/software/termdeck /warp/runtime/termdeck /warp/state/termdeck
+ConditionPathExists=/warp/projects/softwares/termdeck/.termdeck/state/recovery/activation-v2/LATEST
+RequiresMountsFor=/warp/projects/softwares/termdeck /warp/projects/softwares/termdeck/.termdeck /warp/projects/softwares/termdeck/.termdeck/state
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-Environment=HOME=/warp/state/termdeck
+Environment=HOME=/warp/projects/softwares/termdeck/.termdeck/state
 Environment=USER=max
 Environment=LOGNAME=max
-Environment=PATH=/warp/runtime/termdeck/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/warp/runtime/termdeck/t1000-managed/termdeck-web-recovery
-ExecStop=/warp/runtime/termdeck/t1000-managed/termdeck-web-recovery-stop
+Environment=PATH=/warp/projects/softwares/termdeck/.termdeck/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/warp/projects/softwares/termdeck/.termdeck/t1000-managed/termdeck-web-recovery
+ExecStop=/warp/projects/softwares/termdeck/.termdeck/t1000-managed/termdeck-web-recovery-stop
 Restart=on-failure
 RestartMode=direct
 KillMode=control-group
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/warp/state/termdeck/recovery/activation-v2 /warp/runtime/termdeck/termdeck-lan /home/arch/.config/systemd/user /warp/runtime/termdeck/t1000-managed /warp/runtime/termdeck/bin
+ReadWritePaths=/warp/projects/softwares/termdeck/.termdeck/state/recovery/activation-v2 /warp/projects/softwares/termdeck/.termdeck /home/arch/.config/systemd/user /warp/projects/softwares/termdeck/.termdeck/t1000-managed /warp/projects/softwares/termdeck/.termdeck/bin
 TimeoutStartSec=30s
 TimeoutStopSec=20s
 StandardOutput=journal

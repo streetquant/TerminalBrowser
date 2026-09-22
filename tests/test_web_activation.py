@@ -698,7 +698,9 @@ def test_activation_defaults_bind_warp_recovery_evidence_root(tmp_path: Path) ->
         unit_dir=tmp_path / "units",
     )
 
-    assert paths.evidence == Path("/warp/state/termdeck/recovery/activation-v2")
+    assert paths.evidence == Path(
+        "/warp/projects/softwares/termdeck/.termdeck/state/recovery/activation-v2"
+    )
 
 
 def test_transaction_pointer_and_receipt_exist_before_build(tmp_path: Path) -> None:
@@ -914,12 +916,12 @@ def test_custom_runtime_root_must_name_the_exact_lan_subtree(tmp_path: Path) -> 
         managed_bin=valid.managed_bin,
         unit_dir=valid.unit_dir,
     )
-    with pytest.raises(activation.WebActivationError, match="exact <runtime-root>/termdeck-lan"):
+    with pytest.raises(activation.WebActivationError, match="exact <custom-root>/termdeck-lan"):
         activation._wrapper_runtime_root(invalid)
 
 
 def test_static_units_match_managed_service_contract() -> None:
-    roots = "/warp/projects/software/termdeck /warp/runtime/termdeck /warp/state/termdeck"
+    roots = "/warp/projects/softwares/termdeck /warp/projects/softwares/termdeck/.termdeck /warp/projects/softwares/termdeck/.termdeck/state"
     units = {
         "termdeck-web-backend.service": {
             "stem": "termdeck-web-backend",
@@ -928,8 +930,8 @@ def test_static_units_match_managed_service_contract() -> None:
             "conditions": {
                 "ConditionPathIsMountPoint": ("/warp",),
                 "ConditionPathIsDirectory": (
-                    "/warp/runtime/termdeck/termdeck-lan",
-                    "/warp/state/termdeck",
+                    "/warp/projects/softwares/termdeck/.termdeck",
+                    "/warp/projects/softwares/termdeck/.termdeck/state",
                 ),
                 "ConditionPathExists": (),
             },
@@ -940,7 +942,7 @@ def test_static_units_match_managed_service_contract() -> None:
             "after": ("warp.mount", "network-online.target", "termdeck-web-backend.service"),
             "conditions": {
                 "ConditionPathIsMountPoint": ("/warp",),
-                "ConditionPathIsDirectory": ("/warp/runtime/termdeck/termdeck-lan",),
+                "ConditionPathIsDirectory": ("/warp/projects/softwares/termdeck/.termdeck",),
                 "ConditionPathExists": (),
             },
         },
@@ -951,11 +953,11 @@ def test_static_units_match_managed_service_contract() -> None:
             "conditions": {
                 "ConditionPathIsMountPoint": ("/warp",),
                 "ConditionPathIsDirectory": (
-                    "/warp/projects/software/termdeck",
-                    "/warp/runtime/termdeck/t1000-managed",
-                    "/warp/runtime/termdeck/bin",
+                    "/warp/projects/softwares/termdeck",
+                    "/warp/projects/softwares/termdeck/.termdeck/t1000-managed",
+                    "/warp/projects/softwares/termdeck/.termdeck/bin",
                 ),
-                "ConditionPathExists": ("/warp/state/termdeck/recovery/activation-v2/LATEST",),
+                "ConditionPathExists": ("/warp/projects/softwares/termdeck/.termdeck/state/recovery/activation-v2/LATEST",),
             },
         },
         "termdeck-cloudflared.service": {
@@ -964,7 +966,7 @@ def test_static_units_match_managed_service_contract() -> None:
             "after": ("warp.mount", "network-online.target", "termdeck-web-lan.service"),
             "conditions": {
                 "ConditionPathIsMountPoint": ("/warp",),
-                "ConditionPathIsDirectory": ("/warp/runtime/termdeck/termdeck-lan",),
+                "ConditionPathIsDirectory": ("/warp/projects/softwares/termdeck/.termdeck",),
                 "ConditionPathExists": (),
             },
         },
@@ -974,7 +976,7 @@ def test_static_units_match_managed_service_contract() -> None:
             "after": ("warp.mount", "network-online.target", "termdeck-web-lan.service"),
             "conditions": {
                 "ConditionPathIsMountPoint": ("/warp",),
-                "ConditionPathIsDirectory": ("/warp/runtime/termdeck/termdeck-lan",),
+                "ConditionPathIsDirectory": ("/warp/projects/softwares/termdeck/.termdeck",),
                 "ConditionPathExists": (),
             },
         },
@@ -985,8 +987,8 @@ def test_static_units_match_managed_service_contract() -> None:
             "conditions": {
                 "ConditionPathIsMountPoint": ("/warp",),
                 "ConditionPathIsDirectory": (
-                    "/warp/state/termdeck",
-                    "/warp/runtime/termdeck/t1000-managed",
+                    "/warp/projects/softwares/termdeck/.termdeck/state",
+                    "/warp/projects/softwares/termdeck/.termdeck/t1000-managed",
                 ),
                 "ConditionPathExists": (),
             },
@@ -1012,10 +1014,10 @@ def test_static_units_match_managed_service_contract() -> None:
         assert directive_lines(content, "RequiresMountsFor") == (roots,)
         assert tuple(
             value for value in directive_values(content, "Environment") if value.startswith("HOME=")
-        ) == ("HOME=/warp/state/termdeck",)
+        ) == ("HOME=/warp/projects/softwares/termdeck/.termdeck/state",)
         assert tuple(line for line in content.splitlines() if line.startswith("Exec")) == (
-            f"ExecStart=/warp/runtime/termdeck/t1000-managed/{stem}",
-            f"ExecStop=/warp/runtime/termdeck/t1000-managed/{stem}-stop",
+            f"ExecStart=/warp/projects/softwares/termdeck/.termdeck/t1000-managed/{stem}",
+            f"ExecStop=/warp/projects/softwares/termdeck/.termdeck/t1000-managed/{stem}-stop",
         )
         assert directive_values(content, "Restart") == ("on-failure",)
         assert directive_values(content, "RestartMode") == ("direct",)
@@ -1041,12 +1043,12 @@ def test_static_units_match_managed_service_contract() -> None:
 
 def test_generated_canonical_watchdog_unit_exactly_matches_static_contract() -> None:
     paths = activation.ActivationPaths(
-        target=Path("/warp/projects/software/termdeck"),
-        evidence=Path("/warp/state/termdeck/recovery/activation-v2"),
-        runtime=Path("/warp/runtime/termdeck/termdeck-lan"),
-        database=Path("/warp/state/termdeck/sessions.sqlite3"),
-        managed_root=Path("/warp/runtime/termdeck/t1000-managed"),
-        managed_bin=Path("/warp/runtime/termdeck/bin"),
+        target=Path("/warp/projects/softwares/termdeck"),
+        evidence=Path("/warp/projects/softwares/termdeck/.termdeck/state/recovery/activation-v2"),
+        runtime=Path("/warp/projects/softwares/termdeck/.termdeck"),
+        database=Path("/warp/projects/softwares/termdeck/.termdeck/state/sessions.sqlite3"),
+        managed_root=Path("/warp/projects/softwares/termdeck/.termdeck/t1000-managed"),
+        managed_bin=Path("/warp/projects/softwares/termdeck/.termdeck/bin"),
         unit_dir=Path("/home/arch/.config/systemd/user"),
     )
 

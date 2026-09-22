@@ -4,10 +4,10 @@ Documentation=https://github.com/Rebel0789/t1000
 After=local-fs.target termdeck-runtime-attestd.service
 Wants=termdeck-runtime-attestd.service
 Requires=termdeck-preparer-broker.socket
-RequiresMountsFor=/warp/runtime/termdeck/termdeck-lan
+RequiresMountsFor=/warp/projects/softwares/termdeck/.termdeck
 ConditionPathIsDirectory=/var/lib/termdeck-preparer
-ConditionPathIsDirectory=/warp/runtime/termdeck/termdeck-lan
-ConditionPathExists=/warp/runtime/termdeck/.termdeck-tls-recovery-key
+ConditionPathIsDirectory=/warp/projects/softwares/termdeck/.termdeck
+ConditionPathExists=/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key
 RefuseManualStart=yes
 
 [Service]
@@ -32,9 +32,9 @@ RuntimeDirectory=termdeck-preparer-broker
 RuntimeDirectoryMode=0711
 RuntimeDirectoryPreserve=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/termdeck-preparer /warp/runtime/termdeck/termdeck-lan -/warp/runtime/termdeck/.termdeck-tls-recovery-key
+ReadWritePaths=/var/lib/termdeck-preparer /warp/projects/softwares/termdeck/.termdeck -/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key
 TemporaryFileSystem=/warp:ro
-BindPaths=/warp/runtime/termdeck/termdeck-lan -/warp/runtime/termdeck/.termdeck-tls-recovery-key
+BindPaths=/warp/projects/softwares/termdeck/.termdeck -/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key
 
 NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_KILL

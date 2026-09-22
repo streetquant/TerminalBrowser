@@ -5755,10 +5755,10 @@ def test_canonical_managed_root_forces_production_intent_and_ignores_xdg_data(
     assert default_managed_root() == expected
     assert default_layout.root == expected
     assert release_manager._canonical_source_root() == Path(
-        "/warp/projects/software/termdeck"
+        "/warp/projects/softwares/termdeck"
     )
     assert release_manager._canonical_managed_root() == Path(
-        "/warp/runtime/termdeck/t1000-managed"
+        "/warp/projects/softwares/termdeck/.termdeck/t1000-managed"
     )
     assert release_manager._resolve_production_intent(default_layout, None) is False
     assert release_manager._resolve_production_intent(default_layout, False) is False
@@ -5798,10 +5798,10 @@ def test_default_managed_root_honors_supplied_home_mapping(
         supplied_home / ".local/state/codex-project-homes/runtime/t1000-managed"
     )
     assert release_manager._canonical_source_root() == Path(
-        "/warp/projects/software/termdeck"
+        "/warp/projects/softwares/termdeck"
     )
     assert release_manager._canonical_managed_root() == Path(
-        "/warp/runtime/termdeck/t1000-managed"
+        "/warp/projects/softwares/termdeck/.termdeck/t1000-managed"
     )
 
 
@@ -6750,15 +6750,15 @@ def test_semantic_runtime_snapshot_ignores_transient_client_identity(tmp_path: P
 
 def test_deployment_managed_launcher_binds_canonical_termdeck_state_root() -> None:
     layout = release_layout(
-        root="/warp/runtime/termdeck/t1000-managed",
+        root="/warp/projects/softwares/termdeck/.termdeck/t1000-managed",
         bin_dir="/tmp/termdeck-test-bin",
     )
     python = Path("/usr/bin/python3.14")
     launcher = _launcher_source(layout, python).decode("utf-8")
     bootstrap = _bootstrap_source(layout, python).decode("utf-8")
 
-    assert "export TERMDECK_STATE_ROOT=/warp/state/termdeck\n" in launcher
+    assert "export TERMDECK_STATE_ROOT=/warp/projects/softwares/termdeck/.termdeck/state\n" in launcher
     assert (
         'os.environ["TERMDECK_STATE_ROOT"] = '
-        "'/warp/state/termdeck'"
+        "'/warp/projects/softwares/termdeck/.termdeck/state'"
     ) in bootstrap

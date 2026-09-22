@@ -26,10 +26,10 @@ APP_ID = "io.github.t1000.T1000"
 DESKTOP_FILENAME = f"{APP_ID}.desktop"
 AUTOSTART_FILENAME = DESKTOP_FILENAME
 ICON_NAME = "t1000"
-MANAGED_LAUNCHER = Path("/warp/runtime/termdeck/bin/t1000")
+MANAGED_LAUNCHER = Path("/warp/projects/softwares/termdeck/.termdeck/bin/t1000")
 MANAGED_ROOT_ENV = "T1000_MANAGED_ROOT"
 DEFAULT_MANAGED_ROOT = Path(
-    "/warp/runtime/termdeck/t1000-managed"
+    "/warp/projects/softwares/termdeck/.termdeck/t1000-managed"
 )
 AUTOSTART_RESOURCE = "io.github.t1000.T1000.autostart.desktop"
 MAX_DESKTOP_TARGET_BYTES = 1024 * 1024

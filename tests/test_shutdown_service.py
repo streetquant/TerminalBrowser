@@ -155,8 +155,8 @@ class ShutdownServiceTests(unittest.TestCase):
 
         for drift in (
             unit.replace(
-                "RequiresMountsFor=/warp/projects/software/termdeck /warp/runtime/termdeck /warp/state/termdeck",
-                "RequiresMountsFor=/warp/projects/software/termdeck /warp/runtime/termdeck /drift",
+                "RequiresMountsFor=/warp/projects/softwares/termdeck /warp/projects/softwares/termdeck/.termdeck /warp/projects/softwares/termdeck/.termdeck/state",
+                "RequiresMountsFor=/warp/projects/softwares/termdeck /warp/projects/softwares/termdeck/.termdeck /drift",
             ),
             unit.replace(
                 f"ExecStop={CHECKPOINT_STOP_WRAPPER}",

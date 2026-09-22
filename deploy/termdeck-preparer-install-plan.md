@@ -13,7 +13,7 @@ unit, executable, account, runtime, and key preimages.
    and `systemd-tmpfiles --create` for those exact files.  Confirm that `max`
    is not a member of `termdeck-preparer` and that the dedicated account has
    `/usr/bin/nologin`.
-3. If `/warp/runtime/termdeck/.termdeck-tls-recovery-key` is absent, create a
+3. If `/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key` is absent, create a
    same-directory temporary file from 32 bytes returned by the kernel random
    source, set `termdeck-preparer:termdeck-preparer` and mode `0600`, fsync the
    file and parent, and publish with a no-replace rename.  Never replace an

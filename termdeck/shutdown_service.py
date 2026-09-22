@@ -83,9 +83,9 @@ if _LIBC is not None:
 # The deployed services all use the same three physical roots.  Keep these
 # values in one place so a generated checkpoint unit cannot silently drift from
 # the six static service units or from the managed wrapper publication.
-TERMDECK_SOURCE_ROOT = Path("/warp/projects/software/termdeck")
-TERMDECK_RUNTIME_ROOT = Path("/warp/runtime/termdeck")
-TERMDECK_STATE_ROOT = Path("/warp/state/termdeck")
+TERMDECK_SOURCE_ROOT = Path("/warp/projects/softwares/termdeck")
+TERMDECK_RUNTIME_ROOT = TERMDECK_SOURCE_ROOT / ".termdeck"
+TERMDECK_STATE_ROOT = TERMDECK_RUNTIME_ROOT / "state"
 TERMDECK_MANAGED_ROOT = TERMDECK_RUNTIME_ROOT / "t1000-managed"
 CHECKPOINT_START_WRAPPER = TERMDECK_MANAGED_ROOT / "termdeck-checkpoint"
 CHECKPOINT_STOP_WRAPPER = TERMDECK_MANAGED_ROOT / "termdeck-checkpoint-stop"

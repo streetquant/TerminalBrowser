@@ -4,6 +4,11 @@ from __future__ import annotations
 from pathlib import Path
 import json,re,sys
 ROOT=Path(__file__).resolve().parents[1]
+CANONICAL_SOURCE = '/warp/projects/softwares/termdeck'
+CANONICAL_RUNTIME = f'{CANONICAL_SOURCE}/.termdeck'
+CANONICAL_STATE = f'{CANONICAL_RUNTIME}/state'
+CANONICAL_BIN = f'{CANONICAL_RUNTIME}/bin'
+CANONICAL_MANAGED = f'{CANONICAL_RUNTIME}/t1000-managed'
 required={
  'nginx':ROOT/'deploy/nginx/termdeck-web.nginx.conf',
  'prepare':ROOT/'scripts/termdeck-web-prepare-runtime.sh',
@@ -56,8 +61,13 @@ active_path_files = tuple(dict.fromkeys((*required.values(),
     ROOT/'termdeck/release_manager.py',
     ROOT/'termdeck/web_activation.py',
 )))
-legacy_path_markers = ('/8tb', '/var/lib/cloudmcp-exec/projects/softwares',
-                       '/projects/softwares', '/softwares/termdeck')
+legacy_path_markers = (
+    '/8tb',
+    '/var/lib/cloudmcp-exec',
+    '/warp/projects/software/termdeck',
+    '/warp/runtime/termdeck',
+    '/warp/state/termdeck',
+)
 legacy_path_hits = [
     {'path': str(path.relative_to(ROOT)), 'marker': marker}
     for path in active_path_files
@@ -68,19 +78,19 @@ if legacy_path_hits:
     raise SystemExit(f'active deployment contains legacy path(s): {legacy_path_hits}')
 
 warp_path_checks = {
-    'source_is_warp': '/warp/projects/software/termdeck' in
+    'source_is_warp': CANONICAL_SOURCE in
         (ROOT/'termdeck/release_manager.py').read_text(errors='strict'),
-    'runtime_is_warp': '/warp/runtime/termdeck' in ''.join(texts.values()),
-    'state_is_warp': '/warp/state/termdeck' in ''.join(texts.values()),
+    'runtime_is_warp': CANONICAL_RUNTIME in ''.join(texts.values()),
+    'state_is_warp': CANONICAL_STATE in ''.join(texts.values()),
     'service_home_is_state': all(
-        'Environment=HOME=/warp/state/termdeck' in texts[name]
+        f'Environment=HOME={CANONICAL_STATE}' in texts[name]
         for name in ('backend', 'lan', 'recovery', 'cloudflared_unit', 'preview_unit', 'checkpoint')
     ),
 }
 if not all(warp_path_checks.values()):
     raise SystemExit(f'Warp deployment path contract failed: {warp_path_checks}')
 
-canonical_mounts = '/warp/projects/software/termdeck /warp/runtime/termdeck /warp/state/termdeck'
+canonical_mounts = f'{CANONICAL_SOURCE} {CANONICAL_RUNTIME} {CANONICAL_STATE}'
 unit_stems = {
     'backend': 'termdeck-web-backend',
     'lan': 'termdeck-web-lan',
@@ -97,7 +107,7 @@ unit_contracts = {
         'After': ('warp.mount', 'network-online.target'),
         'conditions': {
             'ConditionPathIsMountPoint': ('/warp',),
-            'ConditionPathIsDirectory': ('/warp/runtime/termdeck/termdeck-lan', '/warp/state/termdeck'),
+            'ConditionPathIsDirectory': (CANONICAL_RUNTIME, CANONICAL_STATE),
             'ConditionPathExists': (),
         },
     },
@@ -106,7 +116,7 @@ unit_contracts = {
         'After': ('warp.mount', 'network-online.target', 'termdeck-web-backend.service'),
         'conditions': {
             'ConditionPathIsMountPoint': ('/warp',),
-            'ConditionPathIsDirectory': ('/warp/runtime/termdeck/termdeck-lan',),
+            'ConditionPathIsDirectory': (CANONICAL_RUNTIME,),
             'ConditionPathExists': (),
         },
     },
@@ -116,11 +126,11 @@ unit_contracts = {
         'conditions': {
             'ConditionPathIsMountPoint': ('/warp',),
             'ConditionPathIsDirectory': (
-                '/warp/projects/software/termdeck',
-                '/warp/runtime/termdeck/t1000-managed',
-                '/warp/runtime/termdeck/bin',
+                CANONICAL_SOURCE,
+                CANONICAL_MANAGED,
+                CANONICAL_BIN,
             ),
-            'ConditionPathExists': ('/warp/state/termdeck/recovery/activation-v2/LATEST',),
+            'ConditionPathExists': (f'{CANONICAL_STATE}/recovery/activation-v2/LATEST',),
         },
     },
     'cloudflared_unit': {
@@ -128,7 +138,7 @@ unit_contracts = {
         'After': ('warp.mount', 'network-online.target', 'termdeck-web-lan.service'),
         'conditions': {
             'ConditionPathIsMountPoint': ('/warp',),
-            'ConditionPathIsDirectory': ('/warp/runtime/termdeck/termdeck-lan',),
+            'ConditionPathIsDirectory': (CANONICAL_RUNTIME,),
             'ConditionPathExists': (),
         },
     },
@@ -137,7 +147,7 @@ unit_contracts = {
         'After': ('warp.mount', 'network-online.target', 'termdeck-web-lan.service'),
         'conditions': {
             'ConditionPathIsMountPoint': ('/warp',),
-            'ConditionPathIsDirectory': ('/warp/runtime/termdeck/termdeck-lan',),
+            'ConditionPathIsDirectory': (CANONICAL_RUNTIME,),
             'ConditionPathExists': (),
         },
     },
@@ -146,7 +156,7 @@ unit_contracts = {
         'After': ('warp.mount', 'user@1000.service', 'local-fs.target'),
         'conditions': {
             'ConditionPathIsMountPoint': ('/warp',),
-            'ConditionPathIsDirectory': ('/warp/state/termdeck', '/warp/runtime/termdeck/t1000-managed'),
+            'ConditionPathIsDirectory': (CANONICAL_STATE, CANONICAL_MANAGED),
             'ConditionPathExists': (),
         },
     },
@@ -184,8 +194,8 @@ checks.update({
         and len({f'{stem}{suffix}' for stem in unit_stems.values() for suffix in ('', '-stop')}) == 12
         and all(
             _exec_directives(texts[name]) == (
-                f'ExecStart=/warp/runtime/termdeck/t1000-managed/{stem}',
-                f'ExecStop=/warp/runtime/termdeck/t1000-managed/{stem}-stop',
+                f'ExecStart={CANONICAL_MANAGED}/{stem}',
+                f'ExecStop={CANONICAL_MANAGED}/{stem}-stop',
             )
             for name, stem in unit_stems.items()
         )
@@ -219,13 +229,13 @@ checks.update({
     ),
     'all_six_home_is_state': all(
         tuple(value for value in _directive_values(texts[name], 'Environment') if value.startswith('HOME='))
-        == ('HOME=/warp/state/termdeck',)
+        == (f'HOME={CANONICAL_STATE}',)
         for name in unit_stems
     ),
     'checkpoint_stop_is_unprefixed': 'ExecStop=-' not in texts['checkpoint'],
     'recovery_uses_latest_wrapper': (
-        'ExecStart=/warp/runtime/termdeck/t1000-managed/termdeck-web-recovery' in texts['recovery']
-        and 'ExecStop=/warp/runtime/termdeck/t1000-managed/termdeck-web-recovery-stop' in texts['recovery']
+        f'ExecStart={CANONICAL_MANAGED}/termdeck-web-recovery' in texts['recovery']
+        and f'ExecStop={CANONICAL_MANAGED}/termdeck-web-recovery-stop' in texts['recovery']
         and 'wrapper = paths.managed_root / "termdeck-web-recovery"' in activation_text
         and 'command = shlex.join([str(wrapper)])' in activation_text
         and 'shlex.join([str(wrapper), "--latest"])' not in activation_text

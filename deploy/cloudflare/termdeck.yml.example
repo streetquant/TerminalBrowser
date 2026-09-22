@@ -1,7 +1,7 @@
 # Dedicated named Cloudflare Tunnel for TermDeck.
-# Copy to /warp/runtime/termdeck/cloudflared/termdeck.yml and replace the angle-bracket placeholders.
+# Copy to /warp/projects/softwares/termdeck/.termdeck/cloudflared/termdeck.yml and replace the angle-bracket placeholders.
 tunnel: <TUNNEL_UUID>
-credentials-file: /warp/runtime/termdeck/cloudflared/<TUNNEL_UUID>.json
+credentials-file: /warp/projects/softwares/termdeck/.termdeck/cloudflared/<TUNNEL_UUID>.json
 protocol: http2
 metrics: 127.0.0.1:20343
 loglevel: info
@@ -11,7 +11,7 @@ ingress:
     service: https://127.0.0.1:7443
     originRequest:
       originServerName: termdeck.local
-      caPool: /warp/runtime/termdeck/termdeck-lan/tls/ca.crt
+      caPool: /warp/projects/softwares/termdeck/.termdeck/tls/ca.crt
       httpHostHeader: termdeck.semiotech.org
       connectTimeout: 5s
       tlsTimeout: 5s

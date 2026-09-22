@@ -4,18 +4,18 @@ Documentation=https://developers.cloudflare.com/cloudflare-one/connections/conne
 Wants=network-online.target termdeck-web-lan.service
 After=warp.mount network-online.target termdeck-web-lan.service
 ConditionPathIsMountPoint=/warp
-ConditionPathIsDirectory=/warp/runtime/termdeck/termdeck-lan
-RequiresMountsFor=/warp/projects/software/termdeck /warp/runtime/termdeck /warp/state/termdeck
+ConditionPathIsDirectory=/warp/projects/softwares/termdeck/.termdeck
+RequiresMountsFor=/warp/projects/softwares/termdeck /warp/projects/softwares/termdeck/.termdeck /warp/projects/softwares/termdeck/.termdeck/state
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-Environment=HOME=/warp/state/termdeck
+Environment=HOME=/warp/projects/softwares/termdeck/.termdeck/state
 Environment=USER=max
 Environment=LOGNAME=max
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-ExecStart=/warp/runtime/termdeck/t1000-managed/termdeck-cloudflared
-ExecStop=/warp/runtime/termdeck/t1000-managed/termdeck-cloudflared-stop
+ExecStart=/warp/projects/softwares/termdeck/.termdeck/t1000-managed/termdeck-cloudflared
+ExecStop=/warp/projects/softwares/termdeck/.termdeck/t1000-managed/termdeck-cloudflared-stop
 Restart=on-failure
 RestartMode=direct
 RestartSec=3s

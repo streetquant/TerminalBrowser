@@ -108,7 +108,10 @@ class ActivationPaths:
     def defaults(cls, **overrides: Path | None) -> "ActivationPaths":
         source = Path(overrides.get("target") or Path(__file__).resolve().parents[1]).resolve()
         state_root = Path(
-            os.environ.get("TERMDECK_STATE_ROOT", "/warp/state/termdeck")
+            os.environ.get(
+                "TERMDECK_STATE_ROOT",
+                str(service_wrappers.CANONICAL_STATE_ROOT),
+            )
         ).expanduser()
         if not state_root.is_absolute():
             raise WebActivationError("TERMDECK_STATE_ROOT must be an absolute path")
@@ -126,10 +129,16 @@ class ActivationPaths:
         return cls(
             source,
             evidence.resolve(),
-            Path(overrides.get("runtime") or "/warp/runtime/termdeck/termdeck-lan").resolve(),
+            Path(
+                overrides.get("runtime") or service_wrappers.CANONICAL_RUNTIME_ROOT
+            ).resolve(),
             database.resolve(),
-            Path(overrides.get("managed_root") or "/warp/runtime/termdeck/t1000-managed").resolve(),
-            Path(overrides.get("managed_bin") or "/warp/runtime/termdeck/bin").resolve(),
+            Path(
+                overrides.get("managed_root") or service_wrappers.CANONICAL_MANAGED_ROOT
+            ).resolve(),
+            Path(
+                overrides.get("managed_bin") or service_wrappers.CANONICAL_MANAGED_BIN
+            ).resolve(),
             Path(overrides.get("unit_dir") or "/home/arch/.config/systemd/user").resolve(),
         )
 
@@ -744,18 +753,18 @@ def process_observation(before: object) -> dict[str, object]:
 def _wrapper_runtime_root(paths: ActivationPaths) -> Path:
     """Return the runtime root consumed by the managed-wrapper API.
 
-    ``ActivationPaths.runtime`` intentionally points at the LAN subtree for
-    the web transaction.  The wrapper contract receives its parent runtime
-    root.  Accepting an arbitrary parent here would make activation publish
-    sources under one tree while the managed LAN wrapper derives another
-    ``termdeck-lan`` tree, which used to permit a custom invocation to fall
-    back to the canonical runtime.  Custom roots remain supported, but only
-    as ``<custom-root>/termdeck-lan``.
+    Production ``ActivationPaths.runtime`` is the canonical ``.termdeck``
+    directory itself.  Older disposable activation fixtures may still pass a
+    nested ``<custom-root>/termdeck-lan`` path; retain that isolated shape
+    without allowing an arbitrary production parent to redirect the wrapper.
     """
 
+    if paths.runtime == service_wrappers.CANONICAL_RUNTIME_ROOT:
+        return paths.runtime
     if paths.runtime.name != "termdeck-lan":
         raise WebActivationError(
-            "activation runtime must be the exact <runtime-root>/termdeck-lan directory"
+            "activation runtime must be the canonical .termdeck directory or an exact "
+            "<custom-root>/termdeck-lan directory"
         )
     return paths.runtime.parent
 

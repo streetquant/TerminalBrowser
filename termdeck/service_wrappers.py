@@ -39,9 +39,12 @@ from typing import Any, Callable, TypeAlias
 PathLike: TypeAlias = str | os.PathLike[str]
 
 
-CANONICAL_SOURCE_ROOT = Path("/warp/projects/software/termdeck")
-CANONICAL_RUNTIME_ROOT = Path("/warp/runtime/termdeck")
-CANONICAL_STATE_ROOT = Path("/warp/state/termdeck")
+CANONICAL_SOURCE_ROOT = Path("/warp/projects/softwares/termdeck")
+# TermDeck's deployment state lives beside the source checkout.  Keeping the
+# runtime in this private dot-directory makes the source/runtime/state layout
+# one physical tree and removes the retired runtime/state roots.
+CANONICAL_RUNTIME_ROOT = CANONICAL_SOURCE_ROOT / ".termdeck"
+CANONICAL_STATE_ROOT = CANONICAL_RUNTIME_ROOT / "state"
 CANONICAL_MANAGED_ROOT = CANONICAL_RUNTIME_ROOT / "t1000-managed"
 CANONICAL_MANAGED_BIN = CANONICAL_RUNTIME_ROOT / "bin"
 CANONICAL_STABLE_LAUNCHER = CANONICAL_MANAGED_BIN / "t1000"
@@ -66,7 +69,7 @@ CONTROL_ATTEST_EXCLUDED_PRINCIPAL = "max"
 CONTROL_ROOT_MODE = 0o710
 CONTROL_ATTEST_SOCKET_MODE = 0o660
 PREPARER_BROKER_SOCKET = Path("/run/termdeck-preparer-broker/request.sock")
-PREPARER_RUNTIME_ROOT = Path("/warp/runtime/termdeck/termdeck-lan")
+PREPARER_RUNTIME_ROOT = CANONICAL_RUNTIME_ROOT
 PREPARER_BROKER_REQUEST_SCHEMA = "termdeck.preparer-broker-request.v1"
 PREPARER_BROKER_RESPONSE_SCHEMA = "termdeck.preparer-broker-response.v1"
 PREPARER_BROKER_MAX_FRAME_BYTES = 16 * 1024
@@ -650,7 +653,14 @@ def _release_id(value: str) -> str:
 
 
 def _runtime_paths(layout: WrapperLayout) -> dict[str, Path]:
-    lan = layout.runtime_root / "termdeck-lan"
+    # Production uses the canonical .termdeck tree directly.  Keep the
+    # historical nested shape for disposable caller-supplied layouts so old
+    # test/rollback fixtures remain isolated from the production contract.
+    lan = (
+        layout.runtime_root
+        if layout.runtime_root == CANONICAL_RUNTIME_ROOT
+        else layout.runtime_root / "termdeck-lan"
+    )
     return {
         "lan_root": lan,
         "backend": lan / "bin" / "termdeck-web-server",
