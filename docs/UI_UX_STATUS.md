@@ -31,6 +31,7 @@ canonical production qualification and guarded activation remain outstanding.
 | Priority | Work | State and evidence |
 |---|---|---|
 | 1 | Use `t1000` consistently in visible desktop and browser branding | Implemented in source, including window/menu titles, desktop launchers, browser login/recovery pages, accessibility labels, help and current documentation. Internal IDs, service/path names, authentication headers and cookies are unchanged by explicit user choice |
+| 1 | Ask only for a password when signing in | Implemented in source; device names are automatic (`Browser`). Initial password setup still confirms the password. The regression verifies field counts, password-manager autocomplete, independent sessions and rejected submissions. The live form remains unchanged pending guarded activation |
 | 1 | Desktop layout, controls, focus visibility and compact-window usability | Implemented; long-label account selector bounded to 148 px (previously 328 px); visible keyboard focus; focused GTK tests pass. Actual terminal screenshots pass at 693×480, 1290×848 and 1440×900. The verified desktop minimum remains 693 px |
 | 1 | Responsive browser shell, accessible navigation and narrow-screen controls | Implemented and qualified; mobile safe areas and touch targets, keyboard tab navigation, click-to-type and stable refresh DOM. All 22 integrated Chromium assertions pass, including desktop, compact and mobile layout |
 | 1 | Reduce redundant browser terminal layout/rendering work | Implemented; redundant resize suppression, fit caching with font/layout invalidation, shared input encoder and listener cleanup. Three frontend regression tests and the integrated browser proof pass |
@@ -87,6 +88,12 @@ a broad performance distribution, or a before/after speed comparison.
   running desktop or browser service to the new build.
 
 ## Verification
+
+The password-only follow-up passes all 38 web-server tests, 29 authentication
+tests (including the auth-directory-move integration test), and 11 branding
+tests. Existing explicit-label clients remain compatible. The new regression
+failed against the old form before the device field was removed. This is source
+verification, not evidence that the live login page has been replaced.
 
 The combined focused run under Xvfb and a disposable D-Bus session passes:
 195 unique tests and 32 subtests covering performance instrumentation, actual GTK

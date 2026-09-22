@@ -1303,7 +1303,7 @@ async fn password_submit(
             return password_page_response(
                 StatusCode::BAD_REQUEST,
                 page,
-                Some("Enter a valid password and device name."),
+                Some("Enter a valid password."),
                 base_path,
             );
         }
@@ -2354,9 +2354,7 @@ fn password_page_response(
         output.push_str(MAX_OWNER_PASSWORD_BYTES.to_string().as_str());
         output.push_str("\"></label>");
     }
-    output.push_str("<label>Device name<input name=\"label\" type=\"text\" autocomplete=\"username\" maxlength=\"");
-    output.push_str(MAX_DEVICE_LABEL_BYTES.to_string().as_str());
-    output.push_str("\" value=\"Browser\"></label><button type=\"submit\">");
+    output.push_str("<button type=\"submit\">");
     output.push_str(if page == PasswordPage::Setup {
         "Set password and open t1000"
     } else {
@@ -4177,6 +4175,10 @@ mod auth_integration_tests {
             body.push_str("&confirm=");
             body.push_str(confirmation);
         }
+        password_form_request(path, body)
+    }
+
+    fn password_form_request(path: &str, body: String) -> Request<Body> {
         let mut request = unsafe_request(Method::POST, path, Body::from(body), None, false);
         request.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -4383,6 +4385,88 @@ mod auth_integration_tests {
                 .await
                 .unwrap_or_else(|error| match error {});
             assert_eq!(authenticated.status(), StatusCode::OK);
+        });
+    }
+
+    #[test]
+    fn password_only_setup_and_login_preserve_device_sessions() {
+        runtime().block_on(async {
+            let fixture = fixture(&[]);
+            let router = build_router(fixture.state.clone());
+            let password = "correct-password-123";
+            let mut sessions = Vec::new();
+
+            for (path, input_count, autocomplete, form) in [
+                (
+                    SETUP_PATH,
+                    2,
+                    "new-password",
+                    format!("password={password}&confirm={password}"),
+                ),
+                (
+                    LOGIN_PATH,
+                    1,
+                    "current-password",
+                    format!("password={password}"),
+                ),
+            ] {
+                let page = router
+                    .clone()
+                    .oneshot(request(Method::GET, path, Body::empty()))
+                    .await
+                    .unwrap_or_else(|error| match error {});
+                assert_eq!(page.status(), StatusCode::OK);
+                let html = body_text(page).await;
+                assert_eq!(html.matches("<input ").count(), input_count);
+                assert_eq!(html.matches(r#"type="password""#).count(), input_count);
+                assert!(html.contains(format!(r#"autocomplete="{autocomplete}""#).as_str()));
+                assert!(!html.contains("Device name"));
+                assert!(!html.contains(r#"name="label""#));
+
+                let response = router
+                    .clone()
+                    .oneshot(password_form_request(path, form))
+                    .await
+                    .unwrap_or_else(|error| match error {});
+                assert_eq!(response.status(), StatusCode::SEE_OTHER);
+                sessions.push(cookies_from_response(&response));
+            }
+
+            // An automatic display label must not merge or revoke browser sessions.
+            assert_ne!(sessions[0].header, sessions[1].header);
+            for cookies in &sessions {
+                let session = router
+                    .clone()
+                    .oneshot(authenticated_get(SESSION_PATH, cookies))
+                    .await
+                    .unwrap_or_else(|error| match error {});
+                assert_eq!(session.status(), StatusCode::OK);
+                assert!(
+                    body_text(session)
+                        .await
+                        .contains(r#""device_label":"Browser""#)
+                );
+            }
+
+            for (form, status) in [
+                (String::new(), StatusCode::BAD_REQUEST),
+                (
+                    String::from("password=wrong-password"),
+                    StatusCode::UNAUTHORIZED,
+                ),
+            ] {
+                let response = router
+                    .clone()
+                    .oneshot(password_form_request(LOGIN_PATH, form))
+                    .await
+                    .unwrap_or_else(|error| match error {});
+                assert_eq!(response.status(), status);
+                assert!(!response.headers().contains_key(header::SET_COOKIE));
+                let html = body_text(response).await;
+                assert_eq!(html.matches("<input ").count(), 1);
+                assert!(!html.to_ascii_lowercase().contains("device name"));
+                assert!(!html.contains(r#"name="label""#));
+            }
         });
     }
 

@@ -10,6 +10,10 @@ checks listed at the end.
 - Qualify the clean committed release against the production contract before
   switching the running application. Do not confuse the completed focused UI
   checks with the complete release qualification.
+- Activate the password-only login change after qualification: the source form
+  no longer asks for a device name and automatically uses `Browser`. Initial
+  setup retains password confirmation. The live LAN form still serves the old
+  version until deployment is repaired.
 
 ## Production activation
 
@@ -18,6 +22,10 @@ checks listed at the end.
   colocated managed `state.json` still binds its stable launcher to
   `/warp/runtime/termdeck/bin/t1000`. The existing install contract refuses an
   in-place launcher-path change; do not hand-edit its authenticated hashes.
+  This also blocks live tab actions: the backend's configured `--t1000` launcher
+  refuses even `--help` with exit 78, and a LAN tab-action request returned 409.
+  Verify Kill and Hide with disposable terminals after repair; do not use the
+  user's live work as a destructive test fixture.
 - Install or restore the missing t1000 recovery service from the corrected
   canonical templates.
 - Publish the managed service wrappers under
@@ -49,6 +57,9 @@ checks listed at the end.
 
 ## Already completed; do not repeat
 
+- The password-only form follow-up passes 38 web-server tests, 29 authentication
+  tests and 11 branding tests. Its new regression covers successful setup/login
+  without a device label, independent browser sessions and rejected submissions.
 - The user selected visible branding only: desktop/browser labels and current
   documentation use `t1000`. Package names, storage paths, service identities,
   D-Bus IDs, authentication headers and cookies are deliberately unchanged.
