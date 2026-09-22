@@ -12,7 +12,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-authors = ["TermDeck contributors"]
+authors = ["t1000 contributors"]
 
 [workspace.dependencies]
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash", "zeroize"] }

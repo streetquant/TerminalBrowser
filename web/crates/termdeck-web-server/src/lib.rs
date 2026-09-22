@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Bounded loopback HTTP vertical slice for the read-only TermDeck mirror.
+//! Bounded loopback HTTP vertical slice for the read-only t1000 mirror.
 //!
 //! The server always refuses non-loopback binds and never accepts terminal or
 //! tmux mutation. Its original unauthenticated read-only mode remains available;
@@ -102,17 +102,17 @@ const _: () = {
     assert!(TERMINAL_JS.len() <= MAX_TERMINAL_ASSET_BYTES);
 };
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; manifest-src 'none'; worker-src 'none'";
-const USAGE: &str = "TermDeck read-only web mirror\n\n\
+const USAGE: &str = "t1000 read-only web mirror\n\n\
 Usage: termdeck-web-server [options]\n\n\
 Options:\n\
-  --db PATH                TermDeck sessions.sqlite3 path\n\
+  --db PATH                t1000 sessions.sqlite3 path\n\
   --listen IP:PORT         Loopback address (default 127.0.0.1:7391)\n\
   --refresh-ms N           Refresh interval, 250..60000\n\
   --max-stale-ms N         Maximum stale serving window, 1000..600000\n\
   --max-connections N      Concurrent request cap, 1..1024\n\
   --tmux PATH              tmux executable (default tmux)\n\
   --tmux-timeout-ms N      Read-only inventory timeout, 50..5000\n\
-  --t1000 PATH             Fixed T1000 executable for authenticated tab actions\n\
+  --t1000 PATH             Fixed t1000 executable for authenticated tab actions\n\
   --tab-action-timeout-ms N\n\
                            Tab action timeout, 1000..900000\n\
   --host-id ID             Opaque local host identity\n\
@@ -582,10 +582,10 @@ impl RefreshEngine {
             interval.tick().await;
             if let Err(error) = self.refresh().await {
                 match self.cache.record_error(error.to_string(), unix_ms()) {
-                    Ok(true) => eprintln!("TermDeck web refresh failed: {error}"),
+                    Ok(true) => eprintln!("t1000 web refresh failed: {error}"),
                     Ok(false) => {}
                     Err(cache_error) => eprintln!(
-                        "TermDeck web refresh failed: {error}; cache update failed: {cache_error}"
+                        "t1000 web refresh failed: {error}; cache update failed: {cache_error}"
                     ),
                 }
             }
@@ -869,7 +869,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
     let application = build_router(state);
     let listener = TcpListener::bind(config.listen).await?;
     println!(
-        "TermDeck read-only web mirror listening on http://{}",
+        "t1000 read-only web mirror listening on http://{}",
         listener.local_addr()?
     );
     let refresher = tokio::spawn(engine.run_periodic(config.refresh_interval));
@@ -1902,7 +1902,7 @@ async fn terminal_page(
     let mut output = String::with_capacity(4_096);
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,interactive-widget=resizes-content,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#070a10\"><title>");
     escape_html_into(&mut output, pane.pane_title.as_str());
-    output.push_str(" · TermDeck</title><link rel=\"stylesheet\" href=\"");
+    output.push_str(" · t1000</title><link rel=\"stylesheet\" href=\"");
     output.push_str(FRONTEND_CSS_PATH);
     output.push_str("\"><link rel=\"stylesheet\" href=\"");
     output.push_str(TERMINAL_CSS_PATH);
@@ -2305,16 +2305,16 @@ fn password_page_response(
 ) -> Response {
     let (title, heading, description, action, autocomplete, confirmation) = match page {
         PasswordPage::Setup => (
-            "Set TermDeck password",
-            "Choose your TermDeck password",
+            "Set t1000 password",
+            "Choose your t1000 password",
             "This password signs in every browser you authorize on your LAN.",
             SETUP_PATH,
             "new-password",
             true,
         ),
         PasswordPage::Login => (
-            "Sign in to TermDeck",
-            "Sign in to TermDeck",
+            "Sign in to t1000",
+            "Sign in to t1000",
             "Enter the owner password to open this browser session.",
             LOGIN_PATH,
             "current-password",
@@ -2324,7 +2324,7 @@ fn password_page_response(
     let mut output = String::with_capacity(2_048);
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>");
     escape_html_into(&mut output, title);
-    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck owner authentication</p><h1>");
+    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><p class=\"eyebrow\">t1000 owner authentication</p><h1>");
     escape_html_into(&mut output, heading);
     output.push_str("</h1><p class=\"subtle\">");
     escape_html_into(&mut output, description);
@@ -2358,7 +2358,7 @@ fn password_page_response(
     output.push_str(MAX_DEVICE_LABEL_BYTES.to_string().as_str());
     output.push_str("\" value=\"Browser\"></label><button type=\"submit\">");
     output.push_str(if page == PasswordPage::Setup {
-        "Set password and open TermDeck"
+        "Set password and open t1000"
     } else {
         "Sign in"
     });
@@ -2423,7 +2423,7 @@ fn password_error_response(
 
 fn render_pairing_page(base_path: RequestBasePath) -> String {
     let output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Recovery pairing · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><p class=\"eyebrow\">TermDeck recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Recovery pairing · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><p class=\"eyebrow\">t1000 recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
     );
     html_for_base(prefix_html_template(output), base_path)
 }
@@ -2970,11 +2970,11 @@ fn render_homepage(
     tmux_warning: Option<&str>,
 ) -> Result<String, ServerError> {
     let mut output = String::with_capacity(8_192 + snapshot.total_panes().saturating_mul(32));
-    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>TermDeck</title><link rel=\"stylesheet\" href=\"");
+    output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>t1000</title><link rel=\"stylesheet\" href=\"");
     output.push_str(FRONTEND_CSS_PATH);
     output.push_str("\"><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
-    output.push_str("\"></script></head><body><main id=\"termdeck-app\" aria-busy=\"false\" data-termdeck-page=\"home\"><header class=\"host-header\"><p class=\"eyebrow\">TermDeck host</p><h1>Windows</h1><p class=\"subtle\">");
+    output.push_str("\"></script></head><body><main id=\"termdeck-app\" aria-busy=\"false\" data-termdeck-page=\"home\"><header class=\"host-header\"><p class=\"eyebrow\">t1000 host</p><h1>Windows</h1><p class=\"subtle\">");
     output.push_str(&snapshot.windows().len().to_string());
     output.push_str(" windows · ");
     output.push_str(&snapshot.total_panes().to_string());
@@ -2986,7 +2986,7 @@ fn render_homepage(
     if tmux_warning.is_some() {
         output.push_str("<div class=\"notice\">tmux inventory is temporarily unavailable; registry status is shown without claiming live-process certainty.</div>");
     }
-    output.push_str("<section class=\"grid\" aria-label=\"TermDeck windows\">");
+    output.push_str("<section class=\"grid\" aria-label=\"t1000 windows\">");
     for window in snapshot.windows() {
         let running = window
             .panes()
@@ -3009,7 +3009,7 @@ fn render_homepage(
     }
     if snapshot.windows().is_empty() {
         output.push_str(
-            "<div class=\"empty\">No remembered TermDeck windows are currently available.</div>",
+            "<div class=\"empty\">No remembered t1000 windows are currently available.</div>",
         );
     }
     output.push_str("</section><noscript><div class=\"notice\">Window navigation remains available; live refresh and terminal control require JavaScript.</div></noscript><footer class=\"footer-row\"><a class=\"footer-link\" href=\"/_termdeck/api/v1/snapshot\">Versioned JSON</a><p class=\"refresh-state\">Server-rendered snapshot</p></footer></main></body></html>");
@@ -3026,7 +3026,7 @@ fn render_window_page(
     let mut output = String::with_capacity(8_192 + window.panes().len().saturating_mul(512));
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>");
     escape_html_into(&mut output, window.name());
-    output.push_str(" · TermDeck</title><link rel=\"stylesheet\" href=\"");
+    output.push_str(" · t1000</title><link rel=\"stylesheet\" href=\"");
     output.push_str(FRONTEND_CSS_PATH);
     output.push_str("\"><link rel=\"stylesheet\" href=\"");
     output.push_str(TERMINAL_CSS_PATH);
@@ -3043,7 +3043,7 @@ fn render_window_page(
         output.push_str("\" data-termdeck-pane=\"");
         escape_html_into(&mut output, initial_pane.as_str());
     }
-    output.push_str("\"><nav class=\"page-nav\"><a class=\"back-link\" href=\"/\">← All windows</a></nav><header class=\"host-header\"><p class=\"eyebrow\">TermDeck window</p><h1>");
+    output.push_str("\"><nav class=\"page-nav\"><a class=\"back-link\" href=\"/\">← All windows</a></nav><header class=\"host-header\"><p class=\"eyebrow\">t1000 window</p><h1>");
     escape_html_into(&mut output, window.name());
     output.push_str("</h1><p class=\"subtle\">");
     output.push_str(&window.panes().len().to_string());
@@ -3095,7 +3095,7 @@ fn render_window_page(
 
 fn render_not_found_page(slug: &str, base_path: RequestBasePath) -> String {
     let mut output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Not found · TermDeck</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored TermDeck window owns this route",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Not found · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v5/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored t1000 window owns this route",
     );
     if !slug.is_empty() {
         output.push_str(": <code>/");
@@ -3246,7 +3246,7 @@ fn parse_tmux_bool(value: &str, line: &str) -> Result<bool, ServerError> {
 
 async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
-        eprintln!("TermDeck web shutdown signal failed: {error}");
+        eprintln!("t1000 web shutdown signal failed: {error}");
     }
 }
 
@@ -3478,6 +3478,9 @@ mod tests {
                 Some("text/html; charset=utf-8")
             );
             let home_text = body_text(home).await;
+            assert!(home_text.contains("<title>t1000</title>"));
+            assert!(home_text.contains("t1000 host"));
+            assert!(!home_text.contains("TermDeck"));
             assert!(home_text.contains("href=\"/random\""));
             assert!(home_text.contains("Random &amp; Research"));
             assert!(home_text.contains("id=\"termdeck-app\""));
@@ -3497,6 +3500,8 @@ mod tests {
             };
             assert_eq!(window.status(), StatusCode::OK);
             let window_text = body_text(window).await;
+            assert!(window_text.contains(" · t1000</title>"));
+            assert!(!window_text.contains("TermDeck"));
             assert!(window_text.contains("Shell &lt;unsafe&gt;"));
             assert!(window_text.contains("/tmp/&amp;work"));
             assert!(window_text.contains("data-termdeck-page=\"window\""));
@@ -4423,7 +4428,7 @@ mod auth_integration_tests {
                 .unwrap_or_else(|error| match error {});
             assert_eq!(setup_page.status(), StatusCode::OK);
             let setup_text = body_text(setup_page).await;
-            assert!(setup_text.contains("Choose your TermDeck password"));
+            assert!(setup_text.contains("Choose your t1000 password"));
             assert!(!setup_text.contains("invitation"));
 
             let mismatch = router

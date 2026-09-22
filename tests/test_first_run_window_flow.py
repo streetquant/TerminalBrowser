@@ -115,7 +115,7 @@ class FirstRunWindowFlowTests(TestCase):
 
         dialog = FakeNameDialog.created[0]
         self.assertIs(result, created_window)
-        self.assertEqual(dialog.kwargs["title"], "Create your first T1000 window")
+        self.assertEqual(dialog.kwargs["title"], "Create your first t1000 window")
         self.assertEqual(dialog.kwargs["initial"], "Window 1")
         self.assertEqual(dialog.kwargs["confirm_label"], "Create window")
         self.assertIn("opens immediately", dialog.kwargs["description"])

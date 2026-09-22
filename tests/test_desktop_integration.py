@@ -110,7 +110,7 @@ class DesktopIntegrationTests(unittest.TestCase):
 
     def test_desktop_entry_contains_browser_like_metadata(self):
         entry = build_desktop_entry("t1000 gui")
-        self.assertIn("Name=T1000", entry)
+        self.assertIn("Name=t1000", entry)
         self.assertIn("Exec=t1000 gui", entry)
         self.assertIn("Icon=t1000", entry)
         self.assertIn("Terminal=false", entry)

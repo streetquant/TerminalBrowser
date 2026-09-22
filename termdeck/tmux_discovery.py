@@ -228,9 +228,9 @@ def adopt_tmux_sessions(
     include_termdeck: bool = False,
     dry_run: bool = False,
 ) -> list[AdoptTmuxResult]:
-    """Register existing tmux sessions as browser-like TermDeck tabs.
+    """Register existing tmux sessions as browser-like t1000 tabs.
 
-    TermDeck already owns sessions whose tmux name starts with ``termdeck_``;
+    t1000 already owns sessions whose tmux name starts with ``termdeck_``;
     those are skipped by default so repeated adoption does not create loops.
     """
 
@@ -252,7 +252,7 @@ def adopt_tmux_sessions(
                     pid=session.pid,
                     pane_target=session.pane_target,
                     pane_count=session.pane_count,
-                    reason="already looks like a TermDeck-managed tmux session",
+                    reason="already looks like a t1000-managed tmux session",
                 )
             )
             continue

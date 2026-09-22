@@ -15,7 +15,7 @@ class ShortcutManifestTests(unittest.TestCase):
         self.assertEqual(actions["close_term"]["accelerator"], "<Primary>w")
         self.assertEqual(actions["close_term"]["label"], "Close current tab, keep process alive")
         self.assertEqual(actions["quit_app"]["accelerator"], "<Primary>q")
-        self.assertEqual(actions["quit_app"]["label"], "Quit T1000, keep all processes alive")
+        self.assertEqual(actions["quit_app"]["label"], "Quit t1000, keep all processes alive")
         self.assertEqual(actions["reopen_closed"]["accelerator"], "<Primary><Shift>t")
         self.assertNotIn("task_launcher", actions)
         self.assertNotIn("new_command", actions)

@@ -687,7 +687,7 @@ def test_quit_is_deferred_while_any_auth_switch_is_inflight() -> None:
 
     assert TermDeckApplication.quit_preserving_sessions(app) is False
     assert quit_calls == []
-    assert messages == ["T1000 will stay open until the Codex account switch finishes"]
+    assert messages == ["t1000 will stay open until the Codex account switch finishes"]
 
 
 def test_account_switch_defers_stream_before_any_backend_mutation() -> None:

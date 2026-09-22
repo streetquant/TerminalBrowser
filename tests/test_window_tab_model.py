@@ -1299,7 +1299,7 @@ class WindowTabModelTests(TestCase):
 
                 self.assertEqual(window.window_title, "Backend")
                 self.assertEqual(window.window_title_label.text, "Backend")
-                self.assertEqual(window.native_title, "T1000 · Backend")
+                self.assertEqual(window.native_title, "t1000 · Backend")
                 self.assertEqual(tab.record.window_title, "Backend")
                 self.assertEqual(window.side.refresh_count, 1)
             finally:

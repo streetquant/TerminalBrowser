@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify T1000's mapped HeaderBar and inline-title hierarchy under GTK/X11."""
+"""Verify t1000's mapped HeaderBar and inline-title hierarchy under GTK/X11."""
 
 from __future__ import annotations
 
@@ -88,7 +88,7 @@ def main() -> int:
                 raise AssertionError(
                     f"in-app title must be the window name only: {visible_title.get_text()!r}"
                 )
-            if window.get_title() != "T1000 · Backend":
+            if window.get_title() != "t1000 · Backend":
                 raise AssertionError(
                     f"native title must retain the app prefix: {window.get_title()!r}"
                 )
@@ -129,7 +129,7 @@ def main() -> int:
             ]
             expected_menu = [
                 "Rename window",
-                "New T1000 window",
+                "New t1000 window",
                 "Search tabs",
                 "Command palette",
                 "Reopen closed tab",
@@ -139,7 +139,7 @@ def main() -> int:
                 "Keyboard shortcuts",
                 "Terminal appearance",
                 "Kill Window Permanently…",
-                "Quit T1000",
+                "Quit t1000",
             ]
             if menu_labels != expected_menu:
                 raise AssertionError(f"unexpected ordered More menu: {menu_labels}")

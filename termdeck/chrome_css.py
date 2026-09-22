@@ -1,4 +1,4 @@
-"""GTK3 chrome stylesheet for TermDeck.
+"""GTK3 chrome stylesheet for t1000.
 
 Design language: flat, quiet, professional. Neutral layered surfaces
 separated by hairline borders, edge-to-edge docked panels, soft shadows
@@ -154,7 +154,7 @@ def build_modern_chrome_css(
     compact_card_radius = max(6, radius - 2)
 
     return f"""\
-/* TermDeck chrome — theme={t.name} density={density} ui_font={ui_font or "system"} scale={scale:.2f} */
+/* t1000 chrome — theme={t.name} density={density} ui_font={ui_font or "system"} scale={scale:.2f} */
 * {{
   {font_family_css}
   font-size: {size["base"]};

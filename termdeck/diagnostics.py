@@ -194,7 +194,7 @@ def write_diagnostic_bundle(path: str | Path, *, db_path: str | Path | None = No
         "tasks.json": payload["tasks"],
         "windows.json": payload["windows"],
         "budgets.json": payload["budgets"],
-        "README.txt": "TermDeck diagnostic bundle. It excludes environment variables and terminal captures by default.\n",
+        "README.txt": "t1000 diagnostic bundle. It excludes environment variables and terminal captures by default.\n",
     }
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, value in entries.items():

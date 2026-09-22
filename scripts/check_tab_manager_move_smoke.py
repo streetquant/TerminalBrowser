@@ -197,7 +197,7 @@ def main() -> int:
 
             def accept_new_window_dialog() -> bool:
                 for toplevel in Gtk.Window.list_toplevels():
-                    if toplevel.get_title() != "New T1000 window":
+                    if toplevel.get_title() != "New t1000 window":
                         continue
                     toplevel.entry.set_text("Created destination")
                     toplevel.response(Gtk.ResponseType.OK)

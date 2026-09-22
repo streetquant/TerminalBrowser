@@ -31,7 +31,7 @@ class UiThemeTests(unittest.TestCase):
         for name in chrome_theme_names():
             css = build_chrome_css(name, "comfortable")
             self.assertTrue(css.strip())
-            self.assertIn("TermDeck chrome", css)
+            self.assertIn("t1000 chrome", css)
             self.assertIn(".td-session-card", css)
             self.assertIn("headerbar", css)
             tokens = resolve_chrome_tokens("dark" if name == "system" else name)
@@ -203,7 +203,7 @@ class UiSurfaceStaticTests(unittest.TestCase):
         self.assertIn("self._header_new_tab = header_new_tab", self.gtk)
         self.assertIn("header.pack_start(header_new_tab)", self.gtk)
         self.assertIn("overflow_header_actions", self.gtk)
-        self.assertIn('("New T1000 window", self.new_window)', self.gtk)
+        self.assertIn('("New t1000 window", self.new_window)', self.gtk)
         self.assertIn("list-add-symbolic", self.gtk)
         self.assertIn('Gtk.MenuButton(label="⋯")', self.gtk)
         self.assertIn("show_label=False", self.gtk)

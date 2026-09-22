@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Dependency-free domain core for the TermDeck web host"
+description = "Dependency-free domain core for the t1000 web host"
 publish = false
 
 [lib]

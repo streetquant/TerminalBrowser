@@ -203,7 +203,7 @@ def build_desktop_entry(exec_command: str) -> str:
         "[Desktop Entry]",
         "Type=Application",
         "Version=1.0",
-        "Name=T1000",
+        "Name=t1000",
         "GenericName=Terminal Task Manager",
         "Comment=Named terminal windows with directory-backed tabs",
         f"Exec={exec_command}",

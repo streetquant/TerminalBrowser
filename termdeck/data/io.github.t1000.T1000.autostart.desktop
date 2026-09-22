@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=T1000
+Name=t1000
 Comment=Restore managed terminal sessions at graphical-session start
 Exec=@T1000_EXEC@
 TryExec=@T1000_TRYEXEC@

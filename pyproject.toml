@@ -9,7 +9,7 @@ description = "The terminal manager that never breaks down — named after the T
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-authors = [{name = "TermDeck contributors"}]
+authors = [{name = "t1000 contributors"}]
 keywords = ["terminal", "tmux", "gtk", "vte", "t1000", "codex", "process-manager"]
 classifiers = [
   "Development Status :: 3 - Alpha",

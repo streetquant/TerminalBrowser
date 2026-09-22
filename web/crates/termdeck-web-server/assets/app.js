@@ -223,7 +223,7 @@
   function hostHeader(title, summary, identity) {
     const header = node("header", "host-header");
     header.append(
-      node("p", "eyebrow", "TermDeck web host"),
+      node("p", "eyebrow", "t1000 web host"),
       node("h1", "", title),
       node("p", "subtle", summary),
     );
@@ -264,7 +264,7 @@
       );
     }
     const grid = node("section", "grid");
-    grid.setAttribute("aria-label", "TermDeck windows");
+    grid.setAttribute("aria-label", "t1000 windows");
     for (const windowData of host.windows) {
       const running = windowData.panes.filter((pane) => pane.status === "running").length;
       const card = link("", appPath(windowData.path), "card");
@@ -277,13 +277,13 @@
       grid.append(card);
     }
     if (host.windows.length === 0) {
-      grid.append(node("div", "empty", "No remembered TermDeck windows are currently available."));
+      grid.append(node("div", "empty", "No remembered t1000 windows are currently available."));
     }
     fragment.append(grid, footer(appPath("/_termdeck/api/v1/snapshot"), stale));
     root.replaceChildren(fragment);
     root.dataset.termdeckState = stale ? "stale" : "ready";
     root.setAttribute("aria-busy", "false");
-    document.title = "TermDeck";
+    document.title = "t1000";
   }
 
   function paneArticle(windowSlug, pane) {
@@ -341,7 +341,7 @@
     root.replaceChildren(fragment);
     root.dataset.termdeckState = stale ? "stale" : "ready";
     root.setAttribute("aria-busy", "false");
-    document.title = `${windowData.name} · TermDeck`;
+    document.title = `${windowData.name} · t1000`;
   }
 
   function currentClientNotice() {
@@ -1209,8 +1209,8 @@
     root.className = "workspace-main";
     const topbar = node("header", "workspace-headerbar");
     const leftTools = node("div", "workspace-header-left");
-    const homeLink = link("T1000", appPath("/"), "workspace-home");
-    homeLink.title = "All TermDeck windows";
+    const homeLink = link("t1000", appPath("/"), "workspace-home");
+    homeLink.title = "All t1000 windows";
     const newButton = node("button", "workspace-new-tab", "+");
     newButton.type = "button";
     newButton.title = "New tab";
@@ -1237,11 +1237,11 @@
 
     const tabbar = node("div", "workspace-tabbar");
     tabbar.setAttribute("role", "tablist");
-    tabbar.setAttribute("aria-label", "TermDeck tabs");
+    tabbar.setAttribute("aria-label", "t1000 tabs");
     tabbar.append(node("span", "workspace-tabs-loading", "Syncing tabs…"));
     const shell = node("section", "workspace-shell");
     shell.dataset.state = "loading";
-    const shellStatus = node("p", "workspace-state-message", "Syncing TermDeck…");
+    const shellStatus = node("p", "workspace-state-message", "Syncing t1000…");
     shellStatus.setAttribute("role", "status");
     shellStatus.setAttribute("aria-live", "polite");
     const terminalIdentity = node("span", "workspace-terminal-identity", "No tab selected");
@@ -1314,7 +1314,7 @@
     function updateShellState(state, message) {
       shell.dataset.state = state;
       const messages = {
-        loading: "Syncing TermDeck…",
+        loading: "Syncing t1000…",
         empty: "No visible tabs",
         error: "Live refresh unavailable",
       };
@@ -1374,7 +1374,7 @@
       renderActions();
       if (samePane) {
         if (pane && envelope) {
-          document.title = `${pane.title} · ${envelope.window.name} · TermDeck`;
+          document.title = `${pane.title} · ${envelope.window.name} · t1000`;
         }
         terminalMount.focus();
         if (focusTab) {
@@ -1392,7 +1392,7 @@
         terminalMount.focus();
       }
       if (pane && envelope) {
-        document.title = `${pane.title} · ${envelope.window.name} · TermDeck`;
+        document.title = `${pane.title} · ${envelope.window.name} · t1000`;
       }
       if (focusTab) {
         focusTabButton(paneId);
@@ -1660,7 +1660,7 @@ ${pane.cwd}`;
             : `Pane ${selected}`;
           renderActions();
           if (pane) {
-            document.title = `${pane.title} · ${next.window.name} · TermDeck`;
+            document.title = `${pane.title} · ${next.window.name} · t1000`;
           }
         } else {
           if (terminalMount) {

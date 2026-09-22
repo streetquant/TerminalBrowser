@@ -241,7 +241,7 @@ def render_control_plan_text(plan: ControlPlan, *, max_rows: int = 8) -> str:
         if plan.destructive_hints:
             lines.append("Destructive hints: " + ", ".join(plan.destructive_hints))
     if plan.requires_confirmation:
-        lines.append("Confirmation required before TermDeck touches the selected sessions.")
+        lines.append("Confirmation required before t1000 touches the selected sessions.")
     if not plan.rows:
         lines.append("No matching sessions.")
         return "\n".join(lines)

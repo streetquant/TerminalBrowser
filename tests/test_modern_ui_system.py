@@ -71,7 +71,7 @@ class ModernUiSystemTests(unittest.TestCase):
         self.assertIn("header.pack_start(header_new_tab)", GTK_APP)
         self.assertIn("self.new_tab,", GTK_APP)
         self.assertIn("def new_window_direct", GTK_APP)
-        self.assertIn('("New T1000 window", self.new_window)', GTK_APP)
+        self.assertIn('("New t1000 window", self.new_window)', GTK_APP)
         self.assertIn("overflow_header_actions", GTK_APP)
         self.assertIn('("Search tabs", self.open_search_window)', GTK_APP)
         self.assertIn('("Command palette", self.open_command_palette)', GTK_APP)

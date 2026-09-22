@@ -1,11 +1,11 @@
-# TermDeck web client
+# t1000 web client
 
-This directory contains the Rust-first browser client for TermDeck/T1000. It exposes the same persistent tmux-backed terminals over an authenticated HTTPS origin while preserving the installed GTK application as a rollback-compatible peer until final cutover is independently approved.
+This directory contains the Rust-first browser client for t1000/T1000. It exposes the same persistent tmux-backed terminals over an authenticated HTTPS origin while preserving the installed GTK application as a rollback-compatible peer until final cutover is independently approved.
 
 ## Browser experience
 
-- `/` lists every remembered TermDeck window.
-- `/<window-slug>` is the complete browser workspace for one TermDeck window: a live tab strip, one active terminal, a **New Tab** action, and tab lifecycle controls.
+- `/` lists every remembered t1000 window.
+- `/<window-slug>` is the complete browser workspace for one t1000 window: a live tab strip, one active terminal, a **New Tab** action, and tab lifecycle controls.
 - `/<window-slug>/t/<pane-id>` is the stable deep link to one terminal. Selecting a tab updates this URL without losing the window shell.
 - The terminal is rendered by a pinned xterm.js bundle. ANSI colors, cursor movement, alternate-screen applications, Unicode, IME input, mouse protocols, bracketed paste, selection, links, search, scrollback, and browser resizing are handled by a real terminal emulator rather than a text capture.
 - Ordinary keyboard, paste, mouse, and resize events flow directly through an authenticated WebSocket. There is no separate send-text form and no synthetic Enter/Ctrl+C button panel.

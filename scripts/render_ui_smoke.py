@@ -215,7 +215,7 @@ def _wait_for_window(xwininfo: str, env: dict[str, str], timeout: float = 15.0) 
             if not stripped.startswith("0x"):
                 continue
             window_id = stripped.split()[0]
-            if "termdeck" in stripped.casefold():
+            if "t1000" in stripped.casefold() or "termdeck" in stripped.casefold():
                 return window_id
             geometry = re.search(r"\s(\d+)x(\d+)[+-]-?\d+[+-]-?\d+", stripped)
             if geometry:

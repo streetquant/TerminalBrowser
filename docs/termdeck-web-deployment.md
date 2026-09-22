@@ -1,4 +1,4 @@
-# TermDeck web deployment
+# t1000 web deployment
 
 The browser client is served by a loopback-only Rust backend and a persistent nginx TLS/WebSocket edge. The edge dynamically detects the current RFC1918 address, rotates the LAN certificate under the existing private CA when the DHCP address changes, and allows only the current address, loopback, `termdeck.local`, `max.local`, and the configured Cloudflare hostname.
 
@@ -6,17 +6,17 @@ The browser client is served by a loopback-only Rust backend and a persistent ng
 
 Install `scripts/termdeck-web-prepare-runtime.sh` as `/warp/projects/softwares/termdeck/.termdeck/bin/termdeck-web-prepare`, install the user units from `deploy/systemd`, run `systemctl --user daemon-reload`, and enable `termdeck-web-backend.service` plus `termdeck-web-lan.service`. The user must have lingering enabled. The backend remains bound to `127.0.0.1:7391`; only nginx binds port 7443.
 
-The certificate is signed by the existing TermDeck LAN CA and includes the current DHCP address, `127.0.0.1`, `termdeck.local`, and `max.local`. Re-running the preparation script is idempotent and rotates only when the address changes or the certificate approaches expiry.
+The certificate is signed by the existing t1000 LAN CA and includes the current DHCP address, `127.0.0.1`, `termdeck.local`, and `max.local`. Re-running the preparation script is idempotent and rotates only when the address changes or the certificate approaches expiry.
 
 ## Activation recovery evidence
 
-The web activation helper stores transaction receipts and rollback markers by default under `/warp/projects/softwares/termdeck/.termdeck/state/recovery/activation-v2`. This state-root recovery hierarchy is separate from the TermDeck runtime and session-state directories. Historical recovery artifacts under `/var/lib/cloudmcp-exec` are evidence only; use an explicit reviewed `--evidence` path when replaying a historical transaction.
+The web activation helper stores transaction receipts and rollback markers by default under `/warp/projects/softwares/termdeck/.termdeck/state/recovery/activation-v2`. This state-root recovery hierarchy is separate from the t1000 runtime and session-state directories. Historical recovery artifacts under `/var/lib/cloudmcp-exec` are evidence only; use an explicit reviewed `--evidence` path when replaying a historical transaction.
 
 ## Cloudflare
 
 The preferred standalone public endpoint is a dedicated named tunnel with the configuration in `deploy/cloudflare/termdeck.yml.example` and a proxied CNAME from the public hostname to `<tunnel-id>.cfargotunnel.com`. The Cloudflare token used for DNS creation must have `Zone:DNS:Edit`; tunnel-management permission alone is insufficient. Application password/device authentication, same-origin CSRF checks, sequenced terminal input and single-controller fencing remain authoritative behind the tunnel.
 
-A stable route can also be inserted into the existing `maxchat.semiotech.org` tunnel by applying `deploy/cloudflare/maxchat-termdeck-route.json` before its hostname catch-all. That route exposes TermDeck only under `https://maxchat.semiotech.org/t1000/`, preserves the existing MaxChat root route, validates the local TLS origin through the TermDeck LAN CA, and forwards the exact `/t1000` prefix contract used by redirects, forms, assets, cookies and WSS.
+A stable route can also be inserted into the existing `maxchat.semiotech.org` tunnel by applying `deploy/cloudflare/maxchat-termdeck-route.json` before its hostname catch-all. That route exposes t1000 only under `https://maxchat.semiotech.org/t1000/`, preserves the existing MaxChat root route, validates the local TLS origin through the t1000 LAN CA, and forwards the exact `/t1000` prefix contract used by redirects, forms, assets, cookies and WSS.
 
 When DNS permission or a stable shared route is temporarily unavailable, `deploy/systemd/termdeck-cloudflare-preview.service` and `scripts/termdeck-cloudflare-preview.py` provide a Quick Tunnel and write its current URL to `cloudflare-preview-url.json`. Quick Tunnel URLs are temporary fallbacks and must not replace the named-tunnel or stable shared route in production documentation.
 

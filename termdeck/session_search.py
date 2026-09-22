@@ -295,7 +295,7 @@ def search_sessions(
 
 def render_search_table(result: SessionSearchResult) -> str:
     if not result.matches:
-        return f"No TermDeck sessions matched: {result.query!r}"
+        return f"No t1000 sessions matched: {result.query!r}"
     rows = [["ID", "Window", "Name", "Tag", "Status", "Fields", "Output", "Command"]]
     for match in result.matches:
         rows.append([

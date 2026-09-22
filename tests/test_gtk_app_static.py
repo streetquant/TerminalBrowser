@@ -132,7 +132,7 @@ class GtkAppStaticTests(unittest.TestCase):
         self.assertIn('"Codex: choose account · upgrades terminal"', source)
         self.assertIn("canonical_binding_ready", source)
         self.assertIn('"Codex: repair saved account binding"', source)
-        self.assertIn("T1000 will preserve an exact Codex resume or a verified idle shell", source)
+        self.assertIn("t1000 will preserve an exact Codex resume or a verified idle shell", source)
 
     def test_window_overview_is_exposed_in_gui(self):
         source = GTK_APP.read_text(encoding="utf-8")

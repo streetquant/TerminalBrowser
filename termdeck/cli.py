@@ -932,7 +932,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
 
 
 def cmd_adopt_tmux(args: argparse.Namespace) -> int:
-    """Adopt already-running tmux sessions into T1000's browser registry."""
+    """Adopt already-running tmux sessions into t1000's browser registry."""
 
     backend = TmuxBackend()
     if not backend.available:
@@ -1587,7 +1587,7 @@ def cmd_auth(args: argparse.Namespace) -> int:
                     "name": record.name,
                     "error": (
                         "adopted external tmux sessions cannot be retroactively isolated; "
-                        "recreate this terminal under T1000 before switching Codex accounts"
+                        "recreate this terminal under t1000 before switching Codex accounts"
                     ),
                 }
             )
@@ -1733,13 +1733,13 @@ def _add_targeting_args(
             "--window-id",
             dest="target_window_id",
             default=None,
-            help="restrict targets to one T1000 window",
+            help="restrict targets to one t1000 window",
         )
     parser.add_argument("--db", type=Path, default=None)
 
 
 def _add_config_arg(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", type=Path, default=None, help="optional T1000 JSON config path")
+    parser.add_argument("--config", type=Path, default=None, help="optional t1000 JSON config path")
 
 
 def _mark_session_database_usage(parser: argparse.ArgumentParser) -> None:
@@ -1887,13 +1887,13 @@ def build_parser() -> argparse.ArgumentParser:
     auth_gc.add_argument("--min-age-hours", type=float, default=24.0)
     auth_gc.set_defaults(func=cmd_auth_gc)
 
-    settings_sample = sub.add_parser("settings-sample", help="print a sample T1000 settings JSON file")
+    settings_sample = sub.add_parser("settings-sample", help="print a sample t1000 settings JSON file")
     settings_sample.set_defaults(func=cmd_settings_sample)
 
     shortcuts = sub.add_parser("shortcuts", help="show browser, Terminator, tab, and terminal passthrough shortcuts")
     shortcuts.add_argument("--path", type=Path, default=None, help="optional Terminator config path")
     shortcuts.add_argument("--terminator-profile", default="default", help="Terminator profile name used for imported keybindings")
-    shortcuts.add_argument("--profile", choices=shortcut_profile_names(), default="browser", help="T1000 shortcut profile")
+    shortcuts.add_argument("--profile", choices=shortcut_profile_names(), default="browser", help="t1000 shortcut profile")
     shortcuts.add_argument("--no-terminator", action="store_true", help="do not import Terminator keybinding overrides")
     shortcuts.add_argument("--json", action="store_true")
     shortcuts.set_defaults(func=cmd_shortcuts)
@@ -1959,7 +1959,7 @@ def build_parser() -> argparse.ArgumentParser:
     parse.add_argument("--profile", default="default")
     parse.set_defaults(func=cmd_parse_terminator)
 
-    terminator_workspace = sub.add_parser("terminator-workspace", help="convert a Terminator layout into a T1000 workspace recipe")
+    terminator_workspace = sub.add_parser("terminator-workspace", help="convert a Terminator layout into a t1000 workspace recipe")
     terminator_workspace.add_argument("--path", type=Path, default=None, help="Terminator config path; defaults to ~/.config/terminator/config")
     terminator_workspace.add_argument("--layout", default="default", help="Terminator layout name")
     terminator_workspace.add_argument("--list-layouts", action="store_true", help="list available Terminator layout names")
@@ -2170,13 +2170,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_targeting_args(unpin)
     unpin.set_defaults(func=cmd_unpin)
 
-    adopt = sub.add_parser("adopt-tmux", help="adopt existing tmux sessions as browser-like T1000 tabs")
+    adopt = sub.add_parser("adopt-tmux", help="adopt existing tmux sessions as browser-like t1000 tabs")
     adopt.add_argument("selectors", nargs="*", help="optional tmux session names or session ids to adopt")
-    adopt.add_argument("--tag", default="adopted", help="T1000 tag for adopted sessions")
+    adopt.add_argument("--tag", default="adopted", help="t1000 tag for adopted sessions")
     adopt.add_argument("--window-id", default="adopted", help="browser window id used for the adopted tabs")
     adopt.add_argument("--window-title", default="Adopted tmux", help="browser window title used for the adopted tabs")
     adopt.add_argument("--hidden", action="store_true", help="adopt sessions but keep them out of visible restore")
-    adopt.add_argument("--include-termdeck", action="store_true", help="also adopt tmux sessions that already look T1000-managed")
+    adopt.add_argument("--include-termdeck", action="store_true", help="also adopt tmux sessions that already look t1000-managed")
     adopt.add_argument("--dry-run", action="store_true", help="show what would be adopted without writing the session database")
     adopt.add_argument("--list", dest="list_only", action="store_true", help="list discoverable tmux sessions without adopting")
     adopt.add_argument("--db", type=Path, default=None)
@@ -2257,7 +2257,7 @@ def build_parser() -> argparse.ArgumentParser:
     sessions = sub.add_parser("sessions", help="list remembered sessions")
     sessions.add_argument("--db", type=Path, default=None)
     sessions.add_argument("--all", action="store_true")
-    sessions.add_argument("--window-id", default=None, help="list sessions from one T1000 window")
+    sessions.add_argument("--window-id", default=None, help="list sessions from one t1000 window")
     sessions.set_defaults(func=cmd_sessions)
 
     workspace_open = sub.add_parser("workspace-open", help="materialise a JSON workspace recipe into remembered sessions")
@@ -2353,7 +2353,7 @@ def _prepare_managed_session_database(args: argparse.Namespace) -> None:
         production=True,
     )
     if effective.exists() and not effective.is_file():
-        raise ValueError(f"TermDeck database path is not a regular file: {effective}")
+        raise ValueError(f"t1000 database path is not a regular file: {effective}")
     args.db = effective
 
     managed_default = Path(
@@ -2367,7 +2367,7 @@ def _prepare_managed_session_database(args: argparse.Namespace) -> None:
         command = str(getattr(args, "command", "managed command") or "managed command")
         raise ManagedSessionDatabaseUnavailable(
             "managed session database migration is pending; start the primary "
-            f"T1000 GUI before running {command}"
+            f"t1000 GUI before running {command}"
         )
 
 
