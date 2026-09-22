@@ -7,8 +7,6 @@ checks listed at the end.
 
 ## Active UI and release work
 
-- Commit the completed UI, performance, browser, desktop, release, and
-  colocated `.termdeck` changes as coherent commits, as requested by the user.
 - Qualify the clean committed release against the production contract before
   switching the running application. Do not confuse the completed focused UI
   checks with the complete release qualification.
@@ -16,6 +14,10 @@ checks listed at the end.
 ## Production activation
 
 - Repair the live managed launcher error: `managed bootstrap path mismatch`.
+  Read-only release verification identifies the underlying mismatch: the
+  colocated managed `state.json` still binds its stable launcher to
+  `/warp/runtime/termdeck/bin/t1000`. The existing install contract refuses an
+  in-place launcher-path change; do not hand-edit its authenticated hashes.
 - Install or restore the missing TermDeck recovery service from the corrected
   canonical templates.
 - Publish the managed service wrappers under
@@ -47,6 +49,16 @@ checks listed at the end.
 
 ## Already completed; do not repeat
 
+- Committed the colocated deployment migration (`ca1b34a`), UI/performance and
+  regression tests (`1c1e4fb`), and clean-snapshot release smoke plus audit
+  documentation (`69dcb40`). No remote push was requested or performed.
+- Built the clean committed v0.2.21 Python package twice with byte-identical
+  output and verified all 78 wheel members. This is a build, not installation
+  or complete production qualification; no live service was switched.
+- Release preflight confirms non-rotational XFS storage. The existing backend
+  health check succeeds and HTTPS returns its normal authentication redirect
+  with the existing CA trusted. The managed state, bootstrap, launcher, web
+  executable and CA were left unchanged.
 - The UI session finished all 22 integrated Chromium assertions, including
   failure-state geometry, mobile layout, keyboard navigation, click-to-type,
   and metadata-refresh focus. See `docs/UI_UX_STATUS.md` for proof and limits.

@@ -6,8 +6,25 @@ sessions, remembered tabs, authentication scopes, and working directories must
 survive any release.
 
 The cross-session handoff is [todo.md](../todo.md). Its active UI-session ID
-matches this audit session. Completed colocated-path checks in that handoff are
+matched this audit session. Completed colocated-path checks in that handoff are
 not rerun here, and storage cutover is not part of UI validation.
+
+## Commit and installation status
+
+The implementation is committed: `ca1b34a` contains the colocated deployment
+migration, `1c1e4fb` the desktop/web UI and performance work, and `69dcb40` the
+release smoke and verification documentation. The clean v0.2.21 wheel builds
+reproducibly and verifies all 78 members. No remote push was requested.
+
+Installation is blocked before live activation. The migrated managed-state
+file still identifies `/warp/runtime/termdeck/bin/t1000` as its stable launcher;
+the installer explicitly rejects changing that binding in place. Recovery,
+runtime-attestation, and preparer-broker services are absent. The privileged
+tmpfiles template also needs an ownership review before applying it to the
+now-shared `.termdeck` directory containing user state and managed releases.
+Do not edit authenticated state hashes or apply that ownership change blindly.
+The running backend and HTTPS edge remain healthy and unchanged. Complete
+canonical production qualification and guarded activation remain outstanding.
 
 ## Current implementation checklist
 
