@@ -869,8 +869,11 @@ def main() -> int:
             type_command(page_one, "printf 'NEW_TAB_INPUT_OK\\n'", "NEW_TAB_INPUT_OK")
 
             page_one.locator('summary[aria-label="Tab actions"]').click()
-            page_one.once("dialog", lambda prompt: prompt.accept("Renamed browser tab"))
             page_one.locator(".workspace-action-panel button", has_text="Rename tab").click()
+            action_dialog = page_one.locator("#workspace-action-dialog")
+            action_dialog.wait_for(state="visible")
+            action_dialog.locator('input[name="rename"]').fill("Renamed browser tab")
+            action_dialog.get_by_role("button", name="Save name", exact=True).click()
             page_one.locator(".workspace-tab-title", has_text="Renamed browser tab").wait_for(
                 state="visible", timeout=15_000
             )
@@ -927,8 +930,9 @@ def main() -> int:
                 raise RuntimeError("kill target was not registered")
             kill_tmux = kill_row["tmux_name"]
             page_one.locator('summary[aria-label="Tab actions"]').click()
-            page_one.once("dialog", lambda confirmation: confirmation.accept())
             page_one.locator(".workspace-action-panel button", has_text="Kill process…").click()
+            action_dialog.wait_for(state="visible")
+            action_dialog.get_by_role("button", name="Kill process", exact=True).click()
             wait_until(
                 lambda: (registry_row(database, kill_id) or {}).get("status") == "stopped"
                 and (registry_row(database, kill_id) or {}).get("visible") == 0,
