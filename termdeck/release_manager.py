@@ -6434,6 +6434,7 @@ def _release_wrapper_execution_kwargs(
     required = (
         "termdeck/__init__.py",
         "termdeck/service_wrappers.py",
+        "termdeck/storage_fabric.py",
         "termdeck/web_activation.py",
     )
     file_rows = {
@@ -6463,23 +6464,25 @@ def _wrapper_layout_kwargs(
 ) -> dict[str, object]:
     """Build the wrapper API layout for this release-manager root.
 
-    Production uses the canonical Warp roots.  Disposable release-manager
-    fixtures use sibling roots so their wrapper publication never reaches the
-    live service directories.  The lexical root check is intentional: tests
-    may patch production admission while still using a temporary root.
+    Wrapper identity always names the canonical source checkout.  A verified
+    managed launcher imports this module from a disposable ``.bootstrap-import``
+    snapshot, which must never become persistent wrapper identity.  Production
+    uses the canonical Warp output roots; disposable release-manager fixtures
+    retain sibling output roots so their publication never reaches the live
+    service directories.  The lexical root check is intentional: tests may
+    patch production admission while still using a temporary root.
     """
 
+    source_root = _CANONICAL_SOURCE_ROOT
     canonical = layout.root.resolve(strict=False) == _DEPLOYMENT_MANAGED_ROOT.resolve(
         strict=False
     )
     if canonical:
-        source_root = _CANONICAL_SOURCE_ROOT
         runtime_root = _DEPLOYMENT_MANAGED_ROOT.parent
         state_root = _DEPLOYMENT_STATE_ROOT
         unit_dir = Path("/home/arch/.config/systemd/user")
         control_root = _CANONICAL_CONTROL_ROOT
     else:
-        source_root = Path(__file__).resolve().parent.parent
         runtime_root = layout.root.parent
         state_root = layout.root.parent / "state"
         unit_dir = layout.root.parent / "units"
@@ -7589,6 +7592,7 @@ def _publish_install_wrapper_and_activation(
     verify: Callable[[], None],
     first_install_preimage: _FirstInstallPreimagePublication | None,
     activation_expected_preimages: Mapping[Path, _FileSnapshot] | None = None,
+    activation_preflight_guards: object | None = None,
     wrapper_snapshot: object | None = None,
     wrapper_expected_release_id: str | None = None,
     journal_path: Path | None = None,
@@ -7692,6 +7696,7 @@ def _publish_install_wrapper_and_activation(
     parent_guards = _merge_publication_parent_guards(
         publication.parent_guards,
         activation_guards,
+        activation_preflight_guards,
     )
     activation_preimages = (
         _capture_anchored_files_safely(
@@ -10488,6 +10493,8 @@ def _derive_release_activation_bundle(
     layout: ReleaseLayout,
     release_id: str,
     interpreter: Path,
+    *,
+    render_layout: ReleaseLayout | None = None,
 ) -> _ActivationBundle:
     """Derive canonical activation bytes from one descriptor-anchored wheel.
 
@@ -10497,6 +10504,9 @@ def _derive_release_activation_bundle(
     probe through symlinks, or race the child between verification and import.
     """
 
+    # Relocation authenticates historical rendering from the copied immutable
+    # wheel. Artifact reads stay bound to layout, never to historical paths.
+    rendering = layout if render_layout is None else render_layout
     snapshot = _read_activation_artifact_snapshot(layout, release_id)
     try:
         resolved_interpreter = interpreter.resolve(strict=True)
@@ -10586,8 +10596,8 @@ sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")))
                 "-c",
                 probe,
                 str(resolved_wheel),
-                str(layout.root),
-                str(layout.bin_dir),
+                str(rendering.root),
+                str(rendering.bin_dir),
                 str(resolved_interpreter),
                 release_id,
             ],
@@ -10640,8 +10650,8 @@ sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")))
             "release_id": release_id,
             "module_path": expected_module,
             "package_path": expected_package,
-            "managed_root": str(layout.root),
-            "bin_dir": str(layout.bin_dir),
+            "managed_root": str(rendering.root),
+            "bin_dir": str(rendering.bin_dir),
             "python_executable": str(resolved_interpreter),
         }
         for key, expected in expected_identity.items():
@@ -11628,6 +11638,8 @@ def install_release(
     lock_timeout: float = 15.0,
     production: bool | None = None,
     recover_autostart: bool = False,
+    migrate_from_root: str | Path | None = None,
+    migrate_from_bin_dir: str | Path | None = None,
     before_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
     after_publication: Callable[[PublicationTransactionReceipt], None] | None = None,
     after_recovery: Callable[[PublicationTransactionReceipt], None] | None = None,
@@ -11638,6 +11650,9 @@ def install_release(
         layout,
         production=production,
     )
+    migration_requested = migrate_from_root is not None or migrate_from_bin_dir is not None
+    if (migrate_from_root is None) != (migrate_from_bin_dir is None):
+        raise ReleaseError("path migration requires both source root and source bin directory")
     if recover_autostart and not manage_autostart:
         raise ReleaseError(
             "autostart recovery requires the canonical production root"
@@ -11682,11 +11697,23 @@ def install_release(
                 raise ReleaseError(
                     "an existing managed root cannot change Python interpreter in place"
                 )
-            if state.get("launcher_path") != str(layout.launcher_path):
+            if state.get("launcher_path") != str(layout.launcher_path) and not migration_requested:
                 raise ReleaseError(
                     "an existing managed root cannot change its stable launcher path"
                 )
 
+        migration = None
+        if migration_requested:
+            from .release_path_migration import prepare_legacy_path_migration
+
+            assert migrate_from_root is not None and migrate_from_bin_dir is not None
+            migration = prepare_legacy_path_migration(
+                layout,
+                state,
+                interpreter,
+                source_root=migrate_from_root,
+                source_bin_dir=migrate_from_bin_dir,
+            )
         current_activation = _current_activation_bundle(layout, interpreter)
         expected_launcher = current_activation.launcher
         expected_launcher_hash = current_activation.launcher_sha256
@@ -11694,14 +11721,18 @@ def install_release(
         expected_bootstrap_hash = current_activation.bootstrap_sha256
         legacy = state.get("legacy_launcher")
         prior_activation = (
-            _state_activation_bundle(
-                layout,
-                state,
-                interpreter,
-                verify_selected_release=False,
+            migration.activation
+            if migration is not None
+            else (
+                _state_activation_bundle(
+                    layout,
+                    state,
+                    interpreter,
+                    verify_selected_release=False,
+                )
+                if current is not None
+                else None
             )
-            if current is not None
-            else None
         )
         existing_hash = _optional_regular_hash(
             layout.launcher_path,
@@ -11876,6 +11907,13 @@ def install_release(
             writes.append(
                 (layout.launcher_path, expected_launcher, 0o755, "t1000 launcher")
             )
+        if migration is not None:
+            writes.append((
+                migration.receipt_path,
+                migration.receipt(layout, new_state),
+                0o600,
+                "legacy path migration receipt",
+            ))
         writes.extend(autostart_writes)
         if state_needs_update:
             # The state pointer selects B.  Publish it last so a crash can
@@ -11921,6 +11959,14 @@ def install_release(
                 storage_binding,
                 phase="immediately before install publication",
             )
+        publication_preimages = dict(autostart_preimages)
+        if migration is not None:
+            migration.revalidate()
+            written_paths = {path for path, _content, _mode, _label in writes}
+            publication_preimages.update({
+                path: snapshot for path, snapshot in migration.preimages.items()
+                if path in written_paths
+            })
         # Wrapper files, their legacy preimage receipt, the desktop pair, and
         # the state pointer are one descriptor-journaled set.  Do not let the
         # wrapper API finish and discard its journal before ``state.json``
@@ -11931,7 +11977,8 @@ def install_release(
             writes,
             verify=verify_publication,
             first_install_preimage=first_install_preimage,
-            activation_expected_preimages=autostart_preimages,
+            activation_expected_preimages=publication_preimages,
+            activation_preflight_guards=(migration.parent_guards if migration is not None else None),
             journal_path=_install_publication_journal_path(layout),
             before_publication=before_publication,
             after_publication=after_publication,
@@ -11964,6 +12011,13 @@ def install_release(
             result["autostart"] = autostart_verification
         if storage_attestation is not None:
             result["storage_attestation"] = storage_attestation.as_dict()
+        if migration is not None:
+            result["path_migration"] = {
+                "source_root": str(migration.source_layout.root),
+                "source_bin_dir": str(migration.source_layout.bin_dir),
+                "receipt_path": str(migration.receipt_path),
+                "historical_paths_written": False,
+            }
         return result
 
 

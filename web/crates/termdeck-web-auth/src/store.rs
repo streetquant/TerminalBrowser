@@ -309,6 +309,24 @@ pub struct AuthStore {
 }
 
 impl AuthStore {
+    pub fn require_context(&self, context: &SessionContext, now_ms: u64) -> Result<(), AuthError> {
+        let now_ms = self.observe_time(now_ms)?;
+        let connection = self.lock_connection()?;
+        let valid = connection
+            .query_row(
+                "SELECT 1 FROM auth_sessions s JOIN devices d ON d.device_id=s.device_id
+             WHERE s.session_id=?1 AND s.device_id=?2 AND s.revoked_at_ms IS NULL
+             AND d.revoked_at_ms IS NULL AND s.expires_at_ms>?3",
+                params![
+                    context.session_id().as_str(),
+                    context.device_id().as_str(),
+                    db_timestamp(now_ms)?
+                ],
+                |_| Ok(()),
+            )
+            .optional()?;
+        valid.ok_or(AuthError::Unauthenticated)
+    }
     pub fn open_or_create(
         secure_directory: &Path,
         host_id: HostId,
@@ -1008,7 +1026,11 @@ fn database_identity(metadata: &fs::Metadata) -> Result<DatabaseIdentity, AuthEr
 }
 
 fn validate_database_file(path: &Path) -> Result<(), AuthError> {
-    if path.file_name().and_then(|value| value.to_str()) != Some(AUTH_DATABASE_FILENAME) {
+    validate_private_database_file(path, AUTH_DATABASE_FILENAME)
+}
+
+pub(crate) fn validate_private_database_file(path: &Path, filename: &str) -> Result<(), AuthError> {
+    if path.file_name().and_then(|value| value.to_str()) != Some(filename) {
         return Err(AuthError::InsecurePath("unexpected auth database filename"));
     }
     let metadata = fs::symlink_metadata(path)?;
@@ -1059,7 +1081,7 @@ pub(crate) fn effective_uid() -> Result<u32, AuthError> {
         .map_err(|_| AuthError::InsecurePath("effective uid is malformed"))
 }
 
-fn configure_connection(connection: &Connection) -> Result<(), AuthError> {
+pub(crate) fn configure_connection(connection: &Connection) -> Result<(), AuthError> {
     connection.busy_timeout(Duration::from_millis(2_000))?;
     connection.execute_batch(
         "PRAGMA foreign_keys = ON;

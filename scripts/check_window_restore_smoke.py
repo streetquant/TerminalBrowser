@@ -365,7 +365,7 @@ def main() -> int:
         canonical_accounts.mkdir(mode=0o700)
         for account_id in ("alpha", "beta"):
             account_path = canonical_accounts / f"{account_id}.json"
-            account_path.write_text(json.dumps({"fixture": account_id}) + "\n")
+            account_path.write_text(json.dumps({"token": account_id}) + "\n")
             account_path.chmod(0o600)
         (canonical_home / "auth.json").symlink_to(Path("accounts") / "alpha.json")
         canonical_current = canonical_home / "current"

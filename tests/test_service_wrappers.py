@@ -37,8 +37,10 @@ def _serve_preparer_response(
         connection.sendall(struct.pack("!I", len(encoded)) + encoded)
 
 
-def test_lan_preparer_client_uses_closed_root_broker_protocol(tmp_path: Path) -> None:
-    socket_path = tmp_path / "preparer.sock"
+def test_lan_preparer_client_uses_closed_root_broker_protocol(tmp_path_factory: pytest.TempPathFactory) -> None:
+    # Keep the AF_UNIX pathname bounded under the authoritative runner's
+    # private runtime root, independently of this descriptive test name.
+    socket_path = tmp_path_factory.mktemp("broker") / "preparer.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(os.fspath(socket_path))
     socket_path.chmod(0o600)
@@ -105,6 +107,40 @@ def test_lan_preflight_routes_preparation_through_broker(
     assert calls[1][0:2] == ("/usr/bin/nginx", "-t")
 
 
+def test_backend_admission_exports_persistent_shared_runtime(layout_dirs, monkeypatch):
+    from termdeck import storage_fabric
+
+    layout = wrappers.resolve_layout(**layout_dirs)
+    root = layout.state_root / "tmux"
+    root.mkdir(mode=0o700)
+    calls = []
+    monkeypatch.setattr(storage_fabric, "require_storage_fabric", lambda *a, **kw: calls.append((a, kw)))
+    monkeypatch.setattr(storage_fabric, "tmux_subprocess_environment", lambda **kw: {"TMUX_TMPDIR": str(root)})
+    for name in ("TERMDECK_STATE_ROOT", "TERMDECK_TMUX_RUNTIME", "TMUX_TMPDIR", "TERMDECK_TMUX_IDENTITY", "TMUX"):
+        monkeypatch.setenv(name, "foreign")
+    wrappers._admit_backend_tmux_runtime(layout)
+    assert calls[0][1]["production"] is True
+    assert calls[0][1]["tmux_runtime"] == root
+    assert calls[0][1]["db_path"] == layout.state_root / "sessions.sqlite3"
+    assert os.environ["TMUX_TMPDIR"] == str(root)
+    assert os.environ["TERMDECK_TMUX_RUNTIME"] == str(root)
+    assert os.environ["TERMDECK_TMUX_IDENTITY"] == f"{root.stat().st_dev}:{root.stat().st_ino}:{os.geteuid()}"
+    assert "TMUX" not in os.environ
+
+
+def test_backend_admission_failure_prevents_export(layout_dirs, monkeypatch):
+    from termdeck import storage_fabric
+
+    def reject(*args, **kwargs):
+        raise storage_fabric.StorageFabricError("unadmitted storage")
+
+    monkeypatch.setattr(storage_fabric, "require_storage_fabric", reject)
+    monkeypatch.setenv("TMUX_TMPDIR", "foreign")
+    with pytest.raises(wrappers.WrapperError, match="admission failed"):
+        wrappers._admit_backend_tmux_runtime(wrappers.resolve_layout(**layout_dirs))
+    assert os.environ["TMUX_TMPDIR"] == "foreign"
+
+
 @pytest.fixture()
 def layout_dirs(tmp_path: Path) -> dict[str, Path]:
     paths = {
@@ -141,6 +177,7 @@ def _immutable_execution_site(tmp_path: Path) -> tuple[Path, dict[str, object]]:
             b"    return 0\n"
         ),
         "termdeck/web_activation.py": b"# selected immutable recovery module\n",
+        "termdeck/storage_fabric.py": b"# selected immutable storage module\n",
     }
     binding: dict[str, object] = {}
     for relative, content in modules.items():

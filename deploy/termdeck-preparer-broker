@@ -47,16 +47,24 @@ RESTORE_UNRECEIPTED: Final = "unreceipted"
 RESTORE_VERIFY: Final = "verify"
 SOCKET_FD_NAME: Final = "termdeck-preparer-broker"
 DEFAULT_SOCKET_PATH: Final = Path("/run/termdeck-preparer-broker/request.sock")
-DEFAULT_RUNTIME_ROOT: Final = Path("/warp/projects/softwares/termdeck/.termdeck")
+DEFAULT_PRODUCER_ROOT: Final = Path("/var/lib/termdeck-preparer/runtime")
+DEFAULT_CONSUMER_ROOT: Final = Path("/warp/projects/softwares/termdeck/.termdeck")
+# Compatibility name retained for focused tests and downstream imports.  The
+# preparer always receives the private producer root; max-facing services use
+# ``DEFAULT_CONSUMER_ROOT`` and never obtain access to this tree.
+DEFAULT_RUNTIME_ROOT: Final = DEFAULT_PRODUCER_ROOT
 DEFAULT_BROKER: Final = Path("/usr/libexec/termdeck-preparer-broker")
 DEFAULT_PREPARER: Final = Path("/usr/libexec/termdeck-web-prepare-runtime")
+DEFAULT_PUBLICATION: Final = Path("/usr/libexec/termdeck-preparer-publication")
 PREPARER_ACCOUNT: Final = "termdeck-preparer"
 CALLER_ACCOUNT: Final = "max"
+PUBLICATION_SCHEMA: Final = "termdeck.preparer-publication.v1"
 MAX_FRAME_BYTES: Final = 16 * 1024
 MAX_REQUEST_BYTES: Final = 4096
 FRAME_HEADER_BYTES: Final = 4
 DEFAULT_REQUEST_TIMEOUT: Final = 8.0
 DEFAULT_PREPARER_TIMEOUT: Final = 180.0
+DEFAULT_PUBLICATION_TIMEOUT: Final = 60.0
 _GENERATION = re.compile(r"[0-9a-f]{32}\Z")
 _DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _MAX_EXECUTABLE_BYTES = 16 * 1024 * 1024
@@ -73,7 +81,9 @@ class BrokerConfig:
 
     broker_path: Path = DEFAULT_BROKER
     preparer_path: Path = DEFAULT_PREPARER
+    publication_path: Path = DEFAULT_PUBLICATION
     runtime_root: Path = DEFAULT_RUNTIME_ROOT
+    consumer_root: Path = DEFAULT_CONSUMER_ROOT
     socket_path: Path = DEFAULT_SOCKET_PATH
     preparer_account: str = PREPARER_ACCOUNT
     caller_account: str = CALLER_ACCOUNT
@@ -81,23 +91,40 @@ class BrokerConfig:
     root_gid: int = 0
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT
     preparer_timeout: float = DEFAULT_PREPARER_TIMEOUT
+    publication_timeout: float = DEFAULT_PUBLICATION_TIMEOUT
 
     def __post_init__(self) -> None:
         for value, label in (
             (self.broker_path, "broker path"),
             (self.preparer_path, "preparer path"),
-            (self.runtime_root, "runtime root"),
+            (self.publication_path, "publication helper path"),
+            (self.runtime_root, "producer runtime root"),
+            (self.consumer_root, "consumer runtime root"),
             (self.socket_path, "broker socket path"),
         ):
             _absolute_canonical(value, label=label)
         if (
             self.broker_path.name != "termdeck-preparer-broker"
             or self.preparer_path.name != "termdeck-web-prepare-runtime"
+            or self.publication_path.name != "termdeck-preparer-publication"
             or self.preparer_path.parent != self.broker_path.parent
+            or self.publication_path.parent != self.broker_path.parent
         ):
             raise BrokerError("broker images must use the fixed libexec layout")
-        if self.runtime_root == self.preparer_path or self.runtime_root in self.preparer_path.parents:
-            raise BrokerError("preparer image may not be inside the mutable runtime tree")
+        for image, label in (
+            (self.preparer_path, "preparer image"),
+            (self.publication_path, "publication helper"),
+        ):
+            if self.runtime_root == image or self.runtime_root in image.parents:
+                raise BrokerError(f"{label} may not be inside the mutable producer tree")
+            if self.consumer_root == image or self.consumer_root in image.parents:
+                raise BrokerError(f"{label} may not be inside the mutable consumer tree")
+        if (
+            self.runtime_root == self.consumer_root
+            or self.runtime_root in self.consumer_root.parents
+            or self.consumer_root in self.runtime_root.parents
+        ):
+            raise BrokerError("producer and consumer runtime roots must be disjoint")
         if not self.preparer_account or not self.caller_account:
             raise BrokerError("broker principal names are invalid")
         if self.preparer_account == self.caller_account:
@@ -108,6 +135,8 @@ class BrokerConfig:
             raise BrokerError("broker request timeout is invalid")
         if not 0 < self.preparer_timeout <= 900:
             raise BrokerError("broker preparer timeout is invalid")
+        if not 0 < self.publication_timeout <= 300:
+            raise BrokerError("broker publication timeout is invalid")
 
 
 @dataclass(frozen=True)
@@ -266,10 +295,15 @@ def _validate_installed_file(
     return identity
 
 
-def _open_preparer(config: BrokerConfig) -> tuple[int, FileIdentity]:
+def _open_fixed_executable(
+    path: Path,
+    *,
+    config: BrokerConfig,
+    label: str,
+) -> tuple[int, FileIdentity]:
     expected = _validate_installed_file(
-        config.preparer_path,
-        label="fixed preparer executable",
+        path,
+        label=label,
         owner_uid=config.root_uid,
         owner_gid=config.root_gid,
         mode=0o755,
@@ -279,22 +313,33 @@ def _open_preparer(config: BrokerConfig) -> tuple[int, FileIdentity]:
     if not nofollow:
         raise BrokerError("broker requires O_NOFOLLOW")
     try:
-        descriptor = os.open(
-            config.preparer_path,
-            os.O_RDONLY | os.O_CLOEXEC | nofollow,
-        )
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | nofollow)
     except OSError as exc:
-        raise BrokerError("could not open fixed preparer executable") from exc
+        raise BrokerError(f"could not open {label}") from exc
     try:
-        observed = _regular_identity(
-            os.fstat(descriptor), label="fixed preparer executable"
-        )
+        observed = _regular_identity(os.fstat(descriptor), label=label)
         if observed != expected:
-            raise BrokerError("fixed preparer executable changed while opening")
+            raise BrokerError(f"{label} changed while opening")
         return descriptor, observed
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _open_preparer(config: BrokerConfig) -> tuple[int, FileIdentity]:
+    return _open_fixed_executable(
+        config.preparer_path,
+        config=config,
+        label="fixed preparer executable",
+    )
+
+
+def _open_publication(config: BrokerConfig) -> tuple[int, FileIdentity]:
+    return _open_fixed_executable(
+        config.publication_path,
+        config=config,
+        label="fixed publication helper",
+    )
 
 
 def validate_request(value: object) -> PrepareRequest:
@@ -520,6 +565,117 @@ def run_preparer(
                 raise BrokerError("preparer restore result exceeds its bounded frame")
             return normalized, output
         return normalized
+    finally:
+        if executable_descriptor >= 0:
+            os.close(executable_descriptor)
+
+
+def _publication_environment() -> dict[str, str]:
+    return {
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "TERMDECK_PREPARER_BROKER": "1",
+    }
+
+
+def run_publication(
+    operation: str,
+    *,
+    config: BrokerConfig,
+    principals: Principals,
+    run_process: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+    input_content: bytes | None = None,
+) -> dict[str, object]:
+    """Run the fixed root helper across the private producer/user consumer boundary."""
+
+    if operation not in {"seed", "publish", "verify", "restore"}:
+        raise BrokerError("publication helper operation is invalid")
+    if input_content is not None and (not input_content or len(input_content) > MAX_FRAME_BYTES):
+        raise BrokerError("publication helper input is empty or oversized")
+    _assert_root_invoker(config)
+    _validate_installed_file(
+        config.broker_path,
+        label="broker image",
+        owner_uid=config.root_uid,
+        owner_gid=config.root_gid,
+        mode=0o755,
+        max_bytes=_MAX_EXECUTABLE_BYTES,
+    )
+    if (
+        principals.preparer_uid in {config.root_uid, principals.caller_uid}
+        or principals.preparer_gid == config.root_gid
+        or principals.caller_uid == config.root_uid
+    ):
+        raise BrokerError("publication principals are not separated")
+
+    executable_descriptor = -1
+    try:
+        executable_descriptor, expected = _open_publication(config)
+        command = (
+            f"/proc/self/fd/{executable_descriptor}",
+            operation,
+            "--producer-root",
+            str(config.runtime_root),
+            "--consumer-root",
+            str(config.consumer_root),
+            "--preparer-uid",
+            str(principals.preparer_uid),
+            "--preparer-gid",
+            str(principals.preparer_gid),
+            "--consumer-uid",
+            str(principals.caller_uid),
+            "--consumer-gid",
+            str(principals.caller_gid),
+        )
+        process_options: dict[str, object] = {
+            "check": False,
+            "close_fds": True,
+            "cwd": "/",
+            "env": _publication_environment(),
+            "extra_groups": (),
+            "group": config.root_gid,
+            "pass_fds": (executable_descriptor,),
+            "restore_signals": True,
+            "start_new_session": True,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "timeout": config.publication_timeout,
+            "umask": 0o077,
+            "user": config.root_uid,
+        }
+        if input_content is None:
+            process_options["stdin"] = subprocess.DEVNULL
+        else:
+            process_options["input"] = input_content
+        try:
+            result = run_process(command, **process_options)
+        except subprocess.TimeoutExpired as exc:
+            raise BrokerError("fixed TermDeck publication helper timed out") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BrokerError("could not execute the fixed TermDeck publication helper") from exc
+        if _regular_identity(
+            os.fstat(executable_descriptor), label="fixed publication helper"
+        ) != expected:
+            raise BrokerError("fixed publication helper changed during execution")
+        returncode = int(result.returncode)
+        if returncode != 0:
+            raise BrokerError("fixed TermDeck publication helper refused the transaction")
+        output = getattr(result, "stdout", None)
+        if isinstance(output, str):
+            output = output.encode("utf-8")
+        if not isinstance(output, bytes) or not output or len(output) > MAX_FRAME_BYTES:
+            raise BrokerError("publication helper result is empty or oversized")
+        parsed = _strict_json(output)
+        if (
+            not isinstance(parsed, dict)
+            or parsed.get("schema") != PUBLICATION_SCHEMA
+            or parsed.get("operation") != operation
+            or parsed.get("ok") is not True
+        ):
+            raise BrokerError("publication helper result contract is invalid")
+        return parsed
     finally:
         if executable_descriptor >= 0:
             os.close(executable_descriptor)
@@ -851,6 +1007,12 @@ def serve_once(
         try:
             _assert_peer(peer_credentials(connection), principals=principals)
             request = receive_request(connection, config=config)
+            run_publication(
+                "seed",
+                config=config,
+                principals=principals,
+                run_process=run_process,
+            )
             child_result = run_preparer(
                 request,
                 config=config,
@@ -860,24 +1022,39 @@ def serve_once(
             )
             if isinstance(child_result, tuple):
                 returncode, output = child_result
-                if returncode == 0 and output is not None:
-                    if request.restore_mode == RESTORE_VERIFY:
-                        result = _observe_receipt(config, principals, output)
-                    else:
-                        try:
-                            result = _strict_json(output)
-                        except BrokerError:
-                            raise BrokerError("preparer restore result is not canonical JSON")
-                        if not isinstance(result, dict):
-                            raise BrokerError("preparer restore result is not an object")
-                else:
-                    result = None
             else:
-                returncode, result = child_result, None
-            if returncode == 0:
-                response = _response(returncode=0, error=None, result=result)
-            else:
+                returncode, output = child_result, None
+            if returncode != 0:
                 response = _response(returncode=returncode, error="preparer-failed")
+            else:
+                if request.restore_mode == RESTORE_NONE:
+                    result = run_publication(
+                        "publish",
+                        config=config,
+                        principals=principals,
+                        run_process=run_process,
+                    )
+                elif request.restore_mode == RESTORE_VERIFY:
+                    if output is None:
+                        raise BrokerError("preparer verification result is missing")
+                    _observe_receipt(config, principals, output)
+                    result = run_publication(
+                        "verify",
+                        config=config,
+                        principals=principals,
+                        run_process=run_process,
+                    )
+                else:
+                    if output is None:
+                        raise BrokerError("preparer restore result is missing")
+                    result = run_publication(
+                        "restore",
+                        config=config,
+                        principals=principals,
+                        run_process=run_process,
+                        input_content=output,
+                    )
+                response = _response(returncode=0, error=None, result=result)
         except BrokerError as exc:
             if "timed out" in str(exc):
                 response = _response(returncode=None, error="timeout")

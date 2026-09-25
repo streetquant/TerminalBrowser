@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import os
+from pathlib import Path
+import stat
 from typing import Iterable, Protocol
 
 from .liveness import merge_confirmed_pane_snapshot
@@ -77,6 +80,9 @@ class ReconcileRow:
     changed: bool
     planned: bool
     detail: str
+    observation: str = "observed"
+    recoverable: bool = False
+    auth_scope_state: str = "unassigned"
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -96,6 +102,9 @@ class ReconcileRow:
             "changed": self.changed,
             "planned": self.planned,
             "detail": self.detail,
+            "observation": self.observation,
+            "recoverable": self.recoverable,
+            "auth_scope_state": self.auth_scope_state,
         }
 
 
@@ -117,17 +126,32 @@ class ReconcileResult:
         }
 
 
-def _observe_record(record: SessionRecord, backend: BackendLike, sampler: SamplerLike) -> tuple[bool, int | None, ResourceSnapshot]:
+def _auth_scope_state(record: SessionRecord) -> str:
+    """Report stale scope metadata without reading, deleting or repairing credentials."""
+    if not record.codex_home and not record.auth_scope_id:
+        return "unassigned"
+    if not record.codex_home or not record.auth_scope_id:
+        return "partial"
+    home = Path(record.codex_home)
+    if not home.is_absolute() or home.name != record.auth_scope_id:
+        return "unsafe"
     try:
-        live_session = backend.session_exists(record)
-    except TmuxError:
-        live_session = False
+        info = home.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700 or home.resolve() != home):
+            return "unsafe"
+    except FileNotFoundError:
+        return "missing"
+    except (OSError, RuntimeError):
+        return "unavailable"
+    return "present"
+
+
+def _observe_record(record: SessionRecord, backend: BackendLike, sampler: SamplerLike) -> tuple[bool, int | None, ResourceSnapshot]:
+    live_session = backend.session_exists(record)
     if not live_session:
         return False, None, sampler.snapshot(None)
-    try:
-        pid = backend.pane_pid(record)
-    except TmuxError:
-        pid = None
+    pid = backend.pane_pid(record)
     snapshot = sampler.snapshot(pid)
     snapshot = merge_confirmed_pane_snapshot(
         snapshot,
@@ -382,24 +406,41 @@ def reconcile_records(
     # snapshots over one has-session + pane lookup per record.
     live_by_id: dict[str, bool] | None = None
     pids_by_id: dict[str, int | None] | None = None
+    evidence: dict[str, dict[str, object]] = {}
+    authoritative = getattr(backend, "reconciliation_snapshot", None)
+    if callable(authoritative):
+        try:
+            evidence = authoritative(record_list)
+        except TmuxError:
+            evidence = {record.id: {"state": "unavailable"} for record in record_list}
+        live_by_id = {record.id: evidence.get(record.id, {}).get("state") in {"live", "unobservable"}
+                      for record in record_list}
+        pids_by_id = {record.id: evidence.get(record.id, {}).get("pid") if live_by_id[record.id] else None
+                      for record in record_list}
     exists_many = getattr(backend, "session_exists_many", None)
-    if callable(exists_many):
+    if live_by_id is None and callable(exists_many):
         try:
             live_by_id = dict(exists_many(record_list))
         except TmuxError:
-            live_by_id = None
+            live_by_id = {record.id: False for record in record_list}
+            evidence = {record.id: {"state": "unavailable"} for record in record_list}
     pane_pids = getattr(backend, "pane_pids", None)
-    if live_by_id is not None and callable(pane_pids):
+    if live_by_id is not None and not evidence and callable(pane_pids):
         live_records = [record for record in record_list if live_by_id.get(record.id, False)]
         try:
             pids_by_id = dict(pane_pids(live_records))
         except TmuxError:
-            pids_by_id = None
+            pids_by_id = {}
+            evidence = {record.id: {"state": "unavailable"} for record in live_records}
 
     observations: list[tuple[SessionRecord, bool, int | None, ResourceSnapshot]] = []
     if live_by_id is None:
         for record in record_list:
-            live_session, pid, snapshot = _observe_record(record, backend, sampler)
+            try:
+                live_session, pid, snapshot = _observe_record(record, backend, sampler)
+            except TmuxError:
+                live_session, pid, snapshot = False, None, ResourceSnapshot(None, False)
+                evidence[record.id] = {"state": "unavailable"}
             observations.append((record, live_session, pid, snapshot))
     else:
         resolved: list[tuple[SessionRecord, bool, int | None]] = []
@@ -412,8 +453,9 @@ def reconcile_records(
                     pid = pids_by_id.get(record.id) if pids_by_id is not None else backend.pane_pid(record)
                 except TmuxError:
                     pid = None
+                    evidence[record.id] = {"state": "unavailable"}
             resolved.append((record, live_session, pid))
-        if getattr(backend, "pane_snapshot_stale", False):
+        if not callable(authoritative) and getattr(backend, "pane_snapshot_stale", False):
             # A failed tmux control-plane query returned remembered PIDs. Do
             # not use those stale identifiers as proof that sessions died or
             # changed state; wait for a successful bounded pane snapshot.
@@ -421,6 +463,7 @@ def reconcile_records(
                 ResourceSnapshot(pid=pid, exists=live_session, state="unknown")
                 for _record, live_session, pid in resolved
             ]
+            evidence = {record.id: {"state": "unavailable"} for record in record_list}
         else:
             snapshots = _sample_many(
                 sampler,
@@ -431,7 +474,7 @@ def reconcile_records(
                 merge_confirmed_pane_snapshot(
                     snapshot,
                     pane_pid=pid,
-                    pane_confirmed=live_session and pid is not None,
+                    pane_confirmed=live_session and pid is not None and not callable(authoritative),
                 )
                 for (_record, live_session, pid), snapshot in zip(resolved, snapshots)
             ]
@@ -442,6 +485,14 @@ def reconcile_records(
 
     pending_updates: list[tuple[str, str, bool, int | None]] = []
     for record, live_session, pid, snapshot in observations:
+        observed = evidence.get(record.id, {})
+        state = str(observed.get("state", "observed"))
+        if state == "live" and not backend.reconciliation_identity_current(observed):
+            state = "identity-changed"
+        if state in {"dead", "identity-mismatch", "identity-changed"}:
+            live_session, pid, snapshot = False, None, ResourceSnapshot(None, False)
+        elif state == "unobservable":
+            snapshot = ResourceSnapshot(pid, True, state="unknown")
         after_status, after_visible, after_pid, detail = _desired_state(
             record,
             live_session=live_session,
@@ -450,6 +501,12 @@ def reconcile_records(
             hide_missing=hide_missing,
             recover_missing=recover_missing,
         )
+        if state == "unavailable":
+            after_status, after_visible, after_pid = record.status, record.visible, record.last_pid
+            live_session, snapshot = False, ResourceSnapshot(None, False)
+            detail = "backend unavailable; durable state preserved without claiming live recovery"
+        elif state in {"dead", "identity-mismatch", "identity-changed"}:
+            detail = f"{state}: {detail}"
         changed = (
             after_status != record.status
             or after_visible != record.visible
@@ -475,12 +532,29 @@ def reconcile_records(
                 changed=changed,
                 planned=dry_run,
                 detail=detail,
+                observation=state,
+                recoverable=startup_recovery_allowed(record) and not live_session,
+                auth_scope_state=_auth_scope_state(record),
             )
         )
 
     if pending_updates and store is not None and not dry_run:
+        compare_update = getattr(store, "reconcile_runtime_states", None)
         update_many = getattr(store, "update_runtime_states", None)
-        if callable(update_many):
+        if callable(compare_update):
+            applied = compare_update(pending_updates, {record.id: record for record in record_list})
+            reconciled = []
+            for row in rows:
+                if row.changed and row.id not in applied:
+                    current = store.get(row.id)
+                    row = replace(row, changed=False, live_session=False, live_process=False,
+                                  after_status=current.status if current else "removed",
+                                  after_visible=current.visible if current else False,
+                                  after_pid=current.last_pid if current else None,
+                                  observation="concurrent-change", detail="newer registry change preserved")
+                reconciled.append(row)
+            rows = reconciled
+        elif callable(update_many):
             update_many(pending_updates)
         else:
             for session_id, status, visible, last_pid in pending_updates:

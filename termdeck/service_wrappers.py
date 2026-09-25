@@ -232,6 +232,7 @@ _REQUIRED_EXECUTION_MODULES = frozenset(
     {
         "termdeck/__init__.py",
         "termdeck/service_wrappers.py",
+        "termdeck/storage_fabric.py",
         "termdeck/web_activation.py",
     }
 )
@@ -2195,6 +2196,38 @@ def _request_lan_preparation(
     return result
 
 
+def _admit_backend_tmux_runtime(layout: WrapperLayout) -> None:
+    """Export the same storage admission used by the managed desktop launcher.
+
+    The Rust backend survives this wrapper's exec. Only durable paths and an
+    identity tuple cross that boundary; an open directory descriptor does not.
+    """
+    from .storage_fabric import StorageFabricError, require_storage_fabric, tmux_subprocess_environment
+
+    runtime = layout.state_root / "tmux"
+    try:
+        require_storage_fabric(
+            layout.managed_root,
+            db_path=layout.state_root / "sessions.sqlite3",
+            auth_root=layout.state_root / "terminal-auth",
+            tmux_runtime=runtime,
+            runtime_root=layout.state_root / "runtime",
+            checkpoint_root=layout.state_root / "checkpoints",
+            production=True,
+        )
+        child = tmux_subprocess_environment(materialize=True)
+    except StorageFabricError as exc:
+        raise WrapperError(f"backend tmux admission failed: {exc}") from exc
+    if child is None:
+        raise WrapperError("backend tmux admission produced no runtime binding")
+    metadata = runtime.lstat()
+    os.environ["TERMDECK_STATE_ROOT"] = str(layout.state_root)
+    os.environ["TERMDECK_TMUX_RUNTIME"] = str(runtime)
+    os.environ["TMUX_TMPDIR"] = str(runtime)
+    os.environ["TERMDECK_TMUX_IDENTITY"] = f"{metadata.st_dev}:{metadata.st_ino}:{metadata.st_uid}"
+    os.environ.pop("TMUX", None)
+
+
 def _preflight_unit_start(spec: UnitSpec, layout: WrapperLayout) -> tuple[str, ...]:
     paths = _runtime_paths(layout)
     if spec.kind == "checkpoint":
@@ -2207,6 +2240,7 @@ def _preflight_unit_start(spec: UnitSpec, layout: WrapperLayout) -> tuple[str, .
         _regular_executable(Path("/usr/bin/tmux"), label="tmux", allow_system_symlink=True)
         _regular_input(paths["database"], label="session database")
         _assert_directory(paths["auth"], label="backend auth directory", must_exist=True)
+        _admit_backend_tmux_runtime(layout)
     elif spec.kind == "lan":
         _regular_executable(Path("/usr/bin/nginx"), label="nginx", allow_system_symlink=True)
         _regular_input(paths["nginx_conf"], label="nginx configuration")

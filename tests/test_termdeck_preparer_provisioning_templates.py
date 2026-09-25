@@ -56,7 +56,7 @@ def test_tmpfiles_separates_preparer_state_from_root_signing_state() -> None:
         ["d", "/var/lib/termdeck-preparer", "0700", "termdeck-preparer", "termdeck-preparer", "-"],
         [
             "d",
-            "/warp/projects/softwares/termdeck/.termdeck",
+            "/var/lib/termdeck-preparer/runtime",
             "0700",
             "termdeck-preparer",
             "termdeck-preparer",
@@ -64,7 +64,7 @@ def test_tmpfiles_separates_preparer_state_from_root_signing_state() -> None:
         ],
         [
             "z",
-            "/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key",
+            "/var/lib/termdeck-preparer/.termdeck-tls-recovery-key",
             "0600",
             "termdeck-preparer",
             "termdeck-preparer",
@@ -79,6 +79,9 @@ def test_tmpfiles_separates_preparer_state_from_root_signing_state() -> None:
         or fields[0] in {"f", "f+", "w", "w+"}
         for fields in lines
     )
+    assert not any(
+        "/warp/projects/softwares/termdeck/.termdeck" in fields for fields in lines
+    )
 
 
 def test_attestor_is_root_only_and_sees_only_the_canonical_receipt() -> None:
@@ -92,27 +95,28 @@ def test_attestor_is_root_only_and_sees_only_the_canonical_receipt() -> None:
     assert values["ReadOnlyPaths"] == [
         "/etc/termdeck/control/runtime-attestd.key /etc/termdeck/runtime-attestd.pub"
     ]
-    assert values["TemporaryFileSystem"] == ["/warp:ro"]
-    assert values["BindReadOnlyPaths"] == [
-        "/warp/projects/softwares/termdeck/.termdeck"
-    ]
+    assert "TemporaryFileSystem" not in values
+    assert values["BindReadOnlyPaths"] == ["/var/lib/termdeck-preparer/runtime"]
     assert values["ConditionPathIsDirectory"] == [
         "/etc/termdeck/control",
         "/etc/termdeck/control/records",
-        "/warp/projects/softwares/termdeck/.termdeck",
+        "/var/lib/termdeck-preparer/runtime",
     ]
-    assert "/warp/projects/softwares/termdeck/.termdeck/build-receipt.json" not in values.get(
+    assert "/var/lib/termdeck-preparer/runtime/build-receipt.json" not in values.get(
         "ConditionPathExists", []
     )
     assert values["RestrictAddressFamilies"] == ["AF_UNIX"]
     assert values["PrivateNetwork"] == ["yes"]
     assert values["NoNewPrivileges"] == ["yes"]
-    assert values["CapabilityBoundingSet"] == ["CAP_CHOWN"]
+    assert values["CapabilityBoundingSet"] == ["CAP_CHOWN CAP_DAC_READ_SEARCH"]
     assert values["AmbientCapabilities"] == [""]
     assert values["ProtectSystem"] == ["strict"]
     assert values["ProtectHome"] == ["yes"]
     assert values["MemoryDenyWriteExecute"] == ["yes"]
     assert not any(key.startswith("Socket") for key in values)
+    assert "/warp/projects/softwares/termdeck/.termdeck" not in ATTESTOR.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_broker_socket_is_private_to_the_fixed_max_caller() -> None:
@@ -146,18 +150,14 @@ def test_broker_is_socket_only_root_dispatch_with_fixed_child_state_paths() -> N
     assert values["RuntimeDirectory"] == ["termdeck-preparer-broker"]
     assert values["RuntimeDirectoryMode"] == ["0711"]
     assert values["ReadWritePaths"] == [
-        "/var/lib/termdeck-preparer /warp/projects/softwares/termdeck/.termdeck "
-        "-/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key"
+        "/var/lib/termdeck-preparer /warp/projects/softwares/termdeck/.termdeck"
     ]
     assert values["TemporaryFileSystem"] == ["/warp:ro"]
-    assert values["BindPaths"] == [
-        "/warp/projects/softwares/termdeck/.termdeck "
-        "-/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key"
+    assert values["BindPaths"] == ["/warp/projects/softwares/termdeck/.termdeck"]
+    assert "ConditionPathExists" not in values
+    assert values["CapabilityBoundingSet"] == [
+        "CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_KILL"
     ]
-    assert values["ConditionPathExists"] == [
-        "/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key"
-    ]
-    assert values["CapabilityBoundingSet"] == ["CAP_SETUID CAP_SETGID CAP_KILL"]
     assert values["AmbientCapabilities"] == [""]
     assert values["NoNewPrivileges"] == ["yes"]
     assert values["RestrictAddressFamilies"] == ["AF_UNIX AF_NETLINK"]

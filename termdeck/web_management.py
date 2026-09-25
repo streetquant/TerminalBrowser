@@ -21,12 +21,15 @@ class ManagementError(ValueError):
 
 FIELDS = {
     "list": {"query", "view", "offset", "limit", "window_id", "sort", "descending"},
-    "create-window": {"name"}, "rename-window": {"window_id", "name"},
+    "create-window": {"name", "request_id", "_actor_session"}, "rename-window": {"window_id", "name"},
     "reorder": {"window_id", "ids", "expected"},
     "move": {"window_id", "ids", "sources"},
     "bulk": {"action", "ids", "confirmation"},
     "rename": {"ids", "name"}, "capture": {"ids"},
     "appearance": {"mode", "values", "revision", "confirmation"},
+    "accounts": set(),
+    "switch-account": {"request_id", "_actor_session", "ids", "expected", "account", "confirmation"},
+    "switch-all-accounts": {"request_id", "_actor_session", "ids", "expected", "account", "confirmation"},
 }
 
 
@@ -88,10 +91,36 @@ def handle(store: SessionStore, request: object, *, backend=None):
     if operation == "appearance":
         from .web_appearance import exchange
         return exchange(request)
+    if operation in {"accounts", "switch-account", "switch-all-accounts"}:
+        from .web_accounts import handle as accounts
+        return accounts(store, request, backend=backend)
     if operation == "list":
         return listing(store, request, backend=backend)
     if operation == "create-window":
         name = text(request.get("name"))
+        if "request_id" in request:
+            request_id = request["request_id"]
+            if not isinstance(request_id, str) or not re.fullmatch("[0-9a-f]{32}", request_id):
+                raise ManagementError("Invalid creation request identity")
+            actor = identity(request.get("_actor_session", "local"))
+            store.conn.execute("CREATE TABLE IF NOT EXISTS web_window_requests(session_id TEXT NOT NULL,request_id TEXT NOT NULL,name TEXT NOT NULL,window_id TEXT NOT NULL,PRIMARY KEY(session_id,request_id))")
+            with store.conn:
+                store.conn.execute("BEGIN IMMEDIATE")
+                prior = store.conn.execute("SELECT name,window_id FROM web_window_requests WHERE session_id=? AND request_id=?", (actor,request_id)).fetchone()
+                if prior:
+                    if prior[0] != name:
+                        raise ManagementError("Creation request was already used with a different name")
+                    window = store.conn.execute("SELECT window_title FROM remembered_windows WHERE window_id=?", (prior[1],)).fetchone()
+                    if not window:
+                        raise ManagementError("Previously created window is no longer available")
+                    return {"ok": True, "window_id": prior[1], "window_name": window[0], "replayed": True}
+                if store.conn.execute("SELECT count(*) FROM web_window_requests").fetchone()[0] >= 32768:
+                    raise ManagementError("Window creation receipt capacity reached")
+                window_id = "win-" + uuid.uuid4().hex
+                now = utc_now()
+                store.conn.execute("INSERT INTO remembered_windows VALUES(?,?,?,?)", (window_id,name,now,now))
+                store.conn.execute("INSERT INTO web_window_requests VALUES(?,?,?,?)", (actor,request_id,name,window_id))
+            return {"ok": True, "window_id": window_id, "window_name": name}
         window_id = "win-" + uuid.uuid4().hex
         store.remember_window(window_id, name)
         return {"ok": True, "window_id": window_id}

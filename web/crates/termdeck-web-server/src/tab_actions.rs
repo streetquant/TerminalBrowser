@@ -6,6 +6,7 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -170,6 +171,60 @@ fn hidden_tabs(payload: Value, window_id: &str) -> Result<Vec<HiddenTab>, TabAct
 }
 
 impl TabActionService {
+    pub(crate) async fn stage(
+        &self,
+        auth_dir: &Path,
+        envelope: Value,
+    ) -> Result<Value, TabActionError> {
+        validate_absolute_path(auth_dir, "authentication directory")?;
+        let encoded = serde_json::to_vec(&envelope)?;
+        if encoded.len() > 384 * 1024 {
+            return Err(TabActionError::InvalidCommand);
+        }
+        let _permit = Arc::clone(&self.operation_slots)
+            .try_acquire_owned()
+            .map_err(|_| TabActionError::Busy)?;
+        let mut command = Command::new(self.executable.as_ref());
+        command
+            .arg("client-files")
+            .arg("--db")
+            .arg(self.database_path.as_ref())
+            .arg("--auth-dir")
+            .arg(auth_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let Some(mut input) = child.stdin.take() else {
+            return Err(TabActionError::InvalidCommand);
+        };
+        let Some(output) = child.stdout.take() else {
+            return Err(TabActionError::InvalidCommand);
+        };
+        timeout(self.command_timeout, async {
+            input.write_all(&encoded).await?;
+            drop(input);
+            let mut bytes = Vec::new();
+            output
+                .take((MAX_TAB_ACTION_OUTPUT_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await?;
+            if bytes.len() > MAX_TAB_ACTION_OUTPUT_BYTES {
+                return Err(TabActionError::OutputTooLarge {
+                    actual: bytes.len(),
+                    maximum: MAX_TAB_ACTION_OUTPUT_BYTES,
+                });
+            }
+            if !child.wait().await?.success() {
+                return Err(TabActionError::InvalidCommand);
+            }
+            Ok(serde_json::from_slice(&bytes)?)
+        })
+        .await
+        .map_err(|_| TabActionError::Timeout)?
+    }
+
     pub(crate) async fn manage(&self, request: Value) -> Result<Value, TabActionError> {
         let operation = request.get("operation").and_then(Value::as_str);
         if !matches!(
@@ -184,6 +239,9 @@ impl TabActionService {
                     | "rename"
                     | "capture"
                     | "appearance"
+                    | "accounts"
+                    | "switch-account"
+                    | "switch-all-accounts"
             )
         ) {
             return Err(TabActionError::InvalidAction);

@@ -22,7 +22,11 @@ def _drain_gtk(Gtk, *, until=None, timeout: float = 4.0) -> None:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="termdeck-visual-polish-") as tmp:
+    from smoke_support import require_private_validation_runtime
+
+    # tmux's AF_UNIX socket includes the fixture root. Keep it inside the
+    # admitted disposable runtime and below the kernel's pathname limit.
+    with tempfile.TemporaryDirectory(prefix="vp-", dir=require_private_validation_runtime()) as tmp:
         root_dir = Path(tmp)
         home = root_dir / "home"
         tmux_tmp = root_dir / "tmux"
@@ -86,7 +90,10 @@ def main() -> int:
             def terminal_text() -> str:
                 return attach.terminal.get_text_format(Vte.Format.TEXT) or ""
 
-            _drain_gtk(Gtk, until=lambda: "T1000_VISIBLE_TERMINAL" in terminal_text(), timeout=12)
+            try:
+                _drain_gtk(Gtk, until=lambda: "T1000_VISIBLE_TERMINAL" in terminal_text(), timeout=12)
+            except RuntimeError as exc:
+                raise RuntimeError(f"visual fixture terminal did not render: text={terminal_text()!r}; records={app.store.list()!r}") from exc
             for width, height in ((640, 480), (980, 620), (640, 480)):
                 previous_grid = (attach.terminal.get_column_count(), attach.terminal.get_row_count())
                 window.resize(width, height)

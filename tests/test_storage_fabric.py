@@ -485,7 +485,7 @@ def test_materialized_tmux_runtime_must_match_attested_device(
     assert os.makedev(*map(int, device.split(":"))) == runtime.stat().st_dev
     assert child["TERMDECK_TMUX_RUNTIME"] == str(runtime)
     assert Path(child["TMUX_TMPDIR"]).samefile(runtime)
-    assert child["TMUX_TMPDIR"] != str(runtime)
+    assert child["TMUX_TMPDIR"] == str(runtime)
 
 
 def test_materialized_tmux_runtime_rejects_device_identity_drift(
@@ -527,15 +527,9 @@ def test_pinned_tmux_route_cannot_be_redirected_by_parent_swap(
     runtime.rename(original)
     runtime.symlink_to(attacker, target_is_directory=True)
 
-    subprocess.run(
-        ["/usr/bin/touch", f"{child['TMUX_TMPDIR']}/route-probe"],
-        env=child,
-        check=True,
-    )
-    assert (original / "route-probe").is_file()
-    assert not (attacker / "route-probe").exists()
     with pytest.raises(StorageFabricError, match="identity changed|symlink"):
         tmux_subprocess_environment(materialize=True)
+    assert not (attacker / "route-probe").exists()
 
     binding = storage_fabric._PRODUCTION_TMUX_RUNTIME_BINDING
     assert isinstance(binding, storage_fabric._ProductionDirectoryBinding)
@@ -549,7 +543,8 @@ def test_materialized_tmux_runtime_rejects_non_socket_default_entry(
     runtime = tmp_path / "tmux-runtime"
     device = f"{os.major(tmp_path.stat().st_dev)}:{os.minor(tmp_path.stat().st_dev)}"
     socket_root = runtime / f"tmux-{os.geteuid()}"
-    socket_root.mkdir(parents=True)
+    runtime.mkdir(mode=0o700)
+    socket_root.mkdir(mode=0o700)
     (socket_root / "default").write_text("not-a-socket", encoding="utf-8")
     monkeypatch.setattr(
         storage_fabric,

@@ -263,6 +263,7 @@ def test_current_release_wrappers_bind_verified_wheel_site(
     modules = {
         "termdeck/__init__.py": f'__version__ = "{version}"\n'.encode(),
         "termdeck/service_wrappers.py": b"def main(**kwargs):\n    return 0\n",
+        "termdeck/storage_fabric.py": b"# immutable runtime admission module\n",
         "termdeck/web_activation.py": b"# immutable activation module\n",
     }
     info = write_wheel(wheel, seed="a", version=version, extra_members=modules)
@@ -285,6 +286,7 @@ def test_current_release_wrappers_bind_verified_wheel_site(
     assert set(binding) == {
         "termdeck/__init__.py",
         "termdeck/service_wrappers.py",
+        "termdeck/storage_fabric.py",
         "termdeck/web_activation.py",
     }
     accessor = release_manager.release_wrapper_execution_binding(
@@ -334,6 +336,9 @@ def test_immutable_wrapper_binding_tracks_rollback_target(tmp_path: Path) -> Non
             "termdeck/__init__.py": f'__version__ = "{version}"\n'.encode(),
             "termdeck/service_wrappers.py": (
                 f"# selected wrapper module {seed}\n".encode()
+            ),
+            "termdeck/storage_fabric.py": (
+                f"# selected runtime admission module {seed}\n".encode()
             ),
             "termdeck/web_activation.py": (
                 f"# selected activation module {seed}\n".encode()

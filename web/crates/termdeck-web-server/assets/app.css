@@ -1428,3 +1428,25 @@ html[data-reduce-motion="true"] *, html[data-reduce-motion="true"] *::before, ht
   html[data-chrome] .window-list-main { padding: 20px 12px; }
   .manager-table-scroll { max-height: 38dvh; }
 }
+
+/* Explicit client selection and host-staged immutable copies. */
+.client-files { display: grid; gap: .75rem; min-width: 0; }
+.client-files > div, .new-window-configuration > div { display: grid; gap: .6rem; }
+.client-files .workspace-field { min-width: 0; }
+.client-files input[type="file"] { max-width: 100%; }
+.client-files progress { width: 100%; }
+.client-machine-status, .client-files-notice { overflow-wrap: anywhere; }
+.client-file-row { border: 1px solid var(--line, #303849); border-radius: .5rem; padding: .8rem; margin-top: .6rem; overflow-wrap: anywhere; }
+.client-file-row p { font-size: .85rem; }
+.client-file-row[data-status="changed"], .client-file-row[data-status="failed"] { opacity: .8; }
+.client-file-actions { display: flex; flex-wrap: wrap; gap: .4rem; }
+.client-file-detail { margin-top: .6rem; padding-top: .5rem; border-top: 1px solid var(--line, #303849); }
+.client-file-drop { border: 1px dashed var(--line, #55607a); padding: 1rem; border-radius: .5rem; }
+.new-window-configuration { margin: .6rem 0; }
+.new-window-configuration > summary { cursor: pointer; padding: .5rem 0; }
+.new-window-configuration textarea { min-height: 4rem; resize: vertical; }
+.client-files-controls { border: 0; padding: 0; margin: 0; min-width: 0; }
+.client-files-controls > div { display: grid; gap: .6rem; }
+.client-files .workspace-field:has(input[type="checkbox"]) { display: flex; align-items: center; justify-content: space-between; gap: .75rem; min-height: 44px; }
+.client-files input[type="checkbox"] { width: 22px; height: 22px; min-height: 22px; padding: 0; flex: 0 0 22px; }
+.management-dialog:has(.new-window-configuration[open]) { width: min(900px, calc(100vw - 24px)); }

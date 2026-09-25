@@ -9,9 +9,12 @@
 //! mirrored state routes.
 
 mod auth_http;
+mod machine_http;
+mod staging_http;
 mod tab_actions;
 mod terminal_http;
 mod terminal_stream;
+mod tmux_runtime;
 
 use auth_http::{
     DEVICES_PATH, HttpAuth, HttpAuthError, LOGIN_PATH, LOGOUT_PATH, MAX_AUTH_REQUEST_BYTES,
@@ -55,7 +58,6 @@ use termdeck_web_state::{
     MAX_DATABASE_ROWS, ReadOnlyStateMirror, StateError, TmuxInventory, TmuxPaneState,
 };
 use tokio::net::TcpListener;
-use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::time::{MissedTickBehavior, timeout};
 
@@ -80,11 +82,13 @@ pub const MAX_FRONTEND_ASSET_BYTES: usize = 64 * 1024;
 pub const MAX_TERMINAL_ASSET_BYTES: usize = 1024 * 1024;
 pub const MAX_HTTP_REQUEST_BYTES: usize = MAX_TERMINAL_INPUT_BYTES + 1_024;
 
-const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v6/app.css";
-const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v6/app.js";
-const WORKSPACE_UI_PATH: &str = "/_termdeck/assets/v6/workspace-ui.js";
-const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v6/terminal.css";
-const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v6/terminal.js";
+const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v7/app.css";
+const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v7/app.js";
+const CLIENT_FILES_PATH: &str = "/_termdeck/assets/v7/client-files.js";
+const ACCOUNTS_PATH: &str = "/_termdeck/assets/v7/accounts.js";
+const WORKSPACE_UI_PATH: &str = "/_termdeck/assets/v7/workspace-ui.js";
+const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v7/terminal.css";
+const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v7/terminal.js";
 const EXTERNAL_BASE_PATH: &str = "/t1000";
 const ROOT_COOKIE_PATH: &str = "; Path=/;";
 const EXTERNAL_COOKIE_PATH: &str = "; Path=/t1000;";
@@ -94,12 +98,16 @@ const FORWARDED_HOST_HEADER: &str = "x-forwarded-host";
 const BASE_PATH_PLACEHOLDER: &str = "__TERMDECK_BASE_PATH__";
 const APP_CSS: &[u8] = include_bytes!("../assets/app.css");
 const APP_JS: &[u8] = include_bytes!("../assets/app.js");
+const CLIENT_FILES_JS: &[u8] = include_bytes!("../assets/client-files.js");
+const ACCOUNTS_JS: &[u8] = include_bytes!("../assets/accounts.js");
 const WORKSPACE_UI_JS: &[u8] = include_bytes!("../assets/workspace-ui.js");
 const TERMINAL_CSS: &[u8] = include_bytes!("../assets/terminal.css");
 const TERMINAL_JS: &[u8] = include_bytes!("../assets/terminal.js");
 const _: () = {
     assert!(APP_CSS.len() <= MAX_FRONTEND_ASSET_BYTES);
     assert!(APP_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+    assert!(CLIENT_FILES_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+    assert!(ACCOUNTS_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
     assert!(WORKSPACE_UI_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
     assert!(TERMINAL_CSS.len() <= MAX_TERMINAL_ASSET_BYTES);
     assert!(TERMINAL_JS.len() <= MAX_TERMINAL_ASSET_BYTES);
@@ -804,6 +812,7 @@ fn create_pairing_invitation(config: InvitationConfig) -> Result<(), ServerError
 }
 
 pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
+    tmux_runtime::initialize()?;
     if !config.listen.ip().is_loopback() {
         return Err(ServerError::NonLoopbackRequiresAuthentication(
             config.listen,
@@ -926,6 +935,8 @@ fn build_router(state: AppState) -> Router {
         .route("/", get(homepage))
         .route(FRONTEND_CSS_PATH, get(frontend_css))
         .route(FRONTEND_JS_PATH, get(frontend_js))
+        .route(CLIENT_FILES_PATH, get(client_files_js))
+        .route(ACCOUNTS_PATH, get(accounts_js))
         .route(WORKSPACE_UI_PATH, get(workspace_ui_js))
         .route(TERMINAL_CSS_PATH, get(terminal_css))
         .route(TERMINAL_JS_PATH, get(terminal_js))
@@ -937,6 +948,18 @@ fn build_router(state: AppState) -> Router {
         .route(SESSION_PATH, get(session_info))
         .route(LOGOUT_PATH, axum::routing::post(logout))
         .route(DEVICES_PATH, get(devices))
+        .route(
+            "/_termdeck/api/v1/machines",
+            get(machine_http::list).post(machine_http::mutate),
+        )
+        .route(
+            "/_termdeck/api/v1/machines/current",
+            get(machine_http::current),
+        )
+        .route(
+            "/_termdeck/api/v1/client-files",
+            axum::routing::post(staging_http::operate),
+        )
         .route(
             "/_termdeck/api/v1/devices/{device_id}/revoke",
             axum::routing::post(revoke_device),
@@ -1139,6 +1162,8 @@ fn public_auth_route(path: &str) -> bool {
         path,
         FRONTEND_CSS_PATH
             | FRONTEND_JS_PATH
+            | CLIENT_FILES_PATH
+            | ACCOUNTS_PATH
             | WORKSPACE_UI_PATH
             | TERMINAL_CSS_PATH
             | TERMINAL_JS_PATH
@@ -1155,6 +1180,8 @@ async fn security_headers(request: Request, next: Next) -> Response {
         request.uri().path(),
         FRONTEND_CSS_PATH
             | FRONTEND_JS_PATH
+            | CLIENT_FILES_PATH
+            | ACCOUNTS_PATH
             | WORKSPACE_UI_PATH
             | TERMINAL_CSS_PATH
             | TERMINAL_JS_PATH
@@ -1228,6 +1255,22 @@ async fn frontend_js() -> Response {
         StatusCode::OK,
         "text/javascript; charset=utf-8",
         Bytes::from_static(APP_JS),
+    )
+}
+
+async fn client_files_js() -> Response {
+    text_response(
+        StatusCode::OK,
+        "text/javascript; charset=utf-8",
+        Bytes::from_static(CLIENT_FILES_JS),
+    )
+}
+
+async fn accounts_js() -> Response {
+    text_response(
+        StatusCode::OK,
+        "text/javascript; charset=utf-8",
+        Bytes::from_static(ACCOUNTS_JS),
     )
 }
 
@@ -1822,8 +1865,46 @@ fn tab_action_context(
 async fn management(
     State(state): State<AppState>,
     context: Option<Extension<SessionContext>>,
-    Json(request): Json<serde_json::Value>,
+    headers: HeaderMap,
+    Json(mut request): Json<serde_json::Value>,
 ) -> Response {
+    if request.get("_actor_session").is_some() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"ok":false,"error":"invalid request field"}),
+        );
+    }
+    if request.get("operation").and_then(serde_json::Value::as_str) == Some("launch-options")
+        || request.get("operation").and_then(serde_json::Value::as_str) == Some("create-window")
+            && request.get("workspace_id").is_some()
+    {
+        let mut bridge = Request::new(Body::from(request.to_string()));
+        *bridge.headers_mut() = headers;
+        return staging_http::operate(State(state), context, bridge).await;
+    }
+    if matches!(
+        request.get("operation").and_then(serde_json::Value::as_str),
+        Some("create-window" | "switch-account" | "switch-all-accounts")
+    ) {
+        let valid_id = request
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| {
+                s.len() == 32
+                    && s.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            });
+        if !valid_id {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"ok":false,"error":"creation request ID required"}),
+            );
+        }
+        let Some(Extension(ref session)) = context else {
+            return forbidden_response("authentication is required");
+        };
+        request["_actor_session"] = session.session_id().as_str().into();
+    }
     let actions = match tab_action_context(&state, context) {
         Ok(value) => value,
         Err(response) => return *response,
@@ -1993,6 +2074,10 @@ async fn terminal_page(
     output.push_str(TERMINAL_CSS_PATH);
     output.push_str("\"><script defer src=\"");
     output.push_str(TERMINAL_JS_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(CLIENT_FILES_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(ACCOUNTS_PATH);
     output.push_str("\"></script><script defer src=\"");
     output.push_str(WORKSPACE_UI_PATH);
     output.push_str("\"></script><script defer src=\"");
@@ -2411,7 +2496,7 @@ fn password_page_response(
     let mut output = String::with_capacity(2_048);
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>");
     escape_html_into(&mut output, title);
-    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v6/app.css\"></head><body class=\"auth-page\"><main class=\"auth-main\"><p class=\"auth-brand\"><span class=\"auth-mark\" aria-hidden=\"true\">&gt;_</span>t1000</p><h1>");
+    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v7/app.css\"></head><body class=\"auth-page\"><main class=\"auth-main\"><p class=\"auth-brand\"><span class=\"auth-mark\" aria-hidden=\"true\">&gt;_</span>t1000</p><h1>");
     escape_html_into(&mut output, heading);
     output.push_str("</h1><p class=\"subtle\">");
     escape_html_into(&mut output, description);
@@ -2511,7 +2596,7 @@ fn password_error_response(
 
 fn render_pairing_page(base_path: RequestBasePath) -> String {
     let output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Recovery pairing · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v6/app.css\"></head><body><main><p class=\"eyebrow\">t1000 recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Recovery pairing · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v7/app.css\"></head><body><main><p class=\"eyebrow\">t1000 recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
     );
     html_for_base(prefix_html_template(output), base_path)
 }
@@ -3063,6 +3148,10 @@ fn render_homepage(
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>t1000</title><link rel=\"stylesheet\" href=\"");
     output.push_str(FRONTEND_CSS_PATH);
     output.push_str("\"><script defer src=\"");
+    output.push_str(CLIENT_FILES_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(ACCOUNTS_PATH);
+    output.push_str("\"></script><script defer src=\"");
     output.push_str(WORKSPACE_UI_PATH);
     output.push_str("\"></script><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
@@ -3124,6 +3213,10 @@ fn render_window_page(
     output.push_str(TERMINAL_CSS_PATH);
     output.push_str("\"><script defer src=\"");
     output.push_str(TERMINAL_JS_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(CLIENT_FILES_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(ACCOUNTS_PATH);
     output.push_str("\"></script><script defer src=\"");
     output.push_str(WORKSPACE_UI_PATH);
     output.push_str("\"></script><script defer src=\"");
@@ -3189,7 +3282,7 @@ fn render_window_page(
 
 fn render_not_found_page(slug: &str, base_path: RequestBasePath) -> String {
     let mut output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Not found · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v6/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored t1000 window owns this route",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Not found · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v7/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored t1000 window owns this route",
     );
     if !slug.is_empty() {
         output.push_str(": <code>/");
@@ -3250,7 +3343,7 @@ async fn load_tmux_inventory(
     executable: &Path,
     command_timeout: Duration,
 ) -> Result<TmuxInventory, ServerError> {
-    let mut command = Command::new(executable);
+    let mut command = tmux_runtime::command(executable).await?;
     command
         .arg("list-panes")
         .arg("-a")
@@ -3387,11 +3480,12 @@ fn duration_ms(duration: Duration) -> Result<u64, ServerError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_CSS, APP_JS, AppState, CONTENT_SECURITY_POLICY, CacheAvailability, ConfigAction,
-        EXTERNAL_BASE_PATH, FORWARDED_HOST_HEADER, FORWARDED_PREFIX_HEADER, FORWARDED_PROTO_HEADER,
-        FRONTEND_CSS_PATH, FRONTEND_JS_PATH, MAX_FRONTEND_ASSET_BYTES, MAX_PASSWORD_OPERATIONS,
-        RenderedSnapshot, ServerConfig, ServerError, SnapshotCache, TERMINAL_JS_PATH,
-        WORKSPACE_UI_JS, WORKSPACE_UI_PATH, build_router, unix_ms,
+        APP_CSS, APP_JS, AppState, CLIENT_FILES_JS, CLIENT_FILES_PATH, CONTENT_SECURITY_POLICY,
+        CacheAvailability, ConfigAction, EXTERNAL_BASE_PATH, FORWARDED_HOST_HEADER,
+        FORWARDED_PREFIX_HEADER, FORWARDED_PROTO_HEADER, FRONTEND_CSS_PATH, FRONTEND_JS_PATH,
+        MAX_FRONTEND_ASSET_BYTES, MAX_PASSWORD_OPERATIONS, RenderedSnapshot, ServerConfig,
+        ServerError, SnapshotCache, TERMINAL_JS_PATH, WORKSPACE_UI_JS, WORKSPACE_UI_PATH,
+        build_router, unix_ms,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
@@ -3632,8 +3726,8 @@ mod tests {
             );
             let home_text = body_text(home).await;
             assert!(home_text.contains(r#"data-termdeck-base="/t1000""#));
-            assert!(home_text.contains(r#"href="/t1000/_termdeck/assets/v6/app.css""#));
-            assert!(home_text.contains(r#"src="/t1000/_termdeck/assets/v6/app.js""#));
+            assert!(home_text.contains(r#"href="/t1000/_termdeck/assets/v7/app.css""#));
+            assert!(home_text.contains(r#"src="/t1000/_termdeck/assets/v7/app.js""#));
             assert!(home_text.contains(r#"href="/t1000/random""#));
             assert!(!home_text.contains("__TERMDECK_BASE_PATH__"));
             assert!(!home_text.contains(r#"href="/_termdeck/"#));
@@ -3647,7 +3741,7 @@ mod tests {
             let window_text = body_text(window).await;
             assert!(window_text.contains(r#"data-termdeck-base="/t1000""#));
             assert!(window_text.contains(r#"href="/t1000/random/t/session-one""#));
-            assert!(window_text.contains(r#"href="/t1000/_termdeck/assets/v6/app.css""#));
+            assert!(window_text.contains(r#"href="/t1000/_termdeck/assets/v7/app.css""#));
 
             let asset = router
                 .clone()
@@ -3699,6 +3793,7 @@ mod tests {
             assert!(APP_CSS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(APP_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(WORKSPACE_UI_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+            assert!(CLIENT_FILES_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(CONTENT_SECURITY_POLICY.contains("script-src 'self'"));
             assert!(CONTENT_SECURITY_POLICY.contains("style-src 'self' 'unsafe-inline'"));
             assert!(CONTENT_SECURITY_POLICY.contains("connect-src 'self'"));
@@ -3748,6 +3843,23 @@ mod tests {
             );
             let script = body_text(javascript).await;
             assert_eq!(script.as_bytes(), APP_JS);
+            let files = router
+                .clone()
+                .oneshot(request(Method::GET, CLIENT_FILES_PATH, "localhost:7391"))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(files.status(), StatusCode::OK);
+            assert_eq!(
+                files
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("public, max-age=86400, immutable")
+            );
+            let files = body_text(files).await;
+            assert_eq!(files.as_bytes(), CLIENT_FILES_JS);
+            assert!(!files.contains("innerHTML"));
+            assert!(!files.contains("eval("));
             let workspace = router
                 .oneshot(request(Method::GET, WORKSPACE_UI_PATH, "localhost:7391"))
                 .await
@@ -4470,7 +4582,7 @@ mod auth_integration_tests {
                 .unwrap_or_else(|error| match error {});
             assert_eq!(setup_page.status(), StatusCode::OK);
             let setup_text = body_text(setup_page).await;
-            assert!(setup_text.contains(r#"href="/t1000/_termdeck/assets/v6/app.css""#));
+            assert!(setup_text.contains(r#"href="/t1000/_termdeck/assets/v7/app.css""#));
             assert!(setup_text.contains(r#"action="/t1000/_termdeck/setup""#));
             assert!(!setup_text.contains("__TERMDECK_BASE_PATH__"));
 
@@ -4831,7 +4943,7 @@ mod auth_integration_tests {
                 .clone()
                 .oneshot(request(
                     Method::GET,
-                    "/_termdeck/assets/v6/app.css",
+                    "/_termdeck/assets/v7/app.css",
                     Body::empty(),
                 ))
                 .await
@@ -4961,6 +5073,72 @@ mod auth_integration_tests {
                 .await
                 .unwrap_or_else(|error| match error {});
             assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+        });
+    }
+
+    #[test]
+    fn machine_routes_require_login_csrf_and_separate_enrollment() {
+        runtime().block_on(async {
+            use crate::machine_http;
+            use termdeck_web_auth::{SecretKind, SecretToken};
+            const PATH: &str = "/_termdeck/api/v1/machines";
+            const CURRENT: &str = "/_termdeck/api/v1/machines/current";
+            let fixture = fixture(&["Browser A", "Browser B"]);
+            let router = build_router(fixture.state.clone());
+            let a = pair(&router, fixture.invitations[0].as_str()).await;
+            let b = pair(&router, fixture.invitations[1].as_str()).await;
+            let key = SecretToken::generate(SecretKind::Machine).unwrap_or_else(|e| panic!("randomness: {e}"));
+            let new_key = SecretToken::generate(SecretKind::Machine).unwrap_or_else(|e| panic!("randomness: {e}"));
+            let body = serde_json::json!({"operation":"enroll","request_id":"a".repeat(32),"credential":key.expose_secret(),"label":"Laptop A"});
+            let mutation = |value: &serde_json::Value, cookie: Option<&CookieJar>, csrf: bool| {
+                let mut r = unsafe_request(Method::POST, PATH, Body::from(value.to_string()), cookie, csrf);
+                r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json")); r
+            };
+            let identify = |cookie: &CookieJar, key: Option<&str>| {
+                let mut r = authenticated_get(CURRENT, cookie);
+                if let Some(key) = key { r.headers_mut().insert(machine_http::MACHINE_HEADER, HeaderValue::from_str(key).unwrap_or_else(|e| panic!("header: {e}"))); } r
+            };
+            for (cookie, csrf, status) in [(None,false,StatusCode::UNAUTHORIZED),(Some(&a),false,StatusCode::FORBIDDEN)] {
+                let r = router.clone().oneshot(mutation(&body,cookie,csrf)).await.unwrap_or_else(|e| match e {});
+                assert_eq!(r.status(),status);
+            }
+            let response = router.clone().oneshot(mutation(&body,Some(&a),true)).await.unwrap_or_else(|e| match e {});
+            assert_eq!(response.status(),StatusCode::OK);
+            let text = body_text(response).await;
+            assert!(!text.contains(key.expose_secret()));
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("JSON: {e}"));
+            let machine = value["machine"]["machine_id"].clone();
+            let repeated = router.clone().oneshot(mutation(&body,Some(&a),true)).await.unwrap_or_else(|e| match e {});
+            assert_eq!(repeated.status(),StatusCode::OK);
+            assert_eq!(body_text(repeated).await,text);
+            let mut conflict=body.clone(); conflict["label"]="changed".into();
+            assert_eq!(router.clone().oneshot(mutation(&conflict,Some(&a),true)).await.unwrap_or_else(|e| match e {}).status(),StatusCode::CONFLICT);
+            for cookie in [&a,&b] {
+                assert_eq!(router.clone().oneshot(identify(cookie,None)).await.unwrap_or_else(|e| match e {}).status(),StatusCode::FORBIDDEN);
+            }
+            assert_eq!(router.clone().oneshot(identify(&a,Some(key.expose_secret()))).await.unwrap_or_else(|e| match e {}).status(),StatusCode::OK);
+            let malformed = [serde_json::json!({}),serde_json::json!({"operation":"enroll","request_id":"../x","label":"X","credential":"bad"}),
+                serde_json::json!({"operation":"enroll","request_id":"b".repeat(32),"label":"x".repeat(5000),"credential":key.expose_secret()}),
+                serde_json::json!({"operation":"enroll","request_id":"b".repeat(32),"label":"X","credential":key.expose_secret(),"server_path":"/tmp"})];
+            for bad in malformed {
+                assert_eq!(router.clone().oneshot(mutation(&bad,Some(&a),true)).await.unwrap_or_else(|e| match e {}).status(),StatusCode::BAD_REQUEST);
+            }
+            let rename = serde_json::json!({"operation":"rename","request_id":"b".repeat(32),"machine_id":machine,"credential":key.expose_secret(),"label":"Renamed laptop"});
+            assert_eq!(router.clone().oneshot(mutation(&rename,Some(&a),true)).await.unwrap_or_else(|e| match e {}).status(),StatusCode::OK);
+            let rotate=serde_json::json!({"operation":"rotate","request_id":"c".repeat(32),"machine_id":machine,"credential":key.expose_secret(),"new_credential":new_key.expose_secret()});
+            for _ in 0..2 {assert_eq!(router.clone().oneshot(mutation(&rotate,Some(&a),true)).await.unwrap_or_else(|e| match e {}).status(),StatusCode::OK);}
+            assert_eq!(router.clone().oneshot(identify(&a,Some(key.expose_secret()))).await.unwrap_or_else(|e| match e {}).status(),StatusCode::FORBIDDEN);
+            assert_eq!(router.clone().oneshot(identify(&a,Some(new_key.expose_secret()))).await.unwrap_or_else(|e| match e {}).status(),StatusCode::OK);
+            let revoke=serde_json::json!({"operation":"revoke","request_id":"d".repeat(32),"machine_id":machine});
+            assert_eq!(router.clone().oneshot(mutation(&revoke,Some(&b),true)).await.unwrap_or_else(|e| match e {}).status(),StatusCode::OK);
+            assert_eq!(router.clone().oneshot(identify(&a,Some(new_key.expose_secret()))).await.unwrap_or_else(|e| match e {}).status(),StatusCode::FORBIDDEN);
+            assert_eq!(router.clone().oneshot(authenticated_get(SESSION_PATH,&a)).await.unwrap_or_else(|e| match e {}).status(),StatusCode::OK);
+            let machines=router.clone().oneshot(authenticated_get(PATH,&a)).await.unwrap_or_else(|e| match e {});
+            let listed: serde_json::Value=serde_json::from_str(&body_text(machines).await).unwrap_or_else(|e| panic!("JSON: {e}"));
+            assert_eq!(listed["machines"].as_array().map(Vec::len),Some(1));
+            let auth=fixture.state.auth.as_ref().unwrap_or_else(|| panic!("auth missing"));
+            auth.now_ms(unix_ms()+TEST_AUTH_TTL_MS+1).unwrap_or_else(|e| panic!("time: {e}"));
+            assert_eq!(router.clone().oneshot(mutation(&body,Some(&a),true)).await.unwrap_or_else(|e| match e {}).status(),StatusCode::UNAUTHORIZED);
         });
     }
 

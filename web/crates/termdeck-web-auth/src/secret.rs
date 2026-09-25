@@ -13,6 +13,7 @@ pub enum SecretKind {
     Invitation,
     Session,
     Csrf,
+    Machine,
 }
 
 impl SecretKind {
@@ -21,6 +22,7 @@ impl SecretKind {
             Self::Invitation => "tdi1_",
             Self::Session => "tds1_",
             Self::Csrf => "tdc1_",
+            Self::Machine => "tdm1_",
         }
     }
 
@@ -29,6 +31,7 @@ impl SecretKind {
             Self::Invitation => b"termdeck-web-auth/v1/invitation\0",
             Self::Session => b"termdeck-web-auth/v1/session\0",
             Self::Csrf => b"termdeck-web-auth/v1/csrf\0",
+            Self::Machine => b"termdeck-web-auth/v1/machine\0",
         }
     }
 }

@@ -36,6 +36,7 @@ broker = _load_broker()
 
 def _config(tmp_path: Path, socket_path: Path | None = None):
     runtime = tmp_path / "runtime" / "termdeck-lan"
+    consumer = tmp_path / "consumer" / "termdeck-lan"
     libexec = tmp_path / "usr" / "libexec"
     libexec.mkdir(parents=True)
     installed_broker = libexec / "termdeck-preparer-broker"
@@ -44,10 +45,15 @@ def _config(tmp_path: Path, socket_path: Path | None = None):
     executable = libexec / "termdeck-web-prepare-runtime"
     executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="ascii")
     executable.chmod(0o755)
+    publication = libexec / "termdeck-preparer-publication"
+    publication.write_text("#!/usr/bin/bash\nexit 0\n", encoding="ascii")
+    publication.chmod(0o755)
     return broker.BrokerConfig(
         broker_path=installed_broker,
         preparer_path=executable,
+        publication_path=publication,
         runtime_root=runtime,
+        consumer_root=consumer,
         socket_path=socket_path or tmp_path / "request.sock",
         root_uid=os.getuid(),
         root_gid=os.getgid(),
@@ -92,8 +98,12 @@ def test_request_contract_has_only_allowlisted_restore_modes():
     assert broker.DEFAULT_PREPARER == Path(
         "/usr/libexec/termdeck-web-prepare-runtime"
     )
-    assert broker.DEFAULT_RUNTIME_ROOT == Path(
+    assert broker.DEFAULT_RUNTIME_ROOT == Path("/var/lib/termdeck-preparer/runtime")
+    assert broker.DEFAULT_CONSUMER_ROOT == Path(
         "/warp/projects/softwares/termdeck/.termdeck"
+    )
+    assert broker.DEFAULT_PUBLICATION == Path(
+        "/usr/libexec/termdeck-preparer-publication"
     )
     assert broker.validate_request(_request()) == broker.PrepareRequest("none", None)
     assert broker.validate_request(_request("unreceipted")) == broker.PrepareRequest(
@@ -129,7 +139,20 @@ def test_config_keeps_executable_outside_mutable_runtime(tmp_path: Path):
         broker.BrokerConfig(
             broker_path=config.broker_path,
             preparer_path=config.runtime_root / "bin" / "termdeck-web-prepare",
+            publication_path=config.publication_path,
             runtime_root=config.runtime_root,
+            consumer_root=config.consumer_root,
+            socket_path=config.socket_path,
+            root_uid=config.root_uid,
+            root_gid=config.root_gid,
+        )
+    with pytest.raises(broker.BrokerError, match="must be disjoint"):
+        broker.BrokerConfig(
+            broker_path=config.broker_path,
+            preparer_path=config.preparer_path,
+            publication_path=config.publication_path,
+            runtime_root=config.consumer_root,
+            consumer_root=config.consumer_root,
             socket_path=config.socket_path,
             root_uid=config.root_uid,
             root_gid=config.root_gid,
@@ -217,20 +240,47 @@ def test_socket_broker_authenticates_peer_and_runs_fixed_preparer_once(
     listener.listen(2)
     monkeypatch.setattr(os, "getresuid", lambda: (config.root_uid,) * 3)
     monkeypatch.setattr(os, "getresgid", lambda: (config.root_gid,) * 3)
-    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    principals = broker.Principals(
+        preparer_uid=config.root_uid + 100,
+        preparer_gid=config.root_gid + 100,
+        caller_uid=config.root_uid + 200,
+        caller_gid=config.root_gid + 200,
+    )
+    monkeypatch.setattr(broker, "_validate_socket_path", lambda *_args, **_kwargs: None)
+    publication_calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    preparer_calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    restore_output = broker._canonical_json({"fixture": True})
     outcome: list[int] = []
 
     def fake_run(command, **kwargs):
-        calls.append((tuple(command), kwargs))
-        assert Path(os.readlink(command[0])).samefile(config.preparer_path)
-        return SimpleNamespace(returncode=0)
+        executable = Path(os.readlink(command[0]))
+        if executable.samefile(config.publication_path):
+            operation = command[1]
+            publication_calls.append((tuple(command), kwargs))
+            return SimpleNamespace(
+                returncode=0,
+                stdout=broker._canonical_json(
+                    {
+                        "ok": True,
+                        "operation": operation,
+                        "schema": broker.PUBLICATION_SCHEMA,
+                    }
+                ),
+                stderr=b"",
+            )
+        assert executable.samefile(config.preparer_path)
+        preparer_calls.append((tuple(command), kwargs))
+        return SimpleNamespace(returncode=0, stdout=restore_output, stderr=b"")
 
     worker = threading.Thread(
         target=lambda: outcome.append(
             broker.serve_once(
                 listener,
                 config=config,
-                resolve_principals=_principals,
+                resolve_principals=lambda _config: principals,
+                peer_credentials=lambda _connection: broker.PeerCredentials(
+                    os.getpid(), principals.caller_uid, principals.caller_gid
+                ),
                 run_process=fake_run,
             )
         )
@@ -249,17 +299,24 @@ def test_socket_broker_authenticates_peer_and_runs_fixed_preparer_once(
     assert response == {
         "error": None,
         "ok": True,
+        "result": {
+            "ok": True,
+            "operation": "restore",
+            "schema": broker.PUBLICATION_SCHEMA,
+        },
         "returncode": 0,
         "schema": broker.RESPONSE_SCHEMA,
     }
-    assert len(calls) == 1
-    command, kwargs = calls[0]
+    assert [command[1] for command, _kwargs in publication_calls] == ["seed", "restore"]
+    assert publication_calls[0][1]["stdin"] == subprocess.DEVNULL
+    assert publication_calls[1][1]["input"] == restore_output
+    assert len(preparer_calls) == 1
+    command, kwargs = preparer_calls[0]
     assert command[1:] == ("--restore-tls-generation", "b" * 32)
     assert kwargs["close_fds"] is True
-    assert kwargs["stdin"] == subprocess.DEVNULL
     assert kwargs["cwd"] == "/"
-    assert kwargs["user"] == config.root_uid + 100
-    assert kwargs["group"] == config.root_gid + 100
+    assert kwargs["user"] == principals.preparer_uid
+    assert kwargs["group"] == principals.preparer_gid
     assert kwargs["extra_groups"] == ()
     assert kwargs["pass_fds"] == (int(command[0].rsplit("/", 1)[1]),)
     assert kwargs["timeout"] == config.preparer_timeout

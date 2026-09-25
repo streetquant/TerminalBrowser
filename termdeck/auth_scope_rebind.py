@@ -551,6 +551,10 @@ def _selected_account(
         selected_key = old_state.selected_account_key
         if not selected_key:
             raise AuthScopeRebindError("old Codex account selection is unknown")
+        if old_state.credential_status != "current":
+            raise AuthScopeRebindError(
+                f"old Codex credentials are {old_state.credential_status}; preserve for account review"
+            )
         if hinted and hinted not in {old_state.selected_account, selected_key}:
             raise AuthScopeRebindError(
                 "saved Codex account metadata disagrees with the old scope"

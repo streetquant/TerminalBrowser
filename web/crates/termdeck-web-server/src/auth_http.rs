@@ -4,9 +4,9 @@ use std::fmt;
 use std::sync::{Mutex, MutexGuard};
 use termdeck_web_auth::{
     AuthError, AuthSessionId, AuthStore, AuthenticatedDeviceId, AuthenticatedSession,
-    BoundedRateLimiter, DeviceRecord, OwnerPasswordStore, PasswordError, RateDecision,
-    RateLimitConfig, RateLimitError, SecretKind, SessionContext, VerifiedOwnerPassword,
-    rate_subject_digest, validate_secret,
+    BoundedRateLimiter, DeviceRecord, MachineStore, OwnerPasswordStore, PasswordError,
+    RateDecision, RateLimitConfig, RateLimitError, SecretKind, SessionContext,
+    VerifiedOwnerPassword, rate_subject_digest, validate_secret,
 };
 use zeroize::Zeroizing;
 
@@ -35,6 +35,7 @@ const DEFAULT_RATE_BLOCK_MS: u64 = 5 * 60_000;
 
 pub struct HttpAuth {
     store: AuthStore,
+    machines: MachineStore,
     password_store: OwnerPasswordStore,
     limiter: Mutex<BoundedRateLimiter>,
     session_ttl_ms: u64,
@@ -79,8 +80,11 @@ impl HttpAuth {
             store.owner_id().clone(),
         )
         .map_err(HttpAuthError::Password)?;
+        let machines =
+            MachineStore::open(&store).map_err(|_| HttpAuthError::InvalidConfiguration)?;
         Ok(Self {
             store,
+            machines,
             password_store,
             limiter: Mutex::new(BoundedRateLimiter::new(rate_config)?),
             session_ttl_ms,
@@ -92,6 +96,10 @@ impl HttpAuth {
         self.store
             .observe_time(wall_clock_ms)
             .map_err(HttpAuthError::Auth)
+    }
+
+    pub(crate) fn machine_stores(&self) -> (&AuthStore, &MachineStore) {
+        (&self.store, &self.machines)
     }
 
     pub fn authenticate(

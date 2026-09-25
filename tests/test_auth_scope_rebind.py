@@ -99,7 +99,7 @@ def _write_native_home(home: Path, selected: str = "beta") -> None:
     for name in ("alpha", "beta"):
         account = accounts / f"{name}.json"
         account.write_text(
-            json.dumps({"account": name, "refresh_token": f"{name}-secret"}),
+            json.dumps({"tokens": {"refresh_token": f"{name}-secret"}}),
             encoding="utf-8",
         )
         account.chmod(0o600)

@@ -454,6 +454,7 @@ def main() -> int:
     parser.add_argument("--max-live-ms", type=float, default=5000.0)
     parser.add_argument("--keep-temp", action="store_true")
     parser.add_argument("--manager-only", action="store_true", help="run only the disposable manager/settings interaction matrix")
+    parser.add_argument("--managed-tmux", action="store_true", help="exercise persistent managed socket routing in disposable storage")
     args = parser.parse_args()
 
     binary = args.server_binary.resolve()
@@ -511,6 +512,15 @@ def main() -> int:
     )
     base_env.pop("TMUX", None)
     base_env.pop("TMUX_PANE", None)
+    for key in ("TERMDECK_STATE_ROOT", "TERMDECK_TMUX_RUNTIME", "TERMDECK_TMUX_IDENTITY"):
+        base_env.pop(key, None)
+    if args.managed_tmux:
+        info = (run_root / "tmux").stat()
+        base_env.update({
+            "TERMDECK_STATE_ROOT": str(run_root),
+            "TERMDECK_TMUX_RUNTIME": str(run_root / "tmux"),
+            "TERMDECK_TMUX_IDENTITY": f"{info.st_dev}:{info.st_ino}:{info.st_uid}",
+        })
 
     def cleanup_private_fixture() -> None:
         if tmux.exists():
@@ -610,7 +620,7 @@ def main() -> int:
                 "--max-connections",
                 "128",
                 "--tmux",
-                str(tmux),
+                "/usr/bin/tmux" if args.managed_tmux else str(tmux),
                 "--tmux-timeout-ms",
                 "3000",
                 "--t1000",
@@ -651,6 +661,7 @@ def main() -> int:
         "source": {
             "server_binary": str(binary),
             "server_sha256": sha256_file(binary),
+            "managed_tmux": args.managed_tmux,
         },
         "assertions": {},
         "timings_ms": {},

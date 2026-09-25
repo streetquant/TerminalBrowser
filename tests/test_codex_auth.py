@@ -1044,7 +1044,7 @@ shutil.copyfile(home / 'accounts' / f"{account['account_key']}.json", home / 'au
             self.assertFalse((private / "current").exists())
             self.assertTrue((private / "accounts").is_symlink())
 
-    def test_new_native_scope_rejects_auth_link_that_disagrees_with_canonical_current(self):
+    def test_new_native_scope_inherits_effective_auth_despite_stale_canonical_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "source"
@@ -1059,9 +1059,10 @@ shutil.copyfile(home / 'accounts' / f"{account['account_key']}.json", home / 'au
                 _record(private, root)
             )
 
-            self.assertIsNone(state.selected_account_key)
-            self.assertFalse((private / "auth.json").exists())
-            self.assertFalse((private / "current").exists())
+            self.assertEqual(state.selected_account_key, "beta")
+            self.assertEqual(state.canonical_account_key, "beta")
+            self.assertEqual((private / "auth.json").resolve(), source / "accounts/beta.json")
+            self.assertEqual((source / "current").read_text(), "alpha\n")
             self.assertTrue((private / "accounts").is_symlink())
 
     def test_same_key_switch_repairs_legacy_catalog_and_removes_stale_copies(self):
@@ -1568,7 +1569,8 @@ shutil.copyfile(home / 'accounts' / f"{account['account_key']}.json", home / 'au
             result = manager.switch(record, "beta")
 
             self.assertFalse(result.ok)
-            self.assertIn("does not match exactly one", result.error)
+            self.assertIn("snapshot is malformed", result.error)
+            self.assertIsNone(result.state.selected_account_key)
             self.assertFalse((private / "accounts").is_symlink())
             (private / "auth.json").write_bytes(
                 (source / "accounts" / "beta.json").read_bytes()
@@ -1607,7 +1609,8 @@ shutil.copyfile(home / 'accounts' / f"{account['account_key']}.json", home / 'au
             )
 
             self.assertFalse(result.ok)
-            self.assertIn("points outside", result.error)
+            self.assertIn("snapshot is conflict", result.error)
+            self.assertIsNone(result.state.selected_account_key)
             self.assertTrue(accounts.is_dir())
             self.assertFalse(accounts.is_symlink())
             self.assertFalse((private / ".termdeck-accounts-migration").exists())

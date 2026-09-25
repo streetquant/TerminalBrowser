@@ -577,14 +577,57 @@ window.T1000Management = (() => {
     if (rename && !win || !open(rename ? "Rename window" : "New window")) return;
     const form = el("form", "management-form");
     const name = el("input"); name.required = true; name.maxLength = 100; name.value = rename ? win.name : "";
+    const requestId = window.T1000Files.id();
     const submit = el("button", "primary", rename ? "Save name" : "Create window"); submit.type = "submit";
-    form.append(field("Window name", name), el("p", "subtle", rename ? "Tabs and running processes stay in this window." : "Create an empty window, then add or move tabs into it."), submit);
+    form.append(field("Window name", name), el("p", "subtle", rename ? "Tabs and running processes stay in this window." : "Create an empty window, or configure initial remote tabs and staged client files."));
+    let files, options, rootChoice, runtimeChoice, tabNames, task;
+    if (!rename) {
+      const configured = el("details"); configured.className = "new-window-configuration";
+      configured.append(el("summary", "", "Configure workspace, runtime and client files"));
+      const choices = el("div");
+      const filesRoot = el("section"); filesRoot.setAttribute("aria-label", "Client files for new window");
+      const loadChoices = async () => {
+        if (!files?.machine || !configured.open) return;
+        try {
+          options = await window.T1000Files.management({operation: "launch-options"});
+          const previousRoot = rootChoice?.value, previousRuntime = runtimeChoice?.value;
+          const previousTabs = tabNames?.value, previousTask = task?.value;
+          rootChoice = selector([["", "Empty window (no initial tabs)"], ...options.workspaces.map(item => [item.id, `${item.label} · ${item.path}`])], previousRoot || "");
+          runtimeChoice = selector(options.runtimes.map(item => [item.id, item.label]), previousRuntime || "shell");
+          tabNames = el("textarea"); tabNames.value = previousTabs || "Main"; tabNames.maxLength = 1024;
+          task = el("textarea"); task.maxLength = 8192; task.value = previousTask || ""; task.disabled = runtimeChoice.value !== "codex";
+          runtimeChoice.addEventListener("change", () => { task.disabled = runtimeChoice.value !== "codex"; if (task.disabled) task.value = ""; });
+          choices.replaceChildren(field("Server workspace", rootChoice), field("Runtime", runtimeChoice), field("Initial tab names (one per line, maximum 8)", tabNames), field("Codex task (optional)", task));
+          if (!options.workspaces.length) choices.append(el("p", "subtle", "No server workspaces are approved on this host yet. Empty windows remain available."));
+        } catch (error) { report(error.message); }
+      };
+      let hadMachine = null;
+      files = window.T1000Files.mount(filesRoot, {selectable: true, onChange: () => {
+        const identity = files?.machine?.machine_id || null;
+        if (identity !== hadMachine) { hadMachine = identity; if (identity) loadChoices(); else { options = null; rootChoice = null; choices.replaceChildren(); } }
+      }});
+      configured.addEventListener("toggle", () => { if (configured.open && !options) loadChoices(); });
+      configured.append(choices, filesRoot); form.append(configured);
+    }
+    form.append(submit);
     form.addEventListener("submit", async event => {
-      event.preventDefault(); if (!name.value.trim() || busy) return;
+      event.preventDefault(); if (busy) return;
+      if (!name.value.trim()) { report("Window name is required."); return; }
+      if (files?.busy) { report("Wait for the upload to finish before creating the window."); return; }
       submit.disabled = true;
       try {
-        const result = await run({operation: rename ? "rename-window" : "create-window", name: name.value.trim(), ...(rename ? {window_id: win.id} : {})});
-        await navigate(result.window_id, null, name.value.trim());
+        let result;
+        if (!rename && rootChoice?.value) {
+          const tabs = tabNames.value.split("\n").map(value => value.trim()).filter(Boolean);
+          if (!tabs.length || tabs.length > 8) throw new Error("Enter between 1 and 8 tab names.");
+          busy = true;
+          try { result = await window.T1000Files.management({operation: "create-window", request_id: requestId, policy_revision: options.policy_revision, name: name.value.trim(), workspace_id: rootChoice.value, runtime: runtimeChoice.value, tabs, task: task.value, attachments: files.references()}); }
+          finally { busy = false; }
+        } else {
+          if (!rename && files?.references().length) throw new Error("Choose an approved server workspace to attach files to the new remote task.");
+          result = await run({operation: rename ? "rename-window" : "create-window", name: name.value.trim(), ...(rename ? {window_id: win.id} : {request_id: requestId})});
+        }
+        await navigate(result.window_id, null, result.window_name || name.value.trim());
       } catch (error) { report(error.message); submit.disabled = false; }
     });
     body.append(form); name.focus(); name.select();
@@ -832,18 +875,21 @@ window.T1000Management = (() => {
   }
   function configure(value) {
     api = value;
+    window.T1000Files.configure(value);
     window.T1000UI.applyChrome();
     dialog = el("dialog", "workspace-dialog management-dialog"); dialog.id = "management-dialog";
     heading = el("h2"); heading.id = "management-title"; dialog.setAttribute("aria-labelledby", heading.id);
-    const header = el("div", "workspace-tools-heading"); header.append(heading, button("Close", () => { if (!busy) dialog.close(); }));
+    const header = el("div", "workspace-tools-heading"); header.append(heading, button("Close", () => { if (!busy && !dialog.querySelector('[data-uploading="true"]')) dialog.close(); }));
     body = el("div", "management-body"); notice = el("p", "management-notice"); notice.setAttribute("role", "status"); notice.hidden = true;
     dialog.append(header, notice, body); document.body.append(dialog);
-    dialog.addEventListener("cancel", event => { if (busy) event.preventDefault(); });
+    dialog.addEventListener("cancel", event => { if (busy || dialog.querySelector('[data-uploading="true"]')) event.preventDefault(); });
     dialog.addEventListener("close", () => { if (opener?.isConnected) opener.focus(); });
   }
   function home(header) {
-    const tools = el("div", "window-list-tools"); tools.append(button("New window", () => nameWindow(), "primary"), button("Tab manager", manager)); header.append(tools);
+    const tools = el("div", "window-list-tools"); tools.append(button("New window", () => nameWindow(), "primary"), button("Client files", clientFiles), button("Codex accounts", accounts), button("Tab manager", manager)); header.append(tools);
   }
+  function clientFiles() { if (open("Client files", true)) window.T1000Files.mount(body); }
+  function accounts() { if (open("Codex accounts", true)) window.T1000Accounts.mount(body, request); }
   function attachWorkspace(value) {
     workspace = value;
     const managerButton = button("▤", manager, "workspace-tool-button"); managerButton.title = "Tab manager"; managerButton.setAttribute("aria-label", "Tab manager"); value.toolbar.append(managerButton);
@@ -858,7 +904,7 @@ window.T1000Management = (() => {
     bar.addEventListener("drop", event => { if (!dragged) return; event.preventDefault(); const target = event.target.closest('[role="tab"]')?.dataset.paneId; const from = dragged; dragged = ""; if (target) reorder(from, target).catch(error); });
     bar.addEventListener("dragend", () => { dragged = ""; });
     window.addEventListener("keydown", event => { if (!event.ctrlKey || !event.shiftKey || !["PageUp", "PageDown"].includes(event.key) || document.querySelector("dialog[open]")) return; event.preventDefault(); event.stopImmediatePropagation(); shiftTab(event.key === "PageUp" ? -1 : 1).catch(error); }, true);
-    const handlers = [["New window", () => nameWindow()], ["Rename window", () => nameWindow(true)], ["Tab manager", manager], ["Move tab to window…", () => moveTabs(activeRows())], ["Move tab left", () => shiftTab(-1)], ["Move tab right", () => shiftTab(1)], ["Hide other tabs", () => hideRelative(false)], ["Hide tabs to the right", () => hideRelative(true)]];
+    const handlers = [["New window", () => nameWindow()], ["Client files", clientFiles], ["Codex accounts", accounts], ["Rename window", () => nameWindow(true)], ["Tab manager", manager], ["Move tab to window…", () => moveTabs(activeRows())], ["Move tab left", () => shiftTab(-1)], ["Move tab right", () => shiftTab(1)], ["Hide other tabs", () => hideRelative(false)], ["Hide tabs to the right", () => hideRelative(true)]];
     return {menuItems: () => handlers.map(([name, handler]) => button(name, handler))};
   }
   return {configure, home, workspace: attachWorkspace, appearance: data => request({operation: "appearance", ...data})};

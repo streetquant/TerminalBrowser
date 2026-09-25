@@ -15,6 +15,13 @@
       "source": "deploy/termdeck-preparer-broker"
     },
     {
+      "destination": "/usr/libexec/termdeck-preparer-publication",
+      "group": "root",
+      "mode": "0755",
+      "owner": "root",
+      "source": "deploy/termdeck-preparer-publication"
+    },
+    {
       "destination": "/usr/libexec/termdeck-preparer-state",
       "group": "root",
       "mode": "0755",

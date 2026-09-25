@@ -4,10 +4,9 @@ Documentation=https://github.com/Rebel0789/t1000
 After=local-fs.target termdeck-runtime-attestd.service
 Wants=termdeck-runtime-attestd.service
 Requires=termdeck-preparer-broker.socket
-RequiresMountsFor=/warp/projects/softwares/termdeck/.termdeck
-ConditionPathIsDirectory=/var/lib/termdeck-preparer
+RequiresMountsFor=/var/lib/termdeck-preparer/runtime /warp/projects/softwares/termdeck/.termdeck
+ConditionPathIsDirectory=/var/lib/termdeck-preparer/runtime
 ConditionPathIsDirectory=/warp/projects/softwares/termdeck/.termdeck
-ConditionPathExists=/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key
 RefuseManualStart=yes
 
 [Service]
@@ -24,20 +23,20 @@ RuntimeMaxSec=200s
 KillMode=control-group
 
 # systemd owns the max-only activation socket.  The root broker validates its
-# single named LISTEN_FD and SO_PEERCRED, then drops a bounded child to the
-# dedicated preparer identity.  The child can write only its private state,
-# the canonical LAN runtime subtree, and the one TLS journal authenticator;
-# the root broker does not perform those writes.
+# single named LISTEN_FD and SO_PEERCRED, seeds the private producer through a
+# fixed root-owned helper, and then drops the preparer child to its dedicated
+# identity.  Only the fixed root helper may publish receipt-bound outputs into
+# the max-owned consumer tree; the unprivileged preparer never writes there.
 RuntimeDirectory=termdeck-preparer-broker
 RuntimeDirectoryMode=0711
 RuntimeDirectoryPreserve=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/termdeck-preparer /warp/projects/softwares/termdeck/.termdeck -/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key
+ReadWritePaths=/var/lib/termdeck-preparer /warp/projects/softwares/termdeck/.termdeck
 TemporaryFileSystem=/warp:ro
-BindPaths=/warp/projects/softwares/termdeck/.termdeck -/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key
+BindPaths=/warp/projects/softwares/termdeck/.termdeck
 
 NoNewPrivileges=yes
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_KILL
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_KILL
 AmbientCapabilities=
 PrivateTmp=yes
 PrivateDevices=yes

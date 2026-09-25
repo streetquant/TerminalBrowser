@@ -13,5 +13,6 @@ argon2.workspace = true
 getrandom.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
+serde.workspace = true
 termdeck-web-core = { path = "../termdeck-web-core" }
 zeroize.workspace = true

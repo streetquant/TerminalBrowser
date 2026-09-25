@@ -4,6 +4,7 @@
 include deploy/preparer-install-manifest.json
 include deploy/termdeck-preparer-install-plan.md
 include deploy/termdeck-preparer-broker
+include deploy/termdeck-preparer-publication
 include deploy/systemd/termdeck-runtime-attestd.service
 include deploy/systemd/termdeck-preparer-broker.socket
 include deploy/systemd/termdeck-preparer-broker.service

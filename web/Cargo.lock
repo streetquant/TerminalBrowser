@@ -699,6 +699,7 @@ dependencies = [
  "argon2",
  "getrandom 0.4.3",
  "rusqlite",
+ "serde",
  "sha2",
  "termdeck-web-core",
  "zeroize",

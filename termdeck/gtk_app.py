@@ -7901,6 +7901,17 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 tooltip = "Switch the saved account only for this terminal's private CODEX_HOME"
             else:
                 tooltip = "No saved codex-auth accounts were found"
+            tooltip += (
+                f"\nCanonical account: {state.canonical_account or 'unselected/unknown'}"
+                f"\nTab marker: {state.marker_account_key or 'unselected'}"
+                f"\nEffective credentials: {state.selected_account or 'unselected/unknown'}"
+                f"\nCredential state: {state.credential_status}"
+            )
+            manager = TermDeckWindow._codex_auth_manager(self) if hasattr(self, "app_context") else None
+            if isinstance(manager, CodexAuthManager):
+                runtime = manager.runtime_state(record, state)
+                tooltip += (f"\nRunning process: {runtime['running_account_key'] or 'unknown'}"
+                            f" ({runtime['running_account_state']}); restart needed: {runtime['running_restart_required']}")
             combo.set_tooltip_text(tooltip)
         finally:
             self._auth_combo_updating = False
@@ -8002,7 +8013,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             # bypass the transaction lock's durable commit boundary.
             if not inflight:
                 record = self._sync_observed_auth_state(record, state)
-                self._auth_fingerprints.setdefault(record.id, state.fingerprint)
+                self._auth_fingerprints.setdefault(record.id, state.effective_fingerprint or state.fingerprint)
             self._render_auth_selector(record, state, environment_ready=environment_ready)
         except (CodexAuthError, OSError, ValueError) as exc:
             self._render_auth_selector(
@@ -8074,12 +8085,13 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 state = manager.state(record)
             except (CodexAuthError, OSError, ValueError):
                 continue
+            effective_fingerprint = state.effective_fingerprint or state.fingerprint
             previous_fingerprint = self._auth_fingerprints.get(record.id)
             if previous_fingerprint is None:
-                self._auth_fingerprints[record.id] = state.fingerprint
+                self._auth_fingerprints[record.id] = effective_fingerprint
             fingerprint_changed = bool(
                 previous_fingerprint is not None
-                and previous_fingerprint != state.fingerprint
+                and previous_fingerprint != effective_fingerprint
             )
             activation_retry = bool(getattr(record, "auth_restart_required", False))
             if fingerprint_changed or activation_retry:
@@ -8091,7 +8103,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                 if (
                     now >= retry_at
                     and state.selected_account_key
-                    and state.canonical_binding_ready
+                    and (state.canonical_binding_ready or state.credential_status == "refreshed")
                 ):
                     # Credential files are canonical system-wide links. A new
                     # fingerprint means the token/profile changed outside
@@ -8119,7 +8131,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                     tab = self.tabs.get(record.id)
                     if tab is not None:
                         tab.record = updated
-                    self._auth_fingerprints[record.id] = state.fingerprint
+                    self._auth_fingerprints[record.id] = effective_fingerprint
 
             if record.id == current_id:
                 environment_ready = True
@@ -8512,7 +8524,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         try:
             if transaction_applied:
                 if activation_ok and not error:
-                    self._auth_fingerprints[session_id] = result.state.fingerprint
+                    self._auth_fingerprints[session_id] = result.state.effective_fingerprint or result.state.fingerprint
                     retry_map = getattr(self, "_auth_external_refresh_retry_at", None)
                     if isinstance(retry_map, dict):
                         retry_map.pop(session_id, None)

@@ -3016,6 +3016,30 @@ class SessionStore:
     def mark_recovery_inactive(self, session_id: str) -> SessionRecord:
         return self.set_recovery_intent(session_id, RECOVERY_INTENT_INACTIVE)
 
+    def reconcile_runtime_states(
+        self,
+        updates: Iterable[tuple[str, str, bool, int | None]],
+        expected: dict[str, SessionRecord],
+    ) -> set[str]:
+        """Apply only observations whose complete durable record is unchanged.
+
+        Hold the write lock across comparison and mutation so concurrent stop,
+        recovery, moves and account changes cannot be overwritten by old IO.
+        """
+        rows = list(updates)
+        if not rows:
+            return set()
+        try:
+            if not self.conn.in_transaction:
+                self.conn.execute("BEGIN IMMEDIATE")
+            accepted = [row for row in rows if self.get(row[0]) == expected.get(row[0])]
+            self.update_runtime_states(accepted)
+            self.conn.commit()
+            return {row[0] for row in accepted}
+        except BaseException:
+            self.conn.rollback()
+            raise
+
     def update_runtime_states(
         self,
         updates: Iterable[tuple[str, str, bool, int | None]],

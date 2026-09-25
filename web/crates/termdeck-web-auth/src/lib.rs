@@ -10,10 +10,13 @@
 //! `Debug`, zeroized on drop, and persisted only as domain-separated SHA-256
 //! digests.
 
+mod machines;
 mod password;
 mod rate_limit;
 mod secret;
 mod store;
+
+pub use machines::{MachineError, MachineMutation, MachineRecord, MachineStore};
 
 pub use password::{
     MAX_OWNER_PASSWORD_BYTES, MIN_OWNER_PASSWORD_BYTES, OWNER_PASSWORD_FILENAME,

@@ -448,7 +448,7 @@ def test_tmux_backend_child_uses_exact_attested_socket_runtime(
     child = run.call_args.kwargs["env"]
     assert child["TERMDECK_TMUX_RUNTIME"] == str(runtime)
     assert Path(child["TMUX_TMPDIR"]).samefile(runtime)
-    assert child["TMUX_TMPDIR"] != str(runtime)
+    assert child["TMUX_TMPDIR"] == str(runtime)
     assert "TMUX" not in child
     assert runtime.is_dir()
     assert runtime.stat().st_dev == tmp_path.stat().st_dev

@@ -13,7 +13,6 @@ use termdeck_web_core::{
     LeaseId, OwnerId, PaneControllerRegistry, PaneId,
 };
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
 
@@ -381,7 +380,7 @@ impl TerminalService {
         let _permit = Arc::clone(&self.operation_slots)
             .try_acquire_owned()
             .map_err(|_| TerminalError::Busy)?;
-        let mut command = Command::new(self.tmux_executable.as_ref());
+        let mut command = crate::tmux_runtime::command(self.tmux_executable.as_ref()).await?;
         command
             .arg("capture-pane")
             .arg("-p")
@@ -490,7 +489,7 @@ impl TerminalService {
             InputDecision::Duplicate(view) => return Ok(view),
             InputDecision::Execute(value) => value,
         };
-        let mut command = Command::new(self.tmux_executable.as_ref());
+        let mut command = crate::tmux_runtime::command(self.tmux_executable.as_ref()).await?;
         command
             .arg("send-keys")
             .arg("-t")
@@ -618,7 +617,7 @@ impl TerminalService {
         buffer_name: &str,
         bytes: &[u8],
     ) -> Result<(), TerminalError> {
-        let mut load = Command::new(self.tmux_executable.as_ref());
+        let mut load = crate::tmux_runtime::command(self.tmux_executable.as_ref()).await?;
         load.arg("load-buffer")
             .arg("-b")
             .arg(buffer_name)
@@ -644,7 +643,7 @@ impl TerminalService {
         if !output.status.success() {
             return Err(TerminalError::TmuxFailed(bounded_stderr(&output.stderr)));
         }
-        let mut paste = Command::new(self.tmux_executable.as_ref());
+        let mut paste = crate::tmux_runtime::command(self.tmux_executable.as_ref()).await?;
         paste
             .arg("paste-buffer")
             .arg("-b")
@@ -665,7 +664,10 @@ impl TerminalService {
     }
 
     async fn delete_buffer(&self, buffer_name: &str) {
-        let mut command = Command::new(self.tmux_executable.as_ref());
+        let Ok(mut command) = crate::tmux_runtime::command(self.tmux_executable.as_ref()).await
+        else {
+            return;
+        };
         command
             .arg("delete-buffer")
             .arg("-b")

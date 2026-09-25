@@ -67,6 +67,7 @@ from .resize_signal import (
 )
 from .storage_fabric import StorageFabricError, tmux_subprocess_environment
 from .resources import (
+    _parse_stat,
     observe_recovery_metadata,
     process_tree,
     process_tree_contains_codex,
@@ -1118,6 +1119,70 @@ class TmuxBackend:
         names = {line.strip() for line in result.stdout.splitlines() if line.strip()}
         return {record.id: record.tmux_name in names for record in records}
 
+    def reconciliation_snapshot(self, records: Sequence[SessionRecord]) -> dict[str, dict[str, object]]:
+        """Fresh liveness evidence; neither registry PIDs nor the UI cache are authority.
+
+        In the server's PID namespace, bind the pane to its tmux parent and
+        kernel start time. An inaccessible namespace remains unobservable,
+        rather than borrowing the identity of an unrelated local PID.
+        """
+        result = self._run([
+            "list-panes", "-a", "-F",
+            "#{pid}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_dead}",
+        ], check=False, timeout=self._query_timeout_for(len(records)))
+        if result.returncode:
+            if self._server_is_absent(result):
+                return {record.id: {"state": "missing", "pid": None} for record in records}
+            raise TmuxError("tmux reconciliation snapshot is unavailable")
+        panes: dict[str, dict[str, object]] = {}
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 7 or parts[6] not in {"0", "1"}:
+                raise TmuxError("tmux reconciliation snapshot is malformed")
+            server, session, window, pane, pane_id, pid, dead = parts
+            try:
+                server_pid, pane_pid = int(server), int(pid)
+            except ValueError as exc:
+                raise TmuxError("tmux reconciliation process identity is malformed") from exc
+            if min(server_pid, pane_pid) <= 1 or not pane_id.startswith("%"):
+                raise TmuxError("tmux reconciliation process identity is invalid")
+            evidence: dict[str, object] = {"pid": pane_pid, "server_pid": server_pid, "state": "dead"}
+            if dead == "0":
+                try:
+                    same_namespace = os.path.samefile(
+                        f"/proc/{server_pid}/exe", shutil.which(self.executable) or self.executable,
+                    )
+                except OSError:
+                    same_namespace = False
+                if not same_namespace:
+                    evidence["state"] = "unobservable"
+                else:
+                    process = _parse_stat(pane_pid)
+                    if process and process["state"] not in {"Z", "X", "x"}:
+                        if process["ppid"] == server_pid:
+                            evidence.update(state="live", start_time=process["starttime"])
+                        else:
+                            evidence["state"] = "identity-mismatch"
+            panes[f"{session}:{window}.{pane}"] = evidence
+            panes[pane_id] = evidence
+            panes.setdefault(session, evidence)
+        out = {}
+        for record in records:
+            target = self.pane_target(record)
+            evidence = panes.get(target)
+            if evidence is None and target == f"{record.tmux_name}:0.0":
+                evidence = panes.get(record.tmux_name)
+            out[record.id] = dict(evidence or {"state": "missing", "pid": None})
+        return out
+
+    @staticmethod
+    def reconciliation_identity_current(evidence: dict[str, object]) -> bool:
+        """Reject exit or PID reuse between the tmux query and registry update."""
+        process = _parse_stat(int(evidence["pid"]))
+        return bool(process and process["state"] not in {"Z", "X", "x"}
+                    and process["ppid"] == evidence.get("server_pid")
+                    and process["starttime"] == evidence.get("start_time"))
+
     @staticmethod
     def _resume_uuid(command: str) -> str | None:
         try:
@@ -1797,7 +1862,9 @@ class TmuxBackend:
                 }
             )
 
-        if not self._command_is_interactive_shell(command):
+        # Confined web tasks must never fall out into an unrestricted host
+        # shell when their sandbox exits successfully or receives Ctrl-C.
+        if record.tag != "web-agent" and not self._command_is_interactive_shell(command):
             command = self._with_interactive_shell_fallback(
                 command,
                 fallback_shell_command,
@@ -5482,6 +5549,17 @@ def execute_auth_change(
                     f"terminal activation failed after account selection: {exc}",
                 )
             if activation.ok:
+                # The concrete credential manager records the new process
+                # incarnation only after the guarded lifecycle proves readiness.
+                recorder = inspect.getattr_static(manager, "record_activation", None)
+                if callable(recorder):
+                    try:
+                        manager.record_activation(record, switched.state, activation)
+                    except (OSError, ValueError, RuntimeError):
+                        return AuthTransactionResult(
+                            False, switch_result=switched, activation=replace(activation, ok=False),
+                            error="Account process restarted, but its credential receipt could not be saved; inspect before retrying",
+                        )
                 return AuthTransactionResult(
                     True,
                     switch_result=switched,

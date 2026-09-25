@@ -13,7 +13,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
@@ -559,7 +559,7 @@ impl TmuxControl {
         validate_tmux_target(target.as_str())?;
         let pane_id =
             resolve_pane_id(tmux_executable.as_ref(), target.as_str(), command_timeout).await?;
-        let mut command = Command::new(tmux_executable.as_ref());
+        let mut command = crate::tmux_runtime::command(tmux_executable.as_ref()).await?;
         command
             .arg(CONTROL_MODE_ARGUMENT)
             .arg("attach-session")
@@ -743,7 +743,7 @@ async fn resolve_pane_id(
     target: &str,
     command_timeout: Duration,
 ) -> Result<String, StreamError> {
-    let mut command = Command::new(tmux_executable);
+    let mut command = crate::tmux_runtime::command(tmux_executable).await?;
     command
         .arg("display-message")
         .arg("-p")

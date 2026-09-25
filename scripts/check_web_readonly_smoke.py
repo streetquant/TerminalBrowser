@@ -33,6 +33,7 @@ EXPECTED_PACKAGES: Final = {
 EXPECTED_AUTH_DEPENDENCIES: Final = {
     "argon2",
     "getrandom",
+    "serde",
     "rusqlite",
     "sha2",
     "termdeck-web-core",

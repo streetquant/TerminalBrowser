@@ -145,7 +145,7 @@ def main() -> int:
         source_accounts.mkdir(parents=True)
         for account in ("alpha", "beta"):
             (source_accounts / f"{account}.json").write_text(
-                json.dumps({"fixture": account}) + "\n",
+                json.dumps({"token": account}) + "\n",
                 encoding="utf-8",
             )
         fake_auth = binaries / "codex-auth"
@@ -199,23 +199,29 @@ static void stop_handler(int signal_number) {
 static int read_selected(const char *home, char *output, size_t output_size) {
     char path[PATH_MAX];
     FILE *handle;
+    char payload[2048];
+    char *start, *end;
     size_t length;
-    if (snprintf(path, sizeof(path), "%s/current", home) >= (int)sizeof(path)) {
+    if (snprintf(path, sizeof(path), "%s/auth.json", home) >= (int)sizeof(path)) {
         return -1;
     }
     handle = fopen(path, "r");
     if (handle == NULL) {
         return -1;
     }
-    if (fgets(output, (int)output_size, handle) == NULL) {
+    if (fgets(payload, sizeof(payload), handle) == NULL) {
         fclose(handle);
         return -1;
     }
     fclose(handle);
-    length = strlen(output);
-    while (length > 0 && (output[length - 1] == '\n' || output[length - 1] == '\r')) {
-        output[--length] = '\0';
-    }
+    /* Controlled fixture JSON: read credential content once, not current. */
+    start = strstr(payload, "\"token\"");
+    if (start == NULL || (start = strchr(start, ':')) == NULL) return -1;
+    start = strchr(start, '"');
+    if (start == NULL || (end = strchr(++start, '"')) == NULL) return -1;
+    length = (size_t)(end - start);
+    if (length >= output_size) return -1;
+    memcpy(output, start, length); output[length] = '\0';
     return length > 0 ? 0 : -1;
 }
 
@@ -773,7 +779,7 @@ int main(int argc, char **argv) {
             beta_account = source_accounts / "beta.json"
             external_replacement = source_accounts / ".beta.json.external"
             external_replacement.write_text(
-                json.dumps({"fixture": "beta", "token_version": 2}) + "\n",
+                json.dumps({"token": "beta", "token_version": 2}) + "\n",
                 encoding="utf-8",
             )
             os.replace(external_replacement, beta_account)

@@ -11,7 +11,9 @@ authority used for admission.
 from __future__ import annotations
 
 import os
+import socket
 import stat as stat_module
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, MutableMapping, Sequence
@@ -243,6 +245,7 @@ def _open_pinned_directory(
     expected_device: str | None = None,
     require_owner: bool = False,
     final_mode: int | None = None,
+    reject_unsafe_mode: bool = False,
 ) -> _PinnedDirectory:
     """Open an absolute directory without following any path component."""
 
@@ -337,6 +340,8 @@ def _open_pinned_directory(
                 f"admitted directory is not owned by the current user: {requested}"
             )
         if final_mode is not None and stat_module.S_IMODE(metadata.st_mode) != final_mode:
+            if reject_unsafe_mode:
+                raise StorageFabricError(f"admitted directory permissions are unsafe: {requested}")
             if metadata.st_uid != os.geteuid():
                 raise StorageFabricError(
                     f"admitted directory permissions cannot be hardened: {requested}"
@@ -1086,6 +1091,7 @@ def _bind_production_tmux_runtime(
             expected_device=evidence.device,
             require_owner=True,
             final_mode=0o700,
+            reject_unsafe_mode=True,
         )
 
     global _PRODUCTION_TMUX_RUNTIME_BINDING
@@ -1154,9 +1160,13 @@ def _materialize_tmux_binding(
             expected_device=binding.expected_device,
             require_owner=True,
             final_mode=0o700,
+            reject_unsafe_mode=True,
         )
     else:
         _revalidate_pinned_directory(binding.pinned)
+    metadata = os.fstat(binding.pinned.descriptor)
+    if metadata.st_uid != os.geteuid() or stat_module.S_IMODE(metadata.st_mode) != 0o700:
+        raise StorageFabricError("tmux_runtime: admitted runtime owner or permissions changed")
     return binding.pinned
 
 
@@ -1256,8 +1266,9 @@ def tmux_subprocess_environment(
 
     Development processes that have not performed production storage admission
     retain the historical inherited environment. Once admission succeeds, the
-    stable logical variables remain fixed to the attested path; materialized
-    tmux children use a procfd alias for the retained directory descriptor.
+    stable logical variables remain fixed to the attested path. Descriptors
+    validate identity within this process; they must never be exported as the
+    tmux address because the server outlives the process which admitted it.
     """
 
     binding = _PRODUCTION_TMUX_RUNTIME_BINDING
@@ -1303,6 +1314,8 @@ def tmux_subprocess_environment(
                     raise OSError("tmux socket root is not a directory")
                 if socket_root_metadata.st_uid != os.geteuid():
                     raise OSError("tmux socket root is not owned by the current user")
+                if stat_module.S_IMODE(socket_root_metadata.st_mode) != 0o700:
+                    raise OSError("tmux socket root permissions are unsafe")
                 if _device_id(socket_root_metadata.st_dev) != expected_device:
                     raise OSError("tmux socket root is not on the attested device")
                 socket_root_descriptor = os.open(
@@ -1324,6 +1337,14 @@ def tmux_subprocess_environment(
                             raise OSError("tmux default socket is not a Unix socket")
                         if _device_id(socket_metadata.st_dev) != expected_device:
                             raise OSError("tmux default socket is not on the attested device")
+                        if socket_metadata.st_uid != os.geteuid():
+                            raise OSError("tmux default socket is not owned by the current user")
+                        # tmux creates 0660 and toggles execute bits when a
+                        # client attaches. The enclosing 0700 directory is
+                        # mandatory, so group bits never grant traversal.
+                        if stat_module.S_IMODE(socket_metadata.st_mode) not in {0o600, 0o660, 0o700, 0o770}:
+                            raise OSError("tmux default socket permissions are unsafe")
+                        _validate_tmux_peer(runtime / socket_root_name / "default", runtime)
                 finally:
                     os.close(socket_root_descriptor)
         except OSError as exc:
@@ -1337,9 +1358,31 @@ def tmux_subprocess_environment(
 
     child = dict(source)
     child["TERMDECK_TMUX_RUNTIME"] = expected
-    child["TMUX_TMPDIR"] = str(pinned.proc_path) if pinned is not None else expected
+    child["TMUX_TMPDIR"] = expected
     child.pop("TMUX", None)
     return child
+
+
+def _validate_tmux_peer(path: Path, runtime: Path) -> None:
+    """Authenticate a live local server without sending terminal input."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(0.25)
+        try:
+            connection.connect(str(path))
+        except (ConnectionRefusedError, FileNotFoundError):
+            # A stale/missing socket is left intact. The tmux command reports
+            # absence; only an explicit new-session may start a server.
+            return
+        pid, uid, _gid = struct.unpack(
+            "3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        )
+        if pid <= 1 or uid != os.geteuid():
+            raise OSError("tmux socket peer ownership is foreign")
+        if not Path(f"/proc/{pid}/exe").samefile("/usr/bin/tmux"):
+            raise OSError("tmux socket peer executable is foreign")
+        expected = b"TMUX_TMPDIR=" + os.fsencode(runtime)
+        if expected not in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+            raise OSError("tmux socket peer runtime is foreign")
 
 
 def require_storage_fabric(*args: object, **kwargs: object) -> StorageAttestation:

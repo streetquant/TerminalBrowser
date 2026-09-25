@@ -27,6 +27,57 @@ def test_empty_window_creation_and_rename_preserve_process_fields(registry):
         assert new == {**old, "window_title": "Renamed λ"}
 
 
+def test_window_creation_receipt_survives_reopen_and_name_change(registry):
+    store, rows = registry
+    request = {"operation": "create-window", "name": "New", "request_id": "a" * 32, "_actor_session": "session-one"}
+    before = [store.get(row.id).__dict__ for row in rows]
+    created = handle(store, request)
+    handle(store, {"operation": "rename-window", "window_id": created["window_id"], "name": "Renamed"})
+    replay = handle(store, request)
+    assert replay == {**created, "window_name": "Renamed", "replayed": True}
+    with pytest.raises(ManagementError, match="different name"):
+        handle(store, {**request, "name": "Another"})
+    separate = handle(store, {**request, "_actor_session": "session-two"})
+    assert separate["window_id"] != created["window_id"]
+    assert [store.get(row.id).__dict__ for row in rows] == before
+    store.conn.execute("DELETE FROM remembered_windows WHERE window_id=?", (created["window_id"],))
+    store.conn.commit()
+    with pytest.raises(ManagementError, match="no longer available"):
+        handle(store, request)
+
+
+def test_concurrent_empty_window_creation_is_once(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    path = tmp_path / "sessions.sqlite3"
+    SessionStore(path).close()
+    request = {"operation": "create-window", "name": "Concurrent", "request_id": "b" * 32, "_actor_session": "session-one"}
+    def create(_):
+        store = SessionStore(path)
+        try:
+            return handle(store, request)
+        finally:
+            store.close()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(create, range(8)))
+    assert len({row["window_id"] for row in results}) == 1
+    assert sum(not row.get("replayed", False) for row in results) == 1
+    store = SessionStore(path)
+    try:
+        assert len(store.remembered_windows()) == 1
+        assert handle(store, request)["replayed"]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("request_id", [None, 123, "a" * 31, "A" * 32, "../oops", "a" * 33])
+def test_creation_rejects_invalid_receipt_without_mutation(registry, request_id):
+    store, _ = registry
+    before = store.remembered_windows()
+    with pytest.raises(ManagementError, match="request identity"):
+        handle(store, {"operation": "create-window", "name": "New", "request_id": request_id})
+    assert store.remembered_windows() == before
+
+
 def test_reorder_is_exact_and_stale_orders_roll_back(registry):
     store, rows = registry
     ids = [row.id for row in rows]

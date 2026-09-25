@@ -15,6 +15,7 @@ FILES = {
     "stream": ROOT / "web/crates/termdeck-web-server/src/terminal_stream.rs",
     "terminal_http": ROOT / "web/crates/termdeck-web-server/src/terminal_http.rs",
     "terminal_source": ROOT / "web/frontend/src/terminal-entry.js",
+    "palettes": ROOT / "web/frontend/src/terminal-palettes.json",
     "nginx": ROOT / "deploy/nginx/termdeck-web.nginx.conf",
 }
 
@@ -70,9 +71,11 @@ def main() -> None:
         'new WebSocket(streamUrl(), "termdeck.terminal.v1")',
         "binaryFrame(frame.sequence, frame.bytes)",
         'node("button", "workspace-new-tab", "+")',
-        'actionButton("Rename tab", "rename", false)',
-        'actionButton("Hide tab", "hide", false)',
-        'actionButton("Kill process…", "kill", true)',
+        '["Rename tab", "rename"]',
+        '["Hide tab", "hide"]',
+        '["Kill process…", "kill"]',
+        '["rename", "pause", "pin", "hide", "kill"].map(actionButton)',
+        'actionConfirm.textContent = rename ? "Save name" : "Kill process"',
         'node("button", "workspace-tab-close", "×")',
         'sendJson({ type: "ping" })',
         'window.addEventListener("online", reconnectNow)',
@@ -86,7 +89,7 @@ def main() -> None:
         'data-termdeck-pane=\\"',
         ".active_pane_id()",
         ".or_else(|| window.panes().first().map(PaneSnapshot::id))",
-        "/_termdeck/assets/v6/app.css",
+        "/_termdeck/assets/v7/app.css",
         "public, max-age=86400, immutable",
     ):
         require(server_production, needle, "immediate pane bootstrap")
@@ -134,8 +137,11 @@ def main() -> None:
     require(text["terminal_http"], "MAX_CAPTURE_HISTORY_LINES", "bounded history")
     require(text["terminal_source"], "new Terminal", "xterm terminal")
     require(text["terminal_source"], "FitAddon", "terminal fit/resize")
-    require(text["terminal_source"], 'background: "#0a0d13"', "native terminal palette")
-    require(text["terminal_source"], 'cursor: "#82aaff"', "native terminal cursor")
+    require(text["terminal_source"], "background: pack.background", "native terminal palette binding")
+    require(text["terminal_source"], "cursor: pack.cursor", "native terminal cursor binding")
+    signature_palette = json.loads(text["palettes"])["t1000"]
+    if signature_palette["background"] != "#0a0d13" or signature_palette["cursor"] != "#82aaff":
+        raise SystemExit("native signature terminal palette changed")
 
     payload = {
         "schema": "termdeck.web-interactive-contract.v2",

@@ -2,10 +2,10 @@
 Description=TermDeck root runtime attestation signer
 Documentation=https://github.com/Rebel0789/t1000
 After=local-fs.target systemd-tmpfiles-setup.service
-RequiresMountsFor=/warp/projects/softwares/termdeck/.termdeck
+RequiresMountsFor=/var/lib/termdeck-preparer/runtime
 ConditionPathIsDirectory=/etc/termdeck/control
 ConditionPathIsDirectory=/etc/termdeck/control/records
-ConditionPathIsDirectory=/warp/projects/softwares/termdeck/.termdeck
+ConditionPathIsDirectory=/var/lib/termdeck-preparer/runtime
 ConditionPathExists=/etc/termdeck/control/runtime-attestd.key
 ConditionPathExists=/etc/termdeck/runtime-attestd.pub
 StartLimitIntervalSec=30s
@@ -24,19 +24,17 @@ TimeoutStartSec=15s
 TimeoutStopSec=10s
 KillMode=control-group
 
-# The signer may mutate only its root-owned socket/record namespace.  The
-# private key remains read-only inside that exception and /warp is replaced by
-# an empty read-only view containing only the canonical LAN runtime directory.
-# Binding the directory lets a receipt published after daemon startup become
-# visible while the signer's view remains read-only.
+# The signer may mutate only its root-owned socket/record namespace.  Its
+# private key remains read-only inside that exception.  The private preparer
+# runtime is bound read-only so a receipt produced after daemon startup becomes
+# visible without exposing the max-owned consumer tree or any user state.
 ProtectSystem=strict
 ReadWritePaths=/etc/termdeck/control
 ReadOnlyPaths=/etc/termdeck/control/runtime-attestd.key /etc/termdeck/runtime-attestd.pub
-TemporaryFileSystem=/warp:ro
-BindReadOnlyPaths=/warp/projects/softwares/termdeck/.termdeck
+BindReadOnlyPaths=/var/lib/termdeck-preparer/runtime
 
 NoNewPrivileges=yes
-CapabilityBoundingSet=CAP_CHOWN
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_READ_SEARCH
 AmbientCapabilities=
 PrivateTmp=yes
 PrivateDevices=yes

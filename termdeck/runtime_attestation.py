@@ -51,7 +51,7 @@ DEFAULT_RECORDS_PATH: Final = DEFAULT_CONTROL_ROOT / "records"
 DEFAULT_PRIVATE_KEY_PATH: Final = DEFAULT_CONTROL_ROOT / "runtime-attestd.key"
 DEFAULT_PUBLIC_KEY_PATH: Final = Path("/etc/termdeck/runtime-attestd.pub")
 DEFAULT_RUNTIME_RECEIPT_PATH: Final = Path(
-    "/warp/projects/softwares/termdeck/.termdeck/build-receipt.json"
+    "/var/lib/termdeck-preparer/runtime/build-receipt.json"
 )
 DEFAULT_OPENSSL_PATH: Final = Path("/usr/bin/openssl")
 

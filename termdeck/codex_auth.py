@@ -96,6 +96,13 @@ class CodexAuthState:
     codex_auth_available: bool
     catalog_shared: bool = True
     canonical_binding_ready: bool = True
+    canonical_account_key: str | None = None
+    canonical_account: str | None = None
+    marker_account_key: str | None = None
+    credential_status: str = "unknown"
+    canonical_credential_status: str = "unknown"
+    selection_conflict: bool = False
+    effective_fingerprint: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -106,6 +113,14 @@ class CodexAuthState:
             "codex_auth_available": self.codex_auth_available,
             "catalog_shared": self.catalog_shared,
             "canonical_binding_ready": self.canonical_binding_ready,
+            "canonical_account_key": self.canonical_account_key,
+            "canonical_account": self.canonical_account,
+            "marker_account_key": self.marker_account_key,
+            "effective_account_key": self.selected_account_key,
+            "effective_account": self.selected_account,
+            "credential_status": self.credential_status,
+            "canonical_credential_status": self.canonical_credential_status,
+            "selection_conflict": self.selection_conflict,
             "accounts": [account.to_dict() for account in self.accounts],
         }
 
@@ -1846,28 +1861,10 @@ def _canonical_default_account(
     credentials: dict[str, Path],
     source_registry: dict[str, Any] | None,
 ) -> str | None:
-    """Return the canonical selection only when auth.json proves the same key."""
-
-    canonical_auth = source_root / "auth.json"
-    if source_registry is not None:
-        _rows, selected = _registry_accounts(source_registry)
-    else:
-        # Inheritance follows codex-auth's explicit canonical ``current``
-        # marker only when auth.json independently proves that exact account.
-        # Private live-scope observation remains auth-pointer-authoritative.
-        selected = _native_current_account(
-            source_root,
-            sorted(credentials, key=str.casefold),
-        )
-    if selected is None or selected not in credentials:
-        return None
-
-    if canonical_auth.is_symlink():
-        return selected if _same_link_target(canonical_auth, credentials[selected]) else None
-    if not canonical_auth.exists():
-        return None
-    matched = _regular_auth_account(source_root, credentials)
-    return selected if matched == selected else None
+    """Infer the canonical default from effective credentials, not a marker."""
+    from .codex_credentials import observe
+    observed = observe(source_root, credentials)
+    return observed.key if observed.status == "current" else None
 
 
 def _bind_selected_auth_pointer(home: Path, account_name: str) -> None:
@@ -2269,6 +2266,21 @@ def read_auth_state(
             for name in native_names
         ]
     active = next((account for account in accounts if account.active), None)
+    # Marker metadata remains observable, but cannot stand in for credentials
+    # actually read by Codex, including a regular file replaced on refresh.
+    from .codex_credentials import observe
+    observed_credentials = source_credentials if source_credentials is not None else {
+        account.account_key: (home / "accounts" / f"{account.account_key}.json").resolve(strict=False)
+        for account in accounts
+    }
+    marker_key = private_active_key if rows else _native_current_account(home, list(observed_credentials))
+    observation = observe(home, observed_credentials)
+    active_key = observation.key
+    accounts = [CodexAccount(account.account_key, account.email, account.alias, account.account_name,
+                             account.account_key == active_key) for account in accounts]
+    active = next((account for account in accounts if account.active), None)
+    canonical = observe(source_root, observed_credentials) if account_source is not None else None
+    canonical_account = next((account for account in accounts if canonical and account.account_key == canonical.key), None)
     fingerprint_names = native_names or [account.account_key for account in accounts]
     if source_registry is not None:
         registry_bytes += b"\0source-registry\0" + json.dumps(
@@ -2290,6 +2302,7 @@ def read_auth_state(
     )
     canonical_binding_ready = (
         catalog_shared
+        and observation.status in {"current", "unselected"}
         and not (home / ".termdeck-accounts-migration").exists()
         and pointer_ready
         and _private_current_marker_safe(home)
@@ -2307,6 +2320,13 @@ def read_auth_state(
         codex_auth_available=_real_codex_auth(home) is not None,
         catalog_shared=catalog_shared,
         canonical_binding_ready=canonical_binding_ready,
+        canonical_account_key=canonical.key if canonical else None,
+        canonical_account=canonical_account.label if canonical_account else None,
+        marker_account_key=marker_key,
+        credential_status=observation.status,
+        canonical_credential_status=canonical.status if canonical else "unknown",
+        selection_conflict=marker_key is not None and marker_key != active_key,
+        effective_fingerprint=observation.credential.digest if observation.credential else observation.status,
     )
 
 
@@ -2349,6 +2369,16 @@ class CodexAuthManager:
             account_source=self.account_source,
         )
 
+    def runtime_state(self, record: SessionRecord, state: CodexAuthState) -> dict:
+        from .codex_credentials import runtime_observation
+        return runtime_observation(Path(record.codex_home), record.auth_scope_id,
+                                   state.effective_fingerprint or None)
+
+    def record_activation(self, record: SessionRecord, state: CodexAuthState, activation) -> None:
+        from .codex_credentials import activation_receipt
+        activation_receipt(Path(record.codex_home), record.auth_scope_id,
+                           state.selected_account_key, activation.pid)
+
     def migrate_catalog(self, record: SessionRecord) -> CodexAuthState:
         """Bind a legacy scope to the canonical catalogue while it is stopped.
 
@@ -2359,6 +2389,12 @@ class CodexAuthManager:
 
         if not record.codex_home:
             raise CodexAuthError(f"terminal {record.id} has no private CODEX_HOME")
+        from .codex_credentials import CredentialError, sync_quiescent
+        source, credentials, _ = _source_account_catalog(self.account_source)
+        try:
+            sync_quiescent(Path(record.codex_home), source, credentials)
+        except CredentialError as exc:
+            raise CodexAuthError(str(exc)) from exc
         prepare_auth_scope(
             record.codex_home,
             account_source=self.account_source,

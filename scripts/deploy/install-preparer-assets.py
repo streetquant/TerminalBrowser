@@ -56,6 +56,13 @@ EXPECTED_ENTRIES: Final = (
         "root",
     ),
     Entry(
+        "deploy/termdeck-preparer-publication",
+        '/usr/libexec/termdeck-preparer-publication',
+        "0755",
+        "root",
+        "root",
+    ),
+    Entry(
         "scripts/termdeck-preparer-state.py",
         "/usr/libexec/termdeck-preparer-state",
         "0755",

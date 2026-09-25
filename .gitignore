@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+# Disposable pytest basetemp state; never package credentials or test databases.
+.t/
 .mypy_cache/
 .ruff_cache/
 .coverage

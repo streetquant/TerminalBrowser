@@ -391,6 +391,10 @@ def cmd_release_install(args: argparse.Namespace) -> int:
         }
         if bool(getattr(args, "recover_autostart", False)):
             install_kwargs["recover_autostart"] = True
+        for key in ("migrate_from_root", "migrate_from_bin_dir"):
+            value = getattr(args, key, None)
+            if value is not None:
+                install_kwargs[key] = value
         payload = install_release(
             args.wheel,
             args.manifest,
@@ -1651,6 +1655,9 @@ def cmd_auth(args: argparse.Namespace) -> int:
                 )
             action = "auth"
         payload = state.to_dict()
+        from .codex_auth import CodexAuthManager as ConcreteAuthManager
+        if isinstance(manager, ConcreteAuthManager):
+            payload.update(manager.runtime_state(record, state))
         payload.update(
             {
                 "action": action,
@@ -1769,6 +1776,12 @@ def build_parser() -> argparse.ArgumentParser:
     management.add_argument("--request", required=True)
     management.set_defaults(func=web_management_command)
 
+    from .client_files import command as client_files_command
+    client_files = sub.add_parser("client-files", help="authenticated client-file bridge (JSON on stdin)")
+    client_files.add_argument("--db", type=Path, required=True)
+    client_files.add_argument("--auth-dir", type=Path, required=True)
+    client_files.set_defaults(func=client_files_command)
+
     doctor = sub.add_parser("doctor", help="check system dependencies")
     doctor.set_defaults(func=cmd_doctor)
 
@@ -1854,6 +1867,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--recover-autostart",
         action="store_true",
         help="repair an absent production autostart receipt for the selected release",
+    )
+    release_install.add_argument(
+        "--migrate-from-root", type=Path, default=None,
+        help="authenticate a copied pre-wrapper release using its explicit historical root",
+    )
+    release_install.add_argument(
+        "--migrate-from-bin-dir", type=Path, default=None,
+        help="historical launcher directory; required together with --migrate-from-root",
     )
     release_install.set_defaults(func=cmd_release_install)
 

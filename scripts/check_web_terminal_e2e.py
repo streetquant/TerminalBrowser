@@ -608,7 +608,7 @@ def main() -> int:
         cookies_one = pair(origin, first_invitation)
         cookies_two = pair(origin, second_invitation)
 
-        with urllib.request.urlopen(f"{origin}/_termdeck/assets/v6/terminal.js", timeout=5) as response:
+        with urllib.request.urlopen(f"{origin}/_termdeck/assets/v7/terminal.js", timeout=5) as response:
             result["terminal_asset_cache_control"] = response.headers.get("Cache-Control")
         opener = urllib.request.build_opener()
         request = urllib.request.Request(f"{origin}/_termdeck/healthz")

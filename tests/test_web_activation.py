@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from contextlib import contextmanager
 import csv
+import dataclasses
 import hashlib
 import io
 import json
@@ -3880,6 +3881,50 @@ def test_terminal_transactions_load_and_watchdog_exit_cleanly(
     assert loaded_tx == tx
     assert loaded["status"] == status
     assert activation.watchdog(paths, tx) == 0
+
+
+def test_installed_recovery_command_restarts_without_mutating_terminal_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Execute the qualified frozen watchdog twice, with no host service bus."""
+    paths = _integration_paths(tmp_path)
+    paths = dataclasses.replace(paths, evidence=paths.database.parent / "recovery" / "activation-v2")
+    wheel, manifest, release = _release_artifact(tmp_path, "a")
+    monkeypatch.setattr(
+        release_manager, "_require_managed_storage", lambda _layout: _storage_attestation(),
+    )
+    release_manager.install_release(
+        wheel, manifest, root=paths.managed_root, bin_dir=paths.managed_bin,
+        python=sys.executable, production=True,
+    )
+    tx, receipt = activation.new_transaction(
+        paths, source={"commit": "a" * 40, "tree": "b" * 40,
+                       "branch": "fixture", "origin_main": "a" * 40},
+    )
+    receipt.update({"status": "rolled-back", "mutation_started": True})
+    activation._write(tx / "receipt.json", receipt)
+    paths.database.parent.mkdir(exist_ok=True)
+    paths.database.write_bytes(b"unrelated session database sentinel")
+    paths.unit_dir.mkdir(exist_ok=True)
+    unit = activation._watchdog_unit(paths, tx)
+    (paths.unit_dir / activation.WATCHDOG_UNIT).write_text(unit)
+    kwargs = activation._release_wrapper_kwargs(paths, str(release["release_id"]))
+    command = activation.service_wrappers.build_start_command(activation.WATCHDOG_UNIT, **kwargs)
+    assert str(paths.managed_root / "releases" / str(release["release_id"]) / "site") in command
+    before = {p: p.read_bytes() for p in (paths.database, tx / "receipt.json", paths.evidence / "LATEST")}
+    environment = {**os.environ, "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent-termdeck-fixture",
+                   "XDG_RUNTIME_DIR": str(tmp_path / "no-service-bus")}
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        for _ in range(2):
+            completed = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=15)
+            assert completed.returncode == 0, completed.stderr
+            assert json.loads(completed.stdout) == 0
+            assert unrelated.poll() is None
+            assert {p: p.read_bytes() for p in before} == before
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
 
 
 def test_managed_release_identity_rejects_a_dangling_state_symlink(tmp_path: Path) -> None:

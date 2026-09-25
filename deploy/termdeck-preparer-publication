@@ -1,0 +1,1649 @@
+#!/usr/bin/python3 -I
+"""Root-only producer-to-consumer publication for the TermDeck LAN runtime.
+
+The preparer owns a private runtime below ``/var/lib``.  User services consume
+only the max-owned canonical runtime.  This helper is the fixed, packaged root
+boundary between those trees: it seeds two approved build inputs, verifies the
+producer's signed-receipt-bound postimages, and publishes a bounded consumer
+snapshot with rollback to exact prior inodes on failure.
+
+No path is accepted on the max-facing broker protocol.  The broker supplies
+these fixed installation paths and numeric principals when invoking this
+root-owned image.  The helper never signs a receipt and never exposes the
+attestation key or socket to the consumer principal.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+from dataclasses import dataclass
+import errno
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import secrets
+import stat
+import sys
+from typing import Final, Mapping, Sequence
+
+
+SCHEMA: Final = "termdeck.preparer-publication.v1"
+PRODUCER_ROOT: Final = Path("/var/lib/termdeck-preparer/runtime")
+CONSUMER_ROOT: Final = Path("/warp/projects/softwares/termdeck/.termdeck")
+MAX_BYTES: Final = 16 * 1024 * 1024
+RECEIPT_MAX_BYTES: Final = 128 * 1024
+LOWER_HEX = re.compile(r"[0-9a-f]{64}\Z")
+GENERATION = re.compile(r"[0-9a-f]{32}\Z")
+DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+WRITE_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+SOURCE_MODES: Final = {
+    "bin/termdeck-web-server": 0o755,
+    "nginx/nginx.conf": 0o600,
+}
+OUTPUT_MODES: Final = {
+    "current-lan-ip": 0o600,
+    "nginx/allowed-hosts.map": 0o600,
+}
+TLS_REQUIRED_MODES: Final = {
+    "ca.crt": 0o644,
+    "ca.key": 0o600,
+    "server.key": 0o600,
+    "server.crt": 0o644,
+    "server-chain.crt": 0o644,
+    "server.ext": 0o600,
+}
+TLS_OPTIONAL_MODES: Final = {"ca.srl": 0o644}
+TLS_REQUIRED: Final = frozenset(TLS_REQUIRED_MODES)
+TLS_OPTIONAL: Final = frozenset(TLS_OPTIONAL_MODES)
+CONTROL_KEY = ".termdeck-tls-recovery-key"
+RENAME_NOREPLACE: Final = 1
+
+
+class PublicationError(RuntimeError):
+    """A producer, consumer, receipt, or transaction invariant was unsafe."""
+
+
+@dataclass(frozen=True)
+class Config:
+    producer_root: Path
+    consumer_root: Path
+    preparer_uid: int
+    preparer_gid: int
+    consumer_uid: int
+    consumer_gid: int
+    enforce_principal_separation: bool = True
+
+    def __post_init__(self) -> None:
+        for path, label in (
+            (self.producer_root, "producer root"),
+            (self.consumer_root, "consumer root"),
+        ):
+            value = os.fspath(path)
+            if not value or not os.path.isabs(value) or os.path.normpath(value) != value or "//" in value:
+                raise PublicationError(f"{label} must be an absolute canonical path")
+        if (
+            self.producer_root == self.consumer_root
+            or self.producer_root in self.consumer_root.parents
+            or self.consumer_root in self.producer_root.parents
+        ):
+            raise PublicationError("producer and consumer roots must be disjoint")
+        if min(self.preparer_uid, self.preparer_gid, self.consumer_uid, self.consumer_gid) < 0:
+            raise PublicationError("publication principals are invalid")
+        if self.enforce_principal_separation and (
+            self.preparer_uid == self.consumer_uid or self.preparer_gid == self.consumer_gid
+        ):
+            raise PublicationError("producer and consumer principals must be separated")
+
+
+@dataclass(frozen=True)
+class Identity:
+    device: int
+    inode: int
+    mode: int
+    links: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    uid: int
+    gid: int
+
+    def payload(self) -> list[int]:
+        return [
+            self.device,
+            self.inode,
+            self.mode,
+            self.links,
+            self.size,
+            self.mtime_ns,
+            self.ctime_ns,
+        ]
+
+
+@dataclass(frozen=True)
+class Leaf:
+    content: bytes
+    identity: Identity
+    sha256: str
+
+
+@dataclass(frozen=True)
+class RootLease:
+    path: Path
+    descriptor: int
+    identity: tuple[int, int, int, int, int]
+    uid: int
+    gid: int
+    mode: int
+
+    def revalidate(self) -> None:
+        try:
+            descriptor_info = os.fstat(self.descriptor)
+            named_info = os.stat(self.path, follow_symlinks=False)
+        except OSError as exc:
+            raise PublicationError(f"runtime root changed: {self.path}") from exc
+        if _directory_identity(descriptor_info, label=str(self.path)) != self.identity:
+            raise PublicationError(f"runtime root descriptor changed: {self.path}")
+        if _directory_identity(named_info, label=str(self.path)) != self.identity:
+            raise PublicationError(f"runtime root path changed: {self.path}")
+        if (
+            int(descriptor_info.st_uid) != self.uid
+            or int(descriptor_info.st_gid) != self.gid
+            or stat.S_IMODE(descriptor_info.st_mode) != self.mode
+        ):
+            raise PublicationError(f"runtime root ownership or mode changed: {self.path}")
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+
+
+@dataclass
+class _Operation:
+    kind: str
+    parent: int
+    name: str
+    backup: str | None
+
+
+class Transaction:
+    """Same-directory rename transaction retaining exact prior inodes."""
+
+    def __init__(self) -> None:
+        self._operations: list[_Operation] = []
+        self._finished = False
+
+    @staticmethod
+    def _temporary(prefix: str) -> str:
+        return f".{prefix}-{secrets.token_hex(16)}"
+
+    def detach_file(
+        self,
+        parent: int,
+        name: str,
+        *,
+        owner_uid: int,
+        owner_gid: int,
+        allowed_modes: frozenset[int],
+        label: str,
+    ) -> None:
+        backup: str | None = None
+        try:
+            descriptor = os.open(name, READ_FLAGS, dir_fd=parent)
+        except FileNotFoundError:
+            descriptor = -1
+        except OSError as exc:
+            raise PublicationError(f"could not inspect prior {label}") from exc
+        if descriptor >= 0:
+            try:
+                identity = _regular_identity(os.fstat(descriptor), label=label)
+                named = _regular_identity(
+                    os.stat(name, dir_fd=parent, follow_symlinks=False), label=label
+                )
+                if identity != named:
+                    raise PublicationError(f"prior {label} changed while opening")
+                if (
+                    identity.uid != owner_uid
+                    or identity.gid != owner_gid
+                    or identity.mode not in allowed_modes
+                ):
+                    raise PublicationError(f"prior {label} ownership or mode is unsafe")
+            finally:
+                os.close(descriptor)
+            backup = self._temporary("termdeck-prior")
+            try:
+                os.rename(name, backup, src_dir_fd=parent, dst_dir_fd=parent)
+                os.fsync(parent)
+            except OSError as exc:
+                raise PublicationError(f"could not retain prior {label}") from exc
+        try:
+            retained_parent = os.dup(parent)
+            os.set_inheritable(retained_parent, False)
+        except OSError as exc:
+            if backup is not None:
+                try:
+                    os.rename(backup, name, src_dir_fd=parent, dst_dir_fd=parent)
+                except OSError:
+                    pass
+            raise PublicationError(f"could not retain transaction descriptor for {label}") from exc
+        self._operations.append(_Operation("file", retained_parent, name, backup))
+
+    def replace_file(
+        self,
+        parent: int,
+        name: str,
+        content: bytes,
+        *,
+        mode: int,
+        owner_uid: int,
+        owner_gid: int,
+        label: str,
+    ) -> None:
+        self.detach_file(
+            parent,
+            name,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            allowed_modes=frozenset({mode}),
+            label=label,
+        )
+        temporary = self._temporary("termdeck-new")
+        descriptor = -1
+        try:
+            descriptor = os.open(temporary, WRITE_FLAGS, mode, dir_fd=parent)
+            os.fchmod(descriptor, mode)
+            os.fchown(descriptor, owner_uid, owner_gid)
+            _write_all(descriptor, content, label=label)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.rename(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+            os.fsync(parent)
+        except BaseException as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary, dir_fd=parent)
+            except OSError:
+                pass
+            if isinstance(exc, PublicationError):
+                raise
+            raise PublicationError(f"could not publish {label}") from exc
+
+    def swap_directory(
+        self,
+        parent: int,
+        name: str,
+        staged: str,
+        *,
+        owner_uid: int,
+        owner_gid: int,
+        mode: int,
+        label: str,
+    ) -> None:
+        _validate_named_directory(
+            parent,
+            staged,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            mode=mode,
+            label=f"staged {label}",
+        )
+        backup: str | None = None
+        try:
+            _validate_named_directory(
+                parent,
+                name,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+                mode=mode,
+                label=f"prior {label}",
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            backup = self._temporary("termdeck-prior-dir")
+            try:
+                os.rename(name, backup, src_dir_fd=parent, dst_dir_fd=parent)
+            except OSError as exc:
+                raise PublicationError(f"could not retain prior {label}") from exc
+        try:
+            os.rename(staged, name, src_dir_fd=parent, dst_dir_fd=parent)
+            os.fsync(parent)
+        except OSError as exc:
+            if backup is not None:
+                try:
+                    os.rename(backup, name, src_dir_fd=parent, dst_dir_fd=parent)
+                except OSError:
+                    pass
+            raise PublicationError(f"could not publish {label}") from exc
+        try:
+            retained_parent = os.dup(parent)
+            os.set_inheritable(retained_parent, False)
+        except OSError as exc:
+            garbage = self._temporary("termdeck-unretained-dir")
+            try:
+                os.rename(name, garbage, src_dir_fd=parent, dst_dir_fd=parent)
+                if backup is not None:
+                    os.rename(backup, name, src_dir_fd=parent, dst_dir_fd=parent)
+                _remove_flat_directory(parent, garbage)
+            except OSError:
+                pass
+            raise PublicationError(f"could not retain transaction descriptor for {label}") from exc
+        self._operations.append(_Operation("directory", retained_parent, name, backup))
+
+    def rollback(self) -> None:
+        if self._finished:
+            return
+        errors: list[str] = []
+        for operation in reversed(self._operations):
+            try:
+                if operation.kind == "directory":
+                    garbage = self._temporary("termdeck-rollback-dir")
+                    try:
+                        os.rename(
+                            operation.name,
+                            garbage,
+                            src_dir_fd=operation.parent,
+                            dst_dir_fd=operation.parent,
+                        )
+                    except FileNotFoundError:
+                        garbage = ""
+                    if operation.backup is not None:
+                        os.rename(
+                            operation.backup,
+                            operation.name,
+                            src_dir_fd=operation.parent,
+                            dst_dir_fd=operation.parent,
+                        )
+                    if garbage:
+                        _remove_flat_directory(operation.parent, garbage)
+                else:
+                    try:
+                        os.unlink(operation.name, dir_fd=operation.parent)
+                    except FileNotFoundError:
+                        pass
+                    if operation.backup is not None:
+                        os.rename(
+                            operation.backup,
+                            operation.name,
+                            src_dir_fd=operation.parent,
+                            dst_dir_fd=operation.parent,
+                        )
+                os.fsync(operation.parent)
+            except (OSError, PublicationError) as exc:
+                errors.append(f"{operation.name}: {exc}")
+            finally:
+                os.close(operation.parent)
+        self._finished = True
+        if errors:
+            raise PublicationError("consumer rollback failed: " + "; ".join(errors))
+
+    def commit(self) -> tuple[str, ...]:
+        """Commit the accepted postimage and report backup-cleanup failures.
+
+        Once the new consumer postimage has been observed successfully,
+        deleting retained preimages is cleanup rather than part of the commit.
+        Reporting a cleanup failure as a failed publication would be false: the
+        postimage is already live and this transaction can no longer restore
+        the old names.
+        """
+
+        if self._finished:
+            raise PublicationError("publication transaction is already finished")
+        errors: list[str] = []
+        for operation in self._operations:
+            try:
+                if operation.backup is not None:
+                    if operation.kind == "directory":
+                        _remove_flat_directory(operation.parent, operation.backup)
+                    else:
+                        os.unlink(operation.backup, dir_fd=operation.parent)
+                    os.fsync(operation.parent)
+            except (OSError, PublicationError) as exc:
+                errors.append(f"{operation.name}: {exc}")
+            finally:
+                os.close(operation.parent)
+        self._finished = True
+        return tuple(errors)
+
+
+def _directory_identity(info: os.stat_result, *, label: str) -> tuple[int, int, int, int, int]:
+    if not stat.S_ISDIR(info.st_mode) or info.st_ino <= 0 or info.st_nlink <= 0:
+        raise PublicationError(f"{label} is not a real directory")
+    return (
+        int(info.st_dev),
+        int(info.st_ino),
+        stat.S_IMODE(info.st_mode),
+        int(info.st_uid),
+        int(info.st_gid),
+    )
+
+
+def _regular_identity(info: os.stat_result, *, label: str) -> Identity:
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_ino <= 0
+        or info.st_nlink != 1
+        or info.st_size < 0
+        or info.st_size > MAX_BYTES
+    ):
+        raise PublicationError(f"{label} is not one bounded regular file")
+    return Identity(
+        int(info.st_dev),
+        int(info.st_ino),
+        stat.S_IMODE(info.st_mode),
+        int(info.st_nlink),
+        int(info.st_size),
+        int(info.st_mtime_ns),
+        int(info.st_ctime_ns),
+        int(info.st_uid),
+        int(info.st_gid),
+    )
+
+
+def _open_root(path: Path, *, uid: int, gid: int, mode: int, label: str) -> RootLease:
+    try:
+        descriptor = os.open(path, DIRECTORY_FLAGS)
+        descriptor_info = os.fstat(descriptor)
+        named_info = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise PublicationError(f"could not open {label}") from exc
+    try:
+        identity = _directory_identity(descriptor_info, label=label)
+        if _directory_identity(named_info, label=label) != identity:
+            raise PublicationError(f"{label} changed while opening")
+        if int(descriptor_info.st_uid) != uid or int(descriptor_info.st_gid) != gid or stat.S_IMODE(descriptor_info.st_mode) != mode:
+            raise PublicationError(f"{label} ownership or mode is unsafe")
+        return RootLease(path, descriptor, identity, uid, gid, mode)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _safe_component(name: str, *, label: str) -> str:
+    if not name or name in {".", ".."} or "/" in name or "\\" in name or "\x00" in name:
+        raise PublicationError(f"unsafe {label}")
+    return name
+
+
+def _ensure_directory(parent: int, name: str, *, uid: int, gid: int, mode: int, label: str) -> int:
+    _safe_component(name, label=label)
+    try:
+        os.mkdir(name, mode, dir_fd=parent)
+        os.chown(name, uid, gid, dir_fd=parent, follow_symlinks=False)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise PublicationError(f"could not create {label}") from exc
+    return _open_named_directory(parent, name, uid=uid, gid=gid, mode=mode, label=label)
+
+
+def _open_named_directory(parent: int, name: str, *, uid: int, gid: int, mode: int, label: str) -> int:
+    _safe_component(name, label=label)
+    try:
+        descriptor = os.open(name, DIRECTORY_FLAGS, dir_fd=parent)
+        descriptor_info = os.fstat(descriptor)
+        named_info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except OSError as exc:
+        raise PublicationError(f"could not open {label}") from exc
+    try:
+        identity = _directory_identity(descriptor_info, label=label)
+        if _directory_identity(named_info, label=label) != identity:
+            raise PublicationError(f"{label} changed while opening")
+        if int(descriptor_info.st_uid) != uid or int(descriptor_info.st_gid) != gid or stat.S_IMODE(descriptor_info.st_mode) != mode:
+            raise PublicationError(f"{label} ownership or mode is unsafe")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _validate_named_directory(parent: int, name: str, *, owner_uid: int, owner_gid: int, mode: int, label: str) -> None:
+    descriptor = _open_named_directory(parent, name, uid=owner_uid, gid=owner_gid, mode=mode, label=label)
+    os.close(descriptor)
+
+
+def _parent_and_name(root: int, relative: str, *, uid: int, gid: int, create: bool) -> tuple[int, str, bool]:
+    path = PurePosixPath(relative)
+    if path.is_absolute() or len(path.parts) not in {1, 2} or any(part in {"", ".", ".."} for part in path.parts):
+        raise PublicationError(f"unsafe publication path: {relative}")
+    if len(path.parts) == 1:
+        return root, path.name, False
+    opener = _ensure_directory if create else _open_named_directory
+    descriptor = opener(root, path.parts[0], uid=uid, gid=gid, mode=0o700, label=f"runtime {path.parts[0]}")
+    return descriptor, path.name, True
+
+
+def _read_leaf(parent: int, name: str, *, uid: int, gid: int, mode: int, label: str, max_bytes: int = MAX_BYTES) -> Leaf:
+    _safe_component(name, label=label)
+    descriptor = -1
+    try:
+        descriptor = os.open(name, READ_FLAGS, dir_fd=parent)
+        before = _regular_identity(os.fstat(descriptor), label=label)
+        named_before = _regular_identity(os.stat(name, dir_fd=parent, follow_symlinks=False), label=label)
+        if before != named_before or before.uid != uid or before.gid != gid or before.mode != mode or before.size > max_bytes:
+            raise PublicationError(f"{label} ownership, mode, or identity is unsafe")
+        content = bytearray()
+        while len(content) < before.size:
+            block = os.read(descriptor, min(1024 * 1024, before.size - len(content)))
+            if not block:
+                raise PublicationError(f"{label} ended early")
+            content.extend(block)
+        if os.read(descriptor, 1):
+            raise PublicationError(f"{label} grew while reading")
+        after = _regular_identity(os.fstat(descriptor), label=label)
+        named_after = _regular_identity(os.stat(name, dir_fd=parent, follow_symlinks=False), label=label)
+        if before != after or before != named_after:
+            raise PublicationError(f"{label} changed while reading")
+        raw = bytes(content)
+        return Leaf(raw, before, hashlib.sha256(raw).hexdigest())
+    except OSError as exc:
+        raise PublicationError(f"could not read {label}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_relative(root: int, relative: str, *, uid: int, gid: int, mode: int, label: str) -> Leaf:
+    parent, name, close_parent = _parent_and_name(root, relative, uid=uid, gid=gid, create=False)
+    try:
+        return _read_leaf(parent, name, uid=uid, gid=gid, mode=mode, label=label)
+    finally:
+        if close_parent:
+            os.close(parent)
+
+
+def _write_all(descriptor: int, content: bytes, *, label: str) -> None:
+    offset = 0
+    while offset < len(content):
+        try:
+            written = os.write(descriptor, content[offset:])
+        except OSError as exc:
+            raise PublicationError(f"could not write {label}") from exc
+        if written <= 0:
+            raise PublicationError(f"could not write {label}")
+        offset += written
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+
+def _strict_json(content: bytes, *, label: str) -> dict[str, object]:
+    def pairs(values: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in values:
+            if key in result:
+                raise PublicationError(f"{label} contains duplicate fields")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(content.decode("ascii"), object_pairs_hook=pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PublicationError(f"{label} is not strict JSON") from exc
+    if not isinstance(value, dict) or content not in {_canonical_json(value), _canonical_json(value) + b"\n"}:
+        raise PublicationError(f"{label} is not canonical JSON")
+    return value
+
+
+def _identity_claim(value: object, *, mode: int, label: str) -> tuple[list[int], str]:
+    if not isinstance(value, Mapping) or set(value) not in (
+        {"identity", "mode", "path", "sha256"},
+        {"identity", "mode", "sha256"},
+    ):
+        raise PublicationError(f"{label} claim is invalid")
+    identity = value.get("identity")
+    digest = value.get("sha256")
+    if (
+        not isinstance(identity, list)
+        or len(identity) != 7
+        or not all(isinstance(item, int) and item >= 0 for item in identity)
+        or identity[2] != mode
+        or identity[3] != 1
+        or value.get("mode") != mode
+        or not isinstance(digest, str)
+        or LOWER_HEX.fullmatch(digest) is None
+    ):
+        raise PublicationError(f"{label} claim is invalid")
+    return identity, digest
+
+
+def _receipt(producer: RootLease, config: Config) -> tuple[dict[str, object], Leaf]:
+    leaf = _read_leaf(
+        producer.descriptor,
+        "build-receipt.json",
+        uid=config.preparer_uid,
+        gid=config.preparer_gid,
+        mode=0o644,
+        label="producer build receipt",
+        max_bytes=RECEIPT_MAX_BYTES,
+    )
+    receipt = _strict_json(leaf.content, label="producer build receipt")
+    if receipt.get("schema") != "termdeck.lan-runtime-build.v2" or receipt.get("ok") is not True:
+        raise PublicationError("producer build receipt schema is invalid")
+    generation = receipt.get("runtime_publication", {}).get("generation") if isinstance(receipt.get("runtime_publication"), Mapping) else None
+    if not isinstance(generation, str) or GENERATION.fullmatch(generation) is None:
+        raise PublicationError("producer runtime generation is invalid")
+    return receipt, leaf
+
+
+def _manifest(receipt: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
+    publication = receipt.get("tls_publication")
+    if not isinstance(publication, Mapping):
+        raise PublicationError("producer receipt lacks TLS publication")
+    current = publication.get("current")
+    if not isinstance(current, Mapping) or current.get("path") != "tls":
+        raise PublicationError("producer receipt current TLS publication is invalid")
+    manifest = current.get("manifest")
+    if not isinstance(manifest, Mapping):
+        raise PublicationError("producer TLS manifest is invalid")
+    names = set(manifest)
+    if not TLS_REQUIRED.issubset(names) or not names.issubset(TLS_REQUIRED | TLS_OPTIONAL):
+        raise PublicationError("producer TLS manifest has an unsafe leaf set")
+    parsed: dict[str, Mapping[str, object]] = {}
+    for name, claim in manifest.items():
+        if not isinstance(name, str) or not isinstance(claim, Mapping):
+            raise PublicationError("producer TLS manifest is invalid")
+        mode = claim.get("mode")
+        expected_mode = TLS_REQUIRED_MODES.get(name, TLS_OPTIONAL_MODES.get(name))
+        if not isinstance(mode, int) or expected_mode is None or mode != expected_mode:
+            raise PublicationError(f"producer TLS mode is unsafe: {name}")
+        _identity_claim(claim, mode=mode, label=f"producer TLS {name}")
+        parsed[name] = claim
+    return parsed
+
+
+def _runtime_outputs(receipt: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
+    publication = receipt.get("runtime_publication")
+    outputs = publication.get("outputs") if isinstance(publication, Mapping) else None
+    if not isinstance(outputs, Mapping) or set(outputs) != set(OUTPUT_MODES):
+        raise PublicationError("producer runtime outputs are invalid")
+    parsed: dict[str, Mapping[str, object]] = {}
+    for relative, mode in OUTPUT_MODES.items():
+        claim = outputs.get(relative)
+        if not isinstance(claim, Mapping) or claim.get("path") != relative:
+            raise PublicationError(f"producer runtime output is invalid: {relative}")
+        _identity_claim(claim, mode=mode, label=f"producer runtime {relative}")
+        parsed[relative] = claim
+    return parsed
+
+
+def _file_digests(receipt: Mapping[str, object]) -> Mapping[str, object]:
+    files = receipt.get("files")
+    required = set(SOURCE_MODES) | {"tls/ca.crt", "tls/server.crt", "tls/server-chain.crt"}
+    if not isinstance(files, Mapping) or set(files) != required:
+        raise PublicationError("producer source digest set is invalid")
+    if any(not isinstance(files[name], str) or LOWER_HEX.fullmatch(files[name]) is None for name in required):
+        raise PublicationError("producer source digest is invalid")
+    return files
+
+
+def _claim(leaf: Leaf, *, path: str, mode: int) -> dict[str, object]:
+    if leaf.identity.mode != mode or leaf.identity.links != 1:
+        raise PublicationError(f"published leaf mode is invalid: {path}")
+    return {
+        "path": path,
+        "identity": leaf.identity.payload(),
+        "mode": mode,
+        "sha256": leaf.sha256,
+    }
+
+
+def _copy_into(parent: int, name: str, leaf: Leaf, *, uid: int, gid: int, mode: int, label: str) -> None:
+    temporary = f".termdeck-seed-{secrets.token_hex(16)}"
+    descriptor = -1
+    try:
+        descriptor = os.open(temporary, WRITE_FLAGS, mode, dir_fd=parent)
+        os.fchmod(descriptor, mode)
+        os.fchown(descriptor, uid, gid)
+        _write_all(descriptor, leaf.content, label=label)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.rename(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
+    except BaseException as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except OSError:
+            pass
+        if isinstance(exc, PublicationError):
+            raise
+        raise PublicationError(f"could not seed {label}") from exc
+
+
+def _rename_noreplace(
+    source_parent: int,
+    source: str,
+    destination_parent: int,
+    destination: str,
+    *,
+    label: str,
+) -> None:
+    """Use Linux renameat2 so a concurrent destination is never overwritten."""
+
+    try:
+        rename = ctypes.CDLL(None, use_errno=True).renameat2
+    except (AttributeError, OSError) as exc:
+        raise PublicationError("secure key migration requires renameat2") from exc
+    rename.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    rename.restype = ctypes.c_int
+    failure = 0
+    for attempt in range(3):
+        result = rename(
+            source_parent,
+            os.fsencode(source),
+            destination_parent,
+            os.fsencode(destination),
+            RENAME_NOREPLACE,
+        )
+        if result == 0:
+            return
+        failure = ctypes.get_errno()
+        if failure != errno.EINTR:
+            break
+        if attempt == 2:
+            raise PublicationError(f"secure key migration was interrupted: {label}")
+    if failure == errno.EEXIST:
+        raise FileExistsError(failure, os.strerror(failure), destination)
+    if failure == errno.ENOENT:
+        raise FileNotFoundError(failure, os.strerror(failure), source)
+    if failure in {
+        errno.ENOSYS,
+        errno.EINVAL,
+        errno.ENOTSUP,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+    }:
+        raise PublicationError("secure key migration requires renameat2")
+    raise PublicationError(
+        f"secure no-replace publication failed for {label}: {os.strerror(failure)}"
+    )
+
+
+def _copy_into_noreplace(
+    parent: int,
+    name: str,
+    leaf: Leaf,
+    *,
+    uid: int,
+    gid: int,
+    mode: int,
+    label: str,
+) -> None:
+    """Publish one exact leaf without replacing a concurrent destination."""
+
+    temporary = f".termdeck-migrate-{secrets.token_hex(16)}"
+    descriptor = -1
+    expected: Identity | None = None
+    published_identity: Identity | None = None
+    published = False
+    try:
+        descriptor = os.open(temporary, WRITE_FLAGS, mode, dir_fd=parent)
+        os.fchmod(descriptor, mode)
+        os.fchown(descriptor, uid, gid)
+        _write_all(descriptor, leaf.content, label=label)
+        os.fsync(descriptor)
+        expected = _regular_identity(os.fstat(descriptor), label=label)
+        if (
+            expected.uid != uid
+            or expected.gid != gid
+            or expected.mode != mode
+            or expected.links != 1
+            or expected.size != len(leaf.content)
+        ):
+            raise PublicationError(f"staged {label} ownership or mode is unsafe")
+        _rename_noreplace(parent, temporary, parent, name, label=label)
+        published = True
+        published_identity = _regular_identity(os.fstat(descriptor), label=label)
+        named = _regular_identity(
+            os.stat(name, dir_fd=parent, follow_symlinks=False), label=label
+        )
+        if named != published_identity:
+            raise PublicationError(f"published {label} path changed during no-replace migration")
+        if (
+            expected.device,
+            expected.inode,
+            expected.mode,
+            expected.links,
+            expected.size,
+            expected.mtime_ns,
+            expected.uid,
+            expected.gid,
+        ) != (
+            published_identity.device,
+            published_identity.inode,
+            published_identity.mode,
+            published_identity.links,
+            published_identity.size,
+            published_identity.mtime_ns,
+            published_identity.uid,
+            published_identity.gid,
+        ):
+            raise PublicationError(f"published {label} changed during no-replace migration")
+        os.fsync(parent)
+    except BaseException as exc:
+        cleanup_errors: list[str] = []
+        if published and published_identity is not None:
+            try:
+                current = _regular_identity(
+                    os.stat(name, dir_fd=parent, follow_symlinks=False), label=label
+                )
+                if current == published_identity:
+                    os.unlink(name, dir_fd=parent)
+                    os.fsync(parent)
+                else:
+                    cleanup_errors.append("destination identity changed before rollback")
+            except FileNotFoundError:
+                pass
+            except (OSError, PublicationError) as cleanup_exc:
+                cleanup_errors.append(str(cleanup_exc))
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+        except OSError as cleanup_exc:
+            cleanup_errors.append(str(cleanup_exc))
+        if cleanup_errors and hasattr(exc, "add_note"):
+            exc.add_note("key-migration cleanup: " + "; ".join(cleanup_errors))
+        if isinstance(exc, PublicationError):
+            raise
+        if isinstance(exc, FileExistsError):
+            raise PublicationError(f"{label} appeared during no-replace migration") from exc
+        raise PublicationError(f"could not migrate {label} without replacement") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _optional_leaf(
+    parent: int,
+    name: str,
+    *,
+    uid: int,
+    gid: int,
+    mode: int,
+    label: str,
+    max_bytes: int,
+) -> Leaf | None:
+    try:
+        os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PublicationError(f"could not inspect {label}") from exc
+    return _read_leaf(
+        parent,
+        name,
+        uid=uid,
+        gid=gid,
+        mode=mode,
+        label=label,
+        max_bytes=max_bytes,
+    )
+
+
+def _migrate_control_key(
+    config: Config,
+    *,
+    producer_parent: RootLease,
+    consumer: RootLease,
+) -> str:
+    """Move a legacy max-readable commitment key behind the preparer boundary."""
+
+    legacy = _optional_leaf(
+        consumer.descriptor,
+        CONTROL_KEY,
+        uid=config.consumer_uid,
+        gid=config.consumer_gid,
+        mode=0o600,
+        label="legacy consumer TLS recovery key",
+        max_bytes=64,
+    )
+    private = _optional_leaf(
+        producer_parent.descriptor,
+        CONTROL_KEY,
+        uid=config.preparer_uid,
+        gid=config.preparer_gid,
+        mode=0o600,
+        label="producer TLS recovery key",
+        max_bytes=64,
+    )
+    if legacy is not None and len(legacy.content) != 32:
+        raise PublicationError("legacy consumer TLS recovery key has an invalid size")
+    if private is not None and len(private.content) != 32:
+        raise PublicationError("producer TLS recovery key has an invalid size")
+    if legacy is not None and private is not None and legacy.content != private.content:
+        raise PublicationError("legacy and producer TLS recovery keys do not match")
+
+    created_private = False
+    removed_legacy = False
+    try:
+        if private is None and legacy is not None:
+            _copy_into_noreplace(
+                producer_parent.descriptor,
+                CONTROL_KEY,
+                legacy,
+                uid=config.preparer_uid,
+                gid=config.preparer_gid,
+                mode=0o600,
+                label="producer TLS recovery key",
+            )
+            created_private = True
+            private = _read_leaf(
+                producer_parent.descriptor,
+                CONTROL_KEY,
+                uid=config.preparer_uid,
+                gid=config.preparer_gid,
+                mode=0o600,
+                label="producer TLS recovery key",
+                max_bytes=64,
+            )
+            if private.content != legacy.content:
+                raise PublicationError("producer TLS recovery key migration changed the key")
+
+        if legacy is None:
+            return "private" if private is not None else "absent"
+
+        producer_parent.revalidate()
+        consumer.revalidate()
+        rebound = _read_leaf(
+            consumer.descriptor,
+            CONTROL_KEY,
+            uid=config.consumer_uid,
+            gid=config.consumer_gid,
+            mode=0o600,
+            label="legacy consumer TLS recovery key",
+            max_bytes=64,
+        )
+        if rebound.identity != legacy.identity or rebound.content != legacy.content:
+            raise PublicationError("legacy consumer TLS recovery key changed before migration")
+        os.unlink(CONTROL_KEY, dir_fd=consumer.descriptor)
+        removed_legacy = True
+        os.fsync(consumer.descriptor)
+        return "migrated"
+    except BaseException as exc:
+        rollback_errors: list[str] = []
+        if removed_legacy and legacy is not None:
+            try:
+                _copy_into(
+                    consumer.descriptor,
+                    CONTROL_KEY,
+                    legacy,
+                    uid=config.consumer_uid,
+                    gid=config.consumer_gid,
+                    mode=0o600,
+                    label="legacy consumer TLS recovery key rollback",
+                )
+            except BaseException as rollback_exc:
+                rollback_errors.append(f"legacy key restore: {rollback_exc}")
+        if created_private:
+            try:
+                current = _read_leaf(
+                    producer_parent.descriptor,
+                    CONTROL_KEY,
+                    uid=config.preparer_uid,
+                    gid=config.preparer_gid,
+                    mode=0o600,
+                    label="producer TLS recovery key rollback",
+                    max_bytes=64,
+                )
+                if legacy is None or current.content != legacy.content:
+                    raise PublicationError("producer TLS recovery key changed during rollback")
+                os.unlink(CONTROL_KEY, dir_fd=producer_parent.descriptor)
+                os.fsync(producer_parent.descriptor)
+            except BaseException as rollback_exc:
+                rollback_errors.append(f"producer key rollback: {rollback_exc}")
+        if rollback_errors and hasattr(exc, "add_note"):
+            exc.add_note("; ".join(rollback_errors))
+        raise
+
+
+def seed(config: Config) -> dict[str, object]:
+    producer = _open_root(
+        config.producer_root,
+        uid=config.preparer_uid,
+        gid=config.preparer_gid,
+        mode=0o700,
+        label="private producer root",
+    )
+    consumer = _open_root(
+        config.consumer_root,
+        uid=config.consumer_uid,
+        gid=config.consumer_gid,
+        mode=0o700,
+        label="user consumer root",
+    )
+    copied: list[str] = []
+    try:
+        for relative, mode in SOURCE_MODES.items():
+            source = _read_relative(
+                consumer.descriptor,
+                relative,
+                uid=config.consumer_uid,
+                gid=config.consumer_gid,
+                mode=mode,
+                label=f"consumer source {relative}",
+            )
+            parent, name, close_parent = _parent_and_name(
+                producer.descriptor,
+                relative,
+                uid=config.preparer_uid,
+                gid=config.preparer_gid,
+                create=True,
+            )
+            try:
+                _copy_into(
+                    parent,
+                    name,
+                    source,
+                    uid=config.preparer_uid,
+                    gid=config.preparer_gid,
+                    mode=mode,
+                    label=f"producer source {relative}",
+                )
+            finally:
+                if close_parent:
+                    os.close(parent)
+            copied.append(relative)
+
+        producer_tls = _ensure_directory(
+            producer.descriptor,
+            "tls",
+            uid=config.preparer_uid,
+            gid=config.preparer_gid,
+            mode=0o700,
+            label="producer TLS directory",
+        )
+        consumer_tls = _open_named_directory(
+            consumer.descriptor,
+            "tls",
+            uid=config.consumer_uid,
+            gid=config.consumer_gid,
+            mode=0o700,
+            label="consumer TLS directory",
+        )
+        try:
+            producer_names = set(os.listdir(producer_tls))
+            if not producer_names:
+                consumer_names = set(os.listdir(consumer_tls))
+                names = (consumer_names & (TLS_REQUIRED | TLS_OPTIONAL))
+                if TLS_REQUIRED.issubset(names):
+                    for name in sorted(names):
+                        mode = TLS_REQUIRED_MODES.get(name, TLS_OPTIONAL_MODES.get(name))
+                        if mode is None:
+                            raise PublicationError(f"consumer TLS leaf is unsafe: {name}")
+                        leaf = _read_leaf(
+                            consumer_tls,
+                            name,
+                            uid=config.consumer_uid,
+                            gid=config.consumer_gid,
+                            mode=mode,
+                            label=f"consumer TLS {name}",
+                        )
+                        _copy_into(
+                            producer_tls,
+                            name,
+                            leaf,
+                            uid=config.preparer_uid,
+                            gid=config.preparer_gid,
+                            mode=mode,
+                            label=f"producer TLS {name}",
+                        )
+                        copied.append("tls/" + name)
+        finally:
+            os.close(consumer_tls)
+            os.close(producer_tls)
+
+        producer_parent = _open_root(
+            config.producer_root.parent,
+            uid=config.preparer_uid,
+            gid=config.preparer_gid,
+            mode=0o700,
+            label="producer control parent",
+        )
+        try:
+            control_key = _migrate_control_key(
+                config,
+                producer_parent=producer_parent,
+                consumer=consumer,
+            )
+            producer_parent.revalidate()
+        finally:
+            producer_parent.close()
+        producer.revalidate()
+        consumer.revalidate()
+        if control_key == "migrated":
+            copied.append(CONTROL_KEY)
+        return {
+            "schema": SCHEMA,
+            "operation": "seed",
+            "copied": sorted(copied),
+            "control_key": control_key,
+            "ok": True,
+        }
+    finally:
+        consumer.close()
+        producer.close()
+
+
+def _collect_producer(config: Config, producer: RootLease) -> tuple[dict[str, object], Leaf, dict[str, Leaf], dict[str, Leaf]]:
+    receipt, receipt_leaf = _receipt(producer, config)
+    files = _file_digests(receipt)
+    outputs = _runtime_outputs(receipt)
+    manifest = _manifest(receipt)
+    output_leaves: dict[str, Leaf] = {}
+    for relative, mode in OUTPUT_MODES.items():
+        leaf = _read_relative(
+            producer.descriptor,
+            relative,
+            uid=config.preparer_uid,
+            gid=config.preparer_gid,
+            mode=mode,
+            label=f"producer output {relative}",
+        )
+        identity, digest = _identity_claim(outputs[relative], mode=mode, label=f"producer output {relative}")
+        if leaf.identity.payload() != identity or leaf.sha256 != digest:
+            raise PublicationError(f"producer output does not match receipt: {relative}")
+        output_leaves[relative] = leaf
+    tls_fd = _open_named_directory(
+        producer.descriptor,
+        "tls",
+        uid=config.preparer_uid,
+        gid=config.preparer_gid,
+        mode=0o700,
+        label="producer TLS directory",
+    )
+    tls_leaves: dict[str, Leaf] = {}
+    try:
+        if set(os.listdir(tls_fd)) & (TLS_REQUIRED | TLS_OPTIONAL) != set(manifest):
+            raise PublicationError("producer TLS leaf set does not match receipt")
+        for name, claim in manifest.items():
+            mode = int(claim["mode"])
+            leaf = _read_leaf(
+                tls_fd,
+                name,
+                uid=config.preparer_uid,
+                gid=config.preparer_gid,
+                mode=mode,
+                label=f"producer TLS {name}",
+            )
+            identity, digest = _identity_claim(claim, mode=mode, label=f"producer TLS {name}")
+            if leaf.identity.payload() != identity or leaf.sha256 != digest:
+                raise PublicationError(f"producer TLS does not match receipt: {name}")
+            if "tls/" + name in files and leaf.sha256 != files["tls/" + name]:
+                raise PublicationError(f"producer TLS source digest does not match receipt: {name}")
+            tls_leaves[name] = leaf
+    finally:
+        os.close(tls_fd)
+    return receipt, receipt_leaf, output_leaves, tls_leaves
+
+
+def _verify_consumer_sources(config: Config, consumer: RootLease, receipt: Mapping[str, object]) -> None:
+    files = _file_digests(receipt)
+    for relative, mode in SOURCE_MODES.items():
+        leaf = _read_relative(
+            consumer.descriptor,
+            relative,
+            uid=config.consumer_uid,
+            gid=config.consumer_gid,
+            mode=mode,
+            label=f"consumer source {relative}",
+        )
+        if leaf.sha256 != files[relative]:
+            raise PublicationError(f"consumer source does not match producer receipt: {relative}")
+
+
+def _stage_tls(config: Config, consumer: RootLease, tls_leaves: Mapping[str, Leaf]) -> str:
+    name = f".termdeck-new-tls-{secrets.token_hex(16)}"
+    try:
+        os.mkdir(name, 0o700, dir_fd=consumer.descriptor)
+        os.chown(name, config.consumer_uid, config.consumer_gid, dir_fd=consumer.descriptor, follow_symlinks=False)
+    except OSError as exc:
+        raise PublicationError("could not stage consumer TLS directory") from exc
+    descriptor = _open_named_directory(
+        consumer.descriptor,
+        name,
+        uid=config.consumer_uid,
+        gid=config.consumer_gid,
+        mode=0o700,
+        label="staged consumer TLS directory",
+    )
+    try:
+        for leaf_name, leaf in tls_leaves.items():
+            _copy_into(
+                descriptor,
+                leaf_name,
+                leaf,
+                uid=config.consumer_uid,
+                gid=config.consumer_gid,
+                mode=leaf.identity.mode,
+                label=f"consumer TLS {leaf_name}",
+            )
+    except BaseException:
+        os.close(descriptor)
+        _remove_flat_directory(consumer.descriptor, name)
+        raise
+    os.close(descriptor)
+    return name
+
+
+def _remove_flat_directory(parent: int, name: str) -> None:
+    descriptor = os.open(name, DIRECTORY_FLAGS, dir_fd=parent)
+    try:
+        for child in os.listdir(descriptor):
+            _safe_component(child, label="temporary publication child")
+            info = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise PublicationError("temporary publication directory contains an unsafe entry")
+            os.unlink(child, dir_fd=descriptor)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.rmdir(name, dir_fd=parent)
+
+
+def _observe_consumer(
+    config: Config,
+    consumer: RootLease,
+    receipt_leaf: Leaf,
+    output_leaves: Mapping[str, Leaf],
+    tls_leaves: Mapping[str, Leaf],
+) -> dict[str, object]:
+    observed_receipt = _read_leaf(
+        consumer.descriptor,
+        "build-receipt.json",
+        uid=config.consumer_uid,
+        gid=config.consumer_gid,
+        mode=0o644,
+        label="consumer build receipt",
+        max_bytes=RECEIPT_MAX_BYTES,
+    )
+    if observed_receipt.content != receipt_leaf.content:
+        raise PublicationError("consumer build receipt differs from producer receipt")
+    outputs: dict[str, object] = {}
+    for relative, mode in OUTPUT_MODES.items():
+        observed = _read_relative(
+            consumer.descriptor,
+            relative,
+            uid=config.consumer_uid,
+            gid=config.consumer_gid,
+            mode=mode,
+            label=f"consumer output {relative}",
+        )
+        if observed.content != output_leaves[relative].content:
+            raise PublicationError(f"consumer output differs from producer: {relative}")
+        outputs[relative] = _claim(observed, path=relative, mode=mode)
+    tls_fd = _open_named_directory(
+        consumer.descriptor,
+        "tls",
+        uid=config.consumer_uid,
+        gid=config.consumer_gid,
+        mode=0o700,
+        label="consumer TLS directory",
+    )
+    manifest: dict[str, object] = {}
+    try:
+        if set(os.listdir(tls_fd)) != set(tls_leaves):
+            raise PublicationError("consumer TLS leaf set differs from producer")
+        for name, expected in tls_leaves.items():
+            observed = _read_leaf(
+                tls_fd,
+                name,
+                uid=config.consumer_uid,
+                gid=config.consumer_gid,
+                mode=expected.identity.mode,
+                label=f"consumer TLS {name}",
+            )
+            if observed.content != expected.content:
+                raise PublicationError(f"consumer TLS differs from producer: {name}")
+            manifest[name] = _claim(observed, path=name, mode=expected.identity.mode)
+        directory = _directory_identity(os.fstat(tls_fd), label="consumer TLS directory")
+    finally:
+        os.close(tls_fd)
+    return {
+        "schema": SCHEMA,
+        "receipt": _claim(observed_receipt, path="build-receipt.json", mode=0o644),
+        "outputs": outputs,
+        "tls": {
+            "path": "tls",
+            "identity": list(directory[:4]),
+            "manifest": manifest,
+        },
+    }
+
+
+def _publish_full(config: Config) -> dict[str, object]:
+    producer = _open_root(
+        config.producer_root,
+        uid=config.preparer_uid,
+        gid=config.preparer_gid,
+        mode=0o700,
+        label="private producer root",
+    )
+    consumer = _open_root(
+        config.consumer_root,
+        uid=config.consumer_uid,
+        gid=config.consumer_gid,
+        mode=0o700,
+        label="user consumer root",
+    )
+    transaction = Transaction()
+    staged_tls = ""
+    try:
+        receipt, receipt_leaf, output_leaves, tls_leaves = _collect_producer(config, producer)
+        _verify_consumer_sources(config, consumer, receipt)
+        staged_tls = _stage_tls(config, consumer, tls_leaves)
+        transaction.detach_file(
+            consumer.descriptor,
+            "build-receipt.json",
+            owner_uid=config.consumer_uid,
+            owner_gid=config.consumer_gid,
+            allowed_modes=frozenset({0o644}),
+            label="consumer build receipt",
+        )
+        transaction.swap_directory(
+            consumer.descriptor,
+            "tls",
+            staged_tls,
+            owner_uid=config.consumer_uid,
+            owner_gid=config.consumer_gid,
+            mode=0o700,
+            label="consumer TLS directory",
+        )
+        staged_tls = ""
+        for relative, mode in OUTPUT_MODES.items():
+            parent, name, close_parent = _parent_and_name(
+                consumer.descriptor,
+                relative,
+                uid=config.consumer_uid,
+                gid=config.consumer_gid,
+                create=True,
+            )
+            try:
+                transaction.replace_file(
+                    parent,
+                    name,
+                    output_leaves[relative].content,
+                    mode=mode,
+                    owner_uid=config.consumer_uid,
+                    owner_gid=config.consumer_gid,
+                    label=f"consumer output {relative}",
+                )
+            finally:
+                if close_parent:
+                    os.close(parent)
+        transaction.replace_file(
+            consumer.descriptor,
+            "build-receipt.json",
+            receipt_leaf.content,
+            mode=0o644,
+            owner_uid=config.consumer_uid,
+            owner_gid=config.consumer_gid,
+            label="consumer build receipt",
+        )
+        producer.revalidate()
+        consumer.revalidate()
+        result = _observe_consumer(config, consumer, receipt_leaf, output_leaves, tls_leaves)
+        publication = receipt["runtime_publication"]
+        assert isinstance(publication, Mapping)
+        result["generation"] = publication["generation"]
+        result["producer_receipt_sha256"] = receipt_leaf.sha256
+        cleanup_warnings = transaction.commit()
+        if cleanup_warnings:
+            result["cleanup_warnings"] = list(cleanup_warnings)
+        return result
+    except BaseException as exc:
+        if staged_tls:
+            try:
+                _remove_flat_directory(consumer.descriptor, staged_tls)
+            except BaseException:
+                pass
+        try:
+            transaction.rollback()
+        except PublicationError as rollback_exc:
+            if hasattr(exc, "add_note"):
+                exc.add_note(str(rollback_exc))
+        raise
+    finally:
+        consumer.close()
+        producer.close()
+
+
+def verify(config: Config) -> dict[str, object]:
+    producer = _open_root(
+        config.producer_root,
+        uid=config.preparer_uid,
+        gid=config.preparer_gid,
+        mode=0o700,
+        label="private producer root",
+    )
+    consumer = _open_root(
+        config.consumer_root,
+        uid=config.consumer_uid,
+        gid=config.consumer_gid,
+        mode=0o700,
+        label="user consumer root",
+    )
+    try:
+        receipt, receipt_leaf, output_leaves, tls_leaves = _collect_producer(config, producer)
+        _verify_consumer_sources(config, consumer, receipt)
+        result = _observe_consumer(config, consumer, receipt_leaf, output_leaves, tls_leaves)
+        publication = receipt["runtime_publication"]
+        assert isinstance(publication, Mapping)
+        result["generation"] = publication["generation"]
+        result["producer_receipt_sha256"] = receipt_leaf.sha256
+        result["operation"] = "verify"
+        result["ok"] = True
+        producer.revalidate()
+        consumer.revalidate()
+        return result
+    finally:
+        consumer.close()
+        producer.close()
+
+
+def publish(config: Config) -> dict[str, object]:
+    result = _publish_full(config)
+    result["operation"] = "publish"
+    result["ok"] = True
+    return result
+
+
+def _restore(config: Config, value: Mapping[str, object]) -> dict[str, object]:
+    action = value.get("action")
+    if action == "restored-runtime-generation":
+        publication = _publish_full(config)
+        result = dict(value)
+        restored = result.get("restored")
+        if not isinstance(restored, dict):
+            raise PublicationError("runtime restore result is invalid")
+        restored = dict(restored)
+        restored["outputs"] = publication["outputs"]
+        result["restored"] = restored
+        result["receipt"] = publication["receipt"]
+        if "cleanup_warnings" in publication:
+            result["consumer_cleanup_warnings"] = publication["cleanup_warnings"]
+        return result
+    if action != "restored-tls-generation" or value.get("receipt") != "absent":
+        raise PublicationError("unsupported preparer restore result")
+    restored = value.get("restored")
+    if not isinstance(restored, Mapping) or restored.get("path") != "tls":
+        raise PublicationError("TLS restore result is invalid")
+    manifest = restored.get("manifest")
+    if not isinstance(manifest, Mapping):
+        raise PublicationError("TLS restore manifest is invalid")
+
+    producer = _open_root(
+        config.producer_root,
+        uid=config.preparer_uid,
+        gid=config.preparer_gid,
+        mode=0o700,
+        label="private producer root",
+    )
+    consumer = _open_root(
+        config.consumer_root,
+        uid=config.consumer_uid,
+        gid=config.consumer_gid,
+        mode=0o700,
+        label="user consumer root",
+    )
+    transaction = Transaction()
+    staged_tls = ""
+    try:
+        producer_tls = _open_named_directory(
+            producer.descriptor,
+            "tls",
+            uid=config.preparer_uid,
+            gid=config.preparer_gid,
+            mode=0o700,
+            label="producer TLS directory",
+        )
+        tls_leaves: dict[str, Leaf] = {}
+        try:
+            names = set(manifest)
+            if not TLS_REQUIRED.issubset(names) or not names.issubset(TLS_REQUIRED | TLS_OPTIONAL):
+                raise PublicationError("restored TLS manifest has an unsafe leaf set")
+            for name, claim in manifest.items():
+                if not isinstance(name, str) or not isinstance(claim, Mapping):
+                    raise PublicationError("restored TLS manifest is invalid")
+                mode = claim.get("mode")
+                expected_mode = TLS_REQUIRED_MODES.get(name, TLS_OPTIONAL_MODES.get(name))
+                if not isinstance(mode, int) or expected_mode is None or mode != expected_mode:
+                    raise PublicationError("restored TLS manifest mode is invalid")
+                identity, digest = _identity_claim(claim, mode=mode, label=f"restored TLS {name}")
+                leaf = _read_leaf(
+                    producer_tls,
+                    name,
+                    uid=config.preparer_uid,
+                    gid=config.preparer_gid,
+                    mode=mode,
+                    label=f"restored producer TLS {name}",
+                )
+                if leaf.identity.payload() != identity or leaf.sha256 != digest:
+                    raise PublicationError(f"restored producer TLS does not match result: {name}")
+                tls_leaves[name] = leaf
+        finally:
+            os.close(producer_tls)
+        staged_tls = _stage_tls(config, consumer, tls_leaves)
+        transaction.detach_file(
+            consumer.descriptor,
+            "build-receipt.json",
+            owner_uid=config.consumer_uid,
+            owner_gid=config.consumer_gid,
+            allowed_modes=frozenset({0o644}),
+            label="consumer build receipt",
+        )
+        transaction.swap_directory(
+            consumer.descriptor,
+            "tls",
+            staged_tls,
+            owner_uid=config.consumer_uid,
+            owner_gid=config.consumer_gid,
+            mode=0o700,
+            label="consumer TLS directory",
+        )
+        staged_tls = ""
+        producer.revalidate()
+        consumer.revalidate()
+        result = dict(value)
+        cleanup_warnings = transaction.commit()
+        if cleanup_warnings:
+            result["consumer_cleanup_warnings"] = list(cleanup_warnings)
+        return result
+    except BaseException as exc:
+        if staged_tls:
+            try:
+                _remove_flat_directory(consumer.descriptor, staged_tls)
+            except BaseException:
+                pass
+        try:
+            transaction.rollback()
+        except PublicationError as rollback_exc:
+            if hasattr(exc, "add_note"):
+                exc.add_note(str(rollback_exc))
+        raise
+    finally:
+        consumer.close()
+        producer.close()
+
+
+def restore(config: Config, value: Mapping[str, object]) -> dict[str, object]:
+    result = _restore(config, value)
+    return {
+        "schema": SCHEMA,
+        "operation": "restore",
+        "ok": True,
+        "result": result,
+    }
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("operation", choices=("seed", "publish", "verify", "restore"))
+    parser.add_argument("--producer-root", required=True)
+    parser.add_argument("--consumer-root", required=True)
+    parser.add_argument("--preparer-uid", type=int, required=True)
+    parser.add_argument("--preparer-gid", type=int, required=True)
+    parser.add_argument("--consumer-uid", type=int, required=True)
+    parser.add_argument("--consumer-gid", type=int, required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    if os.getresuid() != (0, 0, 0) or os.getresgid() != (0, 0, 0):
+        raise PublicationError("publication helper requires the full root principal")
+    arguments = _parser().parse_args(sys.argv[1:] if argv is None else argv)
+    config = Config(
+        Path(arguments.producer_root),
+        Path(arguments.consumer_root),
+        arguments.preparer_uid,
+        arguments.preparer_gid,
+        arguments.consumer_uid,
+        arguments.consumer_gid,
+    )
+    if arguments.operation == "seed":
+        result = seed(config)
+    elif arguments.operation == "publish":
+        result = publish(config)
+    elif arguments.operation == "verify":
+        result = verify(config)
+    else:
+        content = sys.stdin.buffer.read(RECEIPT_MAX_BYTES + 1)
+        if not content or len(content) > RECEIPT_MAX_BYTES:
+            raise PublicationError("restore result input is invalid")
+        value = _strict_json(content, label="preparer restore result")
+        result = restore(config, value)
+    sys.stdout.buffer.write(_canonical_json(result))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except PublicationError as exc:
+        sys.stderr.write(f"TermDeck preparer publication refused: {exc}\n")
+        raise SystemExit(2)
