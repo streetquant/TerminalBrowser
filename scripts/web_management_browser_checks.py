@@ -45,7 +45,7 @@ def check_management(page, *, origin, database, initial_id, created_id, output, 
         action(label)
         confirm = page.locator(".management-confirm")
         confirm.get_by_role("button", name="Confirm", exact=True).click()
-        page.wait_for_function("() => /Changes saved|action\\(s\\) failed/.test(document.querySelector('.management-notice')?.textContent || '')")
+        page.wait_for_function("() => !document.querySelector('.management-confirm') && !document.querySelector('#management-dialog').hasAttribute('aria-busy') && /Changes saved|action\\(s\\) failed/.test(document.querySelector('.management-notice')?.textContent || '')")
 
     manager()
     for heading in ["Tab", "Window", "PID", "Health", "CPU %", "RAM", "Procs", "Runtime", "Command", "Directory"]:
@@ -87,7 +87,10 @@ def check_management(page, *, origin, database, initial_id, created_id, output, 
         composer.fill(marker)
         action(label)
         page.locator(".management-confirm").get_by_role("button", name="Send to selected terminals", exact=True).click()
-        page.wait_for_function("() => /Sent to|action\\(s\\) failed/.test(document.querySelector('.management-notice')?.textContent || '')")
+        # Closing the confirmation schedules its close event. The old send's
+        # success remains visible until the next snapshot arrives. Wait for the
+        # confirmation handler and this whole operation, not that stale notice.
+        page.wait_for_function("() => !document.querySelector('.management-confirm') && !document.querySelector('#management-dialog').hasAttribute('aria-busy') && /Sent to|action\\(s\\) failed/.test(document.querySelector('.management-notice')?.textContent || '')")
         notice = dialog.locator('.management-notice').inner_text()
         if notice != 'Sent to 2 terminal(s).':
             page.screenshot(path=str(output / 'manager-send-failure.png'))
