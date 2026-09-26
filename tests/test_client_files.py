@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import tempfile
 import threading
 from types import SimpleNamespace
 import uuid
@@ -15,6 +16,15 @@ import uuid
 import pytest
 
 from termdeck import client_files as cf
+
+
+@pytest.fixture
+def ordinary_workspace_root():
+    # The validation runner deliberately places tmp_path below /run, which is
+    # protected control storage. Only positive workspace scenarios use this
+    # owned ordinary tree; their staging/runtime fixtures retain runner isolation.
+    with tempfile.TemporaryDirectory(prefix="termdeck-workspace-", dir="/tmp") as directory:
+        yield Path(directory)
 
 
 def make_stage(state_root, auth, *, owner="owner", suffix="a", machine_id=None, extra_machine=False):

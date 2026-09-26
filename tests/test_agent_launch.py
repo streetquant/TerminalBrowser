@@ -16,13 +16,13 @@ from termdeck import agent_launch as launch
 from termdeck import client_files as cf
 from termdeck.session_store import SessionStore
 from termdeck.tmux_backend import TmuxBackend
-from test_client_files import stage, call, upload, path  # noqa: F401
+from test_client_files import stage, call, upload, path, ordinary_workspace_root  # noqa: F401
 
 
 @pytest.fixture
-def configured(stage):
+def configured(stage, ordinary_workspace_root):
     store,actor=stage
-    workspace=store.root.parent.with_name(store.root.parent.name+"-workspace")
+    workspace=ordinary_workspace_root/"workspace"
     workspace.mkdir(mode=0o700)
     config={"version":1,"workspaces":[{"id":"ws_"+"a"*32,"label":"Approved project","path":str(workspace)}],"codex":None}
     policy=store.root.parent/launch.POLICY
@@ -323,9 +323,9 @@ def test_shared_asset_alias_cannot_broaden_launch(configured, monkeypatch, targe
         launch.execute(args)
 
 
-def test_colocated_workspace_masks_state_and_preserves_explicit_attachment(stage):
+def test_colocated_workspace_masks_state_and_preserves_explicit_attachment(stage, ordinary_workspace_root):
     original, actor = stage
-    repository = original.root.parent.with_name(original.root.parent.name + "-repository")
+    repository = ordinary_workspace_root / "repository"
     managed = repository / ".termdeck"
     managed.mkdir(parents=True, mode=0o700)
     state = managed / "state"

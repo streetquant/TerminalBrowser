@@ -12,14 +12,17 @@ from termdeck.client_files import StagingError
 from termdeck import server_workspaces as workspaces
 from termdeck import agent_launch as launch, client_files as cf
 from test_agent_launch import Backend
-from test_client_files import stage, call, upload, path, make_stage  # noqa: F401
+from test_client_files import stage, call, upload, path, make_stage, ordinary_workspace_root  # noqa: F401
 
 
 @pytest.fixture
-def directories(tmp_path):
-    state = tmp_path / "state"
+def directories(ordinary_workspace_root):
+    # Keep sibling/rename scenarios inside the one automatically cleaned root.
+    root = ordinary_workspace_root / "workspace-tree"
+    root.mkdir(mode=0o700)
+    state = root / "state"
     state.mkdir(mode=0o700)
-    workspace = tmp_path / "ordinary project with spaces"
+    workspace = root / "ordinary project with spaces"
     workspace.mkdir(mode=0o770)
     return state, workspace
 
@@ -231,9 +234,9 @@ def creation(store, actor, workspace, **extra):
             "attachments": [], **extra}
 
 
-def test_unregistered_selection_persists_and_replays_across_store_restart(stage):
+def test_unregistered_selection_persists_and_replays_across_store_restart(stage, ordinary_workspace_root):
     store, actor = stage
-    workspace = store.root.parent.with_name(store.root.parent.name + "-project with spaces")
+    workspace = ordinary_workspace_root / "project with spaces"
     workspace.mkdir(mode=0o770)
     request = creation(store, actor, workspace)
     receipt = store.handle(actor, request)
@@ -251,9 +254,9 @@ def test_unregistered_selection_persists_and_replays_across_store_restart(stage)
 
 
 @pytest.mark.parametrize("phase", ["start", "execute"])
-def test_launch_revalidates_explicit_directory_before_registry_or_process(stage, phase, monkeypatch):
+def test_launch_revalidates_explicit_directory_before_registry_or_process(stage, phase, monkeypatch, ordinary_workspace_root):
     store, actor = stage
-    workspace = store.root.parent.with_name(store.root.parent.name + "-project")
+    workspace = ordinary_workspace_root / "project"
     workspace.mkdir()
     receipt = store.handle(actor, creation(store, actor, workspace))
     backend = Backend()
@@ -274,9 +277,9 @@ def test_launch_revalidates_explicit_directory_before_registry_or_process(stage,
         assert not backend.records and not store.session_database.exists()
 
 
-def test_directory_request_rejects_ambiguous_authority_and_client_display_metadata(stage):
+def test_directory_request_rejects_ambiguous_authority_and_client_display_metadata(stage, ordinary_workspace_root):
     store, actor = stage
-    workspace = store.root.parent.with_name(store.root.parent.name + "-project")
+    workspace = ordinary_workspace_root / "project"
     workspace.mkdir()
     with pytest.raises(StagingError, match="Choose one"):
         store.handle(actor, creation(store, actor, workspace, workspace_id="ws_" + "a" * 32))
@@ -287,15 +290,15 @@ def test_directory_request_rejects_ambiguous_authority_and_client_display_metada
         store.handle(actor, request)
 
 
-def test_broad_authenticated_launch_keeps_exact_attachment_and_masks_surrounding_state(tmp_path, monkeypatch):
-    (tmp_path / "state").mkdir(mode=0o700)
-    store, actor = make_stage(tmp_path / "state", tmp_path / "auth")
-    project = tmp_path / "project with spaces"
+def test_broad_authenticated_launch_keeps_exact_attachment_and_masks_surrounding_state(ordinary_workspace_root, monkeypatch):
+    (ordinary_workspace_root / "state").mkdir(mode=0o700)
+    store, actor = make_stage(ordinary_workspace_root / "state", ordinary_workspace_root / "auth")
+    project = ordinary_workspace_root / "project with spaces"
     project.mkdir()
     (project / ".beads").mkdir()
     (project / ".beads/private").write_text("private")
     obj = upload((store, actor), b"original immutable bytes", display_path="/client/metadata-only")
-    request = creation(store, actor, tmp_path, attachments=[obj["reference"]])
+    request = creation(store, actor, ordinary_workspace_root, attachments=[obj["reference"]])
     receipt = store.handle(actor, request)
     launch.start(store, actor, receipt, backend=Backend())
     upload((store, actor), b"newer", previous=obj["reference"])

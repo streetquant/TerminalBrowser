@@ -20,7 +20,7 @@ from termdeck.session_store import SessionStore
 from termdeck.tmux_backend import TmuxBackend, TmuxError, _AuthPaneIdentity, auth_transaction_lock, execute_auth_change
 from termdeck.web_accounts import handle
 from test_agent_launch import Backend, configured, request as launch_request  # noqa: F401
-from test_client_files import stage, upload, path  # noqa: F401
+from test_client_files import stage, upload, path, ordinary_workspace_root  # noqa: F401
 from test_codex_auth import _write_native_source, _bind_native_source_default
 
 
