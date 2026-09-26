@@ -96,6 +96,7 @@ def test_privileged_payload_is_explicit_in_sdist_and_absent_from_wheel_data() ->
         "deploy/preparer-install-manifest.json",
         "deploy/termdeck-preparer-install-plan.md",
         "scripts/deploy/install-preparer-assets.py",
+        "scripts/deploy/build-preparer-arch-package.py",
     }
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))

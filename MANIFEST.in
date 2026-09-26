@@ -11,6 +11,7 @@ include deploy/systemd/termdeck-preparer-broker.service
 include deploy/systemd/termdeck-preparer.sysusers.conf
 include deploy/systemd/termdeck-preparer.tmpfiles.conf
 include scripts/deploy/install-preparer-assets.py
+include scripts/deploy/build-preparer-arch-package.py
 include scripts/deploy/termdeck-runtime-attestd
 include scripts/termdeck-preparer-state.py
 include scripts/termdeck-web-prepare-runtime.sh

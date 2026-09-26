@@ -84,6 +84,65 @@ installing any host asset:
 Source tests and a successful staging run qualify only the package inputs. They
 do not prove that the host installation or live services work.
 
+### Arch package artifact
+
+On Arch, build the manifest payload as an ordinary user with the native package
+manager tools, using a fixed qualification timestamp and an existing empty
+mode-0700 output directory:
+
+```sh
+python scripts/deploy/build-preparer-arch-package.py \
+  --output /absolute/private/package-output --epoch QUALIFICATION_UNIX_TIMESTAMP
+```
+
+The builder uses network-isolated bubblewrap and native makepkg, with a fixed
+`/build` path and explicit configuration. It verifies the archive contains only
+the thirteen allowlisted files, their ancestor directories and native package
+metadata, with exact bytes, root ownership and declared modes. It does not use
+an install scriptlet, fetch dependencies, execute sudo or install anything.
+`receipt.json` and `SHA256SUMS` identify the result. Repeat builds at the same
+epoch must have the same digest on the same qualified toolchain.
+
+The output also contains `pacman-hooks/` overrides for the five reviewed broad
+systemd hooks. Standard Arch sysusers/tmpfiles hooks operate on **all** system
+definitions; the install command below defers those hooks and the broad service
+reload/enqueue/update hooks. It leaves unrelated hooks and package signature,
+integrity, dependency and conflict checks enabled. Inspect current host hooks
+and retain their exact preimages before adopting this transaction policy; a new
+or changed matching hook requires review. The privileged preparer services must
+be stopped before replacing an older preparer package; preserve user terminals
+and the existing application services.
+
+After the host preimage gate below, the administrator's native install command
+from the output directory is:
+
+```sh
+sha256sum -c SHA256SUMS &&
+sudo /usr/bin/pacman -U \
+  --hookdir /etc/pacman.d/hooks \
+  --hookdir "$PWD/pacman-hooks" \
+  ./termdeck-preparer-VERSION-any.pkg.tar.zst
+```
+
+Keep the ordinary custom hook directory first and the transaction overrides
+second, so unrelated custom hooks remain active. Use the exact basename recorded
+in the receipt. Do not add `--overwrite`,
+`--nodeps`, signature overrides or `--noconfirm`. This installs package files
+only. Follow the scoped sysusers/tmpfiles, installed-helper, keypair and unit
+checks below; the deferred global hooks are not a substitute for those checks.
+The broker's authenticated prepare/verify transaction remains a subsequent
+gate before application activation.
+
+For a first-install rollback, stop the broker socket and drain its service,
+stop the signer if this transaction started it, then remove only this package
+with `sudo /usr/bin/pacman -R --hookdir /etc/pacman.d/hooks --hookdir "$PWD/pacman-hooks" termdeck-preparer`. Do not use
+recursive dependency removal. Refresh the daemon after removal and restore
+captured unit enablement; retain accounts, private keys, producer/consumer data
+and journals. For upgrades, reinstall the complete recorded prior package with
+the same scoped hook policy while the privileged services are stopped, then
+verify its compatibility before restoring prior activity. Actual host rollback
+still requires the checks in the Rollback section.
+
 ## Capture host preimages
 
 Before installation, record and protect all of the following:
