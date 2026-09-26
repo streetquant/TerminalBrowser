@@ -107,7 +107,76 @@ back; an incomplete rollback fails closed and preserves the backup evidence.
 The original backup is retained after success. Repeating the migration is an
 idempotent no-op with no new backup.
 
-Wrong or broken links fail closed before new links or a wrapper are published.
+### Explicit repair of a stale canonical binding
+
+After an authorized system configuration move, an operator can repair one exact
+saved terminal's existing scope without starting it:
+
+```sh
+t1000 auth-rebind-config SESSION_ID \
+  --expected-source /8tb/codex-home \
+  --source /warp/codex
+```
+
+`--expected-source` must exactly match the saved absolute canonical binding and
+each existing non-auth configuration link. The old source may be absent. The
+new source is explicit; neither the agent's `CODEX_HOME` nor a launcher override
+chooses it. An optional `--db` selects the registry under the usual managed
+database boundary. SessionStore is opened with auth provisioning disabled.
+
+The command verifies the saved scope, refuses a still-present saved PID or live
+tmux session, and holds the auth transaction lock plus both Codex lifetime
+fences. Under a registry write transaction it compares the entire saved row,
+then changes only the configuration links. The final canonical binding is
+replaced atomically after the other links are ready. Original links are kept in
+a mode-`0700` private backup; caught failures restore them without overwriting
+an unexpected concurrent destination. Changed or unsafe sources fail closed.
+All session fields, credentials, selected/pending-account markers, private
+SQLite state, history files, and conversation-root links remain unchanged.
+
+By default the exact existing managed private launcher is preserved, including
+its bytes, inode, and mode. The result reports `launcher_preserved: true` and
+`launcher_qualified: false`: repairing configuration does not attest the host
+executable or prove that a saved terminal or conversation has recovered.
+`--refresh-launcher` additionally replaces the launcher only when the existing
+host resolver passes its unchanged attestation policy. A successful refresh
+retains the original launcher as `codex-launcher` inside the same backup.
+
+The operation does not alter recovery intent, including for inactive or new
+records. A missing saved private home is always refused; neither this command
+nor `migrate_quiescent_codex_configuration` fabricates an anonymous replacement.
+An unrecognized wrapper or copied private configuration requires separate
+review. Replaying the command with the old expected binding after success is
+refused without changing the completed migration. The Python API is
+`auth_config_rebind.rebind_terminal_configuration`; its
+`inspect_configuration_rebind` preflight is read-only and does not prove writer
+quiescence or launch readiness.
+
+### Restoring an existing private Bash terminal
+
+After explicit configuration repair, the ordinary `TmuxBackend.create_or_resume`
+path can restore a saved direct Bash recipe without a currently attested Codex
+executable. Admission requires an absolute registered system Bash executable,
+with no argument or only the single `-i` flag, no recovery command/directory,
+and no configured-agent or checkpoint launch. Scripts, shell operators, other
+flags, relative commands, and basename impostors retain the existing checks.
+
+The saved home and wrapper directory must already exist with safe ownership.
+The canonical binding and every configuration asset must be shared correctly;
+the existing wrapper must exactly match the managed bytes for this private
+home. The backend holds its normal transaction and lifetime fences while it
+checks these properties. It preserves the wrapper, credentials, account
+markers, private state, and history references. It writes only the managed
+Bash rc file, which restores the private scope environment after the user's rc.
+It neither creates missing history/state nor recreates a missing saved home.
+
+This admission proves restoration of the shell only. Native Codex, configured
+agents, native resume and checkpoints keep their existing qualification gates.
+The coordinator still requires active recovery intent and proves a live pane
+before updating runtime fields; configuration repair alone never starts a tab.
+
+During ordinary preparation or automatic lifecycle migration, wrong or broken
+links fail closed before new links or a wrapper are published.
 If ordinary preparation's wrapper publication fails, links created by that
 same reconciliation call are rolled back; previously shared links are left
 untouched.

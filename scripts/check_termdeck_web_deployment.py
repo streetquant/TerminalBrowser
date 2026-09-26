@@ -237,7 +237,7 @@ checks.update({
         f'ExecStart={CANONICAL_MANAGED}/termdeck-web-recovery' in texts['recovery']
         and f'ExecStop={CANONICAL_MANAGED}/termdeck-web-recovery-stop' in texts['recovery']
         and 'wrapper = paths.managed_root / "termdeck-web-recovery"' in activation_text
-        and 'command = shlex.join([str(wrapper)])' in activation_text
+        and 'command = shlex.join(recovery_command or [str(wrapper)])' in activation_text
         and 'shlex.join([str(wrapper), "--latest"])' not in activation_text
         and recovery_wrapper_embeds_latest
     ),

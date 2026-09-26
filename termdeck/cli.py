@@ -1694,6 +1694,35 @@ def cmd_gui(args: argparse.Namespace) -> int:
     return run(db_path=args.db, workspace_path=getattr(args, "workspace", None))
 
 
+def cmd_auth_rebind_config(args: argparse.Namespace) -> int:
+    """Explicitly repair one stopped private scope's non-auth source links."""
+
+    from .auth_config_rebind import rebind_terminal_configuration
+    from .codex_config_scope import CodexConfigScopeError
+
+    store = None
+    try:
+        store = SessionStore(
+            args.db, account_source=args.source, provision_auth_scopes=False,
+        )
+        record = store.get(args.session_id)
+        if record is None:
+            raise ValueError("an exact saved terminal ID is required")
+        payload = rebind_terminal_configuration(
+            record, store, TmuxBackend(),
+            expected_source=args.expected_source, source=args.source,
+            refresh_launcher=getattr(args, "refresh_launcher", False),
+        )
+        _print_json(payload)
+        return 0
+    except (CodexConfigScopeError, TmuxError, OSError, ValueError, sqlite3.Error) as exc:
+        _print_json({"action": "auth-rebind-config", "ok": False, "error": str(exc)})
+        return 1
+    finally:
+        if store is not None:
+            store.close()
+
+
 def cmd_recovery_intent(args: argparse.Namespace) -> int:
     """Queue explicit recovery without opening a GUI or a terminal backend."""
 
@@ -2036,6 +2065,17 @@ def build_parser() -> argparse.ArgumentParser:
     auth.add_argument("--switch", dest="switch_account", default=None, help="saved account alias, email, or key")
     auth.add_argument("--db", type=Path, default=None)
     auth.set_defaults(func=cmd_auth)
+
+    rebind_config = sub.add_parser(
+        "auth-rebind-config",
+        help="repair one quiescent private scope's non-auth configuration source without starting it",
+    )
+    rebind_config.add_argument("session_id", help="exact saved terminal ID")
+    rebind_config.add_argument("--expected-source", type=Path, required=True, help="expected absolute old canonical binding (may be absent)")
+    rebind_config.add_argument("--source", type=Path, required=True, help="explicit authorized system Codex configuration source")
+    rebind_config.add_argument("--refresh-launcher", action="store_true", help="replace the private launcher only if the existing host resolver attests its target; otherwise preserve it")
+    rebind_config.add_argument("--db", type=Path, default=None)
+    rebind_config.set_defaults(func=cmd_auth_rebind_config)
 
     windows = sub.add_parser("windows", help="show aggregate browser-window resource usage without launching GTK")
     windows.add_argument("query", nargs="?", default="", help="filter by window id, title, health, or state summary")

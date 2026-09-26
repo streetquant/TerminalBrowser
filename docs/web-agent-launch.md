@@ -83,6 +83,29 @@ rewriting host/private links. Conflicting mount destinations and aliases into
 protected storage are rejected. The private log directory must be owned by the
 host account, mode 0700, and a real directory rather than a symlink.
 
+For a configured native task, TermDeck initializes a writable 0600 `config.toml`
+inside that tab's private home from the validated system defaults. This lets the
+native trust prompt save its decision without writing the system configuration.
+The canonical defaults remain mounted read-only. A private receipt and a comment
+marker bind the view to its home and canonical source; ordinary scope preparation
+recognizes only that validated view. It preserves native edits and private
+history through restart and account switching. Symlinks, hardlinks, unsafe
+permissions, foreign receipts and unreceipted regular configurations are refused.
+The canonical config target is checked against the same protected-storage policy
+on every launch and resume, including when the tab already has a regular view.
+
+When system defaults change, an untouched private view is refreshed atomically
+before the next launch. If the tab also has configuration edits, TermDeck keeps
+both versions and reports that the private configuration needs reconciliation.
+Resume and account-switch planning check this conflict before stopping a live
+task or changing its account. No automatic merge or reset is attempted. Interrupted
+initialization or refresh can continue only while its recorded private bytes are
+unchanged; otherwise it also requires reconciliation. Reconciliation is an
+explicit operator action while the tab is stopped: preserve the edited view and
+receipt, review the changed defaults, and authorize a new view before reapplying
+the intended private edits. Do not hand-edit provenance fields to suppress a
+conflict. Configuration values are omitted from failure messages.
+
 This does not recursively grant targets of nested skill/plugin symlinks or
 executables named by configuration. A configured hook or MCP command outside
 the admitted mounts needs separate dependency qualification. Successful
@@ -133,7 +156,10 @@ real Codex login or prove production runtime compatibility.
 `tests/test_server_workspaces.py` covers arbitrary directory selection, canonical
 identity replacement, read-only grants, broad parent masking and real descriptor
 mounts. `tests/test_confined_account_resume.py` verifies the configured native
-process and exact confined account restart, including directory revalidation.
+process and exact confined account restart, including directory revalidation and
+refusing configuration conflicts before a live account handoff.
+`tests/test_native_config_view.py` covers private trust persistence, independent
+tabs, source refresh, interruption recovery, unsafe objects and provenance.
 
 `scripts/check_client_files_integration.py` exercises actual HTTP management,
 the stdin bridge, disposable tmux creation, canonical file reads inside the

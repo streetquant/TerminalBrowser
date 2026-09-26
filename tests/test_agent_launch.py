@@ -154,12 +154,16 @@ def test_confined_task_has_no_host_shell_fallback(configured):
 def test_confined_codex_adapter_passes_only_server_paths_and_private_home(configured,monkeypatch):
     store,actor,workspace,config=configured
     private=store.root.parent/"private-codex"; private.mkdir(mode=0o700)
+    source=store.root.parent/"source-codex"; source.mkdir(mode=0o700)
+    monkeypatch.setattr("termdeck.codex_config_scope.resolve_codex_launcher",lambda *_a,**_k:None)
+    from termdeck.codex_config_scope import prepare_shared_codex_configuration
+    prepare_shared_codex_configuration(private,source)
     (private/"auth.json").write_text('{"fixture":true}')
     executable=store.root.parent/"codex-fixture"
     executable.write_text("#!/usr/bin/python\nimport json,os,pathlib,sys\npathlib.Path('codex-proof').write_text(json.dumps({'argv':sys.argv[1:],'home':os.environ.get('CODEX_HOME'),'auth':json.loads(pathlib.Path(os.environ['CODEX_HOME'],'auth.json').read_text())}))\n")
     executable.chmod(0o700)
     import hashlib
-    config["codex"]={"executable":str(executable),"sha256":hashlib.sha256(executable.read_bytes()).hexdigest(),"account_source":str(private)}
+    config["codex"]={"executable":str(executable),"sha256":hashlib.sha256(executable.read_bytes()).hexdigest(),"account_source":str(source)}
     (store.root.parent/launch.POLICY).write_text(json.dumps(config))
     obj=upload((store,actor),display_path="/client/never-server/foo")
     result=store.handle(actor,request(configured,runtime="codex",task="Review files; $(not a shell command)",attachments=[obj["reference"]]))
@@ -411,6 +415,92 @@ assert not (private/'.env').exists()
     assert completed.returncode == 0, completed.stderr
     assert {p.name: os.readlink(p) for p in private.iterdir()} == links_before
     assert (source / "extra.config.toml").read_text() == "fixture = true\n"
+
+
+def test_native_private_config_write_keeps_canonical_defaults_readonly(configured, monkeypatch):
+    from termdeck.codex_config_scope import prepare_shared_codex_configuration
+    from termdeck.native_config_view import is_managed_private_config
+    store, _, workspace, _ = configured
+    source = store.root.parent / "catalogue"
+    source.mkdir(mode=0o700)
+    for name in ("config.toml", "extra.config.toml"):
+        (source / name).write_text("fixture = true\n")
+        (source / name).chmod(0o600)
+    (source / "auth.json").write_text("unselected synthetic credential")
+    private = store.root.parent / "terminal-auth/current"
+    private.mkdir(parents=True, mode=0o700)
+    monkeypatch.setattr("termdeck.codex_config_scope.resolve_codex_launcher", lambda *_a, **_k: None)
+    prepare_shared_codex_configuration(private, source)
+    arguments = dict(state_root=store.root.parent, auth_directory=store.auth_directory,
+                     account_source=source, workspace=workspace)
+    mounts = launch._shared_asset_mounts(private, **arguments)
+    assert launch._prepare_native_configuration(private, **arguments) == "initialized"
+    assert launch._shared_asset_mounts(private, **arguments) == mounts
+    before = (source / "config.toml").read_bytes()
+    code = '''import pathlib,sys
+private,source = map(pathlib.Path,sys.argv[1:])
+assert not (source/'auth.json').exists()
+for path in (source/'config.toml',private/'extra.config.toml'):
+    try: path.write_text('forbidden')
+    except OSError: pass
+    else: raise AssertionError('canonical defaults were writable')
+config=private/'config.toml'
+assert not config.is_symlink()
+temporary=private/'native-trust-write.tmp'
+temporary.write_bytes(config.read_bytes()+b'\\n[projects."/disposable"]\\ntrust_level="trusted"\\n')
+temporary.chmod(0o600)
+temporary.replace(config)
+'''
+    argv = launch.sandbox_argv(str(workspace), [], codex_home=str(private), asset_mounts=mounts,
+                              runtime_argv=[sys.executable, "-c", code, str(private), str(source)])
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    assert completed.returncode == 0, completed.stderr
+    assert (source / "config.toml").read_bytes() == before
+    assert "trust_level" in (private / "config.toml").read_text()
+    assert is_managed_private_config(private, source)
+    assert prepare_shared_codex_configuration(private, source).configuration_ready
+    assert launch._prepare_native_configuration(private, **arguments) == "ready"
+
+
+@pytest.mark.parametrize("managed", [False, True])
+@pytest.mark.parametrize("target", ["source-auth", "other-home", "web-auth", "runtime"])
+def test_config_alias_is_protected_before_read_even_with_private_regular_view(configured, monkeypatch, managed, target):
+    from termdeck.codex_config_scope import prepare_shared_codex_configuration
+    from termdeck import native_config_view
+    store, _, workspace, _ = configured
+    source = store.root.parent / "catalogue"
+    source.mkdir(mode=0o700)
+    config = source / "config.toml"
+    config.write_text("fixture = true\n")
+    config.chmod(0o600)
+    private = store.root.parent / "terminal-auth/current"
+    private.mkdir(parents=True, mode=0o700)
+    monkeypatch.setattr("termdeck.codex_config_scope.resolve_codex_launcher", lambda *_a, **_k: None)
+    prepare_shared_codex_configuration(private, source)
+    arguments = dict(state_root=store.root.parent, auth_directory=store.auth_directory,
+                     account_source=source, workspace=workspace)
+    if managed:
+        launch._prepare_native_configuration(private, **arguments)
+    before = (private / "config.toml").read_bytes()
+    protected = {"source-auth": source / "auth.json", "other-home": private.with_name("other") / "config.toml",
+                 "web-auth": store.auth_directory / "config.toml", "runtime": store.root.parent / "config.toml"}[target]
+    protected.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    protected.write_text('token = "synthetic-must-not-be-copied"\n')
+    protected.chmod(0o600)
+    config.unlink()
+    config.symlink_to(protected)
+    def unexpected_read(*_args):
+        pytest.fail("A protected config target reached the defaults reader")
+    monkeypatch.setattr(native_config_view, "_source_bytes", unexpected_read)
+    for action in (lambda: launch._prepare_native_configuration(private, **arguments),
+                   lambda: launch._shared_asset_mounts(private, **arguments)):
+        with pytest.raises(cf.StagingError, match="Shared asset"):
+            action()
+    if managed:
+        assert (private / "config.toml").read_bytes() == before
+    else:
+        assert (private / "config.toml").is_symlink()
+    assert protected.read_text() == 'token = "synthetic-must-not-be-copied"\n'
 
 
 @pytest.mark.parametrize("unsafe", ["symlink", "public-mode", "file"])

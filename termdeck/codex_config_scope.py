@@ -102,6 +102,7 @@ class _ConfigurationPlan:
     legacy_only_paths: tuple[Path, ...]
     wrapper_path: Path
     wrapper_status: str
+    private_native_config: bool = False
 
     @property
     def migration_required_paths(self) -> tuple[Path, ...]:
@@ -492,6 +493,8 @@ def _bound_canonical_home(home: Path) -> Path:
 def _legacy_only_configuration_paths(
     home: Path,
     canonical_names: set[str],
+    *,
+    managed_native_config: bool = False,
 ) -> tuple[Path, ...]:
     names: set[str] = set(_SHARED_FILES) | set(_SHARED_DIRECTORIES)
     try:
@@ -503,7 +506,7 @@ def _legacy_only_configuration_paths(
 
     legacy: list[Path] = []
     for name in sorted(names):
-        if name in canonical_names:
+        if name in canonical_names or (name == "config.toml" and managed_native_config):
             continue
         destination = home / name
         if destination.is_symlink():
@@ -535,6 +538,11 @@ def _configuration_plan(home: Path, source: Path) -> _ConfigurationPlan:
     # source must be reported as an identity failure, not as a collection of
     # apparently mismatched assets.
     binding_status = _inspect_canonical_binding(home, source)
+    # Only the confined native launcher can create this receipt-backed view.
+    # Recognition preserves its private native edits without qualifying launch.
+    from .native_config_view import is_managed_private_config
+
+    managed_native_config = is_managed_private_config(home, source)
     assets = _canonical_assets(source)
     planned_assets: list[tuple[Path, Path, bool, str]] = []
     for name, target, directory in assets:
@@ -544,7 +552,7 @@ def _configuration_plan(home: Path, source: Path) -> _ConfigurationPlan:
                 target,
                 destination,
                 directory,
-                _inspect_destination(
+                "private-native" if name == "config.toml" and managed_native_config else _inspect_destination(
                     destination,
                     target,
                     expects_directory=directory,
@@ -554,7 +562,9 @@ def _configuration_plan(home: Path, source: Path) -> _ConfigurationPlan:
     canonical_names = {
         target.name for target, _destination, _directory, _status in planned_assets
     }
-    legacy_only = _legacy_only_configuration_paths(home, canonical_names)
+    legacy_only = _legacy_only_configuration_paths(
+        home, canonical_names, managed_native_config=managed_native_config
+    )
 
     wrapper_directory = home / "bin"
     if wrapper_directory.is_symlink() or (
@@ -581,6 +591,7 @@ def _configuration_plan(home: Path, source: Path) -> _ConfigurationPlan:
         legacy_only_paths=legacy_only,
         wrapper_path=wrapper,
         wrapper_status=wrapper_status,
+        private_native_config=managed_native_config,
     )
 
 
@@ -604,6 +615,35 @@ def _prepare_private_home(path: str | Path) -> Path:
     except (OSError, RuntimeError) as exc:
         raise CodexConfigScopeError(
             f"private Codex home cannot be prepared safely: {requested}"
+        ) from exc
+
+
+def _existing_private_home(path: str | Path) -> Path:
+    """Inspect an existing scope without creating it or changing its mode."""
+
+    requested = Path(path)
+    if not requested.is_absolute():
+        raise CodexConfigScopeError("saved private Codex home must be absolute")
+    try:
+        metadata = requested.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o022
+        ):
+            raise CodexConfigScopeError(
+                f"saved private Codex home has unsafe authority: {requested}"
+            )
+        return requested.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise CodexConfigScopeError(
+            f"saved private Codex home is missing; it will not be recreated: {requested}"
+        ) from exc
+    except (OSError, RuntimeError) as exc:
+        if isinstance(exc, CodexConfigScopeError):
+            raise
+        raise CodexConfigScopeError(
+            f"saved private Codex home cannot be inspected safely: {requested}"
         ) from exc
 
 
@@ -697,20 +737,131 @@ def _wrapper_content(private_home: Path, launcher: Path) -> str:
     )
 
 
-def _open_wrapper_directory(path: Path) -> tuple[int, os.stat_result]:
+def _scope_metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid,
+        metadata.st_gid, metadata.st_nlink, metadata.st_size,
+        metadata.st_mtime_ns, metadata.st_ctime_ns,
+    )
+
+
+def preserved_private_launcher(home: Path) -> Path:
+    """Recognize existing managed bytes, without authorizing their target.
+
+    Bash restoration can preserve a saved wrapper even when its Codex target
+    is unavailable. Native Codex execution still requires launcher attestation.
+    """
+
+    path = home / "bin" / "codex"
     try:
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(
+            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        )
+        with os.fdopen(fd, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.geteuid()
+                or before.st_nlink != 1
+                or before.st_mode & 0o022
+                or not before.st_mode & stat.S_IXUSR
+                or before.st_size > 65536
+            ):
+                raise CodexConfigScopeError("private Codex launcher has unsafe authority")
+            content = handle.read(65537).decode("utf-8")
+            identity = _scope_metadata_identity(before)
+            if (
+                _scope_metadata_identity(os.fstat(handle.fileno())) != identity
+                or _scope_metadata_identity(path.lstat()) != identity
+            ):
+                raise CodexConfigScopeError("private Codex launcher changed during inspection")
+        words = shlex.split(content.rstrip().splitlines()[-1])
+        launcher = Path(words[1]) if words[0] == "exec" else Path()
+    except (OSError, UnicodeError, IndexError, ValueError) as exc:
+        raise CodexConfigScopeError(
+            "existing private launcher is not a recognized managed wrapper"
+        ) from exc
+    if (
+        not launcher.is_absolute()
+        or _is_within(launcher, home)
+        or content != _wrapper_content(home, launcher)
+    ):
+        raise CodexConfigScopeError(
+            "existing private launcher is not a recognized managed wrapper"
+        )
+    return launcher
+
+
+def validate_existing_private_bash_scope(
+    private_home: str | Path, *, auth_scope_id: str
+) -> Path:
+    """Read-only admission for restoring a saved direct Bash terminal.
+
+    Require its existing, fully shared configuration and exact managed wrapper.
+    This neither qualifies Codex execution nor provisions auth or history state.
+    The backend holds the scope transaction and quiescent lifetime fences.
+    """
+
+    home = _existing_private_home(private_home)
+    if _AUTH_SCOPE_PATTERN.fullmatch(auth_scope_id) is None or home.name != auth_scope_id:
+        raise CodexConfigScopeError("saved private Bash scope identity does not match its home")
+    home_identity = _scope_metadata_identity(home.lstat())
+    source = _bound_canonical_home(home)
+    plan = _configuration_plan(home, source)
+    if (
+        plan.binding_status != "shared"
+        or plan.private_native_config
+        or plan.legacy_only_paths
+        or any(status != "shared" for _target, _destination, _directory, status in plan.assets)
+    ):
+        raise CodexConfigScopeError("saved private Bash configuration requires explicit repair")
+    for target, destination, _directory, _status in plan.assets:
+        metadata = destination.lstat()
+        if (
+            not stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or _is_within(target.resolve(strict=True), home)
+        ):
+            raise CodexConfigScopeError(f"saved private Bash configuration link is unsafe: {destination}")
+    directory = (home / "bin").lstat()
+    if (
+        not stat.S_ISDIR(directory.st_mode)
+        or directory.st_uid != os.geteuid()
+        or directory.st_mode & 0o022
+    ):
+        raise CodexConfigScopeError("saved private Bash wrapper directory is unsafe")
+    preserved_private_launcher(home)
+    if (
+        _scope_metadata_identity(home.lstat()) != home_identity
+        or _bound_canonical_home(home) != source
+        or _configuration_plan(home, source) != plan
+        or _scope_metadata_identity((home / "bin").lstat()) != _scope_metadata_identity(directory)
+    ):
+        raise CodexConfigScopeError("saved private Bash configuration changed during inspection")
+    return home
+
+
+def _open_wrapper_directory(
+    path: Path, *, require_existing: bool = False
+) -> tuple[int, os.stat_result]:
+    try:
+        if not require_existing:
+            path.mkdir(parents=True, exist_ok=True, mode=0o700)
         metadata = path.lstat()
     except (OSError, RuntimeError) as exc:
         raise CodexConfigScopeError(
             f"private Codex wrapper directory cannot be prepared: {path}"
         ) from exc
-    if not stat.S_ISDIR(metadata.st_mode):
+    if not stat.S_ISDIR(metadata.st_mode) or (
+        require_existing and (metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022)
+    ):
         raise CodexConfigScopeError(
             f"private Codex wrapper directory is unsafe: {path}"
         )
     try:
-        path.chmod(0o700)
+        if not require_existing:
+            path.chmod(0o700)
         flags = (
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         )
@@ -731,13 +882,17 @@ def _open_wrapper_directory(path: Path) -> tuple[int, os.stat_result]:
     return directory_fd, opened_metadata
 
 
-def _write_wrapper(path: Path, content: str) -> None:
-    directory_fd, directory_metadata = _open_wrapper_directory(path.parent)
+def _write_wrapper(
+    path: Path, content: str, *, require_existing_directory: bool = False
+) -> None:
+    directory_fd, directory_metadata = _open_wrapper_directory(
+        path.parent, require_existing=require_existing_directory
+    )
     try:
         try:
             existing_fd = os.open(
                 path.name,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
                 dir_fd=directory_fd,
             )
         except FileNotFoundError:
@@ -749,7 +904,14 @@ def _write_wrapper(path: Path, content: str) -> None:
         else:
             try:
                 existing_metadata = os.fstat(existing_fd)
-                if not stat.S_ISREG(existing_metadata.st_mode):
+                if not stat.S_ISREG(existing_metadata.st_mode) or (
+                    require_existing_directory and (
+                        existing_metadata.st_uid != os.geteuid()
+                        or existing_metadata.st_nlink != 1
+                        or existing_metadata.st_mode & 0o022
+                        or existing_metadata.st_size > 65536
+                    )
+                ):
                     raise CodexConfigScopeError(
                         f"private Codex wrapper is not a regular file: {path}"
                     )
@@ -833,6 +995,7 @@ def prepare_private_bash_launch_command(
     *,
     auth_scope_id: str,
     shell_path: str | Path,
+    require_existing_scope: bool = False,
 ) -> str:
     """Build a Bash launch which keeps the tab's private Codex tools first.
 
@@ -848,7 +1011,10 @@ def prepare_private_bash_launch_command(
     after a destructive recreation.
     """
 
-    home = _prepare_private_home(private_home)
+    home = (
+        _existing_private_home(private_home)
+        if require_existing_scope else _prepare_private_home(private_home)
+    )
     scope_id = str(auth_scope_id).strip()
     if _AUTH_SCOPE_PATTERN.fullmatch(scope_id) is None or home.name != scope_id:
         raise CodexConfigScopeError(
@@ -888,7 +1054,7 @@ def prepare_private_bash_launch_command(
             "",
         )
     )
-    _write_wrapper(rc_path, content)
+    _write_wrapper(rc_path, content, require_existing_directory=require_existing_scope)
     return shlex.join(
         [
             str(shell),
@@ -1228,7 +1394,7 @@ def migrate_quiescent_codex_configuration(
     caught failure restores every moved path; successful backups are retained.
     """
 
-    home = _prepare_private_home(private_home)
+    home = _existing_private_home(private_home)
     binding = home / _CANONICAL_HOME_BINDING
     if not binding.exists() and not binding.is_symlink():
         # Anonymous scopes have no canonical configuration authority and no

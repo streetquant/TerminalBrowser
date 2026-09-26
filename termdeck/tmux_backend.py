@@ -33,6 +33,7 @@ from .codex_config_scope import (
     CodexConfigScopeError,
     migrate_quiescent_codex_configuration,
     prepare_private_bash_launch_command,
+    validate_existing_private_bash_scope,
 )
 from .gateway_models import (
     GatewayModelStatus,
@@ -1827,16 +1828,36 @@ class TmuxBackend:
                 native_resume = recipe.origin in {"legacy-recovery", "native-resume"}
 
         if raw_codex_home:
-            try:
-                migrate_quiescent_codex_configuration(raw_codex_home)
-            except CodexConfigScopeError as exc:
-                raise TmuxError(
-                    f"could not migrate stopped private Codex configuration: {exc}"
-                ) from exc
-            try:
-                ensure_private_codex_state(raw_codex_home, require_complete=True)
-            except (CodexAuthError, CodexConfigScopeError) as exc:
-                raise TmuxError(str(exc)) from exc
+            # A saved direct Bash shell has no Codex conversation to hydrate.
+            # Preserve its already managed scope; do not require (or qualify)
+            # a Codex executable merely to restore the terminal itself.
+            direct_bash = (
+                not checkpoint
+                and not native_resume
+                and not codex_recovery
+                and recipe.origin in {"launch", "legacy-launch"}
+                and command == recipe.command
+                and self._saved_direct_bash_command(record, command)
+            )
+            if direct_bash:
+                try:
+                    validate_existing_private_bash_scope(
+                        raw_codex_home, auth_scope_id=record.auth_scope_id or ""
+                    )
+                except (CodexConfigScopeError, OSError, RuntimeError) as exc:
+                    raise TmuxError(f"saved private Bash scope requires repair: {exc}") from exc
+                fallback_shell_command = command
+            else:
+                try:
+                    migrate_quiescent_codex_configuration(raw_codex_home)
+                except CodexConfigScopeError as exc:
+                    raise TmuxError(
+                        f"could not migrate stopped private Codex configuration: {exc}"
+                    ) from exc
+                try:
+                    ensure_private_codex_state(raw_codex_home, require_complete=True)
+                except (CodexAuthError, CodexConfigScopeError) as exc:
+                    raise TmuxError(str(exc)) from exc
             if codex_recovery:
                 self._hydrate_private_codex_recovery(record, codex_recovery)
             codex_home = Path(raw_codex_home).expanduser().resolve(strict=False)
@@ -1855,6 +1876,7 @@ class TmuxBackend:
                         codex_home,
                         auth_scope_id=(getattr(record, "auth_scope_id", "") or ""),
                         shell_path=fallback_argv[0],
+                        require_existing_scope=direct_bash,
                     )
                 except CodexConfigScopeError as exc:
                     raise TmuxError(
@@ -5194,6 +5216,29 @@ class TmuxBackend:
             return self.apply_auth_change(record, plan, quiescence)
         finally:
             quiescence.release_lifetime_lease()
+
+    @classmethod
+    def _saved_direct_bash_command(cls, record: SessionRecord, command: str) -> bool:
+        """One registered system Bash executable, with at most a single -i.
+
+        The saved interactive flag is equivalent to the managed rc launch's
+        mandatory -i. No script, startup-file option or other shell flag gains
+        this admission, and recovery metadata keeps its existing native gate.
+        """
+
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            return False
+        if (
+            not argv
+            or len(argv) > 2
+            or (len(argv) == 2 and argv[1] != "-i")
+            or Path(argv[0]).name != "bash"
+            or command.strip() != shlex.join(argv)
+        ):
+            return False
+        return cls._recovery_pending_shell_can_start_fresh(record, shlex.quote(argv[0]))
 
     @classmethod
     def _recovery_pending_shell_can_start_fresh(

@@ -7665,7 +7665,7 @@ def _publish_install_wrapper_and_activation(
     *,
     verify: Callable[[], None],
     first_install_preimage: _FirstInstallPreimagePublication | None,
-    activation_expected_preimages: Mapping[Path, _FileSnapshot] | None = None,
+    activation_expected_preimages: Mapping[Path, _FileSnapshot | _AnchoredFileSnapshot] | None = None,
     activation_preflight_guards: object | None = None,
     wrapper_snapshot: object | None = None,
     wrapper_expected_release_id: str | None = None,
@@ -7783,7 +7783,10 @@ def _publish_install_wrapper_and_activation(
     if activation_expected_preimages is not None:
         for path, expected in activation_expected_preimages.items():
             observed = activation_preimages.get(path)
-            if observed is None or observed.snapshot != expected:
+            if observed is None or (
+                observed != expected if isinstance(expected, _AnchoredFileSnapshot)
+                else observed.snapshot != expected
+            ):
                 raise ReleaseError(f"{path.name} changed after activation preflight")
     if first_install_preimage is not None:
         expected_first: dict[Path, _FileSnapshot] = {
@@ -7791,6 +7794,8 @@ def _publish_install_wrapper_and_activation(
             first_install_preimage.receipt_path: first_install_preimage.receipt_preimage,
         }
         for path, expected in (activation_expected_preimages or {}).items():
+            if isinstance(expected, _AnchoredFileSnapshot):
+                expected = expected.snapshot
             if path not in expected_first:
                 if expected.exists:
                     raise ReleaseError("first-install additional activation preimage is not empty")
@@ -11119,6 +11124,7 @@ def _prepare_production_autostart_publication(
     prior_state: Mapping[str, object],
     state: Mapping[str, object],
     recover_missing_receipt: bool = False,
+    legacy_migration: object | None = None,
 ) -> _AutostartPublication:
     descriptor_path = _production_autostart_path()
     receipt_path = _production_autostart_receipt_path(layout)
@@ -11145,7 +11151,13 @@ def _prepare_production_autostart_publication(
             raise ReleaseError("production autostart receipt changed while being prepared")
         prior_descriptor = existing_receipt["prior_descriptor"]
     else:
-        if int(prior_state.get("generation", 0)) > 0:
+        legacy_admission = (
+            legacy_migration is not None
+            and legacy_migration.authorizes_legacy_autostart(
+                layout, prior_state, descriptor_path, descriptor_preimage, receipt_path, receipt_preimage,
+            )
+        )
+        if int(prior_state.get("generation", 0)) > 0 and not legacy_admission:
             if not recover_missing_receipt:
                 raise ReleaseError(
                     "production autostart receipt is missing for an existing managed generation"
@@ -11939,6 +11951,7 @@ def install_release(
                 prior_state=state,
                 state=new_state,
                 recover_missing_receipt=recover_autostart,
+                legacy_migration=migration,
             )
             if manage_autostart
             else None
@@ -12043,7 +12056,7 @@ def install_release(
             migration.revalidate()
             written_paths = {path for path, _content, _mode, _label in writes}
             publication_preimages.update({
-                path: snapshot for path, snapshot in migration.preimages.items()
+                path: snapshot for path, snapshot in migration.anchored_preimages.items()
                 if path in written_paths
             })
         # Wrapper files, their legacy preimage receipt, the desktop pair, and

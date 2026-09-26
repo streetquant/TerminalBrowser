@@ -6727,7 +6727,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     result = rollback(paths, tx, reason="explicit recovery request")
         print(json.dumps(result, sort_keys=True, default=str))
         return 0
-    except WebActivationError as exc:
+    except (WebActivationError, release_manager.ReleaseError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True), file=sys.stderr)
         return 2
 

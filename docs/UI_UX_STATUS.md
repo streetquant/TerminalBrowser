@@ -3,9 +3,10 @@
 Updated 22 September 2026. This reports source changes, not a live deployment.
 The user subsequently approved safe live repair. Installation is blocked by the
 privileged preparation and ownership issues below, not by missing user approval.
-Cloudflare remains deferred in BR (`t1000-cloud-tunnel-tw9`); see the
-[BR/BV handoff guide](BEADS_WORKFLOW.md). This work has not changed
-production services or saved session state.
+The original Cloudflare deferral was lifted by the user on 27 September 2026 for
+`https://maxchat.semiotech.org/t1000/`; consult live BR and the
+[BR/BV handoff guide](BEADS_WORKFLOW.md). The source observations below do not
+establish the current production service or saved-session state.
 
 ## Current interface
 

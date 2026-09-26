@@ -151,7 +151,9 @@ def _private_launch_receipts(backend: TmuxBackend):
         return_value=lease,
     ) as acquire, mock.patch(
         "termdeck.tmux_backend.migrate_quiescent_codex_configuration",
-    ) as migrate:
+    ) as migrate, mock.patch(
+        "termdeck.tmux_backend.validate_existing_private_bash_scope",
+    ):
         yield exists, acquire, migrate, lease
 
 
@@ -1133,6 +1135,7 @@ class TmuxBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             codex_home = Path(tmp) / "auth-one"
             codex_home.mkdir()
+            (codex_home / "bin").mkdir()
             record = _record(
                 command="/bin/bash",
                 cwd=tmp,
@@ -1161,6 +1164,7 @@ class TmuxBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             codex_home = Path(tmp) / "auth-one"
             codex_home.mkdir()
+            (codex_home / "bin").mkdir()
             encoded, digest, policy = record_recipe_fields(
                 command="/bin/bash",
                 cwd=tmp,
@@ -1223,12 +1227,12 @@ class TmuxBackendTests(unittest.TestCase):
             ensure.assert_not_called()
             run.assert_not_called()
 
-    def test_absent_private_session_migrates_config_before_state_and_spawn(self):
+    def test_absent_private_codex_session_migrates_config_before_state_and_spawn(self):
         with tempfile.TemporaryDirectory() as tmp:
             codex_home = Path(tmp) / "auth-one"
             codex_home.mkdir()
             record = _record(
-                command="/bin/bash",
+                command="codex --yolo",
                 cwd=tmp,
                 auth_scope_id="auth-one",
                 codex_home=str(codex_home),

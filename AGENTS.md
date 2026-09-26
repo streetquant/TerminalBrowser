@@ -11,9 +11,12 @@ Preserve dirty work, live terminals, saved tabs/windows, recovery recipes, worki
 directories, authentication and TLS. Use disposable terminals for input, kill and
 bulk-action tests. Do not bypass attestation, hand-edit managed hashes, retry
 rejected escalation, or apply the known unsafe shared-runtime ownership template.
-Source tests do not prove installation. Cloudflare rollout remains deferred;
-resolve its recorded scope/authority gates before resuming it. Warp storage or
-mount migration is not required for TermDeck and is not a deployment prerequisite.
+Source tests do not prove installation. The user resumed the Cloudflare work on
+2026-09-27 for the existing `https://maxchat.semiotech.org/t1000/` route. Inspect
+and preserve its tunnel, origin protections and other shared-hostname routes;
+record direct TLS, access-policy and WebSocket evidence in the existing BR tasks.
+Warp storage or mount migration is not required for TermDeck and is not a
+deployment prerequisite.
 
 ## BR is the sole work ledger; BV is advisory
 

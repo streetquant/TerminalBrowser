@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from termdeck import codex_config_scope as config_scope
+from termdeck.native_config_view import prepare_private_config, RECEIPT
 from termdeck.codex_config_scope import (
     CodexConfigScopeError,
     migrate_quiescent_codex_configuration as _migrate_quiescent_codex_configuration,
@@ -69,6 +71,66 @@ Path(os.environ["TERMDECK_TEST_CODEX_RECORD"]).write_text(
 
 
 class CodexConfigScopeTests(unittest.TestCase):
+    def test_receipt_backed_native_config_survives_shared_preparation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, private, launcher = root / "canonical", root / "auth-test", root / "codex"
+            source.mkdir()
+            (source / "config.toml").write_text("model = 'fixture'\n")
+            _write_launcher(launcher)
+            with mock.patch.dict(os.environ, {"TERMDECK_CODEX_BINARY": str(launcher)}):
+                prepare_shared_codex_configuration(private, source)
+                prepare_private_config(private, source, source / "config.toml")
+                with (private / "config.toml").open("a") as output:
+                    output.write("[projects.\"/fixture\"]\ntrust_level = 'trusted'\n")
+                view, receipt = (private / "config.toml").read_bytes(), (private / RECEIPT).read_bytes()
+                status = prepare_shared_codex_configuration(private, source)
+                plan = config_scope._configuration_plan(private, source)
+            self.assertTrue(status.ready)
+            self.assertFalse(status.migration_required)
+            self.assertTrue(plan.private_native_config)
+            self.assertEqual(plan.assets[0][3], "private-native")
+            self.assertEqual((private / "config.toml").read_bytes(), view)
+            self.assertEqual((private / RECEIPT).read_bytes(), receipt)
+            self.assertEqual((source / "config.toml").read_text(), "model = 'fixture'\n")
+            with self.assertRaisesRegex(CodexConfigScopeError, "requires explicit repair"):
+                config_scope.validate_existing_private_bash_scope(private, auth_scope_id=private.name)
+
+    def test_receipt_backed_native_config_without_source_file_is_not_legacy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, private, launcher = root / "canonical", root / "auth-test", root / "codex"
+            source.mkdir()
+            _write_launcher(launcher)
+            with mock.patch.dict(os.environ, {"TERMDECK_CODEX_BINARY": str(launcher)}):
+                prepare_shared_codex_configuration(private, source)
+                prepare_private_config(private, source, None)
+                view = (private / "config.toml").read_bytes()
+                status = prepare_shared_codex_configuration(private, source)
+            self.assertTrue(status.ready)
+            self.assertFalse(status.migration_required)
+            self.assertEqual((private / "config.toml").read_bytes(), view)
+            self.assertFalse((source / "config.toml").exists())
+            with self.assertRaisesRegex(CodexConfigScopeError, "requires explicit repair"):
+                config_scope.validate_existing_private_bash_scope(private, auth_scope_id=private.name)
+
+    def test_invalid_native_receipt_refuses_scope_preparation_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, private, launcher = root / "canonical", root / "auth-test", root / "codex"
+            source.mkdir()
+            (source / "config.toml").write_text("model = 'fixture'\n")
+            _write_launcher(launcher)
+            with mock.patch.dict(os.environ, {"TERMDECK_CODEX_BINARY": str(launcher)}):
+                prepare_shared_codex_configuration(private, source)
+                prepare_private_config(private, source, source / "config.toml")
+                (private / RECEIPT).write_text("{}\n")
+                view = (private / "config.toml").read_bytes()
+                with self.assertRaises(CodexConfigScopeError):
+                    prepare_shared_codex_configuration(private, source)
+            self.assertEqual((private / "config.toml").read_bytes(), view)
+            self.assertEqual((private / RECEIPT).read_text(), "{}\n")
+
     def test_managed_bash_sources_user_rc_then_restores_private_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

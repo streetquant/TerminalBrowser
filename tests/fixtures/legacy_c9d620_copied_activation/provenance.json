@@ -1,0 +1,35 @@
+{
+  "files": {
+    "bootstrap.py": {
+      "mode": 493,
+      "sha256": "a988252c12712352145bc40b4eacf5b1d6f68a391bcc8823b92d7c12b7fc13f2",
+      "size": 47691,
+      "source": "/warp/projects/softwares/termdeck/.termdeck/t1000-managed/bootstrap.py"
+    },
+    "io.github.t1000.T1000.desktop": {
+      "gid": 985,
+      "mode": 420,
+      "nlink": 1,
+      "sha256": "1b59f7367ffcb07cee4e7b1eed984400dfdd37e5b536305a0e9ed44a70d2f96d",
+      "size": 464,
+      "source": "/home/arch/.config/autostart/io.github.t1000.T1000.desktop",
+      "uid": 1000
+    },
+    "state.json": {
+      "mode": 384,
+      "sha256": "8809017c57fe0ac430909ff006fc652fadebd1e37e5ac1487f5926ebc9093e43",
+      "size": 538,
+      "source": "/warp/projects/softwares/termdeck/.termdeck/t1000-managed/state.json"
+    },
+    "t1000": {
+      "mode": 493,
+      "sha256": "e1e487a5217dfcc47300f125031628dc0df6f3e9759c33534542c9dfd52f256b",
+      "size": 202,
+      "source": "/warp/projects/softwares/termdeck/.termdeck/bin/t1000"
+    }
+  },
+  "release_id": "c9d6204ee6dbe01dc4225970cb41014e759d38146bef824b5fbda71cb3ed707c",
+  "schema": "termdeck.captured-legacy-activation-fixture.v1",
+  "source_bin_dir": "/warp/runtime/termdeck/bin",
+  "source_root": "/warp/runtime/termdeck/t1000-managed"
+}

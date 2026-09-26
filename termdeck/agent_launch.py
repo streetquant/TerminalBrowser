@@ -133,14 +133,24 @@ def _shared_asset_mounts(home, *, state_root, auth_directory, account_source, wo
         for name, canonical, _directory in assets:
             private = Path(home) / name
             if not private.is_symlink():
-                continue
-            target = Path(_shared_asset_path(private, **checks))
-            if target != canonical.resolve(strict=True):
-                raise StagingError("Shared asset binding changed", "unsafe-storage")
-            # Existing valid links can point directly at a target or use a
-            # different alias. Do not rewrite any host or private symlink.
-            alias = Path(os.path.abspath(private.parent / os.readlink(private)))
-            for destination in (target, canonical, alias):
+                if name != "config.toml" or not private.exists():
+                    continue
+                from .native_config_view import is_managed_private_config
+                if not is_managed_private_config(Path(home), Path(account_source)):
+                    raise StagingError("Private native configuration has no validated provenance", "unsafe-storage")
+                # A mutable private view never removes validation of the
+                # canonical read-only target, including a changed source alias.
+                target = Path(_shared_asset_path(canonical, **checks))
+                destinations = (target, canonical)
+            else:
+                target = Path(_shared_asset_path(private, **checks))
+                if target != canonical.resolve(strict=True):
+                    raise StagingError("Shared asset binding changed", "unsafe-storage")
+                # Existing valid links can point directly at a target or use a
+                # different alias. Do not rewrite any host or private symlink.
+                alias = Path(os.path.abspath(private.parent / os.readlink(private)))
+                destinations = (target, canonical, alias)
+            for destination in destinations:
                 _validate_shared_location(destination, **checks)
                 previous = mounts.setdefault(destination, target)
                 if previous != target:
@@ -159,6 +169,29 @@ def _shared_asset_mounts(home, *, state_root, auth_directory, account_source, wo
         return tuple((str(target), str(destination)) for target, destination in result)
     except (OSError, RuntimeError, CodexConfigScopeError) as exc:
         raise StagingError("Shared asset catalogue cannot be validated", "unsafe-storage") from exc
+
+
+def _prepare_native_configuration(home, *, state_root, auth_directory, account_source, workspace, write=True):
+    """Grant-check source bytes before private initialization or read-only planning."""
+    from .codex_config_scope import _canonical_assets, CodexConfigScopeError
+    from .native_config_view import prepare_private_config
+    try:
+        source = Path(account_source)
+        assets = [asset for asset in _canonical_assets(source) if asset[0] != ".env"]
+        checks = dict(state_root=state_root, auth_directory=auth_directory,
+                      account_source=account_source, private_home=home, workspace=workspace,
+                      shared_names={name for name, _path, _directory in assets})
+        canonical = next((path for name, path, _directory in assets if name == "config.toml"), None)
+        target = None
+        if canonical is not None:
+            target = _shared_asset_path(canonical, **checks)
+            _validate_shared_location(canonical, **checks)
+        return prepare_private_config(Path(home), source, target, write=write)
+    except CodexConfigScopeError as exc:
+        # The helper's diagnostics contain no configuration values or tokens.
+        raise StagingError(str(exc), "configuration-conflict") from None
+    except (OSError, RuntimeError):
+        raise StagingError("Private native configuration authority cannot be validated", "configuration-conflict") from None
 
 
 def _prepare_private_log_directory(home):
@@ -389,6 +422,11 @@ def _resume_context(record):
                     directory.check()
                 _validate_resume_record(store, args, db, plan, value, record)
                 _validate_attachments(store, tree, db, actor, plan)
+                _prepare_native_configuration(
+                    record.codex_home, state_root=store.root.parent, auth_directory=store.auth_directory,
+                    account_source=value["codex"]["account_source"], workspace=plan["workspace"]["path"],
+                    write=False,
+                )
                 yield args, store, tree, db, plan, value
                 tree.check()
     finally:
@@ -652,6 +690,10 @@ def execute(args):
                     codex_home, state_root=store.root.parent, auth_directory=store.auth_directory,
                     account_source=value["codex"]["account_source"], workspace=plan["workspace"]["path"],
                 )
+                _prepare_native_configuration(
+                    codex_home, state_root=store.root.parent, auth_directory=store.auth_directory,
+                    account_source=value["codex"]["account_source"], workspace=plan["workspace"]["path"],
+                )
                 _prepare_private_log_directory(codex_home)
                 credential=Path(codex_home)/"auth.json"
                 if credential.is_symlink():
@@ -686,7 +728,10 @@ def main():
     for name in ("state","auth-dir","db","launch","tab"): parser.add_argument("--"+name,required=True)
     parser.add_argument("--resume-permit")
     try: execute(parser.parse_args())
-    except (StagingError,OSError,ValueError):
+    except (StagingError,OSError,ValueError) as exc:
+        if isinstance(exc, StagingError) and exc.code == "configuration-conflict":
+            print("TermDeck confined task could not start: " + str(exc), file=sys.stderr)
+            return 78
         print("TermDeck confined task could not start; review its launch policy and attachment authorization.",file=sys.stderr)
         return 78
     return 0

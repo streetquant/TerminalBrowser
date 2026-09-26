@@ -118,10 +118,22 @@ publication/recovery and live validation. Publication supplies the repaired
 launcher/wrappers/recovery unit; verified terminal recovery follows, and the live
 smoke depends on both. Publishing v6 alone does not prove usable terminals.
 Source prerequisites must not require live deployment before qualification.
-Cloudflare is deferred by the user. On 2026-09-26 the user explicitly cancelled
+On 2026-09-27 the user resumed all three Cloudflare outcomes for the already-used
+`https://maxchat.semiotech.org/t1000/` endpoint. Preserve its shared-hostname
+routes and application protections; verify the existing tunnel and access policy
+before making changes. User-reported access does not substitute for unobserved
+external-client TLS, WebSocket, renewal or revocation checks.
+On 2026-09-26 the user explicitly cancelled
 the imported Warp storage/mount cutover requirement: it is not required for
 TermDeck. The cancelled record preserves history, and active-path verification
-does not depend on that migration. Separate checkpoint cleanup remains deferred.
+does not depend on that migration. Current BR evidence records the obsolete
+checkpoint service as already absent; no cleanup or Warp finalizer is needed.
+The active-path audit belongs to this delivery after application activation.
+Cloudflare work and validation of the existing public endpoint are in scope.
+Consult live BR for status rather than the imported descriptions or historical
+labels. The imported physical UI prerequisite does not block tunnel or policy
+inspection; actual application qualification and external-client evidence remain
+necessary for their respective acceptance criteria.
 No standalone Codex runtime modification is in scope.
 
 ## Frozen migration provenance

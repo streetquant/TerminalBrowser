@@ -150,9 +150,46 @@ live rollback acceptance.
 
 ## Cloudflare
 
-The preferred standalone public endpoint is a dedicated named tunnel with the configuration in `deploy/cloudflare/termdeck.yml.example` and a proxied CNAME from the public hostname to `<tunnel-id>.cfargotunnel.com`. The Cloudflare token used for DNS creation must have `Zone:DNS:Edit`; tunnel-management permission alone is insufficient. Application password/device authentication, same-origin CSRF checks, sequenced terminal input and single-controller fencing remain authoritative behind the tunnel.
+The selected public endpoint is `https://maxchat.semiotech.org/t1000/`, using
+the existing shared tunnel. Its TermDeck path rule precedes the hostname's
+MaxChat catch-all. Preserve that ordering and the unrelated root route when
+reviewing `deploy/cloudflare/maxchat-termdeck-route.json`. Application
+password/device authentication, same-origin CSRF checks, sequenced terminal
+input and single-controller fencing remain authoritative behind the tunnel.
 
-A stable route can also be inserted into the existing `maxchat.semiotech.org` tunnel by applying `deploy/cloudflare/maxchat-termdeck-route.json` before its hostname catch-all. That route exposes t1000 only under `https://maxchat.semiotech.org/t1000/`, preserves the existing MaxChat root route, validates the local TLS origin through the t1000 LAN CA, and forwards the exact `/t1000` prefix contract used by redirects, forms, assets, cookies and WSS.
+The selected access policy uses TermDeck login only. An additional Cloudflare
+Access login is not configured for this hostname. Invitations, device approval,
+session expiry and revocation remain controlled by TermDeck; preserve unrelated
+Cloudflare Access applications on other hostnames.
+
+The route verifies local origin TLS using the t1000 LAN CA and supplies the
+`/t1000` prefix contract for redirects, forms, assets, cookies and WSS. nginx
+returns a relative `/t1000/` redirect for the entry without a slash. The browser
+retains its original HTTPS authority, including an explicit LAN port, instead
+of receiving nginx's private origin port at the public hostname.
+
+Before translating headers for the loopback backend, nginx checks any supplied
+Origin against the original HTTPS Host, including its port. Mutations require
+Origin and same-origin Fetch Metadata. WebSocket upgrades require Origin and
+reject contradictory Fetch Metadata; native clients may omit Fetch Metadata.
+Safe navigation may omit Origin. The proxied response's `same-origin` referrer
+policy preserves native POST form provenance without sending referrers across
+origins. Backend authentication, CSRF and rate limits still apply.
+
+Qualify changes to this edge with
+`python -m pytest tests/test_web_nginx_edge.py`: it runs the actual deployment
+template with private paths, loopback listeners, a disposable certificate and
+an inert upstream. It checks public/LAN redirects, rejected hosts/origins,
+prefix/cookie/WebSocket forwarding and native Chromium forms. This fixture
+does not prove live authentication or external terminal access. The nginx
+template is an application activation input, not a privileged preparer package
+member; publish it through qualified activation and fresh signed preparation,
+never by editing the receipt-bound live config.
+
+The standalone configuration in `deploy/cloudflare/termdeck.yml.example` is an
+alternative for an independently approved hostname; it is not a replacement
+for the selected shared route. Creating DNS records requires appropriate DNS
+permission, which tunnel-management permission alone does not establish.
 
 When DNS permission or a stable shared route is temporarily unavailable, `deploy/systemd/termdeck-cloudflare-preview.service` and `scripts/termdeck-cloudflare-preview.py` provide a Quick Tunnel and write its current URL to `cloudflare-preview-url.json`. Quick Tunnel URLs are temporary fallbacks and must not replace the named-tunnel or stable shared route in production documentation.
 

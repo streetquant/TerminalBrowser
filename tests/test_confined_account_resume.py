@@ -204,6 +204,11 @@ def test_configured_task_switch_uses_real_confined_argv_and_exact_guarded_resume
     assert resources.observe_recovery_metadata(initial_pid) == (True, None, None)
     source_before = {p.relative_to(f.source): p.read_bytes() for p in f.source.rglob("*") if p.is_file()}
     sibling_before = (Path(f.sibling.codex_home) / "auth.json").read_bytes()
+    private_config = Path(record.codex_home) / "config.toml"
+    private_config.write_bytes(private_config.read_bytes() + b'\n[projects."/disposable"]\ntrust_level = "trusted"\n')
+    private_before = private_config.read_bytes()
+    sibling_config = Path(f.sibling.codex_home) / "config.toml"
+    sibling_config_before = sibling_config.read_bytes() if sibling_config.exists() else None
     upload((f.store, f.actor), b"new generation", previous=f.obj["reference"])
     request = {"operation": "switch-account", "ids": [record.id], "confirmation": [record.id],
                "account": "beta", "expected": {record.id: f.manager.state(record).fingerprint},
@@ -227,11 +232,70 @@ def test_configured_task_switch_uses_real_confined_argv_and_exact_guarded_resume
     assert all(p["conversation"] == CONVERSATION and p["cwd"] == str(f.workspace) and p["bytes"] == "original" for p in proofs)
     assert f.attachment.read_bytes() == b"original"
     assert (Path(f.sibling.codex_home) / "auth.json").read_bytes() == sibling_before
+    assert private_config.read_bytes() == private_before
+    assert (sibling_config.read_bytes() if sibling_config.exists() else None) == sibling_config_before
     assert {p.relative_to(f.source): p.read_bytes() for p in f.source.rglob("*") if p.is_file()} == source_before
     assert not (Path(record.codex_home) / "sessions").is_symlink()
     assert "alpha-refresh" not in json.dumps(result) and "beta-refresh" not in json.dumps(result)
     with pytest.raises(cf.StagingError, match="consumed"):
         launch.execute(args_for(f, spec.confined_resume_permit))
+
+
+def test_source_change_with_private_edits_refuses_switch_before_stopping_live_task(confined):
+    from termdeck.native_config_view import SOURCE_CONFLICT
+    f = confined
+    record = resume_record(f)
+    private = Path(record.codex_home) / "config.toml"
+    private.write_bytes(private.read_bytes() + b'\n[projects."/disposable"]\ntrust_level = "trusted"\n')
+    defaults = f.source / "config.toml"
+    defaults.write_text('model = "synthetic-changed-system-default"\n')
+    defaults.chmod(0o600)
+    before = private.read_bytes()
+    auth_before = (Path(record.codex_home) / "auth.json").read_bytes()
+    old_pid = f.backend.process.pid
+    # This public scope step must preserve the validated native view rather than
+    # treating it as a legacy conflict or rebinding it to the canonical file.
+    f.sessions.ensure_auth_scope(record.id, private_history=True)
+    with pytest.raises(cf.StagingError, match=SOURCE_CONFLICT):
+        launch.prepare_resume(record)
+    plan = f.backend.plan_auth_change(record)
+    assert not plan.ok and SOURCE_CONFLICT in plan.detail
+    result = handle(f.sessions, {
+        "operation": "switch-account", "ids": [record.id], "confirmation": [record.id], "account": "beta",
+        "expected": {record.id: f.manager.state(record).fingerprint}, "request_id": uuid.uuid4().hex,
+        "_actor_session": f.actor.session_id,
+    }, manager=f.manager, backend=f.backend)
+    assert not result["ok"] and SOURCE_CONFLICT in json.dumps(result)
+    assert f.backend.process.pid == old_pid and f.backend.process.poll() is None
+    assert not f.backend.launched_specs and not f.backend.input_off
+    assert private.read_bytes() == before
+    assert (Path(record.codex_home) / "auth.json").read_bytes() == auth_before
+    assert "synthetic-changed-system-default" not in json.dumps(result)
+
+
+def test_untouched_private_defaults_refresh_after_exact_confined_account_resume(confined):
+    f = confined
+    record = resume_record(f)
+    private = Path(record.codex_home) / "config.toml"
+    before = private.read_bytes()
+    defaults = f.source / "config.toml"
+    defaults.write_text('model = "synthetic-new-default"\n')
+    defaults.chmod(0o600)
+    assert f.backend.plan_auth_change(record).ok
+    assert private.read_bytes() == before  # Preflight is read-only while running.
+    result = handle(f.sessions, {
+        "operation": "switch-account", "ids": [record.id], "confirmation": [record.id], "account": "beta",
+        "expected": {record.id: f.manager.state(record).fingerprint}, "request_id": uuid.uuid4().hex,
+        "_actor_session": f.actor.session_id,
+    }, manager=f.manager, backend=f.backend)
+    assert result["ok"], result
+    assert result["results"][0]["restarted"] and len(f.backend.launched_specs) == 1
+    assert private.read_bytes().endswith(defaults.read_bytes())
+    assert private.read_bytes().splitlines()[0] == before.splitlines()[0]
+    proofs = [json.loads(line) for line in (f.workspace / "observations.jsonl").read_text().splitlines()]
+    assert [(p["account"], p["resumed"], p["conversation"]) for p in proofs] == [
+        ("alpha", 0, CONVERSATION), ("beta", 1, CONVERSATION),
+    ]
 
 
 @pytest.mark.parametrize("mutation,detail", [

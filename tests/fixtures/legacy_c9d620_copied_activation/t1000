@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+export TERMDECK_STATE_ROOT=/warp/projects/softwares/termdeck/.termdeck/state
+exec /usr/bin/python3.14 -I -B /warp/projects/softwares/termdeck/.termdeck/t1000-managed/bootstrap.py "$@"

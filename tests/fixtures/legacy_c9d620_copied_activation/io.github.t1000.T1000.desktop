@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=T1000
+Comment=Restore managed terminal sessions at graphical-session start
+Exec=/home/arch/.local/bin/t1000 gui
+TryExec=/home/arch/.local/bin/t1000
+Icon=t1000
+Terminal=false
+StartupNotify=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Notify=true
+X-KDE-autostart-after=panel
+X-T1000-Managed-Launcher=/home/arch/.local/bin/t1000
+X-T1000-Storage-Fabric=warp-drives-v1
+X-T1000-Fail-Closed=true
