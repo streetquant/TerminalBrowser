@@ -252,6 +252,522 @@ def test_seed_copies_only_approved_inputs_tls_and_recovery_key(layout) -> None:
     assert (consumer / "releases" / "keep" / "artifact").read_bytes() == b"release-state"
 
 
+def _legacy_seed_prefix(layout, length: int = 5) -> tuple[str, ...]:
+    """Recreate native13's ordered copies, including the real five-leaf stop."""
+
+    _config, producer, consumer = layout
+    for relative, mode in publication.SOURCE_MODES.items():
+        _write(producer / relative, (consumer / relative).read_bytes(), mode)
+    _write(consumer / "tls" / "ca.srl", b"01\n", 0o644)
+    names = sorted(publication.TLS_REQUIRED | publication.TLS_OPTIONAL)[:length]
+    for name in names:
+        _write(
+            producer / "tls" / name, (consumer / "tls" / name).read_bytes(),
+            (publication.TLS_REQUIRED_MODES | publication.TLS_OPTIONAL_MODES)[name],
+        )
+    return tuple(names)
+
+
+def _seed_preserved_paths(producer: Path, consumer: Path) -> tuple[dict, dict]:
+    # Directory mtime at the runtime root changes with staging. The retained
+    # TLS directory and all preexisting leaf inodes/bytes/modes must survive.
+    producer_paths = tuple(
+        str(path.relative_to(producer))
+        for path in producer.rglob("*") if path.is_file() or path == producer / "tls"
+    )
+    consumer_paths = tuple(
+        str(path.relative_to(consumer)) for path in consumer.rglob("*") if path.is_file()
+    )
+    return _snapshot(producer, producer_paths), _snapshot(consumer, consumer_paths)
+
+
+@pytest.mark.parametrize("bad_input", ("binary", "nginx", "extension", "missing-key", "recovery-key"))
+def test_seed_preflights_every_source_before_any_copy(layout, bad_input: str) -> None:
+    config, producer, consumer = layout
+    if bad_input == "binary":
+        (consumer / "bin" / "termdeck-web-server").chmod(0o777)
+    elif bad_input == "nginx":
+        (consumer / "nginx" / "nginx.conf").chmod(0o644)
+    elif bad_input == "extension":
+        (consumer / "tls" / "server.ext").chmod(0o644)
+    elif bad_input == "missing-key":
+        (consumer / "tls" / "server.key").unlink()
+    else:
+        _write(producer.parent / publication.CONTROL_KEY, b"different-private-key".ljust(32, b"!"), 0o600)
+    before = _seed_preserved_paths(producer, consumer)
+
+    with pytest.raises(publication.PublicationError):
+        publication.seed(config)
+
+    assert _seed_preserved_paths(producer, consumer) == before
+    assert not tuple(producer.glob(".termdeck-*"))
+    assert not (producer / "bin" / "termdeck-web-server").exists()
+    assert not (producer / "nginx" / "nginx.conf").exists()
+    assert not tuple((producer / "tls").iterdir())
+
+
+@pytest.mark.parametrize("length", (1, 2, 3, 4, 5, 6))
+def test_seed_resumes_only_the_intact_legacy_prefix_and_replays(layout, length: int) -> None:
+    config, producer, consumer = layout
+    _legacy_seed_prefix(layout, length)
+    (consumer / publication.CONTROL_KEY).unlink()
+    private = _write(producer.parent / publication.CONTROL_KEY, b"private".ljust(32, b"!"), 0o600)
+    before_private = _snapshot(producer.parent, (publication.CONTROL_KEY,))
+    before_consumer = _seed_preserved_paths(producer, consumer)[1]
+    before_sources = _snapshot(producer, tuple(publication.SOURCE_MODES))
+
+    result = publication.seed(config)
+
+    assert result["ok"] is True
+    assert set(result["copied"]) == {"tls/" + name for name in publication.TLS_REQUIRED | publication.TLS_OPTIONAL}
+    assert set(path.name for path in (producer / "tls").iterdir()) == publication.TLS_REQUIRED | publication.TLS_OPTIONAL
+    for name, mode in (publication.TLS_REQUIRED_MODES | publication.TLS_OPTIONAL_MODES).items():
+        destination = producer / "tls" / name
+        assert destination.read_bytes() == (consumer / "tls" / name).read_bytes()
+        info = destination.lstat()
+        assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode), info.st_nlink) == (
+            config.preparer_uid, config.preparer_gid, mode, 1,
+        )
+    after = _seed_preserved_paths(producer, consumer)
+    assert publication.seed(config)["copied"] == []
+    assert _seed_preserved_paths(producer, consumer) == after
+    assert after[1] == before_consumer
+    assert _snapshot(producer, tuple(publication.SOURCE_MODES)) == before_sources
+    assert _snapshot(producer.parent, (publication.CONTROL_KEY,)) == before_private
+    assert private.read_bytes() == b"private".ljust(32, b"!")
+    assert not tuple(producer.glob(".termdeck-*"))
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ("gap", "different-bytes", "wrong-mode", "hardlink", "symlink", "extra-leaf",
+     "missing-source", "changed-source", "receipt", "output", "journal", "nginx-output"),
+)
+def test_seed_refuses_partial_trees_without_exact_initial_seed_evidence(layout, invalid: str) -> None:
+    config, producer, consumer = layout
+    _legacy_seed_prefix(layout)
+    if invalid == "gap":
+        (producer / "tls" / "ca.srl").unlink()
+    elif invalid == "different-bytes":
+        (producer / "tls" / "ca.key").write_bytes(b"unrelated CA key")
+    elif invalid == "wrong-mode":
+        (producer / "tls" / "ca.key").chmod(0o644)
+    elif invalid == "hardlink":
+        os.link(producer / "tls" / "ca.key", producer.parent / "key-alias")
+    elif invalid == "symlink":
+        (producer / "tls" / "ca.key").unlink()
+        (producer / "tls" / "ca.key").symlink_to(consumer / "tls" / "ca.key")
+    elif invalid == "extra-leaf":
+        _write(producer / "tls" / "unrelated", b"keep", 0o600)
+    elif invalid == "missing-source":
+        (producer / "bin" / "termdeck-web-server").unlink()
+    elif invalid == "changed-source":
+        (producer / "nginx" / "nginx.conf").write_bytes(b"different")
+    elif invalid == "receipt":
+        _write(producer / "build-receipt.json", b"{}", 0o644)
+    elif invalid == "output":
+        _write(producer / "current-lan-ip", b"192.168.1.1", 0o600)
+    elif invalid == "journal":
+        _mkdir(producer / (".termdeck-tls-transaction-" + GENERATION))
+    else:
+        _write(producer / "nginx" / "allowed-hosts.map", b"192.168.1.1 1;", 0o600)
+    before = _seed_preserved_paths(producer, consumer)
+
+    with pytest.raises(publication.PublicationError):
+        publication.seed(config)
+
+    assert _seed_preserved_paths(producer, consumer) == before
+    assert not tuple(producer.glob(".termdeck-seed-*"))
+    assert not (producer.parent / publication.CONTROL_KEY).exists()
+
+
+def test_seed_preserves_a_complete_established_producer_generation(layout) -> None:
+    config, producer, consumer = layout
+    publication.seed(config)
+    _prepare_generation(producer, b"established")
+    before = _seed_preserved_paths(producer, consumer)
+
+    result = publication.seed(config)
+
+    assert result["copied"] == []
+    assert _seed_preserved_paths(producer, consumer) == before
+
+
+@pytest.mark.parametrize("partial", (False, True))
+@pytest.mark.parametrize("fault", ("stage-write", "stage-sync", "exchange", "published-sync", "source-write", "key-migration"))
+def test_tls_seed_faults_restore_exact_preimages_and_allow_replay(layout, monkeypatch, partial, fault) -> None:
+    config, producer, consumer = layout
+    if partial:
+        _legacy_seed_prefix(layout)
+    before = _seed_preserved_paths(producer, consumer)
+    original_write = publication._write_all
+    original_sync = publication.os.fsync
+    original_rename = publication._rename_with_flags
+    original_migrate = publication._migrate_control_key
+    injected = False
+    swapped = False
+
+    def faulting_write(descriptor, content, *, label):
+        nonlocal injected
+        target = "staged producer TLS server.key" if fault == "stage-write" else "producer source bin/termdeck-web-server"
+        if not injected and fault in {"stage-write", "source-write"} and label == target:
+            injected = True
+            raise publication.PublicationError("injected seed write failure")
+        return original_write(descriptor, content, label=label)
+
+    def faulting_sync(descriptor):
+        nonlocal injected
+        info = publication.os.fstat(descriptor)
+        if not injected and stat.S_ISDIR(info.st_mode):
+            target = producer if fault == "published-sync" and swapped else None
+            if (target is not None and info.st_ino == target.stat().st_ino) or (
+                fault == "stage-sync" and "server.key" in os.listdir(descriptor)
+                and info.st_ino != (producer / "tls").stat().st_ino
+            ):
+                injected = True
+                raise OSError(errno.EIO, "injected seed sync failure")
+        return original_sync(descriptor)
+
+    def faulting_rename(*args, **kwargs):
+        nonlocal injected, swapped
+        if kwargs.get("label") == "initial producer TLS":
+            if fault == "exchange" and not injected:
+                injected = True
+                raise publication.PublicationError("injected seed exchange failure")
+            result = original_rename(*args, **kwargs)
+            swapped = True
+            return result
+        return original_rename(*args, **kwargs)
+
+    def faulting_migrate(*args, **kwargs):
+        nonlocal injected
+        if fault == "key-migration":
+            injected = True
+            raise publication.PublicationError("injected key migration failure")
+        return original_migrate(*args, **kwargs)
+
+    # A resumed prefix retains matching source inodes; fail its subsequent
+    # source read instead of manufacturing an unnecessary replacement.
+    original_optional = publication._optional_leaf
+
+    def faulting_optional(*args, **kwargs):
+        nonlocal injected
+        if fault == "source-write" and partial and swapped and not injected and kwargs.get("label") == "producer source bin/termdeck-web-server":
+            injected = True
+            raise publication.PublicationError("injected source inspection failure")
+        return original_optional(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(publication, "_write_all", faulting_write)
+        patch.setattr(publication.os, "fsync", faulting_sync)
+        patch.setattr(publication, "_rename_with_flags", faulting_rename)
+        patch.setattr(publication, "_migrate_control_key", faulting_migrate)
+        patch.setattr(publication, "_optional_leaf", faulting_optional)
+        with pytest.raises(publication.PublicationError):
+            publication.seed(config)
+
+    assert injected
+    assert _seed_preserved_paths(producer, consumer) == before
+    assert not tuple(producer.glob(".termdeck-seed-*"))
+    assert not (producer.parent / publication.CONTROL_KEY).exists()
+    assert publication.seed(config)["ok"] is True
+
+
+@pytest.mark.parametrize("existing_directory", (False, True))
+def test_initial_tls_is_visible_only_as_an_entire_set(layout, monkeypatch, existing_directory) -> None:
+    config, producer, consumer = layout
+    if not existing_directory:
+        (producer / "tls").rmdir()
+    original = publication._write_all
+    stages = []
+
+    def observe_stage(descriptor, content, *, label):
+        if label.startswith("staged producer TLS "):
+            stages.append(label)
+            assert (producer / "tls").exists() is existing_directory
+            if existing_directory:
+                assert not tuple((producer / "tls").iterdir())
+        return original(descriptor, content, label=label)
+
+    monkeypatch.setattr(publication, "_write_all", observe_stage)
+    assert publication.seed(config)["ok"] is True
+    assert len(stages) == len(publication.TLS_REQUIRED)
+    assert {p.name for p in (producer / "tls").iterdir()} == publication.TLS_REQUIRED
+
+
+@pytest.mark.parametrize("changed", ("consumer-tls", "consumer-source", "producer-prefix", "generation"))
+def test_seed_revalidates_sources_prefix_and_generation_after_staging(layout, monkeypatch, changed) -> None:
+    config, producer, consumer = layout
+    _legacy_seed_prefix(layout)
+    original = publication._copy_into_noreplace
+    before = _seed_preserved_paths(producer, consumer)
+    injected = False
+    drifted = None
+
+    def mutate_after_staging(*args, **kwargs):
+        nonlocal injected, drifted
+        result = original(*args, **kwargs)
+        if kwargs.get("label") == "staged producer TLS server.key" and not injected:
+            injected = True
+            if changed == "consumer-tls":
+                drifted = consumer / "tls" / "server.key"
+            elif changed == "consumer-source":
+                drifted = consumer / "bin" / "termdeck-web-server"
+            elif changed == "producer-prefix":
+                drifted = producer / "tls" / "ca.key"
+            else:
+                drifted = producer / "build-receipt.json"
+            drifted.write_bytes(b"concurrent-change")
+        return result
+
+    monkeypatch.setattr(publication, "_copy_into_noreplace", mutate_after_staging)
+    with pytest.raises(publication.PublicationError, match="changed|generation"):
+        publication.seed(config)
+
+    assert injected and drifted.read_bytes() == b"concurrent-change"
+    assert not (producer / "tls" / "server.key").exists()
+    assert not (producer.parent / publication.CONTROL_KEY).exists()
+    assert (consumer / publication.CONTROL_KEY).read_bytes() == b"k" * 32
+    assert not tuple(producer.glob(".termdeck-seed-*"))
+    # None of the unaffected preimages may be rewritten by this rejection.
+    after = _seed_preserved_paths(producer, consumer)
+    for old, new, root in zip(before, after, (producer, consumer)):
+        for relative, entry in old.items():
+            if root / relative != drifted and relative != "tls":
+                assert new[relative] == entry
+
+
+def test_seed_exchange_race_restores_the_displaced_conflicting_generation(layout, monkeypatch) -> None:
+    config, producer, consumer = layout
+    _legacy_seed_prefix(layout)
+    before = _seed_preserved_paths(producer, consumer)
+    original = publication._rename_with_flags
+    injected = False
+    concurrent = None
+
+    def replace_before_exchange(*args, **kwargs):
+        nonlocal injected, concurrent
+        if kwargs.get("label") == "initial producer TLS" and not injected:
+            injected = True
+            (producer / "tls").rename(producer.parent / "retained-original-tls")
+            _mkdir(producer / "tls")
+            for name, mode in publication.TLS_REQUIRED_MODES.items():
+                _write(producer / "tls" / name, b"concurrent-" + name.encode(), mode)
+            concurrent = _snapshot(producer, ("tls",) + tuple("tls/" + name for name in publication.TLS_REQUIRED))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(publication, "_rename_with_flags", replace_before_exchange)
+    with pytest.raises(publication.PublicationError, match="changed"):
+        publication.seed(config)
+
+    assert injected
+    assert _snapshot(producer, tuple(concurrent)) == concurrent
+    original_tree = producer.parent / "retained-original-tls"
+    for relative, entry in before[0].items():
+        if relative.startswith("tls/"):
+            name = relative.removeprefix("tls/")
+            assert _snapshot(original_tree, (name,))[name] == entry
+    assert _seed_preserved_paths(producer, consumer)[1] == before[1]
+    assert not tuple(producer.glob(".termdeck-seed-*"))
+
+
+def test_seed_never_overwrites_a_concurrent_initial_tls_destination(layout, monkeypatch) -> None:
+    config, producer, consumer = layout
+    (producer / "tls").rmdir()
+    original = publication._rename_noreplace
+    concurrent = None
+
+    def create_before_publish(*args, **kwargs):
+        nonlocal concurrent
+        if kwargs.get("label") == "initial producer TLS":
+            _mkdir(producer / "tls")
+            _write(producer / "tls" / "ca.key", b"concurrent-private-key", 0o600)
+            concurrent = _snapshot(producer, ("tls", "tls/ca.key"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(publication, "_rename_noreplace", create_before_publish)
+    with pytest.raises(publication.PublicationError):
+        publication.seed(config)
+
+    assert _snapshot(producer, tuple(concurrent)) == concurrent
+    assert (consumer / publication.CONTROL_KEY).read_bytes() == b"k" * 32
+    assert not (producer.parent / publication.CONTROL_KEY).exists()
+    assert not tuple(producer.glob(".termdeck-seed-*"))
+
+
+def test_seed_preserves_both_preimage_and_conflict_if_rollback_path_is_replaced(layout, monkeypatch) -> None:
+    config, producer, consumer = layout
+    _legacy_seed_prefix(layout)
+    before = _snapshot(producer, ("tls", "tls/ca.key"))
+    original_rename = publication._rename_with_flags
+    original_sync = publication.os.fsync
+    swapped = False
+    injected = False
+    concurrent = None
+
+    def observe_exchange(*args, **kwargs):
+        nonlocal swapped
+        result = original_rename(*args, **kwargs)
+        if kwargs.get("label") == "initial producer TLS":
+            swapped = True
+        return result
+
+    def replace_and_fail(descriptor):
+        nonlocal injected, concurrent
+        if swapped and not injected and os.fstat(descriptor).st_ino == producer.stat().st_ino:
+            injected = True
+            (producer / "tls").rename(producer.parent / "displaced-new-seed")
+            _mkdir(producer / "tls")
+            _write(producer / "tls" / "ca.key", b"concurrent-private-key", 0o600)
+            concurrent = _snapshot(producer, ("tls", "tls/ca.key"))
+            raise OSError(errno.EIO, "injected post-publication race")
+        return original_sync(descriptor)
+
+    monkeypatch.setattr(publication, "_rename_with_flags", observe_exchange)
+    monkeypatch.setattr(publication.os, "fsync", replace_and_fail)
+    with pytest.raises(publication.PublicationError):
+        publication.seed(config)
+
+    assert injected and _snapshot(producer, tuple(concurrent)) == concurrent
+    retained, = producer.glob(".termdeck-seed-tls-*")
+    preserved = _snapshot(producer, (retained.name, retained.name + "/ca.key"))
+    assert preserved[retained.name] == before["tls"]
+    assert preserved[retained.name + "/ca.key"] == before["tls/ca.key"]
+    assert (consumer / publication.CONTROL_KEY).read_bytes() == b"k" * 32
+    assert not (producer.parent / publication.CONTROL_KEY).exists()
+
+
+def test_seed_stage_open_failure_cleans_empty_candidate_without_descriptor_leak(layout, monkeypatch) -> None:
+    config, producer, consumer = layout
+    _legacy_seed_prefix(layout)
+    before = _seed_preserved_paths(producer, consumer)
+    descriptor_count = len(os.listdir("/proc/self/fd"))
+    original = publication.os.open
+
+    def fail_stage_open(path, *args, **kwargs):
+        if isinstance(path, str) and path.startswith(".termdeck-seed-tls-"):
+            raise OSError(errno.EMFILE, "injected seed stage open failure")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(publication.os, "open", fail_stage_open)
+    with pytest.raises(publication.PublicationError):
+        publication.seed(config)
+
+    assert _seed_preserved_paths(producer, consumer) == before
+    assert not tuple(producer.glob(".termdeck-seed-*"))
+    assert len(os.listdir("/proc/self/fd")) == descriptor_count
+
+
+@pytest.mark.parametrize("private_exists", (False, True))
+@pytest.mark.parametrize("fault", ("retained-sync", "consumer-sync", "commit-unlink"))
+def test_seed_key_migration_failure_preserves_exact_legacy_and_private_inodes(layout, monkeypatch, private_exists, fault) -> None:
+    config, producer, consumer = layout
+    _legacy_seed_prefix(layout)
+    if private_exists:
+        _write(producer.parent / publication.CONTROL_KEY, b"k" * 32, 0o600)
+    before = _seed_preserved_paths(producer, consumer)
+    private_before = _snapshot(producer.parent, (publication.CONTROL_KEY,)) if private_exists else None
+    original_sync = publication.os.fsync
+    original_unlink = publication.os.unlink
+    injected = False
+
+    def faulting_sync(descriptor):
+        nonlocal injected
+        info = os.fstat(descriptor)
+        is_directory = stat.S_ISDIR(info.st_mode)
+        retained = not (consumer / publication.CONTROL_KEY).exists()
+        if not injected and retained and is_directory and (
+            (fault == "consumer-sync" and info.st_ino == consumer.stat().st_ino)
+            or (fault == "retained-sync" and os.listdir(descriptor) == [publication.CONTROL_KEY])
+        ):
+            injected = True
+            raise OSError(errno.EIO, "injected retained key sync failure")
+        return original_sync(descriptor)
+
+    def faulting_unlink(path, *args, **kwargs):
+        nonlocal injected
+        if fault == "commit-unlink" and path == publication.CONTROL_KEY and not injected:
+            injected = True
+            raise OSError(errno.EIO, "injected key commit failure")
+        return original_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(publication.os, "fsync", faulting_sync)
+        patch.setattr(publication.os, "unlink", faulting_unlink)
+        with pytest.raises(publication.PublicationError):
+            publication.seed(config)
+
+    assert injected
+    assert _seed_preserved_paths(producer, consumer) == before
+    assert not tuple(consumer.glob(".termdeck-key-migration-*"))
+    assert not tuple(producer.glob(".termdeck-seed-*"))
+    if private_exists:
+        assert _snapshot(producer.parent, (publication.CONTROL_KEY,)) == private_before
+    else:
+        assert not (producer.parent / publication.CONTROL_KEY).exists()
+    assert publication.seed(config)["ok"] is True
+
+
+def test_seed_postcommit_tls_cleanup_failure_is_success_with_retained_preimage(layout, monkeypatch) -> None:
+    config, producer, consumer = layout
+    _legacy_seed_prefix(layout)
+    before = _snapshot(producer, ("tls", "tls/ca.key"))
+    original = publication._remove_flat_directory
+
+    def fail_tls_cleanup(parent, name, **kwargs):
+        if name.startswith(".termdeck-seed-tls-"):
+            raise OSError(errno.EIO, "injected TLS cleanup failure")
+        return original(parent, name, **kwargs)
+
+    monkeypatch.setattr(publication, "_remove_flat_directory", fail_tls_cleanup)
+    result = publication.seed(config)
+
+    assert result["ok"] is True
+    assert result["cleanup_warnings"]
+    assert {p.name for p in (producer / "tls").iterdir()} == publication.TLS_REQUIRED | publication.TLS_OPTIONAL
+    retained, = producer.glob(".termdeck-seed-tls-*")
+    retained_snapshot = _snapshot(producer, (retained.name, retained.name + "/ca.key"))
+    assert retained_snapshot[retained.name] == before["tls"]
+    assert retained_snapshot[retained.name + "/ca.key"] == before["tls/ca.key"]
+    assert publication.seed(config)["ok"] is True
+
+
+def test_seed_postcommit_key_cleanup_failure_keeps_committed_tls_and_private_key(layout, monkeypatch) -> None:
+    config, producer, consumer = layout
+    _legacy_seed_prefix(layout)
+    original_unlink = publication.os.unlink
+    original_sync = publication.os.fsync
+    committed_key_stage = None
+    injected = False
+
+    def observe_key_commit(path, *args, **kwargs):
+        nonlocal committed_key_stage
+        result = original_unlink(path, *args, **kwargs)
+        if path == publication.CONTROL_KEY:
+            committed_key_stage = kwargs["dir_fd"]
+        return result
+
+    def fail_committed_sync(descriptor):
+        nonlocal injected
+        if descriptor == committed_key_stage and not injected:
+            injected = True
+            raise OSError(errno.EIO, "injected committed key directory sync failure")
+        return original_sync(descriptor)
+
+    monkeypatch.setattr(publication.os, "unlink", observe_key_commit)
+    monkeypatch.setattr(publication.os, "fsync", fail_committed_sync)
+    result = publication.seed(config)
+
+    assert injected and result["ok"] is True and result["cleanup_warnings"]
+    assert result["control_key"] == "migrated"
+    assert not (consumer / publication.CONTROL_KEY).exists()
+    assert (producer.parent / publication.CONTROL_KEY).read_bytes() == b"k" * 32
+    assert {p.name for p in (producer / "tls").iterdir()} == publication.TLS_REQUIRED | publication.TLS_OPTIONAL
+    retained_stage, = consumer.glob(".termdeck-key-migration-*")
+    assert not tuple(retained_stage.iterdir())
+    assert stat.S_IMODE(retained_stage.stat().st_mode) == 0o700
+
+
 def test_publish_and_verify_bind_consumer_postimages_without_touching_user_state(layout) -> None:
     config, producer, consumer = layout
     publication.seed(config)
@@ -263,6 +779,10 @@ def test_publish_and_verify_bind_consumer_postimages_without_touching_user_state
 
     result = publication.publish(config)
     observed = publication.verify(config)
+
+    from termdeck.service_wrappers import _validate_preparer_publication_result
+
+    assert _validate_preparer_publication_result(result) is None
 
     assert result["ok"] is True
     assert result["operation"] == "publish"
@@ -631,6 +1151,10 @@ def test_seed_rejects_concurrent_private_key_destination_without_replacement(
         *,
         label: str,
     ) -> None:
+        if destination != publication.CONTROL_KEY:
+            return original(
+                source_parent, source, destination_parent, destination, label=label,
+            )
         descriptor = os.open(
             destination,
             publication.WRITE_FLAGS,

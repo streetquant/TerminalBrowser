@@ -22,6 +22,7 @@ the managed runtime tree is never executed by this broker.
 
 from __future__ import annotations
 
+import errno
 import grp
 import hashlib
 import json
@@ -59,7 +60,10 @@ DEFAULT_PUBLICATION: Final = Path("/usr/libexec/termdeck-preparer-publication")
 PREPARER_ACCOUNT: Final = "termdeck-preparer"
 CALLER_ACCOUNT: Final = "max"
 PUBLICATION_SCHEMA: Final = "termdeck.preparer-publication.v1"
-MAX_FRAME_BYTES: Final = 16 * 1024
+# A verified response contains the signed producer receipt and separate
+# consumer claims. Keep it aligned with the attestation/publication envelope;
+# the closed caller request remains limited independently below.
+MAX_FRAME_BYTES: Final = 128 * 1024
 MAX_REQUEST_BYTES: Final = 4096
 FRAME_HEADER_BYTES: Final = 4
 DEFAULT_REQUEST_TIMEOUT: Final = 8.0
@@ -69,10 +73,47 @@ _GENERATION = re.compile(r"[0-9a-f]{32}\Z")
 _DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _MAX_EXECUTABLE_BYTES = 16 * 1024 * 1024
 _PEER_CREDENTIAL_BYTES = struct.calcsize("3i")
+_DIAGNOSTIC_PHASES = frozenset({
+    "startup", "peer", "request", "publication-seed", "preparer",
+    "receipt-observation", "publication-publish", "publication-verify",
+    "verification-binding", "publication-restore", "restore-binding", "response",
+})
+_DIAGNOSTIC_CATEGORIES = frozenset({
+    "contract", "timeout", "execution-failed", "execution-permission-denied",
+    "execution-unavailable", "child-refused", "child-failed",
+})
+_TLS_MODES = {
+    "ca.crt": 0o644, "ca.key": 0o600, "server-chain.crt": 0o644,
+    "server.crt": 0o644, "server.ext": 0o600, "server.key": 0o600,
+    "ca.srl": 0o644,
+}
 
 
 class BrokerError(RuntimeError):
     """The activation, peer, request, or child contract was unsafe."""
+
+    def __init__(self, message: str, *, category: str = "contract") -> None:
+        super().__init__(message)
+        self.category = category if category in _DIAGNOSTIC_CATEGORIES else "contract"
+
+
+def _diagnose(phase: str, category: str) -> None:
+    """Emit only locally defined codes, never request data or child output."""
+
+    phase = phase if phase in _DIAGNOSTIC_PHASES else "startup"
+    category = category if category in _DIAGNOSTIC_CATEGORIES else "contract"
+    sys.stderr.write(
+        f"TermDeck preparer broker refused: phase={phase} category={category}\n"
+    )
+
+
+def _execution_category(error: BaseException) -> str:
+    if isinstance(error, OSError):
+        if error.errno in {errno.EACCES, errno.EPERM}:
+            return "execution-permission-denied"
+        if error.errno in {errno.ENOENT, errno.ENOEXEC}:
+            return "execution-unavailable"
+    return "execution-failed"
 
 
 @dataclass(frozen=True)
@@ -418,7 +459,7 @@ def _receive_exact(connection: socket.socket, size: int) -> bytes:
                 ancillary_size,
             )
         except socket.timeout as exc:
-            raise BrokerError("preparer broker request timed out") from exc
+            raise BrokerError("preparer broker request timed out", category="timeout") from exc
         except OSError as exc:
             raise BrokerError("could not read preparer broker request") from exc
         for level, kind, data in ancillary:
@@ -529,23 +570,23 @@ def run_preparer(
                 "restore_signals": True,
                 "start_new_session": True,
                 "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE if capture_output else subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
                 "timeout": config.preparer_timeout,
                 "umask": 0o077,
                 "user": principals.preparer_uid,
             }
-            if capture_output:
-                process_options.update(
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
             result = run_process(
                 command,
                 **process_options,
             )
         except subprocess.TimeoutExpired as exc:
-            raise BrokerError("fixed TermDeck preparer timed out") from exc
+            raise BrokerError("fixed TermDeck preparer timed out", category="timeout") from exc
         except (OSError, subprocess.SubprocessError) as exc:
-            raise BrokerError("could not execute the fixed TermDeck preparer") from exc
+            raise BrokerError(
+                "could not execute the fixed TermDeck preparer",
+                category=_execution_category(exc),
+            ) from exc
         if _regular_identity(
             os.fstat(executable_descriptor), label="fixed preparer executable"
         ) != expected:
@@ -640,7 +681,7 @@ def run_publication(
             "restore_signals": True,
             "start_new_session": True,
             "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL,
             "timeout": config.publication_timeout,
             "umask": 0o077,
             "user": config.root_uid,
@@ -652,16 +693,22 @@ def run_publication(
         try:
             result = run_process(command, **process_options)
         except subprocess.TimeoutExpired as exc:
-            raise BrokerError("fixed TermDeck publication helper timed out") from exc
+            raise BrokerError("fixed TermDeck publication helper timed out", category="timeout") from exc
         except (OSError, subprocess.SubprocessError) as exc:
-            raise BrokerError("could not execute the fixed TermDeck publication helper") from exc
+            raise BrokerError(
+                "could not execute the fixed TermDeck publication helper",
+                category=_execution_category(exc),
+            ) from exc
         if _regular_identity(
             os.fstat(executable_descriptor), label="fixed publication helper"
         ) != expected:
             raise BrokerError("fixed publication helper changed during execution")
         returncode = int(result.returncode)
         if returncode != 0:
-            raise BrokerError("fixed TermDeck publication helper refused the transaction")
+            raise BrokerError(
+                "fixed TermDeck publication helper refused the transaction",
+                category="child-refused",
+            )
         output = getattr(result, "stdout", None)
         if isinstance(output, str):
             output = output.encode("utf-8")
@@ -908,6 +955,216 @@ def _response(
     return response
 
 
+def _publication_identity(value: object, *, mode: int) -> list[int]:
+    if (
+        not isinstance(value, list)
+        or len(value) != 7
+        or any(type(item) is not int or item < 0 for item in value)
+        or value[1] <= 0 or value[2] != mode or value[3] != 1
+    ):
+        raise BrokerError("consumer publication file identity is invalid")
+    return value
+
+
+def _consumer_file_claim(value: object, *, path: str, mode: int) -> Mapping[str, object]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"path", "mode", "identity", "sha256"}
+        or value.get("path") != path or value.get("mode") != mode
+        or not isinstance(value.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is None
+    ):
+        raise BrokerError("consumer publication file claim is invalid")
+    _publication_identity(value.get("identity"), mode=mode)
+    return value
+
+
+def _bind_consumer_receipt(
+    observed: Mapping[str, object],
+    publication: Mapping[str, object],
+    *,
+    principals: Principals,
+) -> dict[str, object]:
+    """Join the unchanged signed producer receipt to verified consumer inodes.
+
+    The fixed publication helper observes the configured consumer path and
+    ownership. Its claims must also describe the exact generation and bytes
+    observed through the fixed preparer; signed producer identities cannot be
+    substituted for the consumer identities created by publication.
+    """
+
+    if (
+        set(publication) != {
+            "schema", "operation", "ok", "generation", "producer_receipt_sha256",
+            "receipt", "outputs", "tls",
+        }
+        or publication.get("schema") != PUBLICATION_SCHEMA
+        or publication.get("operation") != "verify"
+        or publication.get("ok") is not True
+    ):
+        raise BrokerError("consumer verification publication contract is invalid")
+    receipt = observed.get("receipt")
+    if not isinstance(receipt, dict):
+        raise BrokerError("verified producer receipt is invalid")
+    runtime = receipt.get("runtime_publication")
+    tls = receipt.get("tls_publication")
+    if not isinstance(runtime, dict) or not isinstance(tls, dict):
+        raise BrokerError("verified producer publication metadata is invalid")
+    generation = runtime.get("generation")
+    if (
+        not isinstance(generation, str)
+        or _GENERATION.fullmatch(generation) is None
+        or publication.get("generation") != generation
+        or publication.get("producer_receipt_sha256") != observed.get("sha256")
+    ):
+        raise BrokerError("consumer publication does not match verified producer receipt")
+    if not isinstance(tls.get("generation"), str) or _GENERATION.fullmatch(tls["generation"]) is None:
+        raise BrokerError("verified producer TLS generation is invalid")
+
+    consumer_receipt = _consumer_file_claim(publication.get("receipt"), path="build-receipt.json", mode=0o644)
+    producer_identity = _publication_identity(observed.get("identity"), mode=0o644)
+    consumer_identity = _publication_identity(consumer_receipt.get("identity"), mode=0o644)
+    if (
+        consumer_receipt["sha256"] != observed.get("sha256")
+        or consumer_identity[4] != producer_identity[4]
+    ):
+        raise BrokerError("consumer receipt does not match verified producer receipt")
+
+    def match_content(consumer: Mapping[str, object], producer: object, *, mode: int) -> None:
+        if (
+            not isinstance(producer, dict)
+            or producer.get("mode") != mode
+            or consumer["sha256"] != producer.get("sha256")
+            or _publication_identity(consumer["identity"], mode=mode)[4]
+            != _publication_identity(producer.get("identity"), mode=mode)[4]
+        ):
+            raise BrokerError("consumer publication content differs from verified producer")
+
+    outputs = publication.get("outputs")
+    producer_outputs = runtime.get("outputs")
+    output_names = {"current-lan-ip", "nginx/allowed-hosts.map"}
+    if (
+        not isinstance(outputs, dict) or set(outputs) != output_names
+        or not isinstance(producer_outputs, dict) or set(producer_outputs) != output_names
+    ):
+        raise BrokerError("consumer publication output set is invalid")
+    for relative in sorted(output_names):
+        consumer = _consumer_file_claim(outputs[relative], path=relative, mode=0o600)
+        match_content(consumer, producer_outputs[relative], mode=0o600)
+
+    consumer_tls = publication.get("tls")
+    producer_tls = tls.get("current")
+    if (
+        not isinstance(consumer_tls, dict)
+        or set(consumer_tls) != {"path", "identity", "manifest"}
+        or consumer_tls.get("path") != "tls"
+        or not isinstance(producer_tls, dict) or producer_tls.get("path") != "tls"
+    ):
+        raise BrokerError("consumer TLS publication contract is invalid")
+    directory = consumer_tls.get("identity")
+    if (
+        not isinstance(directory, list) or len(directory) != 4
+        or any(type(item) is not int or item < 0 for item in directory)
+        or directory[1] <= 0 or directory[2:] != [0o700, principals.caller_uid]
+    ):
+        raise BrokerError("consumer TLS publication directory is invalid")
+    manifest = consumer_tls.get("manifest")
+    producer_manifest = producer_tls.get("manifest")
+    if (
+        not isinstance(manifest, dict) or not isinstance(producer_manifest, dict)
+        or set(manifest) != set(producer_manifest)
+        or not (set(_TLS_MODES) - {"ca.srl"}) <= set(manifest) <= set(_TLS_MODES)
+    ):
+        raise BrokerError("consumer TLS publication leaf set is invalid")
+    for name, value in manifest.items():
+        consumer = _consumer_file_claim(value, path=name, mode=_TLS_MODES[name])
+        match_content(consumer, producer_manifest[name], mode=_TLS_MODES[name])
+    return {
+        "identity": consumer_identity,
+        "receipt": receipt,
+        "sha256": consumer_receipt["sha256"],
+        "publication": dict(publication),
+    }
+
+
+def _bind_consumer_restore(
+    output: bytes,
+    publication: Mapping[str, object],
+    *,
+    request: PrepareRequest,
+) -> dict[str, object]:
+    """Preserve producer inverse lineage separately from consumer file claims."""
+
+    producer = _strict_json(output)
+    fields = {"ok", "action", "generation", "receipt", "restored", "retained"}
+    if request.restore_mode == RESTORE_UNRECEIPTED:
+        fields.add("discovered")
+    if (
+        not isinstance(producer, dict) or set(producer) != fields
+        or producer.get("ok") is not True
+        or producer.get("action") not in {"restored-runtime-generation", "restored-tls-generation"}
+        or not isinstance(producer.get("generation"), str)
+        or _GENERATION.fullmatch(producer["generation"]) is None
+        or (request.restore_mode == RESTORE_GENERATION and producer["generation"] != request.generation)
+        or (request.restore_mode == RESTORE_UNRECEIPTED and producer.get("discovered") is not True)
+        or not isinstance(producer.get("restored"), dict)
+        or not isinstance(producer.get("retained"), dict)
+    ):
+        raise BrokerError("producer inverse result contract is invalid")
+    if (
+        set(publication) != {"schema", "operation", "ok", "result"}
+        or publication.get("schema") != PUBLICATION_SCHEMA
+        or publication.get("operation") != "restore" or publication.get("ok") is not True
+        or not isinstance(publication.get("result"), dict)
+    ):
+        raise BrokerError("consumer inverse publication contract is invalid")
+    consumer = publication["result"]
+    comparable = dict(consumer)
+    warnings = comparable.pop("consumer_cleanup_warnings", None)
+    if "consumer_cleanup_warnings" in consumer and (
+        not isinstance(warnings, list) or len(warnings) > 8
+        or any(
+            not isinstance(item, str) or not item or len(item) > 256
+            or not item.isascii() or any(ord(character) < 32 for character in item)
+            for item in warnings
+        )
+    ):
+        raise BrokerError("consumer inverse cleanup warning contract is invalid")
+
+    def match_restored(value: object, expected: object, *, path: str, mode: int) -> None:
+        claim = _consumer_file_claim(value, path=path, mode=mode)
+        if (
+            not isinstance(expected, dict)
+            or claim["sha256"] != expected.get("sha256")
+            or _publication_identity(claim["identity"], mode=mode)[4]
+            != _publication_identity(expected.get("identity"), mode=mode)[4]
+        ):
+            raise BrokerError("consumer inverse content differs from producer inverse")
+
+    if producer["action"] == "restored-runtime-generation":
+        restored = consumer.get("restored")
+        if not isinstance(restored, dict):
+            raise BrokerError("consumer inverse restored metadata is invalid")
+        outputs = restored.get("outputs")
+        producer_outputs = producer["restored"].get("outputs")
+        if (
+            not isinstance(outputs, dict) or not isinstance(producer_outputs, dict)
+            or set(outputs) != {"current-lan-ip", "nginx/allowed-hosts.map"}
+            or set(producer_outputs) != set(outputs)
+        ):
+            raise BrokerError("consumer inverse output set is invalid")
+        for relative in outputs:
+            match_restored(outputs[relative], producer_outputs[relative], path=relative, mode=0o600)
+        match_restored(consumer.get("receipt"), producer["receipt"], path="build-receipt.json", mode=0o644)
+        comparable["receipt"] = producer["receipt"]
+        comparable["restored"] = dict(restored, outputs=producer_outputs)
+    elif producer["receipt"] != "absent":
+        raise BrokerError("producer TLS inverse lacks its receipt tombstone")
+    if comparable != producer:
+        raise BrokerError("consumer inverse changed producer lineage metadata")
+    return {"producer": producer, "publication": dict(consumer)}
+
+
 def _send_response(connection: socket.socket, value: Mapping[str, object]) -> None:
     try:
         connection.sendall(frame(dict(value)))
@@ -999,20 +1256,24 @@ def serve_once(
     try:
         connection, _address = listener.accept()
     except socket.timeout as exc:
-        raise BrokerError("preparer broker activation timed out") from exc
+        raise BrokerError("preparer broker activation timed out", category="timeout") from exc
     except OSError as exc:
         raise BrokerError("could not accept preparer broker request") from exc
     with connection:
         connection.settimeout(config.request_timeout)
+        phase = "peer"
         try:
             _assert_peer(peer_credentials(connection), principals=principals)
+            phase = "request"
             request = receive_request(connection, config=config)
+            phase = "publication-seed"
             run_publication(
                 "seed",
                 config=config,
                 principals=principals,
                 run_process=run_process,
             )
+            phase = "preparer"
             child_result = run_preparer(
                 request,
                 config=config,
@@ -1025,9 +1286,11 @@ def serve_once(
             else:
                 returncode, output = child_result, None
             if returncode != 0:
+                _diagnose(phase, "child-failed")
                 response = _response(returncode=returncode, error="preparer-failed")
             else:
                 if request.restore_mode == RESTORE_NONE:
+                    phase = "publication-publish"
                     result = run_publication(
                         "publish",
                         config=config,
@@ -1035,39 +1298,51 @@ def serve_once(
                         run_process=run_process,
                     )
                 elif request.restore_mode == RESTORE_VERIFY:
+                    phase = "receipt-observation"
                     if output is None:
                         raise BrokerError("preparer verification result is missing")
-                    _observe_receipt(config, principals, output)
-                    result = run_publication(
+                    observed = _observe_receipt(config, principals, output)
+                    phase = "publication-verify"
+                    publication = run_publication(
                         "verify",
                         config=config,
                         principals=principals,
                         run_process=run_process,
                     )
+                    phase = "verification-binding"
+                    result = _bind_consumer_receipt(observed, publication, principals=principals)
                 else:
+                    phase = "publication-restore"
                     if output is None:
                         raise BrokerError("preparer restore result is missing")
-                    result = run_publication(
+                    publication = run_publication(
                         "restore",
                         config=config,
                         principals=principals,
                         run_process=run_process,
                         input_content=output,
                     )
+                    phase = "restore-binding"
+                    result = _bind_consumer_restore(output, publication, request=request)
                 response = _response(returncode=0, error=None, result=result)
         except BrokerError as exc:
-            if "timed out" in str(exc):
+            _diagnose(phase, exc.category)
+            if exc.category == "timeout":
                 response = _response(returncode=None, error="timeout")
             else:
                 response = _response(returncode=None, error="request-refused")
-        _send_response(connection, response)
+        try:
+            _send_response(connection, response)
+        except BrokerError as exc:
+            _diagnose("response", exc.category)
+            return 1
         return 0 if response["ok"] is True else 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = tuple(sys.argv[1:] if argv is None else argv)
     if arguments:
-        sys.stderr.write("TermDeck preparer broker refused: arguments are not allowed\n")
+        _diagnose("startup", "contract")
         return 2
     config = BrokerConfig()
     listener: socket.socket | None = None
@@ -1075,7 +1350,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         listener = activation_listener(config=config)
         return serve_once(listener, config=config)
     except BrokerError as exc:
-        sys.stderr.write(f"TermDeck preparer broker refused: {exc}\n")
+        _diagnose("startup", exc.category)
         return 2
     finally:
         if listener is not None:

@@ -3698,7 +3698,7 @@ def validate_receipt_before_source_restored_inverse(
     restored_sources = {"bin/termdeck-web-server", "nginx/nginx.conf"}
     required_modes = {
         "bin/termdeck-web-server": 0o755,
-        "nginx/nginx.conf": 0o644,
+        "nginx/nginx.conf": 0o600,
     }
     for path, (identity, digest) in source_postimages.items():
         if path in restored_sources:
@@ -6963,6 +6963,61 @@ def _capture_prior_runtime_leaf(
     _assert_all(anchors, phase=f"after capturing prior {label}")
 
 
+def _verify_unreceipted_tls_prior(
+    publication: dict[str, object],
+    journal_descriptor: int,
+    control_key: bytes,
+) -> None:
+    """Permit a retained legacy TLS bundle only with authenticated absence.
+
+    Initial root publication seeds complete TLS without a producer receipt.
+    Its first exchange retains TLS for rollback, but has no receipt-owned
+    runtime outputs to capture.  Missing receipt evidence for an established
+    runtime must never be interpreted as this initial migration.
+    """
+    raw, identity = _read_regular_from_directory(
+        journal_descriptor, "intent.json", label="TLS exchange intent",
+    )
+    try:
+        intent = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _fail("invalid TLS exchange intent", exc) from exc
+    required = {
+        "auth", "candidate", "candidate_identity", "candidate_manifest", "id",
+        "lan_ip", "receipt_previous", "rotation_work_identity", "schema",
+        "tls_previous", "tls_previous_manifest",
+    }
+    if (
+        identity[2] != 0o600
+        or not isinstance(intent, dict)
+        or set(intent) not in (required, required | {"tls_previous_lan_ip"})
+        or intent.get("schema") != "termdeck.tls-directory-transaction.v1"
+        or not isinstance(intent.get("auth"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", intent["auth"]) is None
+    ):
+        raise _fail("invalid TLS exchange intent for unreceipted prior generation")
+    unsigned = dict(intent)
+    del unsigned["auth"]
+    encoded = json.dumps(unsigned, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if not hmac.compare_digest(intent["auth"], hmac.new(control_key, encoded, hashlib.sha256).hexdigest()):
+        raise _fail("TLS exchange intent authentication failed")
+    current, prior = publication["current"], publication["prior"]
+    assert isinstance(current, dict) and isinstance(prior, dict)
+    if (
+        intent["id"] != publication["generation"]
+        or intent["candidate"] != ".termdeck-tls-candidate-" + publication["generation"]
+        or intent["candidate_identity"] != current["identity"]
+        or intent["candidate_manifest"] != current["manifest"]
+        or intent["tls_previous"] != prior["identity"]
+        or intent["tls_previous_manifest"] != prior["manifest"]
+        or intent["receipt_previous"] is not None
+    ):
+        raise _fail("TLS exchange intent does not prove an unreceipted prior generation")
+    for name in (_PRIOR_RECEIPT, _PRIOR_CURRENT, _PRIOR_HOSTS):
+        if _trusted_leaf(journal_descriptor, name, label=f"TLS journal {name}") is not None:
+            raise _fail("unreceipted TLS generation has unexpected prior runtime evidence")
+
+
 def _capture_prior_runtime_generation(
     publication: dict[str, object],
     runtime: Anchor,
@@ -6984,6 +7039,10 @@ def _capture_prior_runtime_generation(
         return False
     journal_descriptor, journal_name, journal_identity = opened
     try:
+        if _trusted_leaf(journal_descriptor, _PRIOR_RECEIPT, label=f"TLS journal {_PRIOR_RECEIPT}") is None:
+            _verify_unreceipted_tls_prior(publication, journal_descriptor, control_key)
+            _assert_tls_journal_current(runtime, journal_name, journal_descriptor, journal_identity, anchors=anchors)
+            return False
         raw, receipt_identity = _read_regular_from_directory(
             journal_descriptor,
             _PRIOR_RECEIPT,

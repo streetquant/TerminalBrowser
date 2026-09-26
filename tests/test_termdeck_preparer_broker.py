@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import errno
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -249,7 +251,15 @@ def test_socket_broker_authenticates_peer_and_runs_fixed_preparer_once(
     monkeypatch.setattr(broker, "_validate_socket_path", lambda *_args, **_kwargs: None)
     publication_calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
     preparer_calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
-    restore_output = broker._canonical_json({"fixture": True})
+    restore_result = {
+        "ok": True,
+        "action": "restored-tls-generation",
+        "generation": "b" * 32,
+        "receipt": "absent",
+        "restored": {"fixture": "producer-restored"},
+        "retained": {"fixture": "producer-retained"},
+    }
+    restore_output = broker._canonical_json(restore_result)
     outcome: list[int] = []
 
     def fake_run(command, **kwargs):
@@ -264,6 +274,7 @@ def test_socket_broker_authenticates_peer_and_runs_fixed_preparer_once(
                         "ok": True,
                         "operation": operation,
                         "schema": broker.PUBLICATION_SCHEMA,
+                        **({"result": restore_result} if operation == "restore" else {}),
                     }
                 ),
                 stderr=b"",
@@ -300,9 +311,8 @@ def test_socket_broker_authenticates_peer_and_runs_fixed_preparer_once(
         "error": None,
         "ok": True,
         "result": {
-            "ok": True,
-            "operation": "restore",
-            "schema": broker.PUBLICATION_SCHEMA,
+            "producer": restore_result,
+            "publication": restore_result,
         },
         "returncode": 0,
         "schema": broker.RESPONSE_SCHEMA,
@@ -357,3 +367,240 @@ def test_socket_broker_rejects_foreign_peer_and_scm_rights(
     peer = broker.PeerCredentials(123, _principals(config).caller_uid + 1, 456)
     with pytest.raises(broker.BrokerError, match="not max"):
         broker._assert_peer(peer, principals=_principals(config))
+
+
+def _verification_pair():
+    def claim(path, mode, inode):
+        return {
+            "path": path, "mode": mode, "sha256": "c" * 64,
+            "identity": [1, inode, mode, 1, 20, 30, 40],
+        }
+
+    outputs = {
+        name: claim(name, 0o600, index)
+        for index, name in enumerate(("current-lan-ip", "nginx/allowed-hosts.map"), 10)
+    }
+    manifest = {
+        name: {key: value for key, value in claim(name, mode, index).items() if key != "path"}
+        for index, (name, mode) in enumerate(broker._TLS_MODES.items(), 20)
+    }
+    receipt = {
+        "schema": "termdeck.lan-runtime-build.v2", "ok": True,
+        "producer_attestation": {"unchanged-signed-payload": True},
+        "runtime_publication": {"generation": "a" * 32, "outputs": outputs},
+        "tls_publication": {
+            "generation": "b" * 32, "prior": None,
+            "current": {"path": "tls", "identity": [1, 200, 0o700, 101], "manifest": manifest},
+        },
+    }
+    content = broker._canonical_json(receipt) + b"\n"
+    observed = {
+        "receipt": receipt, "sha256": hashlib.sha256(content).hexdigest(),
+        "identity": [1, 300, 0o644, 1, len(content), 30, 40],
+    }
+    publication = {
+        "schema": broker.PUBLICATION_SCHEMA, "operation": "verify", "ok": True,
+        "generation": "a" * 32, "producer_receipt_sha256": observed["sha256"],
+        "receipt": {"path": "build-receipt.json", "mode": 0o644,
+                    "sha256": observed["sha256"], "identity": [1, 400, 0o644, 1, len(content), 50, 60]},
+        "outputs": copy.deepcopy(outputs),
+        "tls": {"path": "tls", "identity": [1, 500, 0o700, 202], "manifest": {
+            name: dict(copy.deepcopy(value), path=name) for name, value in manifest.items()
+        }},
+    }
+    for value in [*publication["outputs"].values(), *publication["tls"]["manifest"].values()]:
+        value["identity"][1] += 1000
+    return observed, publication
+
+
+def test_verification_binds_consumer_inodes_without_changing_signed_producer_receipt():
+    observed, publication = _verification_pair()
+    before = broker._canonical_json(observed)
+    result = broker._bind_consumer_receipt(
+        observed, publication, principals=broker.Principals(101, 101, 202, 202),
+    )
+    assert set(result) == {"receipt", "identity", "sha256", "publication"}
+    assert result["receipt"] is observed["receipt"]
+    assert result["identity"] == publication["receipt"]["identity"]
+    assert result["identity"] != observed["identity"]
+    assert result["publication"]["outputs"] != observed["receipt"]["runtime_publication"]["outputs"]
+    assert broker._canonical_json(observed) == before
+
+
+@pytest.mark.parametrize("path,replacement", [
+    (("generation",), "b" * 32),
+    (("producer_receipt_sha256",), "d" * 64),
+    (("receipt", "path"), "tls/server.key"),
+    (("receipt", "sha256"), "d" * 64),
+    (("receipt", "identity", 4), 0),
+    (("receipt", "identity", 1), True),
+    (("outputs", "current-lan-ip", "path"), "../current-lan-ip"),
+    (("outputs", "current-lan-ip", "sha256"), "d" * 64),
+    (("outputs", "current-lan-ip", "identity", 4), 21),
+    (("outputs", "nginx/allowed-hosts.map", "mode"), 0o644),
+    (("tls", "identity", 3), 101),
+    (("tls", "identity", 2), 0o755),
+    (("tls", "manifest", "server.key", "sha256"), "d" * 64),
+    (("tls", "manifest", "server.ext", "identity", 4), 21),
+    (("tls", "manifest", "ca.crt", "path"), "/foreign/ca.crt"),
+])
+def test_verification_refuses_mismatched_consumer_publication(path, replacement):
+    observed, publication = _verification_pair()
+    current = publication
+    for part in path[:-1]:
+        current = current[part]
+    current[path[-1]] = replacement
+    with pytest.raises(broker.BrokerError):
+        broker._bind_consumer_receipt(
+            observed, publication, principals=broker.Principals(101, 101, 202, 202),
+        )
+
+
+def _restore_pair():
+    observed, publication = _verification_pair()
+    restored_outputs = {
+        name: {key: value[key] for key in ("identity", "sha256")}
+        for name, value in observed["receipt"]["runtime_publication"]["outputs"].items()
+    }
+    producer = {
+        "ok": True, "action": "restored-runtime-generation", "generation": "b" * 32,
+        "receipt": {"path": "build-receipt.json", "identity": observed["identity"], "sha256": observed["sha256"]},
+        "restored": {"outputs": restored_outputs, "runtime_generation": "a" * 32,
+                     "tls": observed["receipt"]["tls_publication"]["current"]},
+        "retained": {"fixture": "unchanged authenticated producer lineage"},
+    }
+    consumer = copy.deepcopy(producer)
+    consumer["receipt"] = publication["receipt"]
+    consumer["restored"]["outputs"] = publication["outputs"]
+    return producer, {"schema": broker.PUBLICATION_SCHEMA, "operation": "restore", "ok": True, "result": consumer}
+
+
+def test_restore_keeps_producer_lineage_and_consumer_claims_separate():
+    producer, publication = _restore_pair()
+    raw = broker._canonical_json(producer)
+    result = broker._bind_consumer_restore(
+        raw, publication, request=broker.PrepareRequest("generation", "b" * 32),
+    )
+    assert broker._canonical_json(result["producer"]) == raw
+    assert result["publication"] == publication["result"]
+    assert result["producer"]["receipt"]["identity"] != result["publication"]["receipt"]["identity"]
+
+
+@pytest.mark.parametrize("path,replacement", [
+    (("generation",), "c" * 32),
+    (("restored", "runtime_generation"), "c" * 32),
+    (("restored", "tls", "identity", 1), 99999),
+    (("restored", "outputs", "current-lan-ip", "sha256"), "d" * 64),
+    (("receipt", "identity", 4), 0),
+    (("receipt", "path"), "/foreign/build-receipt.json"),
+    (("retained", "fixture"), "changed lineage"),
+    (("consumer_cleanup_warnings",), ["x" * 257]),
+    (("consumer_cleanup_warnings",), ["injected\nmessage"]),
+    (("consumer_cleanup_warnings",), None),
+])
+def test_restore_refuses_changed_lineage_or_mismatched_consumer_content(path, replacement):
+    producer, publication = _restore_pair()
+    current = publication["result"]
+    for part in path[:-1]:
+        current = current[part]
+    current[path[-1]] = replacement
+    with pytest.raises(broker.BrokerError):
+        broker._bind_consumer_restore(
+            broker._canonical_json(producer), publication,
+            request=broker.PrepareRequest("generation", "b" * 32),
+        )
+
+
+@pytest.mark.parametrize("failure,phase,category", [
+    ("invalid-request", "request", "contract"),
+    ("seed", "publication-seed", "child-refused"),
+    ("execute", "preparer", "execution-permission-denied"),
+    ("timeout", "preparer", "timeout"),
+    ("preparer", "preparer", "child-failed"),
+    ("publish", "publication-publish", "child-refused"),
+])
+def test_refusal_diagnostics_use_only_fixed_phase_and_category(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    failure: str, phase: str, category: str,
+):
+    socket_path = _socket_path(tmp_path)
+    config = _config(tmp_path, socket_path)
+    principals = broker.Principals(config.root_uid + 100, config.root_gid + 100,
+                                   config.root_uid + 200, config.root_gid + 200)
+    monkeypatch.setattr(broker, "_validate_socket_path", lambda *_args: None)
+    marker = "fixture-token-key-data-private\nforged-journal-message"
+
+    def run(command, **options):
+        assert options["stderr"] == subprocess.DEVNULL
+        if Path(os.readlink(command[0])).samefile(config.publication_path):
+            operation = command[1]
+            return SimpleNamespace(
+                returncode=2 if failure == operation else 0,
+                stdout=broker._canonical_json({"schema": broker.PUBLICATION_SCHEMA, "operation": operation, "ok": True}),
+                stderr=marker.encode(),
+            )
+        assert options["stdout"] == subprocess.DEVNULL
+        if failure == "execute":
+            raise OSError(errno.EPERM, marker)
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(marker, 1, output=marker, stderr=marker)
+        return SimpleNamespace(returncode=2 if failure == "preparer" else 0, stdout=marker, stderr=marker)
+
+    outcomes = []
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(socket_path))
+        listener.listen(1)
+        worker = threading.Thread(target=lambda: outcomes.append(broker.serve_once(
+            listener, config=config, resolve_principals=lambda _config: principals,
+            peer_credentials=lambda _connection: broker.PeerCredentials(123, principals.caller_uid, principals.caller_gid),
+            run_process=run,
+        )))
+        worker.start()
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(4)
+                client.connect(str(socket_path))
+                request = _request()
+                if failure == "invalid-request":
+                    request["secret"] = marker
+                client.sendall(broker.frame(request))
+                response = _receive_frame(client)
+            worker.join(timeout=4)
+        finally:
+            socket_path.unlink()
+    assert not worker.is_alive()
+    assert outcomes == [1]
+    assert response["ok"] is False
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"TermDeck preparer broker refused: phase={phase} category={category}\n"
+    assert marker not in json.dumps(response) + captured.err
+
+
+def test_response_frame_limit_does_not_expand_closed_request_limit(tmp_path: Path):
+    assert broker.MAX_FRAME_BYTES == 128 * 1024
+    assert broker.MAX_REQUEST_BYTES == 4096
+    payload = {"receipt": "x" * (17 * 1024)}
+    encoded = broker.frame(payload)
+    assert struct.unpack("!I", encoded[:4])[0] == len(encoded) - 4
+    assert json.loads(encoded[4:]) == payload
+    with pytest.raises(broker.BrokerError, match="frame size"):
+        broker.frame({"receipt": "x" * broker.MAX_FRAME_BYTES})
+    config = _config(tmp_path)
+    left, right = socket.socketpair()
+    try:
+        right.sendall(struct.pack("!I", broker.MAX_REQUEST_BYTES + 1))
+        with pytest.raises(broker.BrokerError, match="frame size"):
+            broker.receive_request(left, config=config)
+    finally:
+        left.close()
+        right.close()
+
+
+def test_diagnostic_codes_reject_arbitrary_exception_or_input_text(capsys):
+    marker = "fixture-secret-token\nforged journal text"
+    error = broker.BrokerError(marker, category=marker)
+    broker._diagnose(marker, error.category)
+    assert capsys.readouterr().err == (
+        "TermDeck preparer broker refused: phase=startup category=contract\n"
+    )

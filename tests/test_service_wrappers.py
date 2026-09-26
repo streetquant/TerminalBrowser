@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import signal
@@ -9,6 +11,7 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +20,44 @@ import pytest
 
 import termdeck.release_manager as release_manager
 from termdeck import service_wrappers as wrappers
+
+
+def _preparer_publication_result() -> dict[str, object]:
+    def claim(path: str, mode: int) -> dict[str, object]:
+        return {
+            "path": path,
+            "mode": mode,
+            "identity": [1, 2, mode, 1, 3, 4, 5],
+            "sha256": "a" * 64,
+        }
+
+    return {
+        "schema": "termdeck.preparer-publication.v1",
+        "operation": "publish",
+        "ok": True,
+        "generation": "b" * 32,
+        "producer_receipt_sha256": "a" * 64,
+        "receipt": claim("build-receipt.json", 0o644),
+        "outputs": {
+            path: claim(path, 0o600)
+            for path in ("current-lan-ip", "nginx/allowed-hosts.map")
+        },
+        "tls": {
+            "path": "tls",
+            "identity": [1, 2, 0o700, os.geteuid()],
+            "manifest": {
+                name: claim(name, mode)
+                for name, mode in {
+                    "ca.crt": 0o644,
+                    "ca.key": 0o600,
+                    "server.key": 0o600,
+                    "server.crt": 0o644,
+                    "server-chain.crt": 0o644,
+                    "server.ext": 0o600,
+                }.items()
+            },
+        },
+    }
 
 
 def _serve_preparer_response(
@@ -37,7 +78,11 @@ def _serve_preparer_response(
         connection.sendall(struct.pack("!I", len(encoded)) + encoded)
 
 
-def test_lan_preparer_client_uses_closed_root_broker_protocol(tmp_path_factory: pytest.TempPathFactory) -> None:
+def _request_preparer_response(
+    tmp_path_factory: pytest.TempPathFactory,
+    response: dict[str, object],
+    **request_options,
+) -> tuple[dict[str, object] | None, list[dict[str, object]]]:
     # Keep the AF_UNIX pathname bounded under the authoritative runner's
     # private runtime root, independently of this descriptive test name.
     socket_path = tmp_path_factory.mktemp("broker") / "preparer.sock"
@@ -48,24 +93,43 @@ def test_lan_preparer_client_uses_closed_root_broker_protocol(tmp_path_factory: 
     observed: list[dict[str, object]] = []
     worker = threading.Thread(
         target=_serve_preparer_response,
-        args=(
-            listener,
-            observed,
-            {
-                "error": None,
-                "ok": True,
-                "returncode": 0,
-                "schema": wrappers.PREPARER_BROKER_RESPONSE_SCHEMA,
-            },
-        ),
+        args=(listener, observed, response),
     )
     worker.start()
     try:
-        wrappers._request_lan_preparation(socket_path=socket_path, timeout=2.0)
+        result = wrappers._request_lan_preparation(
+            socket_path=socket_path, timeout=2.0, **request_options,
+        )
     finally:
         worker.join(timeout=5)
         listener.close()
     assert worker.is_alive() is False
+    return result, observed
+
+
+def _preparer_success_response() -> dict[str, object]:
+    return {
+        "error": None,
+        "ok": True,
+        "returncode": 0,
+        "schema": wrappers.PREPARER_BROKER_RESPONSE_SCHEMA,
+        "result": _preparer_publication_result(),
+    }
+
+
+@pytest.mark.parametrize("optional", ("none", "serial", "cleanup-warnings"))
+def test_lan_preparer_client_uses_closed_root_broker_protocol(
+    tmp_path_factory: pytest.TempPathFactory, optional: str,
+) -> None:
+    response = _preparer_success_response()
+    if optional == "serial":
+        result = response["result"]
+        serial = dict(result["tls"]["manifest"]["ca.crt"], path="ca.srl")
+        result["tls"]["manifest"]["ca.srl"] = serial
+    elif optional == "cleanup-warnings":
+        response["result"]["cleanup_warnings"] = ["retained private transaction backup"]
+    result, observed = _request_preparer_response(tmp_path_factory, response)
+    assert result is None
     assert observed == [
         {
             "operation": "prepare",
@@ -73,6 +137,206 @@ def test_lan_preparer_client_uses_closed_root_broker_protocol(tmp_path_factory: 
             "schema": wrappers.PREPARER_BROKER_REQUEST_SCHEMA,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    (
+        pytest.param(("result",), None, id="null-result"),
+        pytest.param(("result",), {}, id="empty-result"),
+        pytest.param(("result", "schema"), "foreign.v1", id="foreign-schema"),
+        pytest.param(("result", "operation"), "verify", id="wrong-operation"),
+        pytest.param(("result", "ok"), 1, id="numeric-success"),
+        pytest.param(("result", "generation"), "A" * 32, id="invalid-generation"),
+        pytest.param(("result", "foreign"), True, id="unknown-result-field"),
+        pytest.param(("result", "producer_receipt_sha256"), "b" * 64, id="foreign-producer-receipt"),
+        pytest.param(("result", "receipt"), {}, id="empty-receipt"),
+        pytest.param(("result", "receipt", "path"), "foreign.json", id="foreign-receipt-path"),
+        pytest.param(("result", "receipt", "mode"), 0o600, id="receipt-mode"),
+        pytest.param(("result", "receipt", "identity"), [1, 2, 0o644, 1], id="short-receipt-identity"),
+        pytest.param(("result", "receipt", "identity"), [1, True, 0o644, 1, 3, 4, 5], id="boolean-identity"),
+        pytest.param(("result", "receipt", "identity"), [1, 0, 0o644, 1, 3, 4, 5], id="zero-inode"),
+        pytest.param(("result", "receipt", "identity"), [1, 2, 0o644, 2, 3, 4, 5], id="hardlinked-receipt"),
+        pytest.param(("result", "receipt", "sha256"), "A" * 64, id="invalid-receipt-digest"),
+        pytest.param(("result", "receipt", "extra"), True, id="unknown-receipt-field"),
+        pytest.param(("result", "outputs"), {}, id="missing-outputs"),
+        pytest.param(("result", "outputs", "foreign"), {}, id="foreign-output"),
+        pytest.param(("result", "outputs", "current-lan-ip", "path"), "tls/ca.key", id="foreign-output-path"),
+        pytest.param(("result", "tls", "path"), "../tls", id="foreign-tls-path"),
+        pytest.param(("result", "tls", "identity"), [1, 2, 0o700, os.geteuid() + 1], id="foreign-tls-owner"),
+        pytest.param(("result", "tls", "identity"), [1, 2, 0o755, os.geteuid()], id="tls-mode"),
+        pytest.param(("result", "tls", "manifest"), {}, id="missing-tls-leaves"),
+        pytest.param(("result", "tls", "manifest", "foreign"), {}, id="foreign-tls-leaf"),
+        pytest.param(("result", "tls", "manifest", "server.key", "mode"), 0o644, id="public-private-key"),
+        pytest.param(("result", "cleanup_warnings"), "warning", id="invalid-cleanup-warnings"),
+        pytest.param(("result", "cleanup_warnings"), [False], id="invalid-cleanup-warning"),
+        pytest.param(("result", "cleanup_warnings"), ["warning"] * 9, id="too-many-cleanup-warnings"),
+        pytest.param(("result", "cleanup_warnings"), ["w" * 513], id="long-cleanup-warning"),
+        pytest.param(("result", "cleanup_warnings"), ["\u2603" * 512] * 2, id="large-encoded-cleanup-warnings"),
+        pytest.param(("returncode",), False, id="boolean-returncode"),
+        pytest.param(("returncode",), 0.0, id="float-returncode"),
+        pytest.param(("extra",), True, id="unknown-response-field"),
+    ),
+)
+def test_lan_preparer_client_rejects_invalid_publication_response(
+    tmp_path_factory: pytest.TempPathFactory,
+    path: tuple[str, ...],
+    value: object,
+) -> None:
+    response = _preparer_success_response()
+    target = response
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(wrappers.WrapperError, match="preparer broker"):
+        _request_preparer_response(tmp_path_factory, response)
+
+
+def test_lan_preparer_client_requires_current_publication_result(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    response = _preparer_success_response()
+    del response["result"]
+    # A legacy preparation acknowledgement cannot prove that the current
+    # separate producer-to-consumer publication completed.
+    with pytest.raises(wrappers.WrapperError, match="unexpected preparation result"):
+        _request_preparer_response(tmp_path_factory, response)
+
+
+@pytest.mark.parametrize(
+    ("expected_operation", "result_operation", "accepted"),
+    (
+        ("verify", "verify", True),
+        ("verify", "publish", False),
+        ("publish", "verify", False),
+        ("restore", "restore", False),
+    ),
+)
+def test_preparer_publication_result_requires_the_expected_operation(
+    expected_operation: str, result_operation: str, accepted: bool,
+) -> None:
+    result = _preparer_publication_result()
+    result["operation"] = result_operation
+    if accepted:
+        assert wrappers._validate_preparer_publication_result(result, operation=expected_operation) is None
+    else:
+        with pytest.raises(wrappers.WrapperError, match="publication"):
+            wrappers._validate_preparer_publication_result(result, operation=expected_operation)
+
+
+def test_lan_preparer_client_preserves_restore_result_for_receipt_validation(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    response = _preparer_success_response()
+    response["result"] = {"receipt": {"fixture": True}, "publication": {"operation": "verify"}}
+    result, observed = _request_preparer_response(
+        tmp_path_factory, response, restore_mode="verify",
+    )
+    assert result == response["result"]
+    assert observed[0]["restore"] == {"generation": None, "mode": "verify"}
+
+
+def test_lan_preparer_client_accepts_actual_broker_publication_over_socket(
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker_source = Path(__file__).resolve().parents[1] / "deploy" / "termdeck-preparer-broker"
+    module_name = "termdeck_preparer_broker_wrapper_wire_test"
+    loader = importlib.machinery.SourceFileLoader(module_name, str(broker_source))
+    spec = importlib.util.spec_from_loader(module_name, loader)
+    assert spec is not None
+    broker = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, broker)
+    loader.exec_module(broker)
+
+    libexec = tmp_path / "libexec"
+    libexec.mkdir()
+    images = {
+        name: libexec / name
+        for name in (
+            "termdeck-preparer-broker",
+            "termdeck-preparer-publication",
+            "termdeck-web-prepare-runtime",
+        )
+    }
+    for name, path in images.items():
+        path.write_bytes(broker_source.read_bytes() if name == "termdeck-preparer-broker" else b"#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+    socket_path = tmp_path_factory.mktemp("wire") / "request.sock"
+    config = broker.BrokerConfig(
+        broker_path=images["termdeck-preparer-broker"],
+        publication_path=images["termdeck-preparer-publication"],
+        preparer_path=images["termdeck-web-prepare-runtime"],
+        runtime_root=tmp_path / "producer",
+        consumer_root=tmp_path / "consumer",
+        socket_path=socket_path,
+        root_uid=os.getuid(),
+        root_gid=os.getgid(),
+        request_timeout=2.0,
+    )
+    principals = broker.Principals(
+        preparer_uid=config.root_uid + 100,
+        preparer_gid=config.root_gid + 100,
+        caller_uid=config.root_uid + 200,
+        caller_gid=config.root_gid + 200,
+    )
+    # This unprivileged fixture exercises the real transport, broker dispatch,
+    # helper-result parsing and wrapper. Principal separation itself is covered
+    # by the broker's dedicated tests; no installed executable is launched here.
+    monkeypatch.setattr(broker, "_validate_socket_path", lambda *_args, **_kwargs: None)
+    operations: list[str] = []
+
+    def run_fixture_process(command, **kwargs):
+        executable = Path(os.readlink(command[0]))
+        if executable.samefile(config.publication_path):
+            operation = command[1]
+            operations.append(operation)
+            result = _preparer_publication_result() if operation == "publish" else {
+                "schema": broker.PUBLICATION_SCHEMA,
+                "operation": "seed",
+                "ok": True,
+            }
+            return SimpleNamespace(returncode=0, stdout=broker._canonical_json(result), stderr=b"")
+        assert executable.samefile(config.preparer_path)
+        assert command[1:] == ()
+        operations.append("prepare")
+        return SimpleNamespace(returncode=0, stdout=None, stderr=b"")
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(os.fspath(socket_path))
+    socket_path.chmod(0o600)
+    listener.listen(1)
+    outcomes: list[int] = []
+    failures: list[BaseException] = []
+
+    def serve() -> None:
+        try:
+            outcomes.append(broker.serve_once(
+                listener,
+                config=config,
+                resolve_principals=lambda _config: principals,
+                peer_credentials=lambda _connection: broker.PeerCredentials(
+                    os.getpid(), principals.caller_uid, principals.caller_gid,
+                ),
+                run_process=run_fixture_process,
+            ))
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=serve)
+    worker.start()
+    try:
+        assert wrappers._request_lan_preparation(socket_path=socket_path, timeout=2.0) is None
+    finally:
+        worker.join(timeout=5)
+        listener.close()
+        if failures:
+            raise failures[0]
+    assert not worker.is_alive()
+    assert failures == []
+    assert outcomes == [0]
+    assert operations == ["seed", "prepare", "publish"]
 
 
 def test_lan_preflight_routes_preparation_through_broker(

@@ -72,6 +72,11 @@ installing any host asset:
    `tests/test_preparer_packaging.py` uses an unprivileged bubblewrap namespace
    for these installed-path checks. A skipped executable test is a missing
    qualification prerequisite; static unit verification cannot substitute for it.
+   `tests/test_termdeck_preparer_signed_boundary.py` additionally runs the actual
+   staged preparer, signer and broker with separate producer, consumer and root
+   identities. It must pass first preparation from legacy TLS, signed A/B
+   publication, restored-source inverse and replay. The activation consumer and
+   rollback-restart suites must also pass with distinct producer/consumer inodes.
 5. Run `systemd-analyze verify` on
    `termdeck-runtime-attestd.service`,
    `termdeck-preparer-broker.socket`, and
@@ -235,6 +240,39 @@ different bytes, or any required preimage cannot be captured reliably.
     `state`, authentication data, releases, unrelated binaries, saved tabs,
     recovery recipes and working directories must be unchanged and accessible
     to `max`.
+
+### Interrupted initial preparation
+
+Initial seeding validates all approved source, TLS and recovery-key inputs before
+publication. It stages a complete TLS directory and exchanges it atomically;
+failures restore the original directory and recovery-key inodes. A successful
+repair may create new producer inodes while preserving the selected CA/key bytes.
+
+The only automatic legacy repair is an exact proper prefix of the sorted allowed
+TLS leaves, with identical retained bytes, owners and modes, matching preceding
+binary/configuration copies, and no producer receipt, output or generation state.
+Conflicting files and established generations fail closed or remain unchanged.
+Do not delete the partial tree or regenerate keys to force a retry. Install the
+qualified complete package, then issue one ordinary authenticated prepare request.
+
+The first preparation of a complete legacy TLS seed may retain TLS without a
+prior signed runtime receipt. This absence is accepted only when the private
+journal authenticator proves an explicit absent receipt and binds the exact
+current/prior TLS generations. An established generation's missing receipt or
+unexpected retained runtime outputs still fail. Both producer and consumer nginx
+configuration copies use mode `0600`, including source restoration before inverse.
+
+Broker journal failures contain fixed phase/category codes. Use those codes to
+locate seed, execution, publication or verification failure; a generic refused
+client response alone does not establish the failing stage. Raw helper output and
+credential material are not journal diagnostics.
+
+Verification returns the unchanged signed producer receipt plus a separate
+consumer publication observation. Producer and consumer inodes differ, and runtime
+and TLS transaction generations are independently signed. Activation verifies the
+signature against the private producer path and rechecks the consumer files before
+adoption. Restore responses preserve producer lineage separately from consumer
+copies; completed replay must verify the recorded copies without republishing them.
 
 ## Upgrade verification
 

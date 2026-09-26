@@ -72,7 +72,8 @@ PREPARER_BROKER_SOCKET = Path("/run/termdeck-preparer-broker/request.sock")
 PREPARER_RUNTIME_ROOT = CANONICAL_RUNTIME_ROOT
 PREPARER_BROKER_REQUEST_SCHEMA = "termdeck.preparer-broker-request.v1"
 PREPARER_BROKER_RESPONSE_SCHEMA = "termdeck.preparer-broker-response.v1"
-PREPARER_BROKER_MAX_FRAME_BYTES = 16 * 1024
+PREPARER_PUBLICATION_SCHEMA = "termdeck.preparer-publication.v1"
+PREPARER_BROKER_MAX_FRAME_BYTES = 128 * 1024
 PREPARER_BROKER_TIMEOUT = 190.0
 DEFAULT_UNIT_DIR = Path("/home/arch/.config/systemd/user")
 
@@ -2093,6 +2094,96 @@ def _broker_receive_exact(connection: socket.socket, size: int) -> bytes:
     return bytes(content)
 
 
+def _validate_preparer_publication_result(result: object, *, operation: str = "publish") -> None:
+    """Require the fixed publisher's complete consumer observation."""
+
+    if operation not in ("publish", "verify"):
+        raise WrapperError("preparer broker publication operation is invalid")
+    fields = {
+        "schema", "operation", "ok", "generation", "producer_receipt_sha256",
+        "receipt", "outputs", "tls",
+    }
+    if (
+        not isinstance(result, dict)
+        or set(result) not in (fields, fields | {"cleanup_warnings"})
+        or result.get("schema") != PREPARER_PUBLICATION_SCHEMA
+        or result.get("operation") != operation
+        or result.get("ok") is not True
+        or not isinstance(result.get("generation"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", result["generation"]) is None
+    ):
+        raise WrapperError("preparer broker publication result is invalid")
+    if "cleanup_warnings" in result:
+        warnings = result["cleanup_warnings"]
+        if (
+            not isinstance(warnings, list)
+            or len(warnings) > 8
+            or any(
+                not isinstance(warning, str) or not warning.strip() or len(warning) > 512
+                for warning in warnings
+            )
+            or len(_broker_json(warnings)) > 4096
+        ):
+            raise WrapperError("preparer broker publication warnings are invalid")
+
+    def validate_claim(value: object, *, path: str, mode: int) -> None:
+        if not isinstance(value, dict) or set(value) != {"path", "mode", "identity", "sha256"}:
+            raise WrapperError(f"preparer broker publication claim is invalid: {path}")
+        identity = value["identity"]
+        digest = value["sha256"]
+        if (
+            value["path"] != path
+            or type(value["mode"]) is not int
+            or value["mode"] != mode
+            or not isinstance(identity, list)
+            or len(identity) != 7
+            or any(type(item) is not int or item < 0 for item in identity)
+            or identity[1] == 0
+            or identity[2] != mode
+            or identity[3] != 1
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise WrapperError(f"preparer broker publication claim is invalid: {path}")
+
+    validate_claim(result["receipt"], path="build-receipt.json", mode=0o644)
+    if result["producer_receipt_sha256"] != result["receipt"]["sha256"]:
+        raise WrapperError("preparer broker publication receipt digest differs from producer")
+    outputs = result["outputs"]
+    if not isinstance(outputs, dict) or set(outputs) != {"current-lan-ip", "nginx/allowed-hosts.map"}:
+        raise WrapperError("preparer broker publication outputs are invalid")
+    for path, claim in outputs.items():
+        validate_claim(claim, path=path, mode=0o600)
+
+    tls = result["tls"]
+    if not isinstance(tls, dict) or set(tls) != {"path", "identity", "manifest"}:
+        raise WrapperError("preparer broker publication TLS result is invalid")
+    identity = tls["identity"]
+    if (
+        tls["path"] != "tls"
+        or not isinstance(identity, list)
+        or len(identity) != 4
+        or any(type(item) is not int or item < 0 for item in identity)
+        or identity[1] == 0
+        or identity[2] != 0o700
+        or identity[3] != os.geteuid()
+    ):
+        raise WrapperError("preparer broker publication TLS identity is invalid")
+    tls_modes = {
+        "ca.crt": 0o644,
+        "ca.key": 0o600,
+        "server.key": 0o600,
+        "server.crt": 0o644,
+        "server-chain.crt": 0o644,
+        "server.ext": 0o600,
+    }
+    manifest = tls["manifest"]
+    if not isinstance(manifest, dict) or set(manifest) not in (set(tls_modes), set(tls_modes) | {"ca.srl"}):
+        raise WrapperError("preparer broker publication TLS manifest is invalid")
+    for path, claim in manifest.items():
+        validate_claim(claim, path=path, mode=tls_modes.get(path, 0o644))
+
+
 def _request_lan_preparation(
     *,
     socket_path: Path = PREPARER_BROKER_SOCKET,
@@ -2182,14 +2273,16 @@ def _request_lan_preparation(
         or not {"error", "ok", "returncode", "schema"}.issubset(response)
         or response.get("schema") != PREPARER_BROKER_RESPONSE_SCHEMA
         or response.get("ok") is not True
+        or type(response.get("returncode")) is not int
         or response.get("returncode") != 0
         or response.get("error") is not None
     ):
         raise WrapperError("preparer broker refused runtime preparation")
     result = response.get("result")
     if restore_mode == "none":
-        if set(response) != {"error", "ok", "returncode", "schema"}:
+        if set(response) != {"error", "ok", "result", "returncode", "schema"}:
             raise WrapperError("preparer broker returned an unexpected preparation result")
+        _validate_preparer_publication_result(result)
         return None
     if not isinstance(result, dict):
         raise WrapperError("preparer broker returned no attested restore result")
@@ -2433,6 +2526,31 @@ def _expected_proc_argv(command: Sequence[str]) -> tuple[str, ...]:
     return tuple([fields[0], *fields[1:], str(path), *(str(item) for item in command[1:])])
 
 
+def _process_argv_matches(
+    current: tuple[str, ...],
+    expected: tuple[str, ...],
+    *,
+    executable: str,
+) -> bool:
+    if current == expected:
+        return True
+    if not current or not expected or expected[0] != "/usr/bin/nginx":
+        return False
+    try:
+        nginx_executable = str(Path("/usr/bin/nginx").resolve(strict=True))
+    except OSError:
+        return False
+    # nginx replaces argv with this exact master title, joining its original
+    # arguments with spaces. Linux may expose the remaining NUL padding as
+    # empty arguments. Keep raw /proc snapshots unchanged and admit this one
+    # representation only for the expected system nginx executable.
+    return (
+        executable == nginx_executable
+        and current[0] == "nginx: master process " + " ".join(expected)
+        and all(value == "" for value in current[1:])
+    )
+
+
 def verify_process_identity(
     identity: Mapping[str, object],
     *,
@@ -2466,7 +2584,9 @@ def verify_process_identity(
         current["pid"] == recorded_pid
         and current["start_ticks"] == recorded_ticks
         and current["exe"] == str(Path(recorded_exe).resolve(strict=False))
-        and tuple(current["argv"]) == recorded_argv
+        and _process_argv_matches(
+            tuple(current["argv"]), recorded_argv, executable=str(current["exe"]),
+        )
     )
 
 

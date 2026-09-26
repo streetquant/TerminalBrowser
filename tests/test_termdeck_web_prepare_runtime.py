@@ -41,7 +41,7 @@ def _make_layout(tmp_path: Path) -> RuntimeLayout:
     nginx_conf.write_text(
         "server {\n    listen 0.0.0.0:7443 ssl;\n}\n", encoding="utf-8"
     )
-    nginx_conf.chmod(0o644)
+    nginx_conf.chmod(0o600)
     server = binaries / "termdeck-web-server"
     server.write_bytes(b"TermDeck test web server\n")
     server.chmod(0o755)
@@ -2880,7 +2880,7 @@ def _tls_review_restore_source_copies(layout: RuntimeLayout, journal: Path) -> d
         content = source.read_bytes()
         assert hashlib.sha256(content).hexdigest() == prior_receipt["files"][name]
         old_inode = source.stat().st_ino
-        mode = 0o755 if name == "bin/termdeck-web-server" else 0o644
+        mode = 0o755 if name == "bin/termdeck-web-server" else 0o600
         replacement = layout.root / ("restored-" + source.name)
         replacement.write_bytes(content)
         replacement.chmod(mode)
@@ -2940,3 +2940,67 @@ def test_tls_review_inverse_rejects_sources_outside_authenticated_a_contract(
     assert (source.stat().st_ino, source.stat().st_mode, source.read_bytes()) == source_before
     assert not (journal / "rollback-ready").exists()
     assert not (journal / "rollback-prior-build-receipt.json").exists()
+
+
+def test_prepare_runtime_rejects_missing_receipted_prior_after_tls_provenance(tmp_path: Path) -> None:
+    layout = _make_layout(tmp_path)
+    initial = _run(layout)
+    assert initial.returncode == 0, initial.stderr
+    _set_fake_ip(layout, "192.168.50.10")
+    marker = tmp_path / "prior-receipt-removed"
+    environment = _hook_environment(tmp_path / "missing-prior-hook", f"""
+import json, os, sys
+if len(sys.argv) == 5 and sys.argv[1] == {str(layout.runtime)!r}:
+    publication = json.loads(sys.argv[4])
+    journal = os.path.join(sys.argv[1], publication['prior']['journal'])
+    os.unlink(os.path.join(journal, 'prior-build-receipt.json'))
+    with open({str(marker)!r}, 'w') as stream:
+        stream.write('removed')
+""")
+
+    refused = _run(layout, environment)
+
+    assert marker.read_text() == "removed"
+    assert refused.returncode != 0
+    assert "does not prove an unreceipted prior generation" in refused.stderr
+    assert not (layout.runtime / "build-receipt.json").exists()
+
+
+@pytest.mark.parametrize("change", ("authentication", "runtime-evidence"))
+def test_prepare_runtime_rejects_unproved_legacy_tls_prior(tmp_path: Path, change: str) -> None:
+    import shutil
+
+    donor = _make_layout(tmp_path / "donor")
+    prepared = _run(donor)
+    assert prepared.returncode == 0, prepared.stderr
+    layout = _make_layout(tmp_path / "migration")
+    shutil.rmtree(layout.runtime / "tls")
+    shutil.copytree(donor.runtime / "tls", layout.runtime / "tls")
+    marker = tmp_path / "legacy-prior-changed"
+    environment = _hook_environment(tmp_path / "legacy-prior-hook", f"""
+import json, os, sys
+if len(sys.argv) == 5 and sys.argv[1] == {str(layout.runtime)!r}:
+    publication = json.loads(sys.argv[4])
+    journal = os.path.join(sys.argv[1], publication['prior']['journal'])
+    intent_path = os.path.join(journal, 'intent.json')
+    with open(intent_path) as stream:
+        intent = json.load(stream)
+    assert intent['receipt_previous'] is None
+    if {change!r} == 'authentication':
+        intent['auth'] = '0' * 64
+        with open(intent_path, 'w') as stream:
+            json.dump(intent, stream)
+    else:
+        with open(os.path.join(journal, 'prior-current-lan-ip'), 'w') as stream:
+            stream.write('unexpected prior runtime evidence')
+    with open({str(marker)!r}, 'w') as stream:
+        stream.write('changed')
+""")
+
+    refused = _run(layout, environment)
+
+    assert marker.read_text() == "changed"
+    assert refused.returncode != 0
+    expected = "intent authentication failed" if change == "authentication" else "unexpected prior runtime evidence"
+    assert expected in refused.stderr
+    assert not (layout.runtime / "build-receipt.json").exists()

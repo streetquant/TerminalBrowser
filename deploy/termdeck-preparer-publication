@@ -16,8 +16,9 @@ attestation key or socket to the consumer principal.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import errno
 import hashlib
 import json
@@ -72,6 +73,7 @@ TLS_REQUIRED: Final = frozenset(TLS_REQUIRED_MODES)
 TLS_OPTIONAL: Final = frozenset(TLS_OPTIONAL_MODES)
 CONTROL_KEY = ".termdeck-tls-recovery-key"
 RENAME_NOREPLACE: Final = 1
+RENAME_EXCHANGE: Final = 2
 
 
 class PublicationError(RuntimeError):
@@ -741,10 +743,26 @@ def _rename_noreplace(
 ) -> None:
     """Use Linux renameat2 so a concurrent destination is never overwritten."""
 
+    _rename_with_flags(
+        source_parent, source, destination_parent, destination,
+        flags=RENAME_NOREPLACE, label=label,
+    )
+
+
+def _rename_with_flags(
+    source_parent: int,
+    source: str,
+    destination_parent: int,
+    destination: str,
+    *,
+    flags: int,
+    label: str,
+) -> None:
+
     try:
         rename = ctypes.CDLL(None, use_errno=True).renameat2
     except (AttributeError, OSError) as exc:
-        raise PublicationError("secure key migration requires renameat2") from exc
+        raise PublicationError("secure publication requires renameat2") from exc
     rename.argtypes = (
         ctypes.c_int,
         ctypes.c_char_p,
@@ -760,7 +778,7 @@ def _rename_noreplace(
             os.fsencode(source),
             destination_parent,
             os.fsencode(destination),
-            RENAME_NOREPLACE,
+            flags,
         )
         if result == 0:
             return
@@ -768,7 +786,7 @@ def _rename_noreplace(
         if failure != errno.EINTR:
             break
         if attempt == 2:
-            raise PublicationError(f"secure key migration was interrupted: {label}")
+            raise PublicationError(f"secure publication was interrupted: {label}")
     if failure == errno.EEXIST:
         raise FileExistsError(failure, os.strerror(failure), destination)
     if failure == errno.ENOENT:
@@ -779,7 +797,7 @@ def _rename_noreplace(
         errno.ENOTSUP,
         getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
     }:
-        raise PublicationError("secure key migration requires renameat2")
+        raise PublicationError("secure publication requires renameat2")
     raise PublicationError(
         f"secure no-replace publication failed for {label}: {os.strerror(failure)}"
     )
@@ -907,13 +925,12 @@ def _optional_leaf(
     )
 
 
-def _migrate_control_key(
+def _control_keys(
     config: Config,
     *,
     producer_parent: RootLease,
     consumer: RootLease,
-) -> str:
-    """Move a legacy max-readable commitment key behind the preparer boundary."""
+) -> tuple[Leaf | None, Leaf | None]:
 
     legacy = _optional_leaf(
         consumer.descriptor,
@@ -939,9 +956,40 @@ def _migrate_control_key(
         raise PublicationError("producer TLS recovery key has an invalid size")
     if legacy is not None and private is not None and legacy.content != private.content:
         raise PublicationError("legacy and producer TLS recovery keys do not match")
+    return legacy, private
+
+
+def _migrate_control_key(
+    config: Config,
+    *,
+    producer_parent: RootLease,
+    consumer: RootLease,
+    cleanup_warnings: list[str],
+) -> str:
+    """Move a legacy max-readable commitment key behind the preparer boundary."""
+
+    legacy, private = _control_keys(
+        config, producer_parent=producer_parent, consumer=consumer,
+    )
 
     created_private = False
     removed_legacy = False
+    stage = ""
+    stage_fd = -1
+    stage_identity = None
+
+    def cleanup() -> None:
+        if stage_identity is None:
+            return
+        if _directory_identity(
+            os.stat(stage, dir_fd=consumer.descriptor, follow_symlinks=False),
+            label="key migration staging path",
+        ) != stage_identity:
+            raise PublicationError("key migration staging changed; retained evidence")
+        # rmdir refuses a nonempty directory; never discard a retained key.
+        os.rmdir(stage, dir_fd=consumer.descriptor)
+        os.fsync(consumer.descriptor)
+
     try:
         if private is None and legacy is not None:
             _copy_into_noreplace(
@@ -982,23 +1030,53 @@ def _migrate_control_key(
         )
         if rebound.identity != legacy.identity or rebound.content != legacy.content:
             raise PublicationError("legacy consumer TLS recovery key changed before migration")
-        os.unlink(CONTROL_KEY, dir_fd=consumer.descriptor)
+        stage = f".termdeck-key-migration-{secrets.token_hex(16)}"
+        os.mkdir(stage, 0o700, dir_fd=consumer.descriptor)
+        stage_identity = _directory_identity(
+            os.stat(stage, dir_fd=consumer.descriptor, follow_symlinks=False),
+            label="key migration stage",
+        )
+        stage_fd = _open_named_directory(
+            consumer.descriptor, stage, uid=os.geteuid(), gid=os.getegid(),
+            mode=0o700, label="root-private key migration stage",
+        )
+        stage_identity = _directory_identity(os.fstat(stage_fd), label="key migration stage")
+        _rename_noreplace(
+            consumer.descriptor, CONTROL_KEY, stage_fd, CONTROL_KEY,
+            label="retained legacy recovery key",
+        )
         removed_legacy = True
+        retained = _read_leaf(
+            stage_fd, CONTROL_KEY, uid=config.consumer_uid, gid=config.consumer_gid,
+            mode=0o600, label="retained legacy recovery key", max_bytes=64,
+        )
+        if (
+            retained.content != legacy.content
+            or replace(retained.identity, ctime_ns=legacy.identity.ctime_ns) != legacy.identity
+        ):
+            raise PublicationError("legacy recovery key changed during migration")
+        os.fsync(stage_fd)
         os.fsync(consumer.descriptor)
-        return "migrated"
+        producer_parent.revalidate()
+        consumer.revalidate()
+        if _read_leaf(
+            producer_parent.descriptor, CONTROL_KEY, uid=config.preparer_uid,
+            gid=config.preparer_gid, mode=0o600, label="producer TLS recovery key",
+            max_bytes=64,
+        ) != private:
+            raise PublicationError("private recovery key changed during migration")
+        # This unlink is the migration commit. Subsequent directory durability
+        # or empty-stage cleanup failures cannot truthfully roll it back.
+        os.unlink(CONTROL_KEY, dir_fd=stage_fd)
     except BaseException as exc:
         rollback_errors: list[str] = []
         if removed_legacy and legacy is not None:
             try:
-                _copy_into(
-                    consumer.descriptor,
-                    CONTROL_KEY,
-                    legacy,
-                    uid=config.consumer_uid,
-                    gid=config.consumer_gid,
-                    mode=0o600,
-                    label="legacy consumer TLS recovery key rollback",
+                _rename_noreplace(
+                    stage_fd, CONTROL_KEY, consumer.descriptor, CONTROL_KEY,
+                    label="legacy recovery key rollback",
                 )
+                os.fsync(consumer.descriptor)
             except BaseException as rollback_exc:
                 rollback_errors.append(f"legacy key restore: {rollback_exc}")
         if created_private:
@@ -1012,143 +1090,404 @@ def _migrate_control_key(
                     label="producer TLS recovery key rollback",
                     max_bytes=64,
                 )
-                if legacy is None or current.content != legacy.content:
+                if private is None or current != private:
                     raise PublicationError("producer TLS recovery key changed during rollback")
                 os.unlink(CONTROL_KEY, dir_fd=producer_parent.descriptor)
                 os.fsync(producer_parent.descriptor)
             except BaseException as rollback_exc:
                 rollback_errors.append(f"producer key rollback: {rollback_exc}")
+        try:
+            cleanup()
+        except (OSError, PublicationError) as cleanup_exc:
+            rollback_errors.append(f"key staging cleanup: {cleanup_exc}")
         if rollback_errors and hasattr(exc, "add_note"):
             exc.add_note("; ".join(rollback_errors))
         raise
+    else:
+        try:
+            os.fsync(stage_fd)
+            cleanup()
+        except (OSError, PublicationError) as cleanup_exc:
+            cleanup_warnings.append(f"committed recovery-key migration cleanup: {cleanup_exc}")
+        return "migrated"
+    finally:
+        if stage_fd >= 0:
+            os.close(stage_fd)
+
+
+def _tls_leaves(config: Config, descriptor: int, *, consumer: bool) -> dict[str, Leaf]:
+    names = set(os.listdir(descriptor))
+    approved = TLS_REQUIRED | TLS_OPTIONAL
+    if not consumer and not names.issubset(approved):
+        raise PublicationError("producer TLS directory contains unexpected entries")
+    return {
+        name: _read_leaf(
+            descriptor, name,
+            uid=config.consumer_uid if consumer else config.preparer_uid,
+            gid=config.consumer_gid if consumer else config.preparer_gid,
+            mode=(TLS_REQUIRED_MODES | TLS_OPTIONAL_MODES)[name],
+            label=f"{'consumer' if consumer else 'producer'} TLS {name}",
+        )
+        for name in sorted(names & approved)
+    }
+
+
+def _check_tls_snapshot(
+    config: Config,
+    parent: int,
+    name: str,
+    descriptor: int,
+    identity: tuple[int, int, int, int, int],
+    leaves: Mapping[str, Leaf],
+    *,
+    consumer: bool = False,
+) -> None:
+    if (
+        _directory_identity(os.fstat(descriptor), label="seed TLS descriptor") != identity
+        or _directory_identity(
+            os.stat(name, dir_fd=parent, follow_symlinks=False), label="seed TLS path",
+        ) != identity
+        or _tls_leaves(config, descriptor, consumer=consumer) != leaves
+    ):
+        raise PublicationError("TLS seed directory or leaves changed")
+
+
+def _initial_seed_inputs(
+    config: Config,
+    producer: RootLease,
+    sources: Mapping[str, Leaf],
+    *,
+    partial: bool,
+    staged: str = "",
+) -> dict[str, Leaf]:
+    """A legacy interrupted seed has no build output, receipt or journal."""
+
+    root_names = set(os.listdir(producer.descriptor))
+    if root_names - {"bin", "nginx", "tls", staged}:
+        raise PublicationError("incomplete producer TLS has generation or unexpected state")
+    retained: dict[str, Leaf] = {}
+    for relative, mode in SOURCE_MODES.items():
+        directory, name = relative.split("/")
+        if directory not in root_names:
+            if partial:
+                raise PublicationError("partial TLS seed lacks its preceding source inputs")
+            continue
+        parent = _open_named_directory(
+            producer.descriptor, directory, uid=config.preparer_uid,
+            gid=config.preparer_gid, mode=0o700, label="initial producer source directory",
+        )
+        try:
+            if set(os.listdir(parent)) - {name}:
+                raise PublicationError("incomplete producer TLS has generation or unexpected state")
+            leaf = _optional_leaf(
+                parent, name, uid=config.preparer_uid, gid=config.preparer_gid,
+                mode=mode, label=f"initial producer source {relative}", max_bytes=MAX_BYTES,
+            )
+            if partial and (leaf is None or leaf.content != sources[relative].content):
+                raise PublicationError("partial TLS seed does not match its preceding source inputs")
+            if leaf is not None:
+                retained[relative] = leaf
+        finally:
+            os.close(parent)
+    return retained
+
+
+@dataclass
+class _TLSSeed:
+    config: Config
+    producer: RootLease
+    consumer: RootLease
+    consumer_fd: int
+    consumer_identity: tuple[int, int, int, int, int]
+    source: dict[str, Leaf]
+    producer_fd: int | None
+    prior_identity: tuple[int, int, int, int, int] | None
+    prior: dict[str, Leaf]
+    inputs: Mapping[str, Leaf]
+    prior_inputs: dict[str, Leaf]
+    staged: str = ""
+    staged_fd: int = -1
+    staged_identity: tuple[int, int, int, int, int] | None = None
+    staged_leaves: dict[str, Leaf] | None = None
+    published: bool = False
+
+    def revalidate(self) -> None:
+        self.producer.revalidate()
+        self.consumer.revalidate()
+        for relative, expected in self.inputs.items():
+            actual = _read_relative(
+                self.consumer.descriptor, relative, uid=self.config.consumer_uid,
+                gid=self.config.consumer_gid, mode=SOURCE_MODES[relative],
+                label=f"consumer source {relative}",
+            )
+            if actual != expected:
+                raise PublicationError("consumer seed input changed")
+        _check_tls_snapshot(
+            self.config, self.consumer.descriptor, "tls", self.consumer_fd,
+            self.consumer_identity, self.source, consumer=True,
+        )
+        if _initial_seed_inputs(
+            self.config, self.producer, self.inputs, partial=bool(self.prior),
+            staged=self.staged,
+        ) != self.prior_inputs:
+            raise PublicationError("producer seed inputs changed")
+        if self.producer_fd is not None:
+            assert self.prior_identity is not None
+            _check_tls_snapshot(
+                self.config, self.producer.descriptor,
+                self.staged if self.published else "tls", self.producer_fd,
+                self.prior_identity, self.prior,
+            )
+        elif not self.published and "tls" in os.listdir(self.producer.descriptor):
+            raise PublicationError("producer TLS appeared before initial seed")
+
+    def publish(self) -> None:
+        self.staged = f".termdeck-seed-tls-{secrets.token_hex(16)}"
+        os.mkdir(self.staged, 0o700, dir_fd=self.producer.descriptor)
+        self.staged_identity = _directory_identity(
+            os.stat(self.staged, dir_fd=self.producer.descriptor, follow_symlinks=False),
+            label="TLS seed stage",
+        )
+        self.staged_fd = os.open(self.staged, DIRECTORY_FLAGS, dir_fd=self.producer.descriptor)
+        self.staged_leaves = {}
+        # Keep construction root-private until all validated inputs are durable.
+        os.fchmod(self.staged_fd, 0o700)
+        self.staged_identity = _directory_identity(os.fstat(self.staged_fd), label="TLS seed stage")
+        for name, leaf in self.source.items():
+            _copy_into_noreplace(
+                self.staged_fd, name, leaf, uid=self.config.preparer_uid,
+                gid=self.config.preparer_gid, mode=leaf.identity.mode,
+                label=f"staged producer TLS {name}",
+            )
+            self.staged_leaves[name] = _read_leaf(
+                self.staged_fd, name, uid=self.config.preparer_uid,
+                gid=self.config.preparer_gid, mode=leaf.identity.mode,
+                label=f"staged producer TLS {name}",
+            )
+        os.fchown(self.staged_fd, self.config.preparer_uid, self.config.preparer_gid)
+        self.staged_identity = _directory_identity(os.fstat(self.staged_fd), label="TLS seed stage")
+        if _tls_leaves(self.config, self.staged_fd, consumer=False) != self.staged_leaves or {
+            name: leaf.content for name, leaf in self.staged_leaves.items()
+        } != {
+            name: leaf.content for name, leaf in self.source.items()
+        }:
+            raise PublicationError("staged producer TLS differs from source")
+        os.fsync(self.staged_fd)
+        self.revalidate()
+        _check_tls_snapshot(
+            self.config, self.producer.descriptor, self.staged, self.staged_fd,
+            self.staged_identity, self.staged_leaves,
+        )
+        if self.producer_fd is None:
+            _rename_noreplace(
+                self.producer.descriptor, self.staged, self.producer.descriptor, "tls",
+                label="initial producer TLS",
+            )
+        else:
+            _rename_with_flags(
+                self.producer.descriptor, self.staged, self.producer.descriptor, "tls",
+                flags=RENAME_EXCHANGE, label="initial producer TLS",
+            )
+        self.published = True
+        os.fsync(self.producer.descriptor)
+        self.revalidate()
+        _check_tls_snapshot(
+            self.config, self.producer.descriptor, "tls", self.staged_fd,
+            self.staged_identity, self.staged_leaves,
+        )
+
+    def rollback(self) -> None:
+        if self.published:
+            assert self.staged_identity is not None and self.staged_leaves is not None
+            _check_tls_snapshot(
+                self.config, self.producer.descriptor, "tls", self.staged_fd,
+                self.staged_identity, self.staged_leaves,
+            )
+            if self.producer_fd is None:
+                _rename_noreplace(
+                    self.producer.descriptor, "tls", self.producer.descriptor, self.staged,
+                    label="initial TLS rollback",
+                )
+            else:
+                # Exchange also restores a concurrent replacement displaced at the
+                # atomic boundary. Never delete that retained conflicting tree.
+                _rename_with_flags(
+                    self.producer.descriptor, self.staged, self.producer.descriptor, "tls",
+                    flags=RENAME_EXCHANGE, label="initial TLS rollback",
+                )
+            self.published = False
+            os.fsync(self.producer.descriptor)
+        self.cleanup()
+
+    def cleanup(self) -> None:
+        if not self.staged or self.staged_identity is None:
+            return
+        if self.staged_fd < 0:
+            if _directory_identity(
+                os.stat(self.staged, dir_fd=self.producer.descriptor, follow_symlinks=False),
+                label="TLS seed cleanup path",
+            ) != self.staged_identity:
+                raise PublicationError("TLS seed cleanup path changed; retained evidence")
+            os.rmdir(self.staged, dir_fd=self.producer.descriptor)
+            self.staged = ""
+            os.fsync(self.producer.descriptor)
+            return
+        if self.published:
+            if self.producer_fd is None:
+                return
+            assert self.prior_identity is not None
+            _check_tls_snapshot(
+                self.config, self.producer.descriptor, self.staged, self.producer_fd,
+                self.prior_identity, self.prior,
+            )
+            identity, leaves = self.prior_identity, self.prior
+        else:
+            # A staging failure may leave only part of the private candidate.
+            identity = _directory_identity(os.fstat(self.staged_fd), label="TLS seed cleanup")
+            if identity != self.staged_identity or _directory_identity(
+                os.stat(self.staged, dir_fd=self.producer.descriptor, follow_symlinks=False),
+                label="TLS seed cleanup path",
+            ) != identity:
+                raise PublicationError("TLS seed cleanup path changed; retained evidence")
+            leaves = _tls_leaves(self.config, self.staged_fd, consumer=False)
+            if leaves != self.staged_leaves:
+                raise PublicationError("TLS seed cleanup content changed; retained evidence")
+        _remove_flat_directory(
+            self.producer.descriptor, self.staged,
+            expected_identity=identity, expected_leaves=leaves,
+        )
+        self.staged = ""
+        os.fsync(self.producer.descriptor)
+
+
+def _plan_tls_seed(
+    config: Config, producer: RootLease, consumer: RootLease,
+    sources: Mapping[str, Leaf], stack: ExitStack,
+) -> _TLSSeed | None:
+    producer_fd = None
+    prior_identity = None
+    prior: dict[str, Leaf] = {}
+    if "tls" in os.listdir(producer.descriptor):
+        producer_fd = _open_named_directory(
+            producer.descriptor, "tls", uid=config.preparer_uid, gid=config.preparer_gid,
+            mode=0o700, label="producer TLS directory",
+        )
+        stack.callback(os.close, producer_fd)
+        prior_identity = _directory_identity(os.fstat(producer_fd), label="producer TLS directory")
+        prior = _tls_leaves(config, producer_fd, consumer=False)
+        if TLS_REQUIRED.issubset(prior):
+            return None  # An established complete set is never reseeded.
+    consumer_fd = _open_named_directory(
+        consumer.descriptor, "tls", uid=config.consumer_uid, gid=config.consumer_gid,
+        mode=0o700, label="consumer TLS directory",
+    )
+    stack.callback(os.close, consumer_fd)
+    consumer_identity = _directory_identity(os.fstat(consumer_fd), label="consumer TLS directory")
+    source = _tls_leaves(config, consumer_fd, consumer=True)
+    prior_inputs = _initial_seed_inputs(config, producer, sources, partial=bool(prior))
+    if not source and not prior:
+        return None  # The preparer may generate the first TLS set from scratch.
+    if not TLS_REQUIRED.issubset(source):
+        raise PublicationError("consumer TLS seed is incomplete")
+    # native13 copied these names in sorted order. Only its exact retained
+    # prefix, with all preceding source inputs intact, can be resumed.
+    if list(prior) != list(source)[:len(prior)]:
+        raise PublicationError("incomplete producer TLS is not an initial seed prefix")
+    if any(leaf.content != source[name].content for name, leaf in prior.items()):
+        raise PublicationError("partial producer TLS conflicts with consumer seed")
+    return _TLSSeed(
+        config, producer, consumer, consumer_fd, consumer_identity, source,
+        producer_fd, prior_identity, prior, sources, prior_inputs,
+    )
 
 
 def seed(config: Config) -> dict[str, object]:
-    producer = _open_root(
-        config.producer_root,
-        uid=config.preparer_uid,
-        gid=config.preparer_gid,
-        mode=0o700,
-        label="private producer root",
-    )
-    consumer = _open_root(
-        config.consumer_root,
-        uid=config.consumer_uid,
-        gid=config.consumer_gid,
-        mode=0o700,
-        label="user consumer root",
-    )
-    copied: list[str] = []
-    try:
-        for relative, mode in SOURCE_MODES.items():
-            source = _read_relative(
-                consumer.descriptor,
-                relative,
-                uid=config.consumer_uid,
-                gid=config.consumer_gid,
-                mode=mode,
-                label=f"consumer source {relative}",
+    with ExitStack() as stack:
+        roots = []
+        for path, uid, gid, label in (
+            (config.producer_root, config.preparer_uid, config.preparer_gid, "private producer root"),
+            (config.consumer_root, config.consumer_uid, config.consumer_gid, "user consumer root"),
+            (config.producer_root.parent, config.preparer_uid, config.preparer_gid, "producer control parent"),
+        ):
+            root = _open_root(path, uid=uid, gid=gid, mode=0o700, label=label)
+            stack.callback(root.close)
+            roots.append(root)
+        producer, consumer, producer_parent = roots
+        # Validate every approved source and both recovery-key locations before
+        # the first write. In particular server.ext must already be 0600.
+        sources = {
+            relative: _read_relative(
+                consumer.descriptor, relative, uid=config.consumer_uid,
+                gid=config.consumer_gid, mode=mode, label=f"consumer source {relative}",
             )
-            parent, name, close_parent = _parent_and_name(
-                producer.descriptor,
-                relative,
-                uid=config.preparer_uid,
-                gid=config.preparer_gid,
-                create=True,
-            )
-            try:
-                _copy_into(
-                    parent,
-                    name,
-                    source,
-                    uid=config.preparer_uid,
-                    gid=config.preparer_gid,
-                    mode=mode,
-                    label=f"producer source {relative}",
-                )
-            finally:
-                if close_parent:
-                    os.close(parent)
-            copied.append(relative)
-
-        producer_tls = _ensure_directory(
-            producer.descriptor,
-            "tls",
-            uid=config.preparer_uid,
-            gid=config.preparer_gid,
-            mode=0o700,
-            label="producer TLS directory",
-        )
-        consumer_tls = _open_named_directory(
-            consumer.descriptor,
-            "tls",
-            uid=config.consumer_uid,
-            gid=config.consumer_gid,
-            mode=0o700,
-            label="consumer TLS directory",
-        )
-        try:
-            producer_names = set(os.listdir(producer_tls))
-            if not producer_names:
-                consumer_names = set(os.listdir(consumer_tls))
-                names = (consumer_names & (TLS_REQUIRED | TLS_OPTIONAL))
-                if TLS_REQUIRED.issubset(names):
-                    for name in sorted(names):
-                        mode = TLS_REQUIRED_MODES.get(name, TLS_OPTIONAL_MODES.get(name))
-                        if mode is None:
-                            raise PublicationError(f"consumer TLS leaf is unsafe: {name}")
-                        leaf = _read_leaf(
-                            consumer_tls,
-                            name,
-                            uid=config.consumer_uid,
-                            gid=config.consumer_gid,
-                            mode=mode,
-                            label=f"consumer TLS {name}",
-                        )
-                        _copy_into(
-                            producer_tls,
-                            name,
-                            leaf,
-                            uid=config.preparer_uid,
-                            gid=config.preparer_gid,
-                            mode=mode,
-                            label=f"producer TLS {name}",
-                        )
-                        copied.append("tls/" + name)
-        finally:
-            os.close(consumer_tls)
-            os.close(producer_tls)
-
-        producer_parent = _open_root(
-            config.producer_root.parent,
-            uid=config.preparer_uid,
-            gid=config.preparer_gid,
-            mode=0o700,
-            label="producer control parent",
-        )
-        try:
-            control_key = _migrate_control_key(
-                config,
-                producer_parent=producer_parent,
-                consumer=consumer,
-            )
-            producer_parent.revalidate()
-        finally:
-            producer_parent.close()
-        producer.revalidate()
-        consumer.revalidate()
-        if control_key == "migrated":
-            copied.append(CONTROL_KEY)
-        return {
-            "schema": SCHEMA,
-            "operation": "seed",
-            "copied": sorted(copied),
-            "control_key": control_key,
-            "ok": True,
+            for relative, mode in SOURCE_MODES.items()
         }
-    finally:
-        consumer.close()
-        producer.close()
+        _control_keys(config, producer_parent=producer_parent, consumer=consumer)
+        tls_seed = _plan_tls_seed(config, producer, consumer, sources, stack)
+        transaction = Transaction()
+        copied: list[str] = []
+        warnings: list[str] = []
+        try:
+            if tls_seed is not None:
+                tls_seed.publish()
+                copied.extend("tls/" + name for name in tls_seed.source)
+            for relative, source in sources.items():
+                parent, name, close_parent = _parent_and_name(
+                    producer.descriptor, relative, uid=config.preparer_uid,
+                    gid=config.preparer_gid, create=True,
+                )
+                try:
+                    prior = _optional_leaf(
+                        parent, name, uid=config.preparer_uid, gid=config.preparer_gid,
+                        mode=SOURCE_MODES[relative], label=f"producer source {relative}",
+                        max_bytes=MAX_BYTES,
+                    )
+                    if prior is None or prior.content != source.content:
+                        transaction.replace_file(
+                            parent, name, source.content, mode=SOURCE_MODES[relative],
+                            owner_uid=config.preparer_uid, owner_gid=config.preparer_gid,
+                            label=f"producer source {relative}",
+                        )
+                        copied.append(relative)
+                finally:
+                    if close_parent:
+                        os.close(parent)
+            producer.revalidate()
+            consumer.revalidate()
+            producer_parent.revalidate()
+            control_key = _migrate_control_key(
+                config, producer_parent=producer_parent, consumer=consumer,
+                cleanup_warnings=warnings,
+            )
+        except BaseException as exc:
+            for rollback in (transaction.rollback, tls_seed.rollback if tls_seed else lambda: None):
+                try:
+                    rollback()
+                except BaseException as rollback_exc:
+                    if hasattr(exc, "add_note"):
+                        exc.add_note(f"seed rollback retained evidence: {rollback_exc}")
+            if isinstance(exc, PublicationError):
+                raise
+            raise PublicationError("could not atomically seed producer inputs") from exc
+        else:
+            warnings.extend(transaction.commit())
+            if tls_seed is not None:
+                try:
+                    tls_seed.cleanup()
+                except (OSError, PublicationError) as cleanup_exc:
+                    warnings.append(f"TLS seed retained preimage: {cleanup_exc}")
+            if control_key == "migrated":
+                copied.append(CONTROL_KEY)
+            result: dict[str, object] = {
+                "schema": SCHEMA, "operation": "seed", "copied": sorted(copied),
+                "control_key": control_key, "ok": True,
+            }
+            if warnings:
+                result["cleanup_warnings"] = warnings
+            return result
+        finally:
+            if tls_seed is not None and tls_seed.staged_fd >= 0:
+                os.close(tls_seed.staged_fd)
 
 
 def _collect_producer(config: Config, producer: RootLease) -> tuple[dict[str, object], Leaf, dict[str, Leaf], dict[str, Leaf]]:
@@ -1252,16 +1591,32 @@ def _stage_tls(config: Config, consumer: RootLease, tls_leaves: Mapping[str, Lea
     return name
 
 
-def _remove_flat_directory(parent: int, name: str) -> None:
+def _remove_flat_directory(
+    parent: int, name: str, *,
+    expected_identity: tuple[int, int, int, int, int] | None = None,
+    expected_leaves: Mapping[str, Leaf] | None = None,
+) -> None:
     descriptor = os.open(name, DIRECTORY_FLAGS, dir_fd=parent)
     try:
-        for child in os.listdir(descriptor):
+        identity = _directory_identity(os.fstat(descriptor), label="temporary publication directory")
+        names = os.listdir(descriptor)
+        if expected_identity is not None and identity != expected_identity:
+            raise PublicationError("temporary publication directory changed; retained evidence")
+        if expected_leaves is not None and set(names) != set(expected_leaves):
+            raise PublicationError("temporary publication leaf set changed; retained evidence")
+        for child in names:
             _safe_component(child, label="temporary publication child")
             info = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise PublicationError("temporary publication directory contains an unsafe entry")
+            if expected_leaves is not None and _regular_identity(info, label=child) != expected_leaves[child].identity:
+                raise PublicationError("temporary publication leaf changed; retained evidence")
             os.unlink(child, dir_fd=descriptor)
         os.fsync(descriptor)
+        if _directory_identity(
+            os.stat(name, dir_fd=parent, follow_symlinks=False), label="temporary publication path",
+        ) != identity:
+            raise PublicationError("temporary publication path changed; retained evidence")
     finally:
         os.close(descriptor)
     os.rmdir(name, dir_fd=parent)
