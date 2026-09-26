@@ -70,11 +70,24 @@ are not automatically exposed through the sandbox.
 
 The Codex adapter asks the existing TermDeck `SessionStore` to provision that
 tab's private `CODEX_HOME` from the configured account source. It passes a private
-`sqlite_home` override. Only that home, the selected credential when linked,
+`sqlite_home` and `log_dir` overrides. Only that home, the selected credential when linked,
 and explicitly shared non-auth configuration/assets are available. The account
 catalogue and other tab homes are absent. `.env` is excluded from extra mounts.
 Credential refresh can replace the tab-private `auth.json`; account lifecycle
 synchronization remains the TermDeck account controller's responsibility.
+
+Prepared non-auth assets, including additional `*.config.toml` files, are mounted
+read-only at their validated canonical and link destinations. This keeps an
+external skills-directory alias reachable without exposing its parent or
+rewriting host/private links. Conflicting mount destinations and aliases into
+protected storage are rejected. The private log directory must be owned by the
+host account, mode 0700, and a real directory rather than a symlink.
+
+This does not recursively grant targets of nested skill/plugin symlinks or
+executables named by configuration. A configured hook or MCP command outside
+the admitted mounts needs separate dependency qualification. Successful
+`--version` or `features list` diagnostics do not establish those integrations
+or a completed agent task; do not publish a runtime as qualified on that basis.
 
 ## Attachment and process boundary
 

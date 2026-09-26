@@ -15,7 +15,9 @@ FileDescriptorName=termdeck-preparer-broker
 Service=termdeck-preparer-broker.service
 Backlog=8
 RemoveOnStop=yes
-FlushPending=yes
+# A reply can precede service exit. Keep queued requests for the next
+# serialized one-request process, which authenticates its own accepted peer.
+FlushPending=no
 
 [Install]
 WantedBy=sockets.target

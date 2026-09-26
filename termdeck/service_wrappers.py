@@ -18,6 +18,7 @@ import grp
 import hashlib
 import json
 import errno
+import fcntl
 import os
 import pwd
 import re
@@ -31,6 +32,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, TypeAlias
@@ -2234,22 +2236,60 @@ def _request_lan_preparation(
     payload = _broker_json(request)
     if not payload or len(payload) > PREPARER_BROKER_MAX_FRAME_BYTES:
         raise WrapperError("preparer broker request exceeds its bounded frame")
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(timeout)
-            connection.connect(os.fspath(socket_path))
-            connection.sendall(struct.pack("!I", len(payload)) + payload)
-            header = _broker_receive_exact(connection, 4)
-            length = struct.unpack("!I", header)[0]
-            if not 0 < length <= PREPARER_BROKER_MAX_FRAME_BYTES:
-                raise WrapperError("preparer broker response frame is invalid")
-            response_payload = _broker_receive_exact(connection, length)
-            if connection.recv(1):
-                raise WrapperError("preparer broker sent trailing response bytes")
-    except WrapperError:
-        raise
-    except (OSError, socket.timeout) as exc:
-        raise WrapperError(f"preparer broker request failed: {exc}") from exc
+    # The one-request service can send its response before systemd observes
+    # its exit. FlushPending then discards a connection queued during that
+    # handoff. Only a read-only verification may be replayed; preparation and
+    # restoration can already have taken effect when their connection fails.
+    attempts = 3 if restore_mode == "verify" else 1
+    deadline = time.monotonic() + timeout
+    for attempt in range(attempts):
+        if attempt:
+            _assert_canonical(socket_path, label="preparer broker socket", must_exist=True)
+            try:
+                current = socket_path.lstat()
+            except OSError as exc:
+                raise WrapperError("could not reinspect preparer broker socket") from exc
+            if (
+                current.st_dev, current.st_ino, current.st_mode, current.st_uid, current.st_gid
+            ) != (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid):
+                raise WrapperError("preparer broker socket changed during verification handoff")
+        response_started = False
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("preparer broker request deadline expired")
+                connection.settimeout(remaining)
+                connection.connect(os.fspath(socket_path))
+                connection.sendall(struct.pack("!I", len(payload)) + payload)
+                header = connection.recv(4)
+                if not header:
+                    raise EOFError("preparer broker response ended before its frame")
+                response_started = True
+                header += _broker_receive_exact(connection, 4 - len(header))
+                length = struct.unpack("!I", header)[0]
+                if not 0 < length <= PREPARER_BROKER_MAX_FRAME_BYTES:
+                    raise WrapperError("preparer broker response frame is invalid")
+                response_payload = _broker_receive_exact(connection, length)
+                if connection.recv(1):
+                    raise WrapperError("preparer broker sent trailing response bytes")
+            break
+        except WrapperError:
+            raise
+        except (OSError, EOFError) as exc:
+            handoff_disconnect = isinstance(exc, EOFError) or (
+                isinstance(exc, OSError) and exc.errno == errno.ECONNRESET
+            )
+            delay = 0.1 * (attempt + 1)
+            if (
+                handoff_disconnect
+                and not response_started
+                and attempt + 1 < attempts
+                and deadline - time.monotonic() > delay
+            ):
+                time.sleep(delay)
+                continue
+            raise WrapperError(f"preparer broker request failed: {exc}") from exc
 
     def no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
         parsed: dict[str, object] = {}
@@ -2830,11 +2870,329 @@ def _atomic_write_json(
     ):
         raise WrapperError("unit config update snapshot does not match its destination")
     content = _canonical_json(value)
+    if snapshot is not None and _publish_activation_config_transition(snapshot, content, mode):
+        return
     _publish_files_transactionally(
         ((path, content, mode, f"unit config {path.name}"),),
         parent_guards=snapshot.parent_guards if snapshot is not None else None,
         expected_preimages={path: snapshot.preimage} if snapshot is not None else None,
     )
+
+
+_CONFIG_TRANSITION_SCHEMA = "termdeck.activation-config-transition.v1"
+_CONFIG_CHECKPOINT_SCHEMA = "termdeck.activation-config-checkpoint.v1"
+_CONFIG_TRANSITION_LIMIT = 64
+
+
+def _config_transition_path(tx: Path, image: Mapping[str, object]) -> Path:
+    return tx / ("config-transition-" + _sha256_bytes(_canonical_json(image)) + ".json")
+
+
+def _config_checkpoint_path(tx: Path, root: Mapping[str, object]) -> Path:
+    return tx / ("config-checkpoint-" + _sha256_bytes(_canonical_json(root)) + ".json")
+
+
+def _config_transition_read(path: Path):
+    from . import web_activation as api
+    _path, capture = api._capture_anchored(path, label="config transition receipt")
+    if not capture.snapshot.exists:
+        return None, capture
+    if capture.snapshot.mode != 0o600 or len(capture.snapshot.content) > 128 * 1024:
+        raise WrapperError("config transition receipt is unsafe or too large")
+    return api._strict_json_object(capture.snapshot.content, label="config transition receipt"), capture
+
+
+def _config_transition_save(path: Path, value: Mapping[str, object], previous: object):
+    from . import web_activation as api
+    guards = _release_publication_api()._capture_publication_parent_guards((path,), create_parents=False)
+    api._publish_anchored(path, _canonical_json(value), 0o600,
+                          label="config transition receipt", parent_guards=guards, expected_preimage=previous)
+    return _config_transition_read(path)[1]
+
+
+def _config_transition_handoff(tx, path, handoff, parent_guards):
+    from . import web_activation as api
+    if not isinstance(handoff, dict) or set(handoff) != {
+        "journal_path", "journal_identity", "state", "parents", "preimages", "postimages",
+    }:
+        raise WrapperError("config transition publication is invalid")
+    before = api._release_publication_image_map(handoff, "preimages")
+    if set(before) != {path} or before[path].get("exists") is not True:
+        raise WrapperError("config transition predecessor is invalid")
+    guards = api._release_publication_parent_guards_from_payload(handoff["parents"])
+    if len(guards.guards) != 1 or guards.for_path(path) != parent_guards.for_path(path):
+        raise WrapperError("config transition parent changed")
+    journal = path.parent / (".termdeck-publication-config-" + _sha256_bytes(_canonical_json([str(tx), before[path]])) + ".json")
+    if handoff.get("journal_path") != str(journal):
+        raise WrapperError("config transition journal path changed")
+    identity = api._file_identity_from_payload(handoff.get("journal_identity"))
+    if identity is None:
+        raise WrapperError("config transition journal identity is missing")
+    return before[path], guards, journal, identity
+
+
+@contextmanager
+def _config_transition_lock(path: Path, guards: object):
+    manager = _release_publication_api()
+    parents = manager._open_publication_parents((path,), parent_guards=guards, create_parents=False)
+    descriptor = -1
+    try:
+        parent = parents.for_path(path)
+        name = "." + path.name + ".lifecycle.lock"
+        descriptor = os.open(name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             0o600, dir_fd=parent.descriptor)
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1 or stat.S_IMODE(observed.st_mode) != 0o600 or observed.st_uid != os.geteuid():
+            raise WrapperError("config lifecycle lock is unsafe")
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise WrapperError("config lifecycle transition is busy")
+                time.sleep(0.02)
+        named = os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+        if (named.st_dev, named.st_ino, named.st_nlink, named.st_mode) != (observed.st_dev, observed.st_ino, 1, observed.st_mode):
+            raise WrapperError("config lifecycle lock changed")
+        parents.assert_current(phase="before config lifecycle transition")
+        yield
+        parents.assert_current(phase="after config lifecycle transition")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        parents.close()
+
+
+def reconcile_activation_config(tx: Path, path: Path, root: Mapping[str, object], parent_guards: object):
+    with _config_transition_lock(path, parent_guards):
+        return _reconcile_activation_config_locked(tx, path, root, parent_guards)
+
+
+def _reconcile_activation_config_locked(
+    tx: Path, path: Path, root: Mapping[str, object], parent_guards: object,
+) -> tuple[object, int]:
+    """Follow exact CAS receipts from the install image to the current config.
+
+    Receipts are bounded to this transaction and six config destinations.
+    A retained inner journal is settled before its output is admitted. No
+    content-only comparison grants ownership of a replacement inode.
+    """
+    from . import web_activation as api
+    manager = _release_publication_api()
+    if path.name not in UNIT_CONFIG_NAMES or root.get("path") != str(path):
+        raise WrapperError("config transition has an invalid destination")
+    checkpoint_path = _config_checkpoint_path(tx, root)
+    saved, checkpoint_capture = _config_transition_read(checkpoint_path)
+    head = dict(root)
+    pending_retirements = {}
+    if saved is not None:
+        if (set(saved) != {"schema", "transaction", "root", "head", "receipt", "retired"}
+                or saved.get("schema") != _CONFIG_CHECKPOINT_SCHEMA
+                or saved.get("transaction") != str(tx) or saved.get("root") != root):
+            raise WrapperError("config lifecycle checkpoint root changed")
+        handoff = saved.get("receipt")
+        _before, _guards, _journal, _identity = _config_transition_handoff(tx, path, handoff, parent_guards)
+        if handoff.get("state") not in {"published", "recovered"}:
+            raise WrapperError("config lifecycle checkpoint has no settled publication")
+        images = api._release_publication_image_map(handoff, "postimages")
+        if (set(images) != {path} or images[path].get("exists") is not True
+                or saved.get("head") != images[path]):
+            raise WrapperError("config lifecycle checkpoint handoff changed")
+        pending_retirements = api._release_publication_image_map(saved, "retired")
+        if len(pending_retirements) > _CONFIG_TRANSITION_LIMIT:
+            raise WrapperError("config lifecycle checkpoint retirement bound is invalid")
+        for entry, expected in pending_retirements.items():
+            name = entry.name.removeprefix("config-transition-").removesuffix(".json")
+            if (entry.parent != tx or entry.name != "config-transition-" + name + ".json"
+                    or not api._lower_hex(name, length=64) or expected.get("exists") is not True):
+                raise WrapperError("config lifecycle checkpoint retirement destination is invalid")
+        head = images[path]
+    consumed = []
+    last_handoff = None
+
+    def finish(current, count):
+        nonlocal checkpoint_capture
+        # The exact current leaf has just been verified from the prior
+        # checkpoint through every inner CAS. Publish the new authority before
+        # retiring that prefix. The install root never changes. A crash before
+        # this CAS keeps the old chain; a crash afterward starts from this
+        # exact callback postimage, including its inode. The limit bounds only
+        # unreconciled work, never the lifetime number of service restarts.
+        def retire(images):
+            for entry, expected in images.items():
+                _entry, captured = api._capture_anchored(entry, label="retired config transition receipt")
+                if not captured.snapshot.exists:
+                    continue  # A previous cleanup may have completed before its process exited.
+                if api._release_publication_snapshot_payload(entry, captured) != expected:
+                    raise WrapperError("retired config transition receipt inode changed")
+                guards = manager._capture_publication_parent_guards((entry,), create_parents=False)
+                api._publish_anchored(entry, None, 0o600, label="retired config transition receipt",
+                                      parent_guards=guards, expected_preimage=captured)
+
+        retire(pending_retirements)
+        if pending_retirements:
+            completed = dict(saved)
+            completed["retired"] = []
+            checkpoint_capture = _config_transition_save(checkpoint_path, completed, checkpoint_capture)
+        if last_handoff is not None and not os.path.lexists(last_handoff["journal_path"]):
+            retirements = {entry: api._release_publication_snapshot_payload(entry, captured)
+                           for entry, captured in consumed}
+            value = {"schema": _CONFIG_CHECKPOINT_SCHEMA, "transaction": str(tx),
+                     "root": dict(root), "head": api._release_publication_snapshot_payload(path, current),
+                     "receipt": last_handoff, "retired": list(retirements.values())}
+            checkpoint_capture = _config_transition_save(checkpoint_path, value, checkpoint_capture)
+            retire(retirements)
+            value["retired"] = []
+            _config_transition_save(checkpoint_path, value, checkpoint_capture)
+            return current, 0
+        return current, count
+
+    seen = set()
+    for count in range(_CONFIG_TRANSITION_LIMIT + 1):
+        entry = _config_transition_path(tx, head)
+        if entry in seen:
+            raise WrapperError("config transition chain contains a cycle")
+        seen.add(entry)
+        row, captured = _config_transition_read(entry)
+        if row is None:
+            _path, current = api._capture_anchored(path, label="activation config", parent_guards=parent_guards)
+            if api._release_publication_snapshot_payload(path, current) != head:
+                raise WrapperError("activation config changed without a lifecycle receipt")
+            return finish(current, count)
+        if count == _CONFIG_TRANSITION_LIMIT:
+            raise WrapperError("config transition chain exceeds its bound")
+        if set(row) != {"schema", "transaction", "root", "receipt"} or row.get("schema") != _CONFIG_TRANSITION_SCHEMA or row.get("transaction") != str(tx) or row.get("root") != head:
+            raise WrapperError("config transition receipt identity changed")
+        handoff = row.get("receipt")
+        before, guards, journal, expected_identity = _config_transition_handoff(tx, path, handoff, parent_guards)
+        if before != head:
+            raise WrapperError("config transition predecessor changed")
+        _journal, current_journal = api._capture_anchored(journal, label="config transition journal", parent_guards=guards)
+        if current_journal.snapshot.exists:
+            if expected_identity is None or current_journal.identity is None or not api._same_publication_journal_inode(current_journal.identity, expected_identity):
+                raise WrapperError("config transition journal inode changed")
+
+            def recovered(publication):
+                nonlocal captured, handoff
+                value = api._release_publication_receipt_payload(publication)
+                if (value["preimages"] != handoff["preimages"] or value["parents"] != handoff["parents"]
+                        or value["journal_path"] != handoff["journal_path"]
+                        or not api._same_publication_journal_inode(publication.journal_identity, expected_identity)):
+                    raise WrapperError("config transition recovery handoff changed")
+                handoff = value
+                row["receipt"] = value
+                captured = _config_transition_save(entry, row, captured)
+
+            outcome = manager.recover_publication_transaction(journal, after_recovery=recovered)
+            if outcome.get("ok") is not True:
+                raise WrapperError("config transition journal recovery failed")
+        if handoff.get("state") not in {"published", "recovered"}:
+            raise WrapperError("config transition lacks a durable postimage")
+        images = api._release_publication_image_map(handoff, "postimages")
+        if set(images) != {path} or images[path].get("exists") is not True:
+            raise WrapperError("config transition postimage is invalid")
+        successor = images[path]
+        consumed.append((entry, captured))
+        last_handoff = handoff
+        if successor == head:
+            # An intent-only crash can recover without changing the leaf.
+            _path, current = api._capture_anchored(path, label="activation config", parent_guards=parent_guards)
+            if api._release_publication_snapshot_payload(path, current) != head:
+                raise WrapperError("activation config changed after lifecycle recovery")
+            return finish(current, count + 1)
+        head = successor
+    raise WrapperError("config transition chain exceeds its bound")
+
+
+def _activation_config_context(path: Path):
+    from . import web_activation as api
+    evidence = path.parent / "recovery" / "activation-v2"
+    latest = evidence / "LATEST"
+    if not os.path.lexists(latest):
+        return None
+    _latest, capture = api._read_regular(latest, label="activation transaction pointer")
+    pointer_identity = capture.identity
+    pointer = api._strict_json_object(capture.snapshot.content, label="activation transaction pointer")
+    name = pointer.get("transaction")
+    if not isinstance(name, str) or not name.startswith("tx-") or Path(name).name != name:
+        raise WrapperError("activation config transaction pointer is invalid")
+    tx = evidence / name
+    _receipt, capture = api._read_regular(tx / "receipt.json", label="activation receipt")
+    receipt = api._strict_json_object(capture.snapshot.content, label="activation receipt")
+    if receipt.get("schema") != api.SCHEMA or receipt.get("tx_id") != name or Path(str(receipt.get("database"))).parent != path.parent:
+        raise WrapperError("activation config transaction identity is invalid")
+    if not receipt.get("mutation_started") or receipt.get("status") == "rolled-back" or receipt.get("rollback_service_restart") is not None:
+        return None
+    if path.name not in UNIT_CONFIG_NAMES:
+        raise WrapperError("activation config destination is invalid")
+    record = receipt.get("preimages", {}).get("wrapper:" + str(path))
+    if not isinstance(record, dict):
+        raise WrapperError("activation config lacks its outer preimage")
+    parsed = api._release_publication_record_state(receipt, key="package_publication")
+    if parsed is None or parsed[0].get("state") != "published":
+        raise WrapperError("activation config lacks its install receipt")
+    root = api._release_callback_postimage(api._release_publication_recovered_handoff(parsed[0]), path)
+    authority = (receipt.get("status"), receipt.get("mutation_started"),
+                 receipt.get("rollback_service_restart"), pointer_identity)
+    return tx, root, api._record_parent_guards(record, path), authority
+
+
+def _publish_activation_config_transition(snapshot: _UnitConfigSnapshot, content: bytes, mode: int) -> bool:
+    """Persist inner publication handoffs without racing the outer heartbeat."""
+    try:
+        context = _activation_config_context(snapshot.path)
+        if context is None:
+            return False
+        tx, root, guards, _authority = context
+        with _config_transition_lock(snapshot.path, guards):
+            if _activation_config_context(snapshot.path) != context:
+                raise WrapperError("activation config context changed while acquiring lifecycle lock")
+            return _publish_activation_config_locked(snapshot, content, mode, context)
+    except Exception as exc:
+        if isinstance(exc, WrapperError):
+            raise
+        raise WrapperError(f"activation config transition failed: {exc}") from exc
+
+
+def _publish_activation_config_locked(snapshot, content, mode, context):
+    from . import web_activation as api
+    manager = _release_publication_api()
+    tx, root, guards, _authority = context
+    current, count = _reconcile_activation_config_locked(tx, snapshot.path, root, guards)
+    if current != snapshot.preimage or count >= _CONFIG_TRANSITION_LIMIT:
+        raise WrapperError("activation config changed after lifecycle preflight")
+    spec = UNIT_SPEC_BY_NAME[snapshot.path.name[:-5]]
+    previous = _read_unit_config_bytes(current.snapshot.content, spec=spec)
+    _read_unit_config_bytes(content, spec=spec, expected_release_id=previous["release_id"])
+    head = api._release_publication_snapshot_payload(snapshot.path, current)
+    entry = _config_transition_path(tx, head)
+    old, captured = _config_transition_read(entry)
+    if old is not None and (old.get("receipt", {}).get("state") != "recovered" or api._release_publication_image_map(old["receipt"], "postimages") != {snapshot.path: head}):
+        raise WrapperError("config transition predecessor already has a successor")
+    row = {"schema": _CONFIG_TRANSITION_SCHEMA, "transaction": str(tx), "root": head, "receipt": {}}
+    journal = snapshot.path.parent / (".termdeck-publication-config-" + _sha256_bytes(_canonical_json([str(tx), head])) + ".json")
+
+    def checkpoint(publication):
+        nonlocal captured
+        if publication.state == "intent":
+            assert_context()
+        row["receipt"] = api._release_publication_receipt_payload(publication)
+        captured = _config_transition_save(entry, row, captured)
+
+    def assert_context():
+        if _activation_config_context(snapshot.path) != context:
+            raise WrapperError("activation config context changed before lifecycle publication")
+
+    manager._publish_files_transactionally(
+        ((snapshot.path, content, mode, f"unit config {snapshot.path.name}"),),
+        parent_guards=snapshot.parent_guards, expected_preimages={snapshot.path: snapshot.preimage},
+        journal_path=journal, before_publish=checkpoint, after_publish=checkpoint, after_recovery=checkpoint,
+        verify=assert_context,
+    )
+    _reconcile_activation_config_locked(tx, snapshot.path, root, guards)
+    return True
 
 
 def _carry_runtime_identity(

@@ -105,6 +105,49 @@ not install a checkout-importing watchdog or treat its installation as terminal
 recovery. The disposable activation tests cover interrupted publication,
 stale-worker rejection, A/B rollback and repeated frozen-watchdog execution.
 
+### Copied pre-wrapper installation
+
+The historical release `c9d6204ee6dbe01dc4225970cb41014e759d38146bef824b5fbda71cb3ed707c`
+used version 0.2.21 before the managed wrapper module existed. Its supported
+transition verifies the complete published wheel/build identity and the copied
+bootstrap, launcher, state and absent wrapper set. A missing module in any
+other modern release remains an error.
+
+Prepare a **new** transaction in the canonical recovery directory, including
+the historical paths as explicit rendering inputs:
+
+```sh
+python scripts/termdeck-web-activate.py --prepare \
+  --target /warp/projects/softwares/termdeck \
+  --evidence /warp/projects/softwares/termdeck/.termdeck/state/recovery/activation-v2 \
+  --migrate-from-root /warp/runtime/termdeck/t1000-managed \
+  --migrate-from-bin-dir /warp/runtime/termdeck/bin
+```
+
+The historical directories are never read or written. The request is retained
+in the prepared receipt; execute/rollback consume that exact request. Review
+the resulting artifacts and complete the installed preparer/attestor gates
+before using `TERMDECK_ACTIVATION_APPROVED=1 ... --execute --transaction PATH`.
+Custom evidence roots are rejected by execute before database snapshots or
+publication journals. A qualification-directory candidate must be prepared
+again in the canonical directory; do not edit or move its frozen receipt.
+
+Before selecting the new release, this transition stages a separate verified
+frozen recovery capsule within the transaction and arms its independent
+watchdog. Its loader verifies and captures Python bytes before importing them;
+neither the mutable checkout nor historical A provides the recovery code. The
+capsule and all release trees remain retained after success or failure.
+
+Rollback uses the same transaction (`... --rollback --transaction PATH`). It
+restores the original package bytes/modes, launcher path binding and wrapper
+absence through exact journal-owned inode transitions. This intentionally
+restores the original copied layout, including its retired-path limitation;
+it does not silently fabricate a repaired historical A. The retained capsule
+can also run `python -I -B PATH/legacy-recovery.py --rollback` independently of
+the checkout. Saved sessions, authentication and unrelated services are outside
+this path migration. Source/disposable tests do not prove host activation or
+live rollback acceptance.
+
 ## Cloudflare
 
 The preferred standalone public endpoint is a dedicated named tunnel with the configuration in `deploy/cloudflare/termdeck.yml.example` and a proxied CNAME from the public hostname to `<tunnel-id>.cfargotunnel.com`. The Cloudflare token used for DNS creation must have `Zone:DNS:Edit`; tunnel-management permission alone is insufficient. Application password/device authentication, same-origin CSRF checks, sequenced terminal input and single-controller fencing remain authoritative behind the tunnel.

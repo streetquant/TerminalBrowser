@@ -542,7 +542,8 @@ def _run(argv: Sequence[str], *, cwd: Path | None = None, env: Mapping[str, str]
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise WebActivationError(f"command could not complete: {argv[0]}") from exc
+        detail = exc.strerror if isinstance(exc, OSError) else "timeout"
+        raise WebActivationError(f"command could not complete: {argv[0]} ({detail})") from exc
     if check and result.returncode:
         detail = (result.stderr or result.stdout).strip().splitlines()
         raise WebActivationError(f"command failed: {Path(argv[0]).name}: {detail[-1] if detail else result.returncode}")
@@ -1371,6 +1372,9 @@ def _release_publication_callbacks(
             expected_release_id=expected_release_id,
             publication=publication,
         )
+        if operation == "install" and receipt.get("legacy_bootstrap") is not None:
+            from . import legacy_activation
+            legacy_activation.capture_package_preimages(paths, tx, receipt, publication)
         checkpoint(f"{operation}:publication-intent")
 
     def after(publication: release_manager.PublicationTransactionReceipt) -> None:
@@ -1390,6 +1394,9 @@ def _release_publication_callbacks(
             publication,
             operation=operation,
         )
+        if operation == "install" and receipt.get("legacy_bootstrap") is not None:
+            from . import legacy_activation
+            legacy_activation.capture_package_postimages(paths, tx, receipt, publication)
         record["state"] = "published"
         record["receipt"] = _release_publication_receipt_payload(publication)
         checkpoint(f"{operation}:publication-postimage")
@@ -1805,6 +1812,11 @@ def _recover_pending_release_publications(
                 # terminal fact must still be durable before RM retires the
                 # exact journal.
                 record["state"] = "recovered"
+                if receipt.get("legacy_bootstrap") is not None:
+                    from . import legacy_activation
+                    legacy_activation.capture_package_postimages(
+                        paths, tx, receipt, publication, recovered=True,
+                    )
                 checkpoint(f"{operation}:publication-recovered")
             recovery_callback_fired = True
 
@@ -1941,8 +1953,23 @@ def _assert_package_rollback_owned(
             label="managed package wrapper before rollback",
             parent_guards=parent_guards,
         )
-        _expected_postimage(path, current, postimage)
         callback_postimage = _release_callback_postimage(handoff, path)
+        if path.parent == paths.database.parent and path.name in service_wrappers.UNIT_CONFIG_NAMES:
+            tx = paths.evidence / str(receipt.get("tx_id"))
+            if tx.parent != paths.evidence or not tx.name.startswith("tx-"):
+                raise WebActivationError("config transition transaction is invalid")
+            try:
+                current, _count = service_wrappers.reconcile_activation_config(
+                    tx, path, callback_postimage, parent_guards,
+                )
+            except service_wrappers.WrapperError as exc:
+                raise WebActivationError(str(exc)) from exc
+            if not isinstance(wrapper_record, dict):
+                raise WebActivationError("config transition lacks a mutable outer receipt")
+            postimage = _postimage_payload(path, current, parent_guards)
+            wrapper_record["postimage"] = postimage
+            callback_postimage = _release_publication_snapshot_payload(path, current)
+        _expected_postimage(path, current, postimage)
         if (
             callback_postimage.get("exists") is not True
             or callback_postimage.get("sha256") != postimage.get("sha256")
@@ -1990,7 +2017,9 @@ def _copy(
     )
 
 
-def _watchdog_unit(paths: ActivationPaths, tx: Path) -> str:
+def _watchdog_unit(
+    paths: ActivationPaths, tx: Path, *, recovery_command: Sequence[str] | None = None,
+) -> str:
     # Recovery is itself a managed service.  Its generated wrapper carries
     # the source/evidence/runtime identity and invokes the watchdog using the
     # latest transaction pointer, so this fragment never embeds a stale
@@ -1999,13 +2028,18 @@ def _watchdog_unit(paths: ActivationPaths, tx: Path) -> str:
     # The generated recovery wrapper already embeds ``--watchdog --latest``.
     # Passing ``--latest`` a second time changes the managed command contract
     # and diverges from the static recovery unit.
-    command = shlex.join([str(wrapper)])
+    command = shlex.join(recovery_command or [str(wrapper)])
+    stop_command = (f"ExecStop={paths.managed_root / 'termdeck-web-recovery-stop'}\n"
+                    if recovery_command is None else "")
     runtime_root = _wrapper_runtime_root(paths)
     state_root = paths.database.parent
     writable = " ".join(
         str(path)
         for path in (
             paths.evidence,
+            # Canonical runtime contains state. Custom sibling layouts need
+            # an explicit grant for config CAS, lifecycle locks and inverse.
+            *((state_root,) if not state_root.is_relative_to(paths.runtime) else ()),
             paths.runtime,
             paths.unit_dir,
             paths.managed_root,
@@ -2040,7 +2074,7 @@ Environment=USER=max
 Environment=LOGNAME=max
 Environment=PATH={paths.managed_bin}:/usr/local/bin:/usr/bin:/bin
 ExecStart={command}
-ExecStop={paths.managed_root / "termdeck-web-recovery-stop"}
+{stop_command.rstrip()}
 Restart=on-failure
 RestartMode=direct
 KillMode=control-group
@@ -2116,9 +2150,17 @@ def prepare(
     *,
     reuse_web_binary: Path | None = None,
     reuse_web_source_commit: str | None = None,
+    migrate_from_root: Path | None = None,
+    migrate_from_bin_dir: Path | None = None,
 ) -> dict[str, object]:
+    if (migrate_from_root is None) != (migrate_from_bin_dir is None):
+        raise WebActivationError("legacy path migration requires both explicit historical paths")
     source = _source(paths)
     tx, receipt = new_transaction(paths, source)
+    if migrate_from_root is not None:
+        receipt["legacy_path_migration_request"] = {
+            "source_root": str(migrate_from_root), "source_bin_dir": str(migrate_from_bin_dir),
+        }
     try:
         artifacts = tx / "artifacts"
         package_dir = artifacts / "package"
@@ -4856,8 +4898,9 @@ def _arm(
     *,
     preimage: dict[str, object] | None = None,
     checkpoint: Callable[[str], None] | None = None,
+    recovery_command: Sequence[str] | None = None,
 ) -> None:
-    content = _watchdog_unit(paths, tx).encode()
+    content = _watchdog_unit(paths, tx, recovery_command=recovery_command).encode()
     if preimage is None:
         _atomic(paths.unit_dir / WATCHDOG_UNIT, content, 0o644)
     else:
@@ -4929,6 +4972,7 @@ def _install(
     *,
     before_publication: Callable[[release_manager.PublicationTransactionReceipt], None] | None = None,
     after_publication: Callable[[release_manager.PublicationTransactionReceipt], None] | None = None,
+    migration: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     result = install_release(
         str(package["wheel"]),
@@ -4939,6 +4983,8 @@ def _install(
         production=True,
         before_publication=before_publication,
         after_publication=after_publication,
+        **({"migrate_from_root": migration["source_root"],
+            "migrate_from_bin_dir": migration["source_bin_dir"]} if migration is not None else {}),
     )
     if result.get("ok") is not True:
         raise WebActivationError("qualified T1000 package install did not report success")
@@ -5188,6 +5234,10 @@ def _arm_and_record_watchdog(
 
     if arm_phase not in {"pre-package", "post-package"}:
         raise WebActivationError("recovery watchdog arm phase is invalid")
+    if receipt.get("legacy_bootstrap") is not None or receipt.get("recovery_capsule") is not None:
+        from . import legacy_activation
+        legacy_activation.arm(paths, tx, receipt, preimages, checkpoint)
+        return
     _watchdog_state_for_release(paths, expected_release_id)
     receipt["watchdog"] = {
         "unit": WATCHDOG_UNIT,
@@ -5473,6 +5523,9 @@ def _watchdog_owns_current_armed_identity(
     try:
         if not _watchdog_transaction_is_latest(paths, tx):
             return False
+        if receipt.get("legacy_bootstrap") is not None or receipt.get("recovery_capsule") is not None:
+            from . import legacy_activation
+            return legacy_activation.owns(paths, tx, receipt)
         watchdog = receipt.get("watchdog")
         if not isinstance(watchdog, Mapping) or watchdog.get("unit") != WATCHDOG_UNIT:
             return False
@@ -5617,6 +5670,16 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
         raise WebActivationError("execute requires an artifacts-staged transaction")
     if os.environ.get("TERMDECK_ACTIVATION_APPROVED") != "1":
         raise WebActivationError("live activation requires TERMDECK_ACTIVATION_APPROVED=1 after review")
+    if paths.evidence != paths.database.parent / "recovery" / "activation-v2":
+        raise WebActivationError("execute requires the recovery wrapper's canonical activation-v2 evidence root; prepare a new transaction there")
+    from . import legacy_activation
+    legacy_bootstrap = legacy_activation.prepare(paths, tx, receipt)
+    if legacy_bootstrap is not None:
+        receipt["legacy_bootstrap"] = legacy_bootstrap
+    else:
+        capsule = legacy_activation.prepare_recovery(paths, tx, receipt)
+        if capsule is not None:
+            receipt["recovery_capsule"] = capsule
     before = snapshot_database(paths, tx, "before")
     receipt["database_before"] = before
     receipt["processes_before"] = process_snapshot()
@@ -5705,6 +5768,7 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
             package,
             before_publication=install_before,
             after_publication=install_after,
+            **({"migration": legacy_bootstrap["migration"]} if legacy_bootstrap is not None else {}),
         )
         package_result = receipt.get("package_result")
         if not isinstance(package_result, Mapping):
@@ -6344,6 +6408,13 @@ def rollback(paths: ActivationPaths, tx: Path, *, reason: str) -> dict[str, obje
             ),
         )
         current_release_id = _managed_release_id(paths)
+        if receipt.get("legacy_bootstrap") is not None:
+            from . import legacy_activation
+            legacy_activation.restore_package(
+                paths, tx, receipt,
+                lambda record: _checkpoint_publication(paths, tx, receipt, record),
+            )
+            current_release_id = _managed_release_id(paths)
         receipt["package_rollback_required"] = current_release_id != old_release_id
         receipt["package_current_release_id"] = current_release_id
         _persist(paths, tx, receipt)
@@ -6621,10 +6692,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--latest", action="store_true")
     parser.add_argument("--reuse-web-binary", type=Path)
     parser.add_argument("--reuse-web-source-commit")
+    parser.add_argument("--migrate-from-root", type=Path)
+    parser.add_argument("--migrate-from-bin-dir", type=Path)
     for name in ("target", "evidence", "runtime", "database", "managed-root", "managed-bin", "unit-dir"):
         parser.add_argument("--" + name)
     args = parser.parse_args(argv)
     try:
+        if not args.prepare and (args.migrate_from_root is not None or args.migrate_from_bin_dir is not None):
+            raise WebActivationError("migration paths belong to --prepare; execute and rollback use that bound request")
         paths = _paths(args)
         if args.watchdog:
             tx = latest_transaction(paths) if args.latest else args.transaction
@@ -6638,6 +6713,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         paths,
                         reuse_web_binary=args.reuse_web_binary,
                         reuse_web_source_commit=args.reuse_web_source_commit,
+                        migrate_from_root=args.migrate_from_root,
+                        migrate_from_bin_dir=args.migrate_from_bin_dir,
                     )
                 elif args.execute:
                     if not args.transaction:

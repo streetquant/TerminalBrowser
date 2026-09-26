@@ -22,6 +22,7 @@ the managed runtime tree is never executed by this broker.
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import grp
 import hashlib
@@ -81,6 +82,8 @@ _DIAGNOSTIC_PHASES = frozenset({
 _DIAGNOSTIC_CATEGORIES = frozenset({
     "contract", "timeout", "execution-failed", "execution-permission-denied",
     "execution-unavailable", "child-refused", "child-failed",
+    "capabilities-unavailable", "capabilities-incomplete",
+    "missing-setuid-capability", "missing-setgid-capability",
 })
 _TLS_MODES = {
     "ca.crt": 0o644, "ca.key": 0o600, "server-chain.crt": 0o644,
@@ -277,6 +280,56 @@ def _resolve_principals(config: BrokerConfig) -> Principals:
     if preparer_gid in caller_groups:
         raise BrokerError("max may not join termdeck-preparer")
     return Principals(preparer_uid, preparer_gid, caller_uid, caller_gid)
+
+
+def _prepare_execution_capabilities(config: BrokerConfig) -> None:
+    """Require the service's real privileges and remove startup inheritance.
+
+    systemd v262's seccomp setup drops CAP_SETUID unless explicitly ambient.
+    The unit retains it across startup; this broker removes ambient and
+    inheritable capabilities before any helper is created. Effective and
+    permitted capabilities are preserved, never added or recovered.
+    """
+    if config.root_uid != 0:
+        # Offline transport tests model root with the test runner's UID.
+        # Production configuration is fixed at UID 0 and is not caller input.
+        return
+
+    class Header(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+    class Data(ctypes.Structure):
+        _fields_ = [("effective", ctypes.c_uint32), ("permitted", ctypes.c_uint32),
+                    ("inheritable", ctypes.c_uint32)]
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        capget, capset, prctl = libc.capget, libc.capset, libc.prctl
+        capget.argtypes = capset.argtypes = (ctypes.POINTER(Header), ctypes.POINTER(Data))
+        capget.restype = capset.restype = prctl.restype = ctypes.c_int
+        header, values = Header(0x20080522, 0), (Data * 2)()
+        if capget(ctypes.byref(header), values) != 0:
+            raise BrokerError("could not inspect execution capabilities", category="capabilities-unavailable")
+        effective = values[0].effective | (values[1].effective << 32)
+        permitted = values[0].permitted | (values[1].permitted << 32)
+        for bit, category in ((7, "missing-setuid-capability"), (6, "missing-setgid-capability")):
+            if not effective & permitted & (1 << bit):
+                raise BrokerError("required credential capability is absent", category=category)
+        required = sum(1 << bit for bit in (0, 1, 5, 6, 7))
+        if effective & permitted & required != required:
+            raise BrokerError("required execution capabilities are absent", category="capabilities-incomplete")
+        before = tuple((value.effective, value.permitted) for value in values)
+        # PR_CAP_AMBIENT_CLEAR_ALL; this only removes capabilities.
+        if prctl(47, 4, 0, 0, 0) != 0:
+            raise BrokerError("could not clear ambient capabilities", category="capabilities-unavailable")
+        for value in values:
+            value.inheritable = 0
+        if capset(ctypes.byref(header), values) != 0 or capget(ctypes.byref(header), values) != 0:
+            raise BrokerError("could not clear inheritable capabilities", category="capabilities-unavailable")
+        if tuple((value.effective, value.permitted) for value in values) != before or any(value.inheritable for value in values):
+            raise BrokerError("execution capabilities changed during preparation", category="capabilities-unavailable")
+    except (AttributeError, OSError) as exc:
+        raise BrokerError("execution capabilities are unavailable", category="capabilities-unavailable") from exc
 
 
 def _assert_root_invoker(config: BrokerConfig) -> None:
@@ -1250,6 +1303,7 @@ def serve_once(
 
     _assert_root_invoker(config)
     principals = resolve_principals(config)
+    _prepare_execution_capabilities(config)
     _validate_listener(listener, config=config)
     _validate_socket_path(config, principals)
     listener.settimeout(config.request_timeout)

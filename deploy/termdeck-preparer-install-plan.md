@@ -50,6 +50,28 @@ configuration that assigns `/warp/projects/softwares/termdeck/.termdeck` to the
 preparer account or places the producer receipt and recovery authenticator in
 that max-readable tree.
 
+The broker service requires `CAP_SETUID` in its startup ambient set because
+systemd v262 drops that capability during seccomp setup when it is not ambient,
+even if the bounding set includes it. The bounding set remains exactly
+`CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_KILL`. Before accepting a
+request or seeding runtime files, the broker verifies the required effective
+and permitted capabilities, then clears ambient and inheritable capabilities.
+The preparer still runs from its pinned descriptor with its dedicated UID/GID,
+empty supplementary groups and no capabilities. A missing capability is a
+bounded startup refusal; the broker never restores or adds a capability.
+
+The socket keeps pending connections across service exit (`Accept=no`,
+`FlushPending=no`, backlog 8). A response can arrive before systemd observes
+the one-request broker's exit; flushing at that point loses an immediately
+queued verification or rollback request. Each new broker process accepts one
+connection and independently checks its `SO_PEERCRED` before reading the closed
+request protocol. Requests remain serialized, and clients must never replay
+an ambiguously completed preparation or restoration. Qualify this lifecycle
+with disposable user socket/service units: queue a second request after the
+first response but before the first process exits, verify that flushing drops
+it, then prove that retaining the queue serves it exactly once in a distinct
+authenticated invocation.
+
 ## Source qualification gate
 
 Run these checks from the exact reviewed repository root before staging or

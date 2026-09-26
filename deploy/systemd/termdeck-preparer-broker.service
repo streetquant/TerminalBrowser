@@ -37,7 +37,10 @@ BindPaths=/warp/projects/softwares/termdeck/.termdeck
 
 NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_KILL
-AmbientCapabilities=
+# systemd v262 otherwise drops CAP_SETUID during seccomp setup. The broker
+# verifies its effective/permitted set, then clears ambient and inheritable
+# capabilities before spawning helpers or accepting a preparation request.
+AmbientCapabilities=CAP_SETUID
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateMounts=yes

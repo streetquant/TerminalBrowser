@@ -133,7 +133,9 @@ def test_broker_socket_is_private_to_the_fixed_max_caller() -> None:
     assert values["Accept"] == ["no"]
     assert values["FileDescriptorName"] == ["termdeck-preparer-broker"]
     assert values["Service"] == ["termdeck-preparer-broker.service"]
+    assert values["Backlog"] == ["8"]
     assert values["RemoveOnStop"] == ["yes"]
+    assert values["FlushPending"] == ["no"]
 
 
 def test_broker_is_socket_only_root_dispatch_with_fixed_child_state_paths() -> None:
@@ -158,7 +160,7 @@ def test_broker_is_socket_only_root_dispatch_with_fixed_child_state_paths() -> N
     assert values["CapabilityBoundingSet"] == [
         "CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_KILL"
     ]
-    assert values["AmbientCapabilities"] == [""]
+    assert values["AmbientCapabilities"] == ["CAP_SETUID"]
     assert values["NoNewPrivileges"] == ["yes"]
     assert values["RestrictAddressFamilies"] == ["AF_UNIX AF_NETLINK"]
     assert "PrivateNetwork" not in values

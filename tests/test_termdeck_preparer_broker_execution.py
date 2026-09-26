@@ -41,6 +41,10 @@ import json, os, sys
 assert os.getresuid() == (101, 101, 101)
 assert os.getresgid() == (101, 101, 101)
 assert os.getgroups() == []
+capabilities = {key:value.strip() for key,value in (line.split(':',1) for line in open('/proc/self/status'))
+                if key in ('CapEff','CapPrm','CapInh','CapAmb','NoNewPrivs')}
+assert all(int(capabilities[key],16) == 0 for key in ('CapEff','CapPrm','CapInh','CapAmb'))
+assert capabilities['NoNewPrivs'] == '1'
 assert os.environ.get('TERMDECK_PREPARER_BROKER') == '1'
 assert 'BROKER_PARENT_SECRET' not in os.environ
 print('fixture-child-stderr-private-token', file=sys.stderr)

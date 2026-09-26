@@ -87,6 +87,14 @@ def _shared_asset_path(path, *, state_root, auth_directory, account_source,
     """Check the resolved grant, not merely the shared asset's link name."""
     target = Path(path).resolve(strict=True)
     target = _host_path(str(target), directory=target.is_dir())
+    _validate_shared_location(target, state_root=state_root, auth_directory=auth_directory,
+                              account_source=account_source, private_home=private_home,
+                              workspace=workspace, shared_names=shared_names)
+    return str(target)
+
+
+def _validate_shared_location(target, *, state_root, auth_directory, account_source,
+                              private_home, workspace, shared_names):
     source = Path(account_source)
     private = (Path(auth_directory), Path(state_root) / "terminal-auth", Path(private_home))
     runtime = (*_runtime_roots(state_root), *(Path(workspace) / n for n in _MASKED_NAMES))
@@ -107,7 +115,76 @@ def _shared_asset_path(path, *, state_root, auth_directory, account_source,
         raise StagingError("Shared asset would expose runtime storage", "unsafe-storage")
     if ".beads" in target.parts or ".termdeck" in target.parts and not source_asset:
         raise StagingError("Shared asset would expose protected storage", "unsafe-storage")
-    return str(target)
+
+
+def _shared_asset_mounts(home, *, state_root, auth_directory, account_source, workspace):
+    """Keep prepared links reachable without importing their parent directories.
+
+    Only the preparation catalogue supplies asset names. Nested links and paths
+    mentioned in configuration never acquire additional filesystem authority.
+    """
+    from .codex_config_scope import _canonical_assets, CodexConfigScopeError
+    try:
+        assets = [asset for asset in _canonical_assets(Path(account_source)) if asset[0] != ".env"]
+        checks = dict(state_root=state_root, auth_directory=auth_directory,
+                      account_source=account_source, private_home=home, workspace=workspace,
+                      shared_names={name for name, _path, _directory in assets})
+        mounts = {}
+        for name, canonical, _directory in assets:
+            private = Path(home) / name
+            if not private.is_symlink():
+                continue
+            target = Path(_shared_asset_path(private, **checks))
+            if target != canonical.resolve(strict=True):
+                raise StagingError("Shared asset binding changed", "unsafe-storage")
+            # Existing valid links can point directly at a target or use a
+            # different alias. Do not rewrite any host or private symlink.
+            alias = Path(os.path.abspath(private.parent / os.readlink(private)))
+            for destination in (target, canonical, alias):
+                _validate_shared_location(destination, **checks)
+                previous = mounts.setdefault(destination, target)
+                if previous != target:
+                    raise StagingError("Shared asset mount destinations conflict", "unsafe-storage")
+        ordered = sorted(mounts.items(), key=lambda item: (len(item[0].parts), str(item[0])))
+        result = []
+        for destination, target in ordered:
+            for parent_target, parent_destination in result:
+                if _within(destination, parent_destination):
+                    relative = destination.relative_to(parent_destination)
+                    if target != parent_target / relative:
+                        raise StagingError("Shared asset mount destinations overlap", "unsafe-storage")
+                    break  # Already exposed at this exact location by its parent.
+            else:
+                result.append((target, destination))
+        return tuple((str(target), str(destination)) for target, destination in result)
+    except (OSError, RuntimeError, CodexConfigScopeError) as exc:
+        raise StagingError("Shared asset catalogue cannot be validated", "unsafe-storage") from exc
+
+
+def _prepare_private_log_directory(home):
+    """Create only a direct, owned private directory; refuse existing aliases."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    root = log = None
+    try:
+        root = os.open(home, flags)
+        info = os.fstat(root)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise StagingError("Private Codex home has unsafe authority", "unsafe-storage")
+        try:
+            os.mkdir("log", 0o700, dir_fd=root)
+        except FileExistsError:
+            pass
+        log = os.open("log", flags, dir_fd=root)
+        info = os.fstat(log)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise StagingError("Private Codex log directory has unsafe authority", "unsafe-storage")
+    except OSError as exc:
+        raise StagingError("Private Codex log directory is unavailable", "unsafe-storage") from exc
+    finally:
+        if log is not None:
+            os.close(log)
+        if root is not None:
+            os.close(root)
 
 
 def _host_path(value, *, directory=False):
@@ -199,6 +276,7 @@ def _launch_binding(record):
 
 def _runtime_argv(value, plan, home, conversation=None):
     argv = [value["codex"]["executable"], "-c", f"sqlite_home={json.dumps(home)}",
+            "-c", f"log_dir={json.dumps(str(Path(home) / 'log'))}",
             "--sandbox", "workspace-write", "--ask-for-approval", "on-request"]
     if conversation:
         return [*argv, "resume", conversation]
@@ -485,7 +563,7 @@ def start(store,actor,result,*,backend=None):
         finally: tree.close()
 
 
-def sandbox_argv(workspace,attachments,*,runtime_argv,codex_home=None,asset_paths=(),scope_environment=None,workspace_directory=None):
+def sandbox_argv(workspace,attachments,*,runtime_argv,codex_home=None,asset_paths=(),asset_mounts=(),scope_environment=None,workspace_directory=None):
     """A mount namespace contains system libraries and explicit task authority."""
     args=["/usr/bin/bwrap","--die-with-parent","--unshare-all","--share-net","--new-session","--clearenv",
           "--ro-bind","/usr","/usr","--symlink","usr/bin","/bin","--symlink","usr/lib","/lib","--symlink","usr/lib","/lib64",
@@ -507,6 +585,7 @@ def sandbox_argv(workspace,attachments,*,runtime_argv,codex_home=None,asset_path
     for key, value in (scope_environment or {}).items():
         args.extend(["--setenv", key, value])
     for source in asset_paths: args.extend(["--ro-bind",source,source])
+    for source, destination in asset_mounts: args.extend(["--ro-bind",source,destination])
     args.extend(["--chdir",workspace,"--",*runtime_argv])
     return args
 
@@ -556,6 +635,7 @@ def execute(args):
             runtime=["/usr/bin/bash","--noprofile","--norc","-i"]
             codex_home=None
             assets=[]
+            asset_mounts=()
             scope_environment = {}
             if plan["runtime"]=="codex":
                 if not value["codex"]: raise StagingError("TermDeck Codex runtime unavailable")
@@ -568,16 +648,11 @@ def execute(args):
                 if not executable.startswith("/usr/"): assets.append(executable)
                 # Resolve only explicitly shared non-auth assets. Neither the
                 # account catalogue nor another terminal home is mounted.
-                from .codex_config_scope import _SHARED_FILES, _SHARED_DIRECTORIES
-                shared_names = set((*_SHARED_FILES, *_SHARED_DIRECTORIES)) - {".env"}
-                for name in sorted(shared_names):
-                    path=Path(codex_home)/name
-                    if path.is_symlink() and path.exists():
-                        assets.append(_shared_asset_path(
-                            path, state_root=store.root.parent, auth_directory=store.auth_directory,
-                            account_source=value["codex"]["account_source"], private_home=codex_home,
-                            workspace=plan["workspace"]["path"], shared_names=shared_names,
-                        ))
+                asset_mounts = _shared_asset_mounts(
+                    codex_home, state_root=store.root.parent, auth_directory=store.auth_directory,
+                    account_source=value["codex"]["account_source"], workspace=plan["workspace"]["path"],
+                )
+                _prepare_private_log_directory(codex_home)
                 credential=Path(codex_home)/"auth.json"
                 if credential.is_symlink():
                     from .codex_auth import read_auth_state
@@ -597,7 +672,7 @@ def execute(args):
                     "PATH": str(Path(codex_home) / "bin") + ":/usr/bin"}
                 runtime = _runtime_argv(value, plan, codex_home, conversation)
             with _plan_workspace(store, plan, value, inspect=True) as directory:
-                command=sandbox_argv(plan["workspace"]["path"],[a["server_path"] for a in plan["attachments"]],runtime_argv=runtime,codex_home=codex_home,asset_paths=assets,scope_environment=scope_environment,workspace_directory=directory)
+                command=sandbox_argv(plan["workspace"]["path"],[a["server_path"] for a in plan["attachments"]],runtime_argv=runtime,codex_home=codex_home,asset_paths=assets,asset_mounts=asset_mounts,scope_environment=scope_environment,workspace_directory=directory)
                 tree.check()
                 directory.check()
                 os.set_inheritable(directory.fd, True)

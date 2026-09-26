@@ -114,7 +114,11 @@ def prepare_legacy_path_migration(
         if manager._path_lexists(path):
             raise manager.ReleaseError("legacy path migration cannot rewrite existing path-bound history")
     api = manager._service_wrapper_api()
-    kwargs = manager._wrapper_layout_kwargs(layout, current)
+    # The positively identified pre-wrapper release never shipped the module
+    # required by modern wrapper execution.  An absent wrapper set is the
+    # only supported baseline; this does not render or execute an A wrapper.
+    profile = manager._verified_pre_wrapper_profile(layout, current)
+    kwargs = manager._wrapper_layout_kwargs(layout, None if profile else current)
     wrapper_paths = tuple(manager._wrapper_path_set(api, kwargs, current))
     if any(manager._path_lexists(path) for path in wrapper_paths):
         raise manager.ReleaseError("legacy path migration requires an absent managed wrapper set")

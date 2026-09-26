@@ -36,7 +36,7 @@ from termdeck.build_info import (
 def _paths(tmp_path: Path) -> activation.ActivationPaths:
     return activation.ActivationPaths(
         target=tmp_path / "source",
-        evidence=tmp_path / "evidence",
+        evidence=tmp_path / "recovery" / "activation-v2",
         runtime=tmp_path / "runtime" / "termdeck-lan",
         database=tmp_path / "sessions.sqlite3",
         managed_root=tmp_path / "managed",
@@ -94,7 +94,7 @@ def _release_record_hash(content: bytes) -> str:
     ).decode("ascii")
 
 
-def _release_artifact(tmp_path: Path, seed: str) -> tuple[Path, Path, dict[str, object]]:
+def _release_artifact(tmp_path: Path, seed: str, *, module_overrides: dict[str, bytes] | None = None) -> tuple[Path, Path, dict[str, object]]:
     """Build a self-contained, authenticated wheel for activation rollback tests."""
 
     # Current managed releases must bind wrapper execution to their frozen
@@ -116,6 +116,7 @@ def _release_artifact(tmp_path: Path, seed: str) -> tuple[Path, Path, dict[str, 
         str(path.relative_to(project)): path.read_bytes()
         for path in sorted(package.rglob("*.py"))
     }
+    members.update(module_overrides or {})
     # The staged-import and historical-activation checks both import from the
     # wheel.  Keep their small public surface version-consistent while carrying
     # the real release-manager dependency graph for the authenticated rollback.
@@ -170,7 +171,7 @@ def _integration_paths(tmp_path: Path) -> activation.ActivationPaths:
     # preimages cover the wrappers that the real package transaction changes.
     return activation.ActivationPaths(
         target=Path(__file__).parents[1].resolve(),
-        evidence=tmp_path / "evidence",
+        evidence=tmp_path / "state" / "recovery" / "activation-v2",
         runtime=tmp_path / "termdeck-lan",
         database=tmp_path / "state" / "sessions.sqlite3",
         managed_root=tmp_path / "managed",
@@ -1101,6 +1102,7 @@ def test_custom_watchdog_command_and_write_scope_are_complete(tmp_path: Path) ->
     read_write_paths = set(shlex.split(properties["ReadWritePaths"]))
     for path in (
         paths.evidence,
+        paths.database.parent,
         paths.runtime,
         paths.unit_dir,
         paths.managed_root,
@@ -1484,6 +1486,8 @@ def test_watchdog_rejects_checkout_binding_drift_before_service_mutation(
 def test_package_effect_before_receipt_ack_is_rolled_back_by_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from termdeck import legacy_activation
+    monkeypatch.setattr(legacy_activation, "prepare_recovery", lambda *_args: None)
     paths = _paths(tmp_path)
     paths.target.mkdir()
     paths.managed_root.mkdir()
@@ -1607,7 +1611,14 @@ def test_real_a_to_b_post_install_failure_rolls_back_before_outer_wrapper_restor
     """Exercise the real release-manager rollback while B wrappers are live."""
 
     paths = _integration_paths(tmp_path)
-    wheel_a, manifest_a, release_a = _release_artifact(tmp_path, "a")
+    # Authenticate an existing committed A that has no lifecycle handoff
+    # implementation. Recovery must execute B's capsule before any A config
+    # is changed; rebuilding A with current wrapper code would miss this gap.
+    project = Path(__file__).parents[1]
+    old_revision = "26913eb70ce391bf59317b5d254de99b0d55198d"
+    old_wrappers = subprocess.check_output(["git", "show", old_revision + ":termdeck/service_wrappers.py"], cwd=project)
+    assert b"def _publish_activation_config_transition" not in old_wrappers
+    wheel_a, manifest_a, release_a = _release_artifact(tmp_path, "a", module_overrides={"termdeck/service_wrappers.py": old_wrappers})
     wheel_b, manifest_b, release_b = _release_artifact(tmp_path, "b")
     monkeypatch.setattr(
         release_manager,
@@ -1659,8 +1670,8 @@ def test_real_a_to_b_post_install_failure_rolls_back_before_outer_wrapper_restor
     assert not paths.recovery_required.exists()
     watchdog = final["watchdog"]
     assert isinstance(watchdog, dict)
-    assert watchdog["arm_phase"] == "pre-package"
-    assert watchdog["armed_identity"]["release_id"] == old_release_id
+    assert watchdog["arm_phase"] == "recovery-capsule"
+    assert final["recovery_capsule"]["original_state"]["release_id"] == old_release_id
     history = final["phase_history"]
     assert isinstance(history, list)
     assert history.index("watchdog-armed") < history.index("package-installing")
@@ -2062,6 +2073,8 @@ def test_hard_death_after_inverse_callback_retries_distinct_release_journal(
 def test_execute_publishes_units_before_stopping_web_services(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from termdeck import legacy_activation
+    monkeypatch.setattr(legacy_activation, "prepare_recovery", lambda *_args: None)
     paths = _paths(tmp_path)
     paths.target.mkdir()
     paths.managed_root.mkdir()
@@ -2766,6 +2779,8 @@ def test_start_failure_after_lan_preparation_adopts_generated_outputs_before_rol
     monkeypatch: pytest.MonkeyPatch,
     failure_phase: str,
 ) -> None:
+    from termdeck import legacy_activation
+    monkeypatch.setattr(legacy_activation, "prepare_recovery", lambda *_args: None)
     """A start failure before normal capture still leaves generated B rollback-owned."""
 
     paths = _paths(tmp_path)
@@ -2947,6 +2962,8 @@ def test_published_postimage_is_durable_before_simulated_process_crash(
     crash_record: str,
     old_release_id: str | None,
 ) -> None:
+    from termdeck import legacy_activation
+    monkeypatch.setattr(legacy_activation, "prepare_recovery", lambda *_args: None)
     """Every published leaf is durable enough for a new process to roll back."""
 
     paths = _paths(tmp_path)
@@ -3163,6 +3180,8 @@ def test_a_to_b_crash_after_armed_receipt_before_install_recovers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from termdeck import legacy_activation
+    monkeypatch.setattr(legacy_activation, "prepare_recovery", lambda *_args: None)
     """A's verified watchdog survives the pre-B package crash boundary."""
 
     paths = _paths(tmp_path)

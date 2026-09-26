@@ -364,6 +364,87 @@ else: raise AssertionError('attachment writable')
     assert (repository / ".beads/sentinel").read_text() == "ledger fixture"
 
 
+def test_prepared_asset_aliases_and_extra_config_resolve_without_catalogue_grant(configured):
+    store, _, workspace, _ = configured
+    source = store.root.parent / "catalogue"
+    source.mkdir(mode=0o700)
+    private = store.root.parent / "terminal-auth/current"
+    private.mkdir(parents=True, mode=0o700)
+    external = workspace.with_name(workspace.name + "-shared-skills")
+    external.mkdir(mode=0o700)
+    (external / "SKILL.md").write_text("approved skill")
+    (source / "skills").symlink_to(external, target_is_directory=True)
+    for name in ("config.toml", "extra.config.toml"):
+        (source / name).write_text("fixture = true\n")
+        (source / name).chmod(0o600)
+    for name in ("skills", "config.toml", "extra.config.toml"):
+        (private / name).symlink_to(source / name)
+    for name in ("auth.json", ".env", "unselected"):
+        (source / name).write_text("must remain outside")
+        (source / name).chmod(0o600)
+    (external / "unapproved-link").symlink_to(source / "auth.json")
+    (private / ".env").symlink_to(source / ".env")
+    links_before = {p.name: os.readlink(p) for p in private.iterdir()}
+    mounts = launch._shared_asset_mounts(
+        private, state_root=store.root.parent, auth_directory=store.auth_directory,
+        account_source=source, workspace=workspace,
+    )
+    code = '''import pathlib,sys
+private,source = map(pathlib.Path,sys.argv[1:])
+assert (private/'skills/SKILL.md').read_text() == 'approved skill'
+assert not (private/'skills/unapproved-link').exists()
+for name in ('config.toml','extra.config.toml'):
+    assert (private/name).read_text() == 'fixture = true\\n'
+    try:
+        (private/name).write_text('changed')
+    except OSError:
+        pass
+    else:
+        raise AssertionError('shared configuration was writable')
+for name in ('auth.json','.env','unselected'):
+    assert not (source/name).exists()
+assert not (private/'.env').exists()
+'''
+    argv = launch.sandbox_argv(str(workspace), [], codex_home=str(private),
+        asset_mounts=mounts, runtime_argv=[sys.executable, "-c", code, str(private), str(source)])
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    assert completed.returncode == 0, completed.stderr
+    assert {p.name: os.readlink(p) for p in private.iterdir()} == links_before
+    assert (source / "extra.config.toml").read_text() == "fixture = true\n"
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "public-mode", "file"])
+def test_private_log_refuses_unsafe_existing_destination(tmp_path, unsafe):
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    if unsafe == "symlink":
+        (private / "log").symlink_to(outside, target_is_directory=True)
+    elif unsafe == "file":
+        (private / "log").write_text("preserve")
+    else:
+        (private / "log").mkdir(mode=0o755)
+        (private / "log").chmod(0o755)
+    with pytest.raises(cf.StagingError, match="log directory"):
+        launch._prepare_private_log_directory(private)
+    assert not list(outside.iterdir())
+
+
+def test_private_log_is_idempotent_and_native_paths_stay_private(tmp_path):
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    launch._prepare_private_log_directory(private)
+    identity = (private / "log").stat().st_ino
+    launch._prepare_private_log_directory(private)
+    assert (private / "log").stat().st_ino == identity
+    assert (private / "log").stat().st_mode & 0o777 == 0o700
+    argv = launch._runtime_argv({"codex": {"executable": "/usr/bin/codex"}},
+                               {"task": "task", "attachments": []}, str(private))
+    assert "sqlite_home=" + json.dumps(str(private)) in argv
+    assert "log_dir=" + json.dumps(str(private / "log")) in argv
+
+
 @pytest.mark.parametrize("masked_source", [False, True])
 def test_safe_shared_assets_and_selected_file_do_not_expose_catalogue(configured, masked_source):
     store, _, workspace, _ = configured

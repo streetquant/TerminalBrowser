@@ -127,6 +127,26 @@ _CANONICAL_WHEEL_METADATA_MIN_VERSION = (0, 2, 14)
 # inside their frozen wheel site.  Older rollback fixtures legitimately lack
 # those modules, so they retain their historical source-root wrappers.
 _IMMUTABLE_WRAPPER_EXECUTION_MIN_VERSION = (0, 2, 21)
+# This published 0.2.21 artifact predates the immutable wrapper module.  Its
+# complete release identity, rather than a missing file or the shared version
+# number, admits the one-time copied-layout transition.  Modern 0.2.21 wheels
+# continue to require all immutable execution modules.
+_PRE_WRAPPER_V1_MANIFEST = {
+    "schema": "t1000.release-manifest.v1",
+    "release_id": "c9d6204ee6dbe01dc4225970cb41014e759d38146bef824b5fbda71cb3ed707c",
+    "wheel": "t1000-0.2.21-py3-none-any.whl",
+    "wheel_sha256": "491fdd87ef8b97d488a456f1d5f893f284bf227693d2e7f7a61a30b2b09c080e",
+    "wheel_size": 566658,
+    "build_info": {
+        "schema": "t1000.build-info.v1",
+        "build_id": "4b120c724baba9fbc73426c6a4b4f05a3b95f32209e20918d754596e450c55ac",
+        "build_mode": "release",
+        "source_commit": "cc9e96dad9af251d2b86c9b35dc9e322fb7b3d40",
+        "source_date_epoch": 1789377339,
+        "source_tree_sha256": "238474e3d0510c294096f25abc0d970d7cca960f13de849e2001338cd18c967c",
+        "version": "0.2.21",
+    },
+}
 _ZIP_CENTRAL_SIGNATURE = b"PK\x01\x02"
 _ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
 _ZIP_CENTRAL_HEADER_BYTES = 46
@@ -6419,6 +6439,33 @@ def _release_requires_immutable_wrapper_execution(
     return numeric >= _IMMUTABLE_WRAPPER_EXECUTION_MIN_VERSION
 
 
+def _verified_pre_wrapper_profile(
+    layout: ReleaseLayout, release_id: str,
+) -> dict[str, object] | None:
+    """Identify the exact published legacy wheel without relaxing modern A.
+
+    This grants no wrapper execution authority.  Callers must additionally
+    prove the complete wrapper set absent and authenticate the copied
+    bootstrap/launcher through ``prepare_legacy_path_migration``.
+    """
+
+    if release_id != _PRE_WRAPPER_V1_MANIFEST["release_id"]:
+        return None
+    release = layout.releases_dir / release_id
+    verify_installed_tree(release)
+    manifest = read_json(release / "manifest.json", label="legacy release manifest")
+    if manifest != _PRE_WRAPPER_V1_MANIFEST:
+        raise ReleaseError("legacy compatibility release identity changed")
+    if _path_lexists(release / "site/termdeck/service_wrappers.py"):
+        raise ReleaseError("legacy compatibility release contains an unexpected wrapper module")
+    return {
+        "schema": "t1000.pre-wrapper-release.v1",
+        "release_id": release_id,
+        "manifest_sha256": _regular_file_hash(release / "manifest.json", label="legacy manifest"),
+        "wheel_sha256": manifest["wheel_sha256"],
+    }
+
+
 def _release_wrapper_execution_kwargs(
     layout: ReleaseLayout,
     release_id: str,
@@ -6918,13 +6965,19 @@ def _verify_service_wrapper_prepublication(
     # Existing A wrappers can have a different immutable site root from the
     # B set we are about to render.  Their manifest must be checked against
     # A's verified binding, never re-rendered through B's import root.
+    legacy_profile = (
+        _verified_pre_wrapper_profile(layout, expected_release_id)
+        if expected_release_id is not None else None
+    )
     current_kwargs = (
-        _wrapper_layout_kwargs(layout, expected_release_id)
+        _wrapper_layout_kwargs(layout, None if legacy_profile else expected_release_id)
         if expected_release_id is not None
         else dict(kwargs)
     )
     manifest_path = _service_wrapper_manifest_path(current_kwargs)
     present = {path for path in paths if _path_lexists(path)}
+    if legacy_profile is not None and present:
+        raise ReleaseError("legacy compatibility requires an absent managed wrapper set")
     if not _path_lexists(manifest_path):
         if present:
             raise ReleaseError(

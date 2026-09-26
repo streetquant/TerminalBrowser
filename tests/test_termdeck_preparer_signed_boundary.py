@@ -12,6 +12,7 @@ import sys
 
 import pytest
 
+from test_termdeck_preparer_execution_policy import SERVICE_POLICY
 from test_termdeck_web_prepare_runtime import _make_layout, _run
 
 
@@ -30,6 +31,20 @@ bootstrap = runpy.run_path('/usr/libexec/termdeck-preparer-state')
 modules = bootstrap['_load_private_package']()
 attest = modules['termdeck.runtime_attestation']
 config = broker.BrokerConfig()
+policy_proc_mount()
+capability_transitions = []
+prepare_capabilities = broker._prepare_execution_capabilities
+def observe_capabilities(config):
+    before = policy_state()
+    prepare_capabilities(config)
+    after = policy_state()
+    assert all(int(before[key],16) == 0xe3 for key in ('CapEff','CapPrm','CapBnd'))
+    assert int(before['CapInh'],16) == int(before['CapAmb'],16) == 0x80
+    assert all(int(after[key],16) == 0xe3 for key in ('CapEff','CapPrm','CapBnd'))
+    assert int(after['CapInh'],16) == int(after['CapAmb'],16) == 0
+    assert after['NoNewPrivs'] == '1' and after['Seccomp'] == '2'
+    capability_transitions.append({'before':before,'after':after})
+broker._prepare_execution_capabilities = observe_capabilities
 
 def directory(path, uid=0, gid=0, mode=0o755):
     for parent in reversed(path.parents):
@@ -101,6 +116,7 @@ def exchange(mode, generation=None):
         listener.listen(1)
         def serve():
             try:
+                install_service_policy()
                 outcomes.append(broker.serve_once(listener, config=config))
             except BaseException as error:
                 failures.append(error)
@@ -205,7 +221,9 @@ try:
     print(json.dumps({'ok':True,'algorithm':'ed25519-openssl-pkeyutl.v1',
                       'producer_uid':101,'consumer_uid':202,'signer_uid':0,
                       'frame_bytes':max(frame_bytes,b_frame_bytes,restored_frame_bytes),
-                      'records':len(records),'full_inverse_replay':True,'tls_inverse_replay':True}))
+                      'records':len(records),'full_inverse_replay':True,'tls_inverse_replay':True,
+                      'capability_policy':capability_transitions[0],
+                      'policy_qualified_requests':len(capability_transitions)}))
 finally:
     daemon.terminate()
     daemon.wait(timeout=10)
@@ -230,17 +248,20 @@ def test_real_preparer_signer_and_publisher_use_separate_principals(tmp_path: Pa
         if directory_path.is_dir():
             directory_path.chmod(0o755)
     probe = tmp_path / "probe.py"
-    probe.write_text(PROBE)
+    probe.write_text(SERVICE_POLICY + PROBE)
     python_library = f"python{sys.version_info.major}.{sys.version_info.minor}"
     command = [
         "unshare", "--user", "--map-root-user", "--map-auto", "--setgroups", "allow", "--",
         "bwrap", "--unshare-pid", "--unshare-net", "--unshare-ipc", "--unshare-uts",
         "--die-with-parent", "--new-session", "--clearenv", "--setenv", "PATH", "/usr/bin",
+        "--cap-drop", "ALL",
         "--cap-add", "CAP_CHOWN", "--cap-add", "CAP_DAC_OVERRIDE", "--cap-add", "CAP_NET_ADMIN",
         "--cap-add", "CAP_SETUID", "--cap-add", "CAP_SETGID",
+        "--cap-add", "CAP_KILL", "--cap-add", "CAP_SETPCAP", "--cap-add", "CAP_SYS_ADMIN",
         "--ro-bind", "/usr", "/host-usr", "--dir", "/usr",
         "--symlink", "/host-usr/bin", "/usr/bin", "--dir", "/usr/lib",
         "--symlink", f"/host-usr/lib/{python_library}", f"/usr/lib/{python_library}",
+        "--symlink", "/host-usr/lib/systemd", "/usr/lib/systemd",
         "--symlink", "/host-usr/lib", "/lib", "--symlink", "/host-usr/lib", "/lib64",
         "--symlink", "/usr/bin", "/bin", "--tmpfs", "/tmp", "--tmpfs", "/etc",
         "--ro-bind", "/etc/ssl/openssl.cnf", "/etc/ssl/openssl.cnf",
@@ -250,8 +271,10 @@ def test_real_preparer_signer_and_publisher_use_separate_principals(tmp_path: Pa
         "--ro-bind", str(initial.runtime), "/initial", "--ro-bind", str(probe), "/probe.py",
         "--setenv", "LD_LIBRARY_PATH", "/host-usr/lib",
     ]
-    libraries: set[str] = set()
-    for executable in ("/usr/bin/python3", "/usr/bin/openssl", "/usr/bin/ip", "/usr/bin/bash", "/usr/bin/awk", _ctypes.__file__):
+    libraries: set[str] = {"/usr/lib/libseccomp.so.2"}
+    systemd_libraries = list(Path('/usr/lib/systemd').glob('libsystemd-shared-*.so'))
+    assert len(systemd_libraries) == 1
+    for executable in ("/usr/bin/python3", "/usr/bin/openssl", "/usr/bin/ip", "/usr/bin/bash", "/usr/bin/awk", _ctypes.__file__, str(systemd_libraries[0])):
         linked = subprocess.run(["ldd", executable], capture_output=True, text=True, check=True)
         libraries.update(re.findall(r"=> (/usr/lib/\S+)", linked.stdout))
     for library in sorted(libraries):
@@ -264,3 +287,5 @@ def test_real_preparer_signer_and_publisher_use_separate_principals(tmp_path: Pa
     assert report["producer_uid"] != report["consumer_uid"] != report["signer_uid"]
     assert report["frame_bytes"] < 128 * 1024
     assert report["full_inverse_replay"] is True and report["tls_inverse_replay"] is True
+    assert report["policy_qualified_requests"] >= 10
+    print(json.dumps(report, sort_keys=True))
