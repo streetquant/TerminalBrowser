@@ -11,8 +11,9 @@ Preserve dirty work, live terminals, saved tabs/windows, recovery recipes, worki
 directories, authentication and TLS. Use disposable terminals for input, kill and
 bulk-action tests. Do not bypass attestation, hand-edit managed hashes, retry
 rejected escalation, or apply the known unsafe shared-runtime ownership template.
-Source tests do not prove installation. Cloudflare and unrelated Warp cutover are
-deferred; resolve recorded scope/authority gates before resuming them.
+Source tests do not prove installation. Cloudflare rollout remains deferred;
+resolve its recorded scope/authority gates before resuming it. Warp storage or
+mount migration is not required for TermDeck and is not a deployment prerequisite.
 
 ## BR is the sole work ledger; BV is advisory
 

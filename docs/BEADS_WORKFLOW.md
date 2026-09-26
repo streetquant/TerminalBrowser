@@ -118,9 +118,11 @@ publication/recovery and live validation. Publication supplies the repaired
 launcher/wrappers/recovery unit; verified terminal recovery follows, and the live
 smoke depends on both. Publishing v6 alone does not prove usable terminals.
 Source prerequisites must not require live deployment before qualification.
-Cloudflare is deferred by the user;
-Warp infrastructure is deferred for separate operator coordination. No Codex
-runtime work is in scope.
+Cloudflare is deferred by the user. On 2026-09-26 the user explicitly cancelled
+the imported Warp storage/mount cutover requirement: it is not required for
+TermDeck. The cancelled record preserves history, and active-path verification
+does not depend on that migration. Separate checkpoint cleanup remains deferred.
+No standalone Codex runtime modification is in scope.
 
 ## Frozen migration provenance
 
