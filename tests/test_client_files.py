@@ -7,7 +7,9 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import threading
+from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -15,18 +17,17 @@ import pytest
 from termdeck import client_files as cf
 
 
-@pytest.fixture
-def stage(tmp_path):
-    tmp_path.chmod(0o700)
-    auth = tmp_path / "auth"
+def make_stage(state_root, auth, *, owner="owner", suffix="a", machine_id=None, extra_machine=False):
+    """Independent authoritative account records, optionally sharing staging."""
+    state_root.chmod(0o700)
     auth.mkdir(mode=0o700)
     # Match the actual Rust schemas, including login revocation and expiry.
     source = Path("web/crates/termdeck-web-auth/src/store.rs").read_text()
     schema = source.split('const SCHEMA: &str = r#"', 1)[1].split('"#;', 1)[0]
     login = sqlite3.connect(auth / "termdeck-web-auth-v1.sqlite3")
     login.executescript(schema)
-    login.execute("INSERT INTO auth_metadata VALUES(1,1,'host','owner',0,0)")
-    device, session = "dev_" + "a" * 32, "ses_" + "a" * 32
+    login.execute("INSERT INTO auth_metadata VALUES(1,1,'host',?,0,0)", (owner,))
+    device, session = "dev_" + suffix * 32, "ses_" + suffix * 32
     login.execute("INSERT INTO devices VALUES(?,?,0,NULL)", (device, "Browser"))
     login.execute("INSERT INTO auth_sessions VALUES(?,?,?,?,0,?,NULL,NULL)", (session,b"s"*32,b"c"*32,device,10**15))
     login.commit()
@@ -35,17 +36,39 @@ def stage(tmp_path):
     schema = source.split('const SCHEMA: &str = "', 1)[1].split('";', 1)[0]
     machines = sqlite3.connect(auth / "termdeck-machines-v1.sqlite3")
     machines.executescript(schema)
-    machines.execute("INSERT INTO identity VALUES(1,'host','owner',1)")
-    key_hash = hashlib.sha256(b"test machine credential").hexdigest()
-    for suffix in ("a", "b"):
-        machines.execute("INSERT INTO machines VALUES(?,?,?,0,0,NULL,1)", ("mach_" + suffix*32, bytes.fromhex(key_hash if suffix == "a" else "b"*64), suffix))
+    machines.execute("INSERT INTO identity VALUES(1,'host',?,1)", (owner,))
+    key_hash = hashlib.sha256(("test machine credential:" + owner).encode()).hexdigest()
+    machine_id = machine_id or "mach_" + suffix * 32
+    machines.execute("INSERT INTO machines VALUES(?,?,?,0,0,NULL,1)", (machine_id, bytes.fromhex(key_hash), owner))
+    if extra_machine:
+        machines.execute("INSERT INTO machines VALUES(?,?,?,0,0,NULL,1)", ("mach_" + "b"*32, bytes.fromhex("b"*64), "second machine"))
     machines.commit()
     machines.close()
     for db in auth.iterdir():
         db.chmod(0o600)
-    account = "acc_" + hashlib.sha256(b"termdeck/account-namespace/v1\0host\0owner").hexdigest()
-    actor = cf.Actor(account, "mach_" + "a"*32, session, key_hash, 1)
-    return cf.StagingStore(tmp_path, auth), actor
+    account = "acc_" + hashlib.sha256(b"termdeck/account-namespace/v1\0host\0" + owner.encode()).hexdigest()
+    actor = cf.Actor(account, machine_id, session, key_hash, 1)
+    return cf.StagingStore(state_root, auth), actor
+
+
+@pytest.fixture
+def stage(tmp_path):
+    return make_stage(tmp_path, tmp_path / "auth", extra_machine=True)
+
+
+@pytest.fixture(params=[False, True], ids=["distinct-machine-ids", "same-machine-id"])
+def account_stages(tmp_path, request):
+    # Equal public machine IDs in independent registries force the account
+    # namespace to provide isolation instead of relying on machine-ID entropy.
+    a = make_stage(tmp_path, tmp_path / "auth-a", owner="account-a", suffix="a")
+    b = make_stage(tmp_path, tmp_path / "auth-b", owner="account-b", suffix="b",
+                   machine_id=a[1].machine_id if request.param else None)
+    assert a[0].root == b[0].root
+    assert a[0].auth_directory != b[0].auth_directory
+    assert a[1].account_id != b[1].account_id
+    assert a[1].session_id != b[1].session_id
+    assert a[1].credential_hash != b[1].credential_hash
+    return a, b
 
 
 def call(stage, operation, **fields):
@@ -149,8 +172,76 @@ def test_every_operation_revalidates_authority(stage,mutation):
                 {"operation":"download","reference":obj["reference"],"file_index":0,"offset":0}]
     if mutation != "other-machine": operations.append({"operation":"list"})
     for request in operations:
-        with pytest.raises(cf.StagingError): store.handle(actor,request,now_ms=1000,internal_resolve=True)
+        with pytest.raises(cf.StagingError) as rejected:
+            store.handle(actor,request,now_ms=1000,internal_resolve=True)
+        assert rejected.value.code == "unauthorized"
     if mutation == "other-machine": assert store.handle(actor,{"operation":"list"},now_ms=1000)["objects"] == []
+
+
+@pytest.mark.parametrize("operation", ["inspect", "download", "attach", "detach", "remove", "resolve", "chunk", "finalize", "refresh"])
+def test_valid_accounts_share_storage_without_foreign_object_authority(account_stages, operation):
+    objects, requests, before = [], [], []
+    for index, context in enumerate(account_stages):
+        if operation in {"chunk", "finalize"}:
+            obj = call(context, "initiate", files=[{"path": "shared.txt", "size": 1 if operation == "chunk" else 0}])["object"]
+        else:
+            obj = upload(context, f"account {index}".encode(), name="shared.txt")
+        objects.append(obj)
+        reference = obj["reference"]
+        request = {"operation": operation, "reference": reference}
+        if operation in {"attach", "detach", "remove", "finalize", "refresh"}:
+            request["request_id"] = uuid.uuid4().hex
+        if operation in {"detach", "resolve"}:
+            attached = call(context, "attach", reference=reference, target="task:account-proof")
+            request["attachment_id"] = attached["attachment_id"]
+            if operation == "resolve":
+                request.pop("reference")
+        elif operation == "attach":
+            request["target"] = "task:account-proof"
+        elif operation in {"download", "chunk"}:
+            request.update(file_index=0, offset=0)
+            if operation == "chunk":
+                request["data"] = "eA=="
+        elif operation == "refresh":
+            request = {"operation": "initiate", "request_id": request["request_id"],
+                       "previous": reference, "files": [{"path": "shared.txt", "size": 0}]}
+        requests.append(request)
+        before.append(call(context, "inspect", reference=reference))
+
+    # Both accounts have valid authority and real rows in the same metadata DB.
+    for index, context in enumerate(account_stages):
+        assert [entry["reference"] for entry in call(context, "list")["objects"]] == [objects[index]["reference"]]
+    for index, (store, actor) in enumerate(account_stages):
+        with pytest.raises(cf.StagingError) as rejected:
+            store.handle(actor, requests[1-index], now_ms=1000, internal_resolve=True)
+        assert rejected.value.code == "unauthorized"
+    for index, context in enumerate(account_stages):
+        assert call(context, "inspect", reference=objects[index]["reference"]) == before[index]
+        assert path(context, objects[index]).read_bytes() == (b"" if operation in {"chunk", "finalize"} else f"account {index}".encode())
+        store, actor = context
+        result = store.handle(actor, requests[index], now_ms=1000, internal_resolve=True)
+        assert result["ok"] is True
+        if operation == "download":
+            assert base64.b64decode(result["data"]) == f"account {index}".encode()
+        elif operation == "resolve":
+            assert Path(result["server_path"]).joinpath("shared.txt").read_bytes() == f"account {index}".encode()
+
+
+def test_valid_account_cleanup_and_replay_are_scoped(account_stages):
+    pending = []
+    request_id = uuid.uuid4().hex
+    for context in account_stages:
+        obj = call(context, "initiate", request_id=request_id, files=[{"path": "pending", "size": 1}])["object"]
+        assert call(context, "initiate", request_id=request_id, files=[{"path": "pending", "size": 1}])["object"] == obj
+        pending.append(obj)
+    assert pending[0]["reference"]["object_id"] != pending[1]["reference"]["object_id"]
+    for index, (store, actor) in enumerate(account_stages):
+        result = store.handle(actor, {"operation": "cleanup", "request_id": uuid.uuid4().hex}, now_ms=1001 + cf.UPLOAD_TTL_MS)
+        assert result["expired_uploads"] == 1
+        assert not path(account_stages[index], pending[index]).exists()
+        if index == 0:
+            assert path(account_stages[1], pending[1]).exists()
+            assert call(account_stages[1], "inspect", reference=pending[1]["reference"])["object"]["status"] == "uploading"
 
 
 @pytest.mark.parametrize("substitution", ["symlink","hardlink","inode","mode","parent-link"])
@@ -332,6 +423,104 @@ def test_unsafe_storage_root_and_identity_fail_closed(stage,monkeypatch,tmp_path
     else: os.link(store.root/"metadata.sqlite3",tmp_path/"linked-db")
     with pytest.raises((cf.StagingError,OSError)):
         call(stage,"download",reference=obj["reference"],file_index=0,offset=0)
+
+
+@pytest.mark.parametrize("owner,mode,accepted", [
+    ("current", 0o755, True),
+    ("root", 0o755, True),
+    ("current", 0o770, False),
+    ("root", 0o777, False),
+    ("root", 0o1777, True),
+    ("current", 0o1777, os.geteuid() == 0),
+    ("foreign", 0o755, False),
+    ("foreign", 0o1777, False),
+])
+def test_storage_ancestor_ownership_and_temporary_parent_policy(tmp_path, monkeypatch, owner, mode, accepted):
+    ancestor = tmp_path / "ancestor"
+    ancestor.mkdir(mode=0o755)
+    private = ancestor / "private"
+    private.mkdir(mode=0o700)
+    identity = ancestor.stat()
+    uid = {"current": os.geteuid(), "root": 0, "foreign": os.geteuid() + 100000}[owner]
+    original_stat, original_fstat = os.stat, os.fstat
+
+    def observed(info):
+        if (info.st_dev, info.st_ino) != (identity.st_dev, identity.st_ino):
+            return info
+        values = {name: getattr(info, name) for name in ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid")}
+        return SimpleNamespace(**dict(values, st_uid=uid, st_mode=stat.S_IFDIR | mode))
+
+    # Vary only the named ancestor's metadata; the private leaf and effective
+    # principal remain unchanged. No real ownership or system path is changed.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "stat", lambda *args, **kwargs: observed(original_stat(*args, **kwargs)))
+        patch.setattr(os, "fstat", lambda *args, **kwargs: observed(original_fstat(*args, **kwargs)))
+        if accepted:
+            directory = cf.Directory(private)
+            try:
+                directory.check()
+            finally:
+                directory.close()
+        else:
+            with pytest.raises(cf.StagingError) as rejected:
+                cf.Directory(private)
+            assert rejected.value.code == "unsafe-storage"
+
+
+@pytest.mark.parametrize("change", ["permissions", "replacement"])
+def test_directory_revalidation_detects_changed_ancestor_with_same_leaf(tmp_path, change):
+    ancestor = tmp_path / "ancestor"
+    ancestor.mkdir(mode=0o755)
+    private = ancestor / "private"
+    private.mkdir(mode=0o700)
+    directory = cf.Directory(private)
+    try:
+        if change == "permissions":
+            ancestor.chmod(0o750)
+        else:
+            saved = ancestor.with_name("saved")
+            ancestor.rename(saved)
+            ancestor.mkdir(mode=0o755)
+            (saved / "private").rename(private)
+        assert private.stat().st_ino == directory.identity.st_ino
+        with pytest.raises(cf.StagingError) as rejected:
+            directory.check()
+        assert rejected.value.code == "unsafe-storage"
+    finally:
+        directory.close()
+
+
+def test_reused_staging_store_keeps_state_parent_private(stage):
+    store, actor = stage
+    call(stage, "list")
+    store.root.parent.chmod(0o755)
+    with pytest.raises(cf.StagingError) as rejected:
+        call(stage, "list")
+    assert rejected.value.code == "unsafe-storage"
+    with pytest.raises(cf.StagingError) as rejected:
+        cf.StagingStore(store.root.parent, store.auth_directory)
+    assert rejected.value.code == "unsafe-storage"
+    store.root.parent.chmod(0o700)
+    assert store.handle(actor, {"operation": "list"}, now_ms=1000)["ok"]
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_request_revalidates_ancestry_before_success(stage, monkeypatch, replay):
+    store, actor = stage
+    request = {"operation": "initiate", "request_id": uuid.uuid4().hex, "files": [{"path": "empty", "size": 0}]}
+    store.handle(actor, request, now_ms=1000)
+    method = "_row" if replay else "_operate"
+    original = getattr(store, method)
+
+    def drift(*args, **kwargs):
+        result = original(*args, **kwargs)
+        store.root.parent.chmod(0o755)
+        return result
+
+    monkeypatch.setattr(store, method, drift)
+    with pytest.raises(cf.StagingError) as rejected:
+        store.handle(actor, request if replay else {"operation": "list"}, now_ms=1000)
+    assert rejected.value.code == "unsafe-storage"
 
 
 def test_namespace_quota_and_object_size_are_enforced(stage,monkeypatch):

@@ -1,7 +1,7 @@
 "use strict";
 
 window.T1000Files = (() => {
-  let appPath, saved, database;
+  let appPath, database;
   const id = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join("");
   const key = () => `tdm1_${id()}${id()}`;
   const el = (tag, text) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; return node; };
@@ -11,31 +11,43 @@ window.T1000Files = (() => {
     if (!database) database = new Promise((resolve, reject) => {
       const request = indexedDB.open(`t1000-machine:${appPath("/")}`, 1);
       request.onupgradeneeded = () => request.result.createObjectStore("identity");
-      request.onsuccess = () => resolve(request.result);
+      request.onsuccess = () => {
+        request.result.onversionchange = () => { request.result.close(); database = null; };
+        resolve(request.result);
+      };
       request.onerror = () => { database = null; reject(new Error("Private browser storage is unavailable. Machine enrollment needs browser storage.")); };
     });
     return database;
   }
   async function load() {
-    if (saved !== undefined) return saved;
     const database = await db();
-    saved = await new Promise((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       const transaction = database.transaction("identity", "readonly");
       const request = transaction.objectStore("identity").get("current");
-      request.onsuccess = () => resolve(request.result || null);
-      request.onerror = () => reject(new Error("Could not read machine enrollment"));
+      let value;
+      request.onsuccess = () => { value = request.result || null; };
+      transaction.oncomplete = () => resolve(value);
+      transaction.onerror = transaction.onabort = () => reject(new Error("Could not read machine enrollment"));
     });
-    return saved;
   }
-  async function save(value) {
+  const sameIdentity = (left, right) => JSON.stringify(left || null) === JSON.stringify(right || null);
+  async function replaceIdentity(expected, value) {
     const database = await db();
-    await new Promise((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       const transaction = database.transaction("identity", "readwrite");
-      transaction.objectStore("identity").put(value, "current");
-      transaction.oncomplete = resolve;
-      transaction.onerror = () => reject(new Error("Could not save machine enrollment; retry before closing this browser"));
+      const store = transaction.objectStore("identity");
+      const request = store.get("current");
+      let replacement = null;
+      request.onsuccess = () => {
+        // Read and compare inside the write transaction: another tab may have
+        // reserved or completed a request since the caller read its identity.
+        if (!sameIdentity(request.result, expected)) return;
+        replacement = {...value, revision: id()};
+        store.put(replacement, "current");
+      };
+      transaction.oncomplete = () => resolve(replacement);
+      transaction.onerror = transaction.onabort = () => reject(new Error("Could not save machine enrollment; retry before closing this browser"));
     });
-    saved = value;
   }
   function csrf() {
     for (const part of document.cookie.split(";")) {
@@ -44,13 +56,13 @@ window.T1000Files = (() => {
     }
     throw new Error("Your login session expired. Sign in again.");
   }
-  async function api(route, body, {machine = true, method = "POST"} = {}) {
+  async function api(route, body, {machine = true, method = "POST", credential} = {}) {
     const headers = {Accept: "application/json"};
     if (method === "POST") Object.assign(headers, {"Content-Type": "application/json", "X-TermDeck-CSRF": csrf()});
     if (machine) {
-      const identity = await load();
-      if (!identity?.credential) throw new Error("Enroll this browser's machine before staging files.");
-      headers["X-TermDeck-Machine-Key"] = identity.credential;
+      credential ??= (await finishPending())?.credential;
+      if (!credential) throw new Error("Enroll this browser's machine before staging files.");
+      headers["X-TermDeck-Machine-Key"] = credential;
     }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 180000);
@@ -67,27 +79,100 @@ window.T1000Files = (() => {
       throw error;
     } finally { clearTimeout(timeout); }
   }
+  function checkedMachine(machine, expected) {
+    if (!machine || !/^mach_[a-f0-9]{32}$/.test(machine.machine_id)
+        || !/^acc_[a-f0-9]{64}$/.test(machine.account_id)
+        || !Number.isSafeInteger(machine.credential_generation) || machine.credential_generation < 1
+        || machine.revoked_at_ms != null) throw new Error("The host did not confirm an active machine. Stored credentials were preserved.");
+    if (expected && (machine.machine_id !== expected.machine_id || machine.account_id !== expected.account_id)) {
+      throw new Error("The host confirmed a different machine or account. Stored credentials were preserved.");
+    }
+    return machine;
+  }
+  async function identify(credential, expected) {
+    return checkedMachine((await api("machines/current", null, {method: "GET", credential})).machine, expected);
+  }
+  const changedIdentity = () => new Error("Machine enrollment changed in another tab. Refresh and retry.");
   async function finishPending() {
-    const identity = await load();
-    if (!identity?.pending) return;
-    const result = await api("machines", identity.pending, {machine: false});
-    await save({credential: identity.pending.new_credential || identity.pending.credential, machine: result.machine});
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const identity = await load();
+      if (!identity?.pending) return identity;
+      const pending = identity.pending;
+      const credential = pending.new_credential || pending.credential;
+      const expected = pending.operation === "rotate" ? {...identity.machine, machine_id: pending.machine_id} : null;
+      let machine;
+      try {
+        // A committed response may have been lost, including across a new
+        // login whose session cannot replay the original mutation receipt.
+        try { machine = await identify(credential, expected); }
+        catch (error) {
+          if (error.status !== 403) throw error;
+          machine = checkedMachine((await api("machines", pending, {machine: false})).machine, expected);
+        }
+      } catch (error) {
+        if (!sameIdentity(await load(), identity)) continue;
+        throw error;
+      }
+      const confirmed = await replaceIdentity(identity, {credential, machine});
+      if (confirmed) return confirmed;
+    }
+    throw changedIdentity();
   }
   async function enroll(label) {
-    const credential = key();
-    await save({pending: {operation: "enroll", request_id: id(), credential, label}});
-    await finishPending();
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const identity = await load();
+      if (identity?.pending) return finishPending();
+      if (identity?.credential) {
+        try { await identify(identity.credential, identity.machine); return identity; }
+        catch (error) { if (error.status !== 403) throw error; }
+      }
+      const pending = {operation: "enroll", request_id: id(), credential: key(), label};
+      if (await replaceIdentity(identity, {...identity, pending})) return finishPending();
+    }
+    throw changedIdentity();
+  }
+  async function rotate(machine) {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const identity = await load();
+      if (identity?.pending) return finishPending();
+      if (!identity?.credential || identity.machine?.machine_id !== machine.machine_id
+          || identity.machine?.account_id !== machine.account_id) throw changedIdentity();
+      const pending = {operation: "rotate", request_id: id(), machine_id: machine.machine_id, credential: identity.credential, new_credential: key()};
+      if (await replaceIdentity(identity, {...identity, pending})) return finishPending();
+    }
+    throw changedIdentity();
   }
   async function current() {
-    await finishPending();
-    if (!(await load())?.credential) return null;
-    return (await api("machines/current", null, {method: "GET"})).machine;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const identity = await finishPending();
+      if (!identity?.credential) return null;
+      try { return await identify(identity.credential, identity.machine); }
+      catch (error) { if (sameIdentity(await load(), identity)) throw error; }
+    }
+    throw changedIdentity();
   }
   async function management(body) { return api("management", body); }
   async function staging(operation, fields = {}) { return api("client-files", {operation, ...fields}); }
   function encode(bytes) { let value = ""; for (const byte of bytes) value += String.fromCharCode(byte); return btoa(value); }
   async function digest(file) { return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", await file.arrayBuffer())), b => b.toString(16).padStart(2, "0")).join(""); }
   function referenceKey(reference) { return `${reference.object_id}:${reference.generation}:${reference.digest}`; }
+  function normalizedPaths(entries) {
+    const paths = new Set(), components = new Map();
+    return entries.map(entry => {
+      const original = entry.path.split("/");
+      const normalized = original.map(part => part.normalize("NFC"));
+      const path = normalized.join("/");
+      const collision = () => new Error("Selected file or directory names collide after Unicode normalization. Rename the conflicting items and select them again.");
+      if (paths.has(path) || Array.from(paths).some(other => path.startsWith(`${other}/`) || other.startsWith(`${path}/`))) throw collision();
+      paths.add(path);
+      for (let depth = 1; depth <= normalized.length; depth++) {
+        const prefix = normalized.slice(0, depth).join("/"), source = original.slice(0, depth).join("/");
+        if (components.has(prefix) && components.get(prefix) !== source) throw collision();
+        components.set(prefix, source);
+      }
+      return path;
+    });
+  }
 
   function mount(container, {selectable = false, onChange = () => {}} = {}) {
     container.classList.add("client-files");
@@ -179,10 +264,11 @@ window.T1000Files = (() => {
     async function upload(entries, previous = null) {
       if (!machine) throw new Error("Enroll this browser's machine before uploading.");
       if (!entries.length || entries.length > 256 || entries.some(e => e.file.size > 16 * 1024 * 1024) || entries.reduce((sum, e) => sum + e.file.size, 0) > 64 * 1024 * 1024) throw new Error("Select 1–256 files, at most 16 MiB each and 64 MiB total.");
+      const paths = normalizedPaths(entries);
       progress.hidden = false; progress.value = 0;
       report(previous ? "Changed files selected. Preparing a new immutable generation…" : "Preparing selected client files…");
       const metadata = [];
-      for (const entry of entries) metadata.push({path: entry.path, size: entry.file.size, modified_ms: entry.file.lastModified, media_type: entry.file.type || "application/octet-stream", digest: await digest(entry.file)});
+      for (const [index, entry] of entries.entries()) metadata.push({path: paths[index], size: entry.file.size, modified_ms: entry.file.lastModified, media_type: entry.file.type || "application/octet-stream", digest: await digest(entry.file)});
       const body = {request_id: id(), files: metadata, label: entries.length === 1 ? entries[0].file.name : `${entries.length} selected files`, display_path: entries.length === 1 ? entries[0].path : entries.map(e => e.path).slice(0, 3).join(", ").slice(0, 1000), ...(previous ? {previous} : {})};
       const finalizeId = id();
       retry = async () => {
@@ -250,8 +336,15 @@ window.T1000Files = (() => {
     }
     async function renderIdentity() {
       identityControls.replaceChildren();
-      const label = el("input"); label.maxLength = 128; label.value = machine?.label || ""; label.placeholder = "e.g. Work laptop";
+      const identity = await load();
+      const label = el("input"); label.maxLength = 128; label.value = machine?.label || identity?.pending?.label || identity?.machine?.label || ""; label.placeholder = "e.g. Work laptop";
       identityControls.append(field("Machine label", label));
+      if (identity?.pending) {
+        identityControls.append(button("Retry machine action", () => action(async () => {
+          await finishPending(); await refresh(); report("Pending machine action confirmed.");
+        })));
+        if (!machine) return;
+      }
       if (!machine) {
         identityControls.append(button("Enroll this browser's machine", () => action(async () => {
           if (!label.value.trim()) throw new Error("Enter a machine label.");
@@ -260,12 +353,10 @@ window.T1000Files = (() => {
         return;
       }
       identityControls.append(button("Rename machine", () => action(async () => {
-        const identity = await load();
+        const identity = await finishPending();
         await api("machines", {operation: "rename", request_id: id(), machine_id: machine.machine_id, credential: identity.credential, label: label.value.trim()}, {machine: false}); await refresh();
       })), button("Rotate machine credential", () => action(async () => {
-        const identity = await load();
-        await save({...identity, pending: {operation: "rotate", request_id: id(), machine_id: machine.machine_id, credential: identity.credential, new_credential: key()}});
-        await finishPending(); await refresh(); report("Machine credential rotated. Existing login sessions remain separate.");
+        await rotate(machine); await refresh(); report("Machine credential rotated. Existing login sessions remain separate.");
       })), button("List enrolled machines", () => action(async () => {
         const data = await api("machines", null, {method: "GET", machine: false});
         let devices = identityControls.querySelector(".enrolled-machines"); if (!devices) { devices = el("div"); devices.className = "enrolled-machines"; identityControls.append(devices); }

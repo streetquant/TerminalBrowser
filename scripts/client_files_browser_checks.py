@@ -112,7 +112,14 @@ def check_client_files(*,origin,cookies,root:Path,output:Path,assertions):
         expect(modal_b.locator(".client-machine-status")).to_contain_text(" · enrolled")
         expect(modal_b.locator(".client-file-row")).to_have_count(0)
         modal_b.get_by_role("button",name="List enrolled machines",exact=True).click()
-        modal_b.get_by_role("button",name="Revoke Browser fixture A",exact=True).click()
+        with page_b.expect_response(
+            lambda response: response.request.method == "POST"
+            and response.url.endswith("/_termdeck/api/v1/machines")
+            and response.request.post_data_json.get("operation") == "revoke"
+            and response.request.post_data_json.get("machine_id") == machine_a
+        ) as revoked:
+            modal_b.get_by_role("button",name="Revoke Browser fixture A",exact=True).click()
+        assert revoked.value.ok, revoked.value.status
         page.get_by_role("button",name="Refresh staged list",exact=True).click()
         expect(modal.locator(".client-machine-status")).to_contain_text("revoked",timeout=10000)
         expect(modal.get_by_label("Select local files",exact=True)).to_have_count(0)

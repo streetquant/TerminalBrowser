@@ -19,7 +19,7 @@ class StoppedBackend:
     def quiesce_auth_change(self, record, plan): return AuthQuiesceResult(True)
     def apply_auth_change(self, record, plan, quiescence):
         self.calls.append(record.id)
-        return AuthActivationResult(True,False,status="stopped")
+        return AuthActivationResult(True,False,status="stopped",credential_lifecycle="stopped")
 
 
 @pytest.fixture
@@ -156,3 +156,37 @@ def test_failed_runtime_receipt_is_not_reported_as_success(accounts,monkeypatch)
     result=run(accounts,request(accounts))
     assert not result["ok"]
     assert result["results"][0]["state"]["auth_restart_required"]
+
+
+def test_newer_legacy_link_synchronizes_and_switches_only_its_tab(accounts):
+    from test_codex_credentials import payload, write
+    _, rows, manager, _ = accounts
+    source = manager.account_source
+    write(source / "accounts/alpha.json", payload())
+    write(source / ".termdeck-account-authority.json", {"version": 1, "owner": "termdeck", "refresh_writes": True})
+    home = Path(rows[0].codex_home)
+    (home / "accounts").unlink()
+    (home / "accounts").mkdir(mode=0o700)
+    for credential in (source / "accounts").glob("*.json"):
+        (home / "accounts" / credential.name).write_bytes(credential.read_bytes())
+    write(home / "accounts/alpha.json", payload(refresh="2026-03-01T00:00:00Z", secret="newer-legacy-fixture"))
+    newer = (home / "accounts/alpha.json").read_bytes()
+    other_pointer = (Path(rows[1].codex_home) / "auth.json").readlink()
+
+    assert manager.state(rows[0]).credential_status == "refreshed"
+    result = run(accounts, request(accounts))
+    assert result["ok"], result
+    assert (source / "accounts/alpha.json").read_bytes() == newer
+    assert manager.state(rows[0]).selected_account_key == "beta"
+    assert manager.state(rows[1]).selected_account_key == "alpha"
+    assert (Path(rows[1].codex_home) / "auth.json").readlink() == other_pointer
+
+
+def test_stopped_receipt_is_not_reused_after_the_terminal_record_starts(accounts):
+    store, rows, _, _ = accounts
+    assert run(accounts, request(accounts))["ok"]
+    store.update(rows[0].id, status="running", last_pid=12345)
+    row = next(row for row in run(accounts, {"operation": "accounts"})["rows"] if row["id"] == rows[0].id)
+    assert row["running_account_state"] == "unobserved"
+    assert row["running_account_key"] is None
+    assert row["running_restart_required"]

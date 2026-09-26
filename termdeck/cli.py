@@ -808,7 +808,7 @@ def _run_targeted_control(args: argparse.Namespace, action: str) -> int:
                     if record.pinned and not bool(getattr(args, "include_pinned", False)):
                         rows.append(_control_row(record, action, False, pid=record.last_pid, detail="pinned tab protected; pass --include-pinned to stop it"))
                         continue
-                    backend.terminate(record)
+                    stopped = backend.terminate(record)
                     store.clear_window_captain(record.window_id, session_id=record.id)
                     store.update(
                         record.id,
@@ -818,7 +818,8 @@ def _run_targeted_control(args: argparse.Namespace, action: str) -> int:
                         recovery_cwd=None,
                         recovery_intent=RECOVERY_INTENT_INACTIVE,
                     )
-                    rows.append(_control_row(record, action, True, pid=record.last_pid, detail="marked stopped"))
+                    detail = "stopped tmux session" if stopped else "session already ended; marked stopped"
+                    rows.append(_control_row(record, action, True, pid=record.last_pid, detail=detail))
             except TmuxError as exc:
                 rows.append(_control_row(record, action, False, pid=record.last_pid, detail=str(exc)))
     finally:

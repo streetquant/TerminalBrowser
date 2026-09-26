@@ -433,6 +433,7 @@ class AuthActivationResult:
     command: str | None = None
     cwd: str | None = None
     clear_recovery: bool = False
+    credential_lifecycle: str = "unobserved"
 
 
 @dataclass(frozen=True)
@@ -4887,6 +4888,7 @@ class TmuxBackend:
                 status="stopped",
                 detail="selected account is active for this terminal",
                 preserve_selected_account=True,
+                credential_lifecycle="stopped",
             )
 
         if quiescence.gated_respawn:
@@ -4983,6 +4985,7 @@ class TmuxBackend:
                 command=plan.replacement_command,
                 cwd=plan.replacement_cwd,
                 clear_recovery=plan.recovery_command is None,
+                credential_lifecycle="codex-restart" if plan.recovery_command else "idle-shell",
             )
 
         if plan.restart:
@@ -5014,6 +5017,7 @@ class TmuxBackend:
             status=record.status,
             detail="selected account is active; terminal remained ready",
             preserve_selected_account=True,
+            credential_lifecycle="idle-shell",
         )
 
     def rollback_auth_change(
@@ -5321,15 +5325,43 @@ class TmuxBackend:
         self._signal_process_group(pid, signal.SIGCONT)
         return pid
 
-    def terminate(self, record: SessionRecord) -> None:
+    def terminate(self, record: SessionRecord) -> bool:
+        """Stop one exact session, preserving recovery state until exit is proven.
+
+        Return whether the kill command succeeded. False means a fresh query
+        confirmed that the session had already ended, including concurrent exit.
+        An unavailable control plane is never evidence that cleanup is safe.
+        """
+
+        result = self._run(["kill-session", "-t", f"={record.tmux_name}"], check=False)
+        stopped = result.returncode == 0
+        if not stopped:
+            # A session can exit while the stop request is in flight. Use an
+            # exact-name inventory after failure; session_exists deliberately
+            # permits stale UI observations and cannot authorize destruction of
+            # durable recovery state. Never retry the kill against a new target.
+            observed = self._run(
+                ["list-sessions", "-F", "#{session_name}"],
+                check=False,
+                timeout=self.command_timeout,
+                bypass_query_backoff=True,
+            )
+            if observed.returncode == 0:
+                names = set(observed.stdout.splitlines())
+                if record.tmux_name in names:
+                    detail = result.stderr.strip() or "tmux kill-session failed"
+                    raise TmuxError(f"{detail}; terminal session is still present")
+            elif not self._server_is_absent(observed):
+                detail = observed.stderr.strip() or "tmux session inventory is unavailable"
+                raise TmuxError(f"could not verify terminal stop: {detail}")
+
         with self._history_session_lock_for(record.id):
             self._history_pop(record.id)
-        if self.session_exists(record):
-            self._run(["kill-session", "-t", record.tmux_name], check=False)
         # A deliberate Stop/Kill must not resurrect stale process memory on the
         # next TermDeck launch. Browser-style Hide leaves the checkpoint intact.
         self.checkpoints.clear(record)
         self.invalidate_cache()
+        return stopped
 
     def rename(self, record: SessionRecord, new_name: str) -> None:
         if self.session_exists(record):
@@ -5558,7 +5590,7 @@ def execute_auth_change(
                     except (OSError, ValueError, RuntimeError):
                         return AuthTransactionResult(
                             False, switch_result=switched, activation=replace(activation, ok=False),
-                            error="Account process restarted, but its credential receipt could not be saved; inspect before retrying",
+                            error="Account selection was applied, but its activation receipt could not be saved; inspect before retrying",
                         )
                 return AuthTransactionResult(
                     True,

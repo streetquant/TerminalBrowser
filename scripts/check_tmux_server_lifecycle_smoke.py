@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import tempfile
@@ -13,6 +14,15 @@ from pathlib import Path
 def main() -> int:
     from termdeck.tmux_backend import TmuxBackend
     from termdeck.tmux_server_lifecycle import user_systemd_scope_available
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--socket-root-parent",
+        type=Path,
+        default=Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.geteuid()}")),
+        help="parent of the disposable socket directory (default: XDG_RUNTIME_DIR)",
+    )
+    args = parser.parse_args()
 
     if not user_systemd_scope_available():
         print(
@@ -28,9 +38,7 @@ def main() -> int:
         )
         return 0
 
-    runtime_root = Path(
-        os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.geteuid()}")
-    ).expanduser()
+    runtime_root = args.socket_root_parent.expanduser()
     if not runtime_root.is_dir() or not os.access(runtime_root, os.W_OK | os.X_OK):
         print(
             json.dumps(

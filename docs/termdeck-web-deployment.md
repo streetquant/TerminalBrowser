@@ -53,6 +53,41 @@ reported as present, missing, partial, unsafe or unavailable without reading
 credentials. Repeated reconciliation does not recreate sessions or erase
 working directories, recipes or authentication scopes.
 
+### Existing tmux server lifecycle
+
+A first server can start in a delegated `t1000-tmux-server-*.scope` when the
+user manager is available. `systemd-run --scope` executes tmux locally and
+inherits the caller's environment and mount namespace, so private socket
+directories do not require visibility from a manager-launched service.
+Already-running servers in a verified dedicated scope or process-only anchor
+remain accepted. If scope
+creation is unavailable, explicit session creation keeps its existing direct
+start behavior; that does not prove the server can survive its owner's exit.
+
+Legacy servers in an unverified lifecycle are left in their original cgroup.
+Admission returns `ok=false`, `changed=false`, the observed server identity,
+and a `recovery-blocked` diagnostic. It creates no anchor, moves no process,
+stops no unit, and does not create a replacement server. GUI exit remains
+blocked when stopping its service could kill those sessions.
+
+The local API audit examined systemd 262. `AttachProcessesToUnit` accepts
+`ssau` (unit, subgroup, numeric PIDs), as recorded in
+`/usr/share/dbus-1/interfaces/org.freedesktop.systemd1.Manager.xml`. Scope
+creation gained the transient `PIDFDs` property (`ah`) in systemd 255, recorded
+in `/usr/share/doc/systemd/NEWS`. The installed implementation retains that
+process reference, but `unit_attach_pids_to_cgroup` calls `pidref_verify` and
+then passes a numeric PID to `cg_attach`, which writes `cgroup.procs`.
+Consequently, neither a PIDFD transport nor a systemd version alone establishes
+a generation-bound cgroup mutation. Automatic legacy migration requires an
+operation that binds the process generation through the actual membership
+change; no such operation is qualified by this implementation.
+
+There is no migration rollback on refusal because admission changes nothing.
+Keep the existing owning service running. Clearing this blocker requires
+separately authorized lifecycle recovery that preserves the sessions, or their
+deliberate retirement before a future server starts in a dedicated scope.
+Source tests and the API inspection do not qualify that external recovery.
+
 ## Activation recovery evidence
 
 The web activation helper stores transaction receipts and rollback markers by default under `/warp/projects/softwares/termdeck/.termdeck/state/recovery/activation-v2`. This state-root recovery hierarchy is separate from the t1000 runtime and session-state directories. Historical recovery artifacts under `/var/lib/cloudmcp-exec` are evidence only; use an explicit reviewed `--evidence` path when replaying a historical transaction.

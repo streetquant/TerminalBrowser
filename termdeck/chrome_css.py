@@ -1,12 +1,8 @@
 """GTK3 chrome stylesheet for t1000.
 
-Design language: flat, quiet, professional. Neutral layered surfaces
-separated by hairline borders, edge-to-edge docked panels, soft shadows
-on floating surfaces (menus, popovers, toasts), subtle motion on
-interactive elements, and a single restrained accent reserved for
-selection, focus, and the primary action — the visual grammar of mature
-terminal apps (Terminator, cmux, Warp, VS Code) rather than glossy web
-dashboards.
+Neutral working surfaces, aligned controls, and flat notebook tabs keep the
+terminal work visible. A warm accent marks selection and keyboard focus.
+Menus and dialogs use the same compact geometry as the surrounding chrome.
 
 All colors are resolved to plain rgba() at Python-time so GTK3's
 GtkCssProvider accepts every rule. Only properties verified against the
@@ -74,8 +70,6 @@ def build_modern_chrome_css(
     hairline_soft = _rgba(t.border, 0.55)
 
     hov_bg = _rgba(t.fg, 0.06)
-    hb_sheen = _rgba(t.fg, 0.04)
-    tab_sel_border = _rgba(t.accent, 0.38)
     act_bg = _rgba(t.fg, 0.10)
 
     # Buttons — flat and quiet, clear but neutral states
@@ -100,15 +94,14 @@ def build_modern_chrome_css(
     pill_bg     = _rgba(t.fg, 0.07)
     pill_border = _rgba(t.border, 0.80)
 
-    # Session rows — quiet list; selection = accent bar + light tint
+    # Session rows use a neutral selection fill and a narrow accent edge.
     card_hov_bg = _rgba(t.fg, 0.05)
-    card_sel_bg = _rgba(t.accent, 0.13)
+    card_sel_bg = _rgba(t.fg, 0.08)
 
     # Empty state
     emp_border = _rgba(t.border, 1.00)
 
     # Badges — subdued semantic tints
-    ok_bg  = _rgba(t.success, 0.12); ok_b  = _rgba(t.success, 0.30)
     wn_bg  = _rgba(t.warning, 0.12); wn_b  = _rgba(t.warning, 0.30)
     dn_bg  = _rgba(t.danger,  0.12); dn_b  = _rgba(t.danger,  0.30)
     mu_bg  = _rgba(t.fg_muted, 0.10); mu_b = _rgba(t.fg_muted, 0.24)
@@ -120,10 +113,9 @@ def build_modern_chrome_css(
     # List rows
     row_border = _rgba(t.border, 0.45)
 
-    # Notebook tabs — flat strip, accent underline + faint accent tint marks
-    # the active tab so the working surface has a quiet colour identity
+    # Notebook tabs are attached to the work surface with an accent underline.
     tab_hov_bg = _rgba(t.fg, 0.06)
-    tab_sel_bg = _rgba(t.accent, 0.13)
+    tab_sel_bg = t.bg_sunken
 
     # Tab close — neutral hover, not alarming red
     tc_hov_bg = _rgba(t.fg, 0.12)
@@ -139,7 +131,7 @@ def build_modern_chrome_css(
     ts_dn_b = _rgba(t.danger,  0.55)
 
     # Treeview selected
-    tv_sel_bg = _rgba(t.accent, 0.22)
+    tv_sel_bg = _rgba(t.fg, 0.12)
 
     # Scrollbars — slim neutral pill that widens/brightens under the pointer
     # and only takes the accent while actively dragged (the one moment the
@@ -151,7 +143,10 @@ def build_modern_chrome_css(
     sb_term_hov = _rgba(t.fg, 0.50)
     sb_gutter   = _rgba(t.fg, 0.05)
 
-    compact_card_radius = max(6, radius - 2)
+    compact_card_radius = max(0, radius - 1)
+    control_height = 22 if density == "compact" else 26
+    header_height = 34 if density == "compact" else 40
+    control_padding = 3 if density == "compact" else 5
 
     return f"""\
 /* t1000 chrome — theme={t.name} density={density} ui_font={ui_font or "system"} scale={scale:.2f} */
@@ -164,6 +159,11 @@ window, dialog, messagedialog {{
   color: {t.fg};
 }}
 window.background {{ background-color: {t.bg}; }}
+decoration {{
+  border: 1px solid {hairline};
+  border-radius: {radius}px;
+  box-shadow: none;
+}}
 /* Base surface reset — own every surface; never inherit the system GTK theme */
 list, row {{
   background-color: transparent;
@@ -183,6 +183,8 @@ textview, textview text {{
 treeview.view {{
   background-color: transparent;
   color: {t.fg};
+  -GtkTreeView-vertical-separator: 8;
+  -GtkTreeView-horizontal-separator: 8;
 }}
 treeview.view:selected {{
   background-color: {card_sel_bg};
@@ -208,8 +210,8 @@ button {{
   background-image: none;
   color: {t.fg};
   border: 1px solid {btn_border};
-  border-radius: 8px;
-  padding: 5px 13px;
+  border-radius: {radius}px;
+  padding: {control_padding}px 10px;
   box-shadow: none;
   transition: background-color 130ms ease-out, border-color 130ms ease-out;
 }}
@@ -220,6 +222,8 @@ button:hover {{
 button:active {{
   background-color: {btn_act_bg};
 }}
+button:disabled {{ color: {t.fg_muted}; opacity: 0.55; }}
+button label {{ font-size: inherit; }}
 button:focus {{
   border-color: {t.accent};
   outline: 2px solid {foc_ring};
@@ -230,17 +234,17 @@ headerbar {{
   background-image: none;
   border: none;
   border-bottom: 1px solid {hairline};
-  box-shadow: inset 0 1px 0 {hb_sheen};
-  padding: 5px 10px;
-  min-height: 48px;
+  box-shadow: none;
+  padding: 4px 8px;
+  min-height: {header_height}px;
 }}
 headerbar label, headerbar button {{ color: {t.fg}; }}
 headerbar button {{
   background-image: none;
   background-color: transparent;
   border: 1px solid transparent;
-  border-radius: 8px;
-  padding: 5px 10px;
+  border-radius: {radius}px;
+  padding: 3px 8px;
   margin: 0 1px;
   min-height: 30px;
   box-shadow: none;
@@ -264,7 +268,7 @@ button.td-primary-action, headerbar button.suggested-action, button.td-accent {{
   background-image: none;
   color: {t.accent_fg};
   border: 1px solid {acc_edge};
-  border-radius: 8px;
+  border-radius: {radius}px;
   font-weight: 600;
 }}
 button.td-primary-action:hover, headerbar button.suggested-action:hover, button.td-accent:hover {{
@@ -279,7 +283,7 @@ button.td-ghost-action {{
   background-color: transparent;
   color: {t.fg};
   border: 1px solid {hairline};
-  border-radius: 8px;
+  border-radius: {radius}px;
 }}
 button.td-ghost-action:hover {{
   background-color: {hov_bg};
@@ -290,7 +294,7 @@ button.td-danger-action, button.destructive-action {{
   background-color: transparent;
   color: {t.danger};
   border: 1px solid {dng_border};
-  border-radius: 8px;
+  border-radius: {radius}px;
   font-weight: 600;
 }}
 button.td-danger-action:hover, button.destructive-action:hover {{
@@ -304,26 +308,26 @@ button.td-header-overflow {{
 }}
 button.td-header-overflow:hover {{ color: {t.fg}; }}
 button.td-new-tab {{
-  background-color: {inf_bg};
+  background-color: transparent;
   background-image: none;
-  color: {t.accent};
-  border: 1px solid {inf_b};
+  color: {t.fg};
+  border: 1px solid {hairline};
   font-weight: 600;
 }}
 button.td-new-tab:hover {{
-  background-color: {card_sel_bg};
-  border-color: {t.accent};
-  color: {t.accent};
+  background-color: {hov_bg};
+  border-color: {btn_hov_b};
+  color: {t.fg};
 }}
 button.td-new-tab:active {{
   background-color: {tv_sel_bg};
 }}
 entry.td-title-entry, entry.td-tab-name-entry {{
-  background-color: {inf_bg};
+  background-color: {t.bg_sunken};
   background-image: none;
   color: {t.fg};
   border: 1px solid {t.accent};
-  border-radius: 6px;
+  border-radius: {radius}px;
   padding: 1px 6px;
   margin: 0;
   min-height: 0;
@@ -335,25 +339,25 @@ entry.td-title-entry:focus, entry.td-tab-name-entry:focus {{
 }}
 entry.td-title-entry selection, entry.td-tab-name-entry selection {{
   background-color: {t.accent};
-  color: {tab_sel_bg};
+  color: {t.accent_fg};
 }}
 button.td-header-icon {{
-  min-width: 36px;
-  padding-left: 8px;
-  padding-right: 8px;
+  min-width: 30px;
+  padding-left: 5px;
+  padding-right: 5px;
 }}
 headerbar button.td-new-tab.td-header-icon {{
-  min-width: 36px;
-  min-height: 36px;
+  min-width: 32px;
+  min-height: 32px;
   padding: 0;
-  border-radius: 8px;
+  border-radius: {radius}px;
 }}
 combobox.td-auth-account {{
-  background-color: {t.bg_sunken};
+  background-color: transparent;
   background-image: none;
   color: {t.fg};
-  border: 1px solid {hairline_soft};
-  border-radius: 8px;
+  border: none;
+  border-radius: {radius}px;
   min-height: 30px;
   padding: 0;
 }}
@@ -378,12 +382,12 @@ button.td-tabstrip-new {{
   min-height: 28px;
   padding: 0;
   margin: 0;
-  border-radius: 7px;
+  border-radius: {radius}px;
 }}
 .td-title {{
   font-weight: 600;
   font-size: {size["title"]};
-  letter-spacing: 0.2px;
+  letter-spacing: 0;
   color: {t.fg};
 }}
 .td-section-description {{
@@ -399,7 +403,7 @@ button.td-tabstrip-new {{
   color: {t.fg_muted};
   font-size: {size["chip"]};
   font-weight: 600;
-  letter-spacing: 1px;
+  letter-spacing: 0.6px;
 }}
 .td-side-pane {{
   background-color: {t.bg_raised};
@@ -410,23 +414,24 @@ button.td-tabstrip-new {{
   margin: 0;
 }}
 .td-count-pill {{
-  background-color: {pill_bg};
+  background-color: transparent;
   background-image: none;
   color: {t.fg_muted};
-  border: 1px solid {pill_border};
-  border-radius: 999px;
-  padding: 2px 8px;
-  font-size: {size["chip"]};
-  font-weight: 600;
+  border: none;
+  border-radius: 0;
+  padding: 2px 4px;
+  font-size: {size["muted"]};
+  font-weight: 400;
 }}
 .td-session-card {{
   background-color: transparent;
   background-image: none;
-  border: 1px solid transparent;
+  border: none;
+  border-bottom: 1px solid {hairline_soft};
   border-left: 2px solid transparent;
-  border-radius: {radius}px;
-  padding: {pad}px;
-  margin: {margin // 2}px 0;
+  border-radius: 0;
+  padding: {pad}px 8px;
+  margin: 0;
   transition: background-color 130ms ease-out, border-color 130ms ease-out;
 }}
 .td-session-card:hover {{
@@ -437,7 +442,7 @@ button.td-tabstrip-new {{
   background-image: none;
   border-left: 2px solid {t.accent};
 }}
-.td-chip, .td-count-pill {{ border-radius: 999px; }}
+.td-chip {{ border-radius: {radius}px; }}
 .td-chip {{
   background-color: {pill_bg};
   background-image: none;
@@ -448,17 +453,24 @@ button.td-tabstrip-new {{
   font-weight: 600;
 }}
 .td-badge {{
-  border-radius: 999px;
-  padding: 2px 8px;
+  border-radius: 2px;
+  padding: 1px 5px;
   font-size: {size["chip"]};
   font-weight: 600;
 }}
-.td-badge-ok    {{ background-color: {ok_bg};  color: {t.success};  border: 1px solid {ok_b};  }}
+.td-badge-ok    {{ background-color: transparent; color: {t.success}; border: 1px solid {hairline_soft}; }}
 .td-badge-warn  {{ background-color: {wn_bg};  color: {t.warning};  border: 1px solid {wn_b};  }}
 .td-badge-danger{{ background-color: {dn_bg};  color: {t.danger};   border: 1px solid {dn_b};  }}
 .td-badge-muted {{ background-color: {mu_bg};  color: {t.fg_muted}; border: 1px solid {mu_b};  }}
 .td-badge-info  {{ background-color: {inf_bg}; color: {t.accent};   border: 1px solid {inf_b}; }}
 .td-resource {{ font-family: {t.mono}; font-size: {size["chip"]}; color: {t.fg_muted}; }}
+.td-session-card button.td-primary-action {{
+  background-color: {btn_bg};
+  color: {t.fg};
+  border-color: {btn_border};
+  font-weight: 400;
+}}
+.td-session-card button.td-primary-action:hover {{ background-color: {btn_hov_bg}; border-color: {btn_hov_b}; }}
 .td-mono, .td-accel, .td-id {{ font-family: {t.mono}; font-size: {size["mono"]}; }}
 .td-empty-state {{
   background-color: transparent;
@@ -470,25 +482,55 @@ button.td-tabstrip-new {{
 }}
 .td-empty-icon {{ color: {t.fg_muted}; font-size: 26px; font-weight: 600; }}
 .td-table-window, .td-overlay-dialog {{ background-color: {t.bg}; }}
-.td-overlay-dialog border, .td-overlay-dialog {{ border-radius: 12px; }}
+.td-overlay-dialog border, .td-overlay-dialog {{ border-radius: {radius}px; }}
 entry, .td-search-entry entry, entry.td-search-entry {{
   background-color: {t.bg_sunken};
+  background-image: none;
   border: 1px solid {hairline};
-  border-radius: 8px;
-  padding: 8px 12px;
+  border-radius: {radius}px;
+  padding: {control_padding}px 9px;
   color: {t.fg};
-  min-height: 34px;
+  min-height: {control_height}px;
   font-size: {size["base"]};
   caret-color: {t.accent};
+  box-shadow: none;
   transition: border-color 130ms ease-out;
 }}
 entry:focus, .td-search-entry entry:focus, entry.td-search-entry:focus {{
   border-color: {t.accent};
+  box-shadow: none;
   outline: 2px solid {ent_foc_ring};
   outline-offset: 1px;
 }}
+spinbutton {{
+  background-color: {t.bg_sunken};
+  background-image: none;
+  color: {t.fg};
+  border: 1px solid {hairline};
+  border-radius: {radius}px;
+  box-shadow: none;
+}}
+spinbutton entry {{ background-color: transparent; color: {t.fg}; border: none; box-shadow: none; }}
+spinbutton button {{
+  background-color: transparent;
+  color: {t.fg_muted};
+  border: none;
+  border-left: 1px solid {hairline};
+  border-radius: 0;
+  padding: 0 8px;
+}}
+spinbutton button:hover {{ background-color: {hov_bg}; color: {t.fg}; }}
+combobox button {{
+  background-color: {t.bg_sunken};
+  background-image: none;
+  color: {t.fg};
+  border: 1px solid {hairline};
+  border-radius: {radius}px;
+}}
+combobox cellview {{ color: {t.fg}; }}
 checkbutton check {{
   background-color: {t.bg_sunken};
+  background-image: none;
   border: 1px solid {hairline};
   border-radius: 4px;
   min-width: 16px;
@@ -501,8 +543,30 @@ checkbutton check:checked {{ background-color: {t.accent}; border-color: {t.acce
   transition: background-color 130ms ease-out;
 }}
 .td-list-row:hover {{ background-color: {hov_bg}; }}
-.td-category {{ font-size: {size["chip"]}; font-weight: 600; color: {t.fg_muted}; letter-spacing: 1px; }}
+.td-category {{ font-size: {size["chip"]}; font-weight: 600; color: {t.fg_muted}; letter-spacing: 0.6px; }}
 notebook {{ background-color: {t.bg_sunken}; border: none; }}
+notebook > header {{
+  background-color: {t.bg_raised};
+  background-image: none;
+  border: none;
+  border-bottom: 1px solid {hairline};
+  border-radius: 0;
+  padding: 0;
+}}
+notebook > header tabs {{ background-color: transparent; border: none; }}
+notebook > header tab {{
+  background-color: transparent;
+  background-image: none;
+  color: {t.fg_muted};
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 7px 14px;
+  margin: 0;
+}}
+notebook > header tab:checked {{ background-color: {t.bg_sunken}; color: {t.fg}; border-bottom-color: {t.accent}; }}
+notebook > header tab:hover {{ background-color: {hov_bg}; color: {t.fg}; }}
 notebook.td-terminal-notebook {{
   background-color: {t.bg_sunken};
   border: none;
@@ -515,17 +579,19 @@ notebook.td-terminal-notebook header {{
   border: none;
   border-bottom: 1px solid {hairline};
   border-radius: 0;
-  padding: 5px 8px;
+  padding: 0 6px;
 }}
 notebook.td-terminal-notebook header tabs {{ background-color: transparent; border-color: transparent; }}
 notebook.td-terminal-notebook tab {{
   background-color: transparent;
-  border: 1px solid transparent;
-  border-radius: 8px;
+  border: none;
+  border-right: 1px solid {hairline_soft};
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
   box-shadow: none;
   min-width: 0;
-  padding: 6px 13px;
-  margin: 0 2px;
+  padding: 5px 12px;
+  margin: 0;
   color: {t.fg_muted};
   font-size: {size["base"]};
   transition: background-color 130ms ease-out, color 130ms ease-out, border-color 130ms ease-out;
@@ -543,7 +609,7 @@ notebook.td-terminal-notebook tab:checked {{
   background-color: {tab_sel_bg};
   background-image: none;
   color: {t.fg};
-  border: 1px solid {tab_sel_border};
+  border-bottom-color: {t.accent};
   box-shadow: none;
   font-weight: 600;
 }}
@@ -564,7 +630,7 @@ button.td-tab-close {{
   min-height: 22px;
   padding: 0;
   border: none;
-  border-radius: 999px;
+  border-radius: 2px;
   background-color: transparent;
   background-image: none;
   color: {t.fg_muted};
@@ -585,17 +651,17 @@ button.td-tab-close:hover {{
   border-radius: 0;
   padding: 6px 0 0 0;
 }}
-.td-bottom-bar button, headerbar button, button {{ font-size: {size["button"]}; min-height: 32px; }}
-.td-more-actions {{ background-color: transparent; border: 1px solid {hairline_soft}; border-radius: 8px; }}
+.td-bottom-bar button, headerbar button, button {{ font-size: {size["button"]}; min-height: {control_height}px; }}
+.td-more-actions {{ background-color: transparent; border: 1px solid {hairline_soft}; border-radius: {radius}px; }}
 .td-toast {{
   background-color: {mn_bg};
   background-image: none;
   border: 1px solid {hairline};
-  border-radius: 12px;
-  padding: 10px 16px;
+  border-radius: {radius}px;
+  padding: 8px 12px;
   color: {t.fg};
   font-size: {size["base"]};
-  box-shadow: 0 6px 24px {shadow};
+  box-shadow: 0 4px 12px {shadow};
 }}
 .td-toast.td-toast-success {{ border-color: {ts_ok_b}; border-left: 3px solid {t.success}; }}
 .td-toast.td-toast-warn    {{ border-color: {ts_wn_b}; border-left: 3px solid {t.warning}; }}
@@ -603,7 +669,7 @@ button.td-tab-close:hover {{
 scrolledwindow {{
   background-color: {t.bg_sunken};
   border: 1px solid {hairline_soft};
-  border-radius: 8px;
+  border-radius: {radius}px;
 }}
 textview, textview text {{
   background-color: {t.bg_sunken};
@@ -619,25 +685,25 @@ treeview header button {{
   border-bottom: 1px solid {hairline};
   font-weight: 600;
   font-size: {size["button"]};
-  padding: 8px 10px;
+  padding: 4px 8px;
 }}
 menu, popover {{
   background-color: {mn_bg};
   background-image: none;
   color: {t.fg};
   border: 1px solid {hairline};
-  border-radius: 12px;
-  padding: 6px;
-  box-shadow: 0 10px 32px {shadow};
+  border-radius: {radius}px;
+  padding: 4px;
+  box-shadow: 0 6px 18px {shadow};
 }}
-menuitem {{ border-radius: 7px; padding: 7px 10px; margin: 1px 0; }}
+menuitem {{ border-radius: 2px; padding: 6px 10px; margin: 0; }}
 menuitem:hover {{ background-color: {mi_hov_bg}; color: {t.fg}; }}
 separator {{ background-color: {hairline_soft}; min-height: 1px; margin: 5px 4px; }}
 tooltip {{
   background-color: {mn_bg};
   color: {t.fg};
   border: 1px solid {hairline};
-  border-radius: 8px;
+  border-radius: {radius}px;
   padding: 6px 10px;
   box-shadow: 0 4px 16px {shadow};
 }}
@@ -706,6 +772,6 @@ scrollbar.td-terminal-scrollbar slider:active {{
 .td-density-compact .td-session-card {{ padding: 5px 8px; border-radius: {compact_card_radius}px; }}
 .td-density-compact notebook.td-terminal-notebook {{ margin: 0; }}
 .td-density-compact notebook.td-terminal-notebook header {{ padding: 0 3px; }}
-.td-density-compact notebook.td-terminal-notebook tab {{ padding: 4px 10px; margin: 0 2px; border-radius: 7px; }}
+.td-density-compact notebook.td-terminal-notebook tab {{ padding: 3px 10px; margin: 0; border-radius: 0; }}
 .td-density-compact treeview {{ font-size: {size["compact"]}; }}
 """

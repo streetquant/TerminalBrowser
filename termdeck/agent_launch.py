@@ -23,6 +23,57 @@ CREATE TABLE IF NOT EXISTS launches(launch_id TEXT PRIMARY KEY,account_id TEXT N
  UNIQUE(account_id,machine_id,session_id,request_id));
 """
 RUNS = "CREATE TABLE IF NOT EXISTS launch_runs(launch_id TEXT NOT NULL,tab_id TEXT NOT NULL,PRIMARY KEY(launch_id,tab_id));"
+_MASKED_NAMES = (".termdeck", ".beads")
+
+
+def _within(path, root):
+    return path == root or root in path.parents
+
+
+def _runtime_roots(state_root):
+    state_root = Path(state_root)
+    return (state_root, *(p for p in state_root.parents if p.name == ".termdeck"))
+
+
+def _validate_workspace_grant(workspace, state_root, *, protected=()):
+    workspace = Path(workspace)
+    if any(name in workspace.parts for name in _MASKED_NAMES):
+        raise StagingError("Protected storage cannot be a workspace", "unsafe-storage")
+    for root in (*_runtime_roots(state_root), *(Path(p) for p in protected)):
+        if _within(workspace, root):
+            raise StagingError("Protected storage cannot be a workspace", "unsafe-storage")
+        if _within(root, workspace) and not any(
+            _within(root, workspace / name) for name in _MASKED_NAMES
+        ):
+            raise StagingError("Workspace would expose protected storage", "unsafe-storage")
+
+
+def _shared_asset_path(path, *, state_root, auth_directory, account_source,
+                       private_home, workspace, shared_names):
+    """Check the resolved grant, not merely the shared asset's link name."""
+    target = Path(path).resolve(strict=True)
+    target = _host_path(str(target), directory=target.is_dir())
+    source = Path(account_source)
+    private = (Path(auth_directory), Path(state_root) / "terminal-auth", Path(private_home))
+    runtime = (*_runtime_roots(state_root), *(Path(workspace) / n for n in _MASKED_NAMES))
+    # No shared asset may grant a protected tree or any of its ancestors.
+    if any(_within(root, target) for root in (source, *private, *runtime)):
+        raise StagingError("Shared asset would expose protected storage", "unsafe-storage")
+    if any(_within(target, root) for root in private):
+        raise StagingError("Shared asset would expose private authentication", "unsafe-storage")
+    source_asset = False
+    if _within(target, source):
+        relative = target.relative_to(source)
+        source_asset = relative.parts[0] in shared_names
+        if not source_asset or any(name in relative.parts for name in _MASKED_NAMES):
+            raise StagingError("Shared asset is outside the non-auth catalogue assets", "unsafe-storage")
+    # A catalogue inside managed state may expose its explicit non-auth assets,
+    # but aliases into other runtime/ledger data are never implicit grants.
+    if any(_within(target, root) for root in runtime) and not source_asset:
+        raise StagingError("Shared asset would expose runtime storage", "unsafe-storage")
+    if ".beads" in target.parts or ".termdeck" in target.parts and not source_asset:
+        raise StagingError("Shared asset would expose protected storage", "unsafe-storage")
+    return str(target)
 
 
 def _host_path(value, *, directory=False):
@@ -60,11 +111,9 @@ def policy(state_root):
             _id(workspace["id"],"ws_")
             _text(workspace["label"],256)
             root=_host_path(workspace["path"],directory=True)
-            colocated_repository = Path(state_root).parent.name == ".termdeck" and root == Path(state_root).parent.parent
-            if root == Path("/") or root == Path.home() or root == Path("/tmp") or root in Path(state_root).parents and not colocated_repository:
+            if root == Path("/") or root == Path.home() or root == Path("/tmp"):
                 raise StagingError("Workspace grants excessive host access", "unsafe-storage")
-            if Path(state_root) == root or Path(state_root) in root.parents:
-                raise StagingError("Runtime state cannot be a workspace", "unsafe-storage")
+            _validate_workspace_grant(root, state_root)
             if workspace["id"] in seen: raise StagingError("Duplicate workspace identity", "unsafe-storage")
             seen.add(workspace["id"])
         codex=value["codex"]
@@ -75,7 +124,9 @@ def policy(state_root):
             _id(codex["sha256"],"",64)
             if hashlib.sha256(executable.read_bytes()).hexdigest()!=codex["sha256"] or not os.access(executable,os.X_OK):
                 raise StagingError("TermDeck Codex runtime identity changed", "unsafe-storage")
-            _host_path(codex["account_source"],directory=True)
+            source = _host_path(codex["account_source"],directory=True)
+            for workspace in value["workspaces"]:
+                _validate_workspace_grant(workspace["path"], state_root, protected=(source,))
         return value,hashlib.sha256(raw).hexdigest()
     finally: tree.close()
 
@@ -96,9 +147,7 @@ def prepare(store,db,tree,actor,request,machine,now):
     workspace_path=Path(workspace["path"])
     protected=[store.auth_directory]
     if value["codex"]: protected.append(Path(value["codex"]["account_source"]))
-    for secret_root in protected:
-        if (secret_root==workspace_path or workspace_path in secret_root.parents) and workspace_path/".termdeck" not in secret_root.parents:
-            raise StagingError("Workspace would expose authentication storage", "unsafe-storage")
+    _validate_workspace_grant(workspace_path, store.root.parent, protected=protected)
     runtime=request.get("runtime")
     if runtime not in {"shell","codex"} or runtime == "codex" and not value["codex"]:
         raise StagingError("Unsupported or unconfigured runtime")
@@ -155,8 +204,11 @@ def start(store,actor,result,*,backend=None):
                 if row["status"]!="prepared":
                     if row["status"]=="started": return dict(result,status="started")
                     return dict(result,ok=False,status=row["status"],error="Window exists but launch did not finish; inspect its tabs before explicit recovery",code="conflict")
-                _,revision=policy(store.root.parent)
+                value,revision=policy(store.root.parent)
                 if revision!=plan["policy_revision"]: raise StagingError("Launch policy changed", "conflict")
+                protected = [store.auth_directory]
+                if value["codex"]: protected.append(Path(value["codex"]["account_source"]))
+                _validate_workspace_grant(plan["workspace"]["path"], store.root.parent, protected=protected)
                 # Once marked starting, replay never respawns a dead/finished
                 # task. An interrupted partial start requires explicit recovery.
                 db.execute("UPDATE launches SET status='starting' WHERE launch_id=?",(plan["launch_id"],)); db.commit()
@@ -189,7 +241,7 @@ def sandbox_argv(workspace,attachments,*,runtime_argv,codex_home=None,asset_path
     for name in ("resolv.conf","hosts","nsswitch.conf","ssl/certs"):
         source=Path("/etc")/name
         if source.exists(): args.extend(["--ro-bind",str(source),str(source)])
-    for name in (".termdeck",".beads"):
+    for name in _MASKED_NAMES:
         if (Path(workspace)/name).exists(): args.extend(["--tmpfs",str(Path(workspace)/name)])
     for path in attachments: args.extend(["--ro-bind",path,path])
     if codex_home:
@@ -212,6 +264,9 @@ def execute(args):
         with authorized(store.auth_directory,actor):
             value,revision=policy(store.root.parent)
             if revision!=plan["policy_revision"]: raise StagingError("Launch policy changed", "conflict")
+            protected = [store.auth_directory]
+            if value["codex"]: protected.append(Path(value["codex"]["account_source"]))
+            _validate_workspace_grant(plan["workspace"]["path"], store.root.parent, protected=protected)
             if args.tab not in [t["id"] for t in plan["tabs"]]: raise StagingError("Tab is not authorized", "unauthorized")
             with _database(tree,"metadata.sqlite3") as db:
                 db.execute(RUNS)
@@ -240,10 +295,15 @@ def execute(args):
                 # Resolve only explicitly shared non-auth assets. Neither the
                 # account catalogue nor another terminal home is mounted.
                 from .codex_config_scope import _SHARED_FILES, _SHARED_DIRECTORIES
-                for name in (*_SHARED_FILES,*_SHARED_DIRECTORIES):
-                    if name == ".env": continue
+                shared_names = set((*_SHARED_FILES, *_SHARED_DIRECTORIES)) - {".env"}
+                for name in sorted(shared_names):
                     path=Path(codex_home)/name
-                    if path.is_symlink() and path.exists(): assets.append(str(path.resolve(strict=True)))
+                    if path.is_symlink() and path.exists():
+                        assets.append(_shared_asset_path(
+                            path, state_root=store.root.parent, auth_directory=store.auth_directory,
+                            account_source=value["codex"]["account_source"], private_home=codex_home,
+                            workspace=plan["workspace"]["path"], shared_names=shared_names,
+                        ))
                 credential=Path(codex_home)/"auth.json"
                 if credential.is_symlink():
                     from .codex_auth import read_auth_state

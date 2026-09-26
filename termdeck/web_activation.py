@@ -4641,13 +4641,20 @@ def _disarm() -> None:
     reloaded = _systemd("daemon-reload", check=False)
     if reloaded.returncode:
         raise WebActivationError("systemd daemon reload failed while disarming recovery watchdog")
-    # ``is-active`` and ``is-enabled`` intentionally use their documented
-    # non-zero inactive/disabled outcomes.  A zero result proves the watchdog
-    # is still live or enabled and leaves the transaction actionable.
-    if not recovering_self and not _systemd("is-active", WATCHDOG_UNIT, check=False).returncode:
-        raise WebActivationError("independent recovery watchdog is still active after disarm")
-    if not _systemd("is-enabled", WATCHDOG_UNIT, check=False).returncode:
+    # Status queries use non-zero codes for both the expected stopped/disabled
+    # states and errors.  Require the exact state as well as its exit code so
+    # a failed query cannot authorize a durable disarm checkpoint.
+    if not recovering_self:
+        active = _systemd("is-active", WATCHDOG_UNIT, check=False)
+        if not active.returncode:
+            raise WebActivationError("independent recovery watchdog is still active after disarm")
+        if active.returncode != 3 or active.stdout.strip() not in {"inactive", "failed"}:
+            raise WebActivationError("could not verify recovery watchdog inactive state after disarm")
+    enabled = _systemd("is-enabled", WATCHDOG_UNIT, check=False)
+    if not enabled.returncode:
         raise WebActivationError("independent recovery watchdog is still enabled after disarm")
+    if enabled.returncode != 1 or enabled.stdout.strip() != "disabled":
+        raise WebActivationError("could not verify recovery watchdog disabled state after disarm")
 
 
 def _health() -> dict[str, str]:

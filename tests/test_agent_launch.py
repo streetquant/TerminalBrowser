@@ -1,9 +1,11 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import uuid
@@ -209,3 +211,195 @@ def test_changed_policy_and_runtime_hash_fail_before_start(configured):
     config["codex"]={"executable":"/usr/bin/true","sha256":"a"*64,"account_source":str(store.auth_directory)}
     (store.root.parent/launch.POLICY).write_text(json.dumps(config))
     with pytest.raises(cf.StagingError,match="identity changed"): launch.policy(store.root.parent)
+
+
+@pytest.mark.parametrize("relative", [".termdeck", ".termdeck/tls", ".beads", ".beads/archive"])
+def test_policy_rejects_protected_workspace_roots(configured, relative):
+    store, _, workspace, config = configured
+    protected = workspace / relative
+    protected.mkdir(parents=True, mode=0o700)
+    config["workspaces"][0]["path"] = str(protected)
+    (store.root.parent / launch.POLICY).write_text(json.dumps(config))
+    with pytest.raises(cf.StagingError, match="Protected storage"):
+        launch.policy(store.root.parent)
+    assert not store.session_database.exists()
+
+
+@pytest.mark.parametrize("descendant", [False, True])
+def test_prepare_rejects_workspace_in_external_auth_storage(configured, descendant):
+    store, actor, workspace, config = configured
+    auth = workspace.with_name(workspace.name + "-auth")
+    shutil.copytree(store.auth_directory, auth)
+    store.auth_directory = auth
+    selected = auth / "child" if descendant else auth
+    if descendant:
+        selected.mkdir(mode=0o700)
+    config["workspaces"][0]["path"] = str(selected)
+    (store.root.parent / launch.POLICY).write_text(json.dumps(config))
+    req = request(configured)
+    with pytest.raises(cf.StagingError, match="Protected storage"):
+        store.handle(actor, req)
+    assert not store.session_database.exists()
+
+
+def _codex_policy(configured, source):
+    store, _, _, config = configured
+    executable = store.root.parent / "synthetic-runtime"
+    executable.write_text("#!/usr/bin/python\nraise SystemExit(0)\n")
+    executable.chmod(0o700)
+    config["codex"] = {
+        "executable": str(executable),
+        "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+        "account_source": str(source),
+    }
+    (store.root.parent / launch.POLICY).write_text(json.dumps(config))
+
+
+@pytest.mark.parametrize("descendant", [False, True])
+def test_policy_rejects_workspace_in_account_catalogue(configured, descendant):
+    store, _, workspace, config = configured
+    source = workspace.with_name(workspace.name + "-catalogue")
+    source.mkdir(mode=0o700)
+    selected = source / "accounts" if descendant else source
+    if descendant:
+        selected.mkdir(mode=0o700)
+    config["workspaces"][0]["path"] = str(selected)
+    _codex_policy(configured, source)
+    with pytest.raises(cf.StagingError, match="Protected storage"):
+        launch.policy(store.root.parent)
+    assert not store.session_database.exists()
+
+
+@pytest.mark.parametrize("target_name", [
+    "catalogue", "accounts", "auth-file", "web-auth", "current-home",
+    "other-home", "runtime", "runtime-parent", "ledger", "tls",
+    "nested-ledger",
+])
+def test_shared_asset_alias_cannot_broaden_launch(configured, monkeypatch, target_name):
+    store, actor, workspace, _ = configured
+    source = store.root.parent / "catalogue"
+    source.mkdir(mode=0o700)
+    private = store.root.parent / "terminal-auth/current"
+    private.mkdir(parents=True, mode=0o700)
+    targets = {
+        "catalogue": source,
+        "accounts": source / "accounts",
+        "auth-file": source / "auth.json",
+        "web-auth": store.auth_directory,
+        "current-home": private,
+        "other-home": private.with_name("other"),
+        "runtime": store.root.parent,
+        "runtime-parent": store.root.parent.parent,
+        "ledger": workspace / ".beads",
+        "tls": workspace / ".termdeck/tls",
+        "nested-ledger": source / "rules/.beads",
+    }
+    target = targets[target_name]
+    if target_name == "auth-file":
+        target.write_text("synthetic fixture only")
+        target.chmod(0o600)
+    elif not target.exists():
+        target.mkdir(parents=True, mode=0o700)
+    (source / "skills").symlink_to(target, target_is_directory=target.is_dir())
+    (private / "skills").symlink_to(source / "skills", target_is_directory=True)
+    _codex_policy(configured, source)
+    result = store.handle(actor, request(configured, runtime="codex"))
+    launch.start(store, actor, result, backend=Backend())
+    monkeypatch.setattr(SessionStore, "ensure_auth_scope", lambda self, identity: replace(
+        self.get(identity), codex_home=str(private), auth_scope_id="auth-fixture",
+    ))
+    def unexpected_exec(*_args):
+        pytest.fail("A protected shared alias reached runtime execution")
+    monkeypatch.setattr(os, "execve", unexpected_exec)
+    args = argparse.Namespace(
+        state=str(store.root.parent), auth_dir=str(store.auth_directory),
+        db=str(store.session_database), launch=result["launch_id"], tab=result["tabs"][0],
+    )
+    with pytest.raises(cf.StagingError, match="Shared asset"):
+        launch.execute(args)
+
+
+def test_colocated_workspace_masks_state_and_preserves_explicit_attachment(stage):
+    original, actor = stage
+    repository = original.root.parent.with_name(original.root.parent.name + "-repository")
+    managed = repository / ".termdeck"
+    managed.mkdir(parents=True, mode=0o700)
+    state = managed / "state"
+    shutil.copytree(original.root.parent, state)
+    store = cf.StagingStore(state, state / "auth")
+    (repository / ".beads").mkdir(mode=0o700)
+    (repository / ".beads/sentinel").write_text("ledger fixture")
+    config = {"version": 1, "workspaces": [{
+        "id": "ws_" + "a" * 32, "label": "Colocated project", "path": str(repository),
+    }], "codex": None}
+    policy = state / launch.POLICY
+    policy.write_text(json.dumps(config))
+    policy.chmod(0o600)
+    configured = store, actor, repository, config
+    obj = upload((store, actor), b"immutable attachment")
+    result = store.handle(actor, request(configured, attachments=[obj["reference"]]))
+    assert launch.start(store, actor, result, backend=Backend())["status"] == "started"
+    attachment = path((store, actor), obj).parent.parent
+    code = '''import pathlib,sys
+workspace,attachment,state = map(pathlib.Path,sys.argv[1:])
+assert not (workspace/'.beads/sentinel').exists()
+assert not (state/'auth').exists()
+assert not (state/'sessions.sqlite3').exists()
+assert (attachment/'project/file.txt').read_bytes() == b'immutable attachment'
+try: (attachment/'project/file.txt').write_text('changed')
+except OSError: pass
+else: raise AssertionError('attachment writable')
+(workspace/'result').write_text('approved')
+'''
+    argv = launch.sandbox_argv(str(repository), [str(attachment)], runtime_argv=[
+        sys.executable, "-c", code, str(repository), str(attachment), str(state),
+    ])
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    assert completed.returncode == 0, completed.stderr
+    assert (repository / "result").read_text() == "approved"
+    assert (repository / ".beads/sentinel").read_text() == "ledger fixture"
+
+
+@pytest.mark.parametrize("masked_source", [False, True])
+def test_safe_shared_assets_and_selected_file_do_not_expose_catalogue(configured, masked_source):
+    store, _, workspace, _ = configured
+    source = workspace / ".termdeck/catalogue" if masked_source else store.root.parent / "catalogue"
+    source.mkdir(parents=True, mode=0o700)
+    (source / "config.toml").write_text("fixture = true\n")
+    (source / "config.toml").chmod(0o600)
+    (source / "unselected").write_text("unselected fixture")
+    selected = source / "accounts/selected.json"
+    selected.parent.mkdir(mode=0o700)
+    selected.write_text("selected fixture")
+    selected.chmod(0o600)
+    private = store.root.parent / "terminal-auth/current"
+    private.mkdir(parents=True, mode=0o700)
+    private.with_name("other").mkdir(mode=0o700)
+    (private.with_name("other") / "sentinel").write_text("other private fixture")
+    (private / "config.toml").symlink_to(source / "config.toml")
+    (private / "auth.json").symlink_to(selected)
+    external = workspace.with_name(workspace.name + "-skills")
+    external.mkdir(mode=0o700)
+    (external / "SKILL.md").write_text("shared fixture")
+    (private / "skills").symlink_to(external, target_is_directory=True)
+    _codex_policy(configured, source)
+    assert launch.options(store.root.parent)["workspaces"][0]["path"] == str(workspace)
+    assets = [launch._shared_asset_path(
+        private / name, state_root=store.root.parent, auth_directory=store.auth_directory,
+        account_source=source, private_home=private, workspace=workspace,
+        shared_names={"config.toml", "skills"},
+    ) for name in ("config.toml", "skills")]
+    code = '''import pathlib,sys
+private,source = map(pathlib.Path,sys.argv[1:])
+assert (private/'config.toml').read_text() == 'fixture = true\\n'
+assert (private/'skills/SKILL.md').read_text() == 'shared fixture'
+assert (private/'auth.json').read_text() == 'selected fixture'
+assert not (source/'unselected').exists()
+assert not (private.parent/'other').exists()
+'''
+    argv = launch.sandbox_argv(str(workspace), [], codex_home=str(private),
+        asset_paths=[*assets, str(selected)], runtime_argv=[
+            sys.executable, "-c", code, str(private), str(source),
+        ])
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    assert completed.returncode == 0, completed.stderr

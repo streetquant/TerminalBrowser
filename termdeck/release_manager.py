@@ -275,6 +275,7 @@ def _require_managed_storage(layout: "ReleaseLayout"):
             managed_root=layout.root,
             launcher_path=layout.launcher_path,
             production=True,
+            **_deployment_hot_storage_paths(layout),
         )
     except Exception as exc:
         reason = getattr(exc, "reason", str(exc))
@@ -623,6 +624,26 @@ def _deployment_state_root(layout: ReleaseLayout) -> Path | None:
     except OSError:
         pass
     return None
+
+
+def _deployment_hot_storage_paths(layout: ReleaseLayout) -> dict[str, Path]:
+    """Bind canonical admission to the state used by desktop and web clients.
+
+    Other managed layouts retain their configurable storage defaults.  The
+    migrated deployment has one physical state tree, so caller environment
+    settings cannot select a different database or tmux server there.
+    """
+
+    state_root = _deployment_state_root(layout)
+    if state_root is None:
+        return {}
+    return {
+        "db_path": state_root / "sessions.sqlite3",
+        "auth_root": state_root / "terminal-auth",
+        "tmux_runtime": state_root / "tmux",
+        "runtime_root": state_root / "runtime",
+        "checkpoint_root": state_root / "checkpoints",
+    }
 
 
 def _resolve_production_intent(
@@ -8991,6 +9012,10 @@ def _bootstrap_source(layout: ReleaseLayout, python: Path) -> bytes:
         if state_root is not None
         else ""
     )
+    storage_arguments = "".join(
+        f"        {name}=Path({str(path)!r}),\n"
+        for name, path in _deployment_hot_storage_paths(layout).items()
+    )
     template = r'''#!/usr/bin/env __PYTHON_NAME__
 from __future__ import annotations
 import atexit
@@ -10324,7 +10349,7 @@ try:
         managed_root=ROOT,
         launcher_path=launcher,
         production=True,
-    )
+__HOT_STORAGE_ARGUMENTS__    )
 except Exception as exc:
     print(f"t1000 managed launcher refused unsafe storage: {exc}", file=sys.stderr)
     raise SystemExit(78)
@@ -10341,6 +10366,7 @@ raise SystemExit(main())
         template.replace("__PYTHON_NAME__", python.name)
         .replace("__ROOT_REPR__", repr(root))
         .replace("__STATE_ROOT_ASSIGNMENT__", state_assignment)
+        .replace("__HOT_STORAGE_ARGUMENTS__", storage_arguments)
     )
     return source.encode("utf-8")
 

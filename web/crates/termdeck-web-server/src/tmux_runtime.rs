@@ -93,7 +93,7 @@ impl Runtime {
         if root.dev() != self.device
             || root.ino() != self.inode
             || root.uid() != self.uid
-            || root.mode() & 0o777 != 0o700
+            || root.mode() & 0o7777 != 0o700
         {
             return Err(refused(
                 "tmux runtime identity, owner or permissions changed",
@@ -114,9 +114,9 @@ impl Runtime {
             if info.file_type().is_symlink()
                 || info.uid() != self.uid
                 || info.dev() != self.device
-                || (is_socket && !matches!(info.mode() & 0o777, 0o600 | 0o660 | 0o700 | 0o770))
+                || (is_socket && !matches!(info.mode() & 0o7777, 0o600 | 0o660 | 0o700 | 0o770))
                 || (is_socket && !info.file_type().is_socket())
-                || (!is_socket && (!info.is_dir() || info.mode() & 0o777 != 0o700))
+                || (!is_socket && (!info.is_dir() || info.mode() & 0o7777 != 0o700))
             {
                 return Err(refused(
                     "tmux socket owner, type, device or permissions are unsafe",
@@ -249,7 +249,16 @@ mod tests {
         let _listener = fixture.listen()?;
         fixture.0.validate(true)?;
         fixture.0.uid += 1;
-        assert!(fixture.0.validate(true).is_err());
+        let owner_error = fixture
+            .0
+            .validate(true)
+            .err()
+            .ok_or_else(|| refused("foreign runtime owner was accepted"))?;
+        assert_eq!(owner_error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            owner_error.to_string(),
+            "tmux runtime identity, owner or permissions changed"
+        );
         fixture.0.uid -= 1;
         fixture.0.device += 1;
         assert!(fixture.0.validate(true).is_err());
@@ -259,6 +268,44 @@ mod tests {
         fixture.0.inode -= 1;
         fs::set_permissions(&fixture.0.root, fs::Permissions::from_mode(0o755))?;
         assert!(fixture.0.validate(true).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn special_permission_bits_are_rejected_without_repair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let _listener = fixture.listen()?;
+        let socket = fixture.0.socket();
+        let parent = socket.parent().ok_or_else(|| refused("missing parent"))?;
+        let directory_modes: &[u32] = &[0o700];
+        let socket_modes: &[u32] = &[0o600, 0o660, 0o700, 0o770];
+        for (path, native_modes) in [
+            (fixture.0.root.as_path(), directory_modes),
+            (parent, directory_modes),
+            (socket.as_path(), socket_modes),
+        ] {
+            for &native_mode in native_modes {
+                fs::set_permissions(path, fs::Permissions::from_mode(native_mode))?;
+                fixture.0.validate(true)?;
+                for special_bits in [0o1000, 0o2000, 0o4000, 0o7000] {
+                    let unsafe_mode = native_mode | special_bits;
+                    fs::set_permissions(path, fs::Permissions::from_mode(unsafe_mode))?;
+                    assert_eq!(fs::symlink_metadata(path)?.mode() & 0o7777, unsafe_mode);
+                    for require_socket in [false, true] {
+                        let error = fixture
+                            .0
+                            .validate(require_socket)
+                            .err()
+                            .ok_or_else(|| refused("special permission bits were accepted"))?;
+                        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                    }
+                    assert_eq!(fs::symlink_metadata(path)?.mode() & 0o7777, unsafe_mode);
+                    fs::set_permissions(path, fs::Permissions::from_mode(native_mode))?;
+                    fixture.0.validate(true)?;
+                }
+            }
+        }
         Ok(())
     }
 

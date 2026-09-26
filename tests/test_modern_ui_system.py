@@ -13,7 +13,8 @@ class ModernUiSystemTests(unittest.TestCase):
         tokens = resolve_chrome_tokens("dark")
         self.assertNotEqual(tokens.bg, tokens.bg_raised)
         self.assertNotEqual(tokens.bg_raised, tokens.bg_sunken)
-        self.assertGreaterEqual(tokens.card_radius, 8)
+        self.assertGreaterEqual(tokens.card_radius, 0)
+        self.assertLessEqual(tokens.card_radius, 4)
 
     def test_css_has_lean_surfaces_and_interaction_states(self) -> None:
         css = build_chrome_css("dark", "comfortable")
@@ -30,7 +31,7 @@ class ModernUiSystemTests(unittest.TestCase):
         # Focus states use outline rings; hovers animate with short transitions
         self.assertIn("outline:", css)
         self.assertIn("transition:", css)
-        self.assertIn("min-height: 48px", css)
+        self.assertIn("min-height: 40px", css)
         self.assertNotIn("0 18px 48px", css)
 
     def test_polished_terminal_surface_has_distinct_depth_and_focus_states(self) -> None:
@@ -48,7 +49,7 @@ class ModernUiSystemTests(unittest.TestCase):
             self.assertIn(selector, css)
         # Terminal notebook is docked edge-to-edge; no floating card margins
         self.assertIn("margin: 0;", css)
-        self.assertIn("border-radius: 8px", css)
+        self.assertIn("border-radius: 3px", css)
         # Active tab uses a slim accent underline instead of box-shadow inset
         self.assertIn("vte-terminal {", css)
         self.assertIn('"td-terminal-notebook"', GTK_APP)

@@ -3439,6 +3439,10 @@ def run_wrapper(
     # the LAN preparer and recovery activation through their inherited env so
     # they can contact the root attestor without ever reading a raw HMAC key.
     os.environ[CONTROL_ROOT_ENV] = str(layout.control_root)
+    if spec.kind == "recovery":
+        # The watchdog passes explicit database/evidence paths.  Nested
+        # release rollback must inherit the same configured state tree.
+        os.environ["TERMDECK_STATE_ROOT"] = str(layout.state_root)
     if spec.kind == "checkpoint":
         # The start side has no command, writes no config, and intentionally
         # does not require a manifest so a stopped manager can always be safe.

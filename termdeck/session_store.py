@@ -2679,6 +2679,44 @@ class SessionStore:
             recovery_attempts=max(0, int(getattr(record, "recovery_attempts", 0))),
         )
 
+    def _recipe_values_for_update(
+        self,
+        current: SessionRecord,
+        updated: SessionRecord,
+        changed_fields: set[str],
+    ) -> tuple[str | None, str | None, str]:
+        """Change intended launch inputs without discarding canonical fields."""
+
+        if current.recovery_recipe is None and current.recovery_recipe_sha256 is None:
+            return self._recipe_values_for_record(updated)
+        # A malformed existing receipt is evidence to retain, not permission to
+        # reconstruct recovery authority from weaker legacy fields.
+        recipe = parse_session_recipe(
+            current.recovery_recipe, current.recovery_recipe_sha256
+        )
+        if updated.external:
+            return None, None, "never"
+        command = recipe.command
+        cwd = recipe.cwd
+        origin = recipe.origin
+        if changed_fields.intersection({"command", "recovery_command"}):
+            recovery_command = (updated.recovery_command or "").strip()
+            command = recovery_command or updated.command
+            origin = "legacy-recovery" if recovery_command else "launch"
+        if changed_fields.intersection({"cwd", "recovery_cwd"}):
+            cwd = (updated.recovery_cwd or "").strip() or updated.cwd
+        return record_recipe_fields(
+            command=command,
+            cwd=cwd,
+            environment=recipe.environment_dict(),
+            restart_policy=(
+                updated.restart_policy
+                if "restart_policy" in changed_fields
+                else recipe.restart_policy
+            ),
+            origin=origin,
+        )
+
     @staticmethod
     def _record_with_recovery_intent(
         record: SessionRecord,
@@ -2961,12 +2999,21 @@ class SessionStore:
             "recovery_cwd",
             "restart_policy",
         }
-        if recipe_inputs.intersection(changes) and not {
+        changed_recipe_inputs = {
+            field
+            for field in recipe_inputs.intersection(changes)
+            if changes[field] != getattr(current, field)
+        }
+        if changed_recipe_inputs and not {
             "recovery_recipe",
             "recovery_recipe_sha256",
         }.intersection(changes):
-            data["recovery_recipe"] = None
-            data["recovery_recipe_sha256"] = None
+            encoded, digest, policy = self._recipe_values_for_update(
+                current, SessionRecord(**data), changed_recipe_inputs
+            )
+            data["recovery_recipe"] = encoded
+            data["recovery_recipe_sha256"] = digest
+            data["restart_policy"] = policy
         if "last_opened_at" not in changes:
             data["last_opened_at"] = utc_now()
         if "visible" in data:
@@ -3115,74 +3162,73 @@ class SessionStore:
         ]
         if not requested:
             return 0
-        identifiers = [session_id for session_id, _command, _cwd in requested]
-        placeholders = ",".join("?" for _ in identifiers)
-        existing = {
-            str(row["id"]): (row["recovery_command"], row["recovery_cwd"])
-            for row in self.conn.execute(
-                f"SELECT id, recovery_command, recovery_cwd FROM sessions WHERE id IN ({placeholders})",
-                identifiers,
-            ).fetchall()
-        }
-        rows = []
-        for session_id, command, cwd in requested:
-            previous_command, previous_cwd = existing.get(session_id, (None, None))
-            if (
-                command is not None
-                and recovery_command_specificity(previous_command)
-                > recovery_command_specificity(command)
-            ):
-                # Preserve any application's more-specific opaque resume target
-                # over a weaker bare-launcher observation. A positive None
-                # observation still clears metadata after the process ended.
-                rows.append((session_id, previous_command, previous_cwd))
-            else:
-                rows.append((session_id, command, cwd))
-        before = self.conn.total_changes
-        self.conn.executemany(
-            """
-            UPDATE sessions
-            SET recovery_command = ?, recovery_cwd = ?
-            WHERE id = ? AND external = 0
-              AND (recovery_command IS NOT ? OR recovery_cwd IS NOT ?)
-            """,
-            [
-                (command, cwd, session_id, command, cwd)
-                for session_id, command, cwd in rows
-            ],
-        )
-        changed = max(0, self.conn.total_changes - before)
-        if changed:
-            refresh_rows = self.conn.execute(
-                f"SELECT * FROM sessions WHERE id IN ({placeholders}) AND external = 0",
-                identifiers,
-            ).fetchall()
-            recipe_updates = []
-            for row in refresh_rows:
-                record = replace(
-                    self._row_to_record(row),
-                    recovery_recipe=None,
-                    recovery_recipe_sha256=None,
+        try:
+            # Read and write the recipe under one lock: a concurrent observer
+            # must not replace a canonical receipt between validation and use.
+            if not self.conn.in_transaction:
+                self.conn.execute("BEGIN IMMEDIATE")
+            identifiers = [session_id for session_id, _command, _cwd in requested]
+            placeholders = ",".join("?" for _ in identifiers)
+            existing = {
+                str(row["id"]): self._row_to_record(row)
+                for row in self.conn.execute(
+                    f"SELECT * FROM sessions WHERE id IN ({placeholders}) AND external = 0",
+                    identifiers,
+                ).fetchall()
+            }
+            rows = []
+            for session_id, command, cwd in requested:
+                current = existing.get(session_id)
+                if current is None:
+                    continue
+                if (
+                    command is not None
+                    and recovery_command_specificity(current.recovery_command)
+                    > recovery_command_specificity(command)
+                ):
+                    # Preserve the more-specific opaque resume target. A
+                    # positive None observation still clears ended metadata.
+                    continue
+                changed_fields = {
+                    field
+                    for field, value in (
+                        ("recovery_command", command), ("recovery_cwd", cwd)
+                    )
+                    if value != getattr(current, field)
+                }
+                if not changed_fields:
+                    continue
+                updated = replace(current, recovery_command=command, recovery_cwd=cwd)
+                encoded, digest, policy = self._recipe_values_for_update(
+                    current, updated, changed_fields
                 )
-                prepared = self._record_with_recovery_recipe(record)
-                recipe_updates.append(
+                rows.append(
                     (
-                        prepared.recovery_recipe,
-                        prepared.recovery_recipe_sha256,
-                        prepared.restart_policy,
-                        prepared.id,
+                        command, cwd, encoded, digest, policy, session_id,
                     )
                 )
-            self.conn.executemany(
+                existing[session_id] = replace(
+                    updated,
+                    recovery_recipe=encoded,
+                    recovery_recipe_sha256=digest,
+                    restart_policy=policy,
+                )
+            # Validate every changed recipe before the first write, then commit
+            # legacy metadata and canonical authority in the same statement.
+            cursor = self.conn.executemany(
                 """
                 UPDATE sessions
-                SET recovery_recipe = ?, recovery_recipe_sha256 = ?, restart_policy = ?
-                WHERE id = ?
+                SET recovery_command = ?, recovery_cwd = ?,
+                    recovery_recipe = ?, recovery_recipe_sha256 = ?, restart_policy = ?
+                WHERE id = ? AND external = 0
                 """,
-                recipe_updates,
+                rows,
             )
-        self.conn.commit()
-        return changed
+            self.conn.commit()
+            return max(0, cursor.rowcount)
+        except BaseException:
+            self.conn.rollback()
+            raise
 
     def get(self, session_id: str) -> SessionRecord | None:
         row = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()

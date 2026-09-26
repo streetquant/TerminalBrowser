@@ -33,7 +33,17 @@ pub(crate) fn machine_error(error: MachineError) -> Response {
         MachineError::Unauthorized => StatusCode::FORBIDDEN,
         MachineError::Conflict => StatusCode::CONFLICT,
         MachineError::Capacity => StatusCode::TOO_MANY_REQUESTS,
-        MachineError::Store(AuthError::Unauthenticated) => StatusCode::UNAUTHORIZED,
+        MachineError::Store(AuthError::Unauthenticated) => {
+            let mut response = json_response(
+                StatusCode::UNAUTHORIZED,
+                &serde_json::json!({"ok":false,"error":"authentication-required"}),
+            );
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("TermDeckSession"),
+            );
+            return response;
+        }
         MachineError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
     };
     json_response(
@@ -133,5 +143,48 @@ pub(crate) async fn mutate(
             &serde_json::json!({"schema":"termdeck.machine.v1","machine":record}),
         ),
         Err(e) => machine_error(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_revalidation_failure_is_distinct_from_redacted_store_failure() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("could not build machine-error test runtime: {error}"));
+        runtime.block_on(async {
+            for (error, status, message) in [
+                (
+                    MachineError::Store(AuthError::Unauthenticated),
+                    StatusCode::UNAUTHORIZED,
+                    "authentication-required",
+                ),
+                (
+                    MachineError::Store(AuthError::Io(std::io::Error::other(
+                        "private fixture path and credential must remain hidden",
+                    ))),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "machine store is unavailable",
+                ),
+            ] {
+                let response = machine_error(error);
+                assert_eq!(response.status(), status);
+                assert_eq!(
+                    response.headers().get(header::WWW_AUTHENTICATE),
+                    (status == StatusCode::UNAUTHORIZED)
+                        .then_some(&HeaderValue::from_static("TermDeckSession")),
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap_or_else(|error| panic!("could not read machine-error body: {error}"));
+                let value: serde_json::Value = serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|error| panic!("invalid machine-error JSON: {error}"));
+                assert_eq!(value, serde_json::json!({"ok":false,"error":message}));
+            }
+        });
     }
 }

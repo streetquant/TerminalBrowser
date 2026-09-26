@@ -342,6 +342,44 @@ def test_lan_dispatch_inherits_the_bound_control_root(
     assert observed == {"control_root": str(layout_dirs["control_root"])}
 
 
+@pytest.mark.parametrize("inherited", [None, "/tmp/stale-termdeck-state"])
+def test_recovery_dispatch_inherits_its_explicit_state_root(
+    layout_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, inherited: str | None
+) -> None:
+    monkeypatch.setattr(wrappers.os, "environ", dict(os.environ))
+    _published(layout_dirs)
+    if inherited is None:
+        monkeypatch.delenv("TERMDECK_STATE_ROOT", raising=False)
+    else:
+        monkeypatch.setenv("TERMDECK_STATE_ROOT", inherited)
+    observed: dict[str, str] = {}
+
+    def preflight(spec: wrappers.UnitSpec, layout: wrappers.WrapperLayout) -> tuple[str, ...]:
+        assert spec.kind == "recovery"
+        observed["state"] = os.environ["TERMDECK_STATE_ROOT"]
+        command = wrappers.build_start_command(spec, **layout_dirs)
+        assert command[command.index("--database") + 1] == str(
+            Path(observed["state"]) / "sessions.sqlite3"
+        )
+        return command
+
+    class StopExec(Exception):
+        pass
+
+    def stop_execv(_program: str, _argv: list[str]) -> None:
+        assert os.environ["TERMDECK_STATE_ROOT"] == str(layout_dirs["state_root"])
+        raise StopExec()
+
+    monkeypatch.setattr(wrappers, "_preflight_unit_start", preflight)
+    monkeypatch.setattr(wrappers, "_record_start_identity", lambda *_args: None)
+    monkeypatch.setattr(wrappers.os, "execv", stop_execv)
+    with pytest.raises(StopExec):
+        wrappers.run_wrapper(
+            "termdeck-web-recovery.service", "start", release_id="release-a", **layout_dirs
+        )
+    assert observed["state"] == str(layout_dirs["state_root"])
+
+
 def test_readback_rejects_a_rehashed_attestation_endpoint_change(
     layout_dirs: dict[str, Path],
 ) -> None:

@@ -2372,12 +2372,15 @@ class CodexAuthManager:
     def runtime_state(self, record: SessionRecord, state: CodexAuthState) -> dict:
         from .codex_credentials import runtime_observation
         return runtime_observation(Path(record.codex_home), record.auth_scope_id,
-                                   state.effective_fingerprint or None)
+                                   state.effective_fingerprint or None,
+                                   record_status=record.status, record_pid=record.last_pid)
 
     def record_activation(self, record: SessionRecord, state: CodexAuthState, activation) -> None:
         from .codex_credentials import activation_receipt
         activation_receipt(Path(record.codex_home), record.auth_scope_id,
-                           state.selected_account_key, activation.pid)
+                           state.selected_account_key, activation.pid,
+                           kind=activation.credential_lifecycle,
+                           expected_digest=state.effective_fingerprint or None)
 
     def migrate_catalog(self, record: SessionRecord) -> CodexAuthState:
         """Bind a legacy scope to the canonical catalogue while it is stopped.

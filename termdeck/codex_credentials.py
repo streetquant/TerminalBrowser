@@ -207,7 +207,15 @@ def sync_quiescent(home: Path, source: Path, credentials: dict[str, Path]) -> st
         try:
             with os.fdopen(temporary_fd, "wb") as stream:
                 stream.write(latest.credential.data); stream.flush(); os.fsync(stream.fileno())
-            if read(target).digest != latest.saved.digest or read(home / "auth.json").digest != latest.credential.digest:
+            # Reapply the same authority checks used for the initial read. A
+            # legacy auth.json may be a safe link into the private catalogue;
+            # read() must continue to refuse links and read the validated
+            # resolved regular file through observe().
+            checked = observe(home, credentials)
+            if (read(target).digest != latest.saved.digest
+                    or checked.status != "refreshed" or checked.key != latest.key
+                    or checked.credential is None
+                    or checked.credential.digest != latest.credential.digest):
                 raise CredentialError("Credentials changed before publication; private snapshot preserved")
             os.replace(temporary, target)
             directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -228,27 +236,90 @@ def process_start(pid: int) -> int | None:
         return None
 
 
-def activation_receipt(home: Path, scope: str, account_key: str | None, pid: int | None) -> None:
-    """Record a successful guarded restart, never claim provider memory access."""
+def _codex_processes(root_pid: int) -> tuple[tuple[int, int], ...] | None:
+    """Observe Codex process incarnations without retaining command arguments."""
+    from .resources import _process_argv, process_tree
+    pids = process_tree(root_pid)
+    if not pids:
+        return None
+    result = []
+    for pid in pids:
+        start = process_start(pid)
+        argv = _process_argv(pid)
+        if start is None or argv is None:
+            return None
+        if not argv:
+            continue
+        executable = Path(argv[0]).name.casefold()
+        is_codex = executable == "codex" or executable.startswith("codex-")
+        if executable in {"node", "nodejs"} and len(argv) > 1:
+            is_codex = Path(argv[1]).name.casefold() == "codex"
+        if is_codex:
+            if process_start(pid) != start:
+                return None
+            result.append((pid, start))
+    return tuple(sorted(result))
+
+
+def activation_receipt(
+    home: Path,
+    scope: str,
+    account_key: str | None,
+    pid: int | None,
+    *,
+    kind: str,
+    expected_digest: str | None,
+) -> None:
+    """Record the guarded lifecycle kind, never claim provider memory access."""
     from .codex_auth import _write_private_text
+    if kind not in {"stopped", "idle-shell", "codex-restart"}:
+        raise CredentialError("Account activation has no verified lifecycle kind")
+    if (kind == "stopped") != (pid is None):
+        raise CredentialError("Account activation process does not match its lifecycle")
     auth = home / "auth.json"
     credential = read(auth.resolve(strict=True)) if auth.exists() else None
+    if (credential.digest if credential else None) != expected_digest:
+        raise CredentialError("Credentials changed during account activation; inspect before retrying")
     start = process_start(pid) if pid else None
-    payload = {"version": 1, "scope": scope, "pid": pid, "start": start,
-               "account_key": account_key, "credential_digest": credential.digest if credential else None}
+    if pid is not None and start is None:
+        raise CredentialError("Account activation process is no longer observable")
+    codex = _codex_processes(pid) if pid is not None else ()
+    if codex is None or (pid is not None and process_start(pid) != start):
+        raise CredentialError("Account activation process tree is no longer observable")
+    if (kind == "codex-restart") != bool(codex):
+        raise CredentialError("Account activation process tree changed after handoff")
+    payload = {"version": 2, "kind": kind, "scope": scope, "pid": pid, "start": start,
+               "account_key": account_key, "credential_digest": expected_digest,
+               "codex_processes": codex}
     _write_private_text(home / ".termdeck-auth-runtime.json", json.dumps(payload, sort_keys=True) + "\n")
 
 
-def runtime_observation(home: Path, scope: str, effective_digest: str | None) -> dict:
+def runtime_observation(
+    home: Path,
+    scope: str,
+    effective_digest: str | None,
+    *,
+    record_status: str | None = None,
+    record_pid: int | None = None,
+) -> dict:
     unknown = {"running_account_key": None, "running_account_state": "unobserved", "running_pid": None,
                "running_restart_required": True}
     try:
         receipt = json.loads(_read(home / ".termdeck-auth-runtime.json"), object_pairs_hook=_unique)
-        if not isinstance(receipt, dict) or receipt.get("version") != 1 or receipt.get("scope") != scope:
+        if not isinstance(receipt, dict) or receipt.get("version") != 2 or receipt.get("scope") != scope:
+            return unknown
+        kind = receipt.get("kind")
+        if kind not in {"stopped", "idle-shell", "codex-restart"}:
             return unknown
         pid, start = receipt.get("pid"), receipt.get("start")
-        if pid is None:
+        if kind == "stopped":
+            # A stopped receipt has no process incarnation to check. Its
+            # evidence expires as soon as the owning record starts/reopens.
+            if pid is not None or start is not None or record_pid is not None or record_status not in {"stopped", "archived"}:
+                return unknown
             return {**unknown, "running_account_state": "stopped", "running_restart_required": False}
+        if record_status in {"stopped", "archived"} or (record_pid is not None and record_pid != pid):
+            return {**unknown, "running_account_state": "stale-process"}
         if type(pid) is not int or type(start) is not int or process_start(pid) != start:
             return {**unknown, "running_account_state": "stale-process"}
         # A receipt binds a process incarnation. Recheck its inherited scope;
@@ -256,6 +327,20 @@ def runtime_observation(home: Path, scope: str, effective_digest: str | None) ->
         environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
         if ("CODEX_HOME=" + str(home)).encode() not in environment or process_start(pid) != start:
             return unknown
+        codex = _codex_processes(pid)
+        if process_start(pid) != start or codex is None:
+            return unknown
+        if not codex:
+            return {**unknown, "running_account_state": "no-codex", "running_pid": pid,
+                    "running_restart_required": False}
+        if kind != "codex-restart":
+            # A Codex child launched after an idle-shell handoff has no guarded
+            # restart receipt of its own; the shell's readiness is not proof.
+            return {**unknown, "running_pid": pid}
+        if receipt.get("codex_processes") != [list(process) for process in codex]:
+            # A shell or Node launcher can outlive its Codex child. A later
+            # child must not inherit the previous guarded restart's evidence.
+            return {**unknown, "running_pid": pid}
         changed = receipt.get("credential_digest") != effective_digest
         return {"running_account_key": receipt.get("account_key"),
                 "running_account_state": "credentials-changed" if changed else "restart-observed",

@@ -681,17 +681,18 @@ impl TmuxControl {
                 self.target, PANE_STATE_FORMAT
             ))
             .await?;
-        let state_line = state_reply
-            .lines
-            .first()
-            .ok_or(StreamError::ControlProtocol("pane state was empty"))?;
-        let state = PaneState::parse(state_line)?;
-        if state.pane_id != self.pane_id {
-            return Err(StreamError::ControlProtocol(
-                "pane identity changed during attach",
-            ));
+        let mut selected = None;
+        // list-panes returns every pane in the containing window, even for an
+        // explicit adopted pane target. Match the identity pinned at attach.
+        for line in &state_reply.lines {
+            let state = PaneState::parse(line)?;
+            if state.pane_id == self.pane_id && selected.replace(state).is_some() {
+                return Err(StreamError::ControlProtocol("duplicate pane identity"));
+            }
         }
-        Ok(state)
+        selected.ok_or(StreamError::ControlProtocol(
+            "pane identity changed during attach",
+        ))
     }
 
     async fn current_geometry(&self) -> Result<TerminalGeometry, StreamError> {
@@ -1352,6 +1353,64 @@ mod tests {
         assert!(CONTROL_FLAGS_VIEWER.contains("ignore-size"));
         assert!(CONTROL_FLAGS_WRITER.contains("ignore-size"));
         assert!(!CONTROL_FLAGS_WRITER.contains("!ignore-size"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_state_selects_non_first_adopted_pane_and_rejects_missing_identity() {
+        let first = b"%3\t100\t80\t24\t0\t0\t0\t0\t1\t0\t1\t0\t0\t0\t0\t0\t0\t0\t0";
+        let adopted = b"%7\t123\t120\t40\t1\t0\t4\t5\t1\t0\t1\t0\t0\t1\t0\t0\t1\t1\t42";
+        for lines in [
+            vec![first.to_vec(), adopted.to_vec()],
+            vec![first.to_vec()],
+            vec![adopted.to_vec(), adopted.to_vec()],
+        ] {
+            let expected_success = lines.len() == 2 && lines[0].as_slice() == first;
+            let (request_tx, mut request_rx) =
+                tokio::sync::mpsc::channel::<super::CommandRequest>(1);
+            let (_output_tx, output_rx) = tokio::sync::mpsc::channel(1);
+            let actor = tokio::spawn(async move {
+                let request = request_rx
+                    .recv()
+                    .await
+                    .unwrap_or_else(|| panic!("state command was not sent"));
+                assert_eq!(
+                    request.command,
+                    format!("list-panes -t %7 -F '{}'", PANE_STATE_FORMAT)
+                );
+                assert!(
+                    request
+                        .reply
+                        .send(Ok(super::ControlReply { lines }))
+                        .is_ok()
+                );
+            });
+            let mut control = super::TmuxControl {
+                request_tx,
+                output_rx,
+                shutdown_tx: None,
+                actor,
+                command_timeout: std::time::Duration::from_secs(1),
+                pane_id: "%7".to_owned(),
+                target: "%7".to_owned(),
+            };
+            let result = control.current_state().await;
+            if expected_success {
+                let state = result.unwrap_or_else(|error| panic!("adopted state: {error}"));
+                assert_eq!(state.pane_id, "%7");
+                assert_eq!(
+                    state.geometry,
+                    TerminalGeometry {
+                        cols: 120,
+                        rows: 40
+                    }
+                );
+                assert!(state.alternate);
+                assert_eq!(state.history_size, 42);
+            } else {
+                assert!(matches!(result, Err(StreamError::ControlProtocol(_))));
+            }
+            control.shutdown().await;
+        }
     }
 
     #[test]

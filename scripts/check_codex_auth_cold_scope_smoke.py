@@ -65,7 +65,33 @@ def _synthetic_chatgpt_auth() -> dict[str, object]:
     }
 
 
-def _is_direct_codex(candidate: Path) -> tuple[bool, str]:
+def _version_probe_environment(home: Path) -> dict[str, str]:
+    """Keep an explicitly selected binary's version probe inside its fixture."""
+
+    paths = {
+        "HOME": home,
+        "CODEX_HOME": home / ".codex",
+        "XDG_CONFIG_HOME": home / ".config",
+        "XDG_DATA_HOME": home / ".local" / "share",
+        "XDG_STATE_HOME": home / ".local" / "state",
+        "XDG_CACHE_HOME": home / ".cache",
+        "XDG_RUNTIME_DIR": home / "runtime",
+        "TMPDIR": home / "tmp",
+    }
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.chmod(0o700)
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TERM", "TZ"}
+    }
+    environment.update({key: str(path) for key, path in paths.items()})
+    environment["PATH"] = os.defpath
+    return environment
+
+
+def _is_direct_codex(candidate: Path, *, probe_home: Path) -> tuple[bool, str]:
     try:
         resolved = candidate.expanduser().resolve(strict=True)
     except OSError as exc:
@@ -84,6 +110,8 @@ def _is_direct_codex(candidate: Path) -> tuple[bool, str]:
     try:
         version = subprocess.run(
             [str(candidate), "--version"],
+            cwd=probe_home,
+            env=_version_probe_environment(probe_home),
             check=False,
             capture_output=True,
             text=True,
@@ -97,40 +125,16 @@ def _is_direct_codex(candidate: Path) -> tuple[bool, str]:
     return True, output
 
 
-def _discover_direct_codex() -> tuple[Path | None, str]:
-    original_user_home = Path.home()
-    configured = os.environ.get("TERMDECK_REAL_CODEX_BINARY", "").strip()
-    candidates: list[Path] = []
-    if configured:
-        candidates.append(Path(configured))
-    candidates.extend(
-        (
-            original_user_home / ".npm-global" / "bin" / "codex",
-            original_user_home / ".local" / "share" / "pnpm" / "codex",
-            original_user_home / ".bun" / "bin" / "codex",
-        )
-    )
-    discovered = shutil.which("codex")
-    if discovered:
-        candidates.append(Path(discovered))
-    candidates.extend((Path("/usr/local/bin/codex"), Path("/usr/bin/codex")))
+def _configured_direct_codex() -> Path | None:
+    """The operator must explicitly select this qualification's real CLI."""
 
-    failures: list[str] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate.expanduser())
-        if key in seen:
-            continue
-        seen.add(key)
-        direct, detail = _is_direct_codex(candidate)
-        if direct:
-            return candidate.expanduser().absolute(), detail
-        failures.append(f"{candidate}: {detail}")
-    reason = "No direct Codex CLI was discoverable"
-    if failures:
-        reason += "; " + "; ".join(failures)
-    reason += ". Set TERMDECK_REAL_CODEX_BINARY to an executable direct Codex CLI."
-    return None, reason
+    configured = os.environ.get("TERMDECK_REAL_CODEX_BINARY", "").strip()
+    if not configured:
+        return None
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("TERMDECK_REAL_CODEX_BINARY must be an explicit absolute path")
+    return candidate
 
 
 def _snapshot_tree(root: Path) -> dict[str, str]:
@@ -169,25 +173,18 @@ def _wait_for_login_status(path: Path, *, timeout: float = 20.0) -> str:
 
 
 def main() -> int:
-    codex_launcher, codex_version = _discover_direct_codex()
+    codex_launcher = _configured_direct_codex()
     if codex_launcher is None:
-        print(
-            json.dumps(
-                {"ok": True, "skipped": True, "reason": codex_version},
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        return 0
-
-    tmux_executable = shutil.which("tmux")
-    if tmux_executable is None:
         print(
             json.dumps(
                 {
                     "ok": True,
                     "skipped": True,
-                    "reason": "tmux is unavailable; the managed-shell auth smoke cannot run",
+                    "reason": (
+                        "Real Codex qualification requires an operator-selected "
+                        "TERMDECK_REAL_CODEX_BINARY absolute path; local installations "
+                        "are not discovered automatically."
+                    ),
                 },
                 indent=2,
                 sort_keys=True,
@@ -195,8 +192,31 @@ def main() -> int:
         )
         return 0
 
+    tmux_executable = shutil.which("tmux")
     with tempfile.TemporaryDirectory(prefix="td-") as tmp:
         root = Path(tmp)
+        # Version checks are executions too. Probe only the selected path, in
+        # a fresh home with no inherited provider credentials or user config.
+        probe_home = root / "version-probe-home"
+        probe_home.mkdir(mode=0o700)
+        direct, codex_version = _is_direct_codex(codex_launcher, probe_home=probe_home)
+        if not direct:
+            raise RuntimeError(
+                f"Explicit TERMDECK_REAL_CODEX_BINARY was rejected: {codex_version}"
+            )
+        if tmux_executable is None:
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "skipped": True,
+                        "reason": "tmux is unavailable; the managed-shell auth smoke cannot run",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
         fake_user_home = root / "home"
         canonical_home = fake_user_home / ".codex"
         canonical_accounts = canonical_home / "accounts"

@@ -76,24 +76,55 @@ class Directory:
         self.path = Path(path)
         if not self.path.is_absolute() or ".." in self.path.parts:
             raise StagingError("Storage root must be absolute", "unsafe-storage")
-        current = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        current = os.open("/", flags)
         try:
+            root = os.fstat(current)
+            self._check_ancestor(root)
+            chain = [self._receipt(root)]
             for index, part in enumerate(self.path.parts[1:]):
                 if create and index == len(self.path.parts) - 2:
                     try:
                         os.mkdir(part, 0o700, dir_fd=current)
                     except FileExistsError:
                         pass
-                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=current)
+                before = os.stat(part, dir_fd=current, follow_symlinks=False)
+                nxt = os.open(part, flags, dir_fd=current)
+                try:
+                    opened = os.fstat(nxt)
+                    after = os.stat(part, dir_fd=current, follow_symlinks=False)
+                    if self._receipt(before) != self._receipt(opened) or self._receipt(after) != self._receipt(opened):
+                        raise StagingError("Storage ancestor changed while opening", "unsafe-storage")
+                    self._check_ancestor(opened)
+                    chain.append(self._receipt(opened))
+                except BaseException:
+                    os.close(nxt)
+                    raise
                 os.close(current)
                 current = nxt
             self.fd = current
             self.identity = os.fstat(self.fd)
             self._check_dir(self.identity)
+            self.chain = tuple(chain)
             current = -1
         finally:
             if current >= 0:
                 os.close(current)
+
+    @staticmethod
+    def _receipt(info):
+        return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode)
+
+    @staticmethod
+    def _check_ancestor(info):
+        mode = stat.S_IMODE(info.st_mode)
+        # Root-owned sticky temporary parents (for example /tmp) protect each
+        # entry from other users. Their children still need trusted ownership
+        # and non-writable ancestry; the selected private root must be 0700.
+        sticky_temporary = info.st_uid == 0 and mode == 0o1777
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, os.geteuid()}
+                or (mode & 0o022 and not sticky_temporary)):
+            raise StagingError("Storage ancestors must have trusted ownership and permissions", "unsafe-storage")
 
     def _check_dir(self, info):
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
@@ -104,8 +135,8 @@ class Directory:
     def check(self):
         other = Directory(self.path)
         try:
-            if (other.identity.st_dev, other.identity.st_ino) != (self.identity.st_dev, self.identity.st_ino):
-                raise StagingError("Storage directory was replaced", "unsafe-storage")
+            if other.chain != self.chain:
+                raise StagingError("Storage directory ancestry changed", "unsafe-storage")
         finally:
             other.close()
 
@@ -252,8 +283,9 @@ class StagingStore:
         # Do not create trees via mkdir(parents=True), which follows links.
         parent = Directory(state_root)
         try:
-            with parent.directory("client-files", create=True):
-                pass
+            with parent.directory("client-files", create=True) as descriptor:
+                self._root_chain = parent.chain + (Directory._receipt(os.fstat(descriptor)),)
+            parent.check()
         finally:
             parent.close()
 
@@ -280,6 +312,8 @@ class StagingStore:
         with authorized(self.auth_directory, actor, now_ms=now_ms) as (machine, now):
             tree = Directory(self.root)
             try:
+                if tree.chain != self._root_chain:
+                    raise StagingError("Staging root ancestry changed", "unsafe-storage")
                 with _database(tree, "metadata.sqlite3", create=True) as db:
                     db.executescript(SCHEMA)
                     db.execute("BEGIN IMMEDIATE")
@@ -300,6 +334,7 @@ class StagingStore:
                             if "attachment_id" in result and not db.execute("SELECT 1 FROM attachments WHERE attachment_id=?", (result["attachment_id"],)).fetchone():
                                 raise StagingError("Replayed attachment has been detached", "stale-reference")
                             result["replayed"] = True
+                            tree.check()
                             db.commit()
                             return result
                         if db.execute("SELECT count(*) FROM requests").fetchone()[0] >= 65536:

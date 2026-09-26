@@ -176,7 +176,8 @@ class _Operation:
     kind: str
     parent: int
     name: str
-    backup: str | None
+    backup: str | None = None
+    published: bool = False
 
 
 class Transaction:
@@ -190,6 +191,23 @@ class Transaction:
     def _temporary(prefix: str) -> str:
         return f".{prefix}-{secrets.token_hex(16)}"
 
+    def _record_operation(self, kind: str, parent: int, name: str, *, label: str) -> _Operation:
+        """Retain rollback resources before changing any public name."""
+
+        if self._finished:
+            raise PublicationError("publication transaction is already finished")
+        retained_parent = -1
+        try:
+            retained_parent = os.dup(parent)
+            os.set_inheritable(retained_parent, False)
+        except OSError as exc:
+            if retained_parent >= 0:
+                os.close(retained_parent)
+            raise PublicationError(f"could not retain transaction descriptor for {label}") from exc
+        operation = _Operation(kind, retained_parent, name)
+        self._operations.append(operation)
+        return operation
+
     def detach_file(
         self,
         parent: int,
@@ -199,8 +217,7 @@ class Transaction:
         owner_gid: int,
         allowed_modes: frozenset[int],
         label: str,
-    ) -> None:
-        backup: str | None = None
+    ) -> _Operation:
         try:
             descriptor = os.open(name, READ_FLAGS, dir_fd=parent)
         except FileNotFoundError:
@@ -223,23 +240,16 @@ class Transaction:
                     raise PublicationError(f"prior {label} ownership or mode is unsafe")
             finally:
                 os.close(descriptor)
+        operation = self._record_operation("file", parent, name, label=label)
+        if descriptor >= 0:
             backup = self._temporary("termdeck-prior")
             try:
                 os.rename(name, backup, src_dir_fd=parent, dst_dir_fd=parent)
+                operation.backup = backup
                 os.fsync(parent)
             except OSError as exc:
                 raise PublicationError(f"could not retain prior {label}") from exc
-        try:
-            retained_parent = os.dup(parent)
-            os.set_inheritable(retained_parent, False)
-        except OSError as exc:
-            if backup is not None:
-                try:
-                    os.rename(backup, name, src_dir_fd=parent, dst_dir_fd=parent)
-                except OSError:
-                    pass
-            raise PublicationError(f"could not retain transaction descriptor for {label}") from exc
-        self._operations.append(_Operation("file", retained_parent, name, backup))
+        return operation
 
     def replace_file(
         self,
@@ -252,7 +262,7 @@ class Transaction:
         owner_gid: int,
         label: str,
     ) -> None:
-        self.detach_file(
+        operation = self.detach_file(
             parent,
             name,
             owner_uid=owner_uid,
@@ -271,6 +281,7 @@ class Transaction:
             os.close(descriptor)
             descriptor = -1
             os.rename(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+            operation.published = True
             os.fsync(parent)
         except BaseException as exc:
             if descriptor >= 0:
@@ -316,34 +327,19 @@ class Transaction:
             pass
         else:
             backup = self._temporary("termdeck-prior-dir")
+        operation = self._record_operation("directory", parent, name, label=label)
+        if backup is not None:
             try:
                 os.rename(name, backup, src_dir_fd=parent, dst_dir_fd=parent)
+                operation.backup = backup
             except OSError as exc:
                 raise PublicationError(f"could not retain prior {label}") from exc
         try:
             os.rename(staged, name, src_dir_fd=parent, dst_dir_fd=parent)
+            operation.published = True
             os.fsync(parent)
         except OSError as exc:
-            if backup is not None:
-                try:
-                    os.rename(backup, name, src_dir_fd=parent, dst_dir_fd=parent)
-                except OSError:
-                    pass
             raise PublicationError(f"could not publish {label}") from exc
-        try:
-            retained_parent = os.dup(parent)
-            os.set_inheritable(retained_parent, False)
-        except OSError as exc:
-            garbage = self._temporary("termdeck-unretained-dir")
-            try:
-                os.rename(name, garbage, src_dir_fd=parent, dst_dir_fd=parent)
-                if backup is not None:
-                    os.rename(backup, name, src_dir_fd=parent, dst_dir_fd=parent)
-                _remove_flat_directory(parent, garbage)
-            except OSError:
-                pass
-            raise PublicationError(f"could not retain transaction descriptor for {label}") from exc
-        self._operations.append(_Operation("directory", retained_parent, name, backup))
 
     def rollback(self) -> None:
         if self._finished:
@@ -351,17 +347,21 @@ class Transaction:
         errors: list[str] = []
         for operation in reversed(self._operations):
             try:
+                if operation.backup is None and not operation.published:
+                    continue
                 if operation.kind == "directory":
-                    garbage = self._temporary("termdeck-rollback-dir")
-                    try:
-                        os.rename(
-                            operation.name,
-                            garbage,
-                            src_dir_fd=operation.parent,
-                            dst_dir_fd=operation.parent,
-                        )
-                    except FileNotFoundError:
-                        garbage = ""
+                    garbage = ""
+                    if operation.published:
+                        garbage = self._temporary("termdeck-rollback-dir")
+                        try:
+                            os.rename(
+                                operation.name,
+                                garbage,
+                                src_dir_fd=operation.parent,
+                                dst_dir_fd=operation.parent,
+                            )
+                        except FileNotFoundError:
+                            garbage = ""
                     if operation.backup is not None:
                         os.rename(
                             operation.backup,
@@ -372,10 +372,11 @@ class Transaction:
                     if garbage:
                         _remove_flat_directory(operation.parent, garbage)
                 else:
-                    try:
-                        os.unlink(operation.name, dir_fd=operation.parent)
-                    except FileNotFoundError:
-                        pass
+                    if operation.published:
+                        try:
+                            os.unlink(operation.name, dir_fd=operation.parent)
+                        except FileNotFoundError:
+                            pass
                     if operation.backup is not None:
                         os.rename(
                             operation.backup,

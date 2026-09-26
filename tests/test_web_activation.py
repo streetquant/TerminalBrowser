@@ -3015,9 +3015,15 @@ def test_published_postimage_is_durable_before_simulated_process_crash(
 
     def systemd(*args: str, check: bool = True) -> SimpleNamespace:
         if args[0] == "is-active":
-            return SimpleNamespace(returncode=0 if watchdog_state["active"] else 3)
+            return SimpleNamespace(
+                returncode=0 if watchdog_state["active"] else 3,
+                stdout="active\n" if watchdog_state["active"] else "inactive\n",
+            )
         if args[0] == "is-enabled":
-            return SimpleNamespace(returncode=0 if watchdog_state["enabled"] else 1)
+            return SimpleNamespace(
+                returncode=0 if watchdog_state["enabled"] else 1,
+                stdout="enabled\n" if watchdog_state["enabled"] else "disabled\n",
+            )
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setenv("TERMDECK_ACTIVATION_APPROVED", "1")
@@ -3209,9 +3215,15 @@ def test_a_to_b_crash_after_armed_receipt_before_install_recovers(
         elif args[0] == "disable":
             watchdog_state.update(active=False, enabled=False)
         elif args[0] == "is-active":
-            return SimpleNamespace(returncode=0 if watchdog_state["active"] else 3)
+            return SimpleNamespace(
+                returncode=0 if watchdog_state["active"] else 3,
+                stdout="active\n" if watchdog_state["active"] else "inactive\n",
+            )
         elif args[0] == "is-enabled":
-            return SimpleNamespace(returncode=0 if watchdog_state["enabled"] else 1)
+            return SimpleNamespace(
+                returncode=0 if watchdog_state["enabled"] else 1,
+                stdout="enabled\n" if watchdog_state["enabled"] else "disabled\n",
+            )
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setenv("TERMDECK_ACTIVATION_APPROVED", "1")
@@ -3685,8 +3697,10 @@ activation._restore(record, tx, checkpoint=checkpoint)
     assert activation._restore(record, tx) == "already-restored"
 
 
+@pytest.mark.parametrize("inactive_state", ("inactive", "failed"))
 def test_disarm_requires_disable_reload_and_inactive_disabled_results(
     monkeypatch: pytest.MonkeyPatch,
+    inactive_state: str,
 ) -> None:
     calls: list[tuple[str, ...]] = []
 
@@ -3698,7 +3712,10 @@ def test_disarm_requires_disable_reload_and_inactive_disabled_results(
             "is-active": 3,
             "is-enabled": 1,
         }
-        return SimpleNamespace(returncode=outcomes[args[0]])
+        return SimpleNamespace(
+            returncode=outcomes[args[0]],
+            stdout={"is-active": inactive_state + "\n", "is-enabled": "disabled\n"}.get(args[0], ""),
+        )
 
     monkeypatch.setattr(activation, "_systemd", systemd)
     activation._disarm()
@@ -3737,7 +3754,10 @@ def test_watchdog_self_disarm_survives_until_terminal_rollback_checkpoint(
         events.append(args)
         assert "--now" not in args, "watchdog attempted to stop its own recovery process"
         assert args[0] != "is-active", "active recovery worker must survive until it returns"
-        return SimpleNamespace(returncode=1 if args[0] == "is-enabled" else 0)
+        return SimpleNamespace(
+            returncode=1 if args[0] == "is-enabled" else 0,
+            stdout="disabled\n" if args[0] == "is-enabled" else "",
+        )
 
     persist = activation._persist
 
@@ -3783,16 +3803,67 @@ def test_disarm_failure_refuses_to_claim_a_terminal_watchdog_state(
             "is-active": 3,
             "is-enabled": 1,
         }
-        return SimpleNamespace(returncode=outcomes.get(args[0], defaults[args[0]]))
+        return SimpleNamespace(
+            returncode=outcomes.get(args[0], defaults[args[0]]),
+            stdout={"is-active": "inactive\n", "is-enabled": "disabled\n"}.get(args[0], ""),
+        )
 
     monkeypatch.setattr(activation, "_systemd", systemd)
     with pytest.raises(activation.WebActivationError, match=message):
         activation._disarm()
 
 
-def test_rollback_disarm_failure_leaves_a_recovery_actionable_receipt(
+@pytest.mark.parametrize(
+    ("query", "returncode", "stdout"),
+    (
+        ("is-active", 1, ""),
+        ("is-active", 3, ""),
+        ("is-active", 1, "inactive\n"),
+        ("is-active", 4, "unknown\n"),
+        ("is-active", 3, "active\n"),
+        ("is-active", 3, "inactive\nactive\n"),
+        ("is-enabled", 1, ""),
+        ("is-enabled", 4, "not-found\n"),
+        ("is-enabled", -15, "disabled\n"),
+        ("is-enabled", 1, "enabled\n"),
+        ("is-enabled", 1, "disabled\nenabled\n"),
+    ),
+)
+def test_disarm_rejects_failed_or_ambiguous_state_queries(
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+    returncode: int,
+    stdout: str,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def systemd(*args: str, check: bool = True) -> SimpleNamespace:
+        calls.append(args)
+        if args[0] == query:
+            return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="query unavailable")
+        result = {
+            "disable": (0, ""),
+            "daemon-reload": (0, ""),
+            "is-active": (3, "inactive\n"),
+            "is-enabled": (1, "disabled\n"),
+        }[args[0]]
+        return SimpleNamespace(returncode=result[0], stdout=result[1], stderr="")
+
+    monkeypatch.setattr(activation, "_systemd", systemd)
+    with pytest.raises(activation.WebActivationError, match="could not verify recovery watchdog"):
+        activation._disarm()
+    assert calls[-1] == (query, activation.WATCHDOG_UNIT)
+
+
+@pytest.mark.parametrize(
+    ("query", "recovering_self"),
+    (("is-active", False), ("is-enabled", False), ("is-enabled", True)),
+)
+def test_rollback_disarm_query_failure_leaves_a_recovery_actionable_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    query: str,
+    recovering_self: bool,
 ) -> None:
     paths = _paths(tmp_path)
     tx, receipt = activation.new_transaction(
@@ -3810,30 +3881,39 @@ def test_rollback_disarm_failure_leaves_a_recovery_actionable_receipt(
         }
     )
     activation._persist(paths, tx, receipt, "failed")
-    monkeypatch.setattr(activation, "_systemd", lambda *_args, **_kwargs: SimpleNamespace(returncode=0))
-    monkeypatch.setattr(activation, "_start_web", lambda: None)
-    monkeypatch.setattr(
-        activation,
-        "verify_database",
-        lambda *_args: {"integrity": "ok", "lost_session_ids": []},
-    )
-    monkeypatch.setattr(
-        activation,
-        "process_observation",
-        lambda *_args: {"disappeared": [], "natural_exit_allowed": True},
-    )
-    monkeypatch.setattr(
-        activation,
-        "_disarm",
-        lambda: (_ for _ in ()).throw(activation.WebActivationError("disarm unavailable")),
-    )
+    calls: list[tuple[str, ...]] = []
 
-    with pytest.raises(activation.WebActivationError, match="disarm unavailable"):
-        activation.rollback(paths, tx, reason="watchdog disarm failure")
+    def systemd(*args: str, check: bool = True) -> SimpleNamespace:
+        calls.append(args)
+        if args[0] == query:
+            return SimpleNamespace(returncode=1, stdout="", stderr="Failed to connect to bus")
+        result = {
+            "disable": (0, ""),
+            "daemon-reload": (0, ""),
+            "is-active": (3, "inactive\n"),
+        }[args[0]]
+        return SimpleNamespace(returncode=result[0], stdout=result[1], stderr="")
+
+    monkeypatch.setattr(activation, "_systemd", systemd)
+    monkeypatch.setattr(activation._WATCHDOG_EXECUTION, "recovering", recovering_self, raising=False)
+    monkeypatch.setattr(
+        activation, "_recover_pending_release_publications",
+        lambda *_args, **_kwargs: pytest.fail("package recovery ran after an unverified disarm"),
+    )
+    with pytest.raises(activation.WebActivationError, match="could not verify recovery watchdog"):
+        activation.rollback(paths, tx, reason="watchdog disarm query failed")
 
     final = activation._read(tx / "receipt.json")
     assert final["status"] == "rollback-failed"
     assert paths.recovery_required.exists()
+    assert final["watchdog"]["disarm_intent"] is True
+    assert final["watchdog"].get("disarmed_for_rollback") is not True
+    assert calls[0] == (("disable", activation.WATCHDOG_UNIT) if recovering_self else (
+        "disable", "--now", activation.WATCHDOG_UNIT,
+    ))
+    assert calls[-1] == (query, activation.WATCHDOG_UNIT)
+    if recovering_self:
+        assert ("is-active", activation.WATCHDOG_UNIT) not in calls
 
 
 def test_rolled_back_terminal_rollback_is_a_true_noop(

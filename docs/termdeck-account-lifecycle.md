@@ -14,7 +14,8 @@ The browser **Codex accounts** panel and desktop account tooltip distinguish:
 3. Effective private credentials, inferred from `auth.json` contents or an exact
    validated account-file link. A stale marker is not credential evidence.
 4. The account at the last observed guarded process restart, bound to its PID,
-   kernel start time and inherited private `CODEX_HOME`.
+   kernel start time, observed Codex child incarnations and inherited private
+   `CODEX_HOME`.
 
 TermDeck cannot inspect credentials cached inside an arbitrary provider process.
 An absent, stale or mismatched restart receipt is reported as unobserved or
@@ -22,6 +23,11 @@ requiring inspection/restart. A receipt is lifecycle evidence, not a successful
 provider login. A changed credential digest invalidates the prior observation.
 PID reuse cannot validate an old receipt. Existing processes without receipts
 are preserved, not claimed to have loaded the current selection.
+
+Version 2 receipts distinguish a stopped tab, an idle shell and a guarded Codex
+restart. A stopped receipt expires when the session record starts again. An idle
+shell reports no running Codex account; a later child cannot inherit an earlier
+child's restart evidence. Older untyped receipts require a fresh observation.
 
 The existing account handoff proves the exact pane, process incarnation,
 quiescence and recoverable conversation before changing a private pointer.
@@ -93,3 +99,18 @@ loop caused by TermDeck.
 `codex-runtime-scope-prepare.py` is neither present nor referenced in this
 repository's tracked source, packaging or deployment scripts. This work does
 not assign its interrupt traceback to TermDeck or modify an external copy.
+
+## Runtime qualification boundary
+
+The account-selector smoke uses a compiled disposable process and synthetic
+credentials to prove the guarded restart and preserved conversation contract.
+It does not prove provider authentication.
+
+The separate cold-scope smoke requires an operator-selected absolute
+`TERMDECK_REAL_CODEX_BINARY` path for the TermDeck runtime being qualified. It
+does not search PATH or another agent's installation. Without that selection it
+reports a skipped prerequisite; an invalid explicit selection fails. Version
+and login-status probes use disposable homes and synthetic credentials. A
+passing login-status probe checks local credential recognition, not a live
+provider login. Production runtime compatibility and authentication still need
+the selected TermDeck installation and its own account catalogue.

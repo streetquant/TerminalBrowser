@@ -64,85 +64,71 @@ class ChromeTokens:
     danger: str
     warning: str
     success: str
-    card_radius: int = 10
+    card_radius: int = 3
     mono: str = "Monospace"
 
 
 CHROME_TOKENS: Mapping[str, ChromeTokens] = {
     "dark": ChromeTokens(
         name="dark",
-        # Ink-and-indigo: deep blue-black surfaces with a luminous periwinkle
-        # accent (Tokyo Night family). Every surface carries the same cool
-        # undertone so the chrome reads as one material, and the semantic
-        # hues (rose / amber / teal) are drawn from the same palette so
-        # badges, toasts and status marks feel native rather than bolted on.
-        bg="#0f121a",
-        bg_raised="#161b26",
-        bg_sunken="#0a0d13",
-        fg="#e7ecf8",
-        fg_muted="#94a0b8",
-        border="#293145",
-        accent="#82aaff",
-        accent_fg="#0a0e17",
-        danger="#f7768e",
-        warning="#e0af68",
-        success="#4fd6be",
-        card_radius=8,
+        # Neutral graphite keeps the working surface quiet. Amber marks
+        # focus and selection; terminal palette choices remain independent.
+        bg="#151514",
+        bg_raised="#1e1e1c",
+        bg_sunken="#10100f",
+        fg="#e5e1d8",
+        fg_muted="#aaa69c",
+        border="#373731",
+        accent="#d7b477",
+        accent_fg="#151514",
+        danger="#ef9190",
+        warning="#d7b477",
+        success="#a7bba3",
     ),
     "noir": ChromeTokens(
         name="noir",
-        # Pure charcoal with a crisp emerald accent — high contrast, no blue
-        # tint. Deeper base and brighter accent than before so the working
-        # surface recedes and interactive marks pop.
-        bg="#0c0d0f",
-        bg_raised="#141619",
-        bg_sunken="#070809",
-        fg="#eceef1",
-        fg_muted="#939aa2",
-        border="#25292e",
-        accent="#3ddc97",
-        accent_fg="#03110a",
-        danger="#f2556c",
-        warning="#e3b341",
-        success="#3ddc97",
-        card_radius=8,
+        # A deeper neutral variant retains the existing noir preference.
+        bg="#10100f",
+        bg_raised="#181817",
+        bg_sunken="#0b0b0a",
+        fg="#e5e1d8",
+        fg_muted="#aaa69c",
+        border="#30302b",
+        accent="#d7b477",
+        accent_fg="#151514",
+        danger="#ef9190",
+        warning="#d7b477",
+        success="#a7bba3",
     ),
     "light": ChromeTokens(
         name="light",
-        # Explicit paper-light shell: neutral cool greys with an ink foreground
-        # and a saturated cobalt accent. Every text pair clears WCAG AA 4.5:1
-        # (guarded by contrast_violations tests) so the light chrome stays
-        # readable on uncalibrated panels.
-        bg="#f6f7f9",
+        # Warm paper with a dark amber accent; text contrast is tested below.
+        bg="#f6f5f1",
         bg_raised="#ffffff",
-        bg_sunken="#eceef2",
-        fg="#1c2128",
-        fg_muted="#59626e",
-        border="#d7dbe1",
-        accent="#2f6fed",
+        bg_sunken="#edece6",
+        fg="#282822",
+        fg_muted="#68665e",
+        border="#d8d5cb",
+        accent="#805b1a",
         accent_fg="#ffffff",
-        danger="#c62b41",
-        warning="#8a5a00",
-        success="#0a6e4a",
-        card_radius=8,
+        danger="#a33b34",
+        warning="#805b1a",
+        success="#3e674b",
     ),
     "system": ChromeTokens(
         name="system",
-        # Clean neutral light shell — follows desktop when system prefers light.
-        # When system prefers dark, effective_chrome_theme() maps to "dark";
-        # values mirror the explicit "light" pack.
-        bg="#f6f7f9",
+        # System preference continues to select the matching light/dark pack.
+        bg="#f6f5f1",
         bg_raised="#ffffff",
-        bg_sunken="#eceef2",
-        fg="#1c2128",
-        fg_muted="#59626e",
-        border="#d7dbe1",
-        accent="#2f6fed",
+        bg_sunken="#edece6",
+        fg="#282822",
+        fg_muted="#68665e",
+        border="#d8d5cb",
+        accent="#805b1a",
         accent_fg="#ffffff",
-        danger="#c62b41",
-        warning="#8a5a00",
-        success="#0a6e4a",
-        card_radius=8,
+        danger="#a33b34",
+        warning="#805b1a",
+        success="#3e674b",
     ),
 }
 
@@ -150,8 +136,7 @@ CHROME_TOKENS: Mapping[str, ChromeTokens] = {
 # Named 16-color VTE packs + fg/bg. Values are modern community palettes.
 TERMINAL_PALETTE_PACKS: Mapping[str, dict[str, object]] = {
     "t1000": {
-        # Signature pack: deep ink surface shared with the dark chrome, plus
-        # luminous accents drawn from the same family as the chrome tokens.
+        # Terminal colors are independent of the surrounding application chrome.
         "label": "t1000 Ink (signature)",
         "foreground": "#dfe6f2",
         "background": "#0a0d13",
@@ -857,8 +842,8 @@ def build_chrome_css(
         "muted": _css_px(base_size - 1, scale),
         "chip": _css_px(base_size - 2, scale),
         "mono": _css_px(base_size - 1, scale),
-        "button": _css_px(base_size - 1, scale),
-        "compact": _css_px(base_size - 1, scale),
+        "button": _css_px(base_size, scale),
+        "compact": _css_px(base_size, scale),
     }
 
     return build_modern_chrome_css(

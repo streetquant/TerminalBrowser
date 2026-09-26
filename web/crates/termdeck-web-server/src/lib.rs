@@ -2364,6 +2364,14 @@ fn terminal_error_response(error: TerminalError) -> Response {
         TerminalError::OutputTooLarge { .. } => {
             json_error_response(StatusCode::PAYLOAD_TOO_LARGE, "terminal-output-too-large")
         }
+        TerminalError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            json_error_response(StatusCode::SERVICE_UNAVAILABLE, "tmux-unavailable")
+        }
         TerminalError::Utf8(_) | TerminalError::Io(_) | TerminalError::SequenceOverflow => {
             internal_error_response()
         }
@@ -4390,6 +4398,110 @@ mod auth_integration_tests {
         request
     }
 
+    // Keep the double-submit cookie/header pair valid while changing only
+    // whether the login exists or owns that CSRF capability.
+    fn csrf_cookies(session: Option<&CookieJar>, csrf: &CookieJar) -> CookieJar {
+        let csrf_value = csrf
+            .csrf
+            .to_str()
+            .unwrap_or_else(|error| panic!("invalid fixture CSRF token: {error}"));
+        let mut cookie = format!("termdeck_csrf={csrf_value}");
+        if let Some(session) = session {
+            let session_pair = session
+                .header
+                .to_str()
+                .unwrap_or_else(|error| panic!("invalid fixture cookie: {error}"))
+                .split("; ")
+                .find(|pair| pair.starts_with("termdeck_session="))
+                .unwrap_or_else(|| panic!("fixture session cookie missing"));
+            cookie = format!("{session_pair}; {cookie}");
+        }
+        CookieJar {
+            header: HeaderValue::from_str(&cookie)
+                .unwrap_or_else(|error| panic!("invalid fixture cookie combination: {error}")),
+            csrf: csrf.csrf.clone(),
+        }
+    }
+
+    fn json_post(
+        uri: &str,
+        body: &serde_json::Value,
+        cookies: &CookieJar,
+        machine_key: Option<&str>,
+    ) -> Request<Body> {
+        let mut request = unsafe_request(
+            Method::POST,
+            uri,
+            Body::from(body.to_string()),
+            Some(cookies),
+            true,
+        );
+        request.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        if let Some(key) = machine_key {
+            request.headers_mut().insert(
+                super::machine_http::MACHINE_HEADER,
+                HeaderValue::from_str(key)
+                    .unwrap_or_else(|error| panic!("invalid fixture machine key: {error}")),
+            );
+        }
+        request
+    }
+
+    async fn call(router: &axum::Router, request: Request<Body>) -> axum::response::Response {
+        router
+            .clone()
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|error| match error {})
+    }
+
+    async fn expect_json(
+        response: axum::response::Response,
+        status: StatusCode,
+    ) -> serde_json::Value {
+        assert_eq!(response.status(), status);
+        serde_json::from_str(&body_text(response).await)
+            .unwrap_or_else(|error| panic!("invalid HTTP fixture JSON: {error}"))
+    }
+
+    async fn assert_error(response: axum::response::Response, status: StatusCode, message: &str) {
+        if status == StatusCode::UNAUTHORIZED {
+            assert_eq!(
+                response.headers().get(header::WWW_AUTHENTICATE),
+                Some(&HeaderValue::from_static("TermDeckSession")),
+            );
+        }
+        let value = expect_json(response, status).await;
+        assert_eq!(value["error"], message);
+    }
+
+    fn expire_sessions(fixture: &AuthFixture) {
+        fixture
+            .state
+            .auth
+            .as_ref()
+            .unwrap_or_else(|| panic!("fixture authentication missing"))
+            .now_ms(unix_ms() + TEST_AUTH_TTL_MS + 1)
+            .unwrap_or_else(|error| panic!("could not expire fixture sessions: {error}"));
+    }
+
+    async fn fresh_login(fixture: &AuthFixture, router: &axum::Router) -> CookieJar {
+        let auth = fixture
+            .state
+            .auth
+            .as_ref()
+            .unwrap_or_else(|| panic!("fixture authentication missing"));
+        let invitation = auth
+            .machine_stores()
+            .0
+            .create_invitation("Fresh fixture login", unix_ms(), TEST_AUTH_TTL_MS)
+            .unwrap_or_else(|error| panic!("could not create fresh fixture invitation: {error}"));
+        pair(router, invitation.secret().expose_secret()).await
+    }
+
     fn pairing_request(secret: &str) -> Request<Body> {
         let body = format!("invitation={secret}");
         let mut request = unsafe_request(Method::POST, PAIRING_PATH, Body::from(body), None, false);
@@ -5140,6 +5252,512 @@ mod auth_integration_tests {
             auth.now_ms(unix_ms()+TEST_AUTH_TTL_MS+1).unwrap_or_else(|e| panic!("time: {e}"));
             assert_eq!(router.clone().oneshot(mutation(&body,Some(&a),true)).await.unwrap_or_else(|e| match e {}).status(),StatusCode::UNAUTHORIZED);
         });
+    }
+
+    #[test]
+    fn machine_http_denials_are_independent_and_expiry_preserves_enrollment() {
+        runtime().block_on(async {
+            use super::machine_http;
+            use axum::Extension;
+            use axum::extract::State;
+            use termdeck_web_auth::{SecretKind, SecretToken};
+
+            const MACHINES: &str = "/_termdeck/api/v1/machines";
+            const CURRENT: &str = "/_termdeck/api/v1/machines/current";
+            let fixture = fixture(&["Owner", "Other login"]);
+            let router = build_router(fixture.state.clone());
+            let owner = pair(&router, fixture.invitations[0].as_str()).await;
+            let other = pair(&router, fixture.invitations[1].as_str()).await;
+            let anonymous = csrf_cookies(None, &owner);
+            let wrong_binding = csrf_cookies(Some(&owner), &other);
+            let key = SecretToken::generate(SecretKind::Machine)
+                .unwrap_or_else(|error| panic!("fixture randomness failed: {error}"));
+            let enroll = serde_json::json!({
+                "operation":"enroll", "request_id":"a".repeat(32),
+                "credential":key.expose_secret(), "label":"Independent controls",
+            });
+            for (cookies, csrf, status, message) in [
+                (
+                    &anonymous,
+                    true,
+                    StatusCode::UNAUTHORIZED,
+                    "authentication-required",
+                ),
+                (&owner, false, StatusCode::FORBIDDEN, "request-forbidden"),
+                (
+                    &wrong_binding,
+                    true,
+                    StatusCode::FORBIDDEN,
+                    "request-forbidden",
+                ),
+            ] {
+                let mut request = json_post(MACHINES, &enroll, cookies, None);
+                if !csrf {
+                    request.headers_mut().remove(CSRF_HEADER_NAME);
+                }
+                assert_error(call(&router, request).await, status, message).await;
+            }
+            let empty = expect_json(
+                call(&router, authenticated_get(MACHINES, &owner)).await,
+                StatusCode::OK,
+            )
+            .await;
+            assert_eq!(empty["machines"], serde_json::json!([]));
+
+            let mut malformed = json_post(MACHINES, &enroll, &owner, None);
+            *malformed.body_mut() = Body::from("{");
+            assert_error(
+                call(&router, malformed).await,
+                StatusCode::BAD_REQUEST,
+                "invalid machine request",
+            )
+            .await;
+            let enrolled = expect_json(
+                call(&router, json_post(MACHINES, &enroll, &owner, None)).await,
+                StatusCode::OK,
+            )
+            .await;
+            assert!(!enrolled.to_string().contains(key.expose_secret()));
+            let rename = serde_json::json!({
+                "operation":"rename", "request_id":"b".repeat(32),
+                "machine_id":enrolled["machine"]["machine_id"],
+                "credential":key.expose_secret(), "label":"Still enrolled",
+            });
+            let current = |cookies: &CookieJar| {
+                let mut request = authenticated_get(CURRENT, cookies);
+                request.headers_mut().insert(
+                    machine_http::MACHINE_HEADER,
+                    HeaderValue::from_str(key.expose_secret())
+                        .unwrap_or_else(|error| panic!("invalid fixture key header: {error}")),
+                );
+                request
+            };
+            for request in [authenticated_get(MACHINES, &anonymous), current(&anonymous)] {
+                assert_error(
+                    call(&router, request).await,
+                    StatusCode::UNAUTHORIZED,
+                    "authentication-required",
+                )
+                .await;
+            }
+            assert_error(
+                call(&router, authenticated_get(CURRENT, &owner)).await,
+                StatusCode::FORBIDDEN,
+                "machine authorization failed",
+            )
+            .await;
+            expect_json(call(&router, current(&owner)).await, StatusCode::OK).await;
+            expect_json(
+                call(&router, json_post(MACHINES, &rename, &owner, None)).await,
+                StatusCode::OK,
+            )
+            .await;
+            let context = fixture
+                .state
+                .auth
+                .as_ref()
+                .unwrap_or_else(|| panic!("fixture authentication missing"))
+                .authenticate(current(&owner).headers(), unix_ms())
+                .unwrap_or_else(|error| panic!("could not capture live fixture context: {error}"));
+            expire_sessions(&fixture);
+            for request in [
+                authenticated_get(MACHINES, &owner),
+                current(&owner),
+                json_post(MACHINES, &rename, &owner, None),
+            ] {
+                assert_error(
+                    call(&router, request).await,
+                    StatusCode::UNAUTHORIZED,
+                    "authentication-required",
+                )
+                .await;
+            }
+            // Exercise expiry after middleware has already captured a valid context.
+            let list = machine_http::list(
+                State(fixture.state.clone()),
+                Some(Extension(context.clone())),
+            )
+            .await;
+            let identify = machine_http::current(
+                State(fixture.state.clone()),
+                Some(Extension(context.clone())),
+                current(&owner).headers().clone(),
+            )
+            .await;
+            let mutation = machine_http::mutate(
+                State(fixture.state.clone()),
+                Some(Extension(context)),
+                json_post(MACHINES, &rename, &owner, None),
+            )
+            .await;
+            for response in [list, identify, mutation] {
+                assert_error(
+                    response,
+                    StatusCode::UNAUTHORIZED,
+                    "authentication-required",
+                )
+                .await;
+            }
+            let fresh = fresh_login(&fixture, &router).await;
+            let retained = expect_json(call(&router, current(&fresh)).await, StatusCode::OK).await;
+            assert_eq!(
+                retained["machine"]["machine_id"],
+                enrolled["machine"]["machine_id"]
+            );
+            expect_json(
+                call(&router, json_post(MACHINES, &rename, &fresh, None)).await,
+                StatusCode::OK,
+            )
+            .await;
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_http_denials_are_independent_and_never_invoke_the_bridge() {
+        runtime().block_on(async {
+            use axum::Extension;
+            use axum::extract::State;
+            use termdeck_web_auth::{SecretKind, SecretToken};
+
+            const STAGING: &str = "/_termdeck/api/v1/client-files";
+            let mut fixture = fixture(&["Owner", "Other login"]);
+            // This fixture tests the HTTP-to-bridge boundary. Python storage is
+            // exercised separately by check_client_files_integration.py.
+            let bridge = fixture._directory.path().join("staging-fixture");
+            let envelope = fixture._directory.path().join("bridge-envelope.json");
+            let calls = fixture._directory.path().join("bridge-envelope.json.calls");
+            fs::write(
+                &bridge,
+                "#!/bin/sh\nset -eu\n[ \"$1\" = client-files ]\ncat > \"$3\"\nprintf 'called\\n' >> \"$3.calls\"\nprintf '%s\\n' '{\"ok\":true,\"objects\":[]}'\n",
+            )
+            .unwrap_or_else(|error| panic!("could not write staging fixture: {error}"));
+            fs::set_permissions(&bridge, fs::Permissions::from_mode(0o700))
+                .unwrap_or_else(|error| panic!("could not protect staging fixture: {error}"));
+            fixture.state.tab_actions = Some(Arc::new(
+                super::TabActionService::new(bridge, envelope.clone(), Duration::from_secs(5))
+                    .unwrap_or_else(|error| panic!("could not create staging bridge: {error}")),
+            ));
+            let router = build_router(fixture.state.clone());
+            let owner = pair(&router, fixture.invitations[0].as_str()).await;
+            let other = pair(&router, fixture.invitations[1].as_str()).await;
+            let anonymous = csrf_cookies(None, &owner);
+            let wrong_binding = csrf_cookies(Some(&owner), &other);
+            let key = SecretToken::generate(SecretKind::Machine)
+                .unwrap_or_else(|error| panic!("fixture randomness failed: {error}"));
+            let enroll = serde_json::json!({
+                "operation":"enroll", "request_id":"a".repeat(32),
+                "credential":key.expose_secret(), "label":"Staging controls",
+            });
+            expect_json(
+                call(&router, json_post("/_termdeck/api/v1/machines", &enroll, &owner, None)).await,
+                StatusCode::OK,
+            )
+            .await;
+            let list = serde_json::json!({"operation":"list"});
+            for (cookies, csrf, status, message) in [
+                (&anonymous, true, StatusCode::UNAUTHORIZED, "authentication-required"),
+                (&owner, false, StatusCode::FORBIDDEN, "request-forbidden"),
+                (&wrong_binding, true, StatusCode::FORBIDDEN, "request-forbidden"),
+            ] {
+                let mut request = json_post(STAGING, &list, cookies, Some(key.expose_secret()));
+                if !csrf {
+                    request.headers_mut().remove(CSRF_HEADER_NAME);
+                }
+                assert_error(call(&router, request).await, status, message).await;
+            }
+            let mut malformed = json_post(STAGING, &list, &owner, Some(key.expose_secret()));
+            *malformed.body_mut() = Body::from("{");
+            assert_error(call(&router, malformed).await, StatusCode::BAD_REQUEST, "invalid JSON").await;
+            let mut wrong_type = json_post(STAGING, &list, &owner, Some(key.expose_secret()));
+            wrong_type.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+            assert_error(call(&router, wrong_type).await, StatusCode::BAD_REQUEST, "JSON required").await;
+            assert_error(
+                call(&router, json_post(STAGING, &serde_json::json!({"operation":"resolve"}), &owner, Some(key.expose_secret()))).await,
+                StatusCode::BAD_REQUEST,
+                "invalid operation",
+            )
+            .await;
+            assert_error(
+                call(&router, json_post(STAGING, &list, &owner, None)).await,
+                StatusCode::FORBIDDEN,
+                "machine authorization failed",
+            )
+            .await;
+            assert!(!calls.exists(), "a denied request reached the staging bridge");
+            expect_json(
+                call(&router, json_post(STAGING, &list, &owner, Some(key.expose_secret()))).await,
+                StatusCode::OK,
+            )
+            .await;
+            let recorded = fs::read_to_string(&envelope)
+                .unwrap_or_else(|error| panic!("could not read staging envelope: {error}"));
+            assert!(!recorded.contains(key.expose_secret()));
+            let context = fixture
+                .state
+                .auth
+                .as_ref()
+                .unwrap_or_else(|| panic!("fixture authentication missing"))
+                .authenticate(json_post(STAGING, &list, &owner, Some(key.expose_secret())).headers(), unix_ms())
+                .unwrap_or_else(|error| panic!("could not capture staging session: {error}"));
+            expire_sessions(&fixture);
+            assert_error(
+                call(&router, json_post(STAGING, &list, &owner, Some(key.expose_secret()))).await,
+                StatusCode::UNAUTHORIZED,
+                "authentication-required",
+            )
+            .await;
+            let revalidated = super::staging_http::operate(
+                State(fixture.state.clone()),
+                Some(Extension(context)),
+                json_post(STAGING, &list, &owner, Some(key.expose_secret())),
+            )
+            .await;
+            assert_error(revalidated, StatusCode::UNAUTHORIZED, "authentication-required").await;
+            assert_eq!(fs::read_to_string(&calls).unwrap_or_default(), "called\n");
+            let fresh = fresh_login(&fixture, &router).await;
+            expect_json(
+                call(&router, json_post(STAGING, &list, &fresh, Some(key.expose_secret()))).await,
+                StatusCode::OK,
+            )
+            .await;
+            assert_eq!(fs::read_to_string(&calls).unwrap_or_default(), "called\ncalled\n");
+        });
+    }
+
+    #[test]
+    fn device_http_denials_preserve_the_selected_device() {
+        runtime().block_on(async {
+            const DEVICES: &str = "/_termdeck/api/v1/devices";
+            let fixture = fixture(&["Owner", "Other login", "Selected device"]);
+            let router = build_router(fixture.state.clone());
+            let owner = pair(&router, fixture.invitations[0].as_str()).await;
+            let other = pair(&router, fixture.invitations[1].as_str()).await;
+            let selected = pair(&router, fixture.invitations[2].as_str()).await;
+            let anonymous = csrf_cookies(None, &owner);
+            let wrong_binding = csrf_cookies(Some(&owner), &other);
+            let auth = fixture
+                .state
+                .auth
+                .as_ref()
+                .unwrap_or_else(|| panic!("fixture authentication missing"));
+            let target = auth
+                .authenticate(
+                    authenticated_get(SESSION_PATH, &selected).headers(),
+                    unix_ms(),
+                )
+                .unwrap_or_else(|error| panic!("could not identify selected device: {error}"));
+            let revoke = format!("{DEVICES}/{}/revoke", target.device_id().as_str());
+            let body = serde_json::json!({});
+            assert_error(
+                call(&router, authenticated_get(DEVICES, &anonymous)).await,
+                StatusCode::UNAUTHORIZED,
+                "authentication-required",
+            )
+            .await;
+            expect_json(
+                call(&router, authenticated_get(DEVICES, &owner)).await,
+                StatusCode::OK,
+            )
+            .await;
+            for (cookies, csrf, status, message) in [
+                (
+                    &anonymous,
+                    true,
+                    StatusCode::UNAUTHORIZED,
+                    "authentication-required",
+                ),
+                (&owner, false, StatusCode::FORBIDDEN, "request-forbidden"),
+                (
+                    &wrong_binding,
+                    true,
+                    StatusCode::FORBIDDEN,
+                    "request-forbidden",
+                ),
+            ] {
+                let mut request = json_post(&revoke, &body, cookies, None);
+                if !csrf {
+                    request.headers_mut().remove(CSRF_HEADER_NAME);
+                }
+                assert_error(call(&router, request).await, status, message).await;
+                expect_json(
+                    call(&router, authenticated_get(SESSION_PATH, &selected)).await,
+                    StatusCode::OK,
+                )
+                .await;
+            }
+            // The selected target is still present and unrevoked when the
+            // requesting login expires; malformed IDs cannot mask this denial.
+            expire_sessions(&fixture);
+            for request in [
+                authenticated_get(DEVICES, &owner),
+                json_post(&revoke, &body, &owner, None),
+            ] {
+                assert_error(
+                    call(&router, request).await,
+                    StatusCode::UNAUTHORIZED,
+                    "authentication-required",
+                )
+                .await;
+            }
+            let records = auth
+                .devices()
+                .unwrap_or_else(|error| panic!("could not inspect selected device: {error}"));
+            let retained = records
+                .iter()
+                .find(|record| record.device_id() == target.device_id())
+                .unwrap_or_else(|| panic!("denied revocation removed the selected device"));
+            assert!(retained.revoked_at_ms().is_none());
+        });
+    }
+
+    #[test]
+    fn terminal_http_unavailability_is_explicit_and_other_io_stays_redacted() {
+        runtime().block_on(async {
+            for (kind, status, message) in [
+                (
+                    std::io::ErrorKind::NotFound,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "tmux-unavailable",
+                ),
+                (
+                    std::io::ErrorKind::ConnectionRefused,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "tmux-unavailable",
+                ),
+                (
+                    std::io::ErrorKind::PermissionDenied,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal-error",
+                ),
+                (
+                    std::io::ErrorKind::Other,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal-error",
+                ),
+            ] {
+                let error = super::TerminalError::Io(std::io::Error::new(
+                    kind,
+                    "private runtime fixture path",
+                ));
+                let value = expect_json(super::terminal_error_response(error), status).await;
+                assert_eq!(value, serde_json::json!({"error":message}));
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_managed_socket_returns_explicit_http_unavailable_without_starting_tmux() {
+        use std::os::unix::fs::MetadataExt;
+
+        const CHILD_ROOT: &str = "TERMDECK_HTTP_MISSING_SOCKET_TEST_ROOT";
+        const TEST_NAME: &str = "auth_integration_tests::missing_managed_socket_returns_explicit_http_unavailable_without_starting_tmux";
+        let Some(child_root) = std::env::var_os(CHILD_ROOT) else {
+            // Isolate the process-wide runtime admission OnceLock and environment
+            // from concurrent tests; no process-global environment is changed here.
+            let directory = TestDirectory::new("missing-socket");
+            let tmux_root = directory.path().join("tmux");
+            DirBuilder::new()
+                .mode(0o700)
+                .create(&tmux_root)
+                .unwrap_or_else(|error| {
+                    panic!("could not create managed runtime fixture: {error}")
+                });
+            let executable = directory.path().join("tmux-fixture");
+            fs::write(
+                &executable,
+                "#!/bin/sh\nprintf 'unexpected tmux invocation\\n' > \"$0.called\"\nexit 0\n",
+            )
+            .unwrap_or_else(|error| panic!("could not write tmux fixture: {error}"));
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+                .unwrap_or_else(|error| panic!("could not protect tmux fixture: {error}"));
+            let metadata = fs::metadata(&tmux_root).unwrap_or_else(|error| {
+                panic!("could not inspect managed runtime fixture: {error}")
+            });
+            let current_exe = std::env::current_exe()
+                .unwrap_or_else(|error| panic!("could not locate test executable: {error}"));
+            let output = std::process::Command::new(current_exe)
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ROOT, directory.path())
+                .env("TERMDECK_STATE_ROOT", directory.path())
+                .env("TERMDECK_TMUX_RUNTIME", &tmux_root)
+                .env("TMUX_TMPDIR", &tmux_root)
+                .env(
+                    "TERMDECK_TMUX_IDENTITY",
+                    format!("{}:{}:{}", metadata.dev(), metadata.ino(), metadata.uid()),
+                )
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .output()
+                .unwrap_or_else(|error| {
+                    panic!("could not run isolated managed-runtime test: {error}")
+                });
+            assert!(
+                output.status.success(),
+                "isolated managed-runtime test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!directory.path().join("tmux-fixture.called").exists());
+            assert!(!tmux_root.join(format!("tmux-{}", metadata.uid())).exists());
+            assert_eq!(
+                fs::read(directory.path().join("http-unavailable-verified")).unwrap_or_default(),
+                b"verified",
+                "the isolated child must execute all HTTP assertions",
+            );
+            return;
+        };
+        let root = PathBuf::from(child_root);
+        super::tmux_runtime::initialize().unwrap_or_else(|error| {
+            panic!("missing socket should still admit safe runtime metadata: {error}")
+        });
+        runtime().block_on(async {
+            let fixture = fixture(&["Owner"]);
+            let router = build_router(fixture.state.clone());
+            let cookies = pair(&router, fixture.invitations[0].as_str()).await;
+            let saved = expect_json(
+                call(&router, authenticated_get("/_termdeck/api/v1/snapshot", &cookies)).await,
+                StatusCode::OK,
+            )
+            .await;
+            assert!(saved.to_string().contains("pane-one"));
+            const PANE: &str = "/_termdeck/api/v1/windows/random/panes/pane-one";
+            for operation in ["capture", "input/text", "input/key"] {
+                let mut state = fixture.state.clone();
+                state.terminal = Some(Arc::new(super::TerminalService::new(
+                    id(OwnerId::new("owner-test")),
+                    root.join("tmux-fixture"),
+                    Duration::from_secs(2),
+                ).unwrap_or_else(|error| panic!("could not create terminal fixture: {error}"))));
+                let router = build_router(state);
+                let request = if operation == "capture" {
+                    authenticated_get(&format!("{PANE}/capture"), &cookies)
+                } else {
+                    let control = expect_json(
+                        call(&router, json_post(&format!("{PANE}/control"), &serde_json::json!({}), &cookies, None)).await,
+                        StatusCode::OK,
+                    )
+                    .await;
+                    let body = if operation == "input/text" {
+                        serde_json::json!({"sequence":control["next_sequence"], "text":"fixture input"})
+                    } else {
+                        serde_json::json!({"sequence":control["next_sequence"], "key":"enter"})
+                    };
+                    json_post(&format!("{PANE}/{operation}"), &body, &cookies, None)
+                };
+                assert_error(call(&router, request).await, StatusCode::SERVICE_UNAVAILABLE, "tmux-unavailable").await;
+                let preserved = expect_json(
+                    call(&router, authenticated_get("/_termdeck/api/v1/snapshot", &cookies)).await,
+                    StatusCode::OK,
+                )
+                .await;
+                assert_eq!(preserved, saved);
+                assert!(!root.join("tmux-fixture.called").exists());
+            }
+        });
+        fs::write(root.join("http-unavailable-verified"), b"verified")
+            .unwrap_or_else(|error| panic!("could not record isolated HTTP assertions: {error}"));
     }
 
     #[test]

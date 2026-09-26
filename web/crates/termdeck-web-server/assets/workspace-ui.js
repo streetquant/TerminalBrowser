@@ -397,7 +397,7 @@ window.T1000UI = (() => {
       blink.checked = settings.cursorBlink;
       const number = (value, min, max, step = 1) => { const input = element("input"); input.type = "number"; input.value = value; input.min = min; input.max = max; input.step = step; return input; };
       const text = value => { const input = element("input"); input.value = value || ""; input.maxLength = 128; return input; };
-      const chrome = select(["noir", "dark", "light", "system"].map(value => ({value, label: {noir: "Charcoal · emerald", dark: "Ink · blue", light: "Paper · cobalt", system: "Follow system"}[value]})), settings.chrome);
+      const chrome = select(["noir", "dark", "light", "system"].map(value => ({value, label: {noir: "Graphite · amber", dark: "Slate · amber", light: "Warm paper · ochre", system: "Follow system"}[value]})), settings.chrome);
       const density = select(["compact", "comfortable"].map(value => ({value, label: value})), settings.density);
       const uiFont = text(settings.uiFont), customFont = text(settings.fontFamily);
       uiFont.placeholder = "System interface font"; customFont.placeholder = "Optional installed font family";

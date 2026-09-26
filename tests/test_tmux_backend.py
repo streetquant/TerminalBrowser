@@ -2404,6 +2404,7 @@ class TmuxBackendTests(unittest.TestCase):
         self.assertEqual(result.recovery_command, recovery)
         self.assertEqual(result.recovery_cwd, "/workspace/repo")
         self.assertEqual(result.pid, 4242)
+        self.assertEqual(result.credential_lifecycle, "codex-restart")
         self.assertEqual(result.status, "running")
         self.assertFalse(result.clear_recovery)
         self.assertIsNone(result.command)
@@ -2444,6 +2445,7 @@ class TmuxBackendTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertFalse(result.restarted)
         self.assertIn("terminal remained ready", result.detail)
+        self.assertEqual(result.credential_lifecycle, "idle-shell")
         suspend.assert_not_called()
         resume.assert_not_called()
         create.assert_not_called()
@@ -2579,6 +2581,7 @@ class TmuxBackendTests(unittest.TestCase):
         self.assertTrue(result.preserve_selected_account)
         self.assertEqual(result.command, "/bin/bash")
         self.assertEqual(result.cwd, "/tmp")
+        self.assertEqual(result.credential_lifecycle, "idle-shell")
         self.assertTrue(result.clear_recovery)
         self.assertIsNone(result.recovery_command)
         self.assertIsNone(result.recovery_cwd)
@@ -2997,6 +3000,7 @@ class TmuxBackendTests(unittest.TestCase):
         self.assertFalse(result.restarted)
         terminate.assert_not_called()
         create.assert_not_called()
+        self.assertEqual(result.credential_lifecycle, "stopped")
 
     def test_auth_change_fails_closed_when_live_codex_has_no_exact_resume_identity(self):
         record = _auth_record(command="/bin/bash", status="running")
@@ -3540,7 +3544,10 @@ class TmuxBackendTests(unittest.TestCase):
         record = _record()
         backend = TmuxBackend(checkpoint_manager=checkpoints)
 
-        with mock.patch.object(backend, "session_exists", return_value=False):
+        with mock.patch.object(backend, "_run", side_effect=[
+            subprocess.CompletedProcess(["tmux"], 1, "", "can't find session"),
+            subprocess.CompletedProcess(["tmux"], 0, "unrelated\n", ""),
+        ]):
             backend.terminate(record)
 
         self.assertEqual(checkpoints.cleared, [record.id])
@@ -4232,7 +4239,10 @@ class TmuxBackendTests(unittest.TestCase):
             command="bash",
             validated_at=time.monotonic(),
         )
-        with mock.patch.object(backend, "session_exists", return_value=False):
+        with mock.patch.object(backend, "_run", side_effect=[
+            subprocess.CompletedProcess(["tmux"], 1, "", "can't find session"),
+            subprocess.CompletedProcess(["tmux"], 0, "unrelated\n", ""),
+        ]):
             backend.terminate(record)
 
         self.assertFalse(backend.scroll_view_active(record))

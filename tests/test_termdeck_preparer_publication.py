@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -81,6 +82,8 @@ def _snapshot(root: Path, relatives: tuple[str, ...]) -> dict[str, object]:
                 int(info.st_nlink),
                 int(info.st_size),
                 int(info.st_mtime_ns),
+                int(info.st_uid),
+                int(info.st_gid),
             ),
             "kind": "directory" if path.is_dir() else "file",
         }
@@ -356,6 +359,158 @@ def test_mid_publication_failure_restores_exact_consumer_preimages(layout, monke
     assert not any(
         path.name.startswith(temporary_prefixes) for path in (consumer / "nginx").iterdir()
     )
+
+
+@pytest.mark.parametrize(
+    ("phase", "failure"),
+    [
+        (phase, failure)
+        for phase in (
+            "receipt-retain",
+            "tls-retain",
+            "tls-publish",
+            "lan-retain",
+            "lan-publish",
+            "hosts-retain",
+            "hosts-publish",
+            "receipt-publish",
+        )
+        for failure in ("rename", "fsync")
+        if (phase, failure) != ("tls-retain", "fsync")
+    ],
+)
+def test_publication_rename_and_sync_failures_restore_consumer_preimages(
+    layout,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    failure: str,
+) -> None:
+    config, producer, consumer = layout
+    publication.seed(config)
+    _prepare_generation(producer)
+    tracked = (
+        "build-receipt.json",
+        "tls",
+        *("tls/" + name for name in sorted(publication.TLS_REQUIRED)),
+        "current-lan-ip",
+        "nginx/allowed-hosts.map",
+        "state/sessions.db",
+        "state/auth.json",
+        "releases/keep/artifact",
+    )
+    before = _snapshot(consumer, tracked)
+    before_names = {
+        "runtime": set(os.listdir(consumer)),
+        "nginx": set(os.listdir(consumer / "nginx")),
+    }
+    original_rename = publication.os.rename
+    original_fsync = publication.os.fsync
+    pending_sync: int | None = None
+    injected = False
+
+    def rename_phase(source: str, destination: str) -> str | None:
+        targets = {
+            "build-receipt.json": "receipt",
+            "current-lan-ip": "lan",
+            "allowed-hosts.map": "hosts",
+        }
+        if source == "tls" and destination.startswith(".termdeck-prior-dir-"):
+            return "tls-retain"
+        if source.startswith(".termdeck-new-tls-") and destination == "tls":
+            return "tls-publish"
+        if source in targets and destination.startswith(".termdeck-prior-"):
+            return targets[source] + "-retain"
+        if source.startswith(".termdeck-new-") and destination in targets:
+            return targets[destination] + "-publish"
+        return None
+
+    def faulting_rename(source, destination, *args, **kwargs):
+        nonlocal pending_sync, injected
+        selected = rename_phase(os.fsdecode(source), os.fsdecode(destination)) == phase
+        if selected and not injected and failure == "rename":
+            injected = True
+            raise OSError(errno.EIO, "injected publication rename failure")
+        result = original_rename(source, destination, *args, **kwargs)
+        if selected and not injected and failure == "fsync":
+            pending_sync = kwargs["dst_dir_fd"]
+        return result
+
+    def faulting_fsync(descriptor):
+        nonlocal pending_sync, injected
+        if pending_sync == descriptor and not injected:
+            pending_sync = None
+            injected = True
+            raise OSError(errno.EIO, "injected publication directory sync failure")
+        return original_fsync(descriptor)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(publication.os, "rename", faulting_rename)
+        patch.setattr(publication.os, "fsync", faulting_fsync)
+        with pytest.raises(publication.PublicationError):
+            publication.publish(config)
+
+    assert injected is True
+    assert _snapshot(consumer, tracked) == before
+    assert set(os.listdir(consumer)) == before_names["runtime"]
+    assert set(os.listdir(consumer / "nginx")) == before_names["nginx"]
+
+
+@pytest.mark.parametrize("operation_number", (1, 2), ids=("receipt", "tls"))
+@pytest.mark.parametrize("failure", ("dup", "set_inheritable"))
+def test_transaction_descriptor_failure_preserves_preimages_and_closes_descriptors(
+    layout,
+    monkeypatch: pytest.MonkeyPatch,
+    operation_number: int,
+    failure: str,
+) -> None:
+    config, producer, consumer = layout
+    publication.seed(config)
+    _prepare_generation(producer)
+    tracked = (
+        "build-receipt.json",
+        "tls",
+        *("tls/" + name for name in sorted(publication.TLS_REQUIRED)),
+        "current-lan-ip",
+        "nginx/allowed-hosts.map",
+    )
+    before = _snapshot(consumer, tracked)
+    before_names = set(os.listdir(consumer))
+    original_dup = publication.os.dup
+    original_set_inheritable = publication.os.set_inheritable
+    duplicated: list[int] = []
+    attempts = 0
+    injected = False
+
+    def faulting_dup(descriptor):
+        nonlocal attempts, injected
+        attempts += 1
+        if attempts == operation_number and failure == "dup":
+            injected = True
+            raise OSError(errno.EMFILE, "injected transaction descriptor exhaustion")
+        retained = original_dup(descriptor)
+        duplicated.append(retained)
+        return retained
+
+    def faulting_set_inheritable(descriptor, inheritable):
+        nonlocal injected
+        if attempts == operation_number and failure == "set_inheritable":
+            injected = True
+            raise OSError(errno.EIO, "injected descriptor setup failure")
+        return original_set_inheritable(descriptor, inheritable)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(publication.os, "dup", faulting_dup)
+        patch.setattr(publication.os, "set_inheritable", faulting_set_inheritable)
+        with pytest.raises(publication.PublicationError, match="transaction descriptor"):
+            publication.publish(config)
+
+    assert injected is True
+    assert _snapshot(consumer, tracked) == before
+    assert set(os.listdir(consumer)) == before_names
+    for descriptor in duplicated:
+        with pytest.raises(OSError) as closed:
+            os.fstat(descriptor)
+        assert closed.value.errno == errno.EBADF
 
 
 def test_symlink_output_is_rejected_and_earlier_swaps_roll_back(layout) -> None:
