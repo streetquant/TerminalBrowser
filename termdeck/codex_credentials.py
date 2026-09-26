@@ -1,7 +1,8 @@
 """Credential-content observations and guarded TermDeck catalogue refreshes.
 
-No token bytes or decoded token claims leave this module. Local identity matching
-does not authenticate a token with its provider. Reads never repair credentials.
+Credential snapshots stay internal to account handling and never enter public
+state. Local identity matching does not authenticate a token with its provider.
+Reads never repair credentials.
 """
 from __future__ import annotations
 
@@ -30,17 +31,19 @@ def _unique(items):
     return result
 
 
-def _read(path: Path) -> bytes:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+def _read(path: Path, *, dir_fd: int | None = None, limit: int = 1024 * 1024) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                 dir_fd=dir_fd)
     try:
         before = os.fstat(fd)
         if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
-                or before.st_nlink != 1 or before.st_mode & 0o022 or before.st_size > 1024 * 1024):
+                or before.st_nlink != 1 or before.st_mode & 0o022 or before.st_size > limit):
             raise CredentialError("Credential storage is unsafe")
-        data = os.read(fd, 1024 * 1024 + 1)
+        data = os.read(fd, limit + 1)
         after = os.fstat(fd)
         identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-        if len(data) > 1024 * 1024 or identity(before) != identity(after) or identity(after) != identity(path.lstat()):
+        linked = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+        if len(data) > limit or identity(before) != identity(after) or identity(after) != identity(linked):
             raise CredentialError("Credentials changed during observation")
         return data
     finally:
@@ -55,8 +58,8 @@ class Credential:
     refreshed: float | None
 
 
-def read(path: Path) -> Credential:
-    data = _read(path)
+def read(path: Path, *, dir_fd: int | None = None) -> Credential:
+    data = _read(path, dir_fd=dir_fd)
     try:
         value = json.loads(data, object_pairs_hook=_unique)
         if not isinstance(value, dict):
@@ -124,36 +127,56 @@ class Observation:
     saved: Credential | None = None
 
 
-def observe(home: Path, credentials: dict[str, Path]) -> Observation:
+def observe(home: Path, credentials: dict[str, Path], *,
+            alternate_credentials: dict[str, tuple[Path, ...]] | None = None,
+            credential_snapshots: dict[Path, Credential] | None = None) -> Observation:
     auth = home / "auth.json"
     try:
         if auth.is_symlink():
             target = auth.resolve(strict=True)
-            matches = [key for key, path in credentials.items() if path.resolve(strict=True) == target]
+            matches = [key for key, path in credentials.items()
+                       if (path if credential_snapshots is not None else path.resolve(strict=True)) == target]
             if len(matches) == 1:
-                credential = read(target)
+                credential = credential_snapshots[target] if credential_snapshots is not None else read(target)
                 return Observation(matches[0], "current", credential, credential)
             # Older TermDeck scopes have private catalogue copies. Recognize
             # their content against the current catalogue without granting an
             # arbitrary symlink target or trusting the old selection marker.
-            accounts = home / "accounts"
-            info = accounts.lstat()
-            if (matches or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
-                    or info.st_mode & 0o077 or target.parent != accounts.resolve(strict=True)):
-                return Observation(None, "conflict")
-            current = read(target)
+            alternate_matches = [key for key, paths in (alternate_credentials or {}).items()
+                                 if target in paths]
+            if not matches and len(alternate_matches) == 1:
+                # The caller validated every alternate in the same system
+                # catalogue snapshot. Compare its content with the newest
+                # snapshot below; a stale link is never called current.
+                pass
+            else:
+                accounts = home / "accounts"
+                info = accounts.lstat()
+                if (matches or alternate_matches or not stat.S_ISDIR(info.st_mode)
+                        or info.st_uid != os.geteuid() or info.st_mode & 0o077
+                        or target.parent != accounts.resolve(strict=True)):
+                    return Observation(None, "conflict")
+            current = (credential_snapshots[target]
+                       if credential_snapshots is not None and alternate_matches else read(target))
         else:
             current = read(auth)
     except FileNotFoundError:
         return Observation(None, "revoked" if auth.is_symlink() else "unselected")
     except (OSError, CredentialError, RuntimeError):
         return Observation(None, "malformed")
-    candidates = []
+    snapshots = {}
     for key, path in credentials.items():
         try:
-            saved = read(path)
+            snapshots[key] = credential_snapshots[path] if credential_snapshots is not None else read(path)
         except (OSError, CredentialError):
             continue
+    return observe_credential(current, snapshots)
+
+
+def observe_credential(current: Credential, credentials: dict[str, Credential]) -> Observation:
+    """Compare already validated snapshots without trusting selection metadata."""
+    candidates = []
+    for key, saved in credentials.items():
         if saved.digest == current.digest or (current.identity is not None and saved.identity == current.identity):
             candidates.append((key, saved))
     if len(candidates) != 1:
@@ -168,14 +191,17 @@ def observe(home: Path, credentials: dict[str, Path]) -> Observation:
     return Observation(key, status, current, saved)
 
 
-def sync_quiescent(home: Path, source: Path, credentials: dict[str, Path]) -> str:
+def sync_quiescent(home: Path, source: Path, credentials: dict[str, Path], *,
+                   alternate_credentials: dict[str, tuple[Path, ...]] | None = None,
+                   credential_snapshots: dict[Path, Credential] | None = None) -> str:
     """Publish a newer private snapshot only under explicit source policy.
 
     Caller must quiesce private writers and hold the scope transaction lock.
     The catalogue lock serializes TermDeck refreshes across tabs; the prepublish
     digest checks detect unsupported external writers and fail closed.
     """
-    observation = observe(home, credentials)
+    observation = observe(home, credentials, alternate_credentials=alternate_credentials,
+                          credential_snapshots=credential_snapshots)
     if observation.status in {"current", "unselected"}:
         return observation.status
     if observation.status != "refreshed":
@@ -196,7 +222,8 @@ def sync_quiescent(home: Path, source: Path, credentials: dict[str, Path]) -> st
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or info.st_mode & 0o077:
             raise CredentialError("Catalogue refresh lock is unsafe")
         fcntl.flock(fd, fcntl.LOCK_EX)
-        latest = observe(home, credentials)
+        latest = observe(home, credentials, alternate_credentials=alternate_credentials,
+                         credential_snapshots=credential_snapshots)
         if latest.status == "current":
             return "current"
         if latest.status != "refreshed" or latest.key != observation.key or latest.credential.digest != observation.credential.digest:
@@ -211,7 +238,8 @@ def sync_quiescent(home: Path, source: Path, credentials: dict[str, Path]) -> st
             # legacy auth.json may be a safe link into the private catalogue;
             # read() must continue to refuse links and read the validated
             # resolved regular file through observe().
-            checked = observe(home, credentials)
+            checked = observe(home, credentials, alternate_credentials=alternate_credentials,
+                              credential_snapshots=credential_snapshots)
             if (read(target).digest != latest.saved.digest
                     or checked.status != "refreshed" or checked.key != latest.key
                     or checked.credential is None

@@ -2557,7 +2557,7 @@ class SessionStore:
         self.conn.commit()
         return True
 
-    def _new_auth_scope(self) -> tuple[str, str, str | None]:
+    def _new_auth_scope(self, *, private_history: bool = False) -> tuple[str, str, str | None]:
         # Keep the optional account integration out of SessionStore's import and
         # normal initialization path.  A missing third-party executable does not
         # affect the generic session registry.
@@ -2574,6 +2574,7 @@ class SessionStore:
         prepare_auth_scope(
             codex_home,
             account_source=self._account_source_override,
+            **({"private_history": True} if private_history else {}),
         )
         state = read_auth_state(codex_home, account_source=self.account_source)
         inherited_account = (
@@ -2606,7 +2607,7 @@ class SessionStore:
                     account_source=self._account_source_override,
                 )
 
-    def ensure_auth_scope(self, session_id: str) -> SessionRecord:
+    def ensure_auth_scope(self, session_id: str, *, private_history: bool = False) -> SessionRecord:
         """Provision the optional private account environment for one terminal."""
 
         current = self.get(session_id)
@@ -2615,8 +2616,14 @@ class SessionStore:
         if current.external:
             raise ValueError("external tmux sessions cannot receive a private auth scope")
         if current.auth_scope_id and current.codex_home:
+            if private_history:
+                from .codex_auth import prepare_auth_scope
+                prepare_auth_scope(current.codex_home, account_source=self._account_source_override,
+                                   private_history=True)
             return current
-        scope_id, codex_home, inherited_account = self._new_auth_scope()
+        scope_id, codex_home, inherited_account = (
+            self._new_auth_scope(private_history=True) if private_history else self._new_auth_scope()
+        )
         self.conn.execute(
             """
             UPDATE sessions

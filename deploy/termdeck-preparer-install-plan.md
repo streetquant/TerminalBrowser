@@ -29,6 +29,14 @@ boundary:
 - `/usr/libexec/termdeck-runtime-attestd` signs only the producer receipt. Its
   service receives a read-only bind of `/var/lib/termdeck-preparer/runtime` and
   no view of the consumer tree.
+- `/usr/lib/termdeck-preparer/termdeck` is the private, root-owned Python
+  library for the signer and receipt-state helpers. Its `__init__.py`,
+  `runtime_attestation.py`, and `preparer_state.py` are explicit manifest
+  members, installed `root:root` mode `0644`; both library directories are
+  `root:root` mode `0755`. Both libexec entry points use the same isolated
+  loader, which reads only these fixed files through no-follow descriptors
+  after validating every ancestor and file. It never imports TermDeck from
+  the checkout, user site, `PYTHONPATH`, or a global Python installation.
 
 The publication helper may read only the approved consumer inputs
 `bin/termdeck-web-server`, `nginx/nginx.conf`, the existing TLS set, and an
@@ -58,6 +66,12 @@ installing any host asset:
    `root:root`.
 4. Run the focused publication, broker, provisioning-template, packaging,
    attestation and release-path-migration tests against this exact source.
+   Packaging qualification must execute both staged libexec entry points with
+   isolated system Python, exercise a disposable Ed25519 receipt round trip,
+   and reject absent, linked, writable or incorrectly owned private libraries.
+   `tests/test_preparer_packaging.py` uses an unprivileged bubblewrap namespace
+   for these installed-path checks. A skipped executable test is a missing
+   qualification prerequisite; static unit verification cannot substitute for it.
 5. Run `systemd-analyze verify` on
    `termdeck-runtime-attestd.service`,
    `termdeck-preparer-broker.socket`, and
@@ -91,7 +105,10 @@ Before installation, record and protect all of the following:
    `/var/lib/termdeck-preparer/.termdeck-tls-recovery-key` and the legacy
    `/warp/projects/softwares/termdeck/.termdeck/.termdeck-tls-recovery-key`.
 7. Existing signer keypair state under `/etc/termdeck` and the exact previous
-   unit/package assets needed for rollback.
+   unit/package assets needed for rollback, including every private Python
+   library member and the library-directory metadata. Capture an explicit
+   absence record for destinations not installed yet. Preserve the matching
+   launcher/library package as one versioned rollback set.
 
 Stop if the consumer root is not a real max-owned mode-`0700` directory, either
 runtime root resolves through an unsafe symlink, both recovery keys exist with
@@ -99,8 +116,27 @@ different bytes, or any required preimage cannot be captured reliably.
 
 ## Installation and first transaction
 
-1. Install the exact staged manifest entries as `root:root` with their declared
-   modes. Do not execute a helper from the mutable producer or consumer tree.
+1. Install all thirteen exact staged manifest entries as `root:root` with their
+   declared modes through the administrator's reviewed package deployment
+   mechanism. The repository installer validates and stages the payload; its
+   `--destdir` is an existing empty package root, never `/`. Create only the
+   private library directories as `root:root` mode `0755`. Install the shared
+   launcher at **both** libexec destinations and the three private library
+   files as one complete package. Keep the broker socket and signer stopped
+   during a package replacement so an invocation cannot mix versions.
+   Recompare every installed file with its qualified stage and verify all
+   library ancestors are real root-owned directories without group/other
+   write permission. Run these non-mutating executable checks before keygen
+   or service startup:
+
+   ```sh
+   /usr/bin/python3 -I /usr/libexec/termdeck-runtime-attestd --help
+   /usr/bin/python3 -I /usr/libexec/termdeck-preparer-state --help
+   ```
+
+   Stop on import, library, ownership or mode failure. No global `pip` install,
+   editable checkout, `PYTHONPATH` override, or mutable runtime helper is part
+   of this package contract.
 2. Install the sysusers definition and run `systemd-sysusers` for that exact
    file. Verify the dedicated UID/GID, primary group and nologin shell.
 3. Install the tmpfiles definition and run `systemd-tmpfiles --create` for that
@@ -171,8 +207,17 @@ unsafe shared-parent ownership model.
    runtime, transaction journals, failed receipts and all consumer data. Do not
    rotate or copy a key back into the consumer tree merely because package
    files are being rolled back.
-3. Restore the exact preimage executables, unit files, sysusers file and other
-   manifest assets. Do not execute an older tmpfiles rule that would chown or
+3. Restore the exact preimage executables, all three private Python library
+   files, library-directory metadata, unit files, sysusers file and other
+   manifest assets as one matching package. Preserve absence for destinations
+   that were absent before this first installation; remove only the exact
+   verified installed leaves owned by the package transaction. Do not remove
+   producer, consumer, signer, recovery-key or journal data. Recheck both
+   installed libexec entry points with isolated Python before restarting a
+   restored compatible package. A prior ten-file payload without its private
+   library is not an executable rollback package on this host; retain it as
+   evidence and keep the privileged services stopped.
+   Do not execute an older tmpfiles rule that would chown or
    chmod the consumer root. If the prior package requires that unsafe rule or
    cannot operate with the preserved private key, keep services stopped and
    record a rollback blocker instead of forcing compatibility.

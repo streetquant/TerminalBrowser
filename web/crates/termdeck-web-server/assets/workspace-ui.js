@@ -580,7 +580,7 @@ window.T1000Management = (() => {
     const requestId = window.T1000Files.id();
     const submit = el("button", "primary", rename ? "Save name" : "Create window"); submit.type = "submit";
     form.append(field("Window name", name), el("p", "subtle", rename ? "Tabs and running processes stay in this window." : "Create an empty window, or configure initial remote tabs and staged client files."));
-    let files, options, rootChoice, runtimeChoice, tabNames, task;
+    let files, options, rootChoice, directoryPath, runtimeChoice, tabNames, task;
     if (!rename) {
       const configured = el("details"); configured.className = "new-window-configuration";
       configured.append(el("summary", "", "Configure workspace, runtime and client files"));
@@ -592,13 +592,24 @@ window.T1000Management = (() => {
           options = await window.T1000Files.management({operation: "launch-options"});
           const previousRoot = rootChoice?.value, previousRuntime = runtimeChoice?.value;
           const previousTabs = tabNames?.value, previousTask = task?.value;
-          rootChoice = selector([["", "Empty window (no initial tabs)"], ...options.workspaces.map(item => [item.id, `${item.label} · ${item.path}`])], previousRoot || "");
+          const previousDirectory = directoryPath?.value;
+          rootChoice = selector([["", "Empty window (no initial tabs)"], ...(options.server_directory ? [["__server_directory__", "Enter server directory…"]] : []), ...options.workspaces.map(item => [item.id, `${item.label} · ${item.path}`])], previousRoot || "");
+          directoryPath = el("input"); directoryPath.maxLength = 4096; directoryPath.spellcheck = false;
+          directoryPath.autocomplete = "off"; directoryPath.placeholder = "/path/to/project"; directoryPath.value = previousDirectory || "";
+          const directoryField = field("Server directory", directoryPath);
+          const directoryHelp = el("p", "subtle", "Choose an existing folder on the TermDeck host. Files selected below are uploaded copies from this client machine.");
+          const showDirectory = () => {
+            const selected = rootChoice.value === "__server_directory__";
+            directoryField.hidden = directoryHelp.hidden = !selected;
+            directoryPath.disabled = !selected; directoryPath.required = selected;
+          };
+          rootChoice.addEventListener("change", showDirectory); showDirectory();
           runtimeChoice = selector(options.runtimes.map(item => [item.id, item.label]), previousRuntime || "shell");
           tabNames = el("textarea"); tabNames.value = previousTabs || "Main"; tabNames.maxLength = 1024;
           task = el("textarea"); task.maxLength = 8192; task.value = previousTask || ""; task.disabled = runtimeChoice.value !== "codex";
           runtimeChoice.addEventListener("change", () => { task.disabled = runtimeChoice.value !== "codex"; if (task.disabled) task.value = ""; });
-          choices.replaceChildren(field("Server workspace", rootChoice), field("Runtime", runtimeChoice), field("Initial tab names (one per line, maximum 8)", tabNames), field("Codex task (optional)", task));
-          if (!options.workspaces.length) choices.append(el("p", "subtle", "No server workspaces are approved on this host yet. Empty windows remain available."));
+          choices.replaceChildren(field("Server workspace", rootChoice), directoryField, directoryHelp, field("Runtime", runtimeChoice), field("Initial tab names (one per line, maximum 8)", tabNames), field("Codex task (optional)", task));
+          if (!options.workspaces.length && !options.server_directory) choices.append(el("p", "subtle", "No server workspaces are available on this host yet. Empty windows remain available."));
         } catch (error) { report(error.message); }
       };
       let hadMachine = null;
@@ -620,11 +631,13 @@ window.T1000Management = (() => {
         if (!rename && rootChoice?.value) {
           const tabs = tabNames.value.split("\n").map(value => value.trim()).filter(Boolean);
           if (!tabs.length || tabs.length > 8) throw new Error("Enter between 1 and 8 tab names.");
+          const workspaceSelection = rootChoice.value === "__server_directory__" ? {workspace_path: directoryPath.value} : {workspace_id: rootChoice.value};
+          if (rootChoice.value === "__server_directory__" && !directoryPath.value) throw new Error("Enter an existing server directory.");
           busy = true;
-          try { result = await window.T1000Files.management({operation: "create-window", request_id: requestId, policy_revision: options.policy_revision, name: name.value.trim(), workspace_id: rootChoice.value, runtime: runtimeChoice.value, tabs, task: task.value, attachments: files.references()}); }
+          try { result = await window.T1000Files.management({operation: "create-window", request_id: requestId, policy_revision: options.policy_revision, name: name.value.trim(), ...workspaceSelection, runtime: runtimeChoice.value, tabs, task: task.value, attachments: files.references()}); }
           finally { busy = false; }
         } else {
-          if (!rename && files?.references().length) throw new Error("Choose an approved server workspace to attach files to the new remote task.");
+          if (!rename && files?.references().length) throw new Error("Choose a server workspace to attach files to the new remote task.");
           result = await run({operation: rename ? "rename-window" : "create-window", name: name.value.trim(), ...(rename ? {window_id: win.id} : {request_id: requestId})});
         }
         await navigate(result.window_id, null, result.window_name || name.value.trim());

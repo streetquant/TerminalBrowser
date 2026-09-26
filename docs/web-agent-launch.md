@@ -1,9 +1,10 @@
-# Approved browser task launches
+# Server workspace and browser task launches
 
 The authenticated management endpoint accepts `launch-options` and configured
 `create-window` requests through the same enrolled-machine/staging bridge.
 A configured creation includes a request ID, current policy revision, window
-name, workspace ID, `shell` or configured `codex` runtime, 1–8 initial tab names,
+name, exactly one saved `workspace_id` or absolute server `workspace_path`,
+`shell` or configured `codex` runtime, 1–8 initial tab names,
 optional Codex task text, and at most 16 immutable staged references. Shell task
 commands and client-supplied argv are rejected.
 
@@ -22,28 +23,50 @@ commands and client-supplied argv are rejected.
 }
 ```
 
-With no policy, no server workspace is offered. There is no inferred grant from
-an uploaded client path, browser label, current process directory, or login.
-Workspace roots must have real, non-writable-by-others path components. Runtime
-state and broad home/root mounts are rejected. The established repository
-layout may contain `.termdeck/state`; `.termdeck` and `.beads` are masked inside
-the task, then only specific approved attachments/private auth are mounted.
+Saved workspaces are convenient choices. An authenticated enrolled machine can
+also select an existing server directory that the host account can read and
+search, without adding it to the policy. With no policy, this directory option
+and the confined shell are available; Codex still requires explicit runtime
+configuration. Upload display paths and browser labels never select host paths.
 
-An operator can configure TermDeck's own compatible Codex executable using:
+Selection resolves an initial directory alias to its canonical path and records
+the directory's device/inode ancestry in the immutable launch receipt. Start,
+execution and configured resume revalidate that receipt. Bubblewrap binds an
+open directory descriptor, preventing a final path substitution from redirecting
+the grant. Paths with spaces and accessible group-writable projects work.
+Readable directories without write permission are mounted read-only; a receipt
+prepared read-only cannot later gain write authority.
+
+Broad parent directories, including ordinary home directories, are supported.
+Nested `.termdeck`, `.beads`, private authentication and account catalogues,
+TermDeck release/control namespaces, and host sockets/devices/FIFOs are masked.
+Reserved private-directory aliases such as `.codex` have their canonical target
+masked too. Only exact authorized attachment copies and the selected tab's
+private scope are mounted back beneath those masks. A bounded metadata scan
+fails clearly if it cannot establish containment (at most 1,000,000 entries,
+128 levels and 4,096 masks). The filesystem root `/` and kernel/runtime control
+trees `/proc`, `/sys`, `/dev` and `/run` cannot be selected as workspaces.
+Old prepared receipts retain their original saved path and validation contract.
+
+An operator can configure the explicitly authorized system-native Codex
+executable and its existing configuration/account source using:
 
 ```json
 "codex": {
-  "executable": "/qualified/termdeck/codex-runtime",
+  "executable": "/qualified/system/codex-runtime",
   "sha256": "<64 lowercase hex digits from the qualified executable>",
-  "account_source": "/qualified/termdeck/account-source"
+  "account_source": "/qualified/existing/codex-home"
 }
 ```
 
-The executable's owner, path, executable mode and digest are checked before
-launch. This is explicit host policy, not permission to discover or modify an
-unrelated local Codex or CloudMCP installation. Qualify the actual configured
-runtime under the mount contract before production activation. Arbitrary
-host-launcher dependencies are not automatically exposed through the sandbox.
+The executable's owner, canonical path, executable mode and digest are checked
+before launch. The selected source may consume the existing system-native
+configuration and `codex-auth` account catalogue under the user's authorization.
+TermDeck uses its per-tab account adapter and private scope; it does not change
+the global active login or make standalone Codex depend on TermDeck. Resolve any
+configured executable/source alias to its actual host path. Qualify that runtime
+under the mount contract before production activation. Host-launcher dependencies
+are not automatically exposed through the sandbox.
 
 The Codex adapter asks the existing TermDeck `SessionStore` to provision that
 tab's private `CODEX_HOME` from the configured account source. It passes a private
@@ -66,7 +89,8 @@ public system files under `/usr`, minimal `/dev`, private `/tmp`, approved
 workspace, read-only attachment directories, and the one optional private Codex
 scope. Network access is retained for the chosen agent. Paths outside these
 mounts are absent; attachment permission does not expose their parent namespace.
-Runtime argv is fixed by the server. Codex task text is one data argument.
+Runtime argv is fixed by the server. Codex task text follows an explicit `--`
+option terminator and is one data argument.
 
 Durable creation receipts precede registry changes. Repeated and concurrent
 submissions return the same window and tab identities. One-use permits precede
@@ -92,6 +116,11 @@ bytes, target authorization, request replay, failed startup, policy changes,
 concurrent refresh/launch, a disposable Codex-shaped runtime and private scope,
 and the absence of an unrestricted fallback. The fixture does not perform a
 real Codex login or prove production runtime compatibility.
+
+`tests/test_server_workspaces.py` covers arbitrary directory selection, canonical
+identity replacement, read-only grants, broad parent masking and real descriptor
+mounts. `tests/test_confined_account_resume.py` verifies the configured native
+process and exact confined account restart, including directory revalidation.
 
 `scripts/check_client_files_integration.py` exercises actual HTTP management,
 the stdin bridge, disposable tmux creation, canonical file reads inside the

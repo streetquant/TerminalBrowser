@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .codex_config_scope import prepare_shared_codex_configuration
+from .codex_catalogue import AccountCatalogue, read_private_profiles, read_profiles
 from .models import SessionRecord
 
 
@@ -64,6 +65,7 @@ class CodexAccount:
     alias: str = ""
     account_name: str = ""
     active: bool = False
+    selectors: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:
@@ -1233,6 +1235,7 @@ def prepare_auth_scope(
     *,
     account_source: str | Path | None = None,
     migrate_account_catalog: bool = False,
+    private_history: bool = False,
 ) -> Path:
     """Create one durable Codex auth scope with shared conversation history.
 
@@ -1243,16 +1246,48 @@ def prepare_auth_scope(
     credential entries point at the same source files. In both layouts the
     scope's ``current`` and ``auth.json`` selection stay private.
 
+    System login-profile catalogues instead supply validated snapshots to a
+    private accounts tree. Newer native refreshes remain in that one scope.
+
     Releases that hard-code ``~/.codex`` are isolated by running them with a
     private compatibility HOME. Codex session roots are shared with the
     canonical source home so per-tab selection never hides conversations.
+    Confined task scopes opt into durable private history with ``private_history``.
     """
 
     home = Path(codex_home).expanduser().resolve(strict=False)
+    source = Path(account_source).expanduser() if account_source else default_account_source()
+    source_root = source.resolve(strict=False)
+    if home == source_root or source_root in home.parents:
+        # Retain the historical self-preparation no-op for a legacy catalogue.
+        # It must not install private wrappers or alter canonical history.
+        profile_metadata = any((source_root / name).exists() or (source_root / name).is_symlink()
+                               for name in ("login-homes", "next-login-home", "account-profiles.json"))
+        if home == source_root and source_root.is_dir() and not private_history and not profile_metadata:
+            return home
+        raise CodexAuthError("Configured Codex account source cannot contain a private auth scope")
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     home.chmod(0o700)
 
-    source = Path(account_source).expanduser() if account_source else default_account_source()
+    history_marker = home / ".termdeck-private-history"
+    if history_marker.exists() or history_marker.is_symlink():
+        from .codex_credentials import CredentialError, _read
+        try:
+            if _read(history_marker, limit=64) != b"private-history-v1\n":
+                raise CredentialError("Invalid private history marker")
+        except (OSError, CredentialError) as exc:
+            raise CodexAuthError("Private Codex history policy is unsafe") from exc
+        private_history = True
+    if private_history:
+        for name in ("sessions", "archived_sessions"):
+            history = home / name
+            if history.exists() or history.is_symlink():
+                _source_authority(history, kind="private history", directory=True)
+        for name in ("sessions", "archived_sessions"):
+            history = home / name
+            history.mkdir(mode=0o700, exist_ok=True)
+            history.chmod(0o700)
+        _write_private_text(history_marker, "private-history-v1\n")
     _share_account_catalog(
         home,
         source,
@@ -1263,14 +1298,14 @@ def prepare_auth_scope(
     private_state = ensure_private_codex_state(
         home,
         account_source=account_source,
-        session_source=source,
+        session_source=home if private_history else source,
     )
     # Never expose a large shared rollout tree to an existing private database
     # whose native backfill is still pending/running. Scope preparation may run
     # while that database has an active Codex writer. A newly initialized sparse
     # database, or an existing supported database with a natural complete marker,
     # can safely see the shared roots without triggering the native full scan.
-    if (
+    if not private_history and (
         private_state is None
         or _state_template_version(private_state) is not None
     ):
@@ -1351,7 +1386,7 @@ def _account_name(path: Path) -> str:
     return name
 
 
-def _source_account_catalog(
+def _legacy_account_catalog(
     source: Path,
 ) -> tuple[Path, dict[str, Path], dict[str, Any] | None]:
     """Resolve and validate the sole authoritative saved-account catalogue."""
@@ -1360,7 +1395,7 @@ def _source_account_catalog(
         source_root = source.expanduser().resolve(strict=True)
     except FileNotFoundError:
         return source.expanduser().resolve(strict=False), {}, None
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise CodexAuthError(
             f"configured Codex account source cannot be resolved: {source}"
         ) from exc
@@ -1378,7 +1413,11 @@ def _source_account_catalog(
     _source_authority(accounts, kind="account catalogue", directory=True)
 
     try:
-        entries = list(accounts.iterdir())
+        entries = []
+        for entry in accounts.iterdir():
+            entries.append(entry)
+            if len(entries) > 1024:
+                raise CodexAuthError("Configured Codex account catalogue exceeds the entry limit")
     except OSError as exc:
         raise CodexAuthError(
             f"configured Codex account catalogue cannot be read: {accounts}"
@@ -1392,8 +1431,9 @@ def _source_account_catalog(
         _source_authority(entry, kind="saved account file", directory=False)
         if entry.name.casefold() == "registry.json":
             try:
-                parsed = json.loads(entry.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+                from .codex_credentials import _read, _unique
+                parsed = json.loads(_read(entry), object_pairs_hook=_unique)
+            except (ValueError, OSError, UnicodeError) as exc:
                 raise CodexAuthError(
                     f"configured Codex account registry is invalid: {entry}"
                 ) from exc
@@ -1435,6 +1475,25 @@ def _source_account_catalog(
                     f"configured Codex registry account has no credential file: {key}"
                 )
     return source_root, credentials, registry
+
+
+def _source_account_catalog(source: Path) -> AccountCatalogue:
+    from .codex_credentials import CredentialError
+    root, credentials, registry = _legacy_account_catalog(source)
+    if not root.exists():
+        return AccountCatalogue(root, credentials, registry)
+    try:
+        return read_profiles(root, credentials, registry) or AccountCatalogue(root, credentials, registry)
+    except CredentialError as exc:
+        raise CodexAuthError(str(exc)) from exc
+
+
+def _private_profile_catalogue(home: Path, source: AccountCatalogue) -> AccountCatalogue:
+    from .codex_credentials import CredentialError
+    try:
+        return read_private_profiles(home, source)
+    except CredentialError as exc:
+        raise CodexAuthError(str(exc)) from exc
 
 
 def _same_link_target(link: Path, target: Path, *, directory: bool = False) -> bool:
@@ -1856,14 +1915,10 @@ def _regular_auth_account(
     return matches[0] if len(matches) == 1 else None
 
 
-def _canonical_default_account(
-    source_root: Path,
-    credentials: dict[str, Path],
-    source_registry: dict[str, Any] | None,
-) -> str | None:
+def _canonical_default_account(catalogue: AccountCatalogue) -> str | None:
     """Infer the canonical default from effective credentials, not a marker."""
     from .codex_credentials import observe
-    observed = observe(source_root, credentials)
+    observed = catalogue.canonical or observe(catalogue.root, catalogue.credentials)
     return observed.key if observed.status == "current" else None
 
 
@@ -1992,7 +2047,10 @@ def _share_account_catalog(
     *,
     migrate_existing: bool,
 ) -> bool:
-    source_root, credentials, source_registry = _source_account_catalog(source)
+    catalogue = _source_account_catalog(source)
+    source_root, credentials, source_registry = catalogue.root, catalogue.credentials, catalogue.registry
+    if catalogue.profile_layout:
+        return _share_profile_account_catalog(home, catalogue, migrate_existing=migrate_existing)
     source_accounts = source_root / "accounts"
     private_accounts = home / "accounts"
     new_scope_catalog = not private_accounts.exists() and not private_accounts.is_symlink()
@@ -2010,7 +2068,7 @@ def _share_account_catalog(
         for path in (home / "auth.json", home / "current")
     )
     canonical_default = (
-        _canonical_default_account(source_root, credentials, source_registry)
+        _canonical_default_account(catalogue)
         if scope_unselected and new_scope_catalog
         else None
     )
@@ -2105,6 +2163,172 @@ def _share_account_catalog(
     return True
 
 
+def _private_catalogue_preimage(path: Path, *, directory: bool = False, budget: list[int] | None = None):
+    """Retain bounded private rollback bytes; never follow catalogue links."""
+    from .codex_credentials import CredentialError, _read
+    budget = [16 * 1024 * 1024] if budget is None else budget
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if info.st_uid != os.geteuid():
+        raise CodexAuthError("Private catalogue rollback source has an unsafe owner")
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISLNK(info.st_mode):
+        target = os.readlink(path)
+        if len(target) > 4096 or info.st_nlink != 1:
+            raise CodexAuthError("Private catalogue rollback link is unsafe")
+        return "link", target, mode
+    if mode & 0o022:
+        raise CodexAuthError("Private catalogue rollback source is writable by another user")
+    if directory and stat.S_ISDIR(info.st_mode):
+        entries = {}
+        for child in path.iterdir():
+            if len(entries) >= 1024:
+                raise CodexAuthError("Private catalogue exceeds the rollback entry limit")
+            entries[child.name] = _private_catalogue_preimage(child, budget=budget)
+        return "directory", entries, mode
+    try:
+        raw = _read(path, limit=min(budget[0], 1024 * 1024))
+    except (OSError, CredentialError) as exc:
+        raise CodexAuthError("Private catalogue cannot be preserved safely for rollback") from exc
+    budget[0] -= len(raw)
+    return "file", raw, mode
+
+
+def _restore_private_preimage(path: Path, preimage) -> None:
+    """Recreate a removed private object, including after partial cleanup."""
+    if preimage is None:
+        return
+    kind, value, mode = preimage
+    if kind == "link":
+        path.symlink_to(value)
+    elif kind == "directory":
+        path.mkdir(mode=mode)
+        for name, child in value.items():
+            _restore_private_preimage(path / name, child)
+        path.chmod(mode)
+    else:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fchmod(stream.fileno(), mode)
+            os.fsync(stream.fileno())
+
+
+def _share_profile_account_catalog(
+    home: Path, catalogue: AccountCatalogue, *, migrate_existing: bool,
+) -> bool:
+    """Publish a complete private catalogue only while its scope is quiescent."""
+    from .codex_credentials import observe
+    if home == catalogue.root:
+        raise CodexAuthError("System account source cannot be used as a private auth scope")
+    source_catalogue = catalogue
+    catalogue = _private_profile_catalogue(home, source_catalogue)
+    accounts = home / "accounts"
+    existing = accounts.exists() or accounts.is_symlink()
+    if existing and not migrate_existing:
+        return False
+    backup = home / ".termdeck-accounts-migration"
+    if backup.exists() or backup.is_symlink():
+        raise CodexAuthError("Private Codex account migration is incomplete")
+    if existing:
+        if accounts.is_symlink():
+            if not _same_link_target(accounts, catalogue.root / "accounts", directory=True):
+                raise CodexAuthError("Private Codex catalogue link is outside its configured source")
+        else:
+            _source_authority(accounts, kind="private account catalogue", directory=True)
+    _validate_private_current_marker(home)
+    observed = observe(home, catalogue.credentials, alternate_credentials=catalogue.alternate_credentials,
+                       credential_snapshots=catalogue.credential_snapshots)
+    if observed.status not in {"current", "unselected", "refreshed", "stale"}:
+        raise CodexAuthError(f"Private credential snapshot is {observed.status}; preserved for review")
+    selected = observed.key
+    saved = {key: catalogue.credential_snapshots[path] for key, path in catalogue.credentials.items()}
+    if observed.status == "refreshed":
+        saved[selected] = observed.credential
+    if observed.status == "unselected" and not existing:
+        selected = _canonical_default_account(catalogue)
+    private_registry = _private_registry_payload(accounts / "registry.json") if existing else None
+    marker = (_registry_accounts(private_registry)[1] if private_registry is not None
+              else _native_current_account(home, list(catalogue.credentials)))
+    if marker is not None and observed.key is not None and marker != observed.key:
+        raise CodexAuthError("Private Codex marker and credentials identify different accounts")
+    previous_accounts = _private_catalogue_preimage(accounts, directory=True)
+    auth_path = home / "auth.json"
+    previous_auth = _private_catalogue_preimage(auth_path)
+    previous_current = _private_catalogue_preimage(home / "current")
+
+    staged = home / f".termdeck-profile-catalogue-{uuid.uuid4().hex}"
+    staged.mkdir(mode=0o700)
+    moved_existing = False
+    published = False
+    binding_started = False
+    cleanup_started = False
+    try:
+        payload = dict(catalogue.registry or {})
+        payload["active_account_key"] = selected
+        _write_private_text(staged / "registry.json", json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        for name, credential in saved.items():
+            _restore_private_preimage(staged / f"{name}.json", ("file", credential.data, 0o600))
+        # The configured source can rotate or revoke a profile during staging.
+        checked = _source_account_catalog(catalogue.root)
+        if not checked.profile_layout or checked.fingerprint != catalogue.fingerprint:
+            raise CodexAuthError("System account catalogue changed before private publication")
+        if (_private_catalogue_preimage(auth_path) != previous_auth
+                or _private_catalogue_preimage(home / "current") != previous_current
+                or _private_catalogue_preimage(accounts, directory=True) != previous_accounts):
+            raise CodexAuthError("Private account selection changed before catalogue publication")
+        if existing:
+            os.replace(accounts, backup)
+            moved_existing = True
+        os.replace(staged, accounts)
+        published = True
+        if selected is not None:
+            binding_started = True
+            _bind_selected_auth_pointer(home, selected)
+        final_source = _source_account_catalog(catalogue.root)
+        if not final_source.profile_layout or final_source.fingerprint != source_catalogue.fingerprint:
+            raise CodexAuthError("System account catalogue changed during private publication")
+        final = _private_profile_catalogue(home, final_source)
+        result = observe(home, final.credentials, credential_snapshots=final.credential_snapshots)
+        if result.status not in {"current", "unselected"} or result.key != selected:
+            raise CodexAuthError("Private profile catalogue publication did not verify")
+        if moved_existing:
+            cleanup_started = True
+            if backup.is_symlink():
+                backup.unlink()
+            else:
+                shutil.rmtree(backup)
+        return True
+    except Exception as failure:
+        try:
+            if published:
+                shutil.rmtree(accounts)
+            if moved_existing:
+                if not cleanup_started:
+                    os.replace(backup, accounts)
+                else:
+                    _restore_private_preimage(accounts, previous_accounts)
+            if binding_started:
+                auth_path.unlink(missing_ok=True)
+                _restore_private_preimage(auth_path, previous_auth)
+            if cleanup_started and (backup.exists() or backup.is_symlink()):
+                if backup.is_symlink():
+                    backup.unlink()
+                else:
+                    shutil.rmtree(backup)
+        except OSError as exc:
+            raise CodexAuthError("Private catalogue rollback is incomplete; preserved files require review") from exc
+        if isinstance(failure, OSError):
+            raise CodexAuthError("Private account publication failed; previous selection restored") from failure
+        raise
+    finally:
+        if staged.exists():
+            shutil.rmtree(staged)
+
+
 def _path_fingerprint(path: Path) -> bytes:
     """Fingerprint filesystem metadata without hashing token file contents."""
 
@@ -2193,22 +2417,28 @@ def read_auth_state(
     private_payload: dict[str, Any] = {}
     registry_bytes = b""
     try:
-        registry_bytes = registry_path.read_bytes()
-        parsed = json.loads(registry_bytes.decode("utf-8"))
+        from .codex_credentials import _read, _unique
+        registry_bytes = _read(registry_path)
+        parsed = json.loads(registry_bytes.decode("utf-8"), object_pairs_hook=_unique)
         if isinstance(parsed, dict):
             private_payload = parsed
-    except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeError):
+    except (ValueError, OSError, UnicodeError):
         pass
 
     source_credentials: dict[str, Path] | None = None
     source_registry: dict[str, Any] | None = None
     catalog_shared = True
     if account_source is not None:
-        source_root, source_credentials, source_registry = _source_account_catalog(
+        catalogue = _source_account_catalog(
             Path(account_source).expanduser()
         )
+        if catalogue.profile_layout:
+            catalogue = _private_profile_catalogue(home, catalogue)
+        source_root, source_credentials, source_registry = catalogue.root, catalogue.credentials, catalogue.registry
         private_accounts = home / "accounts"
-        if source_registry is None:
+        if catalogue.profile_layout:
+            catalog_shared = catalogue.private_catalogue_ready and not _registry_migration_artifacts(private_accounts)
+        elif source_registry is None:
             catalog_shared = _same_link_target(
                 private_accounts,
                 source_root / "accounts",
@@ -2245,6 +2475,8 @@ def read_auth_state(
                     alias=str(row.get("alias") or "").strip(),
                     account_name=str(row.get("account_name") or row.get("name") or "").strip(),
                     active=key == active_key,
+                    selectors=tuple(value for value in row.get("selectors", ()) if isinstance(value, str))
+                    if isinstance(row.get("selectors", ()), (list, tuple)) else (),
                 )
             )
     else:
@@ -2274,12 +2506,15 @@ def read_auth_state(
         for account in accounts
     }
     marker_key = private_active_key if rows else _native_current_account(home, list(observed_credentials))
-    observation = observe(home, observed_credentials)
+    observation = observe(home, observed_credentials,
+                          alternate_credentials=catalogue.alternate_credentials if account_source is not None else None,
+                          credential_snapshots=catalogue.credential_snapshots
+                          if account_source is not None and catalogue.profile_layout else None)
     active_key = observation.key
     accounts = [CodexAccount(account.account_key, account.email, account.alias, account.account_name,
-                             account.account_key == active_key) for account in accounts]
+                             account.account_key == active_key, account.selectors) for account in accounts]
     active = next((account for account in accounts if account.active), None)
-    canonical = observe(source_root, observed_credentials) if account_source is not None else None
+    canonical = (catalogue.canonical or observe(source_root, observed_credentials)) if account_source is not None else None
     canonical_account = next((account for account in accounts if canonical and account.account_key == canonical.key), None)
     fingerprint_names = native_names or [account.account_key for account in accounts]
     if source_registry is not None:
@@ -2288,6 +2523,8 @@ def read_auth_state(
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
+    if account_source is not None and catalogue.profile_layout:
+        registry_bytes += b"\0system-catalogue\0" + catalogue.fingerprint.encode()
     fingerprint = _state_fingerprint(
         home,
         registry_bytes,
@@ -2342,6 +2579,7 @@ def resolve_account(state: CodexAuthState, query: str) -> CodexAccount:
             account.alias,
             account.account_name,
             account.label,
+            *account.selectors,
         }
         if any(candidate and candidate.casefold() == needle for candidate in candidates):
             matches.append(account)
@@ -2393,11 +2631,13 @@ class CodexAuthManager:
         if not record.codex_home:
             raise CodexAuthError(f"terminal {record.id} has no private CODEX_HOME")
         from .codex_credentials import CredentialError, sync_quiescent
-        source, credentials, _ = _source_account_catalog(self.account_source)
-        try:
-            sync_quiescent(Path(record.codex_home), source, credentials)
-        except CredentialError as exc:
-            raise CodexAuthError(str(exc)) from exc
+        catalogue = _source_account_catalog(self.account_source)
+        source, credentials = catalogue.root, catalogue.credentials
+        if not catalogue.profile_layout:
+            try:
+                sync_quiescent(Path(record.codex_home), source, credentials)
+            except CredentialError as exc:
+                raise CodexAuthError(str(exc)) from exc
         prepare_auth_scope(
             record.codex_home,
             account_source=self.account_source,

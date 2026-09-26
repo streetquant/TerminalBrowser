@@ -2,10 +2,18 @@
 
 The Windows page includes **New window** and **Client files**. An empty window
 requires only a name. Expand **Configure workspace, runtime and client files**
-to select an administrator-approved server workspace, supported runtime, one to
-eight initial tabs, and immutable staged attachments. The server policy is
-described in [web-agent-launch.md](web-agent-launch.md). The browser cannot add
-server workspace paths or executable commands to that policy.
+to choose a saved workspace or **Enter server directory…**, a supported runtime,
+one to eight initial tabs, and immutable staged attachments. A server directory
+must already exist and be accessible to the installed host account. Paths with
+spaces are supported; read-only directories remain read-only. Protected private
+storage and system control trees are excluded. The server validates and pins the
+canonical directory before launch; errors stay in the dialog for correction.
+The server policy is described in [web-agent-launch.md](web-agent-launch.md).
+Selecting a directory does not register a new runtime or executable command.
+
+**Server directory** refers to the machine running TermDeck. It does not read a
+path on the browser's machine. Select local files below to upload copies and
+attach their immutable references to the remote task.
 
 Machine enrollment is explicit and separate from web login. The browser creates
 a random credential and stores it in its origin/base-path-scoped IndexedDB.

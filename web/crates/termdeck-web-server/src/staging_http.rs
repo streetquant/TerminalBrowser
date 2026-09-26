@@ -97,7 +97,7 @@ pub(crate) async fn operate(
                     Some("unauthorized") => StatusCode::FORBIDDEN,
                     Some("conflict" | "stale-reference") => StatusCode::CONFLICT,
                     Some("capacity") => StatusCode::PAYLOAD_TOO_LARGE,
-                    Some("invalid-request") => StatusCode::BAD_REQUEST,
+                    Some("invalid-request" | "unavailable-workspace") => StatusCode::BAD_REQUEST,
                     _ => StatusCode::SERVICE_UNAVAILABLE,
                 }
             };

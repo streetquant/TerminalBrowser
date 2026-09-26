@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 import os
@@ -9,11 +10,14 @@ from pathlib import Path
 import shlex
 import stat
 import sys
+import time
 import uuid
+from types import SimpleNamespace
 
 from .client_files import Actor, Directory, StagingError, _database, _id, _json, _text, authorized
 from .models import SessionRecord
 from .session_store import SessionStore, utc_now
+from . import server_workspaces
 
 
 POLICY = "web-launch-policy.json"
@@ -23,6 +27,11 @@ CREATE TABLE IF NOT EXISTS launches(launch_id TEXT PRIMARY KEY,account_id TEXT N
  UNIQUE(account_id,machine_id,session_id,request_id));
 """
 RUNS = "CREATE TABLE IF NOT EXISTS launch_runs(launch_id TEXT NOT NULL,tab_id TEXT NOT NULL,PRIMARY KEY(launch_id,tab_id));"
+RESUMES = """CREATE TABLE IF NOT EXISTS launch_resumes(
+ permit_id TEXT PRIMARY KEY,launch_id TEXT NOT NULL,tab_id TEXT NOT NULL,
+ conversation_id TEXT NOT NULL,codex_home TEXT NOT NULL,scope_id TEXT NOT NULL,
+ used INTEGER NOT NULL DEFAULT 0);"""
+_RESUME_PREFIX = "termdeck-confined-resume:"
 _MASKED_NAMES = (".termdeck", ".beads")
 
 
@@ -46,6 +55,31 @@ def _validate_workspace_grant(workspace, state_root, *, protected=()):
             _within(root, workspace / name) for name in _MASKED_NAMES
         ):
             raise StagingError("Workspace would expose protected storage", "unsafe-storage")
+
+
+def _workspace_protected(store, value):
+    return [store.auth_directory] + ([value["codex"]["account_source"]] if value["codex"] else [])
+
+
+@contextmanager
+def _plan_workspace(store, plan, value, *, inspect=False):
+    workspace = plan["workspace"]
+    protected = _workspace_protected(store, value)
+    if "pin" in workspace:
+        with server_workspaces.open_workspace(workspace, state_root=store.root.parent,
+                                               protected=protected, inspect=inspect) as directory:
+            yield directory
+    else:
+        # Existing prepared receipts retain their original explicit grant and
+        # checks. They never acquire a different saved choice's current path.
+        _host_path(workspace["path"], directory=True)
+        _validate_workspace_grant(workspace["path"], store.root.parent, protected=protected)
+        directory = server_workspaces.WorkspaceDirectory(workspace["path"], state_root=store.root.parent,
+                                                         protected=protected, inspect=inspect)
+        try:
+            yield directory
+        finally:
+            directory.close()
 
 
 def _shared_asset_path(path, *, state_root, auth_directory, account_source,
@@ -110,10 +144,11 @@ def policy(state_root):
                 raise StagingError("Invalid workspace policy", "unsafe-storage")
             _id(workspace["id"],"ws_")
             _text(workspace["label"],256)
-            root=_host_path(workspace["path"],directory=True)
-            if root == Path("/") or root == Path.home() or root == Path("/tmp"):
-                raise StagingError("Workspace grants excessive host access", "unsafe-storage")
-            _validate_workspace_grant(root, state_root)
+            directory = server_workspaces.WorkspaceDirectory(workspace["path"], state_root=state_root, inspect=False)
+            try:
+                workspace["path"] = str(directory.path)
+            finally:
+                directory.close()
             if workspace["id"] in seen: raise StagingError("Duplicate workspace identity", "unsafe-storage")
             seen.add(workspace["id"])
         codex=value["codex"]
@@ -126,15 +161,229 @@ def policy(state_root):
                 raise StagingError("TermDeck Codex runtime identity changed", "unsafe-storage")
             source = _host_path(codex["account_source"],directory=True)
             for workspace in value["workspaces"]:
-                _validate_workspace_grant(workspace["path"], state_root, protected=(source,))
+                directory = server_workspaces.WorkspaceDirectory(workspace["path"], state_root=state_root,
+                                                                 protected=(source,), inspect=False)
+                directory.close()
         return value,hashlib.sha256(raw).hexdigest()
     finally: tree.close()
 
 
 def options(state_root):
     value,digest=policy(state_root)
-    return {"ok":True,"policy_revision":digest,"workspaces":value["workspaces"],
+    return {"ok":True,"policy_revision":digest,"workspaces":value["workspaces"],"server_directory":True,
             "runtimes":[{"id":"shell","label":"Confined shell"}]+([{"id":"codex","label":"Codex (TermDeck private account)"}] if value["codex"] else [])}
+
+
+def resume_identity(command):
+    """An internal identity, never executable shell syntax."""
+    if not isinstance(command, str) or not command.startswith(_RESUME_PREFIX):
+        return None
+    value = command[len(_RESUME_PREFIX):]
+    try:
+        return value if str(uuid.UUID(value)) == value else None
+    except ValueError:
+        return None
+
+
+def _launch_binding(record):
+    parts = shlex.split(record.command)
+    if (record.tag != "web-agent" or record.external or len(parts) != 14
+            or parts[0] != "exec" or not Path(parts[1]).is_absolute()
+            or parts[2:5] != ["-m", "termdeck.agent_launch", "--state"]
+            or parts[6::2] != ["--auth-dir", "--db", "--launch", "--tab"]):
+        raise StagingError("Configured launch binding is unavailable", "unauthorized")
+    args = SimpleNamespace(state=parts[5], auth_dir=parts[7], db=parts[9], launch=parts[11], tab=parts[13])
+    # The fixed entrypoint has fourteen words; reject trailing decoration.
+    return args
+
+
+def _runtime_argv(value, plan, home, conversation=None):
+    argv = [value["codex"]["executable"], "-c", f"sqlite_home={json.dumps(home)}",
+            "--sandbox", "workspace-write", "--ask-for-approval", "on-request"]
+    if conversation:
+        return [*argv, "resume", conversation]
+    prompt = plan["task"] + "\nAuthorized immutable files staged on the TermDeck host:\n" + "\n".join(a["server_path"] for a in plan["attachments"])
+    return [*argv, "--", prompt]
+
+
+def _launcher_command(store, plan, tab_id):
+    return "exec " + shlex.join([plan.get("launcher", sys.executable), "-m", "termdeck.agent_launch",
+        "--state", str(store.root.parent), "--auth-dir", str(store.auth_directory),
+        "--db", str(store.session_database), "--launch", plan["launch_id"], "--tab", tab_id])
+
+
+def _validate_attachments(store, tree, db, actor, plan):
+    for attachment in plan["attachments"]:
+        row = store._row(db, actor, attachment["reference"])
+        if row["status"] not in {"ready", "changed"}:
+            raise StagingError("Attachment unavailable", "stale-reference")
+        expected = db.execute("SELECT target FROM attachments WHERE attachment_id=? AND account_id=? AND machine_id=?",
+                              (attachment["attachment_id"], actor.account_id, actor.machine_id)).fetchone()
+        if not expected or expected[0] != "window:" + plan["window_id"]:
+            raise StagingError("Attachment no longer authorized", "unauthorized")
+        store._verify(tree, row)
+        if attachment["server_path"] != str(store.root / store._location(row)):
+            raise StagingError("Attachment path changed", "unsafe-storage")
+
+
+@contextmanager
+def _resume_authorized(store, actor):
+    """Keep the original grant; fresh UI authentication cannot replace it."""
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(authorized(store.auth_directory, actor))
+        except StagingError as exc:
+            # This read only classifies a refusal. It never grants authority.
+            directory = Directory(store.auth_directory)
+            try:
+                with _database(directory, "termdeck-machines-v1.sqlite3", readonly=True) as machines:
+                    machine = machines.execute("SELECT * FROM machines WHERE machine_id=?", (actor.machine_id,)).fetchone()
+                    if machine and machine["revoked_at_ms"] is not None:
+                        raise StagingError("Original launch machine was revoked; authorize a new launch", "unauthorized") from exc
+                with _database(directory, "termdeck-web-auth-v1.sqlite3", readonly=True) as auth:
+                    session = auth.execute("SELECT expires_at_ms,revoked_at_ms FROM auth_sessions WHERE session_id=?", (actor.session_id,)).fetchone()
+                    last = auth.execute("SELECT last_observed_at_ms FROM auth_metadata WHERE singleton=1").fetchone()[0]
+                    if session and session["expires_at_ms"] <= max(int(time.time() * 1000), last):
+                        raise StagingError("Original launch login expired; authorize a new launch with the current login", "unauthorized") from exc
+                    if session and session["revoked_at_ms"] is not None:
+                        raise StagingError("Original launch login was revoked; authorize a new launch with the current login", "unauthorized") from exc
+            finally:
+                directory.close()
+            raise StagingError("Original launch authorization changed; authorize a new launch", "unauthorized") from exc
+        yield
+
+
+def _validate_resume_record(store, args, db, plan, value, expected=None):
+    sessions = SessionStore(store.session_database, provision_auth_scopes=False)
+    try:
+        current = sessions.get(args.tab)
+    finally:
+        sessions.close()
+    if current is None:
+        raise StagingError("Configured tab is unavailable", "unauthorized")
+    if "launcher" in plan and current.command != _launcher_command(store, plan, args.tab):
+        raise StagingError("Configured launcher identity changed", "unauthorized")
+    binding = _launch_binding(current)
+    if (any(getattr(binding, key) != getattr(args, key) for key in ("state", "auth_dir", "db", "launch", "tab"))
+            or not Path(args.db).is_absolute() or Path(args.db).parent != Path(args.state)
+            or current.window_id != plan["window_id"] or current.cwd != plan["workspace"]["path"]
+            or args.tab not in [t["id"] for t in plan["tabs"]]
+            or not db.execute("SELECT 1 FROM launches WHERE launch_id=? AND status='started'", (args.launch,)).fetchone()
+            or not db.execute("SELECT 1 FROM launch_runs WHERE launch_id=? AND tab_id=?", (args.launch, args.tab)).fetchone()):
+        raise StagingError("Configured tab binding changed", "unauthorized")
+    if expected is not None and any(getattr(current, key) != getattr(expected, key)
+                                    for key in ("command", "codex_home", "auth_scope_id", "window_id", "cwd")):
+        raise StagingError("Configured tab binding changed", "unauthorized")
+    if plan["runtime"] != "codex" or not value["codex"]:
+        raise StagingError("Configured Codex runtime changed", "unauthorized")
+    expected_home = store.root.parent / "terminal-auth" / (current.auth_scope_id or "")
+    if not current.auth_scope_id or current.codex_home != str(expected_home):
+        raise StagingError("Configured private scope changed", "unauthorized")
+    private = Directory(expected_home)
+    private.close()
+    from .codex_config_scope import _bound_canonical_home
+    if _bound_canonical_home(expected_home) != Path(value["codex"]["account_source"]).resolve(strict=True):
+        raise StagingError("Configured account source changed", "unauthorized")
+    return current
+
+
+@contextmanager
+def _resume_context(record):
+    from .client_files import StagingStore
+    args = _launch_binding(record)
+    if (args.tab != record.id or not Path(args.db).is_absolute()
+            or Path(args.db).parent != Path(args.state)):
+        raise StagingError("Configured launch binding changed", "unauthorized")
+    store = StagingStore(Path(args.state), Path(args.auth_dir), session_database=Path(args.db))
+    tree = Directory(store.root)
+    try:
+        with _database(tree, "metadata.sqlite3") as db:
+            row = db.execute("SELECT plan,status FROM launches WHERE launch_id=?", (_id(args.launch, "launch_"),)).fetchone()
+            if not row or row["status"] != "started":
+                raise StagingError("Configured launch is not started", "conflict")
+            plan = json.loads(row["plan"])
+            actor = Actor(**plan["actor"])
+            with _resume_authorized(store, actor):
+                value, revision = policy(store.root.parent)
+                if revision != plan["policy_revision"] or plan["runtime"] != "codex" or not value["codex"]:
+                    raise StagingError("Configured launch policy changed", "conflict")
+                with _plan_workspace(store, plan, value) as directory:
+                    directory.check()
+                _validate_resume_record(store, args, db, plan, value, record)
+                _validate_attachments(store, tree, db, actor, plan)
+                yield args, store, tree, db, plan, value
+                tree.check()
+    finally:
+        tree.close()
+
+
+def observe_resume(record, root_pid):
+    """Recognize only this policy's original/resumed native process and rollout."""
+    from . import resources
+    from .codex_credentials import process_start
+    with _resume_context(record) as (_, _, _, _, plan, value):
+        executable = Path(value["codex"]["executable"]).stat()
+        matches = []
+        for pid in resources.process_tree(root_pid):
+            before = process_start(pid)
+            environment = resources._process_environment(pid) or {}
+            argv = resources._process_argv(pid)
+            if (before is None or environment.get("CODEX_HOME") != record.codex_home
+                    or environment.get("TERMDECK_WEB_LAUNCH_ID") != plan["launch_id"]
+                    or environment.get("TERMDECK_WEB_TAB_ID") != record.id):
+                continue
+            try:
+                actual = Path(f"/proc/{pid}/exe").stat()
+            except OSError:
+                continue
+            if (actual.st_dev, actual.st_ino) != (executable.st_dev, executable.st_ino):
+                continue
+            conversation = resources._primary_codex_session_id(pid)
+            if not conversation or resume_identity(_RESUME_PREFIX + conversation) is None:
+                continue
+            if argv not in (tuple(_runtime_argv(value, plan, record.codex_home)),
+                            tuple(_runtime_argv(value, plan, record.codex_home, conversation))):
+                continue
+            cwd = resources._process_cwd(pid)
+            if cwd == plan["workspace"]["path"] and before == process_start(pid):
+                matches.append((_RESUME_PREFIX + conversation, cwd))
+        if len(matches) != 1:
+            return True, None, None
+        return True, *matches[0]
+
+
+def prepare_resume(record):
+    """Issue a single-use continuation under the original launch authority."""
+    conversation = resume_identity(record.recovery_command)
+    if conversation is None:
+        raise StagingError("Configured task requires its exact conversation", "conflict")
+    with _resume_context(record) as (args, _, _, db, _, _):
+        db.execute(RESUMES)
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("SELECT count(*) FROM launch_resumes").fetchone()[0] >= 4096:
+            raise StagingError("Configured resume receipt capacity reached", "capacity")
+        permit = "resume_" + uuid.uuid4().hex
+        db.execute("UPDATE launch_resumes SET used=1 WHERE launch_id=? AND tab_id=? AND used=0", (args.launch, record.id))
+        db.execute("INSERT INTO launch_resumes VALUES(?,?,?,?,?,?,0)",
+                   (permit, args.launch, record.id, conversation, record.codex_home, record.auth_scope_id))
+        db.commit()
+        return record.command + " --resume-permit " + permit, permit
+
+
+def cancel_resume(record, permit):
+    """Invalidate only the pending internal permit when a handoff is abandoned."""
+    args = _launch_binding(record)
+    if args.tab != record.id or Path(args.db).parent != Path(args.state):
+        raise StagingError("Configured launch binding changed", "unauthorized")
+    tree = Directory(Path(args.state) / "client-files")
+    try:
+        with _database(tree, "metadata.sqlite3") as db:
+            db.execute(RESUMES)
+            db.execute("UPDATE launch_resumes SET used=1 WHERE permit_id=? AND launch_id=? AND tab_id=?",
+                       (_id(permit, "resume_"), args.launch, record.id))
+            db.commit()
+    finally:
+        tree.close()
 
 
 def prepare(store,db,tree,actor,request,machine,now):
@@ -142,12 +391,17 @@ def prepare(store,db,tree,actor,request,machine,now):
     value,revision=policy(store.root.parent)
     if request.get("policy_revision")!=revision:
         raise StagingError("Workspace policy changed; refresh choices", "conflict")
-    workspace=next((w for w in value["workspaces"] if w["id"]==request.get("workspace_id")),None)
-    if workspace is None: raise StagingError("Choose an approved server workspace")
-    workspace_path=Path(workspace["path"])
-    protected=[store.auth_directory]
-    if value["codex"]: protected.append(Path(value["codex"]["account_source"]))
-    _validate_workspace_grant(workspace_path, store.root.parent, protected=protected)
+    if ("workspace_id" in request) == ("workspace_path" in request):
+        raise StagingError("Choose one saved workspace or enter one server directory")
+    if "workspace_path" in request:
+        workspace = server_workspaces.select(request["workspace_path"], state_root=store.root.parent,
+                                              protected=_workspace_protected(store, value))
+    else:
+        preset=next((w for w in value["workspaces"] if w["id"]==request.get("workspace_id")),None)
+        if preset is None: raise StagingError("Choose a saved server workspace or enter a server directory")
+        workspace = {**server_workspaces.select(preset["path"], state_root=store.root.parent,
+                                                protected=_workspace_protected(store, value)),
+                     "id": preset["id"], "label": preset["label"], "source": "saved-workspace"}
     runtime=request.get("runtime")
     if runtime not in {"shell","codex"} or runtime == "codex" and not value["codex"]:
         raise StagingError("Unsupported or unconfigured runtime")
@@ -172,6 +426,7 @@ def prepare(store,db,tree,actor,request,machine,now):
     launch_id="launch_"+uuid.uuid4().hex
     window_id="win-"+uuid.uuid4().hex
     plan={"launch_id":launch_id,"actor":asdict(actor),"policy_revision":revision,"workspace":workspace,
+          "launcher":str(Path(sys.executable).resolve(strict=True)),
           "runtime":runtime,"task":task,"window_id":window_id,"name":name,"attachments":selected,
           "tabs":[{"id":"td-"+uuid.uuid4().hex,"name":tab} for tab in tabs]}
     # Receipted intent precedes registry or process side effects. Replayed
@@ -206,9 +461,8 @@ def start(store,actor,result,*,backend=None):
                     return dict(result,ok=False,status=row["status"],error="Window exists but launch did not finish; inspect its tabs before explicit recovery",code="conflict")
                 value,revision=policy(store.root.parent)
                 if revision!=plan["policy_revision"]: raise StagingError("Launch policy changed", "conflict")
-                protected = [store.auth_directory]
-                if value["codex"]: protected.append(Path(value["codex"]["account_source"]))
-                _validate_workspace_grant(plan["workspace"]["path"], store.root.parent, protected=protected)
+                with _plan_workspace(store, plan, value) as directory:
+                    directory.check()
                 # Once marked starting, replay never respawns a dead/finished
                 # task. An interrupted partial start requires explicit recovery.
                 db.execute("UPDATE launches SET status='starting' WHERE launch_id=?",(plan["launch_id"],)); db.commit()
@@ -216,7 +470,7 @@ def start(store,actor,result,*,backend=None):
                 try:
                     sessions.remember_window(plan["window_id"],plan["name"])
                     for index,tab in enumerate(plan["tabs"]):
-                        command="exec "+shlex.join([sys.executable,"-m","termdeck.agent_launch","--state",str(store.root.parent),"--auth-dir",str(store.auth_directory),"--db",str(store.session_database),"--launch",plan["launch_id"],"--tab",tab["id"]])
+                        command=_launcher_command(store, plan, tab["id"])
                         record=SessionRecord(id=tab["id"],name=tab["name"],tag="web-agent",command=command,cwd=plan["workspace"]["path"],tmux_name="termdeck_web_"+tab["id"].replace("-","_"),created_at=utc_now(),last_opened_at=utc_now(),window_id=plan["window_id"],window_title=plan["name"],tab_index=index,restart_policy="never")
                         if sessions.get(record.id) is not None: raise StagingError("Launch registry identity conflicts", "conflict")
                         sessions.upsert(record)
@@ -231,21 +485,27 @@ def start(store,actor,result,*,backend=None):
         finally: tree.close()
 
 
-def sandbox_argv(workspace,attachments,*,runtime_argv,codex_home=None,asset_paths=()):
+def sandbox_argv(workspace,attachments,*,runtime_argv,codex_home=None,asset_paths=(),scope_environment=None,workspace_directory=None):
     """A mount namespace contains system libraries and explicit task authority."""
     args=["/usr/bin/bwrap","--die-with-parent","--unshare-all","--share-net","--new-session","--clearenv",
           "--ro-bind","/usr","/usr","--symlink","usr/bin","/bin","--symlink","usr/lib","/lib","--symlink","usr/lib","/lib64",
-          "--proc","/proc","--dev","/dev","--tmpfs","/tmp","--dir","/run","--dir","/home/task",
-          "--setenv","HOME","/home/task","--setenv","PATH","/usr/bin","--setenv","TERM","xterm-256color",
-          "--setenv","LANG","C.UTF-8","--bind",workspace,workspace]
+          "--proc","/proc","--dev","/dev","--tmpfs","/tmp","--dir","/run","--dir","/run/termdeck-home",
+          "--setenv","HOME","/run/termdeck-home","--setenv","PATH","/usr/bin","--setenv","TERM","xterm-256color",
+          "--setenv","LANG","C.UTF-8"]
     for name in ("resolv.conf","hosts","nsswitch.conf","ssl/certs"):
         source=Path("/etc")/name
         if source.exists(): args.extend(["--ro-bind",str(source),str(source)])
-    for name in _MASKED_NAMES:
-        if (Path(workspace)/name).exists(): args.extend(["--tmpfs",str(Path(workspace)/name)])
+    if workspace_directory is not None:
+        args.extend(workspace_directory.mount_arguments())
+    else:
+        args.extend(["--bind",workspace,workspace])
+        for name in _MASKED_NAMES:
+            if (Path(workspace)/name).exists(): args.extend(["--tmpfs",str(Path(workspace)/name)])
     for path in attachments: args.extend(["--ro-bind",path,path])
     if codex_home:
         args.extend(["--bind",codex_home,codex_home,"--setenv","CODEX_HOME",codex_home])
+    for key, value in (scope_environment or {}).items():
+        args.extend(["--setenv", key, value])
     for source in asset_paths: args.extend(["--ro-bind",source,source])
     args.extend(["--chdir",workspace,"--",*runtime_argv])
     return args
@@ -260,34 +520,48 @@ def execute(args):
             row=db.execute("SELECT plan FROM launches WHERE launch_id=?",(_id(args.launch,"launch_"),)).fetchone()
             if not row: raise StagingError("Launch is unavailable", "unauthorized")
             plan=json.loads(row["plan"])
+            if "launcher" in plan and plan["launcher"] != str(Path(sys.executable).resolve(strict=True)):
+                raise StagingError("Configured launcher identity changed", "unauthorized")
         actor=Actor(**plan["actor"])
-        with authorized(store.auth_directory,actor):
+        permit = getattr(args, "resume_permit", None)
+        resume_record = None
+        with (_resume_authorized(store, actor) if permit else authorized(store.auth_directory, actor)):
             value,revision=policy(store.root.parent)
             if revision!=plan["policy_revision"]: raise StagingError("Launch policy changed", "conflict")
-            protected = [store.auth_directory]
-            if value["codex"]: protected.append(Path(value["codex"]["account_source"]))
-            _validate_workspace_grant(plan["workspace"]["path"], store.root.parent, protected=protected)
+            with _plan_workspace(store, plan, value) as directory:
+                directory.check()
             if args.tab not in [t["id"] for t in plan["tabs"]]: raise StagingError("Tab is not authorized", "unauthorized")
+            conversation = None
             with _database(tree,"metadata.sqlite3") as db:
                 db.execute(RUNS)
-                if db.execute("SELECT 1 FROM launch_runs WHERE launch_id=? AND tab_id=?",(plan["launch_id"],args.tab)).fetchone():
-                    raise StagingError("Launch permit was already consumed", "conflict")
-                for attachment in plan["attachments"]:
-                    row=store._row(db,actor,attachment["reference"])
-                    if row["status"] not in {"ready","changed"}: raise StagingError("Attachment unavailable", "stale-reference")
-                    expected=db.execute("SELECT target FROM attachments WHERE attachment_id=? AND account_id=? AND machine_id=?",(attachment["attachment_id"],actor.account_id,actor.machine_id)).fetchone()
-                    if not expected or expected[0]!="window:"+plan["window_id"]: raise StagingError("Attachment no longer authorized", "unauthorized")
-                    store._verify(tree,row)
-                    if attachment["server_path"]!=str(store.root/store._location(row)): raise StagingError("Attachment path changed", "unsafe-storage")
-                db.execute("INSERT INTO launch_runs VALUES(?,?)",(plan["launch_id"],args.tab)); db.commit()
+                _validate_attachments(store, tree, db, actor, plan)
+                if permit:
+                    resume_record = _validate_resume_record(store, args, db, plan, value)
+                    db.execute(RESUMES)
+                    db.execute("BEGIN IMMEDIATE")
+                    continuation = db.execute("SELECT * FROM launch_resumes WHERE permit_id=? AND launch_id=? AND tab_id=? AND used=0",
+                                              (_id(permit, "resume_"), plan["launch_id"], args.tab)).fetchone()
+                    if (not continuation or continuation["codex_home"] != resume_record.codex_home
+                            or continuation["scope_id"] != resume_record.auth_scope_id):
+                        raise StagingError("Resume permit is unavailable or consumed", "conflict")
+                    conversation = continuation["conversation_id"]
+                    consumed = db.execute("UPDATE launch_resumes SET used=1 WHERE permit_id=? AND used=0", (permit,))
+                    if consumed.rowcount != 1:
+                        raise StagingError("Resume permit was already consumed", "conflict")
+                else:
+                    if db.execute("SELECT 1 FROM launch_runs WHERE launch_id=? AND tab_id=?",(plan["launch_id"],args.tab)).fetchone():
+                        raise StagingError("Launch permit was already consumed", "conflict")
+                    db.execute("INSERT INTO launch_runs VALUES(?,?)",(plan["launch_id"],args.tab))
+                db.commit()
             runtime=["/usr/bin/bash","--noprofile","--norc","-i"]
             codex_home=None
             assets=[]
+            scope_environment = {}
             if plan["runtime"]=="codex":
                 if not value["codex"]: raise StagingError("TermDeck Codex runtime unavailable")
                 sessions=SessionStore(store.session_database,account_source=value["codex"]["account_source"],provision_auth_scopes=False)
                 try:
-                    record=sessions.ensure_auth_scope(args.tab)
+                    record=sessions.ensure_auth_scope(args.tab, private_history=True)
                     codex_home=record.codex_home
                 finally: sessions.close()
                 executable=value["codex"]["executable"]
@@ -314,11 +588,20 @@ def execute(args):
                     # replace its private auth.json during refresh; no account
                     # catalogue or another terminal's credential is mounted.
                     assets.append(str(credential.resolve(strict=True)))
-                prompt=plan["task"]+"\nAuthorized immutable files staged on the TermDeck host:\n"+"\n".join(a["server_path"] for a in plan["attachments"])
-                runtime=[executable,"-c",f"sqlite_home={json.dumps(codex_home)}","--sandbox","workspace-write","--ask-for-approval","on-request",prompt]
-            command=sandbox_argv(plan["workspace"]["path"],[a["server_path"] for a in plan["attachments"]],runtime_argv=runtime,codex_home=codex_home,asset_paths=assets)
-            tree.check()
-            os.execve(command[0],command,{"PATH":"/usr/bin"})
+                if resume_record and (record.codex_home != resume_record.codex_home or record.auth_scope_id != resume_record.auth_scope_id):
+                    raise StagingError("Resume private scope changed", "unauthorized")
+                from .tmux_backend import auth_lifetime_gate_root
+                scope_environment = {"CODEX_HOME": codex_home, "TERMDECK_AUTH_SCOPE_ID": record.auth_scope_id,
+                    "CODEX_TERMDECK_GATE_ROOT": str(auth_lifetime_gate_root(record)),
+                    "TERMDECK_WEB_LAUNCH_ID": plan["launch_id"], "TERMDECK_WEB_TAB_ID": record.id,
+                    "PATH": str(Path(codex_home) / "bin") + ":/usr/bin"}
+                runtime = _runtime_argv(value, plan, codex_home, conversation)
+            with _plan_workspace(store, plan, value, inspect=True) as directory:
+                command=sandbox_argv(plan["workspace"]["path"],[a["server_path"] for a in plan["attachments"]],runtime_argv=runtime,codex_home=codex_home,asset_paths=assets,scope_environment=scope_environment,workspace_directory=directory)
+                tree.check()
+                directory.check()
+                os.set_inheritable(directory.fd, True)
+                os.execve(command[0],command,{"PATH":"/usr/bin", **scope_environment})
     finally: tree.close()
 
 
@@ -326,6 +609,7 @@ def main():
     import argparse
     parser=argparse.ArgumentParser()
     for name in ("state","auth-dir","db","launch","tab"): parser.add_argument("--"+name,required=True)
+    parser.add_argument("--resume-permit")
     try: execute(parser.parse_args())
     except (StagingError,OSError,ValueError):
         print("TermDeck confined task could not start; review its launch policy and attachment authorization.",file=sys.stderr)

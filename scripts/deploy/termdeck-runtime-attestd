@@ -1,9 +1,148 @@
 #!/usr/bin/python3 -I
-"""Distro launcher for the root-owned runtime attestation daemon."""
+"""Load the fixed private library for either privileged TermDeck helper.
+
+The package installs these same launcher bytes under both libexec names.  The
+receipt implementation remains directly importable from source for unit tests;
+installed helpers never search a checkout, PYTHONPATH, or another TermDeck
+installation for it or for the attestation implementation.
+"""
 
 from __future__ import annotations
 
-from termdeck.runtime_attestation import main
+import os
+from pathlib import Path
+import stat
+import sys
+from types import ModuleType
+from typing import Sequence
+
+
+LIBRARY_ROOT = Path("/usr/lib/termdeck-preparer/termdeck")
+LIBRARY_MEMBERS = ("__init__.py", "runtime_attestation.py", "preparer_state.py")
+ENTRYPOINTS = {
+    "termdeck-runtime-attestd": "termdeck.runtime_attestation",
+    "termdeck-preparer-state": "termdeck.preparer_state",
+}
+MAX_LIBRARY_BYTES = 16 * 1024 * 1024
+
+
+class PackageError(RuntimeError):
+    """The installed private package is missing or unsafe."""
+
+
+def _identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+        info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def _directory(info: os.stat_result) -> None:
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise PackageError("private library ancestor is not a protected root-owned directory")
+
+
+def _read_library() -> dict[str, bytes]:
+    """Capture the closed module set through no-follow directory descriptors."""
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    descriptors: list[int] = []
+    anchors: list[tuple[int, str, tuple[int, ...]]] = []
+    images: dict[str, bytes] = {}
+    leaves: dict[str, tuple[int, ...]] = {}
+    try:
+        current = os.open("/", directory_flags)
+        descriptors.append(current)
+        _directory(os.fstat(current))
+        for component in LIBRARY_ROOT.parts[1:]:
+            child = os.open(component, directory_flags, dir_fd=current)
+            descriptors.append(child)
+            info = os.fstat(child)
+            _directory(info)
+            anchors.append((current, component, _identity(info)))
+            current = child
+        for name in LIBRARY_MEMBERS:
+            descriptor = os.open(name, file_flags, dir_fd=current)
+            try:
+                before = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or before.st_uid != 0
+                    or before.st_gid != 0
+                    or stat.S_IMODE(before.st_mode) != 0o644
+                    or before.st_nlink != 1
+                    or not 0 < before.st_size <= MAX_LIBRARY_BYTES
+                ):
+                    raise PackageError(f"private library member is unsafe: {name}")
+                chunks: list[bytes] = []
+                remaining = before.st_size
+                while remaining:
+                    chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+                    if not chunk:
+                        raise PackageError(f"private library member changed: {name}")
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                if os.read(descriptor, 1) or _identity(os.fstat(descriptor)) != _identity(before):
+                    raise PackageError(f"private library member changed: {name}")
+                images[name] = b"".join(chunks)
+                leaves[name] = _identity(before)
+            finally:
+                os.close(descriptor)
+        for parent, name, expected in anchors:
+            if _identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != expected:
+                raise PackageError("private library ancestor changed during capture")
+        for name, expected in leaves.items():
+            if _identity(os.stat(name, dir_fd=current, follow_symlinks=False)) != expected:
+                raise PackageError(f"private library member changed during capture: {name}")
+        return images
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _load_private_package() -> dict[str, ModuleType]:
+    if not sys.flags.isolated:
+        raise PackageError("privileged helpers require isolated system Python")
+    if any(name == "termdeck" or name.startswith("termdeck.") for name in sys.modules):
+        raise PackageError("a different TermDeck package was loaded before the private library")
+    images = _read_library()
+    modules: dict[str, ModuleType] = {}
+    for leaf, name in (
+        ("__init__.py", "termdeck"),
+        ("runtime_attestation.py", "termdeck.runtime_attestation"),
+        ("preparer_state.py", "termdeck.preparer_state"),
+    ):
+        module = ModuleType(name)
+        module.__file__ = str(LIBRARY_ROOT / leaf)
+        module.__package__ = "termdeck"
+        if name == "termdeck":
+            # All supported submodules are installed explicitly below.  An
+            # import of any other TermDeck module must fail instead of finding
+            # code in a system site package or the mutable consumer tree.
+            module.__path__ = []
+        sys.modules[name] = module
+        modules[name] = module
+        exec(compile(images[leaf], module.__file__, "exec", dont_inherit=True), module.__dict__)
+        if name != "termdeck":
+            setattr(modules["termdeck"], name.rsplit(".", 1)[1], module)
+    return modules
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        selected = ENTRYPOINTS.get(Path(__file__).name)
+        if selected is None:
+            raise PackageError("unsupported privileged helper name")
+        modules = _load_private_package()
+    except (PackageError, OSError, ImportError, SyntaxError) as exc:
+        raise SystemExit(f"TermDeck privileged helper refused: {exc}") from exc
+    return modules[selected].main(argv)
 
 
 if __name__ == "__main__":

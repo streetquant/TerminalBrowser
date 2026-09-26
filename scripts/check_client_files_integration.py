@@ -125,6 +125,7 @@ def main():
             expect(stage("remove",key=a,reference=reference),409)
             expect(stage("detach",key=a,reference=reference,attachment_id=attached["attachment_id"]))
             options=expect(post("management",{"operation":"launch-options"},key=a))
+            assert options["server_directory"] is True
             create={"operation":"create-window","request_id":uuid.uuid4().hex,"name":"Confined integration","workspace_id":policy["workspaces"][0]["id"],"policy_revision":options["policy_revision"],"runtime":"shell","tabs":["Initial shell"],"attachments":[reference]}
             expect(post("management",create,key=a,login=False),401)
             expect(post("management",create,key=a,csrf_ok=False),403)
@@ -141,25 +142,81 @@ def main():
             assert created["status"]=="started"
             sessions=SessionStore(database)
             record=sessions.get(created["tabs"][0]); sessions.close()
+            assert record.cwd == str(root/"workspace")
             socket=root/"tmux"/f"tmux-{os.geteuid()}"/"default"
-            target=f"{record.tmux_name}:0.0"
-            # Input is restricted to this disposable, newly created pane.
+            def check_shell_output(record,command,proof,expected):
+                # Input is restricted to this disposable, newly created pane.
+                target=f"{record.tmux_name}:0.0"
+                time.sleep(.3)
+                subprocess.run(["/usr/bin/tmux","-S",str(socket),"send-keys","-t",target,"-l",command],check=True,timeout=3,capture_output=True)
+                subprocess.run(["/usr/bin/tmux","-S",str(socket),"send-keys","-t",target,"Enter"],check=True,timeout=3,capture_output=True)
+                deadline=time.monotonic()+10
+                while time.monotonic()<deadline:
+                    if proof.exists() and proof.read_bytes()==expected: return
+                    time.sleep(.05)
+                captured=subprocess.run(["/usr/bin/tmux","-S",str(socket),"capture-pane","-pt",target],capture_output=True,text=True,timeout=3)
+                raise AssertionError("Disposable confined shell proof failed: "+captured.stdout[-2000:])
             host_path=root/"state/client-files"/reference["account_id"]/reference["machine_id"]/"objects"/reference["object_id"]/f"g{reference['generation']}"/"content/project/a.txt"
             command="cat "+shlex.quote(str(host_path))+" > "+shlex.quote(str(root/"workspace/attachment-proof"))
-            time.sleep(.3)
-            subprocess.run(["/usr/bin/tmux","-S",str(socket),"send-keys","-t",target,"-l",command],check=True,timeout=3,capture_output=True)
-            subprocess.run(["/usr/bin/tmux","-S",str(socket),"send-keys","-t",target,"Enter"],check=True,timeout=3,capture_output=True)
-            deadline=time.monotonic()+10
-            while time.monotonic()<deadline:
-                if (root/"workspace/attachment-proof").exists() and (root/"workspace/attachment-proof").read_bytes()==b"hello": break
-                time.sleep(.05)
-            proof=(root/"workspace/attachment-proof")
-            if not proof.exists() or proof.read_bytes()!=b"hello":
-                captured=subprocess.run(["/usr/bin/tmux","-S",str(socket),"capture-pane","-pt",target],capture_output=True,text=True,timeout=3)
-                raise AssertionError("Disposable attachment read failed: "+captured.stdout[-2000:])
-            for link in created["attachments"]:
-                expect(stage("detach",key=a,reference=link["reference"],attachment_id=link["attachment_id"]))
+            check_shell_output(record,command,root/"workspace/attachment-proof",b"hello")
             assertions["configured_window_replay_tmux_and_confined_canonical_file_read"]=True
+
+            server_directory=root/"server project with spaces"
+            server_directory.mkdir(mode=0o700)
+            assert str(server_directory) not in {item["path"] for item in options["workspaces"]}
+            explicit={key:value for key,value in create.items() if key!="workspace_id"}
+            explicit.update(request_id=uuid.uuid4().hex,name="Server directory integration",workspace_path=str(server_directory))
+            def registry():
+                sessions=SessionStore(database,provision_auth_scopes=False)
+                try:
+                    return (dict(sessions.remembered_windows()),
+                            {row.id:(row.window_id,row.name,row.command,row.cwd) for row in sessions.list()})
+                finally: sessions.close()
+            before_invalid=registry()
+            expect(post("management",explicit,key=a,login=False),401)
+            expect(post("management",explicit,key=a,csrf_ok=False),403)
+            expect(post("management",explicit),403)
+            expect(post("management",explicit,key=b),403)
+            expect(post("management",dict(explicit,workspace_id=create["workspace_id"]),key=a),400)
+            missing_selector=expect(post("management",{key:value for key,value in explicit.items() if key!="workspace_path"},key=a))
+            assert not missing_selector["ok"] and missing_selector["error"]=="Unknown request field"
+            assert registry()==before_invalid
+            inaccessible=root/"inaccessible server directory"
+            inaccessible.mkdir(mode=0o700)
+            inaccessible.chmod(0)
+            try:
+                assert not os.access(inaccessible,os.R_OK|os.X_OK,effective_ids=True), "Inaccessible-directory proof requires an unprivileged fixture account"
+                for invalid_path in (root/"missing server directory",inaccessible):
+                    refused=expect(post("management",dict(explicit,workspace_path=str(invalid_path)),key=a),400)
+                    assert refused["code"]=="unavailable-workspace"
+                    assert "Server directory" in refused["error"]
+                    assert any(word in refused["error"] for word in ("missing","inaccessible","readable","searchable"))
+                    assert registry()==before_invalid
+            finally: inaccessible.chmod(0o700)
+            assertions["server_directory_auth_csrf_machine_selector_and_clear_refusal"]=True
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                explicit_results=list(pool.map(lambda _:post("management",explicit,key=a),range(2)))
+            explicit_created=expect(explicit_results[0])
+            assert expect(explicit_results[1])["window_id"]==explicit_created["window_id"]
+            assert expect(post("management",explicit,key=a))["window_id"]==explicit_created["window_id"]
+            expect(post("management",dict(explicit,workspace_path=str(root/"workspace")),key=a),409)
+            assert explicit_created["status"]=="started"
+            sessions=SessionStore(database,provision_auth_scopes=False)
+            try:
+                explicit_record=sessions.get(explicit_created["tabs"][0])
+                assert explicit_record.cwd==str(server_directory)
+                assert len(sessions.list(window_id=explicit_created["window_id"]))==1
+            finally: sessions.close()
+            after_explicit=registry()
+            assert all(after_explicit[0].get(key)==value for key,value in before_invalid[0].items())
+            assert all(after_explicit[1].get(key)==value for key,value in before_invalid[1].items())
+            check_shell_output(explicit_record,"pwd > "+shlex.quote(str(server_directory/"cwd-proof")),server_directory/"cwd-proof",(str(server_directory)+"\n").encode())
+            check_shell_output(explicit_record,"cat "+shlex.quote(str(host_path))+" > "+shlex.quote(str(server_directory/"attachment-proof")),server_directory/"attachment-proof",b"hello")
+            assert ready["display_path"]=="/home/client/project"
+            assert explicit_record.cwd != ready["display_path"]
+            assertions["unregistered_server_directory_spaces_concurrent_replay_and_confined_cwd"]=True
+            for link in [*created["attachments"],*explicit_created["attachments"]]:
+                expect(stage("detach",key=a,reference=link["reference"],attachment_id=link["attachment_id"]))
             expect(stage("remove",key=a,reference=reference))
             expect(stage("download",key=a,reference=reference,file_index=0,offset=0),409)
             assertions["attachments_retain_content_until_detached"]=True
@@ -176,6 +233,7 @@ def main():
             with sqlite3.connect(root/"auth/termdeck-web-auth-v1.sqlite3") as expired:
                 expired.execute("UPDATE auth_sessions SET expires_at_ms=1")
             expect(post("management",dict(create,request_id=uuid.uuid4().hex),key=b),401)
+            expect(post("management",dict(explicit,request_id=uuid.uuid4().hex),key=b),401)
             assertions["expired_session_cannot_create_window"]=True
             assert all(p.stat().st_mode & 0o077 == 0 for p in (root/"state/client-files").rglob("*") if not p.is_symlink())
             assertions["private_storage_modes"]=True

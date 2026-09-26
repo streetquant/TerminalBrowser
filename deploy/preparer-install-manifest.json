@@ -26,7 +26,7 @@
       "group": "root",
       "mode": "0755",
       "owner": "root",
-      "source": "scripts/termdeck-preparer-state.py"
+      "source": "scripts/deploy/termdeck-runtime-attestd"
     },
     {
       "destination": "/usr/libexec/termdeck-web-prepare-runtime",
@@ -34,6 +34,27 @@
       "mode": "0755",
       "owner": "root",
       "source": "scripts/termdeck-web-prepare-runtime.sh"
+    },
+    {
+      "destination": "/usr/lib/termdeck-preparer/termdeck/__init__.py",
+      "group": "root",
+      "mode": "0644",
+      "owner": "root",
+      "source": "termdeck/__init__.py"
+    },
+    {
+      "destination": "/usr/lib/termdeck-preparer/termdeck/runtime_attestation.py",
+      "group": "root",
+      "mode": "0644",
+      "owner": "root",
+      "source": "termdeck/runtime_attestation.py"
+    },
+    {
+      "destination": "/usr/lib/termdeck-preparer/termdeck/preparer_state.py",
+      "group": "root",
+      "mode": "0644",
+      "owner": "root",
+      "source": "scripts/termdeck-preparer-state.py"
     },
     {
       "destination": "/usr/lib/systemd/system/termdeck-runtime-attestd.service",

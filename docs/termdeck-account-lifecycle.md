@@ -3,13 +3,16 @@
 TermDeck's web login, enrolled machine credentials, per-terminal Codex accounts,
 and a separately installed local agent are distinct systems. This integration
 operates on TermDeck's configured account source and private terminal homes.
-It does not configure CloudMCP or rewrite the local agent installation.
+An explicitly approved system Codex executable/configuration and codex-auth
+catalogue can supply the runtime and accounts. Per-tab selection stays in
+TermDeck; the canonical login and standalone runtime remain independently owned.
 
 ## Four observations
 
 The browser **Codex accounts** panel and desktop account tooltip distinguish:
 
-1. Canonical account inferred from the account source's effective `auth.json`.
+1. Canonical account inferred from the account source's effective `auth.json`
+   (the selected login home's credentials for a system profile catalogue).
 2. Private tab selection metadata (`current` or its private registry).
 3. Effective private credentials, inferred from `auth.json` contents or an exact
    validated account-file link. A stale marker is not credential evidence.
@@ -46,7 +49,28 @@ used only for local matching, not authentication or proof of provider acceptance
 Ambiguous identities, equal-time different snapshots and older private snapshots
 are preserved for review. No old snapshot is restored over a newer one.
 
-A newer private `auth.json` can be atomically published to its saved account only
+### System codex-auth profiles
+
+The read-only adapter understands saved `accounts/*.json`, `login-homes`, the
+`next-login-home` selector, and optional `account-profiles.json` aliases. The
+selector chooses a home; credential content proves which account it contains.
+Aliases for the same proven identity share one account entry. Contradictory,
+malformed or unsafe profiles fail clearly without repairing the source.
+
+For this profile layout, each tab retains its own bounded saved credential
+copies. A guarded quiescent handoff atomically incorporates newer private
+credentials into that tab's catalogue before switching accounts. Switching
+alpha → beta → alpha therefore retains refreshed alpha credentials. The source
+catalogue and other tabs remain unchanged. Source identity and availability
+are rechecked; a removed account cannot be resurrected from a private copy.
+Concurrent changes abort publication, with the prior private catalogue and
+selection restored on failure. Polling remains read-only.
+
+### Legacy shared catalogues
+
+The pre-existing legacy-only catalogue contract retains its explicit refresh
+publication policy. A newer private `auth.json` can be atomically published to
+its saved account only
 when that source has an explicit private `.termdeck-account-authority.json`:
 
 ```json
@@ -96,6 +120,41 @@ receipt is not exposed as token material. `codex login --device-auth` explicitly
 starts an authorization flow; repeated invocation is not evidence of an OAuth
 loop caused by TermDeck.
 
+## Configured browser tasks
+
+For a configured `web-agent` tab, account handoff retains its server launch
+recipe and mount namespace. The observer verifies the approved executable,
+generated argv, tab/private-scope markers, process incarnation, working directory,
+and one exact conversation. The restart uses that conversation with the original
+policy and immutable attachment generations; refreshed uploads cannot replace
+the task's files. Generic terminal recovery recognition is unchanged.
+
+Each continuation has a server-issued, single-use permit tied to the original
+launch, tab and private home. Preparation and execution both revalidate the
+original account, enrolled machine, credential generation, active login, policy,
+workspace and attachment bindings. A later permit supersedes an unused one;
+abandoned handoffs cancel their permit. The existing input fence, old-process
+quiescence, account transaction lock and fresh-process readiness checks surround
+the pointer change. A restart receipt is published only after the exact confined
+conversation is observed again.
+
+The original launch login is deliberately retained as its authorization grant.
+A newly authenticated browser session does not replace it implicitly. An expired
+or revoked original login, revoked machine, changed policy or unavailable
+attachment blocks continuation. The error distinguishes login expiry from
+machine revocation. Authorize a new launch from a current login when the old
+grant is no longer valid; this release does not retarget existing grants.
+Failed readiness is reported as recovery pending, never as a successful switch.
+
+New configured Codex tasks provision private `sessions` and `archived_sessions`
+directories as well as private authentication and SQLite state. They may read
+approved system configuration and selected credentials but do not mount a
+writable canonical conversation tree. The private-history preference persists
+when the account controller prepares the scope again. Existing generic terminal
+history sharing is unchanged. A configured scope already linked to external
+history requires explicit migration; it is rejected without replacing that link
+or discarding its conversations.
+
 `codex-runtime-scope-prepare.py` is neither present nor referenced in this
 repository's tracked source, packaging or deployment scripts. This work does
 not assign its interrupt traceback to TermDeck or modify an external copy.
@@ -106,6 +165,13 @@ The account-selector smoke uses a compiled disposable process and synthetic
 credentials to prove the guarded restart and preserved conversation contract.
 It does not prove provider authentication.
 
+`tests/test_confined_account_resume.py` also executes the actual configured
+argv inside the real mount namespace with a compiled disposable runtime. It
+covers per-tab switching, original-generation attachments, private history,
+revoked/expired grants, policy changes, abandoned permits and replay. Its pane
+transport is a local process fixture; the production planner, quiescence,
+restart gates and receipt checks run against real process observations.
+
 The separate cold-scope smoke requires an operator-selected absolute
 `TERMDECK_REAL_CODEX_BINARY` path for the TermDeck runtime being qualified. It
 does not search PATH or another agent's installation. Without that selection it
@@ -113,4 +179,4 @@ reports a skipped prerequisite; an invalid explicit selection fails. Version
 and login-status probes use disposable homes and synthetic credentials. A
 passing login-status probe checks local credential recognition, not a live
 provider login. Production runtime compatibility and authentication still need
-the selected TermDeck installation and its own account catalogue.
+the selected installation and its explicitly approved account catalogue.

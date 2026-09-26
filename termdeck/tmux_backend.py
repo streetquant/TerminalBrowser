@@ -564,6 +564,7 @@ class _LaunchSpec:
     environment: tuple[tuple[str, str], ...]
     checkpoint: bool = False
     application_native_resume: bool = False
+    confined_resume_permit: str | None = None
 
 
 class TmuxBackend:
@@ -1766,6 +1767,28 @@ class TmuxBackend:
         native_resume = False
 
         raw_codex_home = (getattr(record, "codex_home", None) or "").strip()
+        if record.tag == "web-agent" and raw_codex_home:
+            # A configured task keeps its original launch policy and mount
+            # boundary through every account restart. Never use a host wrapper
+            # or generic native-resume command for this record kind.
+            from .agent_launch import prepare_resume
+            resume_permit = None
+            try:
+                if record.recovery_command:
+                    command, resume_permit = prepare_resume(record)
+                    native_resume = True
+            except (OSError, ValueError) as exc:
+                raise TmuxError(str(exc)) from exc
+            codex_home = Path(raw_codex_home).expanduser().resolve(strict=False)
+            environment.update({"CODEX_HOME": str(codex_home),
+                "TERMDECK_AUTH_SCOPE_ID": record.auth_scope_id or "",
+                "CODEX_TERMDECK_GATE_ROOT": str(auth_lifetime_gate_root(record)),
+                "PATH": self._private_auth_path(codex_home)})
+            command = self._with_explicit_private_environment(command, environment.items())
+            return _LaunchSpec(recipe=recipe, command=command, directory=launch_directory,
+                               environment=tuple(sorted(environment.items())), checkpoint=False,
+                               application_native_resume=native_resume,
+                               confined_resume_permit=resume_permit)
         # Native recognizers are an optional private-account adapter. Generic
         # records never consult agent-specific syntax: their canonical recipe is
         # opaque application-owned shell input.
@@ -3601,7 +3624,12 @@ class TmuxBackend:
         for record in selected:
             pid = pids.get(record.id)
             assert pid is not None
-            observed, command, cwd = observe_recovery_metadata(pid)
+            try:
+                observed, command, cwd = self._auth_recovery_metadata(record, pid)
+            except (OSError, TmuxError, ValueError):
+                # Expired/revoked configured authority does not erase the
+                # durable conversation or authorize an alternate launch.
+                continue
             if observed:
                 out[record.id] = (command, cwd if command else None)
         return out
@@ -3822,8 +3850,8 @@ class TmuxBackend:
         # "next launch" path that contradicts seamless account switching.
         for attempt in range(3):
             try:
-                observed, recovery_command, recovery_cwd = observe_recovery_metadata(
-                    identity.pane_pid
+                observed, recovery_command, recovery_cwd = self._auth_recovery_metadata(
+                    record, identity.pane_pid
                 )
                 inspection_error = ""
             except (OSError, RuntimeError, ValueError) as exc:
@@ -3835,7 +3863,7 @@ class TmuxBackend:
                     recovery_command=recovery_command,
                     recovery_cwd=recovery_cwd,
                 )
-                exact_recovery = self._exact_codex_recovery(candidate)
+                exact_recovery = self._exact_auth_recovery(candidate)
                 if exact_recovery is not None:
                     return AuthActivationPlan(
                         True,
@@ -3848,6 +3876,13 @@ class TmuxBackend:
             if attempt < 2:
                 time.sleep(0.025 * (attempt + 1))
 
+        if record.tag == "web-agent":
+            suffix = f": {inspection_error}" if inspection_error else ""
+            return AuthActivationPlan(
+                False,
+                **base,
+                detail=f"configured task requires its exact authorized Codex conversation{suffix}",
+            )
         codex_state = process_tree_contains_codex(identity.pane_pid)
         current_name = Path(identity.current_command).name.casefold().removeprefix("-")
         if (
@@ -4324,6 +4359,15 @@ class TmuxBackend:
             pass
 
     @staticmethod
+    def _cancel_confined_resume(record: SessionRecord, spec: _LaunchSpec | None) -> None:
+        if record.tag != "web-agent":
+            return
+        permit = getattr(spec, "confined_resume_permit", None)
+        if isinstance(permit, str) and permit:
+            from .agent_launch import cancel_resume
+            cancel_resume(record, permit)
+
+    @staticmethod
     def _gated_auth_launch_command(spec: _LaunchSpec, gate_path: Path) -> str:
         gate = shlex.quote(str(gate_path))
         payload = shlex.quote(spec.command)
@@ -4521,8 +4565,8 @@ class TmuxBackend:
         respawned = False
         try:
             if plan.recovery_command is not None:
-                observed, recovery_command, recovery_cwd = observe_recovery_metadata(
-                    plan.pane_pid
+                observed, recovery_command, recovery_cwd = self._auth_recovery_metadata(
+                    record, plan.pane_pid
                 )
                 if (
                     not observed
@@ -4590,6 +4634,7 @@ class TmuxBackend:
                 recovered_payload = False
                 recovery_error += f"; terminal input could not be restored: {input_exc}"
             self._cleanup_auth_switch_gate(gate_path)
+            self._cancel_confined_resume(record, launch_spec)
             return AuthQuiesceResult(
                 False,
                 live=True,
@@ -4801,8 +4846,8 @@ class TmuxBackend:
                     return identity, ""
                 else:
                     try:
-                        observed, recovery_command, recovery_cwd = observe_recovery_metadata(
-                            identity.pane_pid
+                        observed, recovery_command, recovery_cwd = self._auth_recovery_metadata(
+                            record, identity.pane_pid
                         )
                     except (OSError, RuntimeError, ValueError) as exc:
                         last_detail = f"exact Codex recovery could not be observed: {exc}"
@@ -4829,7 +4874,10 @@ class TmuxBackend:
         try:
             return self._apply_auth_change(record, plan, quiescence)
         finally:
-            quiescence.release_lifetime_lease()
+            try:
+                self._cancel_confined_resume(record, quiescence.launch_spec)
+            finally:
+                quiescence.release_lifetime_lease()
 
     def _apply_auth_change(
         self,
@@ -5052,6 +5100,7 @@ class TmuxBackend:
             except (OSError, TmuxError):
                 old_processes = ()
         gate_path: Path | None = None
+        spec: _LaunchSpec | None = None
         try:
             spec = self._launch_spec(replacement)
             gate_path = self._auth_switch_gate_path(record)
@@ -5123,6 +5172,7 @@ class TmuxBackend:
             )
         finally:
             self._cleanup_auth_switch_gate(gate_path)
+            self._cancel_confined_resume(record, spec)
 
     def activate_auth_change(self, record: SessionRecord) -> AuthActivationResult:
         """Revalidate, quiesce, and reactivate without changing credentials."""
@@ -5209,6 +5259,23 @@ class TmuxBackend:
         except ValueError:
             return False
         return safe_codex_recovery_command(argv) is not None
+
+    @staticmethod
+    def _auth_recovery_metadata(record: SessionRecord, root_pid: int):
+        if record.tag == "web-agent":
+            from .agent_launch import observe_resume
+            try:
+                return observe_resume(record, root_pid)
+            except (OSError, ValueError) as exc:
+                raise TmuxError(f"Configured task authorization requires review: {exc}") from exc
+        return observe_recovery_metadata(root_pid)
+
+    @staticmethod
+    def _exact_auth_recovery(record: SessionRecord) -> str | None:
+        if record.tag == "web-agent":
+            from .agent_launch import resume_identity
+            return record.recovery_command if resume_identity(record.recovery_command) else None
+        return TmuxBackend._exact_codex_recovery(record)
 
     @staticmethod
     def _exact_codex_recovery(record: SessionRecord) -> str | None:
@@ -5687,6 +5754,10 @@ def execute_auth_change(
             rolled_back=True,
         )
     finally:
-        release = getattr(quiescence, "release_lifetime_lease", None)
-        if callable(release):
-            release()
+        try:
+            if isinstance(backend, TmuxBackend):
+                backend._cancel_confined_resume(record, quiescence.launch_spec)
+        finally:
+            release = getattr(quiescence, "release_lifetime_lease", None)
+            if callable(release):
+                release()

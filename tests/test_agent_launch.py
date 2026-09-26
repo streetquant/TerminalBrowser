@@ -164,15 +164,19 @@ def test_confined_codex_adapter_passes_only_server_paths_and_private_home(config
     obj=upload((store,actor),display_path="/client/never-server/foo")
     result=store.handle(actor,request(configured,runtime="codex",task="Review files; $(not a shell command)",attachments=[obj["reference"]]))
     launch.start(store,actor,result,backend=Backend())
-    monkeypatch.setattr(SessionStore,"ensure_auth_scope",lambda self,identity:replace(self.get(identity),codex_home=str(private),auth_scope_id="auth-fixture"))
+    monkeypatch.setattr(SessionStore,"ensure_auth_scope",lambda self,identity,**_kwargs:replace(self.get(identity),codex_home=str(private),auth_scope_id="auth-fixture"))
     class Executed(Exception): pass
     captured=[]
-    def execve(_executable,argv,_env): captured.append(argv); raise Executed()
+    completed=[]
+    def execve(_executable,argv,_env):
+        captured.append(argv)
+        descriptors=tuple(int(argv[index+1]) for index, value in enumerate(argv) if value in {"--bind-fd", "--ro-bind-fd"})
+        completed.append(subprocess.run(argv,pass_fds=descriptors,capture_output=True,text=True,timeout=10))
+        raise Executed()
     monkeypatch.setattr(os,"execve",execve)
     args=argparse.Namespace(state=str(store.root.parent),auth_dir=str(store.auth_directory),db=str(store.session_database),launch=result["launch_id"],tab=result["tabs"][0])
     with pytest.raises(Executed): launch.execute(args)
-    completed=subprocess.run(captured[0],capture_output=True,text=True,timeout=10)
-    assert completed.returncode==0,completed.stderr
+    assert completed[0].returncode==0,completed[0].stderr
     proof=json.loads((workspace/"codex-proof").read_text())
     assert proof["home"]==str(private) and proof["auth"]=={"fixture":True}
     assert "/client/never-server/foo" not in " ".join(proof["argv"])
@@ -305,7 +309,7 @@ def test_shared_asset_alias_cannot_broaden_launch(configured, monkeypatch, targe
     _codex_policy(configured, source)
     result = store.handle(actor, request(configured, runtime="codex"))
     launch.start(store, actor, result, backend=Backend())
-    monkeypatch.setattr(SessionStore, "ensure_auth_scope", lambda self, identity: replace(
+    monkeypatch.setattr(SessionStore, "ensure_auth_scope", lambda self, identity, **_kwargs: replace(
         self.get(identity), codex_home=str(private), auth_scope_id="auth-fixture",
     ))
     def unexpected_exec(*_args):

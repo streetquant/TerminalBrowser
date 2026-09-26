@@ -1876,7 +1876,7 @@ async fn management(
     }
     if request.get("operation").and_then(serde_json::Value::as_str) == Some("launch-options")
         || request.get("operation").and_then(serde_json::Value::as_str) == Some("create-window")
-            && request.get("workspace_id").is_some()
+            && (request.get("workspace_id").is_some() || request.get("workspace_path").is_some())
     {
         let mut bridge = Request::new(Body::from(request.to_string()));
         *bridge.headers_mut() = headers;
@@ -5522,6 +5522,33 @@ mod auth_integration_tests {
             )
             .await;
             assert_eq!(fs::read_to_string(&calls).unwrap_or_default(), "called\ncalled\n");
+
+            // Explicit server directories use the same enrolled-machine
+            // bridge as saved choices, including its independent auth gates.
+            const MANAGEMENT: &str = "/_termdeck/api/v1/management";
+            let directory_launch = serde_json::json!({
+                "operation":"create-window", "request_id":"b".repeat(32),
+                "workspace_path":"/server/project with spaces", "policy_revision":"unconfigured",
+                "name":"Directory", "runtime":"shell", "tabs":["One"], "attachments":[],
+            });
+            let mut no_csrf = json_post(MANAGEMENT, &directory_launch, &fresh, Some(key.expose_secret()));
+            no_csrf.headers_mut().remove(CSRF_HEADER_NAME);
+            assert_error(call(&router, no_csrf).await, StatusCode::FORBIDDEN, "request-forbidden").await;
+            assert_error(
+                call(&router, json_post(MANAGEMENT, &directory_launch, &fresh, None)).await,
+                StatusCode::FORBIDDEN, "machine authorization failed",
+            ).await;
+            assert_eq!(fs::read_to_string(&calls).unwrap_or_default(), "called\ncalled\n");
+            expect_json(
+                call(&router, json_post(MANAGEMENT, &directory_launch, &fresh, Some(key.expose_secret()))).await,
+                StatusCode::OK,
+            ).await;
+            let recorded: serde_json::Value = serde_json::from_str(&fs::read_to_string(&envelope)
+                .unwrap_or_else(|error| panic!("could not read directory envelope: {error}")))
+                .unwrap_or_else(|error| panic!("invalid directory envelope: {error}"));
+            assert_eq!(recorded["request"], directory_launch);
+            assert!(recorded["actor"]["machine_id"].as_str().is_some());
+            assert_eq!(fs::read_to_string(&calls).unwrap_or_default(), "called\ncalled\ncalled\n");
         });
     }
 

@@ -4716,5 +4716,25 @@ class TmuxBackendTests(unittest.TestCase):
         self.assertIn("retry the account selection", plan.detail)
         self.assertEqual(observe.call_count, 3)
 
+    def test_configured_task_never_uses_generic_idle_shell_account_handoff(self):
+        record = _auth_record(tag="web-agent", command="configured-task", status="running")
+        backend = TmuxBackend(executable="tmux")
+        for private_environment in (False, True):
+            with self.subTest(private_environment=private_environment), mock.patch.object(
+                backend, "_auth_session_exists", return_value=True
+            ), mock.patch.object(
+                backend, "_inspect_auth_pane", return_value=_auth_pane_identity(command="bash")
+            ), mock.patch.object(
+                backend, "_auth_recovery_metadata", return_value=(True, None, None)
+            ), mock.patch.object(
+                backend, "_idle_shell_executable"
+            ) as generic_shell, _stable_auth_process(backend, environment_ready=private_environment):
+                plan = backend.plan_auth_change(record)
+                self.assertFalse(plan.ok)
+                self.assertFalse(plan.restart)
+                self.assertIsNone(plan.replacement_command)
+                self.assertIn("exact authorized", plan.detail)
+                generic_shell.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

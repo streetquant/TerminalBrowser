@@ -302,7 +302,7 @@ class StagingStore:
             "download": {"reference", "file_index", "offset"},
             "cleanup": {"request_id"},
             "launch-options": set(),
-            "create-window": {"request_id", "policy_revision", "name", "workspace_id", "runtime", "tabs", "task", "attachments"},
+            "create-window": {"request_id", "policy_revision", "name", "workspace_id", "workspace_path", "runtime", "tabs", "task", "attachments"},
         }
         operation = request.get("operation")
         if not isinstance(operation, str) or operation not in allowed or set(request) - allowed[operation] - {"operation"}:
