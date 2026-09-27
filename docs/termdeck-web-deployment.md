@@ -188,6 +188,10 @@ MaxChat catch-all. Preserve that ordering and the unrelated root route when
 reviewing `deploy/cloudflare/maxchat-termdeck-route.json`. Application
 password/device authentication, same-origin CSRF checks, sequenced terminal
 input and single-controller fencing remain authoritative behind the tunnel.
+Use this public hostname on LAN and remote clients that need publicly trusted
+HTTPS. The raw LAN address `192.168.1.10:7443` uses TermDeck's private origin
+certificate and is not covered by the public hostname certificate. A website
+cannot silently install or trust that private CA on another computer.
 
 The selected access policy uses TermDeck login only. An additional Cloudflare
 Access login is not configured for this hostname. Invitations, device approval,
