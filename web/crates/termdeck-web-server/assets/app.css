@@ -1307,7 +1307,13 @@ body.auth-page { display: grid; place-items: center; background: var(--td-bg); }
 .window-filter { grid-area: filter; width: 100%; margin: 0; max-width: 400px; min-height: 36px; }
 .window-list-status { grid-area: count; justify-self: end; color: var(--td-muted); font-size: 12px; font-variant-numeric: tabular-nums; margin: 0; }
 .window-list { display: grid; border-top: 1px solid var(--td-border); }
+.window-list-entry { display: flex; min-width: 0; align-items: stretch; border-bottom: 1px solid var(--td-border); }
 .window-list-row { display: flex; min-width: 0; min-height: 58px; gap: 16px; align-items: center; padding: 12px; border-bottom: 1px solid var(--td-border); }
+.window-list-entry .window-list-row { flex: 1; border-bottom: 0; }
+.window-list-kill { align-self: center; margin: 0 10px; white-space: nowrap; }
+@media (max-width: 600px) {
+  .window-list-kill { max-width: 96px; white-space: normal; font-size: 12px; line-height: 1.2; }
+}
 .window-list-row:hover { background: var(--td-bg-raised); text-decoration: none; }
 .window-list-icon { width: 24px; flex: 0 0 24px; font-family: ui-monospace, monospace; font-size: 13px; color: var(--td-muted); }
 .window-list-description { display: grid; grid-template-columns: minmax(160px, .8fr) minmax(0, 1.8fr); align-items: baseline; gap: 6px 20px; min-width: 0; flex: 1; }

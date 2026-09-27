@@ -1884,7 +1884,7 @@ async fn management(
     }
     if matches!(
         request.get("operation").and_then(serde_json::Value::as_str),
-        Some("create-window" | "switch-account" | "switch-all-accounts")
+        Some("create-window" | "kill-window" | "switch-account" | "switch-all-accounts")
     ) {
         let valid_id = request
             .get("request_id")

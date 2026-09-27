@@ -1007,7 +1007,8 @@ def main() -> int:
                 check_management(page_two, origin=origin, database=database,
                                  initial_id=initial_id, created_id=created["tabs"][0]["id"], output=output,
                                  result=result, database_row=database_row,
-                                 wait_until=wait_until, click_action=click_action)
+                                 wait_until=wait_until, click_action=click_action,
+                                 t1000=t1000, run_root=run_root, base_env=base_env, run_json=run_json)
                 result["scope"] = "manager-settings-only"
                 result["assertions"]["no_browser_errors"] = not result["page_errors"]
                 result["ok"] = all(result["assertions"].values())
@@ -1899,7 +1900,8 @@ def main() -> int:
             check_management(page_two, origin=origin, database=database,
                              initial_id=initial_id, created_id=created_id, output=output,
                              result=result, database_row=database_row,
-                             wait_until=wait_until, click_action=click_action)
+                             wait_until=wait_until, click_action=click_action,
+                             t1000=t1000, run_root=run_root, base_env=base_env, run_json=run_json)
 
             screenshot = output / "terminal-browser-proof.png"
             page_two.screenshot(path=str(screenshot), full_page=True)

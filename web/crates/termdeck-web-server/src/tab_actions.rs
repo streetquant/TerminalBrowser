@@ -233,6 +233,8 @@ impl TabActionService {
                 "list"
                     | "create-window"
                     | "rename-window"
+                    | "preview-kill-window"
+                    | "kill-window"
                     | "reorder"
                     | "move"
                     | "bulk"

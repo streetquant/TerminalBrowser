@@ -10,7 +10,7 @@ def is_cancelled_manager_read(failure):
             and urlsplit(failure.get("url", "")).path == "/_termdeck/api/v1/management")
 
 
-def check_management(page, *, origin, database, initial_id, created_id, output, result, database_row, wait_until, click_action):
+def check_management(page, *, origin, database, initial_id, created_id, output, result, database_row, wait_until, click_action, t1000, run_root, base_env, run_json):
     ids = [initial_id, created_id]
     before = {item: database_row(database, item) for item in ids}
     dialog = page.locator("#management-dialog")
@@ -280,3 +280,42 @@ def check_management(page, *, origin, database, initial_id, created_id, output, 
         raise AssertionError("remove touched an unselected tab")
     close()
     result["assertions"]["bulk_hide_reopen_archive_kill_remove_and_cancel"] = True
+
+    # All destructive actions use only this fixture's isolated tmux server.
+    fixture_ids = []
+    for name in ("Kill fixture one", "Kill fixture two"):
+        created = run_json([str(t1000), "new", "--db", str(database), "--cwd", str(run_root),
+                            "--window-id", "win-kill-fixture", "--window-title", "Kill fixture",
+                            "--name", name, "--command", "sleep 120"], env=base_env, timeout=40)
+        fixture_ids.append(created["tabs"][0]["id"])
+    from pathlib import Path
+    fixture_pids = [database_row(database, item)["last_pid"] for item in fixture_ids]
+    kill_page = page.context.new_page()
+    try:
+        kill_page.goto(origin + "/")
+        entry = kill_page.locator(".window-list-entry").filter(has_text="Kill fixture")
+        entry.get_by_role("button", name="Kill Kill fixture window permanently").click()
+        kill_dialog = kill_page.locator("#management-dialog")
+        kill_dialog.get_by_text("Kill fixture one", exact=False).wait_for()
+        kill_dialog.get_by_text("Kill fixture two", exact=False).wait_for()
+        csrf_status = kill_page.evaluate("""async () => (await fetch('/_termdeck/api/v1/management', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({operation:'kill-window',window_id:'win-kill-fixture'})
+        })).status""")
+        if csrf_status != 403:
+            raise AssertionError(f"window kill accepted missing CSRF: {csrf_status}")
+        kill_dialog.get_by_role("button", name="Cancel", exact=True).click()
+        if any(database_row(database, item) is None for item in fixture_ids):
+            raise AssertionError("cancelled window kill changed saved tabs")
+        entry.get_by_role("button", name="Kill Kill fixture window permanently").click()
+        kill_dialog.get_by_role("button", name="Kill window permanently", exact=True).click()
+        wait_until(lambda: all(database_row(database, item) is None for item in fixture_ids),
+                   timeout=15, detail="window kill removed both managed tabs")
+        wait_until(lambda: all(pid and not Path(f"/proc/{pid}").exists() for pid in fixture_pids),
+                   timeout=15, detail="window kill stopped both fixture processes")
+        kill_page.wait_for_function("() => ![...document.querySelectorAll('.window-list-row')].some(row => row.textContent.includes('Kill fixture'))")
+        if database_row(database, initial_id) is None:
+            raise AssertionError("window kill touched an unrelated tab")
+        result["assertions"]["window_kill_cascades_and_preserves_other_windows"] = True
+    finally:
+        kill_page.close()

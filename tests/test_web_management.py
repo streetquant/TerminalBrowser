@@ -202,6 +202,85 @@ def test_failed_kill_does_not_mark_live_tab_stopped(registry):
     assert store.get(ids[0]).status == rows[0].status
 
 
+def test_window_kill_cascades_all_saved_tabs_and_preserves_external_tmux(registry):
+    store, rows = registry
+    store.update(rows[0].id, status="running", last_pid=1234)
+    store.update(rows[1].id, status="archived", visible=False)
+    store.update(rows[2].id, external=True, visible=False)
+    other = store.create("other", "test", "bash", "/tmp", window_id="two", window_title="Two")
+    backend = Mock(available=True)
+    backend.session_exists.return_value = False
+    preview = handle(store, {"operation": "preview-kill-window", "window_id": "one"})
+    assert {tab["id"] for tab in preview["tabs"]} == {row.id for row in rows}
+    assert len(preview["expected"]) == 64
+    assert len([tab for tab in preview["tabs"] if tab["external"]]) == 1
+    request = {"operation": "kill-window", "window_id": "one", "window_name": "One",
+               "expected": preview["expected"], "request_id": "c" * 32, "_actor_session": "session-one"}
+    result = handle(store, request, backend=backend)
+    assert result["ok"] and result["forgotten"] and not result["remaining"]
+    assert all(store.get(row.id) is None for row in rows)
+    assert store.get(other.id) is not None and store.remembered_windows() == [("two", "Two")]
+    assert {call.args[0].id for call in backend.terminate.call_args_list} == {rows[0].id, rows[1].id}
+    assert handle(store, request, backend=backend) == {**result, "replayed": True}
+    assert backend.terminate.call_count == 2
+
+
+def test_window_kill_requires_exact_current_tabs_and_name(registry):
+    store, rows = registry
+    backend = Mock(available=True)
+    preview = handle(store, {"operation": "preview-kill-window", "window_id": "one"})
+    base = {"operation": "kill-window", "window_id": "one", "window_name": "One",
+            "expected": preview["expected"], "request_id": "d" * 32}
+    for changes in ({"window_name": "Wrong"}, {"expected": preview["expected"][:-1]},
+                    {"expected": "0" * 64}, {"expected": []},
+                    {"request_id": "invalid"}, {"window_id": "../one"}):
+        with pytest.raises(ManagementError):
+            handle(store, {**base, **changes}, backend=backend)
+    backend.terminate.assert_not_called()
+    assert len(store.list(window_id="one")) == len(rows)
+    store.create("new", "test", "bash", "/tmp", window_id="one", window_title="One")
+    with pytest.raises(ManagementError, match="changed"):
+        handle(store, base, backend=backend)
+    backend.terminate.assert_not_called()
+    with pytest.raises(ManagementError, match="no longer exists"):
+        handle(store, {"operation": "preview-kill-window", "window_id": "missing"})
+
+
+def test_window_kill_failure_keeps_window_and_failed_tab_for_retry(registry):
+    store, rows = registry
+    for row in rows:
+        store.update(row.id, status="running")
+    backend = Mock(available=True)
+    backend.session_exists.return_value = False
+    preview = handle(store, {"operation": "preview-kill-window", "window_id": "one"})
+    request = {"operation": "kill-window", "window_id": "one", "window_name": "One",
+               "expected": preview["expected"], "request_id": "e" * 32}
+    # Real backend failures are TmuxError; use that exact error type in the fixture.
+    from termdeck.tmux_backend import TmuxError
+    backend.terminate.side_effect = [None, TmuxError("fixture backend failure"), None]
+    result = handle(store, request, backend=backend)
+    assert not result["ok"] and not result["forgotten"] and len(result["remaining"]) == 1
+    assert store.remembered_windows()[0] == ("one", "One")
+    assert store.get(result["remaining"][0]).status == "running"
+    assert handle(store, request, backend=backend)["replayed"]
+    assert backend.terminate.call_count == 3
+    retry_preview = handle(store, {"operation": "preview-kill-window", "window_id": "one"})
+    retry = handle(store, {**request, "expected": retry_preview["expected"], "request_id": "f" * 32}, backend=Mock(available=True, session_exists=Mock(return_value=False)))
+    assert retry["ok"] and store.remembered_windows() == [("two", "Two")]
+
+
+def test_window_kill_missing_tmux_keeps_recoverable_tabs(registry):
+    store, rows = registry
+    store.update(rows[0].id, status="running", recovery_command="bash", recovery_cwd="/tmp")
+    preview = handle(store, {"operation": "preview-kill-window", "window_id": "one"})
+    backend = Mock(available=False)
+    result = handle(store, {"operation": "kill-window", "window_id": "one", "window_name": "One",
+                            "expected": preview["expected"], "request_id": "0" * 32}, backend=backend)
+    assert not result["ok"] and rows[0].id in result["remaining"]
+    assert store.get(rows[0].id).recovery_command == "bash"
+    backend.terminate.assert_not_called()
+
+
 def test_move_sql_failure_rolls_back_every_tab(registry):
     store, rows = registry
     store.conn.execute(f"CREATE TRIGGER fail_second_move BEFORE UPDATE OF window_id ON sessions WHEN OLD.id = '{rows[1].id}' BEGIN SELECT RAISE(ABORT, 'fixture move failure'); END")

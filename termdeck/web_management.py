@@ -6,6 +6,7 @@ the same backend as the desktop, report individual failures, and protect pins.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import time
@@ -22,6 +23,8 @@ class ManagementError(ValueError):
 FIELDS = {
     "list": {"query", "view", "offset", "limit", "window_id", "sort", "descending"},
     "create-window": {"name", "request_id", "_actor_session"}, "rename-window": {"window_id", "name"},
+    "preview-kill-window": {"window_id"},
+    "kill-window": {"window_id", "window_name", "expected", "request_id", "_actor_session"},
     "reorder": {"window_id", "ids", "expected"},
     "move": {"window_id", "ids", "sources"},
     "bulk": {"action", "ids", "confirmation"},
@@ -82,6 +85,95 @@ def sampled_tasks(records, backend):
     return first
 
 
+def window_kill_preview(store: SessionStore, window_id: str) -> dict:
+    windows = dict(store.remembered_windows())
+    if window_id not in windows:
+        raise ManagementError("Window no longer exists; refresh and retry")
+    rows = store.list(include_archived=True, window_id=window_id)
+    if len(rows) > 4096:
+        raise ManagementError("Window has too many saved tabs for one kill action")
+    rows.sort(key=lambda row: row.id)
+    expected = hashlib.sha256("\n".join(row.id for row in rows).encode()).hexdigest()
+    return {"ok": True, "window_id": window_id, "window_name": windows[window_id],
+            "expected": expected,
+            "tabs": [{"id": row.id, "name": row.name, "status": row.status,
+                      "external": bool(row.external)} for row in rows]}
+
+
+def kill_window(store: SessionStore, request: dict, *, backend=None) -> dict:
+    window_id = identity(request.get("window_id"))
+    window_name = text(request.get("window_name"))
+    expected = request.get("expected")
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise ManagementError("Invalid window tab confirmation")
+    request_id = request.get("request_id")
+    if not isinstance(request_id, str) or not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        raise ManagementError("Invalid window kill request identity")
+    actor = identity(request.get("_actor_session", "local"))
+    store.conn.execute("""CREATE TABLE IF NOT EXISTS web_window_kill_requests (
+        session_id TEXT NOT NULL, request_id TEXT NOT NULL, window_id TEXT NOT NULL,
+        window_name TEXT NOT NULL, expected_hash TEXT NOT NULL, result_json TEXT,
+        PRIMARY KEY(session_id, request_id))""")
+    with store.conn:
+        store.conn.execute("BEGIN IMMEDIATE")
+        prior = store.conn.execute(
+            "SELECT window_id,window_name,expected_hash,result_json FROM web_window_kill_requests WHERE session_id=? AND request_id=?",
+            (actor, request_id)).fetchone()
+        if prior:
+            if tuple(prior[:3]) != (window_id, window_name, expected):
+                raise ManagementError("Window kill request was already used for a different action")
+            if prior[3] is None:
+                return {"ok": False, "pending": True,
+                        "error": "Window kill is still in progress or its outcome is uncertain; refresh before retrying"}
+            return {**json.loads(prior[3]), "replayed": True}
+        if store.conn.execute("SELECT COUNT(*) FROM web_window_kill_requests").fetchone()[0] >= 32768:
+            raise ManagementError("Window kill receipt capacity reached")
+        if store.conn.execute("SELECT 1 FROM web_window_kill_requests WHERE window_id=? AND result_json IS NULL", (window_id,)).fetchone():
+            raise ManagementError("A window kill is in progress; refresh before retrying")
+        preview = window_kill_preview(store, window_id)
+        if preview["window_name"] != window_name or preview["expected"] != expected:
+            raise ManagementError("Window or tabs changed; refresh and confirm again")
+        store.conn.execute(
+            "INSERT INTO web_window_kill_requests VALUES(?,?,?,?,?,NULL)",
+            (actor, request_id, window_id, window_name, expected))
+
+    backend = backend or TmuxBackend()
+    results = []
+    for session_id in (tab["id"] for tab in preview["tabs"]):
+        try:
+            row = store.get(session_id)
+            if row is None or row.window_id != window_id:
+                raise ManagementError("Tab moved or disappeared; refresh and retry")
+            if not row.external and row.status != "stopped":
+                if not backend.available:
+                    raise ManagementError("Admitted tmux server is unavailable; saved tab preserved")
+                backend.terminate(row)
+                if backend.available and backend.session_exists(row):
+                    raise ManagementError("Terminal is still running; saved tab preserved")
+                store.update(row.id, status="stopped", visible=False, last_pid=None,
+                             recovery_command=None, recovery_cwd=None, recovery_intent="inactive")
+            # External sessions belong to their original owner. Removing this
+            # reference must never send kill-session to an external tmux pane.
+            store.delete(row.id)
+            results.append({"id": session_id, "ok": True, "external": bool(row.external)})
+        except (TmuxError, ManagementError, OSError, ValueError, sqlite3.Error) as exc:
+            results.append({"id": session_id, "ok": False, "detail": str(exc)[:512]})
+    try:
+        remaining = store.list(include_archived=True, window_id=window_id)
+        forgotten = not remaining and store.forget_window(window_id)
+        cleanup_error = None
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        remaining, forgotten, cleanup_error = [], False, str(exc)[:512]
+    result = {"ok": bool(forgotten), "window_id": window_id, "forgotten": bool(forgotten),
+              "results": results, "remaining": [row.id for row in remaining]}
+    if cleanup_error:
+        result["error"] = cleanup_error
+    with store.conn:
+        store.conn.execute("UPDATE web_window_kill_requests SET result_json=? WHERE session_id=? AND request_id=?",
+                           (json.dumps(result), actor, request_id))
+    return result
+
+
 def handle(store: SessionStore, request: object, *, backend=None):
     if not isinstance(request, dict) or not isinstance(request.get("operation"), str) or request["operation"] not in FIELDS:
         raise ManagementError("Unknown management operation")
@@ -96,6 +188,10 @@ def handle(store: SessionStore, request: object, *, backend=None):
         return accounts(store, request, backend=backend)
     if operation == "list":
         return listing(store, request, backend=backend)
+    if operation == "preview-kill-window":
+        return window_kill_preview(store, identity(request.get("window_id")))
+    if operation == "kill-window":
+        return kill_window(store, request, backend=backend)
     if operation == "create-window":
         name = text(request.get("name"))
         if "request_id" in request:

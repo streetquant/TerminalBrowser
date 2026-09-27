@@ -78,19 +78,23 @@ window.T1000UI = (() => {
     const rows = [];
     for (const data of host.windows) {
       if (query && ![data.name, ...data.panes.map(pane => `${pane.title} ${pane.cwd}`)].join(" ").toLocaleLowerCase().includes(query)) continue;
+      const entry = element("div", "window-list-entry");
+      entry.dataset.id = data.id;
       const row = element("a", "window-list-row");
       row.href = appPath(data.path);
       const description = element("span", "window-list-description");
       description.append(element("strong", "", data.name), element("span", "", data.panes.map(pane => pane.title).join(" · ") || "No visible tabs"));
       row.append(element("span", "window-list-icon", ">_"), description, element("span", "window-list-count", `${data.panes.length} tabs`));
-      rows.push(row);
+      const kill = button("Kill window…", () => window.T1000Management.killWindow(data.id));
+      kill.className = "window-list-kill danger"; kill.setAttribute("aria-label", `Kill ${data.name} window permanently`);
+      entry.append(row, kill); rows.push(entry);
     }
     if (!rows.length) rows.push(element("p", "subtle", query ? "No matching windows or tabs." : "No windows yet. Choose New window to get started."));
     if (list.dataset.signature !== signature) {
-      const focused = document.activeElement?.closest(".window-list-row")?.getAttribute("href");
+      const focused = document.activeElement?.closest(".window-list-entry")?.dataset.id;
       list.replaceChildren(...rows);
       list.dataset.signature = signature;
-      if (focused) rows.find(row => row.getAttribute("href") === focused)?.focus();
+      if (focused) rows.find(row => row.dataset.id === focused)?.firstChild.focus();
     }
   }
   function attachWorkspace({ root, toolbar, menu, getPanes, selectPane, getTerminal, newTab, runAction, loadHidden, restoreHidden, getWindow, refresh }) {
@@ -646,6 +650,31 @@ window.T1000Management = (() => {
     });
     body.append(form); name.focus(); name.select();
   }
+  async function killWindow(windowId) {
+    if (!windowId||!open("Kill window permanently")) return;
+    const p=await request({operation:"preview-kill-window",window_id:windowId});
+    if (!dialog.open || heading.textContent !== "Kill window permanently") return;
+    const tabs=p.tabs;
+    const warning = el("p","",`Kill “${p.window_name}” (${tabs.length} tabs)?`);
+    const detail = el("p","subtle","Managed sessions stop. External references are forgotten; external tmux keeps running. Includes hidden tabs. Cannot be undone.");
+    const list=el("ul","management-confirm-list");
+    for (const t of tabs) list.append(el("li","",`${t.name} · ${t.status}${t.external ? " · external" : ""}`));
+    const requestId = window.T1000Files.id(), controls = el("div","workspace-dialog-actions"), cancel = button("Cancel",()=>dialog.close());
+    const confirm = button("Kill window permanently", async () => {
+      confirm.disabled = true;
+      try {
+        const r = await run({operation:"kill-window",window_id:windowId,window_name:p.window_name,expected:p.expected,request_id:requestId});
+        if (!r.ok) { report(`${r.remaining?.length||0} remain. ${resultsText(r)}`); return; }
+        if (workspace?.getWindow()?.id === windowId) { location.assign(api.appPath("/")); return; }
+        const host = await api.snapshot();
+        if (host.windows.some(w=>w.id===windowId)) { report("Killed; refresh."); return; }
+        api.root.querySelector(".window-list")?.removeAttribute("data-signature");
+        window.T1000UI.renderHome(api.root,host,false,api.appPath); dialog.close();
+      } catch (error) { report(error.message); }
+      finally { confirm.disabled = false; }
+    }, "danger");
+    controls.append(cancel,confirm); body.replaceChildren(warning,detail,list,controls); cancel.focus();
+  }
   async function moveTabs(rows) {
     if (!rows.length || !open("Move tabs")) return;
     body.append(el("p", "subtle", `Move ${rows.length} selected tab${rows.length === 1 ? "" : "s"}. Running processes and terminal contents are preserved.`));
@@ -918,8 +947,8 @@ window.T1000Management = (() => {
     bar.addEventListener("drop", event => { if (!dragged) return; event.preventDefault(); const target = event.target.closest('[role="tab"]')?.dataset.paneId; const from = dragged; dragged = ""; if (target) reorder(from, target).catch(error); });
     bar.addEventListener("dragend", () => { dragged = ""; });
     window.addEventListener("keydown", event => { if (!event.ctrlKey || !event.shiftKey || !["PageUp", "PageDown"].includes(event.key) || document.querySelector("dialog[open]")) return; event.preventDefault(); event.stopImmediatePropagation(); shiftTab(event.key === "PageUp" ? -1 : 1).catch(error); }, true);
-    const handlers = [["New window", () => nameWindow()], ["Client files", clientFiles], ["Codex accounts", accounts], ["Rename window", () => nameWindow(true)], ["Tab manager", manager], ["Move tab to window…", () => moveTabs(activeRows())], ["Move tab left", () => shiftTab(-1)], ["Move tab right", () => shiftTab(1)], ["Hide other tabs", () => hideRelative(false)], ["Hide tabs to the right", () => hideRelative(true)]];
+    const handlers = [["New window", () => nameWindow()], ["Client files", clientFiles], ["Codex accounts", accounts], ["Rename window", () => nameWindow(true)], ["Kill window permanently…", () => killWindow(workspace?.getWindow()?.id)], ["Tab manager", manager], ["Move tab to window…", () => moveTabs(activeRows())], ["Move tab left", () => shiftTab(-1)], ["Move tab right", () => shiftTab(1)], ["Hide other tabs", () => hideRelative(false)], ["Hide tabs to the right", () => hideRelative(true)]];
     return {menuItems: () => handlers.map(([name, handler]) => button(name, handler))};
   }
-  return {configure, home, workspace: attachWorkspace, appearance: data => request({operation: "appearance", ...data})};
+  return {configure, home, workspace: attachWorkspace, killWindow, appearance: data => request({operation: "appearance", ...data})};
 })();
