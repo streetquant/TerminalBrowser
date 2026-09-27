@@ -82,9 +82,13 @@ warp_path_checks = {
         (ROOT/'termdeck/release_manager.py').read_text(errors='strict'),
     'runtime_is_warp': CANONICAL_RUNTIME in ''.join(texts.values()),
     'state_is_warp': CANONICAL_STATE in ''.join(texts.values()),
-    'service_home_is_state': all(
+    'terminal_service_home_is_host': all(
+        'Environment=HOME=%h' in texts[name]
+        for name in ('backend',)
+    ),
+    'ancillary_service_home_is_state': all(
         f'Environment=HOME={CANONICAL_STATE}' in texts[name]
-        for name in ('backend', 'lan', 'recovery', 'cloudflared_unit', 'preview_unit', 'checkpoint')
+        for name in ('lan', 'recovery', 'cloudflared_unit', 'preview_unit', 'checkpoint')
     ),
 }
 if not all(warp_path_checks.values()):
@@ -227,9 +231,9 @@ checks.update({
         )
         for name, contract in unit_contracts.items()
     ),
-    'all_six_home_is_state': all(
+    'service_homes_match_role': all(
         tuple(value for value in _directive_values(texts[name], 'Environment') if value.startswith('HOME='))
-        == (f'HOME={CANONICAL_STATE}',)
+        == (('HOME=%h' if name == 'backend' else f'HOME={CANONICAL_STATE}'),)
         for name in unit_stems
     ),
     'checkpoint_stop_is_unprefixed': 'ExecStop=-' not in texts['checkpoint'],

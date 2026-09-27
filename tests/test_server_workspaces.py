@@ -17,7 +17,6 @@ from test_client_files import stage, call, upload, path, make_stage, ordinary_wo
 
 @pytest.fixture
 def directories(ordinary_workspace_root):
-    # Keep sibling/rename scenarios inside the one automatically cleaned root.
     root = ordinary_workspace_root / "workspace-tree"
     root.mkdir(mode=0o700)
     state = root / "state"
@@ -27,61 +26,64 @@ def directories(ordinary_workspace_root):
     return state, workspace
 
 
-def sandbox(directory, code, *args):
-    argv = ["/usr/bin/bwrap", "--die-with-parent", "--unshare-all", "--new-session",
-            "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin",
-            "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib", "/lib64",
-            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-            *directory.mount_arguments(), "--chdir", str(directory.path),
-            "--", sys.executable, "-c", code, *map(str, args)]
-    return argv
-
-
-def test_directory_selection_needs_no_saved_policy_and_preserves_spaces(directories):
+def test_directory_selection_preserves_spaces_and_v2_identity(directories):
     state, workspace = directories
     result = workspaces.select(str(workspace), state_root=state)
     assert result["path"] == str(workspace)
     assert result["source"] == "server-directory"
-    assert not result["pin"]["read_only"]
+    assert set(result["pin"]) == {"version", "chain"}
+    assert result["pin"]["version"] == 2
     assert result["pin"]["chain"][-1] == [workspace.stat().st_dev, workspace.stat().st_ino]
-    with workspaces.open_workspace(result, state_root=state) as directory:
+    with workspaces.open_workspace(result) as directory:
         directory.check()
 
 
-def test_initial_symlink_resolves_to_canonical_directory(directories):
+def test_initial_symlink_and_parent_syntax_resolve_to_canonical_directory(directories):
     state, workspace = directories
     alias = workspace.with_name("shortcut")
     alias.symlink_to(workspace, target_is_directory=True)
-    result = workspaces.select(str(alias), state_root=state)
-    assert result["path"] == str(workspace)
+    for selected in (alias, alias / ".." / workspace.name):
+        result = workspaces.select(str(selected), state_root=state)
+        assert result["path"] == str(workspace)
 
 
-def test_readonly_directory_is_usable_and_cannot_gain_write_authority(directories):
+@pytest.mark.parametrize("mode", [0o100, 0o500, 0o770, 0o777])
+def test_searchable_directory_needs_no_read_or_owner_only_permissions(directories, mode):
     state, workspace = directories
-    workspace.chmod(0o500)
+    workspace.chmod(mode)
+    previous = Path.cwd()
     try:
         result = workspaces.select(str(workspace), state_root=state)
-        assert result["pin"]["read_only"]
+        with workspaces.open_workspace(result) as directory, directory.entered():
+            assert Path.cwd() == workspace
+        assert Path.cwd() == previous
+        # Permission changes remain governed by the OS, not an old read-only grant.
         workspace.chmod(0o700)
-        with workspaces.open_workspace(result, state_root=state) as directory:
-            argv = sandbox(directory, "import pathlib; pathlib.Path('proof').write_text('unexpected')")
-            completed = subprocess.run(argv, pass_fds=(directory.fd,), capture_output=True, text=True, timeout=10)
-        assert completed.returncode != 0
-        assert "Read-only file system" in completed.stderr
-        assert not (workspace / "proof").exists()
+        with workspaces.open_workspace(result) as directory, directory.entered():
+            Path("new-file").write_text("ordinary host access")
     finally:
         workspace.chmod(0o700)
 
 
-@pytest.mark.parametrize("selected", ["relative", "../escape", "/tmp/../etc", "", "/", "/proc", "/dev", "/sys", "/run"])
-def test_invalid_and_control_paths_rejected(directories, selected):
+@pytest.mark.parametrize("selected", ["relative", "../escape", ""])
+def test_nonabsolute_paths_rejected(directories, selected):
     state, _ = directories
     with pytest.raises(StagingError):
         workspaces.select(selected, state_root=state)
 
 
-@pytest.mark.parametrize("kind", ["missing", "file", "fifo", "socket", "unreadable"])
-def test_missing_inaccessible_and_special_directory_objects_rejected(directories, kind):
+@pytest.mark.parametrize("selected", ["/", "/proc", "/dev", "/sys", "/run"])
+def test_os_searchable_system_directories_are_selectable(directories, selected):
+    state, _ = directories
+    receipt = workspaces.select(selected, state_root=state)
+    with workspaces.open_workspace(receipt) as directory, directory.entered():
+        assert Path.cwd() == Path(selected).resolve()
+    if selected == "/":
+        assert receipt["label"] == "/"
+
+
+@pytest.mark.parametrize("kind", ["missing", "file", "fifo", "socket", "unsearchable"])
+def test_missing_non_directory_and_os_inaccessible_objects_rejected(directories, kind):
     state, workspace = directories
     selected = workspace / "selection"
     control = None
@@ -92,60 +94,44 @@ def test_missing_inaccessible_and_special_directory_objects_rejected(directories
     elif kind == "socket":
         control = socket.socket(socket.AF_UNIX)
         control.bind(str(selected))
-    elif kind == "unreadable":
+    elif kind == "unsearchable":
         selected.mkdir(mode=0o000)
     try:
-        with pytest.raises(StagingError):
+        if kind == "unsearchable" and os.geteuid() == 0:
+            # Root really can enter it; this feature must not invent restrictions.
             workspaces.select(str(selected), state_root=state)
+        else:
+            with pytest.raises(StagingError):
+                workspaces.select(str(selected), state_root=state)
     finally:
         if control:
             control.close()
-        if kind == "unreadable":
+        if kind == "unsearchable":
             selected.chmod(0o700)
 
 
 @pytest.mark.parametrize("relative", [".termdeck", ".termdeck/tls", ".beads", "terminal-auth", ".ssh"])
-def test_reserved_directory_cannot_be_selected(directories, relative):
+def test_host_user_can_select_previously_masked_names(directories, relative):
     state, workspace = directories
-    protected = workspace / relative
-    protected.mkdir(parents=True)
-    with pytest.raises(StagingError, match="Protected storage"):
-        workspaces.select(str(protected), state_root=state)
+    selected = workspace / relative
+    selected.mkdir(parents=True)
+    receipt = workspaces.select(str(selected), state_root=state, protected=(selected,))
+    assert receipt["path"] == str(selected)
 
 
-def test_external_auth_and_catalogue_cannot_be_selected(directories):
+def test_selection_does_not_walk_or_mask_descendants(directories, monkeypatch):
     state, workspace = directories
-    catalogue = workspace / "external account catalogue"
-    catalogue.mkdir()
-    child = catalogue / "accounts"
-    child.mkdir()
-    for selected in (state, catalogue, child):
-        with pytest.raises(StagingError, match="Protected storage"):
-            workspaces.select(str(selected), state_root=state, protected=(catalogue,))
-
-
-@pytest.mark.parametrize("external", [True, False])
-def test_home_with_private_catalogue_alias_hides_canonical_target(directories, external):
-    state, workspace = directories
-    catalogue = workspace.parent / "outside catalogue" if external else workspace / "native catalogue"
-    catalogue.mkdir()
-    (catalogue / "auth.json").write_text("private credentials")
-    (workspace / ".codex").symlink_to(catalogue, target_is_directory=True)
-    (workspace / "ordinary-alias").symlink_to(catalogue, target_is_directory=True)
-    result = workspaces.select(str(workspace), state_root=state)
-    code = """import pathlib,sys
-root=pathlib.Path.cwd()
-assert not (root/'.codex/auth.json').exists()
-assert not (root/'ordinary-alias/auth.json').exists()
-assert not (pathlib.Path(sys.argv[1])/'auth.json').exists()
-(root/'project.txt').write_text('works')
-"""
-    with workspaces.open_workspace(result, state_root=state) as directory:
-        completed = subprocess.run(sandbox(directory, code, catalogue), pass_fds=(directory.fd,),
-                                   capture_output=True, text=True, timeout=10)
-    assert completed.returncode == 0, completed.stderr
-    assert (workspace / "project.txt").read_text() == "works"
-    assert (catalogue / "auth.json").read_text() == "private credentials"
+    (workspace / "unsearchable").mkdir(mode=0o000)
+    (workspace / "alias").symlink_to(state, target_is_directory=True)
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("Cwd selection must not recursively inventory the host")
+    monkeypatch.setattr(os, "scandir", unexpected)
+    try:
+        result = workspaces.select(str(workspace), state_root=state, protected=(state,))
+        with workspaces.open_workspace(result) as directory:
+            directory.check()
+    finally:
+        (workspace / "unsearchable").chmod(0o700)
 
 
 @pytest.mark.parametrize("replacement", ["directory", "symlink", "ancestor"])
@@ -164,65 +150,36 @@ def test_receipt_rejects_replaced_directory_and_ancestor(directories, replacemen
         changed.mkdir()
         if replacement == "ancestor":
             (changed / workspace.name).mkdir()
-    with pytest.raises(StagingError):
-        workspaces.open_workspace(result, state_root=state).__enter__()
+    with pytest.raises(StagingError, match="changed"):
+        with workspaces.open_workspace(result):
+            pytest.fail("Replacement was accepted")
 
 
-def test_open_descriptor_never_mounts_replacement_after_final_path_check(directories):
+def test_replacement_at_fchdir_fails_before_exec_and_restores_cwd(directories, monkeypatch):
     state, workspace = directories
-    (workspace / "identity").write_text("approved original")
     result = workspaces.select(str(workspace), state_root=state)
-    with workspaces.open_workspace(result, state_root=state) as directory:
-        argv = sandbox(directory, "import pathlib; assert pathlib.Path('identity').read_text() == 'approved original'")
-        moved = workspace.with_name("original")
-        workspace.rename(moved)
-        workspace.mkdir()
-        (workspace / "identity").write_text("unauthorized replacement")
-        completed = subprocess.run(argv, pass_fds=(directory.fd,), capture_output=True, text=True, timeout=10)
-    assert completed.returncode == 0, completed.stderr
+    previous = Path.cwd()
+    real_fchdir = os.fchdir
+    with workspaces.open_workspace(result) as directory:
+        def raced(fd):
+            if fd == directory.fd:
+                workspace.rename(workspace.with_name("original"))
+                workspace.mkdir()
+            real_fchdir(fd)
+        monkeypatch.setattr(os, "fchdir", raced)
+        with pytest.raises(StagingError, match="identity changed"):
+            with directory.entered():
+                pytest.fail("Replacement race reached execution")
+    assert Path.cwd() == previous
 
 
-def test_broad_parent_masks_nested_state_catalogue_ledger_private_homes_and_special_files(directories):
+def test_legacy_directory_pin_never_becomes_host_authority(directories):
     state, workspace = directories
-    root = workspace.parent
-    catalogue = root / "external catalogue"
-    catalogue.mkdir()
-    hidden = [state, catalogue, workspace / ".termdeck", workspace / ".beads",
-              workspace / "nested/terminal-auth", workspace / "nested/project/.beads"]
-    for path in hidden:
-        path.mkdir(parents=True, exist_ok=True)
-        (path / "sentinel").write_text("private")
-    outside = root.with_name(root.name + "-outside")
-    outside.mkdir()
-    (outside / "sentinel").write_text("outside")
-    (workspace / "outside-alias").symlink_to(outside, target_is_directory=True)
-    fifo = workspace / "host-control"
-    os.mkfifo(fifo)
-    result = workspaces.select(str(root), state_root=state, protected=(catalogue,))
-    code = """import pathlib,stat,sys
-root=pathlib.Path(sys.argv[1])
-for value in sys.argv[2:]:
-    assert not (pathlib.Path(value)/'sentinel').exists(), value
-control=root/'ordinary project with spaces/host-control'
-assert not stat.S_ISFIFO(control.stat().st_mode)
-assert not (root/'ordinary project with spaces/outside-alias/sentinel').exists()
-(root/'ordinary project with spaces/proof').write_text('authorized')
-"""
-    with workspaces.open_workspace(result, state_root=state, protected=(catalogue,)) as directory:
-        completed = subprocess.run(sandbox(directory, code, root, *hidden), pass_fds=(directory.fd,),
-                                   capture_output=True, text=True, timeout=10)
-    assert completed.returncode == 0, completed.stderr
-    assert (workspace / "proof").read_text() == "authorized"
-    assert all((path / "sentinel").read_text() == "private" for path in hidden)
-
-
-def test_inventory_limit_fails_clearly(directories, monkeypatch):
-    state, workspace = directories
-    for index in range(3):
-        (workspace / str(index)).mkdir()
-    monkeypatch.setattr(workspaces, "_MAX_ENTRIES", 2)
-    with pytest.raises(StagingError, match="too large"):
-        workspaces.select(str(workspace), state_root=state)
+    result = workspaces.select(str(workspace), state_root=state)
+    result["pin"].update(version=1, read_only=False)
+    with pytest.raises(StagingError, match="new host-user launch"):
+        with workspaces.open_workspace(result):
+            pytest.fail("Legacy mount grant became host authority")
 
 
 def creation(store, actor, workspace, **extra):
@@ -290,38 +247,32 @@ def test_directory_request_rejects_ambiguous_authority_and_client_display_metada
         store.handle(actor, request)
 
 
-def test_broad_authenticated_launch_keeps_exact_attachment_and_masks_surrounding_state(ordinary_workspace_root, monkeypatch):
+def test_broad_launch_preserves_api_attachment_bytes_with_normal_host_visibility(ordinary_workspace_root, monkeypatch):
     (ordinary_workspace_root / "state").mkdir(mode=0o700)
     store, actor = make_stage(ordinary_workspace_root / "state", ordinary_workspace_root / "auth")
     project = ordinary_workspace_root / "project with spaces"
     project.mkdir()
     (project / ".beads").mkdir()
-    (project / ".beads/private").write_text("private")
+    (project / ".beads/private").write_text("disposable host fixture")
     obj = upload((store, actor), b"original immutable bytes", display_path="/client/metadata-only")
-    request = creation(store, actor, ordinary_workspace_root, attachments=[obj["reference"]])
-    receipt = store.handle(actor, request)
+    receipt = store.handle(actor, creation(store, actor, ordinary_workspace_root, attachments=[obj["reference"]]))
     launch.start(store, actor, receipt, backend=Backend())
     upload((store, actor), b"newer", previous=obj["reference"])
     code = """import pathlib,sys
 attachment=pathlib.Path(sys.argv[1]); root=pathlib.Path.cwd()
 assert attachment.read_bytes()==b'original immutable bytes'
-assert not (root/'auth/termdeck-web-auth-v1.sqlite3').exists()
-assert not (root/'state/client-files/metadata.sqlite3').exists()
-assert not (root/'project with spaces/.beads/private').exists()
-try: attachment.write_text('changed')
-except OSError: pass
-else: raise AssertionError('immutable attachment became writable')
-(root/'project with spaces/proof').write_text('confined')
+assert (root/'auth/termdeck-web-auth-v1.sqlite3').exists()
+assert (root/'state/client-files/metadata.sqlite3').exists()
+assert (root/'project with spaces/.beads/private').read_text()=='disposable host fixture'
+(root/'project with spaces/proof').write_text('host user')
 """
     completed = []
     class Executed(Exception):
         pass
-    def execute(_executable, argv, _environment):
-        assert "--bind-fd" in argv
-        split = argv.index("--")
-        descriptors = tuple(int(argv[i + 1]) for i, value in enumerate(argv) if value in {"--bind-fd", "--ro-bind-fd"})
-        command = [*argv[:split + 1], sys.executable, "-c", code, str(path((store, actor), obj))]
-        completed.append(subprocess.run(command, pass_fds=descriptors, capture_output=True, text=True, timeout=10))
+    def execute(executable, argv, environment):
+        assert executable != "/usr/bin/bwrap"
+        completed.append(subprocess.run([sys.executable, "-c", code, str(path((store, actor), obj))],
+                                       env=environment, capture_output=True, text=True, timeout=10))
         raise Executed()
     monkeypatch.setattr(os, "execve", execute)
     args = SimpleNamespace(state=str(store.root.parent), auth_dir=str(store.auth_directory),
@@ -329,7 +280,7 @@ else: raise AssertionError('immutable attachment became writable')
     with pytest.raises(Executed):
         launch.execute(args)
     assert completed[0].returncode == 0, completed[0].stderr
-    assert (project / "proof").read_text() == "confined"
+    assert (project / "proof").read_text() == "host user"
     assert path((store, actor), obj).read_bytes() == b"original immutable bytes"
     with pytest.raises(StagingError, match="consumed"):
         launch.execute(args)

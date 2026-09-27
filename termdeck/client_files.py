@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 import hashlib
 import json
@@ -237,14 +238,40 @@ class Actor:
             raise StagingError("Invalid machine generation", "unauthorized")
 
 
+@dataclass
+class _AuthorizationFence:
+    directory: Directory
+    actor: Actor
+    machine: dict
+    now: int
+    active: bool = True
+
+
+_AUTHORIZATION_FENCE = ContextVar("termdeck_staging_authorization", default=None)
+
+
 @contextmanager
-def authorized(auth_directory, actor, *, now_ms=None):
-    """Revalidate both TermDeck credentials; hold revocation serialization."""
+def authorized(auth_directory, actor, *, now_ms=None, readonly=False):
+    """Revalidate both credentials; mutations retain revocation serialization.
+
+    Read-only launch admission can run inside an existing serialized operation.
+    It does not replace the final execution or mutation authorization fence.
+    """
     actor.validate()
+    current = _AUTHORIZATION_FENCE.get()
+    if readonly and current is not None and current.active and Path(auth_directory) == current.directory.path:
+        if actor != current.actor:
+            raise StagingError("Nested staging authorization does not match", "unauthorized")
+        # POSIX record locks are released when this process closes *any* fd
+        # for the SQLite file. Do not reopen it inside the serialized fence.
+        current.directory.check()
+        yield dict(current.machine), current.now
+        current.directory.check()
+        return
     directory = Directory(auth_directory)
     try:
-        with _database(directory, "termdeck-web-auth-v1.sqlite3", readonly=True) as auth, _database(directory, "termdeck-machines-v1.sqlite3") as machines:
-            machines.execute("BEGIN IMMEDIATE")
+        with _database(directory, "termdeck-web-auth-v1.sqlite3", readonly=True) as auth, _database(directory, "termdeck-machines-v1.sqlite3", readonly=readonly) as machines:
+            machines.execute("BEGIN" if readonly else "BEGIN IMMEDIATE")
             auth.execute("BEGIN")
             metadata = auth.execute("SELECT host_id,owner_id,last_observed_at_ms FROM auth_metadata WHERE singleton=1").fetchone()
             now = max(int(time.time() * 1000) if now_ms is None else now_ms, metadata["last_observed_at_ms"])
@@ -255,7 +282,14 @@ def authorized(auth_directory, actor, *, now_ms=None):
             if (expected != actor.account_id or not session or not machine or not owner
                     or tuple(owner) != (metadata["host_id"], metadata["owner_id"], 1)):
                 raise StagingError("Staging authorization failed", "unauthorized")
-            yield dict(machine), now
+            fence = _AuthorizationFence(directory, actor, dict(machine), now)
+            token = _AUTHORIZATION_FENCE.set(fence) if not readonly else None
+            try:
+                yield dict(machine), now
+            finally:
+                fence.active = False
+                if token is not None:
+                    _AUTHORIZATION_FENCE.reset(token)
             directory.check()
             machines.commit()
     finally:
@@ -276,14 +310,14 @@ CREATE TABLE IF NOT EXISTS attachments(attachment_id TEXT PRIMARY KEY,account_id
 
 
 class StagingStore:
-    def __init__(self, state_root, auth_directory, *, session_database=None):
+    def __init__(self, state_root, auth_directory, *, session_database=None, create=True):
         self.root = Path(state_root) / "client-files"
         self.auth_directory = Path(auth_directory)
         self.session_database = Path(session_database or Path(state_root) / "sessions.sqlite3")
         # Do not create trees via mkdir(parents=True), which follows links.
         parent = Directory(state_root)
         try:
-            with parent.directory("client-files", create=True) as descriptor:
+            with parent.directory("client-files", create=create) as descriptor:
                 self._root_chain = parent.chain + (Directory._receipt(os.fstat(descriptor)),)
             parent.check()
         finally:

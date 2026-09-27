@@ -934,17 +934,15 @@ class TmuxBackend:
         return False
 
     @staticmethod
-    def _private_auth_path(codex_home: Path) -> str:
-        """Build a scope-local PATH without another terminal's wrapper."""
+    def _private_auth_path(codex_home: Path, *, base_path: str | None = None) -> str:
+        """Prepend this scope without discarding ordinary host PATH entries."""
 
         expected_bin = str(codex_home / "bin")
         entries = [expected_bin]
-        seen = {os.path.normpath(expected_bin)}
-        for raw_entry in os.environ.get("PATH", "").split(os.pathsep):
-            if not raw_entry:
-                continue
+        source = os.environ.get("PATH", os.defpath) if base_path is None else base_path
+        for raw_entry in source.split(os.pathsep):
             normalized = os.path.normpath(raw_entry)
-            if normalized in seen:
+            if normalized == os.path.normpath(expected_bin):
                 continue
             candidate = Path(raw_entry)
             if (
@@ -957,7 +955,6 @@ class TmuxBackend:
                 # fallback for this terminal.
                 continue
             entries.append(raw_entry)
-            seen.add(normalized)
         return os.pathsep.join(entries)
 
     @classmethod
@@ -1591,6 +1588,8 @@ class TmuxBackend:
     def _with_explicit_private_environment(
         command: str,
         environment: Sequence[tuple[str, str]],
+        *,
+        login_shell: str | None = None,
     ) -> str:
         """Start a private-scope payload with its actual inherited environment.
 
@@ -1612,6 +1611,14 @@ class TmuxBackend:
             )
             if name in values
         ]
+        if login_shell is not None:
+            # Configured host runtimes need the same profile/tool environment
+            # as an ordinary login terminal. Their authenticated entrypoint
+            # reapplies the private scope after user startup files, before it
+            # execs the selected runtime. A failing entrypoint stays failed.
+            return shlex.join(
+                ["/usr/bin/env", *assignments, login_shell, "-ilc", command]
+            )
         try:
             argv = shlex.split(command)
         except ValueError:
@@ -1759,7 +1766,23 @@ class TmuxBackend:
             resolved = resolve_working_directory(recipe)
         except SessionRecipeError as exc:
             raise TmuxError(str(exc)) from exc
-        environment = recipe.environment_dict()
+        if record.tag == "web-agent":
+            # A legacy or revoked configured plan must be refused before user
+            # login profiles run with the newly authorized host permissions.
+            from .agent_launch import validate_native_launch
+            try:
+                validate_native_launch(record)
+            except (OSError, ValueError) as exc:
+                raise TmuxError(str(exc)) from exc
+        # A long-lived tmux server retains its first caller's environment.
+        # New and recovered tabs use the current host caller's identity/tool
+        # environment, with explicit durable recipe choices still authoritative.
+        environment = {
+            key: os.environ[key]
+            for key in ("HOME", "USER", "LOGNAME", "SHELL", "PATH")
+            if key in os.environ
+        }
+        environment.update(recipe.environment_dict())
         environment.update(resolved.environment)
         launch_directory = resolved.path
         command = recipe.command
@@ -1769,9 +1792,9 @@ class TmuxBackend:
 
         raw_codex_home = (getattr(record, "codex_home", None) or "").strip()
         if record.tag == "web-agent" and raw_codex_home:
-            # A configured task keeps its original launch policy and mount
-            # boundary through every account restart. Never use a host wrapper
-            # or generic native-resume command for this record kind.
+            # A configured task keeps its authenticated launch plan through
+            # every account restart. The entrypoint owns native resume and
+            # private scope restoration after normal shell startup.
             from .agent_launch import prepare_resume
             resume_permit = None
             try:
@@ -1784,8 +1807,11 @@ class TmuxBackend:
             environment.update({"CODEX_HOME": str(codex_home),
                 "TERMDECK_AUTH_SCOPE_ID": record.auth_scope_id or "",
                 "CODEX_TERMDECK_GATE_ROOT": str(auth_lifetime_gate_root(record)),
-                "PATH": self._private_auth_path(codex_home)})
-            command = self._with_explicit_private_environment(command, environment.items())
+                "PATH": self._private_auth_path(codex_home, base_path=environment.get("PATH"))})
+            command = self._with_explicit_private_environment(
+                command, environment.items(),
+                login_shell=shlex.split(fallback_shell_command)[0],
+            )
             return _LaunchSpec(recipe=recipe, command=command, directory=launch_directory,
                                environment=tuple(sorted(environment.items())), checkpoint=False,
                                application_native_resume=native_resume,
@@ -1861,7 +1887,7 @@ class TmuxBackend:
             if codex_recovery:
                 self._hydrate_private_codex_recovery(record, codex_recovery)
             codex_home = Path(raw_codex_home).expanduser().resolve(strict=False)
-            isolated_path = self._private_auth_path(codex_home)
+            isolated_path = self._private_auth_path(codex_home, base_path=environment.get("PATH"))
             try:
                 fallback_argv = shlex.split(fallback_shell_command)
             except ValueError:
@@ -1908,15 +1934,20 @@ class TmuxBackend:
                 }
             )
 
-        # Confined web tasks must never fall out into an unrestricted host
-        # shell when their sandbox exits successfully or receives Ctrl-C.
+        # Configured tasks retain their authenticated entrypoint and its exit
+        # status; a rejected plan must not turn into an implicit shell launch.
         if record.tag != "web-agent" and not self._command_is_interactive_shell(command):
             command = self._with_interactive_shell_fallback(
                 command,
                 fallback_shell_command,
             )
 
-        if raw_codex_home:
+        if record.tag == "web-agent":
+            command = self._with_explicit_private_environment(
+                command, environment.items(),
+                login_shell=shlex.split(fallback_shell_command)[0],
+            )
+        elif raw_codex_home:
             command = self._with_explicit_private_environment(
                 command,
                 environment.items(),

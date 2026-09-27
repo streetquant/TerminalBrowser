@@ -1812,6 +1812,11 @@ def build_parser() -> argparse.ArgumentParser:
     client_files.add_argument("--auth-dir", type=Path, required=True)
     client_files.set_defaults(func=client_files_command)
 
+    from .agent_launch import add_arguments as agent_launch_arguments, command as agent_launch_command
+    agent_launch = sub.add_parser("agent-launch", help="run one authorized native terminal launch")
+    agent_launch_arguments(agent_launch)
+    agent_launch.set_defaults(func=agent_launch_command)
+
     doctor = sub.add_parser("doctor", help="check system dependencies")
     doctor.set_defaults(func=cmd_doctor)
 

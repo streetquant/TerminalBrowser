@@ -79,6 +79,19 @@ def check_client_files(*,origin,cookies,root:Path,output:Path,assertions):
         modal.get_by_text("Configure workspace, runtime and client files",exact=True).click()
         expect(modal.get_by_label("Server workspace",exact=True)).to_be_visible(timeout=10000)
         modal.get_by_label("Server workspace",exact=True).select_option("ws_"+"a"*32)
+        runtime_choice=modal.get_by_label("Runtime",exact=True)
+        expect(runtime_choice.locator('option[value="shell"]')).to_have_text("Native shell")
+        expect(runtime_choice.locator('option[value="codex"]')).to_have_text("Codex (TermDeck private account)")
+        expect(modal).to_contain_text("Runs on the host as your user. The selected folder is the starting directory.")
+        task_input=modal.get_by_label("Codex task (optional)",exact=True)
+        expect(task_input).to_be_disabled()
+        runtime_choice.select_option("codex")
+        expect(task_input).to_be_enabled()
+        task_input.fill("Disposable option-selection check")
+        runtime_choice.select_option("shell")
+        expect(task_input).to_be_disabled()
+        expect(task_input).to_have_value("")
+        assertions["browser_native_shell_codex_choices_and_task_field"]=True
         modal.get_by_label("Initial tab names (one per line, maximum 8)",exact=True).fill("First\nSecond")
         modal.get_by_label("Attach sample.txt generation 2",exact=True).check()
         modal.evaluate("node => node.scrollTop = 0")
@@ -104,7 +117,7 @@ def check_client_files(*,origin,cookies,root:Path,output:Path,assertions):
         assertions["browser_waits_for_stale_inventory_before_canonical_navigation"]=True
         page.goto(origin+"/")
         expect(page.locator(".window-list-row").filter(has_text="Browser configured")).to_have_count(1)
-        expect(page.locator(".window-list-row").filter(has_text="Confined integration")).to_have_count(1)
+        expect(page.locator(".window-list-row").filter(has_text="Native integration")).to_have_count(1)
         expect(page.locator(".window-list-row").filter(has_text="Server directory integration")).to_have_count(1)
         saved_inventory=inventory()
         assert all(saved_inventory.get(key)==value for key,value in original_inventory.items())
@@ -175,7 +188,7 @@ def check_client_files(*,origin,cookies,root:Path,output:Path,assertions):
         page.goto(origin+"/")
         expect(page.locator(".window-list-row").filter(has_text="Browser server directory")).to_have_count(1,timeout=10000)
         expect(page.locator(".window-list-row").filter(has_text="Browser configured")).to_have_count(1)
-        expect(page.locator(".window-list-row").filter(has_text="Confined integration")).to_have_count(1)
+        expect(page.locator(".window-list-row").filter(has_text="Native integration")).to_have_count(1)
         page.screenshot(path=str(output/"windows-after-server-directory.png"),full_page=True)
         assertions["browser_unregistered_server_directory_correction_navigation_and_immediate_inventory"]=True
         page.get_by_role("button",name="Client files",exact=True).click()
@@ -206,6 +219,6 @@ def check_client_files(*,origin,cookies,root:Path,output:Path,assertions):
         expect(modal.locator(".client-machine-status")).to_contain_text("revoked",timeout=10000)
         expect(modal.get_by_label("Select local files",exact=True)).to_have_count(0)
         page.screenshot(path=str(output/"machine-revoked.png"),full_page=True)
-        assertions["browser_new_context_isolation_and_revoked_state"]=True
+        assertions["browser_new_context_machine_enrollment_and_revoked_state"]=True
         assert not errors,errors
         other.close(); context.close(); browser.close()

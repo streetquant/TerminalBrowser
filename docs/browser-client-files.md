@@ -4,12 +4,18 @@ The Windows page includes **New window** and **Client files**. An empty window
 requires only a name. Expand **Configure workspace, runtime and client files**
 to choose a saved workspace or **Enter server directory…**, a supported runtime,
 one to eight initial tabs, and immutable staged attachments. A server directory
-must already exist and be accessible to the installed host account. Paths with
-spaces are supported; read-only directories remain read-only. Protected private
-storage and system control trees are excluded. The server validates and pins the
-canonical directory before launch; errors stay in the dialog for correction.
+must already exist and be searchable by the installed host account. Paths with
+spaces, aliases and `/` are supported; ordinary host permissions apply. The
+server validates and pins the canonical directory before launch; errors stay
+in the dialog for correction.
 The server policy is described in [web-agent-launch.md](web-agent-launch.md).
 Selecting a directory does not register a new runtime or executable command.
+
+**Native shell** and configured **Codex (TermDeck private account)** run as the
+host user. The selected directory is their starting location. A terminal can
+read any host-user-readable file and use the user's normal host tools. Codex
+keeps a separate account home for each tab; processes under the same host UID
+can access each other's files according to ordinary filesystem permissions.
 
 **Server directory** refers to the machine running TermDeck. It does not read a
 path on the browser's machine. Select local files below to upload copies and

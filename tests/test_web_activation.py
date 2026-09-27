@@ -1016,7 +1016,8 @@ def test_static_units_match_managed_service_contract() -> None:
         assert directive_lines(content, "RequiresMountsFor") == (roots,)
         assert tuple(
             value for value in directive_values(content, "Environment") if value.startswith("HOME=")
-        ) == ("HOME=/warp/projects/softwares/termdeck/.termdeck/state",)
+        ) == (("HOME=%h" if unit == "termdeck-web-backend.service"
+               else "HOME=/warp/projects/softwares/termdeck/.termdeck/state"),)
         assert tuple(line for line in content.splitlines() if line.startswith("Exec")) == (
             f"ExecStart=/warp/projects/softwares/termdeck/.termdeck/t1000-managed/{stem}",
             f"ExecStop=/warp/projects/softwares/termdeck/.termdeck/t1000-managed/{stem}-stop",

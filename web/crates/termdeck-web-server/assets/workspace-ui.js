@@ -605,10 +605,11 @@ window.T1000Management = (() => {
           };
           rootChoice.addEventListener("change", showDirectory); showDirectory();
           runtimeChoice = selector(options.runtimes.map(item => [item.id, item.label]), previousRuntime || "shell");
+          const runtimeHelp = el("p", "subtle", "Runs on the host as your user. The selected folder is the starting directory.");
           tabNames = el("textarea"); tabNames.value = previousTabs || "Main"; tabNames.maxLength = 1024;
           task = el("textarea"); task.maxLength = 8192; task.value = previousTask || ""; task.disabled = runtimeChoice.value !== "codex";
           runtimeChoice.addEventListener("change", () => { task.disabled = runtimeChoice.value !== "codex"; if (task.disabled) task.value = ""; });
-          choices.replaceChildren(field("Server workspace", rootChoice), directoryField, directoryHelp, field("Runtime", runtimeChoice), field("Initial tab names (one per line, maximum 8)", tabNames), field("Codex task (optional)", task));
+          choices.replaceChildren(field("Server workspace", rootChoice), directoryField, directoryHelp, field("Runtime", runtimeChoice), runtimeHelp, field("Initial tab names (one per line, maximum 8)", tabNames), field("Codex task (optional)", task));
           if (!options.workspaces.length && !options.server_directory) choices.append(el("p", "subtle", "No server workspaces are available on this host yet. Empty windows remain available."));
         } catch (error) { report(error.message); }
       };

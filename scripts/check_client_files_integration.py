@@ -37,6 +37,7 @@ def main():
         root=Path(temporary)
         for child in ("state","auth","home","tmux","bin","workspace"):
             (root/child).mkdir(mode=0o700)
+        (root/"home/.codex").mkdir(mode=0o700)
         database=root/"state/sessions.sqlite3"
         SessionStore(database).close()
         policy={"version":1,"workspaces":[{"id":"ws_"+"a"*32,"label":"Disposable approved workspace","path":str(root/"workspace")}],"codex":None}
@@ -45,7 +46,7 @@ def main():
         wrapper=root/"bin/t1000"
         wrapper.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -m termdeck.cli \"$@\"\n")
         wrapper.chmod(0o700)
-        env={**os.environ,"HOME":str(root/"home"),"XDG_DATA_HOME":str(root/"home/data"),"XDG_CONFIG_HOME":str(root/"home/config"),"TMUX_TMPDIR":str(root/"tmux"),"PYTHONPATH":str(ROOT),"PYTHONNOUSERSITE":"1"}
+        env={**os.environ,"HOME":str(root/"home"),"SHELL":"/bin/bash","CODEX_HOME":str(root/"home/.codex"),"TERMDECK_CODEX_ACCOUNT_SOURCE":str(root/"home/.codex"),"XDG_DATA_HOME":str(root/"home/data"),"XDG_CONFIG_HOME":str(root/"home/config"),"TMUX_TMPDIR":str(root/"tmux"),"PYTHONPATH":str(ROOT),"PYTHONNOUSERSITE":"1"}
         for key in ("TMUX","TMUX_PANE","TERMDECK_STATE_ROOT","TERMDECK_TMUX_RUNTIME","TERMDECK_TMUX_IDENTITY"):
             env.pop(key,None)
         port=free_port()
@@ -120,13 +121,14 @@ def main():
             expect(stage("initiate",key=a,files=[{"path":"../escape","size":0}]),400)
             expect(stage("initiate",key=a,files=[{"path":"x","size":0}],server_path=str(root/"auth")),400)
             expect(stage("initiate",key=a,files=[{"path":"x","size":17*1024*1024}]),413)
-            assertions["machine_isolation_and_forbidden_server_destinations"]=True
+            assertions["machine_scoped_api_and_upload_destination_validation"]=True
             attached=expect(stage("attach",key=a,reference=reference,target="task:integration"))
             expect(stage("remove",key=a,reference=reference),409)
             expect(stage("detach",key=a,reference=reference,attachment_id=attached["attachment_id"]))
             options=expect(post("management",{"operation":"launch-options"},key=a))
             assert options["server_directory"] is True
-            create={"operation":"create-window","request_id":uuid.uuid4().hex,"name":"Confined integration","workspace_id":policy["workspaces"][0]["id"],"policy_revision":options["policy_revision"],"runtime":"shell","tabs":["Initial shell"],"attachments":[reference]}
+            assert next(item["label"] for item in options["runtimes"] if item["id"]=="shell")=="Native shell"
+            create={"operation":"create-window","request_id":uuid.uuid4().hex,"name":"Native integration","workspace_id":policy["workspaces"][0]["id"],"policy_revision":options["policy_revision"],"runtime":"shell","tabs":["Initial shell"],"attachments":[reference]}
             expect(post("management",create,key=a,login=False),401)
             expect(post("management",create,key=a,csrf_ok=False),403)
             expect(post("management",create,key=b),403)
@@ -155,11 +157,18 @@ def main():
                     if proof.exists() and proof.read_bytes()==expected: return
                     time.sleep(.05)
                 captured=subprocess.run(["/usr/bin/tmux","-S",str(socket),"capture-pane","-pt",target],capture_output=True,text=True,timeout=3)
-                raise AssertionError("Disposable confined shell proof failed: "+captured.stdout[-2000:])
+                raise AssertionError("Disposable native shell proof failed: "+captured.stdout[-2000:])
             host_path=root/"state/client-files"/reference["account_id"]/reference["machine_id"]/"objects"/reference["object_id"]/f"g{reference['generation']}"/"content/project/a.txt"
             command="cat "+shlex.quote(str(host_path))+" > "+shlex.quote(str(root/"workspace/attachment-proof"))
             check_shell_output(record,command,root/"workspace/attachment-proof",b"hello")
-            assertions["configured_window_replay_tmux_and_confined_canonical_file_read"]=True
+            assertions["configured_window_replay_tmux_and_canonical_attachment_read"]=True
+            outside=root/"host-user-readable-outside-workspace.txt"
+            outside_bytes=b"owned native host terminal proof\n"
+            outside.write_bytes(outside_bytes); outside.chmod(0o600)
+            assert root/"workspace" not in outside.parents
+            check_shell_output(record,"cat "+shlex.quote(str(outside))+" > "+shlex.quote(str(root/"workspace/host-user-proof")),root/"workspace/host-user-proof",outside_bytes)
+            assert outside.read_bytes()==outside_bytes
+            assertions["native_host_shell_reads_owned_file_outside_starting_directory"]=True
 
             server_directory=root/"server project with spaces"
             server_directory.mkdir(mode=0o700)
@@ -214,7 +223,7 @@ def main():
             check_shell_output(explicit_record,"cat "+shlex.quote(str(host_path))+" > "+shlex.quote(str(server_directory/"attachment-proof")),server_directory/"attachment-proof",b"hello")
             assert ready["display_path"]=="/home/client/project"
             assert explicit_record.cwd != ready["display_path"]
-            assertions["unregistered_server_directory_spaces_concurrent_replay_and_confined_cwd"]=True
+            assertions["unregistered_server_directory_spaces_concurrent_replay_and_native_cwd"]=True
             for link in [*created["attachments"],*explicit_created["attachments"]]:
                 expect(stage("detach",key=a,reference=link["reference"],attachment_id=link["attachment_id"]))
             expect(stage("remove",key=a,reference=reference))

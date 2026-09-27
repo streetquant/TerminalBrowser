@@ -20,6 +20,15 @@ foreign owner/device, hardlinked file, or replaced recorded inode is accepted.
 Source, `.beads`, auth, TLS, releases, rollback and service paths are outside
 this tree. User-provided absolute paths are display metadata only.
 
+These namespaces and checks govern staging API ownership and launch resolution.
+Terminals run as the host user and can access any files allowed by that user's
+filesystem permissions, including staged files belonging to another enrolled
+machine. Private directory modes protect against other operating-system users;
+they do not separate processes sharing the same host UID. Published generations
+are immutable through the staging protocol. If a host process changes their
+on-disk bytes or identity, subsequent resolution detects that change and refuses
+the reference.
+
 An immutable reference consists of account, machine, object ID, generation,
 authoritative manifest SHA-256, and total byte count. Every file also records its
 SHA-256, size, relative name, uploader session, client modification metadata and

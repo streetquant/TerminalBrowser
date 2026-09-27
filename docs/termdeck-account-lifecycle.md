@@ -3,6 +3,11 @@
 TermDeck's web login, enrolled machine credentials, per-terminal Codex accounts,
 and a separately installed local agent are distinct systems. This integration
 operates on TermDeck's configured account source and private terminal homes.
+
+Private homes separate account selection and mutable state between tabs. Native
+terminals run as the host user and retain that user's filesystem access. A
+process with the same host UID can access other host-user-readable account files;
+the per-tab account adapter does not create a separate operating-system user.
 An explicitly approved system Codex executable/configuration and codex-auth
 catalogue can supply the runtime and accounts. Per-tab selection stays in
 TermDeck; the canonical login and standalone runtime remain independently owned.
@@ -123,7 +128,7 @@ loop caused by TermDeck.
 ## Configured browser tasks
 
 For a configured `web-agent` tab, account handoff retains its server launch
-recipe and mount namespace. The observer verifies the approved executable,
+recipe and native host execution mode. The observer verifies the approved executable,
 generated argv, tab/private-scope markers, process incarnation, working directory,
 and one exact conversation. The restart uses that conversation with the original
 policy and immutable attachment generations; refreshed uploads cannot replace
@@ -135,7 +140,7 @@ original account, enrolled machine, credential generation, active login, policy,
 workspace and attachment bindings. A later permit supersedes an unused one;
 abandoned handoffs cancel their permit. The existing input fence, old-process
 quiescence, account transaction lock and fresh-process readiness checks surround
-the pointer change. A restart receipt is published only after the exact confined
+the pointer change. A restart receipt is published only after the exact
 conversation is observed again.
 
 The original launch login is deliberately retained as its authorization grant.
@@ -147,9 +152,9 @@ grant is no longer valid; this release does not retarget existing grants.
 Failed readiness is reported as recovery pending, never as a successful switch.
 
 New configured Codex tasks provision private `sessions` and `archived_sessions`
-directories as well as private authentication and SQLite state. They may read
-approved system configuration and selected credentials but do not mount a
-writable canonical conversation tree. The private-history preference persists
+directories as well as private authentication and SQLite state. TermDeck
+provisions these paths separately from the canonical conversation tree while
+preserving normal host filesystem access. The private-history preference persists
 when the account controller prepares the scope again. Existing generic terminal
 history sharing is unchanged. A configured scope already linked to external
 history requires explicit migration; it is rejected without replacing that link
@@ -165,8 +170,8 @@ The account-selector smoke uses a compiled disposable process and synthetic
 credentials to prove the guarded restart and preserved conversation contract.
 It does not prove provider authentication.
 
-`tests/test_confined_account_resume.py` also executes the actual configured
-argv inside the real mount namespace with a compiled disposable runtime. It
+`tests/test_confined_account_resume.py` retains its historical filename and
+executes the actual configured native argv with a compiled disposable runtime. It
 covers per-tab switching, original-generation attachments, private history,
 revoked/expired grants, policy changes, abandoned permits and replay. Its pane
 transport is a local process fixture; the production planner, quiescence,

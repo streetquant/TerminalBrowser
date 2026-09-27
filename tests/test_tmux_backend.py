@@ -382,16 +382,15 @@ class TmuxBackendTests(unittest.TestCase):
 
             launch = run.call_args_list[0].args[0]
             self.assertEqual(
-                launch[:-1],
+                launch[:4],
                 [
                     "new-session",
                     "-d",
                     "-s",
                     record.tmux_name,
-                    "-c",
-                    str(recovery_cwd.resolve()),
                 ],
             )
+            self.assertEqual(launch[-3:-1], ["-c", str(recovery_cwd.resolve())])
             self.assert_supervised_command(
                 launch[-1],
                 f"cc-go-ulw --resume {session_id}",
@@ -423,16 +422,15 @@ class TmuxBackendTests(unittest.TestCase):
 
             launch = run.call_args_list[0].args[0]
             self.assertEqual(
-                launch[:-1],
+                launch[:4],
                 [
                     "new-session",
                     "-d",
                     "-s",
                     record.tmux_name,
-                    "-c",
-                    str(recovery_cwd.resolve()),
                 ],
             )
+            self.assertEqual(launch[-3:-1], ["-c", str(recovery_cwd.resolve())])
             self.assert_supervised_command(
                 launch[-1],
                 f"codex --yolo resume {session_id}",
@@ -1043,7 +1041,7 @@ class TmuxBackendTests(unittest.TestCase):
             backend.create_or_resume(record)
 
         launch = run.call_args_list[0].args[0]
-        self.assertEqual(launch[5], str(Path("/checkpoints") / record.id))
+        self.assertEqual(launch[-3:-1], ["-c", str(Path("/checkpoints") / record.id)])
         self.assert_supervised_command(launch[-1], "restart-image")
         self.assertNotIn("python worker.py", launch[-1])
 

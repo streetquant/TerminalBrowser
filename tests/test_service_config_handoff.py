@@ -258,10 +258,18 @@ def test_complete_execute_stops_disposable_backend_and_restores_legacy(case, mon
         pid = process.pid
         spec = wrappers.UNIT_SPEC_BY_NAME["termdeck-web-backend.service"]
         layout = wrappers.resolve_layout(**kwargs)
-        for _ in range(200):
-            value = wrappers._read_unit_config(layout.config_path(spec), spec=spec)
-            if value["pid"] == pid and wrappers.verify_process_identity(value):
-                raise RuntimeError("disposable backend start failure after config publication")
+        deadline = time.monotonic() + 2.0
+        while process.poll() is None and time.monotonic() < deadline:
+            try:
+                value = wrappers._read_unit_config(layout.config_path(spec), spec=spec)
+            except wrappers.WrapperError as exc:
+                # The owned publisher briefly quarantines the old config
+                # before its no-replace publication of the new one.
+                if not isinstance(exc.__cause__, FileNotFoundError) or process.poll() is not None:
+                    raise
+            else:
+                if value["pid"] == pid and wrappers.verify_process_identity(value):
+                    raise RuntimeError("disposable backend start failure after config publication")
             time.sleep(0.01)
         pytest.fail("disposable backend did not reach its recorded identity")
     monkeypatch.setattr(activation, "_start_web", start_backend)

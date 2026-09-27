@@ -10,14 +10,13 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-Environment=HOME=/warp/projects/softwares/termdeck/.termdeck/state
+Environment=HOME=%h
 Environment=USER=max
 Environment=LOGNAME=max
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 Environment=TERMDECK_STATE_ROOT=/warp/projects/softwares/termdeck/.termdeck/state
-Environment=PATH=/warp/projects/softwares/termdeck/.termdeck/bin:/usr/local/bin:/usr/bin:/bin
-UMask=0077
+Environment=PATH=/warp/projects/softwares/termdeck/.termdeck/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/warp/projects/softwares/termdeck/.termdeck/t1000-managed/termdeck-web-backend
 ExecStop=/warp/projects/softwares/termdeck/.termdeck/t1000-managed/termdeck-web-backend-stop
 Restart=on-failure
@@ -26,7 +25,6 @@ RestartSec=2s
 TimeoutStartSec=30s
 TimeoutStopSec=20s
 KillMode=control-group
-LimitNOFILE=65536
 TasksMax=4096
 MemoryHigh=2G
 MemoryMax=4G

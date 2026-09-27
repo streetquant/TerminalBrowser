@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
+import sqlite3
 import subprocess
 import sys
 import uuid
@@ -97,7 +99,8 @@ def test_refresh_preserves_authorized_original_and_gate_is_one_use(configured,mo
     args=argparse.Namespace(state=str(store.root.parent),auth_dir=str(store.auth_directory),db=str(store.session_database),launch=result["launch_id"],tab=result["tabs"][0])
     with pytest.raises(Executed): launch.execute(args)
     argv=captured[0][1]
-    assert str(path((store,actor),obj).parent.parent) in argv
+    assert argv == launch._native_shell_argv()
+    assert captured[0][2]["PWD"] == str(configured[2])
     assert path((store,actor),obj).read_bytes()==b"original"
     with pytest.raises(cf.StagingError,match="consumed"): launch.execute(args)
 
@@ -115,34 +118,66 @@ def test_foreign_revoked_and_stale_attachments_never_launch(configured):
     assert not backend.records
 
 
-def test_real_mount_namespace_has_only_approved_files_and_readonly_attachments(configured):
-    store,actor,workspace,_=configured
-    obj=upload((store,actor),b"original")
-    server_path=path((store,actor),obj).parent.parent
-    sentinel=store.root.parent/"host-secret"; sentinel.write_text("secret")
-    (workspace/".termdeck").mkdir(); (workspace/".termdeck/secret").write_text("secret")
-    (workspace/".beads").mkdir(); (workspace/".beads/secret").write_text("secret")
-    (workspace/"escape").symlink_to(sentinel)
-    code='''import pathlib,sys
-root=pathlib.Path(sys.argv[1]); attachment=pathlib.Path(sys.argv[2]); outside=pathlib.Path(sys.argv[3])
-assert (attachment/'project/file.txt').read_bytes()==b'original'
-assert not outside.exists()
-assert not (root/'.termdeck/secret').exists()
-assert not (root/'.beads/secret').exists()
-assert not (root/'escape').exists()
-try: (attachment/'project/file.txt').write_text('overwrite')
-except OSError: pass
-else: raise AssertionError('attachment writable')
-(root/'result').write_text('confined')
-'''
-    argv=launch.sandbox_argv(str(workspace),[str(server_path)],runtime_argv=[sys.executable,"-c",code,str(workspace),str(server_path),str(sentinel)])
-    result=subprocess.run(argv,capture_output=True,text=True,timeout=10)
-    assert result.returncode==0,result.stderr
-    assert (workspace/"result").read_text()=="confined"
-    assert sentinel.read_text()=="secret" and path((store,actor),obj).read_bytes()==b"original"
+@pytest.mark.parametrize("selection", ["workspace", "root", "symlink"])
+def test_real_native_shell_has_host_identity_environment_and_filesystem(configured, selection):
+    store, actor, workspace, config = configured
+    home = workspace.with_name("disposable-home")
+    home.mkdir(mode=0o700)
+    helper_bin = home / "normal-user-bin"
+    helper_bin.mkdir()
+    (home / ".bashrc").write_text(
+        'export TERMDECK_FIXTURE_RC="ordinary user startup"\n'
+        + "export PATH=" + shlex.quote(str(helper_bin)) + ':"$PATH"\n')
+    outside = home / "outside-cwd"
+    outside.write_text("owned host file")
+    outside.chmod(0o600)
+    (workspace / ".beads").mkdir()
+    (workspace / ".beads" / "sentinel").write_text("host-visible")
+    chosen = workspace
+    if selection == "root":
+        chosen = Path("/")
+    elif selection == "symlink":
+        chosen = workspace.with_name("workspace-alias")
+        chosen.symlink_to(workspace, target_is_directory=True)
+        workspace.chmod(0o777)
+    req = request(configured)
+    req.pop("workspace_id")
+    req["workspace_path"] = str(chosen)
+    receipt = store.handle(actor, req)
+    backend = Backend()
+    assert launch.start(store, actor, receipt, backend=backend)["status"] == "started"
+    proof = home / "proof.json"
+    probe = home / "probe.py"
+    probe.write_text("""import json,os,pathlib,sys
+outside,proof,workspace=map(pathlib.Path,sys.argv[1:])
+assert outside.read_text()=='owned host file'
+outside.write_text('native write outside selected cwd')
+assert (workspace/'.beads/sentinel').read_text()=='host-visible'
+status=dict(line.split(':',1) for line in pathlib.Path('/proc/self/status').read_text().splitlines() if ':' in line)
+proof.write_text(json.dumps(dict(cwd=os.getcwd(),uid=os.getuid(),euid=os.geteuid(),gid=os.getgid(),egid=os.getegid(),groups=os.getgroups(),home=os.environ['HOME'],path=os.environ['PATH'],marker=os.environ.get('TERMDECK_FIXTURE_RC'),inherited=os.environ.get('TERMDECK_FIXTURE_ENV'),nnp=status['NoNewPrivs'].strip(),mount=os.readlink('/proc/self/ns/mnt'))))
+""")
+    environment = {**os.environ, "HOME": str(home), "SHELL": "/bin/bash",
+                   "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+                   "TERMDECK_FIXTURE_ENV": "preserved caller environment"}
+    command = shlex.split(backend.records[0].command)[1:]
+    typed = shlex.join([sys.executable, str(probe), str(outside), str(proof), str(workspace)]) + "\nexit\n"
+    completed = subprocess.run(command, input=typed, env=environment, capture_output=True, text=True, timeout=15)
+    assert completed.returncode == 0, completed.stderr
+    observed = json.loads(proof.read_text())
+    assert observed["cwd"] == str(chosen.resolve())
+    assert [observed[key] for key in ("uid", "euid", "gid", "egid")] == [os.getuid(), os.geteuid(), os.getgid(), os.getegid()]
+    assert observed["groups"] == os.getgroups()
+    assert observed["mount"] == os.readlink("/proc/self/ns/mnt")
+    status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
+    assert observed["nnp"] == status["NoNewPrivs"].strip()
+    assert observed["home"] == str(home)
+    assert observed["path"].split(":")[0] == str(helper_bin)
+    assert observed["marker"] == "ordinary user startup"
+    assert observed["inherited"] == "preserved caller environment"
+    assert outside.read_text() == "native write outside selected cwd"
 
 
-def test_confined_task_has_no_host_shell_fallback(configured):
+def test_configured_entrypoint_cannot_bypass_authority_via_shell_fallback(configured):
     store,actor,_,_=configured
     result=store.handle(actor,request(configured))
     backend=Backend(); launch.start(store,actor,result,backend=backend)
@@ -151,7 +186,7 @@ def test_confined_task_has_no_host_shell_fallback(configured):
     assert "termdeck.agent_launch" in spec.command
 
 
-def test_confined_codex_adapter_passes_only_server_paths_and_private_home(configured,monkeypatch):
+def test_native_codex_adapter_passes_only_server_paths_and_private_home(configured,monkeypatch):
     store,actor,workspace,config=configured
     private=store.root.parent/"private-codex"; private.mkdir(mode=0o700)
     source=store.root.parent/"source-codex"; source.mkdir(mode=0o700)
@@ -172,10 +207,10 @@ def test_confined_codex_adapter_passes_only_server_paths_and_private_home(config
     class Executed(Exception): pass
     captured=[]
     completed=[]
-    def execve(_executable,argv,_env):
+    def execve(_executable,argv,environment):
         captured.append(argv)
-        descriptors=tuple(int(argv[index+1]) for index, value in enumerate(argv) if value in {"--bind-fd", "--ro-bind-fd"})
-        completed.append(subprocess.run(argv,pass_fds=descriptors,capture_output=True,text=True,timeout=10))
+        assert _executable == str(executable)
+        completed.append(subprocess.run(argv,env=environment,capture_output=True,text=True,timeout=10))
         raise Executed()
     monkeypatch.setattr(os,"execve",execve)
     args=argparse.Namespace(state=str(store.root.parent),auth_dir=str(store.auth_directory),db=str(store.session_database),launch=result["launch_id"],tab=result["tabs"][0])
@@ -186,7 +221,10 @@ def test_confined_codex_adapter_passes_only_server_paths_and_private_home(config
     assert "/client/never-server/foo" not in " ".join(proof["argv"])
     assert str(path((store,actor),obj).parent.parent) in proof["argv"][-1]
     assert "$(not a shell command)" in proof["argv"][-1]
-    assert proof["argv"][:2]==["-c",f"sqlite_home={json.dumps(str(private))}"]
+    assert proof["argv"][:5] == ["-c", f"sqlite_home={json.dumps(str(private))}",
+                                  "-c", f"log_dir={json.dumps(str(private / 'log'))}", "--"]
+    assert not {"--sandbox", "--ask-for-approval", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"}.intersection(proof["argv"])
+    assert len(proof["argv"]) == 6
 
 
 def test_concurrent_refresh_and_launch_either_binds_original_or_rejects_stale(configured):
@@ -222,19 +260,18 @@ def test_changed_policy_and_runtime_hash_fail_before_start(configured):
 
 
 @pytest.mark.parametrize("relative", [".termdeck", ".termdeck/tls", ".beads", ".beads/archive"])
-def test_policy_rejects_protected_workspace_roots(configured, relative):
+def test_policy_accepts_host_accessible_storage_names(configured, relative):
     store, _, workspace, config = configured
     protected = workspace / relative
     protected.mkdir(parents=True, mode=0o700)
     config["workspaces"][0]["path"] = str(protected)
     (store.root.parent / launch.POLICY).write_text(json.dumps(config))
-    with pytest.raises(cf.StagingError, match="Protected storage"):
-        launch.policy(store.root.parent)
+    assert launch.policy(store.root.parent)[0]["workspaces"][0]["path"] == str(protected)
     assert not store.session_database.exists()
 
 
 @pytest.mark.parametrize("descendant", [False, True])
-def test_prepare_rejects_workspace_in_external_auth_storage(configured, descendant):
+def test_prepare_accepts_host_accessible_auth_storage(configured, descendant):
     store, actor, workspace, config = configured
     auth = workspace.with_name(workspace.name + "-auth")
     shutil.copytree(store.auth_directory, auth)
@@ -245,8 +282,7 @@ def test_prepare_rejects_workspace_in_external_auth_storage(configured, descenda
     config["workspaces"][0]["path"] = str(selected)
     (store.root.parent / launch.POLICY).write_text(json.dumps(config))
     req = request(configured)
-    with pytest.raises(cf.StagingError, match="Protected storage"):
-        store.handle(actor, req)
+    assert store.handle(actor, req)["status"] == "prepared"
     assert not store.session_database.exists()
 
 
@@ -264,7 +300,7 @@ def _codex_policy(configured, source):
 
 
 @pytest.mark.parametrize("descendant", [False, True])
-def test_policy_rejects_workspace_in_account_catalogue(configured, descendant):
+def test_policy_accepts_host_accessible_account_catalogue(configured, descendant):
     store, _, workspace, config = configured
     source = workspace.with_name(workspace.name + "-catalogue")
     source.mkdir(mode=0o700)
@@ -273,8 +309,7 @@ def test_policy_rejects_workspace_in_account_catalogue(configured, descendant):
         selected.mkdir(mode=0o700)
     config["workspaces"][0]["path"] = str(selected)
     _codex_policy(configured, source)
-    with pytest.raises(cf.StagingError, match="Protected storage"):
-        launch.policy(store.root.parent)
+    assert launch.policy(store.root.parent)[0]["workspaces"][0]["path"] == str(selected)
     assert not store.session_database.exists()
 
 
@@ -327,48 +362,7 @@ def test_shared_asset_alias_cannot_broaden_launch(configured, monkeypatch, targe
         launch.execute(args)
 
 
-def test_colocated_workspace_masks_state_and_preserves_explicit_attachment(stage, ordinary_workspace_root):
-    original, actor = stage
-    repository = ordinary_workspace_root / "repository"
-    managed = repository / ".termdeck"
-    managed.mkdir(parents=True, mode=0o700)
-    state = managed / "state"
-    shutil.copytree(original.root.parent, state)
-    store = cf.StagingStore(state, state / "auth")
-    (repository / ".beads").mkdir(mode=0o700)
-    (repository / ".beads/sentinel").write_text("ledger fixture")
-    config = {"version": 1, "workspaces": [{
-        "id": "ws_" + "a" * 32, "label": "Colocated project", "path": str(repository),
-    }], "codex": None}
-    policy = state / launch.POLICY
-    policy.write_text(json.dumps(config))
-    policy.chmod(0o600)
-    configured = store, actor, repository, config
-    obj = upload((store, actor), b"immutable attachment")
-    result = store.handle(actor, request(configured, attachments=[obj["reference"]]))
-    assert launch.start(store, actor, result, backend=Backend())["status"] == "started"
-    attachment = path((store, actor), obj).parent.parent
-    code = '''import pathlib,sys
-workspace,attachment,state = map(pathlib.Path,sys.argv[1:])
-assert not (workspace/'.beads/sentinel').exists()
-assert not (state/'auth').exists()
-assert not (state/'sessions.sqlite3').exists()
-assert (attachment/'project/file.txt').read_bytes() == b'immutable attachment'
-try: (attachment/'project/file.txt').write_text('changed')
-except OSError: pass
-else: raise AssertionError('attachment writable')
-(workspace/'result').write_text('approved')
-'''
-    argv = launch.sandbox_argv(str(repository), [str(attachment)], runtime_argv=[
-        sys.executable, "-c", code, str(repository), str(attachment), str(state),
-    ])
-    completed = subprocess.run(argv, capture_output=True, text=True, timeout=10)
-    assert completed.returncode == 0, completed.stderr
-    assert (repository / "result").read_text() == "approved"
-    assert (repository / ".beads/sentinel").read_text() == "ledger fixture"
-
-
-def test_prepared_asset_aliases_and_extra_config_resolve_without_catalogue_grant(configured):
+def test_prepared_asset_aliases_resolve_without_rewriting_host_links(configured):
     store, _, workspace, _ = configured
     source = store.root.parent / "catalogue"
     source.mkdir(mode=0o700)
@@ -389,35 +383,20 @@ def test_prepared_asset_aliases_and_extra_config_resolve_without_catalogue_grant
     (external / "unapproved-link").symlink_to(source / "auth.json")
     (private / ".env").symlink_to(source / ".env")
     links_before = {p.name: os.readlink(p) for p in private.iterdir()}
-    mounts = launch._shared_asset_mounts(
+    launch._validate_shared_assets(
         private, state_root=store.root.parent, auth_directory=store.auth_directory,
         account_source=source, workspace=workspace,
     )
-    code = '''import pathlib,sys
-private,source = map(pathlib.Path,sys.argv[1:])
-assert (private/'skills/SKILL.md').read_text() == 'approved skill'
-assert not (private/'skills/unapproved-link').exists()
-for name in ('config.toml','extra.config.toml'):
-    assert (private/name).read_text() == 'fixture = true\\n'
-    try:
-        (private/name).write_text('changed')
-    except OSError:
-        pass
-    else:
-        raise AssertionError('shared configuration was writable')
-for name in ('auth.json','.env','unselected'):
-    assert not (source/name).exists()
-assert not (private/'.env').exists()
-'''
-    argv = launch.sandbox_argv(str(workspace), [], codex_home=str(private),
-        asset_mounts=mounts, runtime_argv=[sys.executable, "-c", code, str(private), str(source)])
-    completed = subprocess.run(argv, capture_output=True, text=True, timeout=10)
-    assert completed.returncode == 0, completed.stderr
+    assert (private / "skills/SKILL.md").read_text() == "approved skill"
+    # Host-user access follows ordinary links; no mount mask is promised.
+    assert (private / "skills/unapproved-link").read_text() == "must remain outside"
+    for name in ("config.toml", "extra.config.toml"):
+        assert (private / name).read_text() == "fixture = true\n"
     assert {p.name: os.readlink(p) for p in private.iterdir()} == links_before
     assert (source / "extra.config.toml").read_text() == "fixture = true\n"
 
 
-def test_native_private_config_write_keeps_canonical_defaults_readonly(configured, monkeypatch):
+def test_native_private_config_write_preserves_canonical_defaults(configured, monkeypatch):
     from termdeck.codex_config_scope import prepare_shared_codex_configuration
     from termdeck.native_config_view import is_managed_private_config
     store, _, workspace, _ = configured
@@ -433,17 +412,13 @@ def test_native_private_config_write_keeps_canonical_defaults_readonly(configure
     prepare_shared_codex_configuration(private, source)
     arguments = dict(state_root=store.root.parent, auth_directory=store.auth_directory,
                      account_source=source, workspace=workspace)
-    mounts = launch._shared_asset_mounts(private, **arguments)
+    launch._validate_shared_assets(private, **arguments)
     assert launch._prepare_native_configuration(private, **arguments) == "initialized"
-    assert launch._shared_asset_mounts(private, **arguments) == mounts
+    launch._validate_shared_assets(private, **arguments)
     before = (source / "config.toml").read_bytes()
     code = '''import pathlib,sys
 private,source = map(pathlib.Path,sys.argv[1:])
-assert not (source/'auth.json').exists()
-for path in (source/'config.toml',private/'extra.config.toml'):
-    try: path.write_text('forbidden')
-    except OSError: pass
-    else: raise AssertionError('canonical defaults were writable')
+assert (source/'auth.json').read_text() == 'unselected synthetic credential'
 config=private/'config.toml'
 assert not config.is_symlink()
 temporary=private/'native-trust-write.tmp'
@@ -451,9 +426,8 @@ temporary.write_bytes(config.read_bytes()+b'\\n[projects."/disposable"]\\ntrust_
 temporary.chmod(0o600)
 temporary.replace(config)
 '''
-    argv = launch.sandbox_argv(str(workspace), [], codex_home=str(private), asset_mounts=mounts,
-                              runtime_argv=[sys.executable, "-c", code, str(private), str(source)])
-    completed = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    completed = subprocess.run([sys.executable, "-c", code, str(private), str(source)],
+                               cwd=workspace, capture_output=True, text=True, timeout=10)
     assert completed.returncode == 0, completed.stderr
     assert (source / "config.toml").read_bytes() == before
     assert "trust_level" in (private / "config.toml").read_text()
@@ -493,7 +467,7 @@ def test_config_alias_is_protected_before_read_even_with_private_regular_view(co
         pytest.fail("A protected config target reached the defaults reader")
     monkeypatch.setattr(native_config_view, "_source_bytes", unexpected_read)
     for action in (lambda: launch._prepare_native_configuration(private, **arguments),
-                   lambda: launch._shared_asset_mounts(private, **arguments)):
+                   lambda: launch._validate_shared_assets(private, **arguments)):
         with pytest.raises(cf.StagingError, match="Shared asset"):
             action()
     if managed:
@@ -536,7 +510,7 @@ def test_private_log_is_idempotent_and_native_paths_stay_private(tmp_path):
 
 
 @pytest.mark.parametrize("masked_source", [False, True])
-def test_safe_shared_assets_and_selected_file_do_not_expose_catalogue(configured, masked_source):
+def test_safe_shared_assets_keep_selected_binding_without_host_isolation(configured, masked_source):
     store, _, workspace, _ = configured
     source = workspace / ".termdeck/catalogue" if masked_source else store.root.parent / "catalogue"
     source.mkdir(parents=True, mode=0o700)
@@ -569,12 +543,363 @@ private,source = map(pathlib.Path,sys.argv[1:])
 assert (private/'config.toml').read_text() == 'fixture = true\\n'
 assert (private/'skills/SKILL.md').read_text() == 'shared fixture'
 assert (private/'auth.json').read_text() == 'selected fixture'
-assert not (source/'unselected').exists()
-assert not (private.parent/'other').exists()
+assert (source/'unselected').read_text() == 'unselected fixture'
+assert (private.parent/'other/sentinel').read_text() == 'other private fixture'
 '''
-    argv = launch.sandbox_argv(str(workspace), [], codex_home=str(private),
-        asset_paths=[*assets, str(selected)], runtime_argv=[
-            sys.executable, "-c", code, str(private), str(source),
-        ])
-    completed = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    assert assets == [str((private / name).resolve()) for name in ("config.toml", "skills")]
+    completed = subprocess.run([sys.executable, "-c", code, str(private), str(source)],
+                               cwd=workspace, capture_output=True, text=True, timeout=10)
     assert completed.returncode == 0, completed.stderr
+
+
+def test_cached_confined_options_require_refresh(configured):
+    store, actor, _, _ = configured
+    stale_revision = hashlib.sha256((store.root.parent / launch.POLICY).read_bytes()).hexdigest()
+    with pytest.raises(cf.StagingError, match="refresh choices"):
+        store.handle(actor, request(configured, policy_revision=stale_revision))
+    assert not store.session_database.exists()
+
+
+@pytest.mark.parametrize("phase", ["start", "execute"])
+@pytest.mark.parametrize("kind", ["unversioned", "wrong-version", "wrong-execution"])
+def test_old_or_unknown_plan_cannot_gain_host_user_authority(configured, monkeypatch, phase, kind):
+    store, actor, _, _ = configured
+    result = store.handle(actor, request(configured))
+    backend = Backend()
+    if phase == "execute":
+        launch.start(store, actor, result, backend=backend)
+    with sqlite3.connect(store.root / "metadata.sqlite3") as db:
+        row = db.execute("SELECT plan FROM launches WHERE launch_id=?", (result["launch_id"],)).fetchone()
+        plan = json.loads(row[0])
+        assert plan["version"] == 2 and plan["execution"] == "host-user"
+        if kind == "unversioned":
+            plan.pop("version")
+            plan.pop("execution")
+        elif kind == "wrong-version":
+            plan["version"] = 1
+        else:
+            plan["execution"] = "confined"
+        db.execute("UPDATE launches SET plan=? WHERE launch_id=?", (json.dumps(plan), result["launch_id"]))
+    def unexpected(*_args):
+        pytest.fail("Legacy intent reached a host-user process")
+    monkeypatch.setattr(os, "execve", unexpected)
+    with pytest.raises(cf.StagingError, match="new authenticated host-user launch"):
+        if phase == "start":
+            launch.start(store, actor, result, backend=backend)
+        else:
+            launch.execute(argparse.Namespace(state=str(store.root.parent), auth_dir=str(store.auth_directory),
+                           db=str(store.session_database), launch=result["launch_id"], tab=result["tabs"][0]))
+    if phase == "start":
+        assert not backend.records and not store.session_database.exists()
+    with sqlite3.connect(store.root / "metadata.sqlite3") as db:
+        assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='launch_runs'").fetchone()
+
+
+def test_native_shell_uses_passwd_when_shell_is_unset_or_unusable(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(launch.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_shell="/bin/bash"))
+    for shell in (None, "/nonexistent/native-shell", "/bin/bash -c injected"):
+        if shell is None:
+            monkeypatch.delenv("SHELL", raising=False)
+        else:
+            monkeypatch.setenv("SHELL", shell)
+        assert launch._native_shell_argv() == [str(Path("/bin/bash").resolve()), "-i"]
+
+
+def test_assigned_private_bash_scope_survives_normal_user_startup(configured, monkeypatch):
+    store, actor, workspace, _ = configured
+    home = workspace.with_name("shell-home")
+    home.mkdir(mode=0o700)
+    (home / ".bashrc").write_text('export CODEX_HOME="/foreign-user-config"\nexport PATH="/usr/bin:/bin"\nexport NORMAL_RC_LOADED=yes\n')
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    monkeypatch.setattr("termdeck.codex_config_scope.resolve_codex_launcher", lambda *_a, **_k: None)
+    source = store.root.parent / "synthetic-source"
+    source.mkdir(mode=0o700)
+    receipt = store.handle(actor, request(configured))
+    backend = Backend()
+    launch.start(store, actor, receipt, backend=backend)
+    sessions = SessionStore(store.session_database, account_source=source, provision_auth_scopes=False)
+    try:
+        record = sessions.ensure_auth_scope(receipt["tabs"][0], private_history=True)
+    finally:
+        sessions.close()
+    private, scope = Path(record.codex_home), record.auth_scope_id
+    proof = workspace / "scoped-shell.json"
+    program = "import json,os,pathlib; pathlib.Path('scoped-shell.json').write_text(json.dumps({key:os.environ.get(key) for key in ('CODEX_HOME','TERMDECK_AUTH_SCOPE_ID','PATH','NORMAL_RC_LOADED','HOME')}))"
+    environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    completed = subprocess.run(shlex.split(backend.records[0].command)[1:],
+                               input=shlex.join([sys.executable, "-c", program])+"\nexit\n",
+                               env=environment, text=True, capture_output=True, timeout=15)
+    assert completed.returncode == 0, completed.stderr
+    observed = json.loads(proof.read_text())
+    assert observed["CODEX_HOME"] == str(private)
+    assert observed["TERMDECK_AUTH_SCOPE_ID"] == scope
+    assert observed["PATH"] == str(private / "bin") + ":/usr/bin:/bin"
+    assert observed["NORMAL_RC_LOADED"] == "yes" and observed["HOME"] == str(home)
+
+
+def test_profile_admission_is_readonly_and_works_inside_initial_authorization(configured):
+    store, actor, _, _ = configured
+    obj = upload((store, actor), b"original")
+    receipt = store.handle(actor, request(configured, attachments=[obj["reference"]]))
+    class AdmittedBackend(Backend):
+        def create_or_resume(self, record):
+            launch.validate_native_launch(record)
+            super().create_or_resume(record)
+    backend = AdmittedBackend()
+    assert launch.start(store, actor, receipt, backend=backend)["status"] == "started"
+    files = [store.root / "metadata.sqlite3", store.session_database,
+             store.auth_directory / "termdeck-machines-v1.sqlite3",
+             store.auth_directory / "termdeck-web-auth-v1.sqlite3"]
+    before = {file: (file.stat().st_ino, file.read_bytes()) for file in files}
+    launch.validate_native_launch(backend.records[0])
+    launch.validate_native_launch(backend.records[0])
+    assert {file: (file.stat().st_ino, file.read_bytes()) for file in files} == before
+    with sqlite3.connect(store.root / "metadata.sqlite3") as db:
+        assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='launch_runs'").fetchone()
+
+
+@pytest.mark.parametrize("mutation,detail", [
+    ("legacy", "new authenticated host-user launch"), ("machine", "authorization failed"),
+    ("expired-login", "authorization failed"), ("policy", "policy changed"),
+    ("attachment", "no longer authorized"), ("cwd", "directory identity changed"),
+])
+def test_profile_admission_refuses_invalid_authority(configured, mutation, detail):
+    store, actor, workspace, config = configured
+    obj = upload((store, actor), b"original")
+    receipt = store.handle(actor, request(configured, attachments=[obj["reference"]]))
+    backend = Backend()
+    launch.start(store, actor, receipt, backend=backend)
+    if mutation == "legacy":
+        with sqlite3.connect(store.root / "metadata.sqlite3") as db:
+            plan = json.loads(db.execute("SELECT plan FROM launches WHERE launch_id=?", (receipt["launch_id"],)).fetchone()[0])
+            plan.pop("version")
+            db.execute("UPDATE launches SET plan=? WHERE launch_id=?", (json.dumps(plan), receipt["launch_id"]))
+    elif mutation == "policy":
+        config["workspaces"][0]["label"] = "changed"
+        (store.root.parent / launch.POLICY).write_text(json.dumps(config))
+    elif mutation == "cwd":
+        workspace.rename(workspace.with_name("original"))
+        workspace.mkdir()
+    else:
+        database, statement = {
+            "machine": (store.auth_directory / "termdeck-machines-v1.sqlite3", "UPDATE machines SET revoked_at_ms=1"),
+            "expired-login": (store.auth_directory / "termdeck-web-auth-v1.sqlite3", "UPDATE auth_sessions SET expires_at_ms=1"),
+            "attachment": (store.root / "metadata.sqlite3", "UPDATE attachments SET target='window:other'"),
+        }[mutation]
+        with sqlite3.connect(database) as db:
+            db.execute(statement)
+    with pytest.raises(cf.StagingError, match=detail):
+        launch.validate_native_launch(backend.records[0])
+
+
+def test_profile_admission_does_not_recreate_missing_staging_storage(configured):
+    store, actor, _, _ = configured
+    receipt = store.handle(actor, request(configured))
+    backend = Backend()
+    launch.start(store, actor, receipt, backend=backend)
+    moved = store.root.with_name("preserved-client-files")
+    store.root.rename(moved)
+    with pytest.raises((cf.StagingError, OSError)):
+        launch.validate_native_launch(backend.records[0])
+    assert not store.root.exists()
+    assert moved.is_dir()
+
+
+def test_nested_profile_admission_keeps_machine_revocation_serialized(configured):
+    store, actor, _, _ = configured
+    receipt = store.handle(actor, request(configured))
+    backend = Backend()
+    launch.start(store, actor, receipt, backend=backend)
+    program = """import sqlite3,sys
+connection=sqlite3.connect(sys.argv[1],timeout=0)
+try:
+    connection.execute('BEGIN IMMEDIATE')
+except sqlite3.OperationalError as error:
+    assert 'locked' in str(error)
+    sys.exit(0)
+else:
+    connection.rollback()
+    sys.exit(1)
+"""
+    def competing_writer_is_blocked():
+        process = subprocess.run([sys.executable, "-c", program, str(store.auth_directory / "termdeck-machines-v1.sqlite3")],
+                                 capture_output=True, text=True, timeout=5)
+        assert process.returncode in {0, 1}, process.stderr
+        return process.returncode == 0
+    with cf.authorized(store.auth_directory, actor):
+        assert competing_writer_is_blocked()
+        launch.validate_native_launch(backend.records[0])
+        assert competing_writer_is_blocked(), "Read-only admission released the outer SQLite revocation lock"
+        with pytest.raises(cf.StagingError, match="does not match"):
+            with cf.authorized(store.auth_directory, replace(actor, session_id="ses_" + "f" * 32), readonly=True):
+                pytest.fail("Different actor reused the original authorization")
+        assert competing_writer_is_blocked()
+    assert not competing_writer_is_blocked()
+
+
+def test_readonly_admission_never_reuses_expired_context_or_foreign_directory(configured, tmp_path):
+    from contextvars import copy_context
+    from test_client_files import make_stage
+    store, actor, _, _ = configured
+    other_root = tmp_path / "other-state"
+    other_root.mkdir(mode=0o700)
+    other_store, _ = make_stage(other_root, other_root / "auth", owner="other-owner", suffix="b")
+    with cf.authorized(store.auth_directory, actor):
+        saved_context = copy_context()
+        with pytest.raises(cf.StagingError, match="authorization failed"):
+            with cf.authorized(other_store.auth_directory, actor, readonly=True):
+                pytest.fail("Different auth directory reused authorization")
+    with sqlite3.connect(store.auth_directory / "termdeck-machines-v1.sqlite3") as db:
+        db.execute("UPDATE machines SET revoked_at_ms=1")
+    def admit():
+        with cf.authorized(store.auth_directory, actor, readonly=True):
+            pytest.fail("An exited context admitted a revoked actor")
+    with pytest.raises(cf.StagingError, match="authorization failed"):
+        saved_context.run(admit)
+
+
+@pytest.fixture
+def managed_launch_context(tmp_path, monkeypatch):
+    from termdeck import build_info
+    from test_build_info import release_build_info, release_manifest
+    root = tmp_path / "managed"
+    root.mkdir(mode=0o700)
+    launcher = root / "bin" / "t1000"
+    launcher.parent.mkdir(mode=0o700)
+    launcher.write_bytes(b"#!/bin/sh\nexit 0\n")
+    launcher.chmod(0o755)
+    (root / "bootstrap.py").write_bytes(b"# fixture bootstrap\n")
+    state = {"schema": build_info.MANAGED_STATE_SCHEMA, "generation": 0,
+             "current_release_id": None, "previous_release_id": None,
+             "manifest_sha256": "", "legacy_launcher": None,
+             "python_executable": str(Path(sys.executable).resolve()),
+             "bootstrap_sha256": build_info.sha256_file(root / "bootstrap.py"),
+             "launcher_path": str(launcher), "launcher_sha256": build_info.sha256_file(launcher)}
+    def activate(seed):
+        info = release_build_info(seed)
+        manifest = release_manifest(info)
+        manifest_path = root / "releases" / manifest["release_id"] / "manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_bytes(build_info.canonical_json_bytes(manifest))
+        state.update(generation=state["generation"] + 1,
+                     previous_release_id=state["current_release_id"],
+                     current_release_id=manifest["release_id"],
+                     manifest_sha256=build_info.sha256_file(manifest_path))
+        (root / "state.json").write_bytes(build_info.canonical_json_bytes(state))
+        monkeypatch.setattr(build_info, "load_bundled_build_info", lambda: info)
+        monkeypatch.setenv("T1000_MANAGED_ROOT", str(root))
+        monkeypatch.setenv("T1000_RELEASE_STATE", str(root / "state.json"))
+        monkeypatch.setenv("T1000_RELEASE_MANIFEST", str(manifest_path))
+    activate("a")
+    return root, launcher, state, activate
+
+
+def test_managed_command_binds_verified_stable_entrypoint_and_allows_release_upgrade(configured, managed_launch_context, monkeypatch):
+    store, actor, workspace, _ = configured
+    root, launcher, _, activate = managed_launch_context
+    result = store.handle(actor, request(configured, tabs=["One"]))
+    backend = Backend()
+    assert launch.start(store, actor, result, backend=backend)["status"] == "started"
+    record = backend.records[0]
+    assert shlex.split(record.command) == ["exec", str(launcher), "agent-launch",
+        "--state", str(store.root.parent), "--auth-dir", str(store.auth_directory),
+        "--db", str(store.session_database), "--launch", result["launch_id"], "--tab", record.id]
+    with sqlite3.connect(store.root / "metadata.sqlite3") as db:
+        plan = json.loads(db.execute("SELECT plan FROM launches").fetchone()[0])
+    assert plan["managed_entrypoint"] == {"root": str(root), "launcher": str(launcher)}
+    launch.validate_native_launch(record)
+    activate("b")
+    launch.validate_native_launch(record)
+    captured = []
+    class Executed(Exception): pass
+    def execve(executable, argv, environment):
+        captured.append((executable, argv, environment, os.getcwd()))
+        raise Executed()
+    monkeypatch.setattr(os, "execve", execve)
+    with pytest.raises(Executed):
+        launch.execute(launch._launch_binding(record))
+    assert captured[0][1] == launch._native_shell_argv()
+    assert captured[0][3] == str(workspace)
+
+
+@pytest.mark.parametrize("shape", ["source", "managed"])
+@pytest.mark.parametrize("change", ["extra", "other-module", "wrong-flag", "relative-executable", "external"])
+def test_launch_binding_rejects_other_dispatch_shapes(configured, shape, change):
+    store, actor, _, _ = configured
+    result = store.handle(actor, request(configured, tabs=["One"]))
+    backend = Backend()
+    launch.start(store, actor, result, backend=backend)
+    record = backend.records[0]
+    parts = shlex.split(record.command)
+    if shape == "managed":
+        parts[1:4] = ["/fixture/bin/t1000", "agent-launch"]
+    assert launch._launch_binding(replace(record, command=shlex.join(parts))).tab == record.id
+    if change == "extra": parts += ["--resume-permit", "resume_" + "a" * 32]
+    elif change == "other-module": parts[2] = "other-command"
+    elif change == "wrong-flag": parts[-2] = "--command"
+    elif change == "relative-executable": parts[1] = "t1000"
+    with pytest.raises(cf.StagingError, match="binding is unavailable"):
+        launch._launch_binding(replace(record, command=shlex.join(parts), external=change == "external"))
+
+
+@pytest.mark.parametrize("mutation", ["launcher-bytes", "bootstrap-bytes", "state-bytes", "manifest-bytes",
+    "launcher-symlink", "launcher-hardlink", "launcher-owner", "root-writable", "root-alias",
+    "context-state", "context-manifest", "launcher-path", "python-path", "missing-context"])
+def test_managed_launch_authority_drift_refuses_before_start(configured, managed_launch_context, monkeypatch, mutation):
+    from termdeck import build_info
+    store, actor, _, _ = configured
+    root, launcher, state, _ = managed_launch_context
+    result = store.handle(actor, request(configured, tabs=["One"]))
+    if mutation.endswith("-bytes"):
+        path = {"launcher-bytes": launcher, "bootstrap-bytes": root / "bootstrap.py",
+                "state-bytes": root / "state.json", "manifest-bytes": Path(os.environ["T1000_RELEASE_MANIFEST"])}[mutation]
+        path.write_bytes(path.read_bytes() + b" \n")
+    elif mutation == "launcher-symlink":
+        moved = launcher.with_name("original")
+        launcher.rename(moved)
+        launcher.symlink_to(moved)
+    elif mutation == "launcher-hardlink": os.link(launcher, launcher.with_name("extra-link"))
+    elif mutation == "launcher-owner":
+        original = Path.lstat
+        def changed_owner(path, *args, **kwargs):
+            info = original(path, *args, **kwargs)
+            if path == launcher:
+                fields = list(info)
+                fields[4] = os.geteuid() + 1001
+                return os.stat_result(fields)
+            return info
+        monkeypatch.setattr(Path, "lstat", changed_owner)
+    elif mutation == "root-writable": root.chmod(0o770)
+    elif mutation == "root-alias":
+        alias = root.with_name("alias")
+        alias.symlink_to(root)
+        monkeypatch.setenv("T1000_MANAGED_ROOT", str(alias))
+    elif mutation == "context-state": monkeypatch.setenv("T1000_RELEASE_STATE", str(root / "other-state"))
+    elif mutation == "context-manifest": monkeypatch.setenv("T1000_RELEASE_MANIFEST", str(root / "other-manifest"))
+    elif mutation == "launcher-path":
+        other = launcher.with_name("other-t1000")
+        other.write_bytes(launcher.read_bytes())
+        other.chmod(0o755)
+        state["launcher_path"] = str(other)
+        (root / "state.json").write_bytes(build_info.canonical_json_bytes(state))
+    elif mutation == "python-path":
+        state["python_executable"] = "/missing/python"
+        (root / "state.json").write_bytes(build_info.canonical_json_bytes(state))
+    else:
+        for name in ("T1000_MANAGED_ROOT", "T1000_RELEASE_STATE", "T1000_RELEASE_MANIFEST"):
+            monkeypatch.delenv(name)
+    backend = Backend()
+    with pytest.raises(cf.StagingError, match="launch authority|launcher identity"):
+        launch.start(store, actor, result, backend=backend)
+    assert not backend.records
+    assert not store.session_database.exists()
+
+
+def test_present_invalid_managed_context_never_falls_back_to_source_launch(configured, monkeypatch):
+    store, actor, _, _ = configured
+    monkeypatch.setenv("T1000_MANAGED_ROOT", str(store.root / "missing"))
+    with pytest.raises(cf.StagingError, match="Managed launch authority"):
+        store.handle(actor, request(configured))
+    assert not store.session_database.exists()

@@ -219,7 +219,8 @@ class GenericTmuxRecoveryTests(unittest.TestCase):
                 backend.create_or_resume(record)
 
             respawn = run.call_args_list[0].args[0]
-            self.assertEqual(respawn[:4], ["respawn-pane", "-t", "%42", "-c"])
+            self.assertEqual(respawn[:3], ["respawn-pane", "-t", "%42"])
+            self.assertEqual(respawn[-3:-1], ["-c", tmp])
             self.assertNotIn("-k", respawn)
             self.assertIn(record.command, respawn[-1])
             self.assertIn("__termdeck_status=$?", respawn[-1])

@@ -48,8 +48,11 @@ int main(int argc, char **argv) {
     FILE *attachment = fopen(ATTACHMENT, "r");
     if (!attachment) return 32;
     fread(bytes, 1, sizeof(bytes)-1, attachment); fclose(attachment);
-    if (access(SENTINEL, F_OK) == 0) return 33;
+    if (access(SENTINEL, F_OK) != 0) return 33;
+    /* Staging retains its ordinary immutable file mode; no read-only mount. */
     if (fopen(ATTACHMENT, "a")) return 34;
+    for (int i = 1; i < argc; ++i)
+        if (!strcmp(argv[i], "--sandbox") || !strcmp(argv[i], "--ask-for-approval")) return 37;
     snprintf(filename, sizeof(filename), "%s/sessions", home); mkdir(filename, 0700);
     snprintf(filename, sizeof(filename), "%s/sessions/rollout-%s.jsonl", home, id);
     FILE *rollout = fopen(filename, "a+");
@@ -144,7 +147,7 @@ def confined(configured, monkeypatch, request):
     obj = upload((store, actor), b"original")
     attachment = path((store, actor), obj)
     sentinel = store.root.parent / "host-secret"
-    sentinel.write_text("must remain outside the task")
+    sentinel.write_text("ordinary host user access")
     runtime = store.root.parent / "runtime"
     runtime.mkdir(mode=0o700)
     executable = runtime / "codex"
@@ -197,7 +200,7 @@ def args_for(fixture, permit):
                            tab=fixture.record.id, resume_permit=permit)
 
 
-def test_configured_task_switch_uses_real_confined_argv_and_exact_guarded_resume(confined):
+def test_configured_task_switch_uses_real_native_argv_and_exact_guarded_resume(confined):
     f = confined
     record = resume_record(f)
     initial_pid = f.backend.process.pid
@@ -303,6 +306,7 @@ def test_untouched_private_defaults_refresh_after_exact_confined_account_resume(
     ("expired-login", "login expired"), ("revoked-login", "login was revoked"),
     ("tab", "binding changed"), ("attachment", "no longer authorized"),
     ("workspace", "directory identity changed"), ("launcher", "launcher identity changed"),
+    ("legacy-plan", "new authenticated host-user launch"),
 ])
 def test_resume_revalidates_original_authority_before_prepare_and_execute(confined, mutation, detail):
     f = confined
@@ -320,6 +324,13 @@ def test_resume_revalidates_original_authority_before_prepare_and_execute(confin
         words = shlex.split(record.command)
         words[1] = "/usr/bin/false"
         f.sessions.update(record.id, command=shlex.join(words))
+    elif mutation == "legacy-plan":
+        with sqlite3.connect(f.store.root / "metadata.sqlite3") as db:
+            row = db.execute("SELECT plan FROM launches WHERE launch_id=?", (f.receipt["launch_id"],)).fetchone()
+            old = json.loads(row[0])
+            old.pop("version")
+            old.pop("execution")
+            db.execute("UPDATE launches SET plan=? WHERE launch_id=?", (json.dumps(old), f.receipt["launch_id"]))
     else:
         database, statement = {
             "machine": (f.store.auth_directory / "termdeck-machines-v1.sqlite3", "UPDATE machines SET revoked_at_ms=1"),
@@ -363,7 +374,7 @@ def test_resume_permits_are_single_use_superseded_and_cancelled(confined, monkey
     with pytest.raises(cf.StagingError, match="consumed"):
         launch.execute(args_for(f, active))
     executable, argv, environment = commands[0]
-    assert executable == "/usr/bin/bwrap"
+    assert executable == f.config["codex"]["executable"]
     assert argv[-2:] == ["resume", CONVERSATION]
     assert f.config["codex"]["executable"] in argv
     assert environment["TERMDECK_WEB_LAUNCH_ID"] == f.receipt["launch_id"]
