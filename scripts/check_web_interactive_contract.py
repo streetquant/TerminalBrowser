@@ -89,8 +89,8 @@ def main() -> None:
         'data-termdeck-pane=\\"',
         ".active_pane_id()",
         ".or_else(|| window.panes().first().map(PaneSnapshot::id))",
-        "/_termdeck/assets/v7/app.css",
-        "public, max-age=86400, immutable",
+        "/_termdeck/assets/v8/app.css",
+        "no-store, max-age=0",
     ):
         require(server_production, needle, "immediate pane bootstrap")
 

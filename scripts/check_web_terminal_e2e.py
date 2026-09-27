@@ -608,7 +608,7 @@ def main() -> int:
         cookies_one = pair(origin, first_invitation)
         cookies_two = pair(origin, second_invitation)
 
-        with urllib.request.urlopen(f"{origin}/_termdeck/assets/v7/terminal.js", timeout=5) as response:
+        with urllib.request.urlopen(f"{origin}/_termdeck/assets/v8/terminal.js", timeout=5) as response:
             result["terminal_asset_cache_control"] = response.headers.get("Cache-Control")
         opener = urllib.request.build_opener()
         request = urllib.request.Request(f"{origin}/_termdeck/healthz")
@@ -1023,9 +1023,9 @@ def main() -> int:
             raise RuntimeError(
                 f"WebSocket evidence is incomplete: records={websocket_records!r} errors={websocket_errors!r}"
             )
-        if result.get("terminal_asset_cache_control") != "public, max-age=86400, immutable":
+        if result.get("terminal_asset_cache_control") != "no-store, max-age=0":
             raise RuntimeError(
-                f"versioned terminal asset cache policy mismatch: {result.get('terminal_asset_cache_control')!r}"
+                f"terminal asset cache policy mismatch: {result.get('terminal_asset_cache_control')!r}"
             )
         csp = result.get("content_security_policy")
         if not isinstance(csp, str) or "script-src 'self'" not in csp or "'unsafe-eval'" in csp:

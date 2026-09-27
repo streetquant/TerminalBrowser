@@ -82,13 +82,13 @@ pub const MAX_FRONTEND_ASSET_BYTES: usize = 64 * 1024;
 pub const MAX_TERMINAL_ASSET_BYTES: usize = 1024 * 1024;
 pub const MAX_HTTP_REQUEST_BYTES: usize = MAX_TERMINAL_INPUT_BYTES + 1_024;
 
-const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v7/app.css";
-const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v7/app.js";
-const CLIENT_FILES_PATH: &str = "/_termdeck/assets/v7/client-files.js";
-const ACCOUNTS_PATH: &str = "/_termdeck/assets/v7/accounts.js";
-const WORKSPACE_UI_PATH: &str = "/_termdeck/assets/v7/workspace-ui.js";
-const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v7/terminal.css";
-const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v7/terminal.js";
+const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v8/app.css";
+const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v8/app.js";
+const CLIENT_FILES_PATH: &str = "/_termdeck/assets/v8/client-files.js";
+const ACCOUNTS_PATH: &str = "/_termdeck/assets/v8/accounts.js";
+const WORKSPACE_UI_PATH: &str = "/_termdeck/assets/v8/workspace-ui.js";
+const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v8/terminal.css";
+const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v8/terminal.js";
 const EXTERNAL_BASE_PATH: &str = "/t1000";
 const ROOT_COOKIE_PATH: &str = "; Path=/;";
 const EXTERNAL_COOKIE_PATH: &str = "; Path=/t1000;";
@@ -1176,16 +1176,6 @@ fn public_auth_route(path: &str) -> bool {
 }
 
 async fn security_headers(request: Request, next: Next) -> Response {
-    let versioned_asset = matches!(
-        request.uri().path(),
-        FRONTEND_CSS_PATH
-            | FRONTEND_JS_PATH
-            | CLIENT_FILES_PATH
-            | ACCOUNTS_PATH
-            | WORKSPACE_UI_PATH
-            | TERMINAL_CSS_PATH
-            | TERMINAL_JS_PATH
-    );
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(
@@ -1219,13 +1209,11 @@ async fn security_headers(request: Request, next: Next) -> Response {
         HeaderName::from_static("permissions-policy"),
         HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=()"),
     );
+    // Release URLs can be reused by clients and intermediate caches. A stale
+    // script must never hide current controls or call an outdated API.
     headers.insert(
         header::CACHE_CONTROL,
-        if versioned_asset {
-            HeaderValue::from_static("public, max-age=86400, immutable")
-        } else {
-            HeaderValue::from_static("no-store, max-age=0")
-        },
+        HeaderValue::from_static("no-store, max-age=0"),
     );
     response
 }
@@ -2504,7 +2492,7 @@ fn password_page_response(
     let mut output = String::with_capacity(2_048);
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>");
     escape_html_into(&mut output, title);
-    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v7/app.css\"></head><body class=\"auth-page\"><main class=\"auth-main\"><p class=\"auth-brand\"><span class=\"auth-mark\" aria-hidden=\"true\">&gt;_</span>t1000</p><h1>");
+    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v8/app.css\"></head><body class=\"auth-page\"><main class=\"auth-main\"><p class=\"auth-brand\"><span class=\"auth-mark\" aria-hidden=\"true\">&gt;_</span>t1000</p><h1>");
     escape_html_into(&mut output, heading);
     output.push_str("</h1><p class=\"subtle\">");
     escape_html_into(&mut output, description);
@@ -2604,7 +2592,7 @@ fn password_error_response(
 
 fn render_pairing_page(base_path: RequestBasePath) -> String {
     let output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Recovery pairing · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v7/app.css\"></head><body><main><p class=\"eyebrow\">t1000 recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Recovery pairing · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v8/app.css\"></head><body><main><p class=\"eyebrow\">t1000 recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
     );
     html_for_base(prefix_html_template(output), base_path)
 }
@@ -3290,7 +3278,7 @@ fn render_window_page(
 
 fn render_not_found_page(slug: &str, base_path: RequestBasePath) -> String {
     let mut output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Not found · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v7/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored t1000 window owns this route",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Not found · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v8/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored t1000 window owns this route",
     );
     if !slug.is_empty() {
         output.push_str(": <code>/");
@@ -3734,8 +3722,8 @@ mod tests {
             );
             let home_text = body_text(home).await;
             assert!(home_text.contains(r#"data-termdeck-base="/t1000""#));
-            assert!(home_text.contains(r#"href="/t1000/_termdeck/assets/v7/app.css""#));
-            assert!(home_text.contains(r#"src="/t1000/_termdeck/assets/v7/app.js""#));
+            assert!(home_text.contains(r#"href="/t1000/_termdeck/assets/v8/app.css""#));
+            assert!(home_text.contains(r#"src="/t1000/_termdeck/assets/v8/app.js""#));
             assert!(home_text.contains(r#"href="/t1000/random""#));
             assert!(!home_text.contains("__TERMDECK_BASE_PATH__"));
             assert!(!home_text.contains(r#"href="/_termdeck/"#));
@@ -3749,7 +3737,7 @@ mod tests {
             let window_text = body_text(window).await;
             assert!(window_text.contains(r#"data-termdeck-base="/t1000""#));
             assert!(window_text.contains(r#"href="/t1000/random/t/session-one""#));
-            assert!(window_text.contains(r#"href="/t1000/_termdeck/assets/v7/app.css""#));
+            assert!(window_text.contains(r#"href="/t1000/_termdeck/assets/v8/app.css""#));
 
             let asset = router
                 .clone()
@@ -3828,7 +3816,7 @@ mod tests {
                 css.headers()
                     .get(header::CACHE_CONTROL)
                     .and_then(|value| value.to_str().ok()),
-                Some("public, max-age=86400, immutable")
+                Some("no-store, max-age=0")
             );
             let css_text = body_text(css).await;
             assert_eq!(css_text.as_bytes(), APP_CSS);
@@ -3862,7 +3850,7 @@ mod tests {
                     .headers()
                     .get(header::CACHE_CONTROL)
                     .and_then(|v| v.to_str().ok()),
-                Some("public, max-age=86400, immutable")
+                Some("no-store, max-age=0")
             );
             let files = body_text(files).await;
             assert_eq!(files.as_bytes(), CLIENT_FILES_JS);
@@ -3878,7 +3866,7 @@ mod tests {
                     .headers()
                     .get(header::CACHE_CONTROL)
                     .and_then(|value| value.to_str().ok()),
-                Some("public, max-age=86400, immutable")
+                Some("no-store, max-age=0")
             );
             let workspace = body_text(workspace).await;
             assert_eq!(workspace.as_bytes(), WORKSPACE_UI_JS);
@@ -4694,7 +4682,7 @@ mod auth_integration_tests {
                 .unwrap_or_else(|error| match error {});
             assert_eq!(setup_page.status(), StatusCode::OK);
             let setup_text = body_text(setup_page).await;
-            assert!(setup_text.contains(r#"href="/t1000/_termdeck/assets/v7/app.css""#));
+            assert!(setup_text.contains(r#"href="/t1000/_termdeck/assets/v8/app.css""#));
             assert!(setup_text.contains(r#"action="/t1000/_termdeck/setup""#));
             assert!(!setup_text.contains("__TERMDECK_BASE_PATH__"));
 
@@ -5055,7 +5043,7 @@ mod auth_integration_tests {
                 .clone()
                 .oneshot(request(
                     Method::GET,
-                    "/_termdeck/assets/v7/app.css",
+                    "/_termdeck/assets/v8/app.css",
                     Body::empty(),
                 ))
                 .await
@@ -5073,7 +5061,7 @@ mod auth_integration_tests {
                     .headers()
                     .get(header::CACHE_CONTROL)
                     .and_then(|value| value.to_str().ok()),
-                Some("public, max-age=86400, immutable")
+                Some("no-store, max-age=0")
             );
             let pairing_page = router
                 .clone()

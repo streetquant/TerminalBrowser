@@ -76,7 +76,7 @@ def main() -> None:
         finally: con.close()
         command=[str(binary),'--db',str(database),'--listen',f'127.0.0.1:{port}','--refresh-ms','250','--max-stale-ms','10000','--max-connections','128','--tmux',str(wrapper),'--tmux-timeout-ms','2000']
         started=time.monotonic(); server=subprocess.Popen(command,cwd=repository,stdout=stdout,stderr=stderr,start_new_session=True); wait_http(f'http://127.0.0.1:{port}/_termdeck/healthz'); ready_ms=(time.monotonic()-started)*1000
-        paths=['/','/random','/_termdeck/api/v1/snapshot','/_termdeck/api/v1/windows/random','/_termdeck/assets/v7/app.css','/_termdeck/assets/v7/app.js','/_termdeck/assets/v7/terminal.css','/_termdeck/assets/v7/terminal.js']
+        paths=['/','/random','/_termdeck/api/v1/snapshot','/_termdeck/api/v1/windows/random','/_termdeck/assets/v8/app.css','/_termdeck/assets/v8/app.js','/_termdeck/assets/v8/terminal.css','/_termdeck/assets/v8/terminal.js']
         stop=threading.Event(); rss_samples: list[int]=[]
         def sample() -> None:
             while not stop.wait(.02):
