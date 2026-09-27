@@ -245,7 +245,7 @@ def test_complete_execute_stops_disposable_backend_and_restores_legacy(case, mon
     backend.chmod(0o700)
     children = []
     kwargs = activation._wrapper_kwargs(case.paths)
-    def start_backend():
+    def start_backend(_paths):
         # On A restart the legacy wrapper intentionally does not exist.
         if activation._managed_release_id(case.paths) == case.original_release:
             return

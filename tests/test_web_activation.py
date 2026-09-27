@@ -476,7 +476,7 @@ def _inject_post_install_failure(monkeypatch: pytest.MonkeyPatch) -> None:
         "_systemd",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0),
     )
-    monkeypatch.setattr(activation, "_start_web", lambda: None)
+    monkeypatch.setattr(activation, "_start_web", lambda _paths: None)
     monkeypatch.setattr(activation, "_stop_web", lambda: None)
     monkeypatch.setattr(activation, "_disarm", lambda: None)
     monkeypatch.setattr(
@@ -513,7 +513,8 @@ activation.snapshot_database = lambda *_args: {"session_ids": [], "session_count
 activation.process_snapshot = lambda: []
 activation._sources = lambda *_args: {}
 activation._systemd = lambda *_args, **_kwargs: SimpleNamespace(returncode=0)
-activation._start_web = activation._stop_web = activation._disarm = lambda: None
+activation._start_web = lambda _paths: None
+activation._stop_web = activation._disarm = lambda: None
 activation.verify_database = lambda *_args: {"integrity":"ok","lost_session_ids":[],"preserved_session_ids":0}
 activation.process_observation = lambda *_args: {"disappeared":[],"natural_exit_allowed":True}
 def preflight(value, expected):
@@ -572,7 +573,8 @@ activation.snapshot_database = lambda *_args: {"session_ids": [], "session_count
 activation.process_snapshot = lambda: []
 activation._sources = lambda *_args: {}
 activation._systemd = lambda *_args, **_kwargs: SimpleNamespace(returncode=0)
-activation._start_web = activation._stop_web = activation._disarm = lambda: None
+activation._start_web = lambda _paths: None
+activation._stop_web = activation._disarm = lambda: None
 activation.verify_database = lambda *_args: {"integrity":"ok","lost_session_ids":[],"preserved_session_ids":0}
 activation.process_observation = lambda *_args: {"disappeared":[],"natural_exit_allowed":True}
 def preflight(value, expected):
@@ -628,7 +630,8 @@ class Attestation:
         return {"schema":"termdeck.storage-fabric-attestation.v1","fabric":"warp-drives-v1","storage_class":"ssd-cell","production":True,"path_evidence":[]}
 release_manager._require_managed_storage = lambda _layout: Attestation()
 activation._systemd = lambda *_args, **_kwargs: SimpleNamespace(returncode=0)
-activation._start_web = activation._stop_web = activation._disarm = lambda: None
+activation._start_web = lambda _paths: None
+activation._stop_web = activation._disarm = lambda: None
 activation.verify_database = lambda *_args: {"integrity":"ok","lost_session_ids":[],"preserved_session_ids":0}
 activation.process_observation = lambda *_args: {"disappeared":[],"natural_exit_allowed":True}
 original = activation._checkpoint_publication
@@ -1547,7 +1550,7 @@ def test_package_effect_before_receipt_ack_is_rolled_back_by_identity(
         lambda *args, check=True: SimpleNamespace(returncode=0),
     )
     monkeypatch.setattr(activation, "_publish_units", lambda paths, tx, **_kwargs: None)
-    monkeypatch.setattr(activation, "_start_web", lambda: None)
+    monkeypatch.setattr(activation, "_start_web", lambda _paths: None)
     monkeypatch.setattr(activation, "_stop_web", lambda: None)
     monkeypatch.setattr(activation, "_disarm", lambda: None)
     monkeypatch.setattr(
@@ -2164,7 +2167,7 @@ def test_execute_publishes_units_before_stopping_web_services(
         events.append("stop-web")
 
     monkeypatch.setattr(activation, "_stop_web", stop_web)
-    monkeypatch.setattr(activation, "_start_web", lambda: events.append("start-web"))
+    monkeypatch.setattr(activation, "_start_web", lambda _paths: events.append("start-web"))
     monkeypatch.setattr(
         activation,
         "_capture_generated_runtime_postimages",
@@ -2880,7 +2883,7 @@ def test_start_failure_after_lan_preparation_adopts_generated_outputs_before_rol
     )
     starts = 0
 
-    def start_web() -> None:
+    def start_web(_paths) -> None:
         nonlocal starts
         starts += 1
         if starts != 1:
@@ -3094,7 +3097,7 @@ def test_published_postimage_is_durable_before_simulated_process_crash(
         lambda *_args, **_kwargs: {"fixture": "manifest"},
     )
     monkeypatch.setattr(activation, "_assert_current_postimage", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(activation, "_start_web", lambda: None)
+    monkeypatch.setattr(activation, "_start_web", lambda _paths: None)
     monkeypatch.setattr(activation, "_stop_web", lambda: None)
     monkeypatch.setattr(
         activation,
@@ -3280,7 +3283,7 @@ def test_a_to_b_crash_after_armed_receipt_before_install_recovers(
         pytest.fail("B install ran after the armed-receipt crash point")
 
     monkeypatch.setattr(activation, "_install", install_must_not_run)
-    monkeypatch.setattr(activation, "_start_web", lambda: None)
+    monkeypatch.setattr(activation, "_start_web", lambda _paths: None)
     monkeypatch.setattr(activation, "verify_database", lambda *_args: {"integrity": "ok", "lost_session_ids": []})
     monkeypatch.setattr(activation, "process_observation", lambda *_args: {"disappeared": [], "natural_exit_allowed": True})
     real_persist = activation._persist
@@ -3386,7 +3389,7 @@ def test_first_install_crash_after_wrapper_journal_before_watchdog_arm_recovers(
         "_arm_and_record_watchdog",
         lambda *_args, **_kwargs: pytest.fail("watchdog arm ran after wrapper-journal crash point"),
     )
-    monkeypatch.setattr(activation, "_start_web", lambda: None)
+    monkeypatch.setattr(activation, "_start_web", lambda _paths: None)
     monkeypatch.setattr(activation, "verify_database", lambda *_args: {"integrity": "ok", "lost_session_ids": []})
     monkeypatch.setattr(activation, "process_observation", lambda *_args: {"disappeared": [], "natural_exit_allowed": True})
     real_checkpoint = activation._checkpoint_publication
@@ -3476,7 +3479,7 @@ def test_rollback_stops_live_b_and_disarms_before_package_rollback(
     monkeypatch.setattr(activation, "_assert_release_publication_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(activation, "_assert_package_rollback_owned", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(activation, "_systemd", lambda *_args, **_kwargs: SimpleNamespace(returncode=0))
-    monkeypatch.setattr(activation, "_start_web", lambda: events.append("start-a-web"))
+    monkeypatch.setattr(activation, "_start_web", lambda _paths: events.append("start-a-web"))
     monkeypatch.setattr(activation, "verify_database", lambda *_args: {"integrity": "ok", "lost_session_ids": []})
     monkeypatch.setattr(activation, "process_observation", lambda *_args: {"disappeared": [], "natural_exit_allowed": True})
 
@@ -3592,7 +3595,7 @@ def test_rollback_retry_recognizes_an_already_restored_preimage(
 
     monkeypatch.setattr(activation, "_persist", tracked_persist)
     monkeypatch.setattr(activation, "_systemd", lambda *_args, **_kwargs: SimpleNamespace(returncode=0))
-    monkeypatch.setattr(activation, "_start_web", lambda: None)
+    monkeypatch.setattr(activation, "_start_web", lambda _paths: None)
     monkeypatch.setattr(
         activation,
         "verify_database",

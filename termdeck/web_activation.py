@@ -4611,6 +4611,286 @@ def _runtime_inverse_has_no_changes(
         raise WebActivationError("bootstrap TLS absence could not be verified") from exc
 
 
+def _reprepared_runtime_observation(
+    paths: ActivationPaths,
+    preimages: Mapping[str, object],
+    *,
+    policy: Mapping[str, object],
+    producer_tls: Mapping[str, object],
+    not_before_ns: int,
+) -> dict[str, object]:
+    """Authenticate a fresh preparation and fence its separate consumer copies.
+
+    Both runtime-only rollback and service restart use this observation. A
+    signed producer inode is never substituted for a copied consumer inode.
+    """
+
+    signed, _identity, publication = _broker_runtime_receipt(paths)
+    if (
+        {field: signed[field] for field in ("files", "https_port", "lan_ip")} != policy
+        or signed["tls_publication"]["current"] != producer_tls
+        or _integer(signed["producer_attestation"].get("issued_at_ns"), label="restart attestation time", minimum=1) < not_before_ns
+    ):
+        raise WebActivationError("rollback service preparation differs from its authorized A inputs")
+    for relative in GENERATED_RUNTIME:
+        record = preimages["generated:" + relative]
+        path = _record_target(record)
+        if path != _publication_path(paths.runtime / relative, label="reprepared consumer"):
+            raise WebActivationError("rollback preparation consumer path changed")
+        claim = publication["receipt"] if relative == "build-receipt.json" else publication["outputs"][relative]
+        expected = _runtime_broker_postimage(record, path, claim, expected_mode=0o644 if relative == "build-receipt.json" else 0o600)
+        guards = _record_parent_guards(record, path)
+        _path, capture = _capture_anchored(path, label="rollback restarted consumer", parent_guards=guards)
+        _expected_postimage(path, capture, expected)
+    _runtime_tls_publication(paths, _consumer_tls_publication(publication))
+    return {"receipt": signed, "publication": publication}
+
+
+def _restore_runtime_with_unchanged_tls(
+    paths: ActivationPaths,
+    tx: Path,
+    record: dict[str, object],
+    preimages: Mapping[str, object],
+    *,
+    checkpoint: Callable[[str], None],
+) -> bool:
+    """Republish A when A/B changed runtime generation but retained exact TLS.
+
+    The historical TLS inverse intent, if any, remains evidence. Its TLS
+    generation cannot identify this runtime transition. A separate durable
+    intent permits normal preparation only from exact owned B consumer leaves;
+    a retry may instead adopt a fresh authenticated A successor. Completed
+    replay checks the checkpointed copies without invoking the broker.
+    """
+
+    pending = record.get("runtime_reprepare")
+    if paths.runtime != service_wrappers.PREPARER_RUNTIME_ROOT:
+        if pending is not None:
+            raise WebActivationError("runtime-only rollback requires its canonical broker")
+        return False
+    if pending is None and (record.get("tls_publication") is None or record.get("runtime_rollback") is not None):
+        return False
+    old_capture = _receipt_preimage(record, tx)
+    if not old_capture.snapshot.exists:
+        if pending is not None:
+            raise WebActivationError("runtime-only rollback lacks original A receipt")
+        return False
+    old = _strict_json_object(old_capture.snapshot.content, label="original A runtime receipt")
+    if pending is None and old.get("tls_publication") != record.get("tls_publication"):
+        return False
+    if any(record.get(name) is not None for name in ("runtime_rollback", "tls_rollback", "tls_receipt_tombstoned")):
+        raise WebActivationError("runtime-only rollback conflicts with a TLS inverse")
+
+    def authenticate(value: object) -> dict[str, object]:
+        if not isinstance(value, Mapping):
+            raise WebActivationError("runtime-only rollback receipt is invalid")
+        try:
+            runtime_attestation.verify_runtime_build_attestation(value, config=_runtime_attestation_config(paths))
+        except runtime_attestation.AttestationError as exc:
+            raise WebActivationError("runtime-only rollback receipt attestation is invalid") from exc
+        return dict(value)
+
+    old = authenticate(old)
+    tls = _parse_runtime_tls_publication(old["tls_publication"])
+    historical_intent = record.get("runtime_rollback_intent")
+    if historical_intent is not None and historical_intent != {
+        "schema": "termdeck.web-activation-runtime-inverse.v1", "mode": "explicit", "generation": tls["generation"],
+    }:
+        raise WebActivationError("runtime-only rollback historical inverse intent is invalid")
+    if record.get("tls_publication") != tls:
+        raise WebActivationError("runtime-only rollback producer TLS changed")
+    policy = {field: old[field] for field in ("files", "https_port", "lan_ip")}
+
+    def generated() -> dict[str, object]:
+        result = {}
+        for relative in GENERATED_RUNTIME:
+            item = preimages.get("generated:" + relative)
+            if not isinstance(item, dict):
+                raise WebActivationError("runtime-only rollback lacks generated preimages")
+            path = _record_target(item)
+            if path != _publication_path(paths.runtime / relative, label="runtime-only consumer"):
+                raise WebActivationError("runtime-only rollback consumer path changed")
+            guards = _record_parent_guards(item, path)
+            _path, capture = _capture_anchored(path, label="runtime-only consumer", parent_guards=guards)
+            result[relative] = _postimage_payload(path, capture, guards)
+        return result
+
+    def sources() -> dict[str, object]:
+        result = {}
+        for relative in sorted(name for name in RUNTIME_PREPARER_SOURCE_FILES if not name.startswith("tls/")):
+            item = preimages.get("runtime:" + relative)
+            if not isinstance(item, Mapping):
+                raise WebActivationError("runtime-only rollback lacks restored A sources")
+            path = _record_target(item)
+            if path != _publication_path(paths.runtime / relative, label="runtime-only source"):
+                raise WebActivationError("runtime-only rollback source path changed")
+            guards = _record_parent_guards(item, path)
+            _path, capture = _capture_anchored(path, label="runtime-only source", parent_guards=guards)
+            original = _receipt_preimage(item, tx)
+            if not _same_preimage_inode(capture, original):
+                _expected_postimage(path, capture, item.get("rollback_postimage"))
+            if (
+                not original.snapshot.exists or capture.snapshot != original.snapshot
+                or hashlib.sha256(capture.snapshot.content).hexdigest() != policy["files"][relative]
+            ):
+                raise WebActivationError("runtime-only rollback source differs from original A")
+            result[relative] = _postimage_payload(path, capture, guards)
+        return result
+
+    baseline_generated = {}
+    for relative in GENERATED_RUNTIME:
+        item = preimages.get("generated:" + relative)
+        if not isinstance(item, dict) or not isinstance(item.get("postimage"), Mapping):
+            raise WebActivationError("runtime-only rollback lacks owned B postimages")
+        baseline_generated[relative] = item["postimage"]
+    if pending is None:
+        if generated() != baseline_generated:
+            raise WebActivationError("runtime-only rollback B consumer postimages changed")
+        path = _record_target(record)
+        _path, capture = _capture_anchored(path, label="retained B receipt", parent_guards=_record_parent_guards(record, path))
+        _expected_postimage(path, capture, record.get("postimage"))
+        failed = authenticate(_strict_json_object(capture.snapshot.content, label="retained B receipt"))
+        pending = {
+            "schema": "termdeck.web-activation-runtime-reprepare.v1", "state": "intent",
+            "not_before_ns": time.time_ns(), "historical_inverse": historical_intent,
+            "original_receipt_sha256": hashlib.sha256(old_capture.snapshot.content).hexdigest(),
+            "failed_receipt": failed, "sources": sources(),
+            "baseline": {"generated": baseline_generated, "consumer_tls": record.get("consumer_tls_publication")},
+            "observed": None,
+        }
+    fields = {"schema", "state", "not_before_ns", "historical_inverse", "original_receipt_sha256", "failed_receipt", "sources", "baseline", "observed"}
+    if (
+        not isinstance(pending, dict) or set(pending) != fields
+        or pending.get("schema") != "termdeck.web-activation-runtime-reprepare.v1"
+        or pending.get("state") not in {"intent", "preparing", "verified"}
+        or (pending["state"] != "verified") != (pending.get("observed") is None)
+        or pending.get("original_receipt_sha256") != hashlib.sha256(old_capture.snapshot.content).hexdigest()
+        or pending.get("historical_inverse") != historical_intent
+        or pending.get("baseline") != {"generated": baseline_generated, "consumer_tls": record.get("consumer_tls_publication")}
+    ):
+        raise WebActivationError("runtime-only rollback intent is invalid")
+    failed = authenticate(pending["failed_receipt"])
+    failed_bytes = runtime_attestation._canonical_json(failed)
+    if (
+        not isinstance(record.get("postimage"), Mapping)
+        or hashlib.sha256(failed_bytes).hexdigest() != record["postimage"].get("sha256")
+        or len(failed_bytes) != record["postimage"].get("size")
+        or failed["tls_publication"] != tls
+        or failed["lan_ip"] != old["lan_ip"] or failed["https_port"] != old["https_port"]
+        or failed["runtime_publication"]["generation"] == old["runtime_publication"]["generation"]
+        or any(failed["files"][name] != old["files"][name] for name in RUNTIME_PREPARER_SOURCE_FILES if name.startswith("tls/"))
+    ):
+        raise WebActivationError("runtime-only rollback A/B transition is not qualified")
+    baseline_tls = _parse_runtime_tls_publication(pending["baseline"]["consumer_tls"])
+    if (
+        baseline_tls["generation"] != failed["runtime_publication"]["generation"]
+        or baseline_tls["prior"] is not None
+        or set(baseline_tls["current"]["manifest"]) != set(tls["current"]["manifest"])
+        or any(
+            baseline_tls["current"]["manifest"][name]["sha256"] != claim["sha256"]
+            or baseline_tls["current"]["manifest"][name]["mode"] != claim["mode"]
+            or baseline_tls["current"]["manifest"][name]["identity"][4] != claim["identity"][4]
+            for name, claim in tls["current"]["manifest"].items()
+        )
+    ):
+        raise WebActivationError("runtime-only rollback B consumer TLS is not its signed content")
+    for relative in RUNTIME_PREPARER_OUTPUTS:
+        original = _receipt_preimage(preimages["generated:" + relative], tx)
+        claim = failed["runtime_publication"]["outputs"][relative]
+        expected = baseline_generated[relative]
+        if (
+            not original.snapshot.exists or not isinstance(expected, Mapping)
+            or claim["sha256"] != expected.get("sha256") or claim["mode"] != expected.get("mode")
+            or hashlib.sha256(original.snapshot.content).hexdigest() != claim["sha256"]
+            or original.snapshot.mode != claim["mode"]
+        ):
+            raise WebActivationError("runtime-only rollback changed original A outputs")
+    not_before_ns = _integer(pending["not_before_ns"], label="runtime-only rollback time", minimum=1)
+    if sources() != pending["sources"]:
+        raise WebActivationError("runtime-only rollback A source binding changed")
+    if record.get("runtime_reprepare") is None:
+        if generated() != baseline_generated:
+            raise WebActivationError("runtime-only rollback B changed before intent")
+        _runtime_tls_publication(paths, pending["baseline"]["consumer_tls"])
+        record["runtime_reprepare"] = pending
+        checkpoint("intent:rollback:runtime-reprepare")
+
+    def verify_result(observed: object) -> dict[str, object]:
+        if not isinstance(observed, Mapping) or set(observed) != {"receipt", "publication"}:
+            raise WebActivationError("runtime-only rollback observation is invalid")
+        signed = authenticate(observed["receipt"])
+        if (
+            any(signed[field] != old[field] for field in ("files", "https_port", "lan_ip", "ok", "schema", "tls_publication"))
+            or signed["runtime_publication"]["generation"] in {old["runtime_publication"]["generation"], failed["runtime_publication"]["generation"]}
+            or _integer(signed["producer_attestation"].get("issued_at_ns"), label="runtime-only attestation time", minimum=1) < not_before_ns
+        ):
+            raise WebActivationError("runtime-only rollback successor differs from authorized A")
+        publication = observed["publication"]
+        try:
+            service_wrappers._validate_preparer_publication_result(publication, operation="verify")
+        except service_wrappers.WrapperError as exc:
+            raise WebActivationError("runtime-only rollback consumer observation is invalid") from exc
+        if publication["generation"] != signed["runtime_publication"]["generation"]:
+            raise WebActivationError("runtime-only rollback successor generation changed")
+        result = generated()
+        for relative in GENERATED_RUNTIME:
+            item = preimages["generated:" + relative]
+            path = _record_target(item)
+            claim = publication["receipt"] if relative == "build-receipt.json" else publication["outputs"][relative]
+            expected = _runtime_broker_postimage(item, path, claim, expected_mode=0o644 if relative == "build-receipt.json" else 0o600)
+            digest = hashlib.sha256(runtime_attestation._canonical_json(signed)).hexdigest() if relative == "build-receipt.json" else preimages["generated:" + relative]["sha256"]
+            if result[relative] != expected or result[relative]["sha256"] != digest:
+                raise WebActivationError("runtime-only rollback successor consumer changed")
+        consumer_tls = _consumer_tls_publication(publication)
+        if _capture_restored_consumer_tls(paths, consumer_tls["generation"], tls["current"]) != consumer_tls:
+            raise WebActivationError("runtime-only rollback successor TLS changed")
+        if sources() != pending["sources"]:
+            raise WebActivationError("runtime-only rollback A sources changed during preparation")
+        return result
+
+    if pending["state"] == "verified":
+        restored = verify_result(pending["observed"])
+        if any(preimages["generated:" + relative].get("rollback_postimage") != restored[relative] for relative in GENERATED_RUNTIME):
+            raise WebActivationError("runtime-only rollback completed postimages changed")
+        if record.get("consumer_tls_rollback") != _consumer_tls_publication(pending["observed"]["publication"]):
+            raise WebActivationError("runtime-only rollback completed TLS changed")
+        return True
+    if generated() == baseline_generated:
+        _runtime_tls_publication(paths, pending["baseline"]["consumer_tls"])
+        if sources() != pending["sources"]:
+            raise WebActivationError("runtime-only rollback A sources changed before preparation")
+        if pending["state"] != "intent":
+            # The producer may have completed while consumer publication
+            # rolled back to B. Its unchanged consumer baseline cannot prove
+            # that a submitted request never ran. Preserve this uncertainty.
+            raise WebActivationError("runtime-only rollback preparation outcome is uncertain; refusing to repeat it")
+        pending["state"] = "preparing"
+        checkpoint("intent:rollback:runtime-reprepare-request")
+        if generated() != baseline_generated or sources() != pending["sources"]:
+            raise WebActivationError("runtime-only rollback inputs changed before submission")
+        _runtime_tls_publication(paths, pending["baseline"]["consumer_tls"])
+        try:
+            service_wrappers._request_lan_preparation(restore_mode="none", runtime_root=paths.runtime, timeout=90.0)
+        except service_wrappers.WrapperError as exc:
+            raise WebActivationError("runtime-only rollback broker preparation failed") from exc
+    observed = _reprepared_runtime_observation(
+        paths, preimages, policy=policy, producer_tls=tls["current"], not_before_ns=not_before_ns,
+    )
+    restored = verify_result(observed)
+    # Fence again after all signature, source and consumer checks, before the
+    # single durable checkpoint. Interrupted publication is adopted on retry.
+    if generated() != restored:
+        raise WebActivationError("runtime-only rollback successor changed before checkpoint")
+    for relative in GENERATED_RUNTIME:
+        preimages["generated:" + relative]["rollback_postimage"] = restored[relative]
+        preimages["generated:" + relative]["rollback_restore"] = "restored"
+    record["consumer_tls_rollback"] = _consumer_tls_publication(observed["publication"])
+    pending.update(state="verified", observed=observed)
+    checkpoint("rollback:runtime-reprepare")
+    verify_result(observed)
+    return True
+
+
 def _restore_tls_generation(
     paths: ActivationPaths,
     tx: Path,
@@ -4639,6 +4919,8 @@ def _restore_tls_generation(
     prior = normalized["prior"] if normalized is not None else None
     intent = record.get("runtime_rollback_intent")
     completed = record.get("runtime_rollback")
+    if _restore_runtime_with_unchanged_tls(paths, tx, record, preimages, checkpoint=checkpoint):
+        return True
     history = receipt.get("phase_history")
     preparation_may_have_run = (
         receipt.get("status") == "services-starting"
@@ -4954,14 +5236,165 @@ def _stop_web() -> None:
         raise WebActivationError("TermDeck web units did not stop in the bounded timeout")
 
 
-def _start_web() -> None:
-    for unit in SERVICES:
-        _systemd("start", unit)
+def _web_service_start_ready(
+    paths: ActivationPaths,
+    unit: str,
+    values: Mapping[str, str],
+    *,
+    layout: service_wrappers.WrapperLayout,
+    command: tuple[str, ...],
+    managed: bool,
+    release_id: str | None,
+    observed: dict[str, tuple[int, int, str]],
+) -> bool:
+    """Wait only for the expected wrapper to become its expected runtime.
+
+    Type=simple reports running while the LAN wrapper is still preparing its
+    publication. Its recorded config is written after preparation and nginx
+    -t; require that identity to have actually exec'd before broker inspection.
+    """
+
+    spec = service_wrappers.UNIT_SPEC_BY_NAME[unit]
+    if (
+        values.get("FragmentPath") != str(paths.unit_dir / unit)
+        or values.get("DropInPaths") != ""
+        or values.get("NeedDaemonReload") != "no"
+        or values.get("LoadState") != "loaded"
+        or values.get("Type") != "simple"
+    ):
+        raise WebActivationError(f"web startup unit binding changed: {unit}")
+    if values.get("ActiveState") == "activating":
+        if unit in observed:
+            raise WebActivationError(f"web startup invocation changed: {unit}")
+        return False
+    if values.get("ActiveState") != "active" or values.get("SubState") != "running":
+        raise WebActivationError(f"web startup unit stopped or failed: {unit}")
+    raw_pid = values.get("MainPID", "")
+    invocation = values.get("InvocationID", "")
+    if not raw_pid.isascii() or not raw_pid.isdecimal() or int(raw_pid) <= 0 or not _lower_hex(invocation, length=32):
+        raise WebActivationError(f"web startup process identity is invalid: {unit}")
+    pid = int(raw_pid)
+    current = service_wrappers.process_identity(pid)
+    identity = (pid, int(current["start_ticks"]), invocation)
+    if observed.setdefault(unit, identity) != identity:
+        raise WebActivationError(f"web startup process identity changed: {unit}")
+    expected = {
+        "pid": pid, "start_ticks": identity[1],
+        "exe": service_wrappers._expected_proc_executable(command[0]),
+        "argv": list(service_wrappers._expected_proc_argv(command)),
+    }
+    if not service_wrappers.verify_process_identity(expected):
+        if managed:
+            wrapper = (str(layout.wrapper_path(spec, "start")),)
+            preparing = {
+                **expected,
+                "exe": service_wrappers._expected_proc_executable(wrapper[0]),
+                "argv": list(service_wrappers._expected_proc_argv(wrapper)),
+            }
+            if service_wrappers.verify_process_identity(preparing):
+                return False
+            # exec can occur between the two /proc observations above.
+            if not service_wrappers.verify_process_identity(expected):
+                raise WebActivationError(f"web startup has an unexpected process: {unit}")
+        else:
+            raise WebActivationError(f"web startup has an unexpected process: {unit}")
+    if managed:
+        config, snapshot = service_wrappers._read_unit_config_snapshot(
+            layout.config_path(spec), spec=spec, expected_release_id=release_id,
+        )
+        if (
+            config.get("pid") != pid or config.get("start_ticks") != identity[1]
+            or config.get("state") not in {"starting", "running"}
+        ):
+            raise WebActivationError(f"web startup config does not own its process: {unit}")
+        service_wrappers._validate_recorded_command(spec, layout, config)
+        service_wrappers._assert_unit_config_snapshot(snapshot, spec=spec, expected_release_id=release_id)
+    if spec.kind == "lan":
+        pid_path = service_wrappers._runtime_paths(layout)["nginx_pid"]
+        if not os.path.lexists(pid_path):
+            return False
+        if service_wrappers._read_nginx_pid(layout) != pid:
+            raise WebActivationError("web startup LAN process does not own its pidfile")
+    return service_wrappers.verify_process_identity(expected)
+
+
+def _start_web(paths: ActivationPaths) -> None:
     deadline = time.monotonic() + 90
-    while time.monotonic() < deadline and not all(_unit_info(u).get("ActiveState") == "active" and _unit_info(u).get("SubState") == "running" for u in SERVICES):
-        time.sleep(0.25)
-    if not all(_unit_info(u).get("ActiveState") == "active" and _unit_info(u).get("SubState") == "running" for u in SERVICES):
-        raise WebActivationError("TermDeck web units did not become active and running")
+
+    def systemd(*args: str) -> subprocess.CompletedProcess[str]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise WebActivationError("TermDeck web runtime did not become ready in 90 seconds")
+        return _run(["/usr/bin/systemctl", "--user", *args], timeout=remaining)
+
+    try:
+        layout = service_wrappers.resolve_layout(**_wrapper_kwargs(paths))
+        release_state = _managed_release_state_snapshot(paths)
+        release_id = release_state["release_id"] if release_state is not None else None
+        contracts = {}
+        for unit in SERVICES:
+            if unit not in {"termdeck-web-backend.service", "termdeck-web-lan.service"}:
+                raise WebActivationError(f"unit outside activation allowlist: {unit}")
+            spec = service_wrappers.UNIT_SPEC_BY_NAME[unit]
+            guards = _capture_parent_guards((paths.unit_dir / unit,))
+            path, capture = _capture_anchored(paths.unit_dir / unit, label="web startup unit", parent_guards=guards)
+            if not capture.snapshot.exists:
+                raise WebActivationError(f"web startup unit is absent: {unit}")
+            properties: dict[str, list[str]] = {}
+            section = ""
+            for raw in capture.snapshot.content.decode("utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith(("#", ";")):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    section = line[1:-1]
+                elif section == "Service":
+                    key, separator, value = line.partition("=")
+                    if not separator or line.endswith("\\"):
+                        raise WebActivationError("web startup unit syntax is unsupported")
+                    properties.setdefault(key, []).append(value)
+            if properties.get("Type") != ["simple"] or len(properties.get("ExecStart", [])) != 1:
+                raise WebActivationError("web startup service type or command is unsupported")
+            value = properties["ExecStart"][0]
+            if "$" in value or "%" in value:
+                raise WebActivationError("web startup command expansion is unsupported")
+            start = tuple(shlex.split(value))
+            command = service_wrappers.build_start_command(spec, **_wrapper_kwargs(paths))
+            managed = start == (str(layout.wrapper_path(spec, "start")),)
+            if managed:
+                if not isinstance(release_id, str) or not release_id:
+                    raise WebActivationError("web startup has no selected managed release")
+                service_wrappers._read_unit_config_snapshot(layout.config_path(spec), spec=spec, expected_release_id=release_id)
+            elif start != command or os.path.lexists(layout.config_path(spec)):
+                raise WebActivationError("web startup direct command is not the original service contract")
+            contracts[unit] = (path, capture, guards, command, managed)
+        if len({contract[4] for contract in contracts.values()}) != 1:
+            raise WebActivationError("web startup service modes are mixed")
+        for unit in SERVICES:
+            systemd("start", unit)
+        observed: dict[str, tuple[int, int, str]] = {}
+        while True:
+            ready = True
+            for unit, (path, capture, guards, command, managed) in contracts.items():
+                _assert_runtime_capture_current(path, capture, guards, label="web startup unit")
+                info = systemd("show", unit, "-p", "MainPID", "-p", "InvocationID", "-p", "ActiveState", "-p", "SubState", "-p", "LoadState", "-p", "Type", "-p", "FragmentPath", "-p", "DropInPaths", "-p", "NeedDaemonReload", "--no-pager")
+                values = dict(line.partition("=")[::2] for line in info.stdout.splitlines() if "=" in line)
+                ready = _web_service_start_ready(
+                    paths, unit, values, layout=layout, command=command, managed=managed,
+                    release_id=release_id, observed=observed,
+                ) and ready
+            if _managed_release_state_snapshot(paths) != release_state:
+                raise WebActivationError("web startup managed release changed")
+            if ready:
+                for path, capture, guards, _command, _managed in contracts.values():
+                    _assert_runtime_capture_current(path, capture, guards, label="web startup unit")
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WebActivationError("TermDeck web runtime did not become ready in 90 seconds")
+            time.sleep(min(0.25, remaining))
+    except (service_wrappers.WrapperError, UnicodeError, ValueError) as exc:
+        raise WebActivationError(f"web startup readiness failed: {exc}") from exc
 
 
 def _arm(
@@ -5926,7 +6359,7 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
         # changing the selected package or its wrappers.
         receipt["services_may_be_live"] = True
         _persist(paths, tx, receipt, "services-starting")
-        _start_web()
+        _start_web(paths)
         _capture_generated_runtime_postimages(
             paths,
             tx,
@@ -6294,23 +6727,10 @@ def _rollback_service_restart(
                     if hashlib.sha256(capture.snapshot.content).hexdigest() != digest:
                         raise WebActivationError("legacy restart source differs from its original receipt")
                 return {"mode": "legacy-unsigned-observation", "generated": generated, "consumer_tls": baseline["consumer_tls"]}
-            signed, _identity, publication = _broker_runtime_receipt(paths)
-            if (
-                {field: signed[field] for field in ("files", "https_port", "lan_ip")} != baseline["policy"]
-                or signed["tls_publication"]["current"] != baseline["producer_tls"]
-                or _integer(signed["producer_attestation"].get("issued_at_ns"), label="restart attestation time", minimum=1) < not_before_ns
-            ):
-                raise WebActivationError("rollback service preparation differs from its authorized A inputs")
-            for relative in GENERATED_RUNTIME:
-                record = preimages["generated:" + relative]
-                path = _record_target(record)
-                claim = publication["receipt"] if relative == "build-receipt.json" else publication["outputs"][relative]
-                expected = _runtime_broker_postimage(record, path, claim, expected_mode=0o644 if relative == "build-receipt.json" else 0o600)
-                guards = _record_parent_guards(record, path)
-                _path, capture = _capture_anchored(path, label="rollback restarted consumer", parent_guards=guards)
-                _expected_postimage(path, capture, expected)
-            _runtime_tls_publication(paths, _consumer_tls_publication(publication))
-            return {"receipt": signed, "publication": publication}
+            return _reprepared_runtime_observation(
+                paths, preimages, policy=baseline["policy"],
+                producer_tls=baseline["producer_tls"], not_before_ns=not_before_ns,
+            )
 
         def services_observation() -> dict[str, object]:
             result = {}
@@ -6376,7 +6796,7 @@ def _rollback_service_restart(
                     already_started = True
                 runtime_observation()
             if not already_started:
-                _start_web()
+                _start_web(paths)
             observed = {"runtime": runtime_observation(), "services": services_observation()}
             if binding() != restart["binding"]:
                 raise WebActivationError("rollback restart inputs changed during service start")
@@ -6547,6 +6967,7 @@ def rollback(paths: ActivationPaths, tx: Path, *, reason: str) -> dict[str, obje
         inverse_pending = isinstance(generated_record, Mapping) and (
             generated_record.get("runtime_rollback_intent") is not None
             or generated_record.get("runtime_rollback") is not None
+            or generated_record.get("runtime_reprepare") is not None
         )
         outer_generated_inverse_pending = any(
             isinstance(preimages.get(name), Mapping) and (
@@ -6690,7 +7111,7 @@ def rollback(paths: ActivationPaths, tx: Path, *, reason: str) -> dict[str, obje
                     _persist(paths, tx, receipt)
                 _rollback_service_restart(paths, tx, receipt)
             else:
-                _start_web()
+                _start_web(paths)
         receipt["rollback_reason"] = reason
         receipt["post_checks"] = {"database": verify_database(paths, tx, receipt.get("database_before", {})), "processes": process_observation(receipt.get("processes_before", []))}
         watchdog["arming"] = False

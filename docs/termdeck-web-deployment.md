@@ -148,6 +148,19 @@ the checkout. Saved sessions, authentication and unrelated services are outside
 this path migration. Source/disposable tests do not prove host activation or
 live rollback acceptance.
 
+Activation waits for each service's expected executable and recorded process
+identity. A systemd `active` state alone is insufficient: the LAN wrapper may
+still be preparing its signed runtime before it executes nginx.
+
+An application update can publish a new runtime receipt while retaining the
+existing TLS generation. In that case rollback verifies the retained A/B
+receipts and owned output identities, then asks the installed preparer to sign
+a fresh runtime over the restored A inputs. It requires unchanged producer TLS
+and records the new consumer file identities. The older TLS inverse is not the
+inverse of this application update. Interrupted and completed attempts retain
+their transaction evidence; unexpected source, TLS or output changes stop
+recovery for review.
+
 ### Executable publication and interrupted preparation
 
 Publication journals store immutable file payloads once and append compact

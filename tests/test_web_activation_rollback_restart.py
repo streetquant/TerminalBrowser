@@ -137,7 +137,7 @@ def restart_case(consumer_generation, monkeypatch):
     command = ("/usr/bin/sleep", "120")
     monkeypatch.setattr(wrappers, "build_start_command", lambda _spec, **_kwargs: command)
 
-    def start():
+    def start(_paths):
         state.starts += 1
         for unit in activation.SERVICES:
             if unit in state.children and state.children[unit].poll() is None:
