@@ -188,11 +188,40 @@ class PrivateBashRecoveryTests(unittest.TestCase):
 
     def test_configured_agent_does_not_use_bash_admission(self):
         record = replace(self.record, tag="web-agent", recovery_command="configured resume")
-        with mock.patch("termdeck.agent_launch.prepare_resume", side_effect=ValueError("configured policy rejected")), mock.patch(
-            "termdeck.tmux_backend.validate_existing_private_bash_scope"
-        ) as validate, self.assertRaisesRegex(TmuxError, "configured policy rejected"):
+        def admit_exact_record(candidate):
+            self.assertIs(candidate, record)
+        with mock.patch("termdeck.agent_launch.validate_native_launch", side_effect=admit_exact_record) as admit, mock.patch(
+            "termdeck.agent_launch.prepare_resume", side_effect=ValueError("configured policy rejected")
+        ) as resume, mock.patch("termdeck.tmux_backend.validate_existing_private_bash_scope") as validate, mock.patch.object(
+            self.backend, "_with_explicit_private_environment"
+        ) as profile, mock.patch.object(self.backend, "_with_interactive_shell_fallback") as fallback, self.assertRaisesRegex(
+            TmuxError, "configured policy rejected"
+        ):
             self.backend._launch_spec(record)
+        admit.assert_called_once_with(record)
+        resume.assert_called_once_with(record)
         validate.assert_not_called()
+        profile.assert_not_called()
+        fallback.assert_not_called()
+
+    def test_configured_admission_refusal_precedes_resume_profile_and_bash_fallback(self):
+        from termdeck.client_files import StagingError
+
+        record = replace(self.record, tag="web-agent", recovery_command="configured resume")
+        with mock.patch("termdeck.agent_launch.validate_native_launch", side_effect=StagingError("configured admission rejected")) as admit, mock.patch(
+            "termdeck.agent_launch.prepare_resume"
+        ) as resume, mock.patch("termdeck.tmux_backend.validate_existing_private_bash_scope") as validate, mock.patch.object(
+            self.backend, "_with_explicit_private_environment"
+        ) as profile, mock.patch.object(self.backend, "_with_interactive_shell_fallback") as fallback, mock.patch.object(
+            self.backend, "_run"
+        ) as publish, self.assertRaisesRegex(TmuxError, "configured admission rejected"):
+            self.backend._launch_spec(record)
+        admit.assert_called_once_with(record)
+        resume.assert_not_called()
+        validate.assert_not_called()
+        profile.assert_not_called()
+        fallback.assert_not_called()
+        publish.assert_not_called()
 
     def test_missing_home_and_bin_are_never_created(self):
         missing = self.root / "auth-missing"

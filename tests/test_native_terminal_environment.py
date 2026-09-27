@@ -154,11 +154,9 @@ def test_actual_tmux_refreshes_stale_server_home_path_and_preserves_host_permiss
     monkeypatch.setenv("SHELL", "/bin/bash")
     tmux = backend()
     tmux._run(["new-session", "-d", "-s", "owned_anchor", "/bin/sleep 120"])
-    isolation = tmux.ensure_server_lifecycle_isolated()
-    assert isolation.ok
-    if isolation.unit is not None:
-        assert isolation.unit.startswith("t1000-tmux-server-")
-        assert isolation.unit.endswith(".scope")
+    # Exercise ordinary tab creation/respawn even when CI has a private XDG
+    # runtime with no user manager. Lifecycle acceptance is separately proven
+    # by the real inherited-service gate; the blocked path is tested below.
     output = root / "observed.json"
     probe = root / "probe.py"
     probe.write_text(
@@ -212,6 +210,37 @@ def test_actual_tmux_refreshes_stale_server_home_path_and_preserves_host_permiss
     # The canonical server's process-wide values were not rewritten to fix a tab.
     assert tmux._run(["show-environment", "-g", "HOME"]).stdout.strip() == f"HOME={stale}"
     assert tmux._run(["has-session", "-t", "owned_anchor"], check=False).returncode == 0
+
+
+def test_unavailable_private_user_manager_preserves_own_server_and_neighbor(private_tmux, monkeypatch):
+    from termdeck.tmux_server_lifecycle import user_systemd_scope_available
+
+    unavailable = private_tmux / "unavailable-user-manager"
+    unavailable.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(unavailable))
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=" + str(unavailable / "bus"))
+    assert not user_systemd_scope_available()
+    tmux = backend()
+    for name in ("owned_anchor", "owned_neighbor"):
+        tmux._run(["new-session", "-d", "-s", name, "exec /bin/sleep 120"])
+
+    def snapshot():
+        pid = int(tmux._run(["display-message", "-p", "#{pid}"]).stdout.strip())
+        proc = Path("/proc") / str(pid)
+        fields = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+        sessions = tmux._run(["list-sessions", "-F", "#{session_name}|#{session_id}|#{session_created}"]).stdout
+        panes = tmux._run(["list-panes", "-a", "-F", "#{session_name}|#{pane_id}|#{pane_pid}|#{pane_dead}"]).stdout
+        return pid, int(fields[19]), (proc / "cgroup").read_text().strip(), sessions, panes
+
+    before = snapshot()
+    assert "owned_anchor|" in before[3] and "owned_neighbor|" in before[3]
+    refusal = tmux.ensure_server_lifecycle_isolated()
+    assert not refusal.ok and refusal.server_present and not refusal.changed
+    assert refusal.detail.startswith("recovery-blocked: user systemd is unavailable")
+    assert (refusal.server_pid, refusal.server_start_ticks, refusal.cgroup) == before[:3]
+    assert snapshot() == before
+    assert tmux.ensure_server_lifecycle_isolated() == refusal
+    assert snapshot() == before
 
 
 @pytest.mark.parametrize("private_scope", [False, True])
