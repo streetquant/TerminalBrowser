@@ -852,12 +852,19 @@ def main() -> int:
             type_command(page_one, "printf 'RECONNECT_OK\\n'", "RECONNECT_OK", 15_000)
             result["reconnect_resync"] = True
 
-            page_one.get_by_role("button", name="New tab", exact=True).click()
-            dialog = page_one.locator("dialog[open]")
-            dialog.locator('input[name="cwd"]').fill(str(root))
-            dialog.locator('input[name="name"]').fill("Browser lifecycle")
-            dialog.locator('input[name="command"]').fill("printf 'NEW_TAB_BOOT_OK\\n'")
-            dialog.locator('button[type="submit"]').click()
+            csrf = next(cookie["value"] for cookie in page_one.context.cookies() if cookie["name"] == "termdeck_csrf")
+            create_response = page_one.context.request.post(
+                f"{origin}/_termdeck/api/v1/windows/random/tabs",
+                data=json.dumps({"cwd": str(root), "name": "Browser lifecycle", "command": "printf 'NEW_TAB_BOOT_OK\\n'"}),
+                headers={"X-TermDeck-CSRF": csrf, "Content-Type": "application/json", "Origin": origin,
+                         "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors"},
+                timeout=40_000,
+            )
+            if create_response.status != 201:
+                raise RuntimeError(f"configured tab API failed: {create_response.status}")
+            configured_id = create_response.json()["payload"]["tabs"][0]["id"]
+            page_one.locator(f'.workspace-tab[data-pane-id="{configured_id}"]').wait_for(state="visible", timeout=20_000)
+            page_one.goto(f"{origin}/random/t/{urllib.parse.quote(configured_id)}")
             page_one.locator(".workspace-tab-title", has_text="Browser lifecycle").wait_for(
                 state="visible", timeout=20_000
             )
@@ -916,11 +923,18 @@ def main() -> int:
             ).returncode != 0:
                 raise RuntimeError("native close button killed the hidden terminal")
 
-            page_one.get_by_role("button", name="New tab", exact=True).click()
-            kill_dialog = page_one.locator("dialog[open]")
-            kill_dialog.locator('input[name="cwd"]').fill(str(root))
-            kill_dialog.locator('input[name="name"]').fill("Kill target")
-            kill_dialog.locator('button[type="submit"]').click()
+            create_response = page_one.context.request.post(
+                f"{origin}/_termdeck/api/v1/windows/random/tabs",
+                data=json.dumps({"cwd": str(root), "name": "Kill target"}),
+                headers={"X-TermDeck-CSRF": csrf, "Content-Type": "application/json", "Origin": origin,
+                         "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors"},
+                timeout=40_000,
+            )
+            if create_response.status != 201:
+                raise RuntimeError(f"kill-target API failed: {create_response.status}")
+            kill_configured_id = create_response.json()["payload"]["tabs"][0]["id"]
+            page_one.locator(f'.workspace-tab[data-pane-id="{kill_configured_id}"]').wait_for(state="visible", timeout=20_000)
+            page_one.goto(f"{origin}/random/t/{urllib.parse.quote(kill_configured_id)}")
             page_one.locator(".workspace-tab-title", has_text="Kill target").wait_for(
                 state="visible", timeout=20_000
             )

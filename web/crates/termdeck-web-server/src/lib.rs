@@ -1822,7 +1822,7 @@ fn resolve_window(cache: &SnapshotCache, slug: &str) -> Result<ResolvedWindow, B
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewTabRequest {
-    cwd: String,
+    cwd: Option<String>,
     name: Option<String>,
     command: Option<String>,
     #[serde(default)]
@@ -1917,11 +1917,18 @@ async fn tab_create(
         Ok(value) => value,
         Err(response) => return *response,
     };
+    let cwd = match request.cwd {
+        Some(cwd) => cwd,
+        None => match std::env::var("HOME") {
+            Ok(home) => home,
+            Err(_) => return internal_error_response(),
+        },
+    };
     match actions
         .create(
             window.id.as_str(),
             window.name.as_str(),
-            request.cwd.as_str(),
+            cwd.as_str(),
             request.name.as_deref(),
             request.command.as_deref(),
             request.pinned,

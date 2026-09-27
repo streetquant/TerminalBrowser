@@ -1433,11 +1433,19 @@ def main() -> int:
                     "CREATED",
                 ]
             )
-            page_two.get_by_role("button", name="New tab", exact=True).click()
-            page_two.locator('dialog input[name="cwd"]').fill(str(run_root))
-            page_two.locator('dialog input[name="name"]').fill("Browser Created")
-            page_two.locator('dialog input[name="command"]').fill(created_command)
-            page_two.get_by_role("button", name="Create tab", exact=True).click()
+            csrf = next(cookie["value"] for cookie in page_two.context.cookies() if cookie["name"] == "termdeck_csrf")
+            create_response = page_two.context.request.post(
+                f"{origin}/_termdeck/api/v1/windows/random/tabs",
+                data=json.dumps({"cwd": str(run_root), "name": "Browser Created", "command": created_command}),
+                headers={"X-TermDeck-CSRF": csrf, "Content-Type": "application/json", "Origin": origin,
+                         "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors"},
+                timeout=40_000,
+            )
+            if create_response.status != 201:
+                raise AssertionError(f"configured tab API failed: {create_response.status}")
+            configured_id = create_response.json()["payload"]["tabs"][0]["id"]
+            page_two.locator(f'.workspace-tab[data-pane-id="{configured_id}"]').wait_for(state="visible", timeout=20_000)
+            page_two.goto(f"{origin}/random/t/{urllib.parse.quote(configured_id)}")
             page_two.wait_for_url(f"**/random/t/*", timeout=40_000)
             page_two.wait_for_function(
                 "() => document.querySelector('#terminal-status')?.textContent === 'Live'",
@@ -1788,11 +1796,18 @@ def main() -> int:
                     "KILL",
                 ]
             )
-            page_two.get_by_role("button", name="New tab", exact=True).click()
-            page_two.locator('dialog input[name="cwd"]').fill(str(run_root))
-            page_two.locator('dialog input[name="name"]').fill("Kill Target")
-            page_two.locator('dialog input[name="command"]').fill(kill_command)
-            page_two.get_by_role("button", name="Create tab", exact=True).click()
+            create_response = page_two.context.request.post(
+                f"{origin}/_termdeck/api/v1/windows/random/tabs",
+                data=json.dumps({"cwd": str(run_root), "name": "Kill Target", "command": kill_command}),
+                headers={"X-TermDeck-CSRF": csrf, "Content-Type": "application/json", "Origin": origin,
+                         "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors"},
+                timeout=40_000,
+            )
+            if create_response.status != 201:
+                raise AssertionError(f"kill-target API failed: {create_response.status}")
+            kill_configured_id = create_response.json()["payload"]["tabs"][0]["id"]
+            page_two.locator(f'.workspace-tab[data-pane-id="{kill_configured_id}"]').wait_for(state="visible", timeout=20_000)
+            page_two.goto(f"{origin}/random/t/{urllib.parse.quote(kill_configured_id)}")
             page_two.locator(".workspace-tab-title", has_text="Kill Target").wait_for(
                 state="visible", timeout=20_000
             )

@@ -1124,25 +1124,65 @@ def main() -> None:
             wait_buffer(page_one, "RECONNECT_MARKER_1", timeout=20)
             checks["reconnect_resynchronization"] = True
 
-            page_one.get_by_role("button", name="New tab", exact=True).click()
-            dialog = page_one.locator("dialog.workspace-dialog")
-            dialog.wait_for(state="visible", timeout=5000)
-            dialog.locator('input[name="cwd"]').fill(str(ROOT))
-            dialog.locator('input[name="name"]').fill("Browser created")
-            dialog.locator('input[name="pinned"]').check()
-            dialog.get_by_role("button", name="Create tab").click()
+            page_one.evaluate("""() => {
+              const button = document.querySelector('.workspace-new-tab');
+              button.click(); button.click();
+            }""")
+            if page_one.locator('dialog[open]').count() or page_one.locator('input[name="cwd"]').count():
+                raise RuntimeError("New tab unexpectedly opened a configuration form")
             page_one.wait_for_url(re.compile(r"/random/t/td-e2e-1$"), timeout=15000)
-            page_one.locator('[data-pane-id="td-e2e-1"]').wait_for(state="visible", timeout=15000)
+            page_one.locator('.workspace-tab[data-pane-id="td-e2e-1"]').wait_for(state="visible", timeout=15000)
             wait_live(page_one, timeout=20)
             wait_buffer(page_one, "ALT_SCREEN_OK", timeout=20)
             row = sqlite_row(database, "td-e2e-1")
-            if not row or row["name"] != "Browser created" or row["pinned"] != 1:
+            if not row or row["cwd"] != str(browser_home) or row["pinned"] != 0:
                 raise RuntimeError(f"new tab registry state is wrong: {row}")
+            if (run_root / "counter").read_text() != "1":
+                raise RuntimeError("repeated New tab click created duplicate tabs")
             checks["new_tab"] = True
             checks["stable_tab_route"] = page_one.url.endswith("/random/t/td-e2e-1")
+            create_url = f"{origin}/_termdeck/api/v1/windows/random/tabs"
+            request_headers = {"Origin": origin, "Sec-Fetch-Site": "same-origin",
+                               "Sec-Fetch-Mode": "cors", "Content-Type": "application/json"}
+            rejected = page_one.context.request.post(create_url, data="{}", headers=request_headers)
+            if rejected.status != 403:
+                raise RuntimeError(f"new-tab mutation without CSRF returned {rejected.status}")
+            csrf = next(cookie["value"] for cookie in page_one.context.cookies() if cookie["name"] == "termdeck_csrf")
+            rejected = page_one.context.request.post(
+                create_url, data='{"cwd":"relative"}',
+                headers={**request_headers, "X-TermDeck-CSRF": csrf},
+            )
+            if rejected.status != 400:
+                raise RuntimeError(f"relative server cwd returned {rejected.status}")
+            checks["new_tab_csrf_and_cwd_denials"] = True
 
-            page_one.once("dialog", lambda prompt: prompt.accept("Renamed browser tab"))
+            page_one.locator('details.workspace-actions summary').click()
+            page_one.locator('.workspace-action-panel').get_by_role('button', name='Tab manager').click()
+            manager_dialog = page_one.locator('#management-dialog')
+            manager_dialog.wait_for(state='visible')
+            manager_dialog.locator('#management-title').click()
+            if not manager_dialog.is_visible():
+                raise RuntimeError('clicking inside the manager dismissed it')
+            page_one.mouse.click(5, 5)
+            manager_dialog.wait_for(state='hidden')
+            page_one.wait_for_timeout(300)
+            if manager_dialog.evaluate('dialog => dialog.open'):
+                raise RuntimeError(f"manager reopened after backdrop dismissal: {manager_dialog.locator('#management-title').inner_text()}")
+            checks['manager_backdrop_dismissal'] = True
+            page_one.locator('details.workspace-actions summary').click()
+            page_one.locator('.workspace-action-panel').get_by_role('button', name='Client files').click()
+            manager_dialog.wait_for(state='visible')
+            if manager_dialog.locator('#management-title').inner_text() != 'Client files':
+                raise RuntimeError('Client files popup did not open')
+            page_one.mouse.click(5, 5)
+            manager_dialog.wait_for(state='hidden')
+            checks['client_files_backdrop_dismissal'] = True
+
             click_action(page_one, "Rename tab")
+            action_dialog = page_one.locator("#workspace-action-dialog")
+            action_dialog.wait_for(state="visible")
+            action_dialog.locator('input[name="rename"]').fill("Renamed browser tab")
+            action_dialog.get_by_role("button", name="Save name").click()
             page_one.get_by_role("tab", name=re.compile("Renamed browser tab")).wait_for(timeout=15000)
             wait_until(
                 lambda: (sqlite_row(database, "td-e2e-1") or {}).get("name") == "Renamed browser tab",
@@ -1165,13 +1205,6 @@ def main() -> None:
                 "resumed tab in registry",
             )
             checks["resume_tab"] = True
-            click_action(page_one, "Unpin")
-            wait_until(
-                lambda: (sqlite_row(database, "td-e2e-1") or {}).get("pinned") == 0,
-                10,
-                "unpinned tab in registry",
-            )
-            checks["unpin_tab"] = True
             click_action(page_one, "Pin")
             wait_until(
                 lambda: (sqlite_row(database, "td-e2e-1") or {}).get("pinned") == 1,
@@ -1179,6 +1212,13 @@ def main() -> None:
                 "pinned tab in registry",
             )
             checks["pin_tab"] = True
+            click_action(page_one, "Unpin")
+            wait_until(
+                lambda: (sqlite_row(database, "td-e2e-1") or {}).get("pinned") == 0,
+                10,
+                "unpinned tab in registry",
+            )
+            checks["unpin_tab"] = True
 
             hidden_row = sqlite_row(database, "td-e2e-1")
             if not hidden_row:
@@ -1190,7 +1230,7 @@ def main() -> None:
                 10,
                 "hidden tab registry state",
             )
-            page_one.locator('[data-pane-id="td-e2e-1"]').wait_for(state="detached", timeout=15000)
+            page_one.locator('.workspace-tab[data-pane-id="td-e2e-1"]').wait_for(state="detached", timeout=15000)
             hidden_alive = subprocess.run(
                 ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", hidden_tmux],
                 check=False,
@@ -1201,29 +1241,38 @@ def main() -> None:
             if not hidden_alive:
                 raise RuntimeError("browser close killed the hidden terminal process")
             checks["hide_tab_preserves_process"] = True
-            checks["replacement_tab_selected"] = page_one.locator('[data-pane-id="td-fixture"]').count() == 1
+            checks["replacement_tab_selected"] = page_one.locator('.workspace-tab[data-pane-id="td-fixture"]').count() == 1
 
             page_one.get_by_role("button", name="New tab", exact=True).click()
-            kill_dialog = page_one.locator("dialog.workspace-dialog")
-            kill_dialog.wait_for(state="visible", timeout=5000)
-            kill_dialog.locator('input[name="cwd"]').fill(str(ROOT))
-            kill_dialog.locator('input[name="name"]').fill("Kill target")
-            kill_dialog.get_by_role("button", name="Create tab").click()
             page_one.wait_for_url(re.compile(r"/random/t/td-e2e-2$"), timeout=15000)
-            page_one.locator('[data-pane-id="td-e2e-2"]').wait_for(state="visible", timeout=15000)
+            page_one.locator('.workspace-tab[data-pane-id="td-e2e-2"]').wait_for(state="visible", timeout=15000)
             kill_row = sqlite_row(database, "td-e2e-2")
             if not kill_row:
                 raise RuntimeError("kill target was not created")
             kill_tmux = kill_row["tmux_name"]
-            page_one.once("dialog", lambda prompt: prompt.accept())
             click_action(page_one, "Kill process…")
+            action_dialog.wait_for(state="visible")
+            action_dialog.get_by_role("button", name="Cancel").click()
+            action_dialog.wait_for(state="hidden")
+            if (sqlite_row(database, "td-e2e-2") or {}).get("status") != "running":
+                raise RuntimeError("canceling Kill changed the disposable process")
+            click_action(page_one, "Kill process…")
+            action_dialog.wait_for(state="visible")
+            page_one.mouse.click(5, 5)
+            action_dialog.wait_for(state="hidden")
+            if (sqlite_row(database, "td-e2e-2") or {}).get("status") != "running":
+                raise RuntimeError("backdrop dismissal changed the disposable process")
+            checks["backdrop_dismisses_without_action"] = True
+            click_action(page_one, "Kill process…")
+            action_dialog.wait_for(state="visible")
+            action_dialog.get_by_role("button", name="Kill process", exact=True).click()
             wait_until(
                 lambda: (sqlite_row(database, "td-e2e-2") or {}).get("status") == "stopped"
                 and (sqlite_row(database, "td-e2e-2") or {}).get("visible") == 0,
                 10,
                 "killed tab registry state",
             )
-            page_one.locator('[data-pane-id="td-e2e-2"]').wait_for(state="detached", timeout=15000)
+            page_one.locator('.workspace-tab[data-pane-id="td-e2e-2"]').wait_for(state="detached", timeout=15000)
             killed_alive = subprocess.run(
                 ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", kill_tmux],
                 check=False,
@@ -1242,6 +1291,8 @@ def main() -> None:
                 checks["unauthenticated_redirect"] = any(
                     path in unauth_page.url for path in ("/_termdeck/login", "/_termdeck/setup")
                 )
+                denied = unauthenticated.request.post(create_url, data="{}", headers=request_headers)
+                checks["unauthenticated_new_tab_denied"] = denied.status == 401
             finally:
                 unauthenticated.close()
             if not checks["unauthenticated_redirect"]:

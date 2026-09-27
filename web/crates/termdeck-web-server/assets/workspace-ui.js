@@ -1,6 +1,5 @@
 "use strict";
 
-// Optional workspace tools stay outside the transport/terminal state machine.
 window.T1000UI = (() => {
   function element(tag, className, text) {
     const item = document.createElement(tag);
@@ -45,7 +44,6 @@ window.T1000UI = (() => {
     document.documentElement.style.setProperty("--td-ui-font", settings.uiFont || 'Cantarell, "Noto Sans", system-ui, sans-serif');
   }
   function renderHome(root, host, stale, appPath) {
-    // Keep the search field and keyboard focus intact across background refresh.
     let header = root.querySelector(".window-list-header");
     if (!header) {
       root.className = "window-list-main";
@@ -112,6 +110,7 @@ window.T1000UI = (() => {
     content.append(header, body);
     modal.append(content);
     root.append(modal);
+    window.T1000Backdrop(modal);
     let opener = null;
     let returnToTerminal = false;
     let generation = 0;
@@ -512,9 +511,8 @@ window.T1000UI = (() => {
   return { renderHome, attachWorkspace, preferences, applyChrome };
 })();
 
-// Management is deliberately separate from the low-latency terminal transport.
 window.T1000Management = (() => {
-  let api, workspace, dialog, body, heading, notice, opener, busy = false;
+  let api, workspace, dialog, body, heading, notice, opener, busy = false, dialogGeneration = 0;
   const el = (tag, cls = "", value) => {
     const node = document.createElement(tag); node.className = cls;
     if (value !== undefined) node.textContent = String(value);
@@ -522,7 +520,14 @@ window.T1000Management = (() => {
   };
   const button = (name, action, cls = "") => {
     const node = el("button", cls, name); node.type = "button";
-    node.addEventListener("click", () => Promise.resolve().then(action).catch(error => { if (!dialog.open) open("Action unavailable"); report(error.message); }));
+    node.addEventListener("click", () => {
+      const started = dialogGeneration;
+      Promise.resolve().then(action).catch(error => {
+        if (!dialog.open && dialogGeneration !== started) return;
+        if (!dialog.open) open("Action unavailable");
+        report(error.message);
+      });
+    });
     return node;
   };
   function report(message) { notice.textContent = message; notice.hidden = !message; }
@@ -536,6 +541,7 @@ window.T1000Management = (() => {
     }
     dialog.classList.toggle("manager-wide", wide);
     heading.textContent = title; body.replaceChildren(); report("");
+    dialogGeneration++;
     return true;
   }
   async function request(data) {
@@ -552,8 +558,6 @@ window.T1000Management = (() => {
     finally { busy = false; dialog.removeAttribute("aria-busy"); }
   }
   async function navigate(windowId, sessionId, expectedName) {
-    // Resolve the canonical route from the refreshed snapshot, never from a
-    // guessed title slug. Renames can change slugs, including collision suffixes.
     for (let attempt = 0; attempt < 24; attempt++) {
       const host = await api.snapshot();
       const win = host.windows.find(item => item.id === windowId && (!expectedName || item.name === expectedName));
@@ -699,7 +703,6 @@ window.T1000Management = (() => {
     if (rows.length > 128) throw new Error("Select no more than 128 tabs at a time.");
     const ids = rows.map(row => row.id);
     if (["pause", "pause-hot", "kill", "remove", "archive", "hide"].includes(action)) {
-      // A second native dialog keeps the manager selection/results intact.
       const confirm = el("dialog", "workspace-dialog management-confirm");
       const title = el("h2", "", `${action === "kill" ? "Stop processes" : action === "remove" ? "Remove saved records" : action === "pause-hot" ? "Pause hot processes" : action[0].toUpperCase() + action.slice(1)} — ${rows.length} tabs?`);
       title.id = "management-confirm-title"; confirm.setAttribute("aria-labelledby", title.id);
@@ -710,6 +713,7 @@ window.T1000Management = (() => {
         const cancel = button("Cancel", () => confirm.close("cancel"));
         const accept = button("Confirm", () => confirm.close("confirm"), ["kill", "remove"].includes(action) ? "danger" : "primary");
         controls.append(cancel, accept); confirm.append(title, description, list, controls); document.body.append(confirm);
+        window.T1000Backdrop(confirm);
         confirm.addEventListener("close", () => { const yes = confirm.returnValue === "confirm"; confirm.remove(); resolve(yes); }, {once: true});
         confirm.showModal(); cancel.focus();
       });
@@ -770,6 +774,7 @@ window.T1000Management = (() => {
       const cancel = button("Cancel", () => confirm.close("cancel"));
       controls.append(cancel, button("Send to selected terminals", () => confirm.close("send"), "primary"));
       confirm.append(title, summary, list, preview, controls); document.body.append(confirm);
+      window.T1000Backdrop(confirm);
       confirm.addEventListener("close", () => { const accepted = confirm.returnValue === "send"; confirm.remove(); resolve(accepted); }, {once: true});
       confirm.showModal(); cancel.focus();
     });
@@ -925,8 +930,9 @@ window.T1000Management = (() => {
     const header = el("div", "workspace-tools-heading"); header.append(heading, button("Close", () => { if (!busy && !dialog.querySelector('[data-uploading="true"]')) dialog.close(); }));
     body = el("div", "management-body"); notice = el("p", "management-notice"); notice.setAttribute("role", "status"); notice.hidden = true;
     dialog.append(header, notice, body); document.body.append(dialog);
+    window.T1000Backdrop(dialog, () => !busy && !dialog.querySelector('[data-uploading="true"]'));
     dialog.addEventListener("cancel", event => { if (busy || dialog.querySelector('[data-uploading="true"]')) event.preventDefault(); });
-    dialog.addEventListener("close", () => { if (opener?.isConnected) opener.focus(); });
+    dialog.addEventListener("close", () => { dialogGeneration++; if (opener?.isConnected) opener.focus(); });
   }
   function home(header) {
     const tools = el("div", "window-list-tools"); tools.append(button("New window", () => nameWindow(), "primary"), button("Client files", clientFiles), button("Codex accounts", accounts), button("Tab manager", manager)); header.append(tools);

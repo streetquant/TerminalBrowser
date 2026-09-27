@@ -1,5 +1,14 @@
 "use strict";
 
+window.T1000Backdrop = (dialog, mayClose = () => true) => {
+  dialog.addEventListener("click", (event) => {
+    if (event.target !== dialog || !mayClose()) return;
+    const bounds = dialog.getBoundingClientRect();
+    if (event.clientX < bounds.left || event.clientX > bounds.right
+        || event.clientY < bounds.top || event.clientY > bounds.bottom) dialog.close();
+  });
+};
+
 (() => {
   const root = document.getElementById("termdeck-app");
   if (!root || typeof window.fetch !== "function") {
@@ -1085,7 +1094,7 @@
     homeLink.title = "All t1000 windows";
     const newButton = node("button", "workspace-new-tab", "+");
     newButton.type = "button";
-    newButton.title = "New tab";
+    newButton.title = "New tab in the home directory";
     newButton.setAttribute("aria-label", "New tab");
     leftTools.append(homeLink, newButton);
     const titleGroup = node("div", "workspace-title-group");
@@ -1145,51 +1154,11 @@
     actionNotice.append(actionNoticeText, dismissNotice);
     shell.append(shellStatus, emptyNewButton, xtermShell, actionNotice);
 
-    const dialog = document.createElement("dialog");
-    dialog.className = "workspace-dialog";
-    const newForm = document.createElement("form");
-    newForm.method = "dialog";
-    const dialogTitle = node("h2", "", "New tab");
-    dialogTitle.id = "workspace-new-title";
-    dialog.setAttribute("aria-labelledby", dialogTitle.id);
-    const cwdInput = document.createElement("input");
-    cwdInput.name = "cwd";
-    cwdInput.required = true;
-    cwdInput.autocomplete = "off";
-    const nameInput = document.createElement("input");
-    nameInput.name = "name";
-    nameInput.autocomplete = "off";
-    const commandInput = document.createElement("input");
-    commandInput.name = "command";
-    commandInput.autocomplete = "off";
-    const pinnedInput = document.createElement("input");
-    pinnedInput.type = "checkbox";
-    pinnedInput.name = "pinned";
-    const dialogStatus = node("p", "workspace-dialog-status", "");
-    dialogStatus.setAttribute("role", "status");
-    const cancelButton = node("button", "secondary", "Cancel");
-    cancelButton.type = "button";
-    const createButton = node("button", "", "Create tab");
-    createButton.type = "submit";
-    const formActions = node("div", "workspace-dialog-actions");
-    formActions.append(cancelButton, createButton);
     function labeled(labelText, input) {
       const label = node("label", "workspace-field");
       label.append(node("span", "", labelText), input);
       return label;
     }
-    const pinLabel = node("label", "workspace-check");
-    pinLabel.append(pinnedInput, node("span", "", "Pin this tab"));
-    newForm.append(
-      dialogTitle,
-      labeled("Working directory", cwdInput),
-      labeled("Tab name (optional)", nameInput),
-      labeled("Command (optional)", commandInput),
-      pinLabel,
-      dialogStatus,
-      formActions,
-    );
-    dialog.append(newForm);
 
     const actionDialog = document.createElement("dialog");
     actionDialog.id = "workspace-action-dialog";
@@ -1215,7 +1184,8 @@
     actionButtons.append(actionCancel, actionConfirm);
     actionForm.append(actionTitle, actionDescription, renameField, actionButtons);
     actionDialog.append(actionForm);
-    for (const modal of [dialog, actionDialog]) {
+    for (const modal of [actionDialog]) {
+      window.T1000Backdrop(modal);
       modal.addEventListener("keydown", (event) => {
         if (event.key !== "Tab") return;
         const controls = [...modal.querySelectorAll("input:not(:disabled), button:not(:disabled)")];
@@ -1278,7 +1248,7 @@
       });
     }
 
-    root.replaceChildren(topbar, tabbar, shell, statusbar, dialog, actionDialog);
+    root.replaceChildren(topbar, tabbar, shell, statusbar, actionDialog);
 
     let envelope = null;
     let activePaneId = initialPaneId || "";
@@ -1532,7 +1502,7 @@ ${pane.cwd}`;
 
     async function runTabAction(action, targetPane = currentPane()) {
       const pane = targetPane;
-      if (!pane || !pane.sessionId || pendingAction || actionDialog.open || dialog.open) {
+      if (!pane || !pane.sessionId || pendingAction || actionDialog.open) {
         return;
       }
       const removedIndex = (action === "hide" || action === "kill") && envelope
@@ -1609,21 +1579,17 @@ ${pane.cwd}`;
     }
 
     async function createTab() {
-      if (createButton.disabled) {
+      if (pendingAction) {
         return;
       }
-      dialogStatus.textContent = "Creating…";
-      createButton.disabled = true;
-      const payload = {
-        cwd: cwdInput.value,
-        name: nameInput.value.trim() || null,
-        command: commandInput.value.trim() || null,
-        pinned: pinnedInput.checked,
-      };
+      pendingAction = "create";
+      newButton.disabled = true;
+      workspaceStatus.textContent = "Creating tab…";
+      renderActions();
       try {
         const result = await mutateJson(
           appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(routeSlug)}/tabs`),
-          payload,
+          {},
           180000,
         );
         const created = result.payload?.payload?.tabs?.[0]?.id;
@@ -1634,13 +1600,14 @@ ${pane.cwd}`;
         if (!visible) {
           throw new Error("The new tab did not appear in the live window snapshot.");
         }
-        dialog.close();
-        newForm.reset();
         switchPane(created, true);
       } catch (error) {
-        dialogStatus.textContent = errorMessage(error);
+        actionNoticeText.textContent = `Could not create tab. ${errorMessage(error)}`;
+        actionNotice.hidden = false;
       } finally {
-        createButton.disabled = false;
+        pendingAction = "";
+        newButton.disabled = false;
+        renderActions();
       }
     }
 
@@ -1726,18 +1693,9 @@ ${pane.cwd}`;
     }
 
     newButton.addEventListener("click", () => {
-      if (dialog.open || actionDialog.open || pendingAction) {
+      if (actionDialog.open || pendingAction) {
         return;
       }
-      const pane = currentPane();
-      cwdInput.value = pane?.cwd || "/";
-      dialogStatus.textContent = "";
-      dialog.showModal();
-      window.setTimeout(() => cwdInput.focus(), 0);
-    });
-    cancelButton.addEventListener("click", () => dialog.close());
-    newForm.addEventListener("submit", (event) => {
-      event.preventDefault();
       createTab();
     });
     function orderedPaneIds() {
@@ -1755,7 +1713,7 @@ ${pane.cwd}`;
     }
 
     window.addEventListener("keydown", (event) => {
-      if (event.defaultPrevented || dialog.open || actionDialog.open || workspaceTools.isOpen()) {
+      if (event.defaultPrevented || actionDialog.open || workspaceTools.isOpen()) {
         return;
       }
       if (event.ctrlKey && event.altKey && event.key.toLowerCase() === "t") {
