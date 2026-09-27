@@ -2017,6 +2017,61 @@ def _copy(
     )
 
 
+def _stage_cargo_binary(binary: Path, cargo_target: Path, destination: Path) -> str:
+    """Detach Cargo's verified executable/deps hardlink pair before publication."""
+
+    binary = _publication_path(binary, label="Cargo executable")
+    if binary != cargo_target / "release/termdeck-web-server":
+        raise WebActivationError("Cargo executable is outside its private build output")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(binary, flags)
+    except OSError as exc:
+        raise WebActivationError("Cargo executable is unavailable") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or not stat.S_IMODE(before.st_mode) & 0o111
+            or before.st_nlink not in (1, 2)
+        ):
+            raise WebActivationError("Cargo executable has an unexpected file identity")
+        if before.st_nlink == 2:
+            peers = []
+            for candidate in (cargo_target / "release/deps").iterdir():
+                if not candidate.name.startswith("termdeck_web_server-"):
+                    continue
+                peer = candidate.lstat()
+                if stat.S_ISREG(peer.st_mode) and (peer.st_dev, peer.st_ino) == (before.st_dev, before.st_ino):
+                    peers.append(candidate)
+            if len(peers) != 1:
+                raise WebActivationError("Cargo executable hardlink is not its build artifact")
+        if before.st_size > 16 * 1024 * 1024:
+            raise WebActivationError("Cargo executable exceeds activation publication capacity")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            content = stream.read(before.st_size + 1)
+        after = os.fstat(descriptor)
+        named = binary.lstat()
+        if len(content) != before.st_size or (
+            before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+            before.st_gid, before.st_nlink, before.st_size, before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+            after.st_gid, after.st_nlink, after.st_size, after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise WebActivationError("Cargo executable changed during staging")
+        if (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino):
+            raise WebActivationError("Cargo executable path changed during staging")
+    finally:
+        os.close(descriptor)
+    _atomic(destination, content, 0o755)
+    return hashlib.sha256(content).hexdigest()
+
+
 def _watchdog_unit(
     paths: ActivationPaths, tx: Path, *, recovery_command: Sequence[str] | None = None,
 ) -> str:
@@ -2175,6 +2230,7 @@ def prepare(
         })
         _persist(paths, tx, receipt, "building-web")
         cargo_target = artifacts / "cargo-target"
+        staged_binary = artifacts / "web/termdeck-web-server"
         current_web_tree = _web_source_tree(paths, source["commit"])
         if reuse_web_binary is not None:
             reuse_web_binary = reuse_web_binary.resolve()
@@ -2193,6 +2249,7 @@ def prepare(
                 "current_source_tree": current_web_tree,
                 "sha256": _sha(reuse_web_binary),
             }
+            _copy(binary, staged_binary, 0o755)
         else:
             environment = dict(os.environ)
             environment["CARGO_TARGET_DIR"] = str(cargo_target)
@@ -2202,14 +2259,14 @@ def prepare(
             if not binary.is_file() or not os.access(binary, os.X_OK):
                 raise WebActivationError("staged web build did not produce an executable")
             _run([str(binary), "--help"], cwd=paths.target / "web", timeout=30)
+            binary_sha256 = _stage_cargo_binary(binary, cargo_target, staged_binary)
             receipt["web_binary"] = {
                 "reused": False,
                 "source_commit": source["commit"],
                 "source_tree": current_web_tree,
                 "current_source_tree": current_web_tree,
-                "sha256": _sha(binary),
+                "sha256": binary_sha256,
             }
-        _copy(binary, artifacts / "web/termdeck-web-server", 0o755)
         staged_runtime, staged_units = tx / "staged-runtime", tx / "staged-units"
         for relative, (source_path, mode) in _sources(paths, tx).items():
             _source_path, source_capture = _read_regular(

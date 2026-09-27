@@ -4038,3 +4038,35 @@ def test_managed_release_identity_rejects_a_dangling_state_symlink(tmp_path: Pat
 
     with pytest.raises(activation.WebActivationError):
         activation._managed_release_id(paths)
+
+
+def test_stage_cargo_binary_accepts_only_its_private_build_hardlink(tmp_path: Path) -> None:
+    cargo_target = tmp_path / "cargo-target"
+    release = cargo_target / "release"
+    deps = release / "deps"
+    deps.mkdir(parents=True)
+    binary = release / "termdeck-web-server"
+    binary.write_bytes(b"#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    peer = deps / "termdeck_web_server-test"
+    os.link(binary, peer)
+    staged = tmp_path / "staged" / "termdeck-web-server"
+
+    digest = activation._stage_cargo_binary(binary, cargo_target, staged)
+
+    assert digest == hashlib.sha256(binary.read_bytes()).hexdigest()
+    assert staged.read_bytes() == binary.read_bytes()
+    assert staged.stat().st_nlink == 1
+    assert staged.stat().st_ino != binary.stat().st_ino
+    assert stat.S_IMODE(staged.stat().st_mode) == 0o755
+
+    peer.unlink()
+    outsider = tmp_path / "foreign-hardlink"
+    os.link(binary, outsider)
+    with pytest.raises(activation.WebActivationError, match="not its build artifact"):
+        activation._stage_cargo_binary(binary, cargo_target, tmp_path / "bad")
+
+    binary.unlink()
+    binary.symlink_to(outsider)
+    with pytest.raises(activation.WebActivationError):
+        activation._stage_cargo_binary(binary, cargo_target, tmp_path / "symlink-bad")
