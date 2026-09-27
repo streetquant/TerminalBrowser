@@ -2455,6 +2455,54 @@ def _rollback_publication_journal_path(path: Path, tx: Path) -> Path:
     return forward.with_name(forward.stem + "-rollback.json")
 
 
+def _checkpoint_rollback_recovery(
+    record: dict[str, object],
+    publication: release_manager.PublicationTransactionReceipt,
+    *,
+    journal: Path,
+    journal_identity: release_manager._FileIdentity,
+    parent_guards: object,
+    before_images: Mapping[Path, Mapping[str, object]],
+    checkpoint: Callable[[], None] | None,
+) -> None:
+    """Bind the exact recovered B before its inverse journal can be retired."""
+
+    path = _record_target(record)
+    value = record.get("rollback_publication")
+    if not isinstance(value, dict):
+        raise WebActivationError("activation rollback recovery lost its intent")
+    recovered = _release_publication_receipt_payload(publication)
+    if (
+        publication.state != "recovered"
+        or publication.journal_path != journal
+        or not _same_publication_journal_inode(publication.journal_identity, journal_identity)
+        or publication.parent_guards != parent_guards
+        or _release_publication_image_map(recovered, "preimages") != before_images
+        or set(before_images) != {path}
+        or set(publication.postimages) != {path}
+    ):
+        raise WebActivationError("activation rollback recovery callback changed")
+    previous_recovery = value.get("recovery")
+    if previous_recovery is not None and (
+        not isinstance(previous_recovery, Mapping)
+        or not _same_release_publication_handoff(previous_recovery, recovered)
+    ):
+        raise WebActivationError("activation rollback recovered postimage changed")
+    restored = publication.postimages[path]
+    if (
+        not restored.snapshot.exists or restored.identity is None
+        or restored.snapshot.mode != before_images[path].get("mode")
+        or restored.sha256 != before_images[path].get("sha256")
+    ):
+        raise WebActivationError("activation rollback recovery lost its B postimage")
+    record["postimage"] = _postimage_payload(path, restored, parent_guards)
+    record.pop("rollback_postimage", None)
+    value["state"] = "recovered"
+    value["recovery"] = recovered
+    if checkpoint is not None:
+        checkpoint()
+
+
 def _recover_record_rollback_publication(
     record: dict[str, object],
     tx: Path,
@@ -2533,31 +2581,10 @@ def _recover_record_rollback_publication(
 
     def after_recovery(publication: release_manager.PublicationTransactionReceipt) -> None:
         nonlocal callback_fired
-        recovered = _release_publication_receipt_payload(publication)
-        if (
-            publication.state != "recovered"
-            or publication.journal_path != journal
-            or not _same_publication_journal_inode(publication.journal_identity, journal_identity)
-            or publication.parent_guards != parent_guards
-            or _release_publication_image_map(recovered, "preimages") != before_images
-            or set(publication.postimages) != {path}
-        ):
-            raise WebActivationError("activation rollback recovery callback changed")
-        previous_recovery = value.get("recovery")
-        if previous_recovery is not None and (
-            not isinstance(previous_recovery, Mapping)
-            or not _same_release_publication_handoff(previous_recovery, recovered)
-        ):
-            raise WebActivationError("activation rollback recovered postimage changed")
-        restored = publication.postimages[path]
-        if not restored.snapshot.exists or restored.identity is None:
-            raise WebActivationError("activation rollback recovery lost its B postimage")
-        record["postimage"] = _postimage_payload(path, restored, parent_guards)
-        record.pop("rollback_postimage", None)
-        value["state"] = "recovered"
-        value["recovery"] = recovered
-        if checkpoint is not None:
-            checkpoint()
+        _checkpoint_rollback_recovery(
+            record, publication, journal=journal, journal_identity=journal_identity,
+            parent_guards=parent_guards, before_images=before_images, checkpoint=checkpoint,
+        )
         callback_fired = True
 
     _journal_path, current_journal = _capture_anchored(
@@ -2614,8 +2641,8 @@ def _recover_record_publication(
     tx: Path,
     *,
     checkpoint: Callable[[], None] | None = None,
-) -> None:
-    """Resolve a retained inner journal before accepting an outer leaf state."""
+) -> release_manager._AnchoredFileSnapshot | None:
+    """Resolve a bound journal, or return the exact untouched A for revalidation."""
 
     _recover_record_rollback_publication(record, tx, checkpoint=checkpoint)
     path = _record_target(record)
@@ -2688,7 +2715,7 @@ def _recover_record_publication(
         raise WebActivationError("activation publication intent journal identity is invalid")
 
     # The journal is in the target's anchored parent.  A dangling/symlinked
-    # candidate is handed to the release-manager parser, which fails closed.
+    # candidate fails the anchored capture before any recovery decision.
     _journal_path, journal_capture = _capture_anchored(
         journal,
         label="activation publication journal",
@@ -2698,8 +2725,20 @@ def _recover_record_publication(
         if journal_identity is None:
             # ``before_publish`` has not durably returned, so no public B
             # rename was authorized.  Do not adopt or replay an unbound
-            # journal name; an exact preimage below is still safe to leave
-            # alone, while any visible B fails closed.
+            # journal name.  Only an untouched preimage with no contradictory
+            # publication ownership is safe to leave alone.  Unlike a bound
+            # tombstone inverse, no authorized rename can explain ctime drift.
+            if (
+                postimage is None
+                and record.get("rollback_postimage") is None
+                and record.get("rollback_publication") is None
+            ):
+                _path, current = _capture_anchored(
+                    path, label="activation unpublished target", parent_guards=parent_guards,
+                )
+                preimage = _receipt_preimage(record, tx)
+                if current == preimage:
+                    return preimage
             raise WebActivationError("activation publication journal was not receipt-bound before publication")
         if (
             journal_capture.identity is None
@@ -2857,7 +2896,7 @@ def _restore(
 ) -> str:
     path = _record_target(record)
     parent_guards = _record_parent_guards(record, path)
-    _recover_record_publication(record, tx, checkpoint=checkpoint)
+    unpublished_preimage = _recover_record_publication(record, tx, checkpoint=checkpoint)
     _path, current = _capture_anchored(
         path,
         label="activation rollback target",
@@ -2866,6 +2905,12 @@ def _restore(
     preimage = _receipt_preimage(record, tx)
     if not isinstance(current, release_manager._AnchoredFileSnapshot):  # defensive narrowing
         raise WebActivationError("invalid anchored activation file capture")
+    if unpublished_preimage is not None:
+        # Preserve the stricter no-publication proof across the outer read;
+        # generic authenticated tombstone recovery below may tolerate ctime.
+        if current != unpublished_preimage or preimage != unpublished_preimage:
+            raise WebActivationError(f"activation unpublished target changed before rollback: {path}")
+        return "already-restored"
     # A generic publication journal can restore its original A tombstone with
     # the same inode (ctime changes on the rename).  A direct outer rollback
     # records the new A identity while that journal is still active.  Neither
@@ -2945,6 +2990,32 @@ def _restore(
         if checkpoint is not None:
             checkpoint()
 
+    def checkpoint_recovered(publication: release_manager.PublicationTransactionReceipt) -> None:
+        # A callback exception can make the inner inverse compensate locally
+        # back to B.  Keep that B's new exact identity durable before the inner
+        # journal is retired, using the same checks as restart recovery.
+        value = record.get("rollback_publication")
+        if not isinstance(value, dict) or not isinstance(value.get("receipt"), Mapping):
+            raise WebActivationError("activation rollback recovery lost its intent")
+        intent = value["receipt"]
+        identity = _file_identity_from_payload(intent.get("journal_identity"))
+        before_images = {path: _release_publication_snapshot_payload(path, expected_postimage)}
+        if (
+            value.get("schema") != "termdeck.web-activation-file-rollback.v1"
+            or value.get("state") not in {"intent", "published"}
+            or intent.get("state") != value["state"]
+            or intent.get("journal_path") != str(journal)
+            or identity is None
+            or _release_publication_parent_guards_from_payload(intent.get("parents")) != parent_guards
+            or _release_publication_image_map(intent, "preimages") != before_images
+            or not _outer_postimage_matches_release_image(path, record.get("postimage"), before_images[path])
+        ):
+            raise WebActivationError("activation rollback recovery intent changed")
+        _checkpoint_rollback_recovery(
+            record, publication, journal=journal, journal_identity=identity,
+            parent_guards=parent_guards, before_images=before_images, checkpoint=checkpoint,
+        )
+
     try:
         release_manager._publish_files_transactionally(
             ((
@@ -2958,6 +3029,7 @@ def _restore(
             journal_path=journal,
             before_publish=checkpoint_intent,
             after_publish=checkpoint_restored,
+            after_recovery=checkpoint_recovered,
         )
     except release_manager.ReleaseError as exc:
         raise WebActivationError(str(exc)) from exc

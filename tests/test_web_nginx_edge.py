@@ -148,9 +148,12 @@ def edge(tmp_path_factory):
         command = [str(NGINX), "-p", str(runtime / "nginx") + "/", "-c", str(config)]
         subprocess.run([*command, "-t"], check=True, capture_output=True, timeout=10)
         context = ssl.create_default_context(cafile=str(certificate))
+        (runtime / "bootstrap.html").write_text("disposable bootstrap fixture")
+        (runtime / "tls/ca.crt").write_bytes(certificate.read_bytes())
 
-        def request(path, *, host=PUBLIC_HOST, method="GET", headers=None):
-            connection = http.client.HTTPSConnection("127.0.0.1", port, timeout=5, context=context)
+        def request(path, *, host=PUBLIC_HOST, method="GET", headers=None, source_address="127.0.0.1"):
+            connection = http.client.HTTPSConnection("127.0.0.1", port, timeout=5, context=context,
+                                                    source_address=(source_address, 0))
             try:
                 connection.request(method, path, headers={"Host": host, **(headers or {})})
                 response = connection.getresponse()
@@ -178,6 +181,57 @@ def edge(tmp_path_factory):
         backend.shutdown()
         backend.server_close()
         worker.join(timeout=3)
+
+
+@pytest.mark.parametrize("claimed_peer", (None, "127.0.0.1", "192.168.1.10"))
+@pytest.mark.parametrize("path,method", (
+    ("/t1000", "GET"),
+    ("/t1000/", "GET"),
+    ("/t1000/_termdeck/fixture", "GET"),
+    ("/t1000/_termdeck/fixture", "POST"),
+    ("/_termdeck/fixture", "GET"),
+    ("/_termdeck/fixture", "POST"),
+    ("/_termdeck/bootstrap", "GET"),
+    ("/_termdeck/lan-ca.crt", "GET"),
+    ("/t1000/_termdeck/ws/fixture", "GET"),
+    ("/_termdeck/ws/fixture", "GET"),
+))
+def test_unlisted_connection_peer_is_refused_before_any_route(edge, claimed_peer, path, method):
+    # Linux loopback provides a real distinct TCP peer without changing host
+    # interfaces, routes or firewall state. The production peer gate is intact.
+    headers = {"Origin": "https://" + PUBLIC_HOST, "Sec-Fetch-Site": "same-origin",
+               "Sec-Fetch-Mode": "cors"}
+    if "/ws/" in path:
+        headers.update({"Sec-Fetch-Mode": "websocket", "Upgrade": "websocket",
+                        "Connection": "Upgrade", "Sec-WebSocket-Version": "13",
+                        "Sec-WebSocket-Key": "ZGlzcG9zYWJsZS10ZXN0IQ=="})
+    if claimed_peer is not None:
+        headers.update({"X-Forwarded-For": claimed_peer, "X-Real-IP": claimed_peer,
+                        "CF-Connecting-IP": claimed_peer, "Forwarded": "for=" + claimed_peer})
+    before = len(edge.requests)
+    response = edge.request(path, method=method, headers=headers, source_address="127.0.0.2")
+    assert response.status == 403
+    assert response.location is None
+    assert len(edge.requests) == before
+
+
+def test_loopback_tunnel_peer_is_admitted_with_external_client_headers(edge):
+    response = edge.request("/t1000/_termdeck/fixture", source_address="127.0.0.1", headers={
+        "X-Forwarded-For": "198.51.100.23", "X-Real-IP": "198.51.100.23",
+        "CF-Connecting-IP": "198.51.100.23", "Forwarded": "for=198.51.100.23"})
+    assert response.status == 200
+    headers = json.loads(response.body)["headers"]
+    assert headers["x-forwarded-for"] == "127.0.0.1"
+    assert headers["x-real-ip"] == "127.0.0.1"
+
+
+@pytest.mark.parametrize("path", ("/_termdeck/bootstrap", "/_termdeck/lan-ca.crt"))
+def test_loopback_peer_retains_static_bootstrap_and_ca_access(edge, path):
+    response = edge.request(path, source_address="127.0.0.1")
+    assert response.status == 200
+    expected = (b"disposable bootstrap fixture" if path.endswith("bootstrap")
+                else edge.certificate.read_bytes())
+    assert response.body == expected
 
 
 @pytest.mark.parametrize("authority", (PUBLIC_HOST, PUBLIC_HOST + ":443", "127.0.0.1:{port}"))

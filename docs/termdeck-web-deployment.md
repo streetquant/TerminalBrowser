@@ -148,6 +148,25 @@ the checkout. Saved sessions, authentication and unrelated services are outside
 this path migration. Source/disposable tests do not prove host activation or
 live rollback acceptance.
 
+### Executable publication and interrupted preparation
+
+Publication journals store immutable file payloads once and append compact
+state records on the same journal inode. Limits are 16 MiB per file, 32 MiB of
+decoded preimage/postimage data and 64 MiB for the complete journal. Capacity
+is checked before publication; an oversized transaction must fail without
+replacing its destinations. Existing journals remain readable for recovery.
+Restart recovery removes an incomplete trailing frame only from the exact
+authenticated journal inode, preserving every complete frame and immutable
+payload. A compensated inverse checkpoints its restored identity before its
+journal is retired, so a later retry can establish ownership again.
+
+If journal initialization stops before its identity is bound to the activation
+receipt, rollback may leave the original destination in place only after
+checking its complete recorded identity, metadata and content again. An
+unbound journal is retained untouched. A replacement inode, changed metadata,
+or an unowned postimage requires investigation; do not delete the journal or
+edit the receipt to make recovery proceed.
+
 ## Cloudflare
 
 The selected public endpoint is `https://maxchat.semiotech.org/t1000/`, using
@@ -161,6 +180,23 @@ The selected access policy uses TermDeck login only. An additional Cloudflare
 Access login is not configured for this hostname. Invitations, device approval,
 session expiry and revocation remain controlled by TermDeck; preserve unrelated
 Cloudflare Access applications on other hostnames.
+
+The qualified origin peer allowlist admits `127.0.0.1` for the tunnel and
+`192.168.1.0/24` for the current LAN. nginx checks the socket peer before
+redirecting or forwarding requests; forwarded client-IP headers cannot grant
+admission. A LAN subnet change requires updating and qualifying this allowlist.
+This restricts HTTP and terminal control, while port 7443 still listens for
+LAN TLS connections. It does not prove that outside clients cannot reach the
+TCP port or that a router cannot translate an external source into a LAN peer;
+retain the separate router and outside-LAN validation gates.
+
+To check managed edge TLS, select `semiotech.org` in Cloudflare and open
+**SSL/TLS → Edge Certificates**. A **Disable Universal SSL** action means the
+setting is enabled; leave it enabled. Check that a Universal certificate is
+Active and covers the selected hostname, normally through `*.semiotech.org`.
+A successful public TLS handshake proves current trust, not that dashboard
+setting or a future renewal. Keep any denied settings API read explicit in
+the evidence rather than inferring renewal from the certificate issuer.
 
 The route verifies local origin TLS using the t1000 LAN CA and supplies the
 `/t1000` prefix contract for redirects, forms, assets, cookies and WSS. nginx

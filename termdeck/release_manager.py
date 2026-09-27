@@ -103,12 +103,19 @@ _PUBLICATION_EINTR_RETRIES = 8
 _PUBLICATION_JOURNAL_SCHEMA = "t1000.publication-transaction.v1"
 _PUBLICATION_JOURNAL_PREFIX = ".termdeck-publication-"
 _PUBLICATION_JOURNAL_SUFFIX = ".json"
-# Each append-only frame contains the complete authenticated preimage set, so
-# a multi-wrapper publication legitimately accumulates several frames.  Bound
-# a single frame tightly enough to reject a malicious giant record, while
-# allowing the complete durable log to hold its ordered recovery history.
+# State frames remain bounded independently of immutable executable bytes.
+# V2 stores those bytes once in the same journal inode, before its first state
+# frame. V1 journals with repeated inline base64 remain readable/recoverable.
 _MAX_PUBLICATION_JOURNAL_FRAME_BYTES = 8 * 1024 * 1024
 _MAX_PUBLICATION_JOURNAL_BYTES = 64 * 1024 * 1024
+_PUBLICATION_COMPACT_JOURNAL_SCHEMA = "t1000.publication-transaction.v2"
+_PUBLICATION_PAYLOAD_SCHEMA = "t1000.publication-payloads.v1"
+_PUBLICATION_PAYLOAD_PREFIX = b"TDP1:"
+_MAX_PUBLICATION_PAYLOAD_FILE_BYTES = 16 * 1024 * 1024
+_MAX_PUBLICATION_PAYLOAD_BYTES = 32 * 1024 * 1024
+_MAX_PUBLICATION_PAYLOAD_MANIFEST_BYTES = 64 * 1024
+_MAX_PUBLICATION_RECORDS = 64
+_PUBLICATION_IMMUTABLE_RECORD_FIELDS = ("path", "name", "mode", "label", "snapshot", "content_ref")
 # A release install and its inverse must never reuse a fixed journal pathname.
 # Activation keeps the exact journal inode in its outer durable receipt.  If an
 # ordinary install cleaned its terminal journal and a later B-to-A rollback
@@ -2183,14 +2190,29 @@ def _journal_file_identity_from_payload(value: object, *, label: str) -> _FileId
     return identity
 
 
-def _journal_snapshot_payload(snapshot: _AnchoredFileSnapshot) -> dict[str, object]:
+def _journal_payload_reference(content: bytes | None, payloads: Mapping[str, bytes]) -> object:
+    if content is None:
+        return None
+    digest = sha256_bytes(content)
+    if payloads.get(digest) != content:
+        raise ReleaseError("publication immutable payload changed")
+    return {"sha256": digest, "size": len(content)}
+
+
+def _journal_snapshot_payload(
+    snapshot: _AnchoredFileSnapshot, *, payloads: Mapping[str, bytes] | None = None,
+) -> dict[str, object]:
     value: dict[str, object] = {
         "exists": snapshot.snapshot.exists,
         "mode": snapshot.snapshot.mode,
         "identity": _journal_file_identity_payload(snapshot.identity),
         "sha256": snapshot.sha256,
     }
-    if snapshot.snapshot.exists:
+    if payloads is not None:
+        value["content_ref"] = _journal_payload_reference(
+            snapshot.snapshot.content if snapshot.snapshot.exists else None, payloads,
+        )
+    elif snapshot.snapshot.exists:
         value["content_b64"] = base64.b64encode(snapshot.snapshot.content).decode("ascii")
     else:
         value["content_b64"] = None
@@ -2275,18 +2297,20 @@ def _journal_directory_guards_from_payload(value: object) -> _PublicationParentG
     return _PublicationParentGuards(tuple(guards))
 
 
-def _journal_record_payload(record: _PublicationRecord) -> dict[str, object]:
-    return {
+def _journal_record_payload(
+    record: _PublicationRecord, *, payloads: Mapping[str, bytes] | None = None,
+) -> dict[str, object]:
+    value = {
         "path": str(record.path),
         "name": record.name,
         "content_b64": (
             base64.b64encode(record.content).decode("ascii")
-            if record.content is not None
+            if record.content is not None and payloads is None
             else None
         ),
         "mode": record.mode,
         "label": record.label,
-        "snapshot": _journal_snapshot_payload(record.snapshot),
+        "snapshot": _journal_snapshot_payload(record.snapshot, payloads=payloads),
         "staged_name": record.staged_name,
         "staged_identity": _journal_file_identity_payload(record.staged_identity),
         "quarantine_name": record.quarantine_name,
@@ -2300,6 +2324,250 @@ def _journal_record_payload(record: _PublicationRecord) -> dict[str, object]:
         "deleted": record.deleted,
         "phase": record.phase,
     }
+    if payloads is not None:
+        del value["content_b64"]
+        value["content_ref"] = _journal_payload_reference(record.content, payloads)
+    return value
+
+
+def _publication_payloads(records: Sequence[_PublicationRecord]) -> dict[str, bytes]:
+    """Bound logical decoded bytes, including repeated references, before writing."""
+    if not 0 < len(records) <= _MAX_PUBLICATION_RECORDS:
+        raise ReleaseError("publication journal record capacity exceeded before mutation")
+    result: dict[str, bytes] = {}
+    total = 0
+    for record in records:
+        for content in (record.content, record.snapshot.snapshot.content if record.snapshot.snapshot.exists else None):
+            if content is None:
+                continue
+            total += len(content)
+            if len(content) > _MAX_PUBLICATION_PAYLOAD_FILE_BYTES or total > _MAX_PUBLICATION_PAYLOAD_BYTES:
+                raise ReleaseError("publication journal decoded payload capacity exceeded before mutation")
+            digest = sha256_bytes(content)
+            if digest in result and result[digest] != content:
+                raise ReleaseError("publication payload digest collision")
+            result[digest] = content
+    return result
+
+
+def _publication_payload_manifest(payloads: Mapping[str, bytes], context: Mapping[str, object]) -> bytes:
+    return canonical_json_bytes({
+        "schema": _PUBLICATION_PAYLOAD_SCHEMA,
+        "blobs": [{"sha256": digest, "size": len(content)} for digest, content in sorted(payloads.items())],
+        "context": context,
+    })
+
+
+def _publication_payload_prefix(payloads: Mapping[str, bytes], context: Mapping[str, object]) -> bytes:
+    manifest = _publication_payload_manifest(payloads, context)
+    if len(manifest) > _MAX_PUBLICATION_PAYLOAD_MANIFEST_BYTES:
+        raise ReleaseError("publication payload manifest capacity exceeded before mutation")
+    return b"".join((
+        _PUBLICATION_PAYLOAD_PREFIX, f"{len(manifest):08x}:".encode("ascii"),
+        sha256_bytes(manifest).encode("ascii"), b"\n", manifest,
+        *(content for _digest, content in sorted(payloads.items())),
+    ))
+
+
+def _publication_read_payload_prefix(
+    content: bytes,
+) -> tuple[dict[str, bytes] | None, dict[str, object] | None, str | None, int]:
+    if not content.startswith(_PUBLICATION_PAYLOAD_PREFIX):
+        return None, None, None, 0
+    header = len(_PUBLICATION_PAYLOAD_PREFIX) + 8 + 1 + 64 + 1
+    if len(content) < header:
+        raise ReleaseError("publication payload prefix is truncated")
+    start = len(_PUBLICATION_PAYLOAD_PREFIX)
+    size_raw = content[start:start + 8]
+    digest_raw = content[start + 9:header - 1]
+    if (re.fullmatch(rb"[0-9a-f]{8}", size_raw) is None
+            or content[start + 8:start + 9] != b":" or content[header - 1:header] != b"\n"
+            or re.fullmatch(rb"[0-9a-f]{64}", digest_raw) is None):
+        raise ReleaseError("publication payload prefix is malformed")
+    size = int(size_raw, 16)
+    if not 0 < size <= _MAX_PUBLICATION_PAYLOAD_MANIFEST_BYTES:
+        raise ReleaseError("publication payload manifest capacity exceeded")
+    raw = content[header:header + size]
+    if len(raw) != size or sha256_bytes(raw).encode("ascii") != digest_raw:
+        raise ReleaseError("publication payload manifest is truncated or changed")
+    try:
+        manifest = json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise ReleaseError("publication payload manifest is malformed") from None
+    if (not isinstance(manifest, dict) or set(manifest) != {"schema", "blobs", "context"}
+            or manifest["schema"] != _PUBLICATION_PAYLOAD_SCHEMA or canonical_json_bytes(manifest) != raw
+            or not isinstance(manifest["blobs"], list) or len(manifest["blobs"]) > 2 * _MAX_PUBLICATION_RECORDS):
+        raise ReleaseError("publication payload manifest is malformed")
+    context = manifest["context"]
+    if (not isinstance(context, dict) or set(context) != {"journal_parent", "parents", "records"}
+            or not isinstance(context["records"], list)
+            or not 0 < len(context["records"]) <= _MAX_PUBLICATION_RECORDS
+            or any(not isinstance(row, dict) or set(row) != set(_PUBLICATION_IMMUTABLE_RECORD_FIELDS)
+                   for row in context["records"])):
+        raise ReleaseError("publication immutable context is malformed")
+    payloads: dict[str, bytes] = {}
+    offset, total, previous = header + size, 0, ""
+    for item in manifest["blobs"]:
+        if not isinstance(item, dict) or set(item) != {"sha256", "size"}:
+            raise ReleaseError("publication payload descriptor is malformed")
+        digest, length = item["sha256"], item["size"]
+        if (not isinstance(digest, str) or _RELEASE_ID.fullmatch(digest) is None or digest <= previous
+                or type(length) is not int or not 0 <= length <= _MAX_PUBLICATION_PAYLOAD_FILE_BYTES):
+            raise ReleaseError("publication payload descriptor is malformed or repeated")
+        total += length
+        if total > _MAX_PUBLICATION_PAYLOAD_BYTES:
+            raise ReleaseError("publication decoded payload capacity exceeded")
+        raw = content[offset:offset + length]
+        if len(raw) != length or sha256_bytes(raw) != digest:
+            raise ReleaseError("publication immutable payload is truncated or changed")
+        payloads[digest] = raw
+        offset += length
+        previous = digest
+    return payloads, context, digest_raw.decode("ascii"), offset
+
+
+def _publication_immutable_context(payload: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "journal_parent": payload["journal_parent"], "parents": payload["parents"],
+        "records": [{key: row[key] for key in _PUBLICATION_IMMUTABLE_RECORD_FIELDS}
+                    for row in payload["records"]],
+    }
+
+
+def _publication_compact_state(payload: Mapping[str, object]) -> dict[str, object]:
+    return {
+        **{key: value for key, value in payload.items() if key not in {"journal_parent", "parents", "records"}},
+        "records": [{key: value for key, value in row.items() if key not in _PUBLICATION_IMMUTABLE_RECORD_FIELDS}
+                    for row in payload["records"]],
+    }
+
+
+def _publication_expand_references(
+    payload: Mapping[str, object], payloads: Mapping[str, bytes], context: Mapping[str, object],
+    manifest_digest: str, *, hydrate: bool,
+) -> dict[str, object]:
+    expected = {"schema", "generation", "state", "records", "payloads_sha256"}
+    if (set(payload) != expected or payload.get("schema") != _PUBLICATION_COMPACT_JOURNAL_SCHEMA
+            or payload.get("payloads_sha256") != manifest_digest
+            or not isinstance(payload.get("records"), list)
+            or len(payload["records"]) != len(context["records"])):
+        raise ReleaseError("publication compact state is malformed or has changed payload binding")
+    total = 0
+    used: set[str] = set()
+
+    def expand(container: dict[str, object]) -> None:
+        nonlocal total
+        if "content_ref" not in container or "content_b64" in container:
+            raise ReleaseError("publication payload reference is malformed")
+        reference = container.pop("content_ref")
+        raw = None
+        if reference is not None:
+            if (not isinstance(reference, dict) or set(reference) != {"sha256", "size"}
+                    or not isinstance(reference["sha256"], str) or type(reference["size"]) is not int):
+                raise ReleaseError("publication payload reference is malformed")
+            raw = payloads.get(reference["sha256"])
+            if raw is None or len(raw) != reference["size"]:
+                raise ReleaseError("publication payload reference is unavailable or changed")
+            used.add(reference["sha256"])
+            total += len(raw)
+            if total > _MAX_PUBLICATION_PAYLOAD_BYTES:
+                raise ReleaseError("publication decoded reference capacity exceeded")
+        container["content_b64"] = base64.b64encode(raw).decode("ascii") if hydrate and raw is not None else None
+
+    records = []
+    for record, immutable in zip(payload["records"], context["records"]):
+        if (not isinstance(record, dict) or set(record).intersection(_PUBLICATION_IMMUTABLE_RECORD_FIELDS)
+                or not isinstance(immutable["snapshot"], dict)):
+            raise ReleaseError("publication compact record is malformed")
+        row = {**immutable, **record}
+        row["snapshot"] = dict(immutable["snapshot"])
+        expand(row)
+        expand(row["snapshot"])
+        records.append(row)
+    if used != set(payloads):
+        raise ReleaseError("publication journal has unreferenced immutable payloads")
+    return {**{key: value for key, value in payload.items() if key != "payloads_sha256"},
+            "journal_parent": context["journal_parent"], "parents": context["parents"],
+            "schema": _PUBLICATION_JOURNAL_SCHEMA, "records": records}
+
+
+def _publication_capacity_preflight(
+    writes: Sequence[tuple[Path, bytes | None, int, str]], *,
+    preimage_sizes: Mapping[Path, int] | None = None,
+) -> None:
+    """Reserve bounded payloads and a complete publication/inverse before mkdir.
+
+    Without another fault, a record uses at most 9 forward appends, 12 inverse
+    appends (including interrupted-rename adoption), and 25 restart appends
+    (inverse plus disposal completion and three private cleanups). Reserve 48
+    per record plus 16 transaction frames for an attempt and clean restart.
+    Further interruptions or UUID-name collisions consume this reserve too;
+    every append independently enforces the total bound and retains the exact
+    recovery handle on exhaustion. No finite journal can promise unlimited
+    interrupted retries.
+    """
+    if not 0 < len(writes) <= _MAX_PUBLICATION_RECORDS:
+        raise ReleaseError("publication journal record capacity exceeded before mutation")
+    total = 0
+    largest = (1 << 64) - 1  # Unsigned device/inode width; generation is byte-bounded.
+    # A signed 64-bit seconds field represented in nanoseconds, including its
+    # possible minus sign. Do not assume all supported timestamps are positive.
+    timestamp = -(1 << 63) * 1_000_000_000
+    identity = {"device": largest, "inode": largest, "mode": 0o7777, "nlink": 1,
+                "size": _MAX_PUBLICATION_PAYLOAD_FILE_BYTES, "mtime_ns": timestamp, "ctime_ns": timestamp}
+    rows = []
+    for path, content, mode, label in writes:
+        if not isinstance(label, str):
+            raise ReleaseError("publication label is invalid")
+        length = len(content) if content is not None else 0
+        if length > _MAX_PUBLICATION_PAYLOAD_FILE_BYTES:
+            raise ReleaseError("publication journal decoded payload capacity exceeded before mutation")
+        total += length
+        original_size = 0
+        if preimage_sizes is not None:
+            original_size = preimage_sizes[path]
+        elif _path_lexists(path.parent):
+            anchor = _open_directory_anchor(path.parent, label="publication capacity parent", create_parents=False)
+            try:
+                original = _validate_regular_at(anchor, path.name, label=label)
+                if original is not None:
+                    original_size = original.size
+                anchor.assert_current(phase="during capacity preflight")
+            finally:
+                anchor.close()
+        if original_size > _MAX_PUBLICATION_PAYLOAD_FILE_BYTES:
+            raise ReleaseError("publication journal decoded payload capacity exceeded before mutation")
+        total += original_size
+        if total > _MAX_PUBLICATION_PAYLOAD_BYTES:
+            raise ReleaseError("publication journal decoded payload capacity exceeded before mutation")
+        ref = {"sha256": "f" * 64, "size": _MAX_PUBLICATION_PAYLOAD_FILE_BYTES}
+        # pid_t is signed 32-bit on the supported descriptor/renameat2 ABI.
+        private = f".{path.name}.quarantine-{(1 << 31) - 1}-{'f' * 32}"
+        rows.append({
+            "path": str(path), "name": path.name, "content_ref": ref, "mode": mode, "label": label,
+            "snapshot": {"exists": True, "mode": 0o7777, "identity": identity, "sha256": "f" * 64, "content_ref": ref},
+            **{kind + "_name": private for kind in ("staged", "quarantine", "rollback")},
+            "disposal_name": f".{private}.dispose-{(1 << 31) - 1}-{'f' * 32}",
+            **{kind + "_identity": identity for kind in ("staged", "quarantine", "rollback", "disposal", "committed")},
+            "disposal_source": "quarantine", "deleted": False, "phase": "rollback-restore-intent",
+        })
+    paths = sorted({path.parent for path, _content, _mode, _label in writes}, key=str)
+    template = {"schema": _PUBLICATION_COMPACT_JOURNAL_SCHEMA, "generation": largest,
+                "state": "rolling-back", "payloads_sha256": "f" * 64,
+                "journal_parent": max(map(str, paths), key=lambda value: len(canonical_json_bytes(value))),
+                "parents": [{"path": str(path), "chain": [{"device": largest, "inode": largest, "mode": 0o7777}
+                            for _part in path.parts]} for path in paths], "records": rows}
+    frame = _publication_journal_frame(_publication_compact_state(template))
+    # At most two descriptors per record; each is under 256 bytes including
+    # punctuation. The immutable context uses the same conservative fields as
+    # the frame template and is stored once, never once per transition.
+    context_maximum = len(canonical_json_bytes(_publication_immutable_context(template)))
+    manifest_maximum = context_maximum + 256 + 512 * len(writes)
+    if manifest_maximum > _MAX_PUBLICATION_PAYLOAD_MANIFEST_BYTES:
+        raise ReleaseError("publication journal immutable context capacity exceeded before mutation")
+    prefix_maximum = total + 79 + manifest_maximum
+    if prefix_maximum + len(frame) * (48 * len(writes) + 16) > _MAX_PUBLICATION_JOURNAL_BYTES:
+        raise ReleaseError("publication journal lifecycle capacity exceeded before mutation")
 
 
 def _publication_journal_name(name: str) -> str:
@@ -2331,10 +2599,18 @@ def _publication_journal_frame(payload: Mapping[str, object]) -> bytes:
 def _publication_journal_latest_payload(content: bytes) -> dict[str, object]:
     """Read the newest complete append-only journal frame after an interruption."""
 
+    return _publication_journal_decode(content)[0]
+
+
+def _publication_journal_decode(content: bytes) -> tuple[dict[str, object], int]:
+    """Return the latest verified state and end of its complete frame."""
+
+    if len(content) > _MAX_PUBLICATION_JOURNAL_BYTES:
+        raise ReleaseError("publication journal total capacity exceeded")
     latest: dict[str, object] | None = None
     latest_generation = -1
     seen_generations: set[int] = set()
-    offset = 0
+    payloads, context, manifest_digest, offset = _publication_read_payload_prefix(content)
     header_size = len(_PUBLICATION_JOURNAL_FRAME) + 8 + 1 + 64 + 1
     while offset < len(content):
         if len(content) - offset < header_size:
@@ -2342,7 +2618,12 @@ def _publication_journal_latest_payload(content: bytes) -> dict[str, object]:
             # still authoritative.  Do not silently tolerate arbitrary tail
             # bytes, however: a torn writer can only have begun the fixed
             # frame marker at this offset.
-            if content[offset:].startswith(_PUBLICATION_JOURNAL_FRAME):
+            tail = content[offset:]
+            pattern = b"TDJ1:" + b"h" * 8 + b":" + b"h" * 64 + b"\n"
+            if all(
+                value in b"0123456789abcdef" if expected == ord("h") else value == expected
+                for value, expected in zip(tail, pattern)
+            ):
                 break
             raise ReleaseError("publication journal frame order is malformed")
         if content[offset:offset + len(_PUBLICATION_JOURNAL_FRAME)] != _PUBLICATION_JOURNAL_FRAME:
@@ -2354,10 +2635,10 @@ def _publication_journal_latest_payload(content: bytes) -> dict[str, object]:
         payload_start = digest_start + 65
         if separator != ord(":") or content[payload_start - 1:payload_start] != b"\n":
             raise ReleaseError("publication journal frame is malformed")
-        try:
-            size = int(size_raw.decode("ascii"), 16)
-        except (UnicodeDecodeError, ValueError):
-            raise ReleaseError("publication journal frame is malformed") from None
+        if (re.fullmatch(rb"[0-9a-f]{8}", size_raw) is None
+                or re.fullmatch(rb"[0-9a-f]{64}", digest) is None):
+            raise ReleaseError("publication journal frame is malformed")
+        size = int(size_raw, 16)
         if size <= 0 or size > _MAX_PUBLICATION_JOURNAL_FRAME_BYTES:
             raise ReleaseError("publication journal frame is malformed")
         payload_end = payload_start + size
@@ -2374,6 +2655,8 @@ def _publication_journal_latest_payload(content: bytes) -> dict[str, object]:
             raise ReleaseError("publication journal frame payload is malformed") from None
         if not isinstance(payload, dict) or canonical_json_bytes(payload) != payload_raw:
             raise ReleaseError("publication journal frame payload is malformed")
+        if payloads is not None:
+            _publication_expand_references(payload, payloads, context, manifest_digest, hydrate=False)
         generation = payload.get("generation")
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
             raise ReleaseError("publication journal frame generation is malformed")
@@ -2390,7 +2673,9 @@ def _publication_journal_latest_payload(content: bytes) -> dict[str, object]:
         offset = payload_end
     if latest is None:
         raise ReleaseError("publication journal has no complete durable record")
-    return latest
+    if payloads is not None:
+        latest = _publication_expand_references(latest, payloads, context, manifest_digest, hydrate=True)
+    return latest, offset
 
 
 @dataclass
@@ -2415,6 +2700,10 @@ class _PublicationJournal:
     state: str = "active"
     attempted_state: str | None = None
     durability_uncertain: bool = False
+    # None preserves inline V1 recovery. New journals and recovered V2 journals
+    # keep one immutable payload set; only generation zero writes its prefix.
+    payloads: Mapping[str, bytes] | None = None
+    context: Mapping[str, object] | None = None
 
     @property
     def path(self) -> Path:
@@ -2430,6 +2719,11 @@ class _PublicationJournal:
     ) -> "_PublicationJournal":
         if not records:
             raise ReleaseError("publication journal has no records")
+        _publication_capacity_preflight(
+            tuple((r.path, r.content, r.mode, r.label) for r in records),
+            preimage_sizes={r.path: len(r.snapshot.snapshot.content) for r in records},
+        )
+        payloads = _publication_payloads(records)
         if journal_path is None:
             parent = parents.for_path(records[0].path)
             name = (
@@ -2441,6 +2735,14 @@ class _PublicationJournal:
             parent = parents.for_path(path)
             name = _publication_journal_name(path.name)
         _publication_journal_name(name)
+        context = _publication_immutable_context({
+            "journal_parent": str(parent.path),
+            "parents": [_journal_directory_guard_payload(anchor)
+                        for _path, anchor in sorted(parents.anchors().items(), key=lambda item: str(item[0]))],
+            "records": [_journal_record_payload(record, payloads=payloads) for record in records],
+        })
+        if len(_publication_payload_manifest(payloads, context)) > _MAX_PUBLICATION_PAYLOAD_MANIFEST_BYTES:
+            raise ReleaseError("publication journal immutable context capacity exceeded before mutation")
         parent.assert_current(phase="before journal creation")
         flags = (
             os.O_WRONLY
@@ -2522,6 +2824,8 @@ class _PublicationJournal:
                         parents.anchors(),
                     )
                     try:
+                        failure_journal.payloads = payloads
+                        failure_journal.context = context
                         failure_journal.persist()
                         parent.fsync(label="publication journal failure receipt parent")
                     except BaseException as receipt_exc:
@@ -2636,7 +2940,7 @@ class _PublicationJournal:
             if identity.mode != 0o600:
                 raise ReleaseError("publication journal mode is unsafe during creation")
             try:
-                result = cls(parent, name, descriptor, records, parents.anchors())
+                result = cls(parent, name, descriptor, records, parents.anchors(), payloads=payloads, context=context)
                 result.persist()
                 parent.fsync(label="publication journal parent")
             except BaseException as exc:
@@ -2656,8 +2960,8 @@ class _PublicationJournal:
             abort_pre_result_failure(exc)
 
     def _payload(self, *, state: str | None = None) -> dict[str, object]:
-        return {
-            "schema": _PUBLICATION_JOURNAL_SCHEMA,
+        value = {
+            "schema": _PUBLICATION_JOURNAL_SCHEMA if self.payloads is None else _PUBLICATION_COMPACT_JOURNAL_SCHEMA,
             "generation": self.generation,
             "state": self.state if state is None else state,
             "journal_parent": str(self.parent.path),
@@ -2665,8 +2969,14 @@ class _PublicationJournal:
                 _journal_directory_guard_payload(anchor)
                 for _path, anchor in sorted(self._parents_for_payload().items(), key=lambda item: str(item[0]))
             ],
-            "records": [_journal_record_payload(record) for record in self.records],
+            "records": [_journal_record_payload(record, payloads=self.payloads) for record in self.records],
         }
+        if self.payloads is not None:
+            if self.context != _publication_immutable_context(value):
+                raise ReleaseError("publication immutable context changed")
+            value = _publication_compact_state(value)
+            value["payloads_sha256"] = sha256_bytes(_publication_payload_manifest(self.payloads, self.context))
+        return value
 
     def _parents_for_payload(self) -> dict[Path, _DirectoryAnchor]:
         return dict(self.anchors)
@@ -2686,12 +2996,19 @@ class _PublicationJournal:
         opened = _file_identity(os.fstat(self.descriptor), label="publication journal")
         if named is None or opened.nlink != 1 or not _same_file_object(named, opened):
             raise ReleaseError("publication journal changed before update")
+        initial = self.generation == 0 and self.payloads is not None
         self.generation += 1
         self.attempted_state = next_state
         try:
+            frame = _publication_journal_frame(self._payload(state=next_state))
+            prefix = _publication_payload_prefix(self.payloads, self.context) if initial else b""
+            if opened.size + len(prefix) + len(frame) > _MAX_PUBLICATION_JOURNAL_BYTES:
+                raise ReleaseError("publication journal total capacity exceeded; recovery handle retained")
+            if prefix:
+                _write_all(self.descriptor, prefix, label="publication immutable payloads")
             _write_all(
                 self.descriptor,
-                _publication_journal_frame(self._payload(state=next_state)),
+                frame,
                 label="publication journal",
             )
             _fsync_descriptor(self.descriptor, label="publication journal")
@@ -3491,12 +3808,18 @@ def _read_regular_at(
     before = _validate_regular_at(parent, name, label=label)
     if before is None:
         raise FileNotFoundError(name)
+    # Publication payloads have a tighter preflight bound. This outer bound
+    # also covers journals and prevents a raced growth or hostile sparse file
+    # from being read without limit before the parser can reject it.
+    if before.size > _MAX_PUBLICATION_JOURNAL_BYTES:
+        raise ReleaseError(f"{label} exceeds publication capture capacity")
     descriptor = _openat(parent.descriptor, name, _file_open_flags(), label=label)
     try:
         opened = _file_identity(os.fstat(descriptor), label=label)
         if opened.nlink != 1 or before != opened:
             raise ReleaseError(f"{label} changed while opening")
         chunks: list[bytes] = []
+        total = 0
         while True:
             try:
                 block = os.read(descriptor, 1024 * 1024)
@@ -3504,6 +3827,9 @@ def _read_regular_at(
                 continue
             if not block:
                 break
+            total += len(block)
+            if total > _MAX_PUBLICATION_JOURNAL_BYTES:
+                raise ReleaseError(f"{label} exceeds publication capture capacity")
             chunks.append(block)
         after = _file_identity(os.fstat(descriptor), label=label)
         if after.nlink != 1 or after != opened:
@@ -5128,6 +5454,10 @@ def _publish_files_transactionally(
                 value,
                 label=f"expected preimage {path}",
             )
+    # Capacity rejection must precede even parent-directory creation. The
+    # journal constructor repeats this against the captured preimages before
+    # its O_EXCL open, while later appends enforce the actual total byte bound.
+    _publication_capacity_preflight(normalized)
     parents = _open_publication_parents(
         [path for path, _content, _mode, _label in normalized],
         parent_guards=parent_guards,
@@ -5818,14 +6148,24 @@ def _open_recovery_journal(
             capture.identity is None
             or opened.nlink != 1
             or named is None
-            or not _same_file_object(opened, capture.identity)
-            or not _same_file_object(named, capture.identity)
+            or opened != capture.identity
+            or named != capture.identity
         ):
             raise ReleaseError("publication journal changed before restart recovery")
+        # Appending behind a torn frame would make every subsequent recovery
+        # frame unparsable on another restart. Only the exact captured inode's
+        # incomplete tail can be dropped; complete frames and the immutable
+        # prefix are never rewritten. A truncate/fsync failure occurs before
+        # any canonical or private recovery mutation and retains the handle.
+        _latest, complete_size = _publication_journal_decode(capture.snapshot.content)
+        if complete_size < opened.size:
+            os.ftruncate(descriptor, complete_size)
+            _fsync_descriptor(descriptor, label="publication journal tail recovery")
         generation = payload.get("generation")
         state = payload.get("state")
         if isinstance(generation, bool) or not isinstance(generation, int) or not isinstance(state, str):
             raise ReleaseError("publication journal is malformed")
+        payloads, context, _digest, _offset = _publication_read_payload_prefix(capture.snapshot.content)
         return _PublicationJournal(
             parent,
             path.name,
@@ -5834,6 +6174,8 @@ def _open_recovery_journal(
             parents.anchors(),
             generation=generation,
             state=state,
+            payloads=payloads,
+            context=context,
         )
     except BaseException:
         try:
