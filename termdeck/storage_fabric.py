@@ -14,6 +14,7 @@ import os
 import socket
 import stat as stat_module
 import struct
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, MutableMapping, Sequence
@@ -128,6 +129,9 @@ class DatabaseFileBinding:
             raise StorageFabricError(
                 "database_root: database device changed after production admission"
             )
+        _validate_sqlite_inode(metadata, label="database_root")
+        if _directory_identity(os.fstat(self.descriptor)) != self.identity:
+            raise StorageFabricError("database_root: retained database identity changed")
 
     def close(self) -> None:
         descriptor = self.descriptor
@@ -1199,22 +1203,18 @@ def pin_production_database(
     requested = binding.path
     descriptor = -1
     try:
-        descriptor = os.open(
-            requested.name,
-            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600,
-            dir_fd=parent.descriptor,
-        )
+        try:
+            descriptor = _open_sqlite_inode(requested.name, dir_fd=parent.descriptor)
+        except FileNotFoundError:
+            _create_sqlite_inode(parent, requested.name)
+            descriptor = _open_sqlite_inode(requested.name, dir_fd=parent.descriptor)
         metadata = os.fstat(descriptor)
-        if not stat_module.S_ISREG(metadata.st_mode):
-            raise StorageFabricError(
-                "database_root: admitted database is not a regular file"
-            )
+        _validate_sqlite_inode(metadata, label="database_root")
         if _device_id(metadata.st_dev) != binding.expected_device:
             raise StorageFabricError(
                 "database_root: database device changed before SQLite open"
             )
-        os.fchmod(descriptor, 0o600)
+        _chmod_sqlite_inode(descriptor, 0o600, label="database_root")
         result = DatabaseFileBinding(
             path=requested,
             parent=parent,
@@ -1229,6 +1229,80 @@ def pin_production_database(
             os.close(descriptor)
         parent.close()
         raise
+
+
+def _open_sqlite_inode(path: str | Path, *, dir_fd: int | None = None) -> int:
+    # A normal descriptor's close releases this process's SQLite POSIX locks,
+    # even when another connection owns them. Linux O_PATH pins do not.
+    if not hasattr(os, "O_PATH"):
+        raise StorageFabricError("database_root: Linux O_PATH is required")
+    return os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+
+
+def _validate_sqlite_inode(metadata: os.stat_result, *, label: str) -> None:
+    if not stat_module.S_ISREG(metadata.st_mode):
+        raise StorageFabricError(f"{label}: database file is not a regular file")
+    if metadata.st_uid != os.geteuid() or metadata.st_nlink != 1:
+        raise StorageFabricError(f"{label}: database file owner or link count is unsafe")
+
+
+def _chmod_sqlite_inode(descriptor: int, mode: int, *, label: str) -> None:
+    before = os.fstat(descriptor)
+    _validate_sqlite_inode(before, label=label)
+    # fchmod rejects O_PATH; procfs resolves this retained inode without opening
+    # and closing another normal descriptor. Never chmod the mutable pathname.
+    os.chmod(f"/proc/self/fd/{descriptor}", mode)
+    after = os.fstat(descriptor)
+    _validate_sqlite_inode(after, label=label)
+    if (
+        _directory_identity(after) != _directory_identity(before)
+        or stat_module.S_IMODE(after.st_mode) != mode
+    ):
+        raise StorageFabricError(f"{label}: database permission hardening changed identity")
+
+
+def _create_sqlite_inode(parent: _PinnedDirectory, name: str) -> None:
+    # Close the sole normal descriptor before the canonical database becomes
+    # visible. Otherwise another thread can SQLite-open the new path before our
+    # close and lose its just-acquired locks. The final link never replaces a
+    # concurrent creator; the caller independently admits that winner.
+    temporary = f".{name}.create-{uuid.uuid4().hex}"
+    descriptor = os.open(
+        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600, dir_fd=parent.descriptor,
+    )
+    metadata = None
+    pinned = -1
+    try:
+        metadata = os.fstat(descriptor)
+        os.fchmod(descriptor, 0o600)
+        pinned = _open_sqlite_inode(temporary, dir_fd=parent.descriptor)
+        if _directory_identity(os.fstat(pinned)) != _directory_identity(metadata):
+            raise StorageFabricError("database_root: new database identity changed")
+        os.close(descriptor)
+        descriptor = -1
+        _validate_sqlite_inode(os.fstat(pinned), label="database_root")
+        try:
+            os.link(
+                f"/proc/self/fd/{pinned}", name,
+                dst_dir_fd=parent.descriptor, follow_symlinks=True,
+            )
+        except FileExistsError:
+            pass
+    finally:
+        try:
+            # Keep the inode pinned through cleanup, preventing inode reuse.
+            # If fstat failed, leave the unproven private temporary untouched.
+            if metadata is not None:
+                current = os.stat(temporary, dir_fd=parent.descriptor, follow_symlinks=False)
+                if _directory_identity(current) != _directory_identity(metadata):
+                    raise StorageFabricError("database_root: new database temporary was replaced")
+                os.unlink(temporary, dir_fd=parent.descriptor)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if pinned >= 0:
+                os.close(pinned)
 
 
 def pin_production_database_parent(

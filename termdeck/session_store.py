@@ -34,7 +34,10 @@ from .storage_fabric import (
     DatabaseFileBinding,
     StorageFabricError,
     _PinnedDirectory,
+    _chmod_sqlite_inode,
+    _directory_identity,
     _open_pinned_directory,
+    _open_sqlite_inode,
     pin_production_database,
     pin_production_database_parent,
 )
@@ -640,17 +643,15 @@ def _copy_legacy_sqlite_snapshot(
 
 def _harden_regular_file(path: Path, mode: int) -> None:
     try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
-        )
+        descriptor = _open_sqlite_inode(path)
     except FileNotFoundError:
         return
     try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            raise SessionDatabaseMigrationError(f"database sidecar is not a regular file: {path}")
-        os.fchmod(descriptor, mode)
+        _chmod_sqlite_inode(descriptor, mode, label=str(path))
+        if _directory_identity(path.lstat()) != _directory_identity(os.fstat(descriptor)):
+            raise SessionDatabaseMigrationError(f"database file identity changed: {path}")
+    except StorageFabricError as exc:
+        raise SessionDatabaseMigrationError(str(exc)) from exc
     finally:
         os.close(descriptor)
 
@@ -662,26 +663,11 @@ def _harden_database_permissions(path: Path) -> None:
 
 
 def _harden_bound_database_permissions(binding: DatabaseFileBinding) -> None:
-    os.fchmod(binding.descriptor, 0o600)
+    binding.revalidate()
+    _chmod_sqlite_inode(binding.descriptor, 0o600, label="database_root")
     for suffix in ("-wal", "-shm"):
-        try:
-            descriptor = os.open(
-                f"{binding.path.name}{suffix}",
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=binding.parent.descriptor,
-            )
-        except FileNotFoundError:
-            continue
-        try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise SessionDatabaseMigrationError(
-                    "database sidecar is not a regular file: "
-                    f"{binding.path.name}{suffix}"
-                )
-            os.fchmod(descriptor, 0o600)
-        finally:
-            os.close(descriptor)
+        _harden_regular_at(binding.parent, f"{binding.path.name}{suffix}", 0o600)
+    binding.revalidate()
 
 
 def _is_managed_state_path(path: Path) -> bool:
@@ -1728,16 +1714,15 @@ def _migration_source_parent(source: Path) -> _PinnedDirectory:
 
 
 def _harden_regular_at(parent: _PinnedDirectory, name: str, mode: int) -> None:
-    descriptor = _open_regular_at(
-        parent,
-        name,
-        label=f"managed database file {name}",
-        required=False,
-    )
-    if descriptor is None:
+    try:
+        descriptor = _open_sqlite_inode(name, dir_fd=parent.descriptor)
+    except FileNotFoundError:
         return
     try:
-        os.fchmod(descriptor, mode)
+        _chmod_sqlite_inode(descriptor, mode, label=f"managed database file {name}")
+        _validate_bound_path(parent, name, os.fstat(descriptor))
+    except StorageFabricError as exc:
+        raise SessionDatabaseMigrationError(str(exc)) from exc
     finally:
         os.close(descriptor)
 
