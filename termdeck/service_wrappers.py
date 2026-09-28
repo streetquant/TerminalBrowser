@@ -95,6 +95,8 @@ WRAPPER_MODE = 0o755
 UNIT_CONFIG_MODE = 0o600
 MAX_STOP_TIMEOUT = 60.0
 DEFAULT_STOP_TIMEOUT = 30.0
+LAN_GRACEFUL_STOP_TIMEOUT = 10.0
+LAN_TERMINATE_STOP_TIMEOUT = 5.0
 CHECKPOINT_TIMEOUT = 120.0
 CHECKPOINT_TERMINATE_GRACE = 5.0
 CHECKPOINT_KILL_GRACE = 5.0
@@ -3831,8 +3833,28 @@ def stop_unit(
                 raise WrapperError(
                     f"could not signal {spec.name} process {pid}: {exc}"
                 ) from exc
-            if matches and not _wait_for_pidfd_exit(pidfd, timeout=stop_timeout):
-                raise WrapperError(f"timed out waiting for {spec.name} process {pid}")
+            if matches:
+                if spec.kind == "lan":
+                    # nginx's graceful QUIT waits for upgraded WebSocket
+                    # clients. Bound that drain before systemd's 30s stop
+                    # deadline; the pidfd keeps both signals on the verified
+                    # process generation rather than a reused PID.
+                    graceful = min(stop_timeout, LAN_GRACEFUL_STOP_TIMEOUT)
+                    exited = _wait_for_pidfd_exit(pidfd, timeout=graceful)
+                    if not exited and stop_timeout > graceful:
+                        try:
+                            _pidfd_send_signal(pidfd, signal.SIGTERM)
+                        except ProcessLookupError:
+                            exited = True
+                        else:
+                            exited = _wait_for_pidfd_exit(
+                                pidfd,
+                                timeout=min(stop_timeout - graceful, LAN_TERMINATE_STOP_TIMEOUT),
+                            )
+                else:
+                    exited = _wait_for_pidfd_exit(pidfd, timeout=stop_timeout)
+                if not exited:
+                    raise WrapperError(f"timed out waiting for {spec.name} process {pid}")
         finally:
             try:
                 os.close(pidfd)

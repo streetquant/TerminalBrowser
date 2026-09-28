@@ -151,6 +151,13 @@ live rollback acceptance.
 Activation waits for each service's expected executable and recorded process
 identity. A systemd `active` state alone is insufficient: the LAN wrapper may
 still be preparing its signed runtime before it executes nginx.
+On stop, nginx drains upgraded WebSockets for at most five seconds. The
+managed LAN stop wrapper targets the recorded nginx generation by pidfd,
+allows ten seconds for graceful exit, then gives the same generation five
+seconds to terminate. These bounds stay below the unit's 30-second stop
+deadline. A failed `systemctl stop` is an activation failure even if systemd
+subsequently reports the unit as inactive or failed; the transaction retains
+its rollback evidence for review.
 
 An application update can publish a new runtime receipt while retaining the
 existing TLS generation. In that case rollback verifies the retained A/B

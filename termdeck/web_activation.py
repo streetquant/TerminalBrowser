@@ -5282,7 +5282,10 @@ def _stop_web() -> None:
         if _unit_stopped_or_absent(unit):
             continue
         stopped = _systemd("stop", unit, check=False)
-        if stopped.returncode and not _unit_stopped_or_absent(unit):
+        # A timed-out ExecStop can leave the unit inactive/failed after
+        # systemd kills its control process. That is not a clean stop even
+        # though a state-only observation says there is no active process.
+        if stopped.returncode:
             raise WebActivationError(f"TermDeck web unit could not stop: {unit}")
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline and not all(

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -213,3 +214,74 @@ raise SystemExit(wrappers.run_wrapper('termdeck-web-lan.service', 'start', relea
         assert stopped["pid"] is None and stopped["start_ticks"] is None and stopped["exe"] is None
         assert stopped["argv"] == [] and stopped["command_sha256"] is None
         assert wrappers.run_wrapper(UNIT, "stop", release_id="nginx-disposable", **paths) == 0
+
+
+@pytest.mark.parametrize("worker_timeout", (True, False), ids=("nginx-drain", "pidfd-fallback"))
+def test_disposable_nginx_stop_with_open_websocket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worker_timeout: bool
+) -> None:
+    paths = _nginx_layout(tmp_path)
+    layout = wrappers.resolve_layout(**paths)
+    runtime = wrappers._runtime_paths(layout)
+    with socket.socket() as upstream:
+        upstream.bind(("127.0.0.1", 0))
+        upstream.listen(1)
+        upstream.settimeout(8)
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            listen_port = reservation.getsockname()[1]
+        config = (
+            "worker_processes 1;\nerror_log stderr notice;\n"
+            + "pid " + json.dumps(str(runtime["nginx_pid"])) + ";\n"
+            + ("worker_shutdown_timeout 1s;\n" if worker_timeout else "")
+            + "events { worker_connections 16; }\n"
+            + "http { access_log off; client_body_temp_path "
+            + json.dumps(str(runtime["nginx_root"])) + ";\n"
+            + "server { listen 127.0.0.1:" + str(listen_port) + ";\n"
+            + "location /hold { proxy_pass http://127.0.0.1:" + str(upstream.getsockname()[1]) + ";\n"
+            + 'proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; } } }\n'
+        )
+        runtime["nginx_conf"].write_text(config, encoding="ascii")
+        runtime["nginx_conf"].chmod(0o600)
+        wrappers.publish_wrappers("nginx-websocket", **paths)
+        script = """
+import json, sys
+from pathlib import Path
+from termdeck import service_wrappers as wrappers
+paths = json.loads(sys.argv[1])
+def preparation(*, runtime_root):
+    assert runtime_root == Path(paths['runtime_root']) / 'termdeck-lan'
+wrappers._request_lan_preparation = preparation
+raise SystemExit(wrappers.run_wrapper('termdeck-web-lan.service', 'start', release_id='nginx-websocket', **paths))
+"""
+        command = [sys.executable, "-B", "-c", script, json.dumps({key: str(path) for key, path in paths.items()})]
+        with _disposable_process(command) as process:
+            _wait_for_master(process, runtime["nginx_pid"])
+            with socket.create_connection(("127.0.0.1", listen_port), timeout=5) as client:
+                client.settimeout(5)
+                client.sendall(
+                    b"GET /hold HTTP/1.1\r\nHost: localhost\r\n"
+                    b"Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+                )
+                backend, _ = upstream.accept()
+                with backend:
+                    backend.settimeout(5)
+                    assert b"GET /hold" in backend.recv(4096)
+                    backend.sendall(
+                        b"HTTP/1.1 101 Switching Protocols\r\n"
+                        b"Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+                    )
+                    assert b"101 Switching Protocols" in client.recv(4096)
+                    if not worker_timeout:
+                        monkeypatch.setattr(wrappers, "LAN_GRACEFUL_STOP_TIMEOUT", 0.3)
+                    started = time.monotonic()
+                    assert wrappers.run_wrapper(
+                        UNIT, "stop", release_id="nginx-websocket", stop_timeout=8, **paths
+                    ) == 0
+                    elapsed = time.monotonic() - started
+                    assert elapsed < 5, f"open WebSocket blocked stop for {elapsed:.2f}s"
+                    assert process.wait(timeout=2) == 0
+                    assert client.recv(1) == b""
+                    stopped = json.loads(layout.config_path(wrappers.UNIT_SPEC_BY_NAME[UNIT]).read_bytes())
+                    assert stopped["state"] == "stopped" and stopped["pid"] is None
+                    assert wrappers.run_wrapper(UNIT, "stop", release_id="nginx-websocket", **paths) == 0

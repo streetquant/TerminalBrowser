@@ -3523,6 +3523,25 @@ def test_explicit_services_not_live_marker_overrides_history_and_skips_absent_un
     assert all(call[0] == "show" for call in calls)
 
 
+def test_stop_web_rejects_timed_out_execstop_even_when_unit_is_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def systemd(*args: str, check: bool = True) -> SimpleNamespace:
+        calls.append(args)
+        if args[0] == "show":
+            state = "failed" if any(call[0] == "stop" for call in calls) else "active"
+            return SimpleNamespace(returncode=0, stdout=f"LoadState=loaded\nActiveState={state}\n")
+        assert args[0] == "stop" and args[1] == "termdeck-web-lan.service"
+        return SimpleNamespace(returncode=1, stdout="", stderr="stop timed out")
+
+    monkeypatch.setattr(activation, "_systemd", systemd)
+    with pytest.raises(activation.WebActivationError, match="could not stop: termdeck-web-lan.service"):
+        activation._stop_web()
+    assert not any(args[:2] == ("stop", "termdeck-web-backend.service") for args in calls)
+
+
 @pytest.mark.parametrize("recovery_marker", ("owned", "foreign", "symlink"))
 def test_rollback_retry_recognizes_an_already_restored_preimage(
     tmp_path: Path,
