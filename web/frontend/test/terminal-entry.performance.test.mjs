@@ -239,6 +239,12 @@ test("canonical fit suppresses stable remeasurement and invalidates font/layout 
   }
   api.setAppearance({ ...appearance, palette: "t1000", font: "auto" });
   assert.deepEqual(api.terminal.options.theme, originalPalette);
+  api.fitGrid(120, 40);
+  assert.equal(api.terminal.options.fontSize, 7);
+  assert.deepEqual(api.fit(), { cols: 80, rows: 24 });
+  assert.equal(api.terminal.options.fontSize, 16);
+  assert.equal(host.dataset.termdeckColumns, "80");
+  assert.equal(host.dataset.termdeckOverflow, "false");
   t.diagnostic(
     `fit proposals: first=${firstFitProposals}, stable=${cachedFitProposals}, `
       + `metric=${metricChangeProposals}, layout=${layoutChangeProposals}, `

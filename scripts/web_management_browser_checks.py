@@ -135,7 +135,12 @@ def check_management(page, *, origin, database, initial_id, created_id, output, 
     page.screenshot(path=str(output / "tab-manager-mobile.png"))
     page.set_viewport_size({"width": 1440, "height": 900})
     close()
-    page.locator('.xterm-helper-textarea').focus()
+    # A click is the user's explicit request to reclaim WebSocket control
+    # after management input. Programmatic DOM focus alone is not a claim.
+    page.locator('#terminal-xterm').click(position={"x": 100, "y": 100})
+    page.wait_for_function(
+        "() => document.activeElement?.classList?.contains('xterm-helper-textarea') === true"
+    )
     page.keyboard.type('AFTER_MANAGER_CONTROL_RELEASE', delay=2)
     wait_until(lambda: any(path.exists() and b'AFTER_MANAGER_CONTROL_RELEASE' in path.read_bytes() for path in logs), timeout=10, detail='keyboard control after manager send')
     result["assertions"]["keyboard_control_returns_after_manager_send"] = True

@@ -113,8 +113,8 @@ def main() -> None:
     require(stream_production, "MAX_INITIAL_REPLAY_JOINED_CELLS", "joined-line geometry bound")
     require(stream_production, "initial_replay_history_lines", "geometry-aware replay selection")
     require(stream_production, "CONTROL_FLAGS_WRITER", "tmux writer mode")
-    require(stream_production, 'CONTROL_FLAGS_WRITER: &str = "active-pane,ignore-size,no-detach-on-destroy"', "browser geometry isolation")
-    reject(stream_production, "!ignore-size", "browser geometry authority")
+    require(stream_production, 'CONTROL_FLAGS_VIEWER: &str = "active-pane,ignore-size,no-detach-on-destroy"', "passive viewer geometry isolation")
+    require(stream_production, 'CONTROL_FLAGS_WRITER: &str = "active-pane,!ignore-size,no-detach-on-destroy"', "active browser geometry authority")
     require(text["app"], "MAX_IN_FLIGHT_FRAMES = 64", "bounded pipelined input")
     require(text["app"], "INPUT_BATCH_MS = 3", "interactive input batching")
     require(text["app"], "inFlight = new Map()", "multi-frame acknowledgement tracking")
@@ -153,7 +153,8 @@ def main() -> None:
         "automatic_single_writer": True,
         "focus_takeover": True,
         "heartbeat_reconnect": True,
-        "canonical_geometry_isolation": True,
+        "active_writer_viewport_geometry": True,
+        "passive_viewer_geometry_isolation": True,
         "bounded_pipelined_input": True,
         "nginx_websocket_upgrade": True,
         "tab_lifecycle": ["new", "rename", "pause", "resume", "pin", "unpin", "hide", "kill"],

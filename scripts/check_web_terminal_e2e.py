@@ -789,7 +789,10 @@ def main() -> int:
                 "#{pane_width}x#{pane_height}",
             ).stdout.strip()
             page_one.set_viewport_size({"width": 1040, "height": 640})
-            page_one.wait_for_timeout(500)
+            wait_until(lambda: tmux(
+                socket_name, "display-message", "-p", "-t", tmux_target,
+                "#{pane_width}x#{pane_height}",
+            ).stdout.strip() != before_size)
             compact_size = tmux(
                 socket_name,
                 "display-message",
@@ -799,7 +802,10 @@ def main() -> int:
                 "#{pane_width}x#{pane_height}",
             ).stdout.strip()
             page_one.set_viewport_size({"width": 1680, "height": 1050})
-            page_one.wait_for_timeout(500)
+            wait_until(lambda: tmux(
+                socket_name, "display-message", "-p", "-t", tmux_target,
+                "#{pane_width}x#{pane_height}",
+            ).stdout.strip() != compact_size)
             after_size = tmux(
                 socket_name,
                 "display-message",
@@ -808,9 +814,12 @@ def main() -> int:
                 tmux_target,
                 "#{pane_width}x#{pane_height}",
             ).stdout.strip()
-            if compact_size != before_size or after_size != before_size:
+            before_cols, before_rows = map(int, before_size.split("x"))
+            compact_cols, compact_rows = map(int, compact_size.split("x"))
+            after_cols, after_rows = map(int, after_size.split("x"))
+            if not (compact_cols < before_cols < after_cols and compact_rows < before_rows < after_rows):
                 raise RuntimeError(
-                    f"browser viewport changed canonical tmux geometry: "
+                    f"active browser failed to resize tmux with its viewport: "
                     f"before={before_size}, compact={compact_size}, after={after_size}"
                 )
             browser_grid = page_one.evaluate(
@@ -819,19 +828,19 @@ def main() -> int:
                   return terminal ? `${terminal.cols}x${terminal.rows}` : null;
                 }"""
             )
-            if browser_grid != before_size:
+            if browser_grid != after_size:
                 raise RuntimeError(
-                    f"browser xterm grid diverged from canonical tmux geometry: "
-                    f"tmux={before_size}, browser={browser_grid}"
+                    f"browser xterm grid diverged from the resized tmux pane: "
+                    f"tmux={after_size}, browser={browser_grid}"
                 )
             result["resize"] = {
-                "canonical": before_size,
+                "initial": before_size,
                 "after_compact_viewport": compact_size,
                 "after_large_viewport": after_size,
                 "browser_grid": browser_grid,
-                "isolated": True,
+                "active_writer_resized": True,
             }
-            type_command(page_one, "printf 'RESIZE_ISOLATED_OK\n'", "RESIZE_ISOLATED_OK")
+            type_command(page_one, "printf 'RESIZE_APPLIED_OK\n'", "RESIZE_APPLIED_OK")
 
             result["takeover"] = {
                 "covered_by": "check_web_browser_e2e.py",

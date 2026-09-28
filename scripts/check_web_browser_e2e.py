@@ -961,7 +961,13 @@ def main() -> None:
                 env=environment,
             ).stdout.strip()
             page_one.set_viewport_size({"width": 1024, "height": 640})
-            page_one.wait_for_timeout(500)
+            wait_until(
+                lambda: run(
+                    ["/usr/bin/tmux", "-L", socket_name, "display-message", "-p", "-t",
+                     initial_tmux, "#{pane_width}x#{pane_height}"], env=environment,
+                ).stdout.strip() != canonical_size,
+                10, "active browser compact tmux resize",
+            )
             compact_size = run(
                 [
                     "/usr/bin/tmux", "-L", socket_name, "display-message", "-p", "-t",
@@ -970,7 +976,13 @@ def main() -> None:
                 env=environment,
             ).stdout.strip()
             page_one.set_viewport_size({"width": 1680, "height": 1050})
-            page_one.wait_for_timeout(500)
+            wait_until(
+                lambda: run(
+                    ["/usr/bin/tmux", "-L", socket_name, "display-message", "-p", "-t",
+                     initial_tmux, "#{pane_width}x#{pane_height}"], env=environment,
+                ).stdout.strip() != compact_size,
+                10, "active browser large tmux resize",
+            )
             large_size = run(
                 [
                     "/usr/bin/tmux", "-L", socket_name, "display-message", "-p", "-t",
@@ -978,6 +990,14 @@ def main() -> None:
                 ],
                 env=environment,
             ).stdout.strip()
+            large_cols, large_rows = map(int, large_size.split("x"))
+            wait_until(
+                lambda: any(
+                    (event.get("cols"), event.get("rows")) == (large_cols, large_rows)
+                    for event in read_log(initial_log) if event.get("kind") == "size"
+                ),
+                10, "terminal child observed active browser large resize",
+            )
             final_sizes = [
                 (event.get("cols"), event.get("rows"))
                 for event in read_log(initial_log)
@@ -989,15 +1009,17 @@ def main() -> None:
                   return terminal ? `${terminal.cols}x${terminal.rows}` : null;
                 }"""
             )
-            checks["browser_geometry_isolated"] = (
-                compact_size == canonical_size
-                and large_size == canonical_size
-                and browser_grid == canonical_size
-                and set(final_sizes) == set(initial_sizes)
+            initial_cols, initial_rows = map(int, canonical_size.split("x"))
+            compact_cols, compact_rows = map(int, compact_size.split("x"))
+            checks["active_browser_resizes_own_tmux_window"] = (
+                compact_cols < initial_cols < large_cols
+                and compact_rows < initial_rows < large_rows
+                and browser_grid == large_size
+                and (large_cols, large_rows) in final_sizes
             )
-            if not checks["browser_geometry_isolated"]:
+            if not checks["active_browser_resizes_own_tmux_window"]:
                 raise RuntimeError(
-                    f"browser viewport changed shared terminal geometry: canonical={canonical_size}, "
+                    f"active browser and tmux geometry diverged: initial={canonical_size}, "
                     f"compact={compact_size}, large={large_size}, browser={browser_grid}, "
                     f"initial_events={initial_sizes}, final_events={final_sizes}"
                 )

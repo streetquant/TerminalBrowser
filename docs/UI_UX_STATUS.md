@@ -38,7 +38,7 @@ score. No overall production completion is claimed.
 | Search tabs | Name/directory filter with keyboard navigation and direct selection |
 | Command palette | New tab, hidden tabs, find, appearance, shortcuts, rename, hide and tab results |
 | Find in terminal | Actual xterm search, previous/next, selected match and no-match feedback |
-| Appearance | All seven exact desktop terminal palettes; installed/custom fonts, maximum text size, cursor color/shape/blink, scrollback, reset and persistence; canonical desktop grid unchanged |
+| Appearance | All seven exact desktop terminal palettes; installed/custom fonts, maximum text size, cursor color/shape/blink, scrollback, reset and persistence; the active browser writer sizes its tmux window to the chosen font and viewport |
 | Shortcut help | New tab, search, palette, find, switching, rename, context actions and Escape |
 | Window overview | Searchable list; refresh preserves query and keyboard focus |
 | Create / rename windows | Durable empty-window creation and rename, resolved through canonical routes; no process restart |
@@ -99,7 +99,7 @@ Codex-captain subsystems; those are outside this UI/UX task.
   browser storage; only non-sensitive appearance and pane-layout preferences are persisted.
 - Existing terminal layout caching, redundant resize suppression, shared input
   encoding, bounded input/output queues and subscription cleanup are preserved.
-- Appearance changes invalidate font metrics without changing canonical geometry.
+- Appearance changes invalidate font metrics and resize the active browser writer's tmux window; passive viewers do not change its grid.
 - Management work is outside the terminal transport path. Tables render 100 rows
   per page, search is debounced, and automatic refresh preserves selection/focus.
   Moves and reorder use exact IDs and a database transaction, not terminal respawns.

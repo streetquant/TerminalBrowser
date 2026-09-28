@@ -41,7 +41,7 @@ const INPUT_FRAME_TYPE: u8 = 1;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const CONTROL_MODE_ARGUMENT: &str = "-C";
 const CONTROL_FLAGS_VIEWER: &str = "active-pane,ignore-size,no-detach-on-destroy";
-const CONTROL_FLAGS_WRITER: &str = "active-pane,ignore-size,no-detach-on-destroy";
+const CONTROL_FLAGS_WRITER: &str = "active-pane,!ignore-size,no-detach-on-destroy";
 const PANE_STATE_FORMAT: &str = "#{pane_id}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{alternate_on}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{keypad_cursor_flag}\t#{wrap_flag}\t#{insert_flag}\t#{origin_flag}\t#{mouse_standard_flag}\t#{mouse_button_flag}\t#{mouse_all_flag}\t#{mouse_sgr_flag}\t#{bracket_paste_flag}\t#{history_size}";
 
 #[derive(Clone)]
@@ -220,7 +220,7 @@ async fn run_terminal_socket_inner(
 ) -> Result<(), StreamError> {
     validate_termdeck_id(pane.pane_id.as_str())?;
     validate_tmux_target(pane.tmux_target.as_str())?;
-    let _viewport_geometry = receive_hello(socket).await?;
+    let mut viewport_geometry = receive_hello(socket).await?;
     let mut control_view = match terminal
         .acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), false)
         .await
@@ -238,6 +238,11 @@ async fn run_terminal_socket_inner(
         terminal.command_timeout(),
     )
     .await?;
+    // Only the active browser writer contributes a size to tmux.  Viewers
+    // retain the canonical pane grid without resizing another user's TUI.
+    control
+        .set_writer_mode(control_view.mine, viewport_geometry)
+        .await?;
     let replay = control.initial_replay().await?;
     let mut geometry = replay.geometry;
     send_json(
@@ -249,7 +254,9 @@ async fn run_terminal_socket_inner(
     )
     .await?;
     send_message(socket, Message::Binary(replay.bytes.into())).await?;
-    control.set_writer_mode(control_view.mine, geometry).await?;
+    control
+        .set_writer_mode(control_view.mine, viewport_geometry)
+        .await?;
     control.continue_output().await?;
     send_json(
         socket,
@@ -283,6 +290,7 @@ async fn run_terminal_socket_inner(
                                 &mut sender,
                                 &mut control,
                                 &control_view,
+                                viewport_geometry,
                             )
                             .await?;
                         }
@@ -300,7 +308,7 @@ async fn run_terminal_socket_inner(
                             control_view = terminal
                                 .acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), true)
                                 .await?;
-                            control.set_writer_mode(true, geometry).await?;
+                            control.set_writer_mode(true, viewport_geometry).await?;
                             send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view }).await?;
                         }
                         let decision = terminal
@@ -347,21 +355,38 @@ async fn run_terminal_socket_inner(
                                         Ok(value) => value,
                                         Err(_error) => terminal.status(pane.pane_id.as_str(), actor.as_str(), unix_ms()).await?,
                                     };
-                                    control.set_writer_mode(control_view.mine, geometry).await?;
+                                    control.set_writer_mode(control_view.mine, viewport_geometry).await?;
                                     send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view }).await?;
                                 }
                             }
                             ClientEvent::Resize { cols, rows } => {
-                                // Browser viewport geometry is presentation-only. The shared
-                                // tmux PTY retains the canonical native-client geometry.
-                                validate_geometry(cols, rows)?;
+                                viewport_geometry = TerminalGeometry::new(cols, rows)?;
+                                if control_view.mine {
+                                    control.set_writer_mode(true, viewport_geometry).await?;
+                                    let observed = control.current_geometry().await?;
+                                    if observed != geometry {
+                                        geometry = send_sink_resync(
+                                            &mut sender,
+                                            &mut control,
+                                            &control_view,
+                                            viewport_geometry,
+                                        ).await?;
+                                    } else {
+                                        send_sink_json(&mut sender, &ResyncedEvent {
+                                            r#type: "resynced",
+                                            control: &control_view,
+                                            geometry,
+                                        }).await?;
+                                    }
+                                }
                             }
                             ClientEvent::Resync { cols, rows } => {
-                                validate_geometry(cols, rows)?;
+                                viewport_geometry = TerminalGeometry::new(cols, rows)?;
                                 geometry = send_sink_resync(
                                     &mut sender,
                                     &mut control,
                                     &control_view,
+                                    viewport_geometry,
                                 )
                                 .await?;
                             }
@@ -383,7 +408,7 @@ async fn run_terminal_socket_inner(
                         Ok(value) => value,
                         Err(_error) => terminal.status(pane.pane_id.as_str(), actor.as_str(), unix_ms()).await?,
                     };
-                    control.set_writer_mode(control_view.mine, geometry).await?;
+                    control.set_writer_mode(control_view.mine, viewport_geometry).await?;
                     send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view }).await?;
                 }
             }
@@ -397,6 +422,7 @@ async fn send_sink_resync<S>(
     sender: &mut S,
     control: &mut TmuxControl,
     control_view: &TerminalControlView,
+    viewport_geometry: TerminalGeometry,
 ) -> Result<TerminalGeometry, StreamError>
 where
     S: futures_util::Sink<Message> + Unpin,
@@ -413,7 +439,9 @@ where
     )
     .await?;
     send_sink_message(sender, Message::Binary(replay.bytes.into())).await?;
-    control.set_writer_mode(control_view.mine, geometry).await?;
+    control
+        .set_writer_mode(control_view.mine, viewport_geometry)
+        .await?;
     control.continue_output().await?;
     send_sink_json(
         sender,
@@ -1351,8 +1379,7 @@ mod tests {
         assert!(refresh_pane_action("%7", "run-shell").is_err());
         assert_eq!(MAX_INITIAL_REPLAY_JOINED_CELLS, 32 * 1024);
         assert!(CONTROL_FLAGS_VIEWER.contains("ignore-size"));
-        assert!(CONTROL_FLAGS_WRITER.contains("ignore-size"));
-        assert!(!CONTROL_FLAGS_WRITER.contains("!ignore-size"));
+        assert!(CONTROL_FLAGS_WRITER.contains("!ignore-size"));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1264,24 +1264,37 @@ def main() -> int:
             geometry_before = tmux_geometry(tmux, base_env, initial_tmux_name)
             state_before_resize = terminal_state(page_one)
             page_one.set_viewport_size({"width": 980, "height": 620})
-            page_one.wait_for_timeout(500)
+            wait_until(
+                lambda: tmux_geometry(tmux, base_env, initial_tmux_name) != geometry_before,
+                timeout=8,
+                detail="active browser shrinks only its tmux window",
+            )
             geometry_small = tmux_geometry(tmux, base_env, initial_tmux_name)
             state_small = terminal_state(page_one)
             page_one.set_viewport_size({"width": 1600, "height": 1000})
-            page_one.wait_for_timeout(500)
+            wait_until(
+                lambda: tmux_geometry(tmux, base_env, initial_tmux_name) != geometry_small,
+                timeout=8,
+                detail="active browser grows only its tmux window",
+            )
             geometry_large = tmux_geometry(tmux, base_env, initial_tmux_name)
             state_large = terminal_state(page_one)
-            if geometry_small != geometry_before or geometry_large != geometry_before:
+            before_size = tuple(int(part) for part in geometry_before.split("x", 1))
+            small_size = tuple(int(part) for part in geometry_small.split("x", 1))
+            large_size = tuple(int(part) for part in geometry_large.split("x", 1))
+            if not (small_size[0] < before_size[0] < large_size[0]
+                    and small_size[1] < before_size[1] < large_size[1]):
                 raise AssertionError(
-                    f"browser viewport changed canonical tmux geometry: "
+                    f"active browser did not resize its tmux grid with viewport: "
                     f"initial={geometry_before}, small={geometry_small}, large={geometry_large}"
                 )
-            canonical = tuple(int(part) for part in geometry_before.split("x", 1))
-            for label, observed in (("initial", state_before_resize), ("small", state_small), ("large", state_large)):
-                if (observed.get("cols"), observed.get("rows")) != canonical:
+            for label, observed, expected in (("initial", state_before_resize, before_size),
+                                              ("small", state_small, small_size),
+                                              ("large", state_large, large_size)):
+                if (observed.get("cols"), observed.get("rows")) != expected:
                     raise AssertionError(
-                        f"browser {label} viewport did not preserve canonical xterm grid: "
-                        f"expected={canonical}, observed={(observed.get('cols'), observed.get('rows'))}"
+                        f"browser {label} xterm grid did not match its tmux pane: "
+                        f"expected={expected}, observed={(observed.get('cols'), observed.get('rows'))}"
                     )
             viewport_fit = page_one.evaluate(
                 """() => {
@@ -1295,12 +1308,12 @@ def main() -> int:
                 }"""
             )
             result["geometry"] = {
-                "canonical": geometry_before,
+                "initial": geometry_before,
                 "after_small_viewport": geometry_small,
                 "after_large_viewport": geometry_large,
                 "viewport_fit": viewport_fit,
             }
-            result["assertions"]["browser_geometry_isolated_from_tmux"] = True
+            result["assertions"]["active_browser_resizes_own_tmux_window"] = True
 
             wait_browser_condition(
                 page_one,
@@ -1330,6 +1343,13 @@ def main() -> int:
                     f"passive second-browser open changed controller epoch: "
                     f"first={first_view!r}, second={second_before!r}"
                 )
+            if tmux_geometry(tmux, base_env, initial_tmux_name) != geometry_large:
+                raise AssertionError("passive browser changed the active writer's tmux geometry")
+            page_two.set_viewport_size({"width": 980, "height": 620})
+            page_two.wait_for_timeout(250)
+            if tmux_geometry(tmux, base_env, initial_tmux_name) != geometry_large:
+                raise AssertionError("passive browser resize changed the active writer's tmux geometry")
+            result["assertions"]["passive_browser_resize_is_size_neutral"] = True
             box_two = page_two.locator("#terminal-xterm").bounding_box()
             if not box_two:
                 raise AssertionError("second terminal has no browser geometry")
@@ -1340,15 +1360,34 @@ def main() -> int:
                 timeout=5,
                 detail="explicit second-browser focus takeover",
             )
+            wait_until(
+                lambda: tmux_geometry(tmux, base_env, initial_tmux_name) == geometry_small,
+                timeout=8,
+                detail="new browser writer applies its own viewport geometry",
+            )
+            result["assertions"]["focus_takeover_applies_new_writer_size"] = True
             second_focused = latest_socket_control("two") or {}
             if int(second_focused.get("epoch") or 0) <= int(first_view.get("epoch") or 0):
                 raise AssertionError(
                     f"explicit second-browser focus did not advance controller epoch: "
                     f"first={first_view!r}, focused={second_focused!r}"
                 )
+            page_two.wait_for_function(
+                "() => document.activeElement?.classList?.contains('xterm-helper-textarea') === true",
+                timeout=5_000,
+            )
             page_two.keyboard.type("TWO_TAKEOVER")
             page_two.keyboard.press("Enter")
-            wait_bytes(initial_raw, b"TWO_TAKEOVER\r")
+            try:
+                wait_bytes(initial_raw, b"TWO_TAKEOVER\r")
+            except AssertionError as error:
+                raise AssertionError(
+                    f"second-browser input did not reach its disposable pane: "
+                    f"control={latest_socket_control('two')!r}, "
+                    f"focused={page_two.evaluate('document.activeElement?.outerHTML.slice(0, 300)')!r}, "
+                    f"terminal={terminal_state(page_two)!r}, "
+                    f"raw_tail={initial_raw.read_bytes()[-180:]!r}"
+                ) from error
             second_after = latest_socket_control("two") or {}
             if second_after.get("mine") is not True:
                 raise AssertionError(
@@ -1592,9 +1631,43 @@ def main() -> int:
             page_two.screenshot(path=str(output / "desktop-style-tabs-pane-mobile.png"))
             sidebar.get_by_role("button", name="Hide Tabs pane", exact=True).click()
             sidebar.wait_for(state="hidden")
+            mobile_geometry = tmux_geometry(tmux, base_env, initial_tmux_name)
+            control_before_desktop = latest_socket_control("two")
             page_two.set_viewport_size({"width": 1280, "height": 800})
-            if tmux_geometry(tmux, base_env, initial_tmux_name) != geometry_before:
-                raise AssertionError("Tabs pane changed canonical tmux geometry")
+            try:
+                wait_until(
+                    lambda: tmux_geometry(tmux, base_env, initial_tmux_name) != mobile_geometry,
+                    timeout=8,
+                    detail="desktop terminal grows after leaving mobile Tabs pane layout",
+                )
+            except AssertionError as error:
+                debug = page_two.evaluate("""() => {
+                  const host = document.querySelector('#terminal-xterm');
+                  const api = host?.termdeckTerminal;
+                  return {hostWidth: host?.clientWidth, hostHeight: host?.clientHeight,
+                    cols: api?.terminal?.cols, rows: api?.terminal?.rows,
+                    focused: document.activeElement === api?.terminal?.textarea,
+                    status: document.querySelector('#terminal-status')?.textContent};
+                }""")
+                raise AssertionError(
+                    f"{error}; mobile={mobile_geometry}, now={tmux_geometry(tmux, base_env, initial_tmux_name)}, "
+                    f"control_before={control_before_desktop}, control_now={latest_socket_control('two')}, browser={debug}"
+                ) from error
+            desktop_geometry = tmux_geometry(tmux, base_env, initial_tmux_name)
+            mobile_size = tuple(int(part) for part in mobile_geometry.split("x", 1))
+            desktop_size = tuple(int(part) for part in desktop_geometry.split("x", 1))
+            if not (desktop_size[0] > mobile_size[0] and desktop_size[1] > mobile_size[1]):
+                raise AssertionError(f"terminal did not grow with workspace: {mobile_geometry} -> {desktop_geometry}")
+            page_two.wait_for_function(
+                """expected => {
+                  const terminal = document.querySelector('#terminal-xterm')?.termdeckTerminal?.terminal;
+                  return terminal?.cols === expected[0] && terminal?.rows === expected[1];
+                }""",
+                arg=list(desktop_size),
+                timeout=8_000,
+            )
+            result["geometry"]["after_tabs_pane_mobile"] = mobile_geometry
+            result["geometry"]["after_tabs_pane_desktop"] = desktop_geometry
             result["assertions"]["desktop_tabs_pane_navigation_layout_and_persistence"] = True
             page_two.keyboard.press("Control+Shift+k")
             tools_dialog = page_two.locator("#workspace-tools-dialog")
@@ -1637,6 +1710,12 @@ def main() -> int:
             tools_dialog.get_by_label("Blink cursor").uncheck()
             tools_dialog.get_by_label("Terminal palette").select_option("nord")
             tools_dialog.get_by_label("Terminal font", exact=True).select_option("liberation")
+            wait_until(
+                lambda: tmux_geometry(tmux, base_env, initial_tmux_name) != desktop_geometry,
+                timeout=8,
+                detail="selected terminal font changes the active writer's tmux grid",
+            )
+            appearance_geometry = tmux_geometry(tmux, base_env, initial_tmux_name)
             page_two.screenshot(path=str(output / "terminal-appearance.png"))
             page_two.keyboard.press("Escape")
             page_two.reload(wait_until="domcontentloaded")
@@ -1646,9 +1725,11 @@ def main() -> int:
                 return {cursor: terminal.options.cursorStyle, blink: terminal.options.cursorBlink, cols: terminal.cols, rows: terminal.rows,
                   background: terminal.options.theme.background, red: terminal.options.theme.red, font: terminal.options.fontFamily};
             }""")
-            if options != {"cursor": "bar", "blink": False, "cols": canonical[0], "rows": canonical[1],
+            current_size = tuple(int(part) for part in tmux_geometry(tmux, base_env, initial_tmux_name).split("x", 1))
+            if options != {"cursor": "bar", "blink": False, "cols": current_size[0], "rows": current_size[1],
                            "background": "#2e3440", "red": "#bf616a", "font": '"Liberation Mono", monospace'}:
-                raise AssertionError(f"appearance did not persist or changed canonical geometry: {options}")
+                raise AssertionError(f"appearance did not persist or xterm diverged from tmux {current_size}: {options}")
+            result["geometry"]["after_appearance"] = appearance_geometry
             click_action(page_two, "Terminal appearance")
             palette_backgrounds = {"t1000": "#0a0d13", "terminator": "#000000", "catppuccin": "#1e1e2e",
                                    "tokyo-night": "#1a1b26", "nord": "#2e3440", "one-dark": "#282c34", "solarized-dark": "#002b36"}

@@ -413,7 +413,12 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
     const MAX_COLUMNS = 1000;
     const MIN_ROWS = 2;
     const MAX_ROWS = 500;
-    const terminalApi = library.createTerminal(host, { scrollback: 20000, ...window.T1000UI.preferences() });
+    const terminalApi = library.createTerminal(host, {
+      scrollback: 20000,
+      ...window.T1000UI.preferences(),
+      onLayoutChange: () => resizeViewport(),
+      onFocusIntent: () => requestControl(),
+    });
     Object.defineProperty(host, "termdeckTerminal", {
       configurable: true,
       value: terminalApi,
@@ -449,6 +454,16 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
     let outputChunks = [];
     let outputBytes = 0;
     let canonicalGeometry = null;
+    let lastViewportGeometry = null;
+    let focusRequested = false;
+
+    function requestControl() {
+      if (ready && socketOpen()) {
+        sendJson({ type: "focus" });
+      } else {
+        focusRequested = true;
+      }
+    }
 
     function setStatus(message, kind) {
       status.textContent = message;
@@ -488,10 +503,19 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
     }
 
     function fitViewport() {
-      if (canonicalGeometry) {
+      const dimensions = boundedGeometry(terminalApi.fit());
+      if (ready && socketOpen() && (
+        !lastViewportGeometry
+        || lastViewportGeometry.cols !== dimensions.cols
+        || lastViewportGeometry.rows !== dimensions.rows
+      )) {
+        lastViewportGeometry = dimensions;
+        sendJson({ type: "resize", ...dimensions });
+      }
+      if (canonicalGeometry && !mine) {
         return terminalApi.fitGrid(canonicalGeometry.cols, canonicalGeometry.rows);
       }
-      return terminalApi.fit();
+      return dimensions;
     }
 
     function streamUrl() {
@@ -783,11 +807,15 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       window.clearTimeout(helloTimer);
       setOverlay("");
       ready = true;
+      if (focusRequested) {
+        focusRequested = false;
+        sendJson({ type: "focus" });
+      }
       window.requestAnimationFrame(() => {
         const focused = document.activeElement;
         if (!disposed && document.visibilityState === "visible" && document.hasFocus()
           && (!focused || focused === document.body || host.contains(focused))) {
-          terminalApi.focus();
+          terminalApi.focus(false);
         }
       });
       flushInputBatch(false);
@@ -877,6 +905,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
         return;
       }
       const dimensions = boundedGeometry(terminalApi.fit());
+      lastViewportGeometry = dimensions;
       candidate.send(JSON.stringify({ type: "hello", cols: dimensions.cols, rows: dimensions.rows }));
       helloTimer = window.setTimeout(() => {
         if (candidate === socket && !ready) {
@@ -967,7 +996,6 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
     terminalApi.onData(enqueue);
     host.addEventListener("pointerdown", () => {
       terminalApi.focus();
-      sendJson({ type: "focus" });
     });
     const observer = new ResizeObserver(() => {
       window.clearTimeout(resizeTimer);
@@ -1069,9 +1097,8 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
         }
         terminalApi.dispose();
       },
-      focus() {
-        terminalApi.focus();
-        sendJson({ type: "focus" });
+      focus(claimControl = true) {
+        terminalApi.focus(claimControl);
       },
     };
   }
@@ -1351,7 +1378,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
         if (pane && envelope) {
           document.title = `${pane.title} · ${envelope.window.name} · t1000`;
         }
-        terminalMount.focus();
+        terminalMount.focus(updateHistory);
         if (focusTab) {
           focusTabButton(paneId);
         }
@@ -1364,7 +1391,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       terminalHost.replaceChildren();
       terminalMount = mountTerminal(routeSlug, paneId, terminalHost, terminalStatus, terminalOverlay);
       if (!focusTab) {
-        terminalMount.focus();
+        terminalMount.focus(updateHistory);
       }
       if (pane && envelope) {
         document.title = `${pane.title} · ${envelope.window.name} · t1000`;

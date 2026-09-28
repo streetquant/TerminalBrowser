@@ -125,6 +125,13 @@ export function createTerminal(element, options = {}) {
     return dimensions;
   };
   const fit = () => {
+    // A viewer may have reduced the font to show a larger canonical grid.
+    // A browser writer measures its own viewport at the selected font size.
+    const preferredFontSize = Number.isFinite(options.fontSize)
+      ? options.fontSize : DEFAULT_FONT_SIZE;
+    if (terminal.options.fontSize !== preferredFontSize) {
+      terminal.options.fontSize = preferredFontSize;
+    }
     const dimensions = proposedDimensions();
     if (
       dimensions
@@ -132,6 +139,10 @@ export function createTerminal(element, options = {}) {
     ) {
       terminal.resize(dimensions.cols, dimensions.rows);
     }
+    element.dataset.termdeckColumns = String(terminal.cols);
+    element.dataset.termdeckRows = String(terminal.rows);
+    element.dataset.termdeckFontSize = String(terminal.options.fontSize);
+    element.dataset.termdeckOverflow = "false";
     return { cols: terminal.cols, rows: terminal.rows };
   };
   let lastGridFit = null;
@@ -253,12 +264,16 @@ export function createTerminal(element, options = {}) {
   };
   const fontSet = document.fonts;
   if (fontSet?.addEventListener) {
-    fontSet.addEventListener("loadingdone", invalidateFontMetrics);
-    fontSet.addEventListener("loadingerror", invalidateFontMetrics);
+    const fontChanged = () => {
+      invalidateFontMetrics();
+      options.onLayoutChange?.();
+    };
+    fontSet.addEventListener("loadingdone", fontChanged);
+    fontSet.addEventListener("loadingerror", fontChanged);
     trackSubscription({
       dispose() {
-        fontSet.removeEventListener?.("loadingdone", invalidateFontMetrics);
-        fontSet.removeEventListener?.("loadingerror", invalidateFontMetrics);
+        fontSet.removeEventListener?.("loadingdone", fontChanged);
+        fontSet.removeEventListener?.("loadingerror", fontChanged);
       },
     });
   }
@@ -269,8 +284,9 @@ export function createTerminal(element, options = {}) {
     dimensions() {
       return { cols: terminal.cols, rows: terminal.rows };
     },
-    focus() {
+    focus(claimControl = true) {
       terminal.focus();
+      if (claimControl) options.onFocusIntent?.();
     },
     activateWebgl,
     write(data, callback) {
@@ -321,6 +337,7 @@ export function createTerminal(element, options = {}) {
       invalidateFontMetrics();
       if (grid) fitGrid(grid.columns, grid.rows);
       else terminal.options.fontSize = value.fontSize;
+      options.onLayoutChange?.();
     },
     onData(callback) {
       const dataSubscription = terminal.onData((value) => callback(TEXT_ENCODER.encode(value)));
