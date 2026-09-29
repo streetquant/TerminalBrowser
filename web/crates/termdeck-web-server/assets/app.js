@@ -570,7 +570,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       mine = value.mine === true;
       const remoteNext = remoteNextSequence(value);
       if (remoteNext !== null) {
-        if (synchronizeSequence || inFlight.size === 0) {
+        if (!inFlight.size && (synchronizeSequence && !ready || !previouslyMine)) {
           nextSequence = remoteNext;
         } else {
           nextSequence = Math.max(nextSequence, remoteNext);
@@ -614,7 +614,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
     }
 
     function sendAvailable() {
-      if (!ready || !socketOpen()) {
+      if (!ready || !mine || !socketOpen()) {
         return;
       }
       if (socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) {

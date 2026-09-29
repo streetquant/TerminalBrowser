@@ -1169,6 +1169,14 @@ def main() -> int:
             page_one.keyboard.press("Control+C")
             page_one.keyboard.press("ArrowUp")
             page_one.keyboard.press("Tab")
+            terminal_focus_after_tab = page_one.evaluate(
+                "() => document.querySelector('#terminal-xterm')?.contains(document.activeElement) === true"
+            )
+            if not terminal_focus_after_tab:
+                raise AssertionError(
+                    "terminal lost keyboard focus after Tab: "
+                    + str(page_one.evaluate("document.activeElement?.outerHTML.slice(0, 300)"))
+                )
             wait_bytes(initial_raw, b"ONE_KEYBOARD\r")
             raw = wait_bytes(initial_raw, b"\x03")
             if b"\x1b[A" not in raw and b"\x1bOA" not in raw:
@@ -1183,24 +1191,54 @@ def main() -> int:
             render_echo_started = time.monotonic_ns()
             page_one.keyboard.type("UX_ECHO_REQUEST")
             page_one.keyboard.press("Enter")
-            page_one.wait_for_function(
-                "() => document.querySelector('#terminal-xterm')?.termdeckTerminal?.readBuffer().includes('UX_ECHO_RENDERED')",
-                timeout=5_000,
-            )
+            try:
+                page_one.wait_for_function(
+                    "() => document.querySelector('#terminal-xterm')?.termdeckTerminal?.readBuffer().includes('UX_ECHO_RENDERED')",
+                    timeout=5_000,
+                )
+            except Exception as exc:
+                diagnostic = {
+                    "active_element": page_one.evaluate("document.activeElement?.outerHTML.slice(0, 300)"),
+                    "raw_tail_hex": initial_raw.read_bytes()[-120:].hex(),
+                    "terminal_tail": page_one.evaluate(
+                        "document.querySelector('#terminal-xterm')?.termdeckTerminal?.readBuffer()?.slice(-500)"
+                    ),
+                }
+                (output / "echo-timeout-diagnostic.json").write_text(
+                    json.dumps(diagnostic, indent=2) + "\n", encoding="utf-8"
+                )
+                raise AssertionError(f"terminal echo timed out: {diagnostic}") from exc
             render_echo_ms = (time.monotonic_ns() - render_echo_started) / 1_000_000
             result["timings_ms"]["keyboard_to_terminal_buffer_echo"] = round(render_echo_ms, 3)
             result["assertions"]["keyboard_to_terminal_buffer_echo"] = True
+            if not page_one.evaluate(
+                "() => document.querySelector('#terminal-xterm')?.contains(document.activeElement) === true"
+            ):
+                raise AssertionError(
+                    "terminal lost keyboard focus after output: "
+                    + str(page_one.evaluate("document.activeElement?.outerHTML.slice(0, 300)"))
+                )
 
             latency_text = "PIPELINED_" + ("abcdefghijklmnopqrstuvwxyz0123456789" * 5)
             latency_offset = len(initial_raw.read_bytes())
             latency_started = time.monotonic_ns()
             page_one.keyboard.type(latency_text)
             latency_dispatched = time.monotonic_ns()
-            wait_until(
-                lambda: latency_text.encode("utf-8") in initial_raw.read_bytes()[latency_offset:],
-                timeout=5,
-                detail="120ms-ack delayed typing burst",
-            )
+            try:
+                wait_until(
+                    lambda: latency_text.encode("utf-8") in initial_raw.read_bytes()[latency_offset:],
+                    timeout=5,
+                    detail="120ms-ack delayed typing burst",
+                )
+            except Exception as exc:
+                diagnostic = {
+                    "active_element": page_one.evaluate("document.activeElement?.outerHTML.slice(0, 300)"),
+                    "raw_tail_hex": initial_raw.read_bytes()[-240:].hex(),
+                }
+                (output / "typing-timeout-diagnostic.json").write_text(
+                    json.dumps(diagnostic, indent=2) + "\n", encoding="utf-8"
+                )
+                raise AssertionError(f"typing burst timed out: {diagnostic}") from exc
             latency_finished = time.monotonic_ns()
             latency_total_ms = (latency_finished - latency_started) / 1_000_000
             latency_after_dispatch_ms = (latency_finished - latency_dispatched) / 1_000_000
@@ -1344,6 +1382,18 @@ def main() -> int:
                     f"passive second-browser open changed controller epoch: "
                     f"first={first_view!r}, second={second_before!r}"
                 )
+            # A passive viewer can queue bytes while its focus claim is in
+            # flight. They must not be sent with an unowned input sequence.
+            passive_marker = b"QUEUED_UNTIL_CONTROL"
+            page_two.evaluate(
+                "text => document.querySelector('#terminal-xterm').termdeckTerminal.paste(text)",
+                passive_marker.decode("ascii"),
+            )
+            page_two.wait_for_timeout(150)
+            if passive_marker in initial_raw.read_bytes():
+                raise AssertionError("passive browser sent terminal input before control ownership")
+            if (latest_socket_control("two") or {}).get("mine") is not False:
+                raise AssertionError("passive terminal input took control without a focus request")
             if tmux_geometry(tmux, base_env, initial_tmux_name) != geometry_large:
                 raise AssertionError("passive browser changed the active writer's tmux geometry")
             page_two.set_viewport_size({"width": 980, "height": 620})
@@ -1361,6 +1411,7 @@ def main() -> int:
                 timeout=5,
                 detail="explicit second-browser focus takeover",
             )
+            wait_bytes(initial_raw, passive_marker)
             wait_until(
                 lambda: tmux_geometry(tmux, base_env, initial_tmux_name) == geometry_small,
                 timeout=8,
@@ -1698,15 +1749,17 @@ def main() -> int:
             tools_dialog.get_by_text("No matches", exact=True).wait_for()
             page_two.keyboard.press("Escape")
             page_two.keyboard.press("Control+Shift+p")
-            tools_dialog.get_by_role("searchbox").fill("Terminal appearance")
-            page_two.keyboard.press("Enter")
+            tools_dialog.get_by_role("textbox", name="Codex prompt").wait_for(timeout=3000)
+            tools_dialog.get_by_role("combobox", name="Directory").wait_for(timeout=3000)
+            page_two.keyboard.press("Escape")
+            click_action(page_two, "Terminal appearance")
             try:
-                tools_dialog.get_by_label("Maximum text size (px)").wait_for(timeout=3000)
+                tools_dialog.get_by_label("Terminal text size (px)").wait_for(timeout=3000)
             except Exception as exc:
                 page_two.screenshot(path=str(output / "palette-transition-failure.png"))
-                raise AssertionError(f"palette transition failed: {tools_dialog.evaluate('el => el.outerHTML')}; errors={result['page_errors']}") from exc
-            tools_dialog.get_by_label("Maximum text size (px)").fill("16")
-            tools_dialog.get_by_label("Maximum text size (px)").press("Tab")
+                raise AssertionError(f"appearance dialog failed: {tools_dialog.evaluate('el => el.outerHTML')}; errors={result['page_errors']}") from exc
+            tools_dialog.get_by_label("Terminal text size (px)").fill("16")
+            tools_dialog.get_by_label("Terminal text size (px)").press("Tab")
             tools_dialog.get_by_label("Cursor shape").select_option("bar")
             tools_dialog.get_by_label("Blink cursor").uncheck()
             tools_dialog.get_by_label("Terminal palette").select_option("nord")
@@ -1751,7 +1804,7 @@ def main() -> int:
             if initial_raw.read_bytes() != before_tools:
                 raise AssertionError("workspace tool shortcuts leaked input into the terminal")
             switch_pane_timed(created_id, "CODEX COMPOSER › CREATED")
-            result["assertions"]["search_palette_find_appearance_and_shortcuts"] = True
+            result["assertions"]["codex_palette_find_appearance_and_shortcuts"] = True
 
             home_page = context_two.new_page()
             home_page.goto(f"{origin}/")
