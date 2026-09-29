@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from termdeck.cli import cmd_recovery_qualification
@@ -110,6 +111,40 @@ class RecoveryQualificationTests(unittest.TestCase):
             self.assertEqual(by_id[stopped.id].classification, "skipped")
             self.assertEqual(by_id[deferred.id].classification, "deferred")
             self.assertEqual(by_id[deferred.id].primary_reason.code, "cwd_unavailable")
+
+    def test_colocated_production_storage_uses_direct_evidence_without_launcher_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / ".termdeck"
+            state = root / "state"
+            state.mkdir(parents=True)
+            db = state / "sessions.sqlite3"
+            self._create_record(db, state)
+            self._claim_table(db)
+            before = hashlib.sha256(db.read_bytes()).hexdigest()
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+                "termdeck.recovery_qualification.attest_storage_fabric",
+                return_value=SimpleNamespace(ok=True, reason="direct device proof"),
+            ) as attest:
+                approved = qualify_recovery(db)
+            self.assertEqual(approved.counts["eligible"], 1)
+            self.assertEqual(approved.panes[0].checks["storage_attestation"].state, "pass")
+            self.assertEqual(attest.call_args.kwargs["db_path"], db)
+            self.assertEqual(attest.call_args.kwargs["tmux_runtime"], state / "tmux")
+            with mock.patch.dict(os.environ, self._STORAGE, clear=True), mock.patch(
+                "termdeck.recovery_qualification.attest_storage_fabric",
+                return_value=SimpleNamespace(ok=False, reason="unsafe storage path"),
+            ):
+                rejected = qualify_recovery(db)
+            self.assertEqual(rejected.counts["fail_closed"], 1)
+            self.assertEqual(rejected.panes[0].primary_reason.code, "storage_attestation_invalid")
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+                "termdeck.recovery_qualification.attest_storage_fabric",
+                side_effect=OSError("mount evidence unavailable"),
+            ):
+                failed = qualify_recovery(db)
+            self.assertFalse(failed.ok)
+            self.assertEqual(failed.counts["eligible"], 0)
+            self.assertEqual(hashlib.sha256(db.read_bytes()).hexdigest(), before)
 
     def test_each_required_gate_is_reported_for_native_codex(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

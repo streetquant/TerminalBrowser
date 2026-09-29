@@ -26,6 +26,7 @@ from typing import Iterable, Mapping
 from .session_recipe import SessionRecipe, SessionRecipeError, recipe_from_record
 from .session_store import default_db_path
 from .sqlite_io import SQLiteReadOnlyError, read_only_refresh
+from .storage_fabric import StorageAttestation, StorageFabricError, attest_storage_fabric
 
 
 CLASSIFICATIONS = ("eligible", "deferred", "fail_closed", "skipped")
@@ -483,7 +484,18 @@ def _rollout_observation(
     return _RolloutObservation("missing", "no exact CLI rollout metadata matched the target UUID and cwd")
 
 
-def _storage_observation(environment: Mapping[str, str]) -> tuple[str, QualificationReason | None, QualificationCheck]:
+def _storage_observation(
+    environment: Mapping[str, str],
+    direct_attestation: StorageAttestation | None,
+) -> tuple[str, QualificationReason | None, QualificationCheck]:
+    if direct_attestation is not None:
+        if direct_attestation.ok:
+            return "pass", None, _check("pass", "configured storage paths passed direct mount and device attestation")
+        return (
+            "fail_closed",
+            _reason("storage_attestation_invalid", direct_attestation.reason, "storage_attestation"),
+            _check("invalid", direct_attestation.reason),
+        )
     # Direct-root evidence does not infer bulk-storage masking.
     expected = {
         "CODEX_STORAGE_FABRIC": "direct-root",
@@ -650,6 +662,7 @@ def _qualify_row(
     connection: sqlite3.Connection,
     *,
     environment: Mapping[str, str],
+    direct_attestation: StorageAttestation | None,
     rollout_root: str | Path | None,
     rollout_states: Mapping[str, object] | None,
     max_rollout_files: int,
@@ -735,7 +748,7 @@ def _qualify_row(
     if rollout_reason is not None:
         reasons.append(rollout_reason)
 
-    storage_state, storage_reason, storage_check = _storage_observation(environment)
+    storage_state, storage_reason, storage_check = _storage_observation(environment, direct_attestation)
     checks["storage_attestation"] = storage_check
     if storage_reason is not None:
         reasons.append(storage_reason)
@@ -823,6 +836,7 @@ def _qualify_recovery_connection(
     connection: sqlite3.Connection,
     *,
     values: Mapping[str, str],
+    direct_attestation: StorageAttestation | None,
     rollout_root: str | Path | None,
     rollout_states: Mapping[str, object] | None,
     max_rollout_files: int,
@@ -843,6 +857,7 @@ def _qualify_recovery_connection(
             record,
             connection,
             environment=values,
+            direct_attestation=direct_attestation,
             rollout_root=rollout_root,
             rollout_states=rollout_states,
             max_rollout_files=max_rollout_files,
@@ -877,6 +892,25 @@ def qualify_recovery(
 
     path = Path(db_path).expanduser() if db_path is not None else default_db_path()
     values = os.environ if environment is None else environment
+    direct_attestation = None
+    # This repository's colocated production layout can be proved from the
+    # actual mount and device. Launcher CODEX_STORAGE_* labels are advisory and
+    # need not be present in a standalone read-only qualification process.
+    absolute_path = Path(os.path.abspath(path))
+    root = absolute_path.parent.parent
+    if environment is None and absolute_path.parent.name == "state" and root.name == ".termdeck":
+        try:
+            direct_attestation = attest_storage_fabric(
+                managed_root=root / "t1000-managed",
+                db_path=absolute_path,
+                auth_root=root / "auth",
+                tmux_runtime=absolute_path.parent / "tmux",
+                runtime_root=absolute_path.parent / "runtime",
+                checkpoint_root=absolute_path.parent / "checkpoints",
+                production=True,
+            )
+        except (OSError, ValueError, StorageFabricError) as exc:
+            return _empty_error_report(path, f"direct storage attestation failed: {exc}")
     try:
         refreshed = read_only_refresh(
             path,
@@ -884,6 +918,7 @@ def qualify_recovery(
                 Path(path),
                 connection,
                 values=values,
+                direct_attestation=direct_attestation,
                 rollout_root=rollout_root,
                 rollout_states=rollout_states,
                 max_rollout_files=max_rollout_files,
