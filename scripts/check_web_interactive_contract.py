@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FILES = {
     "app": ROOT / "web/crates/termdeck-web-server/assets/app.js",
+    "session": ROOT / "web/crates/termdeck-web-server/assets/terminal-session.js",
     "workspace_ui": ROOT / "web/crates/termdeck-web-server/assets/workspace-ui.js",
     "terminal_scroll": ROOT / "web/crates/termdeck-web-server/assets/terminal-scroll.js",
     "terminal_copy": ROOT / "web/crates/termdeck-web-server/assets/terminal-copy.js",
@@ -42,6 +43,7 @@ def reject(text: str, needle: str, surface: str) -> None:
 
 def main() -> None:
     text = {name: path.read_text(encoding="utf-8") for name, path in FILES.items()}
+    browser = text["app"] + "\n" + text["session"]
     server_production = text["server"].split("#[cfg(test)]\nmod tests {", 1)[0]
     stream_production = text["stream"].split("#[cfg(test)]", 1)[0]
 
@@ -53,7 +55,7 @@ def main() -> None:
         "Controller active",
         "typing switches control here",
     ):
-        reject(text["app"], needle, "browser UI")
+        reject(browser, needle, "browser UI")
         reject(server_production, needle, "server-rendered UI")
 
     for needle in (
@@ -64,7 +66,7 @@ def main() -> None:
 
     for needle in (
         'const routePane = root.getAttribute("data-termdeck-pane") || "";',
-        "terminalMount = mountTerminal(routeSlug, paneId, terminalHost, terminalStatus, terminalOverlay);",
+        "terminalViews.select(paneId)",
         "if (activePaneId) {",
         "switchPane(activePaneId, false);",
         "terminalApi.onData(bytes => scroll.isWheelInput() ? enqueueWheel(bytes) : enqueue(bytes))",
@@ -84,7 +86,7 @@ def main() -> None:
         "let refreshRequested = false;",
         "queued ? 0 : document.hidden ? 30000 : 5000",
     ):
-        require(text["app"], needle, "browser")
+        require(browser, needle, "browser")
 
     for needle in (
         'data-termdeck-page=\\"window\\" data-termdeck-slug=\\"',
@@ -117,10 +119,15 @@ def main() -> None:
     require(stream_production, "CONTROL_FLAGS_WRITER", "tmux writer mode")
     require(stream_production, 'CONTROL_FLAGS_VIEWER: &str = "active-pane,ignore-size,no-detach-on-destroy"', "passive viewer geometry isolation")
     require(stream_production, 'CONTROL_FLAGS_WRITER: &str = "active-pane,!ignore-size,no-detach-on-destroy"', "active browser geometry authority")
-    require(text["app"], "MAX_IN_FLIGHT_FRAMES = 64", "bounded pipelined input")
-    require(text["app"], "INPUT_BATCH_MS = 3", "interactive input batching")
-    require(text["app"], "inFlight = new Map()", "multi-frame acknowledgement tracking")
-    require(text["app"], "window.T1000TerminalScroll.install(host, terminalApi", "scroll owner wiring")
+    require(browser, "MAX_IN_FLIGHT_FRAMES = 64", "bounded pipelined input")
+    require(browser, "INPUT_BATCH_MS = 3", "interactive input batching")
+    require(browser, "inFlight = new Map()", "multi-frame acknowledgement tracking")
+    require(browser, "window.T1000TerminalScroll.install(host, terminalApi", "scroll owner wiring")
+    require(text["session"], "limit > 4", "recent terminal resource bound")
+    require(text["session"], "if (!active || disposed) return;", "inactive terminal focus isolation")
+    require(text["session"], "if (!active || !(bytes instanceof Uint8Array)", "inactive terminal input isolation")
+    require(text["app"], "terminalViews.prune(next.window.panes.map(pane => pane.id))", "removed terminal cleanup")
+    require(text["server"], 'const TERMINAL_SESSION_PATH: &str = "/_termdeck/assets/v8/terminal-session.js"', "session asset route")
     require(text["terminal_scroll"], 'host.addEventListener("wheel", wheel, { capture: true, passive: false })', "wheel interception")
     require(text["terminal_copy"], "navigator.clipboard.writeText", "explicit selection clipboard")
     require(text["terminal_source"], "fitGrid", "canonical-grid viewport fit")
@@ -135,7 +142,7 @@ def main() -> None:
     require(text["css"], "@media (max-width: 460px)", "narrow viewport layout")
     require(
         text["stream"],
-        "terminal.acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), true).await",
+        "terminal.focus(pane.pane_id.as_str(), actor.as_str(), unix_ms()).await",
         "focus-driven generation-safe takeover",
     )
     require(stream_production, "send-keys -t {} -H", "exact-byte tmux input")

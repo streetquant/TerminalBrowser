@@ -1084,6 +1084,13 @@ body.workspace-page[data-termdeck-connection="error"] .xterm-shell { opacity: .7
   direction: ltr;
   accent-color: var(--td-accent);
 }
+.terminal-scroll-controls[data-scroll-pages="true"] { justify-content: space-between; }
+.terminal-scroll-page {
+  width: 22px;
+  height: 26px;
+  padding: 0;
+  font-size: 14px;
+}
 .terminal-scroll-live {
   flex: none;
   width: 22px;

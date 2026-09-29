@@ -55,6 +55,7 @@ const MIN_ROWS: u16 = 2;
 const MAX_ROWS: u16 = 500;
 const INPUT_FRAME_TYPE: u8 = 1;
 const MOUSE_WHEEL_FRAME_TYPE: u8 = 2;
+const APPLICATION_SCROLL_FRAME_TYPE: u8 = 3;
 const MAX_MOUSE_WHEEL_BYTES: usize = 64;
 const MOUSE_REPORTING_FORMAT: &str =
     "#{||:#{mouse_standard_flag},#{||:#{mouse_button_flag},#{mouse_all_flag}}}";
@@ -154,6 +155,7 @@ enum InputKind {
     Raw,
     MouseWheel,
     MouseMotion,
+    ApplicationScroll,
 }
 
 impl InputKind {
@@ -162,6 +164,7 @@ impl InputKind {
             Self::Raw => b"websocket-raw",
             Self::MouseWheel => b"websocket-wheel",
             Self::MouseMotion => b"websocket-motion",
+            Self::ApplicationScroll => b"websocket-application-scroll",
         }
     }
 }
@@ -210,6 +213,7 @@ struct ReadyEvent<'a> {
 struct ControlEvent<'a> {
     r#type: &'static str,
     control: &'a TerminalControlView,
+    focused: bool,
 }
 
 #[derive(Serialize)]
@@ -375,7 +379,7 @@ async fn run_terminal_socket_inner(
                                 .acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), true)
                                 .await?;
                             control.set_writer_mode(true, viewport_geometry).await?;
-                            send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view }).await?;
+                            send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view, focused: false }).await?;
                         }
                         let decision = terminal
                             .authorize_input(
@@ -396,6 +400,7 @@ async fn run_terminal_socket_inner(
                                 let delivered = match kind {
                                     InputKind::Raw | InputKind::MouseMotion => control.send_input(bytes).await,
                                     InputKind::MouseWheel => control.send_mouse_wheel(bytes).await,
+                                    InputKind::ApplicationScroll => control.send_application_scroll(bytes).await,
                                 };
                                 match delivered {
                                     Ok(()) => {
@@ -417,17 +422,11 @@ async fn run_terminal_socket_inner(
                         match serde_json::from_str::<ClientEvent>(text.as_str())? {
                             ClientEvent::Hello { .. } => return Err(StreamError::ClientProtocol("hello may only be sent once")),
                             ClientEvent::Focus => {
-                                if !control_view.mine {
-                                    // Browser focus is the user's implicit control intent. A
-                                    // remounted pane has a fresh WebSocket actor, so a
-                                    // generation-safe takeover is required before input.
-                                    control_view = match terminal.acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), true).await {
-                                        Ok(value) => value,
-                                        Err(_error) => terminal.status(pane.pane_id.as_str(), actor.as_str(), unix_ms()).await?,
-                                    };
-                                    control.set_writer_mode(control_view.mine, viewport_geometry).await?;
-                                    send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view }).await?;
-                                }
+                                // The cached view can predate HTTP management or
+                                // another stream. Focus must check current ownership.
+                                control_view = terminal.focus(pane.pane_id.as_str(), actor.as_str(), unix_ms()).await?;
+                                control.set_writer_mode(control_view.mine, viewport_geometry).await?;
+                                send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view, focused: true }).await?;
                             }
                             ClientEvent::Resize { cols, rows } => {
                                 viewport_geometry = TerminalGeometry::new(cols, rows)?;
@@ -479,7 +478,7 @@ async fn run_terminal_socket_inner(
                         Err(_error) => terminal.status(pane.pane_id.as_str(), actor.as_str(), unix_ms()).await?,
                     };
                     control.set_writer_mode(control_view.mine, viewport_geometry).await?;
-                    send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view }).await?;
+                    send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view, focused: false }).await?;
                 }
             }
             _ = session_check.tick() => {
@@ -596,6 +595,7 @@ fn parse_input_frame(frame: &[u8]) -> Result<(u64, &[u8], InputKind), StreamErro
     let mut kind = match frame[0] {
         INPUT_FRAME_TYPE => InputKind::Raw,
         MOUSE_WHEEL_FRAME_TYPE => InputKind::MouseWheel,
+        APPLICATION_SCROLL_FRAME_TYPE => InputKind::ApplicationScroll,
         _ => return Err(StreamError::ClientProtocol("invalid terminal input frame")),
     };
     let sequence = u64::from_be_bytes(
@@ -611,6 +611,9 @@ fn parse_input_frame(frame: &[u8]) -> Result<(u64, &[u8], InputKind), StreamErro
     }
     if kind == InputKind::MouseWheel && !is_mouse_wheel_packet(bytes) {
         return Err(StreamError::ClientProtocol("invalid terminal mouse wheel"));
+    }
+    if kind == InputKind::ApplicationScroll && application_scroll_key(bytes).is_none() {
+        return Err(StreamError::ClientProtocol("invalid application scroll"));
     }
     // Mouse motion is generated while hovering, before a wheel gesture can
     // reach its own handler. Even an older or stale browser must not turn a
@@ -681,6 +684,26 @@ fn mouse_packet(bytes: &[u8]) -> Option<(u32, usize)> {
         .collect::<Option<Vec<_>>>();
     // SGR pixel coordinates are zero based, unlike cell coordinates.
     values.map(|value| (value[0], bytes.len()))
+}
+
+fn application_scroll_key(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        b"\x1b[5~" => Some("PageUp"),
+        b"\x1b[6~" => Some("PageDown"),
+        _ => None,
+    }
+}
+
+fn application_scroll_command(pane_id: &str, bytes: &[u8]) -> Result<String, StreamError> {
+    validate_tmux_pane_id(pane_id)?;
+    let key = application_scroll_key(bytes)
+        .ok_or(StreamError::ClientProtocol("invalid application scroll"))?;
+    // Evaluate mode inside tmux's command queue. A stale browser gesture must
+    // not become shell/prompt input after the application exits or enables
+    // its mouse protocol. Navigation never implicitly acquires control.
+    Ok(format!(
+        "if-shell -F -t {pane_id} '#{{&&:#{{alternate_on}},#{{!:{MOUSE_REPORTING_FORMAT}}}}}' 'send-keys -t {pane_id} {key}'"
+    ))
 }
 
 fn mouse_wheel_command(pane_id: &str, bytes: &[u8]) -> Result<String, StreamError> {
@@ -1013,6 +1036,12 @@ impl TmuxControl {
 
     async fn send_mouse_wheel(&self, bytes: &[u8]) -> Result<(), StreamError> {
         self.command(mouse_wheel_command(self.pane_id.as_str(), bytes)?)
+            .await?;
+        Ok(())
+    }
+
+    async fn send_application_scroll(&self, bytes: &[u8]) -> Result<(), StreamError> {
+        self.command(application_scroll_command(self.pane_id.as_str(), bytes)?)
             .await?;
         Ok(())
     }
@@ -1858,14 +1887,51 @@ mod tests {
         CONTROL_FLAGS_VIEWER, CONTROL_FLAGS_WRITER, CONTROL_MODE_ARGUMENT, ControlNotification,
         InputKind, MAX_INITIAL_REPLAY_JOINED_CELLS, MAX_OUTPUT_FRAME_BYTES,
         MAX_PENDING_OUTPUT_BYTES, OutputQueue, PANE_STATE_FORMAT, PaneState, PendingReply,
-        StreamError, TerminalGeometry, build_replay, decode_tmux_output, extended_output_payload,
-        handle_control_line, initial_replay_history_lines, is_mouse_wheel_packet,
-        mouse_wheel_command, output_payload, parse_input_frame, parse_marker, refresh_pane_action,
-        validate_geometry,
+        StreamError, TerminalGeometry, application_scroll_command, build_replay,
+        decode_tmux_output, extended_output_payload, handle_control_line,
+        initial_replay_history_lines, is_mouse_wheel_packet, mouse_wheel_command, output_payload,
+        parse_input_frame, parse_marker, refresh_pane_action, validate_geometry,
     };
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn application_scroll_admits_only_fenced_page_navigation() {
+        for (bytes, key) in [
+            (b"\x1b[5~".as_slice(), "PageUp"),
+            (b"\x1b[6~".as_slice(), "PageDown"),
+        ] {
+            let mut frame = vec![3];
+            frame.extend_from_slice(&7_u64.to_be_bytes());
+            frame.extend_from_slice(bytes);
+            let (sequence, payload, kind) = parse_input_frame(&frame)
+                .unwrap_or_else(|error| panic!("valid application scroll: {error}"));
+            assert_eq!(sequence, 7);
+            assert_eq!(payload, bytes);
+            assert_eq!(kind, InputKind::ApplicationScroll);
+            assert_eq!(kind.domain(), b"websocket-application-scroll");
+            let command = application_scroll_command("%7", bytes)
+                .unwrap_or_else(|error| panic!("valid application scroll command: {error}"));
+            assert!(command.contains("#{alternate_on}"));
+            assert!(command.contains("#{!:"));
+            assert!(command.ends_with(&format!("'send-keys -t %7 {key}'")));
+        }
+        for bytes in [
+            b"\x1b[A".as_slice(),
+            b"\x1b[5~\x1b[6~",
+            b"run-shell x",
+            b"\x1b[5;2~",
+            b"",
+        ] {
+            let mut frame = vec![3];
+            frame.extend_from_slice(&7_u64.to_be_bytes());
+            frame.extend_from_slice(bytes);
+            assert!(parse_input_frame(&frame).is_err());
+            assert!(application_scroll_command("%7", bytes).is_err());
+        }
+        assert!(application_scroll_command("%7; kill-session", b"\x1b[5~").is_err());
+    }
 
     #[test]
     fn tmux_control_mode_and_state_format_are_pipe_safe() {

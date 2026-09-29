@@ -90,6 +90,7 @@ const WORKSPACE_UI_PATH: &str = "/_termdeck/assets/v8/workspace-ui.js";
 const CODEX_PALETTE_PATH: &str = "/_termdeck/assets/v8/codex-palette.js";
 const TERMINAL_COPY_PATH: &str = "/_termdeck/assets/v8/terminal-copy.js";
 const TERMINAL_SCROLL_PATH: &str = "/_termdeck/assets/v8/terminal-scroll.js";
+const TERMINAL_SESSION_PATH: &str = "/_termdeck/assets/v8/terminal-session.js";
 const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v8/terminal.css";
 const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v8/terminal.js";
 const EXTERNAL_BASE_PATH: &str = "/t1000";
@@ -107,6 +108,7 @@ const WORKSPACE_UI_JS: &[u8] = include_bytes!("../assets/workspace-ui.js");
 const CODEX_PALETTE_JS: &[u8] = include_bytes!("../assets/codex-palette.js");
 const TERMINAL_COPY_JS: &[u8] = include_bytes!("../assets/terminal-copy.js");
 const TERMINAL_SCROLL_JS: &[u8] = include_bytes!("../assets/terminal-scroll.js");
+const TERMINAL_SESSION_JS: &[u8] = include_bytes!("../assets/terminal-session.js");
 const TERMINAL_CSS: &[u8] = include_bytes!("../assets/terminal.css");
 const TERMINAL_JS: &[u8] = include_bytes!("../assets/terminal.js");
 const _: () = {
@@ -118,6 +120,7 @@ const _: () = {
     assert!(CODEX_PALETTE_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
     assert!(TERMINAL_COPY_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
     assert!(TERMINAL_SCROLL_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+    assert!(TERMINAL_SESSION_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
     assert!(TERMINAL_CSS.len() <= MAX_TERMINAL_ASSET_BYTES);
     assert!(TERMINAL_JS.len() <= MAX_TERMINAL_ASSET_BYTES);
 };
@@ -950,6 +953,7 @@ fn build_router(state: AppState) -> Router {
         .route(CODEX_PALETTE_PATH, get(codex_palette_js))
         .route(TERMINAL_COPY_PATH, get(terminal_copy_js))
         .route(TERMINAL_SCROLL_PATH, get(terminal_scroll_js))
+        .route(TERMINAL_SESSION_PATH, get(terminal_session_js))
         .route(TERMINAL_CSS_PATH, get(terminal_css))
         .route(TERMINAL_JS_PATH, get(terminal_js))
         .route("/_termdeck/healthz", get(healthz))
@@ -1180,6 +1184,7 @@ fn public_auth_route(path: &str) -> bool {
             | CODEX_PALETTE_PATH
             | TERMINAL_COPY_PATH
             | TERMINAL_SCROLL_PATH
+            | TERMINAL_SESSION_PATH
             | TERMINAL_CSS_PATH
             | TERMINAL_JS_PATH
             | "/_termdeck/healthz"
@@ -1306,6 +1311,14 @@ async fn terminal_scroll_js() -> Response {
         StatusCode::OK,
         "text/javascript; charset=utf-8",
         Bytes::from_static(TERMINAL_SCROLL_JS),
+    )
+}
+
+async fn terminal_session_js() -> Response {
+    text_response(
+        StatusCode::OK,
+        "text/javascript; charset=utf-8",
+        Bytes::from_static(TERMINAL_SESSION_JS),
     )
 }
 
@@ -2120,6 +2133,8 @@ async fn terminal_page(
     output.push_str(TERMINAL_COPY_PATH);
     output.push_str("\"></script><script defer src=\"");
     output.push_str(TERMINAL_SCROLL_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(TERMINAL_SESSION_PATH);
     output.push_str("\"></script><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
     output.push_str("\"></script></head><body class=\"terminal-page\"><main id=\"termdeck-app\" class=\"terminal-page-main\" data-termdeck-page=\"terminal\" data-termdeck-slug=\"");
@@ -3216,6 +3231,8 @@ fn render_homepage(
     output.push_str("\"></script><script defer src=\"");
     output.push_str(TERMINAL_SCROLL_PATH);
     output.push_str("\"></script><script defer src=\"");
+    output.push_str(TERMINAL_SESSION_PATH);
+    output.push_str("\"></script><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
     output.push_str("\"></script></head><body><main id=\"termdeck-app\" aria-busy=\"false\" data-termdeck-page=\"home\"><header class=\"host-header\"><p class=\"eyebrow\">t1000 host</p><h1>Windows</h1><p class=\"subtle\">");
     output.push_str(&snapshot.windows().len().to_string());
@@ -3287,6 +3304,8 @@ fn render_window_page(
     output.push_str(TERMINAL_COPY_PATH);
     output.push_str("\"></script><script defer src=\"");
     output.push_str(TERMINAL_SCROLL_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(TERMINAL_SESSION_PATH);
     output.push_str("\"></script><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
     output.push_str("\"></script></head><body><main id=\"termdeck-app\" aria-busy=\"false\" data-termdeck-page=\"window\" data-termdeck-slug=\"");
@@ -3554,7 +3573,8 @@ mod tests {
         FRONTEND_CSS_PATH, FRONTEND_JS_PATH, MAX_FRONTEND_ASSET_BYTES, MAX_PASSWORD_OPERATIONS,
         RenderedSnapshot, ServerConfig, ServerError, SnapshotCache, TERMINAL_COPY_JS,
         TERMINAL_COPY_PATH, TERMINAL_JS_PATH, TERMINAL_SCROLL_JS, TERMINAL_SCROLL_PATH,
-        WORKSPACE_UI_JS, WORKSPACE_UI_PATH, build_router, unix_ms,
+        TERMINAL_SESSION_JS, TERMINAL_SESSION_PATH, WORKSPACE_UI_JS, WORKSPACE_UI_PATH,
+        build_router, unix_ms,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
@@ -3861,6 +3881,7 @@ mod tests {
         runtime().block_on(async {
             assert!(APP_CSS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(APP_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+            assert!(TERMINAL_SESSION_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(WORKSPACE_UI_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(CODEX_PALETTE_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(TERMINAL_COPY_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
@@ -3958,6 +3979,20 @@ mod tests {
             assert_eq!(scroll.status(), StatusCode::OK);
             let scroll = body_text(scroll).await;
             assert_eq!(scroll.as_bytes(), TERMINAL_SCROLL_JS);
+
+            let session = router
+                .clone()
+                .oneshot(request(
+                    Method::GET,
+                    TERMINAL_SESSION_PATH,
+                    "localhost:7391",
+                ))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(session.status(), StatusCode::OK);
+            let session = body_text(session).await;
+            assert_eq!(session.as_bytes(), TERMINAL_SESSION_JS);
+            assert!(!session.contains("innerHTML"));
             assert!(!scroll.contains("innerHTML"));
             assert!(!scroll.contains("eval("));
             let workspace = router
@@ -3985,10 +4020,10 @@ mod tests {
             assert!(script.contains("workspace-statusbar"));
             assert!(!script.contains("window.confirm("));
             assert!(!script.contains("window.prompt("));
-            assert!(script.contains("termdeck.terminal-control.v1"));
-            assert!(script.contains("/_termdeck/ws/v1/windows/"));
-            assert!(script.contains("new WebSocket"));
-            assert!(script.contains("termdeck.terminal.v1"));
+            assert!(session.contains("termdeck.terminal-control.v1"));
+            assert!(session.contains("/_termdeck/ws/v1/windows/"));
+            assert!(session.contains("new WebSocket"));
+            assert!(session.contains("termdeck.terminal.v1"));
             assert!(script.contains("terminal-xterm"));
             assert!(script.contains("AbortController"));
             assert!(script.contains("revision_text"));

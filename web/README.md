@@ -123,6 +123,40 @@ another tab does not download the xterm bundle again. Operator-facing controller
 intentionally absent: focusing and typing in a terminal performs generation-safe automatic
 ownership transfer while every other authenticated browser remains a live viewer.
 
+Within a window, the browser retains at most four recent terminal renderers and
+authenticated streams. Returning to a retained tab preserves its scrollback and
+avoids a WebSocket handshake. Only the selected view is attached to the page;
+inactive views cannot request control, send new input or resize their panes.
+Their bounded output queues keep the buffers current. Least recently used
+views are disposed when the bound is reached; hiding, killing or leaving the
+window also releases the corresponding views. Authentication is still checked
+by the server on every operation and periodically on every stream.
+
+Normal-screen history scrolls locally in xterm. An alternate-screen application
+without mouse reporting receives bounded Page Up/Down navigation from the wheel
+and page buttons; its own conversation remains on the same terminal surface.
+TermDeck does not invent an application history length or inject prompt-history
+arrows. Those frames share the authenticated input sequence and replay checks,
+never take control from a viewer, and recheck alternate-screen/mouse modes in
+tmux before delivery. Mouse-aware applications keep their native wheel protocol.
+
+The real-Codex browser fixture uses a synthetic conversation and private home:
+
+```bash
+python scripts/check_web_codex_scroll.py \
+  --server-binary web/target/release/termdeck-web-server \
+  --codex-binary <installed-native-codex-binary> \
+  --output <private-evidence-directory>
+```
+
+Run the disposable cache, history, input isolation and revocation checks:
+
+```bash
+python scripts/check_web_terminal_switch.py \
+  --server-binary web/target/release/termdeck-web-server \
+  --output <private-evidence-directory>
+```
+
 Run the complete disposable Chromium proof without addressing the production tmux server:
 
 ```bash

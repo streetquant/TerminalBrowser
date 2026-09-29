@@ -322,13 +322,38 @@ impl TerminalService {
         now_unix_ms: u64,
         takeover: bool,
     ) -> Result<TerminalControlView, TerminalError> {
+        self.acquire_control(pane_id, device_id, now_unix_ms, takeover, false)
+            .await
+    }
+
+    pub(crate) async fn focus(
+        &self,
+        pane_id: &str,
+        device_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<TerminalControlView, TerminalError> {
+        // Revalidate explicit focus atomically. Keeping an already-owned lease
+        // preserves pending input and its replay receipt; a different owner
+        // requires a new generation before any browser input can be sent.
+        self.acquire_control(pane_id, device_id, now_unix_ms, true, true)
+            .await
+    }
+
+    async fn acquire_control(
+        &self,
+        pane_id: &str,
+        device_id: &str,
+        now_unix_ms: u64,
+        takeover: bool,
+        retain_owned: bool,
+    ) -> Result<TerminalControlView, TerminalError> {
         let pane_id = PaneId::new(pane_id)?;
         let device_id = DeviceId::new(device_id)?;
         let device = AuthenticatedDevice::new(self.owner_id.clone(), device_id.clone());
         let mut state = self.state.lock().await;
         if let Some(current) = state.registry.current(&pane_id, now_unix_ms)
             && current.device_id() == &device_id
-            && !takeover
+            && (!takeover || retain_owned)
         {
             return Ok(view_locked(&mut state, &pane_id, &device_id, now_unix_ms));
         }
@@ -1111,6 +1136,76 @@ mod tests {
                 .await,
             Ok(InputDecision::Duplicate(_))
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_focus_preserves_owned_pending_input_and_receipt() {
+        let service = service();
+        let acquired = service
+            .acquire("pane-1", "device-1", 10, false)
+            .await
+            .unwrap_or_else(|error| panic!("acquire: {error}"));
+        let decision = service
+            .authorize_input("pane-1", "device-1", 1, b"raw", b"abc", 11)
+            .await
+            .unwrap_or_else(|error| panic!("authorize: {error}"));
+        let InputDecision::Execute(permit) = decision else {
+            panic!("not executable");
+        };
+        let focused = service
+            .focus("pane-1", "device-1", 12)
+            .await
+            .unwrap_or_else(|error| panic!("focus: {error}"));
+        assert_eq!(focused.epoch, acquired.epoch);
+        assert!(matches!(
+            service
+                .authorize_input("pane-1", "device-1", 1, b"raw", b"abc", 13)
+                .await,
+            Err(TerminalError::Busy)
+        ));
+        let committed = service
+            .complete_input(permit, InputOutcome::Committed, 14)
+            .await
+            .unwrap_or_else(|error| panic!("complete: {error}"));
+        let focused = service
+            .focus("pane-1", "device-1", 15)
+            .await
+            .unwrap_or_else(|error| panic!("focus: {error}"));
+        assert_eq!(focused.epoch, committed.epoch);
+        assert_eq!(focused.next_sequence, Some(2));
+        assert!(matches!(
+            service
+                .authorize_input("pane-1", "device-1", 1, b"raw", b"abc", 16)
+                .await,
+            Ok(InputDecision::Duplicate(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_focus_reclaims_changed_owner_with_a_fresh_sequence() {
+        let service = service();
+        let acquired = service
+            .acquire("pane-1", "device-1", 10, false)
+            .await
+            .unwrap_or_else(|error| panic!("acquire: {error}"));
+        service
+            .acquire("pane-1", "manager", 11, true)
+            .await
+            .unwrap_or_else(|error| panic!("manager: {error}"));
+        let focused = service
+            .focus("pane-1", "device-1", 12)
+            .await
+            .unwrap_or_else(|error| panic!("focus: {error}"));
+        assert!(focused.mine);
+        assert_ne!(focused.epoch, acquired.epoch);
+        assert_eq!(focused.next_sequence, Some(1));
+        assert!(
+            !service
+                .status("pane-1", "manager", 13)
+                .await
+                .unwrap_or_else(|error| panic!("status: {error}"))
+                .mine
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

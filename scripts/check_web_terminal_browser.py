@@ -61,6 +61,12 @@ SOCKET_CAPTURE_INIT = r"""
     Object.defineProperty(WrappedWebSocket, name, { value: NativeWebSocket[name] });
   }
   Object.defineProperty(window, "__termdeckTestSockets", { value: sockets });
+  window.__termdeckActiveSocket = () => {
+    const pane = document.querySelector('.workspace-tab-select[aria-selected="true"]')?.dataset.paneId
+      || document.querySelector('[data-termdeck-pane]')?.dataset.termdeckPane;
+    return [...sockets].reverse().find(socket => socket.readyState === WebSocket.OPEN
+      && socket.url.endsWith('/panes/' + encodeURIComponent(pane)));
+  };
   window.WebSocket = WrappedWebSocket;
 })();
 """
@@ -817,7 +823,11 @@ def main() -> int:
                 page.on("websocket", on_websocket)
 
             def latest_socket_control(label: str) -> dict[str, Any] | None:
+                page = page_one if label == "one" else page_two
+                active_url = page.evaluate("() => window.__termdeckActiveSocket()?.url || ''")
                 for record in reversed(result["websockets"][label]):
+                    if record["url"] != active_url or record.get("closed"):
+                        continue
                     for event in reversed(record["events"]):
                         control = event.get("control") if isinstance(event, dict) else None
                         if isinstance(control, dict) and control.get("schema") == "termdeck.terminal-control.v1":
@@ -862,10 +872,7 @@ def main() -> int:
             def send_manual_frame(page: Page, sequence: int, text: str) -> None:
                 page.evaluate(
                     r"""({sequence, text}) => {
-                      const sockets = window.__termdeckTestSockets || [];
-                      const socket = [...sockets].reverse().find(
-                        candidate => candidate.readyState === WebSocket.OPEN
-                      );
+                      const socket = window.__termdeckActiveSocket();
                       if (!socket) throw new Error('no open terminal socket');
                       const body = new TextEncoder().encode(text);
                       const frame = new Uint8Array(9 + body.length);

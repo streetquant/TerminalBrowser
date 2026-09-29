@@ -92,6 +92,12 @@ SOCKET_CAPTURE_INIT = r"""
   }
   Object.defineProperty(window, "__termdeckTestSockets", { value: sockets });
   Object.defineProperty(window, "__termdeckTestEvents", { value: events });
+  window.__termdeckActiveSocket = () => {
+    const pane = document.querySelector('.workspace-tab-select[aria-selected="true"]')?.dataset.paneId
+      || document.querySelector('[data-termdeck-pane]')?.dataset.termdeckPane;
+    return [...sockets].reverse().find(socket => socket.readyState === WebSocket.OPEN
+      && socket.url.endsWith('/panes/' + encodeURIComponent(pane)));
+  };
   window.WebSocket = WrappedWebSocket;
 })();
 """
@@ -536,7 +542,9 @@ def latest_control(page: Page) -> dict[str, Any] | None:
     value = page.evaluate(
         r"""() => {
           const events = window.__termdeckTestEvents || [];
+          const socketIndex = window.__termdeckTestSockets.indexOf(window.__termdeckActiveSocket());
           for (let index = events.length - 1; index >= 0; index -= 1) {
+            if (events[index].socket !== socketIndex) continue;
             const event = events[index].event;
             if (event?.control?.schema === 'termdeck.terminal-control.v1') return event.control;
           }
@@ -553,8 +561,7 @@ def wait_mine(page: Page, mine: bool, timeout: float = 10.0) -> None:
 def send_manual_frame(page: Page, sequence: int, text: str) -> None:
     page.evaluate(
         r"""({sequence, text}) => {
-          const sockets = window.__termdeckTestSockets || [];
-          const socket = [...sockets].reverse().find(candidate => candidate.readyState === WebSocket.OPEN);
+          const socket = window.__termdeckActiveSocket();
           if (!socket) throw new Error('no open terminal socket');
           const body = new TextEncoder().encode(text);
           const frame = new Uint8Array(9 + body.length);
@@ -1104,7 +1111,7 @@ def main() -> None:
             socket_count = int(page_one.evaluate("() => window.__termdeckTestSockets.length"))
             page_one.evaluate(
                 r"""() => {
-                  const socket=[...window.__termdeckTestSockets].reverse().find(item => item.readyState===WebSocket.OPEN);
+                  const socket=window.__termdeckActiveSocket();
                   if (!socket) throw new Error('no socket to close');
                   socket.close(4000, 'disposable reconnect proof');
                 }"""

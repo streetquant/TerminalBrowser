@@ -33,7 +33,17 @@
     status.setAttribute("role", "status");
     status.setAttribute("aria-live", "polite");
     status.hidden = true;
-    controls.append(position, live);
+    const appUp = document.createElement("button");
+    const appDown = document.createElement("button");
+    for (const [button, label, text] of [[appUp, "Previous application page", "↑"], [appDown, "Next application page", "↓"]]) {
+      button.type = "button";
+      button.className = "terminal-scroll-page";
+      button.setAttribute("aria-label", label);
+      button.title = label;
+      button.textContent = text;
+      button.hidden = true;
+    }
+    controls.append(appUp, position, live, appDown);
     const shell = host.parentElement;
     (shell?.classList.contains("xterm-shell") ? shell : host).append(controls, status);
 
@@ -59,10 +69,16 @@
       if (disposed) return;
       const extent = maximum();
       const top = Math.min(extent, Math.max(0, terminal.buffer.active.viewportY));
-      const owner = localBuffer() ? "browser" : hasMouseWheel() ? "application" : "unavailable";
+      const owner = localBuffer() ? "browser" : "application";
+      const pages = !localBuffer() && !hasMouseWheel() && typeof options.onApplicationScroll === "function";
       const snapshot = `${extent}:${top}:${owner}`;
-      if (snapshot === renderedState) return;
-      renderedState = snapshot;
+      const state = `${snapshot}:${pages}`;
+      if (state === renderedState) return;
+      renderedState = state;
+      controls.dataset.scrollPages = String(pages);
+      position.hidden = pages;
+      live.hidden = pages;
+      appUp.hidden = appDown.hidden = !pages;
       position.max = String(extent);
       position.value = String(top);
       position.disabled = extent === 0;
@@ -71,6 +87,14 @@
       live.disabled = extent === 0 || extent === top;
       host.dataset.termdeckScrollOwner = owner;
       host.dataset.termdeckHistoryLines = String(extent);
+    };
+    const applicationPage = (direction) => {
+      if (localBuffer() || hasMouseWheel()) return;
+      if (!isController()) {
+        notice("Click the terminal to scroll this app.");
+        return;
+      }
+      options.onApplicationScroll?.(direction);
     };
     const scheduleUpdate = () => {
       // xterm can emit onScroll for every parsed line in a large burst. Keep
@@ -117,7 +141,21 @@
       }
       consume(event);
       if (!localBuffer()) {
-        residual = 0;
+        if (event.shiftKey || typeof options.onApplicationScroll !== "function") {
+          residual = 0;
+          return;
+        }
+        // Alternate-screen applications retain their own conversation. Page
+        // navigation moves that surface; arrow keys would recall old prompts.
+        const pixels = event.deltaMode === 1 ? event.deltaY * 16
+          : event.deltaMode === 2 ? event.deltaY * 120 : event.deltaY;
+        residual += Math.max(-360, Math.min(360, pixels));
+        if (Math.abs(residual) >= 24) {
+          const direction = residual < 0 ? "up" : "down";
+          const pages = Math.min(3, Math.max(1, Math.floor(Math.abs(residual) / 120)));
+          residual = 0;
+          for (let i = 0; i < pages; i += 1) applicationPage(direction);
+        }
         return;
       }
       const extent = maximum();
@@ -163,6 +201,8 @@
     controls.addEventListener("click", stopFocusIntent);
     position.addEventListener("input", changePosition);
     live.addEventListener("click", returnLive);
+    appUp.addEventListener("click", () => applicationPage("up"));
+    appDown.addEventListener("click", () => applicationPage("down"));
     host.addEventListener("wheel", wheel, { capture: true, passive: false });
     host.addEventListener("mousemove", guardViewerHover, true);
     subscriptions.push(terminal.onScroll(scheduleUpdate), terminal.onWriteParsed(scheduleUpdate));
