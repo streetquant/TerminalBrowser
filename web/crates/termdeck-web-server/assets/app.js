@@ -420,11 +420,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       onLayoutChange: () => resizeViewport(),
       onFocusIntent: () => requestControl(),
     });
-    Object.defineProperty(host, "termdeckTerminal", {
-      configurable: true,
-      value: terminalApi,
-      writable: false,
-    });
+    Object.defineProperty(host, "termdeckTerminal", {configurable: true, value: terminalApi, writable: false});
 
     const disposeCopy = window.T1000TerminalCopy.install(host, terminalApi);
 
@@ -461,7 +457,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
     let lastViewportGeometry = null;
     let focusRequested = false;
     const scroll = window.T1000TerminalScroll.install(host, terminalApi,
-      {isController: () => ready && mine && socketOpen()});
+      {isController: () => ready && mine && socketOpen(), capture: [windowSlug,paneId]});
 
     function requestControl() {
       if (ready && socketOpen()) {
