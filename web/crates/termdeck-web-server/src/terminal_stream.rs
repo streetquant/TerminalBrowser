@@ -21,16 +21,17 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CLIENT_TEXT_BYTES: usize = 4 * 1024;
-const MAX_CONTROL_LINE_BYTES: usize = 256 * 1024;
-const MAX_CONTROL_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONTROL_COMMAND_BYTES: usize = 256 * 1024;
+const MAX_CONTROL_NOTIFICATION_LINE_BYTES: usize = 256 * 1024;
+// A joined tmux history line can contain every retained wrapped row. Keep the
+// wire, reply and replay limits finite while admitting the configured history
+// depth at the largest accepted grid. Commands retain their smaller limit.
+const MAX_CONTROL_LINE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CONTROL_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REPLAY_BYTES: usize = 8 * 1024 * 1024;
-const MAX_INITIAL_REPLAY_HISTORY_LINES: usize = 512;
-// `capture-pane -J` preserves soft-wrap semantics, but it can join many physical
-// rows into one control-protocol line. Bound joined source cells independently
-// of history depth so even the maximum accepted geometry cannot create an
-// oversized control line or a multi-second replay burst.
-const MAX_INITIAL_REPLAY_JOINED_CELLS: usize = 32 * 1024;
-const _: () = assert!(MAX_INITIAL_REPLAY_HISTORY_LINES <= 512);
+const MAX_INITIAL_REPLAY_HISTORY_LINES: usize = MAX_CAPTURE_HISTORY_LINES as usize;
+const MAX_INITIAL_REPLAY_JOINED_CELLS: usize =
+    MAX_INITIAL_REPLAY_HISTORY_LINES * MAX_COLUMNS as usize;
 const CONTROL_REQUEST_CAPACITY: usize = 64;
 // Viewer output is bounded by queued bytes, not by tmux line count: a burst of
 // small `%output` lines must not disconnect a healthy browser while the stream
@@ -905,7 +906,7 @@ impl TmuxControl {
         barrier: Option<u64>,
     ) -> Result<Vec<ControlReply>, StreamError> {
         if command.is_empty()
-            || command.len() > MAX_CONTROL_LINE_BYTES
+            || command.len() > MAX_CONTROL_COMMAND_BYTES
             || command.contains(['\n', '\r', '\0'])
             || !(1..=MAX_COMMAND_BLOCKS).contains(&blocks)
         {
@@ -1135,7 +1136,12 @@ async fn control_actor(context: ControlActorContext) -> Result<(), StreamError> 
             read = reader.read_until(b'\n', &mut line) => {
                 let count = read?;
                 if count == 0 { break Err(StreamError::ControlClosed); }
-                if line.len() > MAX_CONTROL_LINE_BYTES { break Err(StreamError::ControlProtocol("control line exceeded bound")); }
+                let line_bound = if active.is_some() {
+                    MAX_CONTROL_LINE_BYTES
+                } else {
+                    MAX_CONTROL_NOTIFICATION_LINE_BYTES
+                };
+                if line.len() > line_bound { break Err(StreamError::ControlProtocol("control line exceeded bound")); }
                 trim_line_ending(&mut line);
                 if let Err(error) = handle_control_line(
                     line.as_slice(),
@@ -1455,8 +1461,13 @@ fn build_replay(
     }
     if state.alternate {
         extend_bounded(&mut output, b"\x1b[?1049h")?;
+        extend_bounded(&mut output, b"\x1b[2J\x1b[H")?;
     }
-    extend_bounded(&mut output, b"\x1b[2J\x1b[H")?;
+    // The browser resets its terminal immediately before this replay. On the
+    // normal screen, painting the visible rows after history scrolls the last
+    // viewport of history into xterm's scrollback. Clearing here would erase
+    // those retained rows instead. The alternate screen starts separately and
+    // still needs its own clear/home sequence.
     visible.truncate(usize::from(rows));
     paint_rows(&mut output, visible.as_slice(), false)?;
     mode(&mut output, state.keypad_cursor, b"\x1b[?1h", b"\x1b[?1l")?;
@@ -1859,7 +1870,7 @@ mod tests {
             "refresh-client -A '%7:continue'"
         );
         assert!(refresh_pane_action("%7", "run-shell").is_err());
-        assert_eq!(MAX_INITIAL_REPLAY_JOINED_CELLS, 32 * 1024);
+        assert_eq!(MAX_INITIAL_REPLAY_JOINED_CELLS, 4_000_000);
         assert!(CONTROL_FLAGS_VIEWER.contains("ignore-size"));
         assert!(CONTROL_FLAGS_WRITER.contains("!ignore-size"));
     }
@@ -1926,12 +1937,70 @@ mod tests {
     }
 
     #[test]
-    fn initial_history_replay_is_bounded_by_depth_and_geometry() {
-        assert_eq!(initial_replay_history_lines(u32::MAX, 2), 512);
-        assert_eq!(initial_replay_history_lines(u32::MAX, 80), 409);
-        assert_eq!(initial_replay_history_lines(u32::MAX, 100), 327);
-        assert_eq!(initial_replay_history_lines(u32::MAX, 1_000), 32);
+    fn initial_history_replay_retains_configured_depth_at_any_valid_geometry() {
+        assert_eq!(initial_replay_history_lines(u32::MAX, 2), 4_000);
+        assert_eq!(initial_replay_history_lines(u32::MAX, 80), 4_000);
+        assert_eq!(initial_replay_history_lines(u32::MAX, 181), 4_000);
+        assert_eq!(initial_replay_history_lines(u32::MAX, 1_000), 4_000);
+        assert_eq!(initial_replay_history_lines(2_000, 181), 2_000);
         assert_eq!(initial_replay_history_lines(7, 1_000), 7);
+    }
+
+    #[test]
+    fn replay_keeps_distant_normal_screen_history_in_one_terminal_stream() {
+        let state = PaneState {
+            pane_id: "%1".to_owned(),
+            geometry: TerminalGeometry {
+                cols: 181,
+                rows: 49,
+            },
+            alternate: false,
+            cursor_x: 0,
+            cursor_y: 48,
+            cursor_visible: true,
+            keypad_cursor: false,
+            wrap: true,
+            insert: false,
+            origin: false,
+            mouse_standard: false,
+            mouse_button: false,
+            mouse_all: false,
+            mouse_sgr: false,
+            bracket_paste: false,
+            history_size: 2_000,
+        };
+        let history = (0..2_000)
+            .map(|index| format!("history-row-{index:04}").into_bytes())
+            .collect();
+        let replay = build_replay(&state, 49, history, vec![b"live-row".to_vec()])
+            .unwrap_or_else(|error| panic!("replay: {error}"));
+        for marker in [
+            b"history-row-0000".as_slice(),
+            b"history-row-1999",
+            b"live-row",
+        ] {
+            assert!(replay.windows(marker.len()).any(|window| window == marker));
+        }
+        assert_eq!(
+            replay
+                .windows(2)
+                .filter(|window| *window == b"\r\n")
+                .count(),
+            2_000
+        );
+        assert!(replay.len() < super::MAX_REPLAY_BYTES);
+    }
+
+    #[test]
+    fn oversized_replay_still_fails_closed() {
+        let state = plain_state();
+        let source = vec![b'x'; super::MAX_REPLAY_BYTES];
+        assert!(matches!(
+            build_replay(&state, 24, vec![source], vec![b"visible".to_vec()]),
+            Err(StreamError::ControlProtocol(
+                "terminal replay exceeded bound"
+            ))
+        ));
     }
 
     #[test]
@@ -2179,12 +2248,14 @@ mod tests {
         ));
         // An empty SGR is a full reset, and private CSI sequences are ignored.
         assert!(contains(&replay, b"\x1b[0m\r\x1b[2KR"));
-        // History and the visible screen are separate captures.
+        // History and the visible screen are separate captures, but the
+        // normal-screen replay must not clear the last history viewport.
         assert!(contains(&replay, b"\x1b[0m\r\x1b[2K\x1b[44mtail"));
         assert!(contains(
             &replay,
-            b"\x1b[2J\x1b[H\x1b[0m\r\x1b[2K\x1b[48;2;30;30;30m    AAA"
+            b"\r\n\x1b[0m\r\x1b[2K\x1b[48;2;30;30;30m    AAA"
         ));
+        assert!(!contains(&replay, b"\x1b[2J\x1b[H"));
     }
 
     fn output_queue() -> (
