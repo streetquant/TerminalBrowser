@@ -498,7 +498,7 @@ window.T1000UI = (() => {
     searchButton.title = "Search tabs (Ctrl+Shift+K)";
     searchButton.setAttribute("aria-label", "Search tabs");
     toolbar.append(searchButton);
-    const handlers = [["Show/hide Tabs pane", () => toggleSidebar()], ["Search tabs", searchTabs], ["Hidden tabs", hiddenTabs], ["Launch Codex in directories", commandPalette], ["Find in terminal", find], ["Settings · themes and fonts", appearance], ["Keyboard shortcuts", shortcuts]];
+    const handlers = [["Show/hide Tabs pane", () => toggleSidebar()], ["Search tabs", searchTabs], ["Hidden tabs", hiddenTabs], ["Launch Codex in directories", commandPalette], ["Find in terminal", find], ["Keyboard shortcuts", shortcuts]];
     window.addEventListener("keydown", event => {
       if (event.defaultPrevented || !event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey || root.querySelector("dialog[open]")) return;
       const action = { k: searchTabs, p: commandPalette, f: find }[event.key.toLowerCase()];
@@ -506,7 +506,7 @@ window.T1000UI = (() => {
     }, true);
     return {
       updateTabs,
-      menuItems: () => [...management.menuItems(), ...handlers.map(([name, action]) => button(name, action))],
+      menuItems: () => [button("Settings · themes and fonts", appearance), ...management.menuItems(), ...handlers.map(([name, action]) => button(name, action))],
       isOpen: () => modal.open,
     };
   }

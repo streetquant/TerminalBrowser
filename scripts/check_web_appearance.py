@@ -2,6 +2,7 @@
 """Exercise real xterm appearance controls in a disposable Brave page."""
 
 import json
+import os
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -34,7 +35,8 @@ def attach(page):
             refresh: async () => {}, snapshot: async () => ({windows:[]}),
             appPath: path => '/t1000' + path,
         });
-        document.querySelector('#menu').append(...tools.menuItems());
+        const panel = document.querySelector('#menu .workspace-action-panel');
+        panel.append(Object.assign(document.createElement('a'), {textContent:'All windows'}), ...tools.menuItems());
         tools.updateTabs([{id:'one',title:'one',cwd:'/home/arch',status:'running'}], 'one');
     }""")
 
@@ -58,6 +60,10 @@ def state(page):
 
 
 def main():
+    evidence = os.environ.get("TERMDECK_APPEARANCE_EVIDENCE_DIR")
+    evidence_dir = Path(evidence) if evidence else None
+    if evidence_dir:
+        evidence_dir.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
             executable_path="/usr/bin/brave", headless=False,
@@ -70,7 +76,9 @@ def main():
                 <div id='root'><div class='workspace-title'>Fixture</div>
                 <div class='workspace-tabbar'></div>
                 <div class='workspace-shell'><div id='terminal'></div></div></div>
-                <div id='toolbar'></div><details id='menu'><summary>Actions</summary></details>
+                <div id='toolbar'></div><div style='position:fixed;top:8px;right:8px;z-index:20'>
+                <details id='menu' class='workspace-actions'><summary>Actions</summary>
+                <div class='workspace-action-panel'></div></details></div>
                 </body></html>"""))
             page.goto("https://termdeck.test/")
             page.add_style_tag(path=str(ASSETS / "app.css"))
@@ -89,6 +97,18 @@ def main():
             assert not any(name == "Terminal appearance" or name == "Settings" for name in menu_names), menu_names
             page.locator("#menu summary").focus()
             page.keyboard.press("Enter")
+            assert page.evaluate("""() => {
+                const panel = document.querySelector('#menu .workspace-action-panel');
+                const settings = [...panel.querySelectorAll('button')]
+                    .find(item => item.textContent === 'Settings · themes and fonts');
+                const panelRect = panel.getBoundingClientRect();
+                const itemRect = settings.getBoundingClientRect();
+                return panel.scrollTop === 0 && itemRect.top >= panelRect.top
+                    && itemRect.bottom <= Math.min(panelRect.bottom, innerHeight)
+                    && settings.previousElementSibling?.textContent === 'All windows';
+            }"""), "Settings is outside the initial visible menu viewport"
+            if evidence_dir:
+                page.screenshot(path=str(evidence_dir / "settings-menu-desktop.png"))
             page.get_by_role("button", name="Settings · themes and fonts").click()
             assert "Current here:" in page.get_by_role("status").first.inner_text()
             page.get_by_label("Terminal text size (px)").fill("24")
@@ -154,6 +174,16 @@ def main():
             assert restored["palette"] == "#2e3440" and restored["scrollback"] == 1200, restored
             assert restored["cursorColor"] == "#abcdef" and restored["fontFamily"] == "monospace", restored
             page.locator("#menu summary").click()
+            assert page.evaluate("""() => {
+                const panel = document.querySelector('#menu .workspace-action-panel');
+                const settings = [...panel.querySelectorAll('button')]
+                    .find(item => item.textContent === 'Settings · themes and fonts');
+                return panel.scrollTop === 0
+                    && settings.getBoundingClientRect().bottom <= Math.min(
+                        panel.getBoundingClientRect().bottom, innerHeight);
+            }"""), "Settings is outside the compact visible menu viewport"
+            if evidence_dir:
+                page.screenshot(path=str(evidence_dir / "settings-menu-compact.png"))
             page.get_by_role("button", name="Settings · themes and fonts").click()
             assert "Warm paper" in page.get_by_role("status").first.inner_text()
             assert "Liberation Sans" in page.get_by_role("status").first.inner_text()
