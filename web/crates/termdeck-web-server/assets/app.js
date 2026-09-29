@@ -457,7 +457,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
     let lastViewportGeometry = null;
     let focusRequested = false;
     const scroll = window.T1000TerminalScroll.install(host, terminalApi,
-      {isController: () => ready && mine && socketOpen(), capture: [windowSlug,paneId]});
+      {isController: () => ready && mine && socketOpen()});
 
     function requestControl() {
       if (ready && socketOpen()) {

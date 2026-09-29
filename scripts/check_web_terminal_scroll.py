@@ -114,7 +114,8 @@ def main():
             page.evaluate("probes.first.input = []")
             wheel(page, -160)
             assert state(page)["input"] == [] and state(page)["disabled"]
-            page.locator("#first-shell .terminal-scroll-status").filter(has_text="No captured terminal history").wait_for()
+            assert page.locator(".terminal-history").count() == 0
+            assert page.locator("#first-shell .terminal-scroll-status").is_hidden()
             page.screenshot(path=str(evidence / "alternate-no-history.png"))
             write(page, "first", "\x1b[?9h")
             wheel(page, -160)
