@@ -186,6 +186,29 @@ def main():
             }""")
             assert mutations < 100, f"scroll controls mutated {mutations} times during one burst"
             result["scroll_control_mutations_for_10000_line_burst"] = mutations
+            # The mobile Tabs pane overlays the terminal. Its controls must
+            # remain above the terminal's positioned scroll slider.
+            page.set_viewport_size({"width": 320, "height": 568})
+            page.set_content('''<body class="workspace-page"><div class="workspace-shell"
+                data-sidebar="open" style="width:320px;height:400px">
+                <div class="xterm-shell"><div class="terminal-scroll-controls">
+                <input class="terminal-scroll-position" type="range" disabled></div></div>
+                <aside class="workspace-sidebar" aria-label="Tabs pane">
+                <div class="workspace-sidebar-heading"><h2>Tabs</h2>
+                <button aria-label="Move Tabs pane to left"
+                onclick="document.querySelector('.workspace-shell').dataset.sidebarSide='left'">Move</button>
+                <button aria-label="Hide Tabs pane" onclick="window.sidebarClicks++">×</button>
+                </div></aside></div><script>window.sidebarClicks=0</script></body>''')
+            page.add_style_tag(path=str(ASSETS / "app.css"))
+            pane = page.get_by_role("complementary", name="Tabs pane")
+            pane.get_by_role("button", name="Hide Tabs pane").click(timeout=3000)
+            assert page.evaluate("window.sidebarClicks") == 1
+            pane.get_by_role("button", name="Move Tabs pane to left").click(timeout=3000)
+            assert page.locator(".workspace-shell").get_attribute("data-sidebar-side") == "left"
+            pane.get_by_role("button", name="Hide Tabs pane").click(timeout=3000)
+            assert page.evaluate("window.sidebarClicks") == 2
+            page.screenshot(path=str(evidence / "mobile-sidebar-above-scroll-controls.png"))
+            result["mobile_sidebar_above_scroll_controls"] = True
             assert not errors, errors
             result["dispose_isolated"] = True
             result["page_errors"] = errors

@@ -698,7 +698,8 @@ def main() -> int:
         (browser_home / ".config").mkdir(parents=True, mode=0o700)
         os.environ["HOME"] = str(browser_home)
         os.environ["XDG_CONFIG_HOME"] = str(browser_home / ".config")
-        os.environ["TMPDIR"] = "/tmp"
+        # Preserve the caller's qualified temporary filesystem. Forcing /tmp
+        # exhausts per-user quota on production hosts before Chromium starts.
         tempfile.tempdir = None
 
         with sync_playwright() as playwright:

@@ -17,11 +17,13 @@ from test_client_files import stage, call, upload, path, make_stage, ordinary_wo
 
 @pytest.fixture
 def directories(ordinary_workspace_root):
-    root = ordinary_workspace_root / "workspace-tree"
+    # Keep the AF_UNIX fixture below the kernel's 108-byte socket path limit
+    # inside the production runner's isolated task directory.
+    root = ordinary_workspace_root / "w"
     root.mkdir(mode=0o700)
     state = root / "state"
     state.mkdir(mode=0o700)
-    workspace = root / "ordinary project with spaces"
+    workspace = root / "a b"
     workspace.mkdir(mode=0o770)
     return state, workspace
 

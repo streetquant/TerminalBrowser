@@ -934,7 +934,9 @@ body.workspace-page {
 
 .workspace-sidebar[hidden] { display: none; }
 .workspace-sidebar {
-  position: absolute; inset: 0 0 0 auto; z-index: 5;
+  /* The terminal's scroll controls have z-index 8 inside the same shell.
+     Keep the mobile overlay above them so its close button stays clickable. */
+  position: absolute; inset: 0 0 0 auto; z-index: 20;
   display: flex; flex-direction: column; gap: 8px;
   width: 280px; max-width: 86%; min-height: 0; padding: 10px;
   border-left: 1px solid var(--td-border); background: var(--td-bg);
