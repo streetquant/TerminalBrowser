@@ -135,6 +135,11 @@ by the server on every operation and periodically on every stream.
 Normal-screen history scrolls locally in xterm. An alternate-screen application
 without mouse reporting receives bounded Page Up/Down navigation from the wheel
 and page buttons; its own conversation remains on the same terminal surface.
+Its draggable gutter control performs relative page navigation and recenters
+after release, so it can keep moving through history of unknown length. A normal
+buffer's scrollbar retains its exact position and history extent. Application
+navigation batches at most eight same-direction pages per authenticated frame;
+drags are paced and canceled if the mode or controller changes.
 TermDeck does not invent an application history length or inject prompt-history
 arrows. Those frames share the authenticated input sequence and replay checks,
 never take control from a viewer, and recheck alternate-screen/mouse modes in

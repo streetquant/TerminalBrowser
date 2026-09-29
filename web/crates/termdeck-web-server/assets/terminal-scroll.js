@@ -2,6 +2,8 @@
   "use strict";
 
   const MAX_WHEEL_LINES = 120;
+  const APP_DRAG_CENTER = 20;
+  const MAX_DRAG_PAGES = 40;
   const WHEEL_MOUSE_MODES = new Set(["vt200", "drag", "any"]);
 
   function install(host, terminalApi, options = {}) {
@@ -53,6 +55,9 @@
     let updateFrame = 0;
     let renderedState = "";
     let wheelEvent = null;
+    let dragValue = APP_DRAG_CENTER;
+    let pendingPages = 0;
+    let navigationFrame = 0;
     const subscriptions = [];
     const isController = () => options.isController?.() === true;
     const localBuffer = () => terminal.buffer.active.type === "normal";
@@ -76,25 +81,48 @@
       if (state === renderedState) return;
       renderedState = state;
       controls.dataset.scrollPages = String(pages);
-      position.hidden = pages;
+      position.hidden = false;
       live.hidden = pages;
       appUp.hidden = appDown.hidden = !pages;
-      position.max = String(extent);
-      position.value = String(top);
-      position.disabled = extent === 0;
-      position.setAttribute("aria-valuetext", extent === top ? "Live output" : `${extent - top} lines above live output`);
-      position.title = extent ? "Scroll terminal history" : localBuffer() ? "No scrollback available" : "This app owns its scrolling";
+      position.max = String(pages ? MAX_DRAG_PAGES : extent);
+      position.value = String(pages ? dragValue : top);
+      position.disabled = !pages && extent === 0;
+      position.setAttribute("aria-label", pages ? "Application scroll control" : "Terminal scroll position");
+      position.setAttribute("aria-valuetext", pages ? "Drag up or down to scroll the application" : extent === top ? "Live output" : `${extent - top} lines above live output`);
+      position.title = pages ? "Drag up or down to scroll; release to center" : extent ? "Scroll terminal history" : localBuffer() ? "No scrollback available" : "This app owns its scrolling";
       live.disabled = extent === 0 || extent === top;
       host.dataset.termdeckScrollOwner = owner;
       host.dataset.termdeckHistoryLines = String(extent);
     };
-    const applicationPage = (direction) => {
-      if (localBuffer() || hasMouseWheel()) return;
+    const applicationPage = (direction, count = 1) => {
+      if (localBuffer() || hasMouseWheel()) return false;
       if (!isController()) {
         notice("Click the terminal to scroll this app.");
-        return;
+        return false;
       }
-      options.onApplicationScroll?.(direction);
+      return options.onApplicationScroll?.(direction, count) !== false;
+    };
+    const flushNavigation = () => {
+      navigationFrame = 0;
+      if (disposed) return;
+      // Keep a drag responsive without flooding the authenticated input queue.
+      // Recheck ownership and application mode on every painted frame; never
+      // retain navigation for a later controller or a shell after app exit.
+      if (pendingPages) {
+        const step = Math.sign(pendingPages);
+        const count = Math.min(8, Math.abs(pendingPages));
+        if (!applicationPage(step > 0 ? "up" : "down", count)) {
+          pendingPages = 0;
+        } else {
+          pendingPages -= step * count;
+        }
+      }
+      if (pendingPages) navigationFrame = window.requestAnimationFrame(flushNavigation);
+    };
+    const centerDrag = () => {
+      if (localBuffer()) return;
+      dragValue = APP_DRAG_CENTER;
+      position.value = String(dragValue);
     };
     const scheduleUpdate = () => {
       // xterm can emit onScroll for every parsed line in a large burst. Keep
@@ -154,7 +182,7 @@
           const direction = residual < 0 ? "up" : "down";
           const pages = Math.min(3, Math.max(1, Math.floor(Math.abs(residual) / 120)));
           residual = 0;
-          for (let i = 0; i < pages; i += 1) applicationPage(direction);
+          applicationPage(direction, pages);
         }
         return;
       }
@@ -176,7 +204,16 @@
     };
     const changePosition = () => {
       const value = Number(position.value);
-      if (!Number.isSafeInteger(value) || !localBuffer()) return;
+      if (!Number.isSafeInteger(value)) return;
+      if (!localBuffer()) {
+        if (hasMouseWheel() || typeof options.onApplicationScroll !== "function") return;
+        const bounded = Math.max(0, Math.min(MAX_DRAG_PAGES, value));
+        const delta = dragValue - bounded;
+        dragValue = bounded;
+        pendingPages = Math.max(-MAX_DRAG_PAGES, Math.min(MAX_DRAG_PAGES, pendingPages + delta));
+        if (pendingPages && !navigationFrame) navigationFrame = window.requestAnimationFrame(flushNavigation);
+        return;
+      }
       residual = 0;
       terminal.scrollToLine(Math.min(maximum(), Math.max(0, value)));
       update();
@@ -200,6 +237,12 @@
     controls.addEventListener("keydown", stopFocusIntent);
     controls.addEventListener("click", stopFocusIntent);
     position.addEventListener("input", changePosition);
+    // Applications do not expose an absolute history extent to xterm. This
+    // handle therefore performs relative page navigation and recenters after
+    // each gesture, rather than inventing a total length or scroll position.
+    position.addEventListener("change", centerDrag);
+    position.addEventListener("pointerup", centerDrag);
+    position.addEventListener("pointercancel", centerDrag);
     live.addEventListener("click", returnLive);
     appUp.addEventListener("click", () => applicationPage("up"));
     appDown.addEventListener("click", () => applicationPage("down"));
@@ -208,6 +251,8 @@
     subscriptions.push(terminal.onScroll(scheduleUpdate), terminal.onWriteParsed(scheduleUpdate));
     subscriptions.push(terminal.buffer.onBufferChange(() => {
       residual = 0;
+      pendingPages = 0;
+      dragValue = APP_DRAG_CENTER;
       renderedState = "";
       update();
     }));
@@ -221,6 +266,7 @@
         wheelEvent = null;
         window.clearTimeout(noticeTimer);
         window.cancelAnimationFrame(updateFrame);
+        window.cancelAnimationFrame(navigationFrame);
         host.removeEventListener("wheel", wheel, true);
         host.removeEventListener("mousemove", guardViewerHover, true);
         for (const subscription of subscriptions) subscription.dispose();

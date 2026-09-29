@@ -1082,7 +1082,39 @@ body.workspace-page[data-termdeck-connection="error"] .xterm-shell { opacity: .7
   padding: 0;
   writing-mode: vertical-lr;
   direction: ltr;
-  accent-color: var(--td-accent);
+  appearance: none;
+  background: transparent;
+  cursor: ns-resize;
+}
+.terminal-scroll-position::-webkit-slider-runnable-track {
+  width: 10px;
+  height: 100%;
+  border-radius: 5px;
+  background: var(--td-sunken);
+  border: 1px solid var(--td-border);
+}
+.terminal-scroll-position::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 32px;
+  margin: 0 -3px;
+  border: 1px solid var(--td-border-strong);
+  border-radius: 4px;
+  background: var(--td-muted);
+}
+.terminal-scroll-position::-moz-range-track {
+  width: 10px;
+  height: 100%;
+  border-radius: 5px;
+  background: var(--td-sunken);
+  border: 1px solid var(--td-border);
+}
+.terminal-scroll-position::-moz-range-thumb {
+  width: 14px;
+  height: 32px;
+  border: 1px solid var(--td-border-strong);
+  border-radius: 4px;
+  background: var(--td-muted);
 }
 .terminal-scroll-controls[data-scroll-pages="true"] { justify-content: space-between; }
 .terminal-scroll-page {

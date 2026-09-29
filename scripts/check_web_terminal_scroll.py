@@ -94,6 +94,13 @@ def main():
             slider = page.locator("#first-shell .terminal-scroll-position")
             assert page.locator("#first .terminal-scroll-controls").count() == 0, "scroll controls reduced terminal host width"
             assert slider.is_visible() and slider.is_enabled()
+            box = slider.bounding_box()
+            page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] - 8)
+            page.mouse.down()
+            page.mouse.move(box["x"] + box["width"] / 2, box["y"] + 1, steps=12)
+            page.mouse.up()
+            page.wait_for_function("probes.first.api.terminal.buffer.active.viewportY === 0")
+            result["real_pointer_drag_normal_history"] = True
             slider.focus()
             page.keyboard.press("Home")
             page.wait_for_function("probes.first.api.terminal.buffer.active.viewportY === 0")

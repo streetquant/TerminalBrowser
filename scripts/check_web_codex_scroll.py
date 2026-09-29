@@ -28,10 +28,11 @@ WIRE = r"""(() => {
   const Native = WebSocket;
   window.scrollSockets = [];
   function Socket(...args) {
-    const ws = new Native(...args); scrollSockets.push(ws); ws.frames = []; ws.events = [];
+    const ws = new Native(...args); scrollSockets.push(ws); ws.frames = []; ws.events = []; ws.timings = [];
     const send = ws.send.bind(ws);
-    ws.send = value => { if (typeof value !== 'string') ws.frames.push([...new Uint8Array(value)]); send(value); };
+    ws.send = value => { if (typeof value !== 'string') { ws.frames.push([...new Uint8Array(value)]); ws.timings.push({kind:"sent",at:performance.now()}); } send(value); };
     ws.addEventListener('message', e => {
+      ws.timings.push({kind:typeof e.data === 'string'?'event':'output',at:performance.now()});
       if (typeof e.data === 'string') { const v = JSON.parse(e.data); ws.events.push(v); if(v.control) ws.control=v.control; }
     });
     return ws;
@@ -132,6 +133,15 @@ def main() -> int:
                 box = page.locator("#terminal-xterm .xterm-screen").bounding_box()
                 page.mouse.move(box["x"] + 60, box["y"] + 100)
                 page.mouse.wheel(0, delta); page.wait_for_timeout(100)
+            def drag_scroll(edge):
+                slider = page.locator(".terminal-scroll-position")
+                box = slider.bounding_box()
+                if not box: raise AssertionError("application drag track missing")
+                x = box["x"] + box["width"] / 2
+                page.mouse.move(x, box["y"] + box["height"] / 2)
+                page.mouse.down()
+                page.mouse.move(x, box["y"] + (8 if edge == "up" else box["height"] - 8), steps=12)
+                page.mouse.up()
             page.goto(origin + "/scroll/t/" + tabs["Codex"])
             wait("()=>document.querySelector('#terminal-xterm')?.termdeckTerminal?.readBuffer().includes('CODEX_SCROLL_ROW_0249')")
             page.evaluate("document.querySelector('#terminal-xterm').termdeckTerminal.focus()")
@@ -140,15 +150,54 @@ def main() -> int:
             result["initial_first_row"] = start
             check("real_codex_alternate_screen", page.evaluate("document.querySelector('#terminal-xterm').termdeckTerminal.terminal.buffer.active.type==='alternate'"))
             check("application_page_controls_visible", page.get_by_role("button", name="Previous application page").is_visible()
-                and not page.locator(".terminal-scroll-position").is_visible())
+                and page.locator(".terminal-scroll-position").is_visible())
+            # Real pointer drags, not synthetic range-input events. The native
+            # app owns its history length; the relative handle recenters.
+            drag_scroll("up")
+            proof.wait_until(lambda: first_row() == 0, timeout=10, detail="drag reached native conversation top")
+            check("drag_scroll_reaches_actual_conversation_top")
+            drag_scroll("down")
+            proof.wait_until(lambda: "CODEX_SCROLL_ROW_0249" in text() and "Back to bottom" not in text(), timeout=10, detail="drag returned native conversation to bottom")
+            check("drag_scroll_returns_to_native_latest")
+            check("relative_app_handle_does_not_invent_extent", page.locator(".terminal-scroll-position").get_attribute("aria-label") == "Application scroll control"
+                and page.locator(".terminal-scroll-position").input_value() == "20")
+            page.screenshot(path=str(out / "codex-draggable-scrollbar.png"))
+            # SCROLL_LATENCY_BEGIN: compare identical real wheel gestures using
+            # browser timestamps, including two paint frames after parse.
+            page.evaluate("""()=>{window.scrollLag=[];let last=performance.now();function tick(now){scrollLag.push(now-last);last=now;requestAnimationFrame(tick)}requestAnimationFrame(tick)}""")
+            timings = []
+            screen = page.locator("#terminal-xterm .xterm-screen").bounding_box()
+            page.mouse.move(screen["x"] + 60, screen["y"] + 100)
+            for _ in range(10):
+                for delta in (-240, 240):
+                    row = first_row()
+                    page.evaluate("window.gestureStarted=performance.now()")
+                    page.mouse.wheel(0, delta)
+                    timings.append(page.evaluate("""row=>new Promise((resolve,reject)=>{
+                        const start=gestureStarted;function poll(){
+                          const text=document.querySelector('#terminal-xterm').termdeckTerminal.readBuffer();
+                          const rows=[...text.matchAll(/CODEX_SCROLL_ROW_(\\d+)/g)].map(m=>Number(m[1]));
+                          if(rows.length && Math.min(...rows)!==row){requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(performance.now()-start)));return}
+                          if(performance.now()-start>3000){reject(Error('scroll redraw timed out'));return}requestAnimationFrame(poll)
+                        }poll()
+                    })""", row))
+            result["scroll_latency_ms"] = {"samples": len(timings), "p50": proof.percentile(timings, .5),
+                "p95": proof.percentile(timings, .95), "max": max(timings), "raf_max": page.evaluate("Math.max(...scrollLag)")}
+            result["scroll_transport_timings"] = page.evaluate("scrollSockets.findLast(s=>s.readyState===WebSocket.OPEN).timings.slice(-200)")
+            check("repeated_scroll_redraws_without_stall", max(timings) < 500)
+            # SCROLL_LATENCY_END
             wheel(-160)
             proof.wait_until(lambda: first_row() < start, timeout=10, detail="wheel moved actual Codex transcript")
             after = first_row(); check("wheel_moves_conversation_without_prompt_recall", "Ask Codex to do anything" in text())
             page.get_by_role("button", name="Previous application page").click()
             proof.wait_until(lambda: first_row() < after, timeout=10, detail="page button moved Codex transcript")
             check("page_button_moves_actual_codex")
+            before_batch = first_row()
+            wheel(-240)
+            proof.wait_until(lambda: first_row() < before_batch, timeout=10, detail="batched native navigation")
             page.evaluate("window.scrollSocket=scrollSockets.findLast(s=>s.readyState===WebSocket.OPEN)")
             wait("()=>scrollSocket.events.some(e=>e.type==='ack')")
+            check("same_direction_pages_share_one_authenticated_frame", page.evaluate("scrollSocket.frames.findLast(f=>f[0]===3).length===17"))
             row = first_row()
             page.evaluate("""() => { window.savedFrame=scrollSocket.frames.findLast(f=>f[0]===3); scrollSocket.send(new Uint8Array(savedFrame)); }""")
             wait("()=>scrollSocket.events.some(e=>e.type==='ack' && e.duplicate===true)")
@@ -180,6 +229,21 @@ def main() -> int:
             wait("()=>document.querySelector('#terminal-xterm')?.termdeckTerminal?.readBuffer().includes('STALE_SHELL_READY')")
             page.evaluate("id=>document.querySelector(`.workspace-tab-select[data-pane-id='${id}']`).click()", tabs["Codex"])
             check("warm_tab_switch_keeps_app_conversation_position", first_row() == row)
+            # Repeated page updates interleaved with warm switches must neither
+            # freeze the chrome nor send navigation to the other shell.
+            other_before = (root / "other.raw").read_bytes() if (root / "other.raw").exists() else b""
+            page.evaluate("window.scrollLag=[]")
+            for _ in range(10):
+                wheel(240)
+                page.evaluate("id=>document.querySelector(`.workspace-tab-select[data-pane-id='${id}']`).click()", tabs["Other"])
+                wait("()=>document.querySelector('#terminal-xterm').termdeckTerminal.readBuffer().includes('STALE_SHELL_READY')")
+                page.evaluate("id=>document.querySelector(`.workspace-tab-select[data-pane-id='${id}']`).click()", tabs["Codex"])
+                wait("()=>document.querySelector('#terminal-xterm').termdeckTerminal.readBuffer().includes('CODEX_SCROLL_ROW_')")
+                wheel(-240)
+            other_after = (root / "other.raw").read_bytes() if (root / "other.raw").exists() else b""
+            check("rapid_scroll_and_tab_switch_remain_isolated", other_after == other_before)
+            result["scroll_switch_raf_max_ms"] = page.evaluate("Math.max(...scrollLag)")
+            check("rapid_scroll_and_switch_do_not_block_browser", result["scroll_switch_raf_max_ms"] < 250)
             peer = ctx.new_page(); peer.goto(origin + "/scroll/t/" + tabs["Codex"])
             proof.wait_until(lambda: peer.evaluate("()=>!!document.querySelector('#terminal-xterm')?.termdeckTerminal"), timeout=15, detail="peer ready")
             peer.evaluate("document.querySelector('#terminal-xterm').termdeckTerminal.focus()")
@@ -187,10 +251,12 @@ def main() -> int:
             page.evaluate("window.sentBefore=scrollSocket.frames.length")
             wheel(-160)
             page.get_by_role("button", name="Previous application page").click()
+            drag_scroll("up")
+            page.wait_for_timeout(200)
             check("viewer_scroll_never_takes_control", page.evaluate("scrollSocket.frames.length===sentBefore")
                 and peer.evaluate("document.querySelector('#terminal-status').dataset.state==='live'"))
             peer_screen = peer.evaluate("document.querySelector('#terminal-xterm').termdeckTerminal.readBuffer()")
-            page.evaluate("""()=>{const f=new Uint8Array(13);f[0]=3;new DataView(f.buffer).setBigUint64(1,1n);f.set([27,91,53,126],9);scrollSocket.send(f)}""")
+            page.evaluate("""()=>{const f=new Uint8Array(41);f[0]=3;new DataView(f.buffer).setBigUint64(1,1n);for(let i=9;i<41;i+=4)f.set([27,91,53,126],i);scrollSocket.send(f)}""")
             wait("()=>scrollSocket.readyState===WebSocket.CLOSED")
             check("forged_viewer_navigation_denied_by_server", peer.evaluate("document.querySelector('#terminal-status').dataset.state==='live'")
                 and peer.evaluate("document.querySelector('#terminal-xterm').termdeckTerminal.readBuffer()") == peer_screen)
@@ -216,7 +282,7 @@ def main() -> int:
             wait("()=>document.querySelector('#terminal-xterm').termdeckTerminal.readBuffer().includes('STALE_SHELL_READY')")
             page.evaluate("document.querySelector('#terminal-xterm').termdeckTerminal.focus()")
             wait("()=>document.querySelector('#terminal-status').dataset.state==='live'")
-            page.evaluate("""()=>{window.stale=scrollSockets.findLast(s=>s.readyState===WebSocket.OPEN);window.staleSequence=stale.control.next_sequence;const f=new Uint8Array(13);f[0]=3;new DataView(f.buffer).setBigUint64(1,BigInt(staleSequence));f.set([27,91,53,126],9);stale.send(f)}""")
+            page.evaluate("""()=>{window.stale=scrollSockets.findLast(s=>s.readyState===WebSocket.OPEN);window.staleSequence=stale.control.next_sequence;const f=new Uint8Array(41);f[0]=3;new DataView(f.buffer).setBigUint64(1,BigInt(staleSequence));for(let i=9;i<41;i+=4)f.set([27,91,53,126],i);stale.send(f)}""")
             wait("()=>stale.events.some(e=>e.type==='ack' && e.sequence===staleSequence)")
             page.wait_for_timeout(200)
             check("stale_alternate_mode_cannot_send_shell_navigation", not (root / "stale.raw").exists() or b"\x1b[5~" not in (root / "stale.raw").read_bytes())

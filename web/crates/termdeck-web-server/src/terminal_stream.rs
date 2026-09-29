@@ -56,6 +56,7 @@ const MAX_ROWS: u16 = 500;
 const INPUT_FRAME_TYPE: u8 = 1;
 const MOUSE_WHEEL_FRAME_TYPE: u8 = 2;
 const APPLICATION_SCROLL_FRAME_TYPE: u8 = 3;
+const MAX_APPLICATION_SCROLL_PAGES: usize = 8;
 const MAX_MOUSE_WHEEL_BYTES: usize = 64;
 const MOUSE_REPORTING_FORMAT: &str =
     "#{||:#{mouse_standard_flag},#{||:#{mouse_button_flag},#{mouse_all_flag}}}";
@@ -686,23 +687,31 @@ fn mouse_packet(bytes: &[u8]) -> Option<(u32, usize)> {
     values.map(|value| (value[0], bytes.len()))
 }
 
-fn application_scroll_key(bytes: &[u8]) -> Option<&'static str> {
-    match bytes {
-        b"\x1b[5~" => Some("PageUp"),
-        b"\x1b[6~" => Some("PageDown"),
-        _ => None,
+fn application_scroll_key(bytes: &[u8]) -> Option<(&'static str, usize)> {
+    if bytes.is_empty() || bytes.len() > MAX_APPLICATION_SCROLL_PAGES * 4 || bytes.len() % 4 != 0 {
+        return None;
     }
+    let first = &bytes[..4];
+    let key = match first {
+        b"\x1b[5~" => "PageUp",
+        b"\x1b[6~" => "PageDown",
+        _ => return None,
+    };
+    bytes
+        .chunks_exact(4)
+        .all(|chunk| chunk == first)
+        .then_some((key, bytes.len() / 4))
 }
 
 fn application_scroll_command(pane_id: &str, bytes: &[u8]) -> Result<String, StreamError> {
     validate_tmux_pane_id(pane_id)?;
-    let key = application_scroll_key(bytes)
+    let (key, count) = application_scroll_key(bytes)
         .ok_or(StreamError::ClientProtocol("invalid application scroll"))?;
     // Evaluate mode inside tmux's command queue. A stale browser gesture must
     // not become shell/prompt input after the application exits or enables
     // its mouse protocol. Navigation never implicitly acquires control.
     Ok(format!(
-        "if-shell -F -t {pane_id} '#{{&&:#{{alternate_on}},#{{!:{MOUSE_REPORTING_FORMAT}}}}}' 'send-keys -t {pane_id} {key}'"
+        "if-shell -F -t {pane_id} '#{{&&:#{{alternate_on}},#{{!:{MOUSE_REPORTING_FORMAT}}}}}' 'send-keys -N {count} -t {pane_id} {key}'"
     ))
 }
 
@@ -1885,10 +1894,10 @@ fn unix_ms() -> u64 {
 mod tests {
     use super::{
         CONTROL_FLAGS_VIEWER, CONTROL_FLAGS_WRITER, CONTROL_MODE_ARGUMENT, ControlNotification,
-        InputKind, MAX_INITIAL_REPLAY_JOINED_CELLS, MAX_OUTPUT_FRAME_BYTES,
-        MAX_PENDING_OUTPUT_BYTES, OutputQueue, PANE_STATE_FORMAT, PaneState, PendingReply,
-        StreamError, TerminalGeometry, application_scroll_command, build_replay,
-        decode_tmux_output, extended_output_payload, handle_control_line,
+        InputKind, MAX_APPLICATION_SCROLL_PAGES, MAX_INITIAL_REPLAY_JOINED_CELLS,
+        MAX_OUTPUT_FRAME_BYTES, MAX_PENDING_OUTPUT_BYTES, OutputQueue, PANE_STATE_FORMAT,
+        PaneState, PendingReply, StreamError, TerminalGeometry, application_scroll_command,
+        build_replay, decode_tmux_output, extended_output_payload, handle_control_line,
         initial_replay_history_lines, is_mouse_wheel_packet, mouse_wheel_command, output_payload,
         parse_input_frame, parse_marker, refresh_pane_action, validate_geometry,
     };
@@ -1915,13 +1924,28 @@ mod tests {
                 .unwrap_or_else(|error| panic!("valid application scroll command: {error}"));
             assert!(command.contains("#{alternate_on}"));
             assert!(command.contains("#{!:"));
-            assert!(command.ends_with(&format!("'send-keys -t %7 {key}'")));
+            assert!(command.ends_with(&format!("'send-keys -N 1 -t %7 {key}'")));
+            for count in 2..=MAX_APPLICATION_SCROLL_PAGES {
+                let repeated = bytes.repeat(count);
+                frame.truncate(9);
+                frame.extend_from_slice(&repeated);
+                assert!(parse_input_frame(&frame).is_ok());
+                let command = application_scroll_command("%7", &repeated)
+                    .unwrap_or_else(|error| panic!("valid bounded scroll batch: {error}"));
+                assert!(command.ends_with(&format!("'send-keys -N {count} -t %7 {key}'")));
+            }
+            assert!(
+                application_scroll_command("%7", &bytes.repeat(MAX_APPLICATION_SCROLL_PAGES + 1))
+                    .is_err()
+            );
         }
         for bytes in [
             b"\x1b[A".as_slice(),
             b"\x1b[5~\x1b[6~",
             b"run-shell x",
             b"\x1b[5;2~",
+            b"\x1b[5~\x1b[5",
+            b"\x1b[5~\0\0\0\0",
             b"",
         ] {
             let mut frame = vec![3];

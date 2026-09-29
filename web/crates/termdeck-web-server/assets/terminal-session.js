@@ -76,7 +76,7 @@ window.T1000TerminalSession = (() => {
     let focusRequested = false;
     const scroll = window.T1000TerminalScroll.install(host, terminalApi,
       {isController: () => active && ready && mine && socketOpen(),
-        onApplicationScroll: direction => enqueueWheel(new TextEncoder().encode(direction === "up" ? "\x1b[5~" : "\x1b[6~"), 3)});
+        onApplicationScroll: (direction, count = 1) => enqueueWheel(new TextEncoder().encode((direction === "up" ? "\x1b[5~" : "\x1b[6~").repeat(count)), 3)});
 
     function requestControl() {
       if (!active || disposed) return;
@@ -322,13 +322,14 @@ window.T1000TerminalSession = (() => {
 
     function enqueueWheel(bytes, type = 2) {
       if (!active || !ready || !mine || !socketOpen() || disposed || !(bytes instanceof Uint8Array)
-          || !bytes.length || bytes.length > 64 || queuedBytes + bytes.length > MAX_PENDING_BYTES) return;
+          || !bytes.length || bytes.length > 64 || queuedBytes + bytes.length > MAX_PENDING_BYTES) return false;
       flushInputBatch(true);
       if (queue.length || inFlight.size >= MAX_IN_FLIGHT_FRAMES
-          || socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) return;
+          || socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) return false;
       queuedBytes += bytes.length;
       queueFrame(bytes, type);
       sendAvailable();
+      return true;
     }
 
     function cancelOutputSchedule() {
