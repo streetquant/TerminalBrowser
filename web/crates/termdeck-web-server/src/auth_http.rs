@@ -102,6 +102,18 @@ impl HttpAuth {
         (&self.store, &self.machines)
     }
 
+    /// Revalidate an upgraded connection without retaining its cookie secret
+    /// or charging the HTTP login rate limiter for terminal traffic.
+    pub(crate) fn require_session(
+        &self,
+        context: &SessionContext,
+        wall_clock_ms: u64,
+    ) -> Result<(), HttpAuthError> {
+        self.store
+            .require_context(context, wall_clock_ms)
+            .map_err(HttpAuthError::Auth)
+    }
+
     pub fn authenticate(
         &self,
         headers: &HeaderMap,
@@ -599,6 +611,47 @@ mod tests {
         };
         headers.insert(header::COOKIE, value);
         headers
+    }
+
+    #[test]
+    fn upgraded_context_observes_logout_revocation_and_expiry_without_cross_session_changes() {
+        let directory = TestDirectory::new("upgraded-context");
+        let auth = auth(&directory, false);
+        let mut contexts = Vec::new();
+        for label in ["Logout", "Revoke", "Unchanged"] {
+            let invitation = auth
+                .store
+                .create_invitation(label, 10, 1_000)
+                .unwrap_or_else(|error| panic!("invitation failed: {error}"));
+            let session = auth
+                .pair(invitation.secret().expose_secret(), 20)
+                .unwrap_or_else(|error| panic!("pairing failed: {error}"));
+            let headers = cookie_headers(
+                &auth
+                    .session_cookie_headers(&session, 20)
+                    .unwrap_or_else(|error| panic!("cookies failed: {error}")),
+            );
+            contexts.push(
+                auth.authenticate(&headers, 21)
+                    .unwrap_or_else(|error| panic!("authentication failed: {error}")),
+            );
+        }
+        for context in &contexts {
+            assert!(auth.require_session(context, 22).is_ok());
+        }
+        assert!(auth.revoke_session(contexts[0].session_id(), 23).is_ok());
+        assert!(auth.require_session(&contexts[0], 24).is_err());
+        assert!(auth.require_session(&contexts[1], 24).is_ok());
+        assert!(auth.require_session(&contexts[2], 24).is_ok());
+        assert!(auth.revoke_device(contexts[1].device_id(), 25).is_ok());
+        assert!(auth.require_session(&contexts[1], 26).is_err());
+        assert!(auth.require_session(&contexts[2], 26).is_ok());
+        assert!(
+            auth.require_session(&contexts[2], contexts[2].expires_at_ms())
+                .is_err()
+        );
+        // A wall-clock rewind cannot restore an expired upgraded session.
+        assert!(auth.require_session(&contexts[2], 27).is_err());
     }
 
     #[test]

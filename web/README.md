@@ -40,6 +40,22 @@ The current LAN deployment uses an HTTPS reverse proxy in front of the loopback 
 
 The Rust origin itself remains loopback-only. Cloudflare Tunnel support is a later staging gate and must authenticate the origin rather than exposing the loopback service directly.
 
+Upgraded terminal connections revalidate their login session before accepting
+each incoming message and every second while idle. Logout, device revocation,
+expiry or an unavailable authentication store closes the connection with a
+redacted, nonrecoverable authentication error. Checks run outside the terminal
+executor; cookie secrets are not retained by the stream. Other valid sessions
+and the underlying tmux process are preserved.
+
+Run the isolated raw-browser negative controls (without client polling that
+could conceal server revocation failures):
+
+```bash
+python3 scripts/check_web_socket_auth.py \
+  --binary web/target/release/termdeck-web-server \
+  --evidence-dir .termdeck/qualification/socket-auth
+```
+
 ## Crates
 
 - `termdeck-web-auth`: owner password, opaque device sessions, CSRF, revocation, audit chain, and bounded rate limiting in a separate owner-only database.

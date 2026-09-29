@@ -2179,6 +2179,9 @@ async fn terminal_websocket(
         Ok(value) => value,
         Err(response) => return *response,
     };
+    let Some(auth) = state.auth else {
+        return internal_error_response();
+    };
     websocket
         .protocols(["termdeck.terminal.v1"])
         .on_upgrade(move |socket| {
@@ -2190,6 +2193,8 @@ async fn terminal_websocket(
                     tmux_target: pane.tmux_target,
                 },
                 actor,
+                auth,
+                context,
             )
         })
 }

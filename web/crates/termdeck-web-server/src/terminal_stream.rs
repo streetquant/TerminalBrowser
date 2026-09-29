@@ -1,3 +1,4 @@
+use crate::auth_http::HttpAuth;
 use crate::terminal_http::{
     InputDecision, InputOutcome, MAX_CAPTURE_HISTORY_LINES, MAX_TERMINAL_INPUT_BYTES,
     TerminalControlView, TerminalError, TerminalService,
@@ -13,6 +14,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use termdeck_web_auth::SessionContext;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
@@ -57,6 +59,9 @@ const MAX_MOUSE_WHEEL_BYTES: usize = 64;
 const MOUSE_REPORTING_FORMAT: &str =
     "#{||:#{mouse_standard_flag},#{||:#{mouse_button_flag},#{mouse_all_flag}}}";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+// An idle viewer must lose access too; controller lease heartbeats alone do
+// not observe logout, device revocation or authentication expiry.
+const SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CONTROL_MODE_ARGUMENT: &str = "-C";
 const CONTROL_FLAGS_VIEWER: &str = "active-pane,ignore-size,no-detach-on-destroy";
 const CONTROL_FLAGS_WRITER: &str = "active-pane,!ignore-size,no-detach-on-destroy";
@@ -76,6 +81,7 @@ pub(crate) enum StreamError {
     ControlProtocol(&'static str),
     Io(std::io::Error),
     Json(serde_json::Error),
+    SessionUnavailable,
     Terminal(TerminalError),
     Timeout(&'static str),
     Tmux(String),
@@ -92,6 +98,9 @@ impl fmt::Display for StreamError {
             }
             Self::Io(error) => write!(formatter, "terminal stream I/O failed: {error}"),
             Self::Json(error) => write!(formatter, "terminal stream JSON failed: {error}"),
+            Self::SessionUnavailable => {
+                formatter.write_str("terminal authentication is no longer valid")
+            }
             Self::Terminal(error) => error.fmt(formatter),
             Self::Timeout(operation) => {
                 write!(formatter, "terminal stream timed out during {operation}")
@@ -236,14 +245,21 @@ pub(crate) async fn run_terminal_socket(
     terminal: Arc<TerminalService>,
     pane: StreamPane,
     actor: String,
+    auth: Arc<HttpAuth>,
+    context: SessionContext,
 ) {
-    if let Err(error) = run_terminal_socket_inner(&mut socket, terminal, pane, actor).await {
+    if let Err(error) =
+        run_terminal_socket_inner(&mut socket, terminal, pane, actor, auth, context).await
+    {
         let message = error.to_string();
         let event = ErrorEvent {
             r#type: "error",
             code: error_code(&error),
             message: message.as_str(),
-            recoverable: !matches!(error, StreamError::ClientProtocol(_)),
+            recoverable: !matches!(
+                error,
+                StreamError::ClientProtocol(_) | StreamError::SessionUnavailable
+            ),
         };
         let _result = send_json(&mut socket, &event).await;
     }
@@ -255,10 +271,13 @@ async fn run_terminal_socket_inner(
     terminal: Arc<TerminalService>,
     pane: StreamPane,
     actor: String,
+    auth: Arc<HttpAuth>,
+    context: SessionContext,
 ) -> Result<(), StreamError> {
     validate_termdeck_id(pane.pane_id.as_str())?;
     validate_tmux_target(pane.tmux_target.as_str())?;
     let mut viewport_geometry = receive_hello(socket).await?;
+    require_stream_session(&auth, &context).await?;
     let mut control_view = match terminal
         .acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), false)
         .await
@@ -308,6 +327,8 @@ async fn run_terminal_socket_inner(
     let (mut sender, mut receiver) = socket.split();
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut session_check = interval(SESSION_CHECK_INTERVAL);
+    session_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -339,6 +360,10 @@ async fn run_terminal_socket_inner(
                 let Some(message) = message else {
                     break;
                 };
+                // Recheck before input, focus/takeover, resize or any reply.
+                // The periodic branch separately closes an idle/output-only
+                // socket. SQLite work stays off the terminal executor thread.
+                require_stream_session(&auth, &context).await?;
                 match message.map_err(|_| StreamError::ControlClosed)? {
                     Message::Binary(frame) => {
                         let (sequence, bytes, kind) = parse_input_frame(frame.as_ref())?;
@@ -457,10 +482,25 @@ async fn run_terminal_socket_inner(
                     send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view }).await?;
                 }
             }
+            _ = session_check.tick() => {
+                require_stream_session(&auth, &context).await?;
+            }
         }
     }
     control.shutdown().await;
     Ok(())
+}
+
+async fn require_stream_session(
+    auth: &Arc<HttpAuth>,
+    context: &SessionContext,
+) -> Result<(), StreamError> {
+    let auth = Arc::clone(auth);
+    let context = context.clone();
+    tokio::task::spawn_blocking(move || auth.require_session(&context, unix_ms()))
+        .await
+        .map_err(|_| StreamError::SessionUnavailable)?
+        .map_err(|_| StreamError::SessionUnavailable)
 }
 
 async fn send_sink_resync<S>(
@@ -504,6 +544,7 @@ where
 
 fn error_code(error: &StreamError) -> &'static str {
     match error {
+        StreamError::SessionUnavailable => "authentication-required",
         StreamError::Backpressure => "viewer-backpressure",
         StreamError::ClientProtocol(_) | StreamError::Json(_) => "invalid-client-message",
         StreamError::ControlClosed | StreamError::ControlProtocol(_) => "terminal-disconnected",
