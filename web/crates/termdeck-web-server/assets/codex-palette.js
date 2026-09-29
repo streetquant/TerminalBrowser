@@ -1,6 +1,7 @@
 "use strict";
 
 window.T1000CodexPalette = ({ open, element, button, body, modal, getPanes, getSelectedId, getGeneration, snapshot, appPath }) => {
+    const MAX_ALL_DIRECTORIES = 32;
     function commandPalette() {
       if (!open("Launch Codex in directories")) return;
       modal.onkeydown = null;
@@ -42,8 +43,12 @@ window.T1000CodexPalette = ({ open, element, button, body, modal, getPanes, getS
           if (current !== serial || !modal.open) return;
           if (!found.runtimes.some(runtime => runtime.id === "codex")) throw new Error("Codex is unavailable in the TermDeck launch policy.");
           options = found;
-          const all = element("option", "", `All immediate subdirectories (${found.directories.length})`);
+          const allAvailable = found.directories.length <= MAX_ALL_DIRECTORIES;
+          const all = element("option", "", allAvailable
+            ? `All immediate subdirectories (${found.directories.length})`
+            : `All unavailable above ${MAX_ALL_DIRECTORIES} directories`);
           all.value = "all";
+          all.disabled = !allAvailable;
           directory.append(all);
           for (const [index, item] of found.directories.entries()) {
             const option = element("option", "", item.name);
@@ -51,7 +56,9 @@ window.T1000CodexPalette = ({ open, element, button, body, modal, getPanes, getS
             directory.append(option);
           }
           if (found.directories.length) directory.value = "0";
-          status.textContent = found.directories.length ? `${found.directories.length} host directories available. Choose one or All.` : "No immediate subdirectories are available here.";
+          status.textContent = found.directories.length
+            ? `${found.directories.length} host directories available. Choose one${allAvailable ? " or All" : `; All is limited to ${MAX_ALL_DIRECTORIES} at once. Enter a narrower parent for All`}.`
+            : "No immediate subdirectories are available here.";
           launch.disabled = !found.directories.length;
         } catch (error) {
           if (current === serial && modal.open) { options = null; status.textContent = error.message; }
@@ -63,6 +70,10 @@ window.T1000CodexPalette = ({ open, element, button, body, modal, getPanes, getS
         if (!task) { status.textContent = "Enter a Codex prompt before launching."; prompt.focus(); return; }
         if (!batch) {
           const chosen = directory.value === "all" ? options.directories : [options.directories[Number(directory.value)]];
+          if (chosen.length > MAX_ALL_DIRECTORIES) {
+            status.textContent = `All is limited to ${MAX_ALL_DIRECTORIES} directories at once. Enter a narrower parent.`;
+            return;
+          }
           if (!chosen.length || chosen.some(item => !item)) { status.textContent = "Choose an available directory."; return; }
           batch = chosen.map(item => ({...item, requestId: window.T1000Files.id(), result: null, error: ""}));
           parent.disabled = directory.disabled = prompt.disabled = refresh.disabled = true;

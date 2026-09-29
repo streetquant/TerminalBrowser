@@ -39,7 +39,12 @@ def main():
                         if (request.operation === 'launch-options') return {
                             ok: true, policy_revision: 'fixture-policy',
                             runtimes: [{id: 'codex', label: 'Codex'}],
-                            directory: '/projects', directories: [
+                            directory: request.directory,
+                            directories: request.directory === '/home/arch'
+                              ? Array.from({length: 515}, (_, index) => ({
+                                  name: `folder-${String(index).padStart(3, '0')}`,
+                                  path: `/home/arch/folder-${String(index).padStart(3, '0')}`,
+                                })) : [
                                 {name: 'alpha', path: '/projects/alpha'},
                                 {name: 'beta', path: '/projects/beta'},
                             ],
@@ -92,8 +97,27 @@ def main():
                        and item["task"] == "Review code; $(not a command)" for item in launches)
             assert page.get_by_role("link", name="Open window").count() == 2
             assert page.get_by_role("button", name="Retry unresolved").is_disabled()
+            page.evaluate("document.querySelector('#workspace-tools-dialog').close()")
+            page.locator("#menu summary").click()
+            page.get_by_role("button", name="Launch Codex in directories").click()
+            page.get_by_role("textbox", name="Parent directory on TermDeck host").fill("/home/arch")
+            page.get_by_role("button", name="Refresh directories").click()
+            page.get_by_text("515 host directories available.", exact=False).wait_for()
+            picker = page.get_by_role("combobox", name="Directory")
+            assert picker.locator("option").count() == 516
+            all_disabled = page.evaluate("document.querySelector('option[value=all]').disabled")
+            assert all_disabled, page.evaluate("document.querySelector('option[value=all]').outerHTML")
+            picker.select_option("514")
+            assert picker.input_value() == "514"
+            # A forged value must not bypass the disabled bulk action.
+            picker.evaluate("element => { element.value = 'all'; }")
+            page.get_by_role("textbox", name="Codex prompt").fill("No bulk launch")
+            page.get_by_role("button", name="Launch Codex", exact=True).click()
+            assert len([item for item in page.evaluate("window.calls") if item["operation"] == "create-window"]) == 3
+            page.get_by_text("All is limited to 32 directories at once", exact=False).wait_for()
             print(json.dumps({"ok": True, "requests": len(launches), "unique_launches": 2,
-                              "retry_reused_id": True}))
+                              "retry_reused_id": True, "large_parent_options": 515,
+                              "large_parent_single_selection": True, "large_parent_all_bounded": True}))
         finally:
             browser.close()
 

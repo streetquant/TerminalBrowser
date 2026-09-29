@@ -140,7 +140,7 @@ def select(path, *, state_root=None, protected=()):
         directory.close()
 
 
-def immediate_directories(path, *, limit=128):
+def immediate_directories(path, *, limit=768, max_bytes=128 * 1024):
     """List searchable direct children of an admitted host directory.
 
     The list is only a picker snapshot. Each chosen path is admitted and pinned
@@ -154,6 +154,7 @@ def immediate_directories(path, *, limit=128):
         if _identity(os.fstat(descriptor)) != parent.chain[-1]:
             raise StagingError("Server directory changed while listing", "conflict")
         children = []
+        response_bytes = 0
         with os.scandir(descriptor) as entries:
             for entry in entries:
                 if entry.name in {".", ".."} or "/" in entry.name or "\x00" in entry.name:
@@ -166,12 +167,18 @@ def immediate_directories(path, *, limit=128):
                     try:
                         if child.chain[:-1] != parent.chain or child.chain[-1] != _identity(info):
                             continue
-                        children.append({"name": entry.name, "path": str(child.path)})
+                        selected = str(child.path)
                     finally:
                         child.close()
                 except (OSError, StagingError):
                     # A child may be private or change during the listing.
                     continue
+                # Bound the returned JSON even when the parent contains
+                # hundreds of children with unusually long names.
+                response_bytes += len(entry.name.encode("utf-8")) + len(selected.encode("utf-8")) + 64
+                if response_bytes > max_bytes:
+                    raise StagingError("Directory picker result is too large; choose a narrower parent", "capacity")
+                children.append({"name": entry.name, "path": selected})
                 if len(children) > limit:
                     raise StagingError("Too many immediate directories; choose a narrower parent", "capacity")
         parent.check()

@@ -15,6 +15,10 @@ the prompt is one data argument, and each create request has its own durable
 replay identity. The palette's `--yolo` mode is an explicit Codex runtime flag,
 never shell syntax or an arbitrary client-supplied command. Existing launches
 without that flag keep their configured runtime behavior.
+The directory picker can list up to 768 immediate children within a 128 KiB
+response budget. A single directory remains selectable from a larger list;
+**All** is enabled for at most 32 children to bound simultaneous agent starts.
+Choose a narrower parent for a larger batch.
 
 **Native shell** opens a terminal as the host user. **Codex (TermDeck private
 account)** starts the configured native Codex runtime with the tab's own account

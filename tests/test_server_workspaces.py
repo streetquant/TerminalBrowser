@@ -53,6 +53,20 @@ def test_immediate_directory_picker_excludes_links_files_and_nested_children(dir
         workspaces.immediate_directories(str(workspace), limit=1)
 
 
+def test_large_home_style_picker_stays_available_but_bounded(directories):
+    _, workspace = directories
+    for index in range(515):
+        (workspace / f"folder-{index:03d}").mkdir()
+    listed = workspaces.immediate_directories(str(workspace))
+    assert len(listed) == 515
+    assert listed[0] == {"name": "folder-000", "path": str(workspace / "folder-000")}
+    assert listed[-1] == {"name": "folder-514", "path": str(workspace / "folder-514")}
+    with pytest.raises(StagingError, match="Too many immediate directories"):
+        workspaces.immediate_directories(str(workspace), limit=128)
+    with pytest.raises(StagingError, match="picker result is too large"):
+        workspaces.immediate_directories(str(workspace), max_bytes=1024)
+
+
 def test_immediate_directory_picker_rejects_invalid_parent(directories):
     _, workspace = directories
     with pytest.raises(StagingError):
