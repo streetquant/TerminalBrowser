@@ -1752,7 +1752,7 @@ def main() -> int:
             tools_dialog.get_by_role("textbox", name="Codex prompt").wait_for(timeout=3000)
             tools_dialog.get_by_role("combobox", name="Directory").wait_for(timeout=3000)
             page_two.keyboard.press("Escape")
-            click_action(page_two, "Terminal appearance")
+            click_action(page_two, "Settings · themes and fonts")
             try:
                 tools_dialog.get_by_label("Terminal text size (px)").wait_for(timeout=3000)
             except Exception as exc:
@@ -1784,7 +1784,7 @@ def main() -> int:
                            "background": "#2e3440", "red": "#bf616a", "font": '"Liberation Mono", monospace'}:
                 raise AssertionError(f"appearance did not persist or xterm diverged from tmux {current_size}: {options}")
             result["geometry"]["after_appearance"] = appearance_geometry
-            click_action(page_two, "Terminal appearance")
+            click_action(page_two, "Settings · themes and fonts")
             palette_backgrounds = {"t1000": "#0a0d13", "terminator": "#000000", "catppuccin": "#1e1e2e",
                                    "tokyo-night": "#1a1b26", "nord": "#2e3440", "one-dark": "#282c34", "solarized-dark": "#002b36"}
             for palette, background in palette_backgrounds.items():

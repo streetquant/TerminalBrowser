@@ -365,7 +365,7 @@ window.T1000UI = (() => {
       }
     }
     function appearance() {
-      if (!open("Terminal appearance")) return;
+      if (!open("Settings")) return;
       modal.onkeydown = null;
       const settings = preferences();
       const choices = window.TermDeckTerminal.appearanceOptions();
@@ -421,7 +421,8 @@ window.T1000UI = (() => {
       for (const [text, control] of [["Interface theme", chrome], ["Density", density], ["Interface font", uiFont], ["Interface scale", scale], ["Sidebar position", side], ["Show Tabs pane", paneVisible], ["Reduce motion", motion]]) {
         control.setAttribute("aria-label", text); const label = element("label", control.type === "checkbox" ? "workspace-check" : "workspace-field"); label.append(element("span", "", text), control); body.append(label);
       }
-      const status = element("p", "subtle", "Saved only in this browser. Fonts must be installed here. A larger font may make a remote client's fixed grid scroll inside this browser.");
+      const selectionSummary = () => `${chrome.selectedOptions[0]?.textContent || chrome.value} theme, ${font.selectedOptions[0]?.textContent || font.value} terminal font, ${uiFont.value.trim() || "system"} interface font`;
+      const status = element("p", "subtle", `Current here: ${selectionSummary()}. Changes apply immediately and are saved in this browser. Fonts must be installed on this computer.`);
       status.setAttribute("role", "status");
       body.append(status);
       function apply() {
@@ -431,7 +432,10 @@ window.T1000UI = (() => {
         getTerminal()?.setAppearance(next);
         applyChrome(next);
         shell.dataset.sidebarSide = side.value; sidebar.hidden = !paneVisible.checked; shell.dataset.sidebar = sidebar.hidden ? "closed" : "open"; saveLayout(); updateTabs(getPanes(), selectedId);
-        try { localStorage.setItem("t1000.appearance", JSON.stringify(next)); }
+        try {
+          localStorage.setItem("t1000.appearance", JSON.stringify(next));
+          status.textContent = `Applied here: ${selectionSummary()}. Saved in this browser.`;
+        }
         catch (_) { status.textContent = "Applied for this tab. Browser storage is unavailable, so this cannot be saved."; }
         return next;
       }
@@ -494,7 +498,7 @@ window.T1000UI = (() => {
     searchButton.title = "Search tabs (Ctrl+Shift+K)";
     searchButton.setAttribute("aria-label", "Search tabs");
     toolbar.append(searchButton);
-    const handlers = [["Show/hide Tabs pane", () => toggleSidebar()], ["Search tabs", searchTabs], ["Hidden tabs", hiddenTabs], ["Launch Codex in directories", commandPalette], ["Find in terminal", find], ["Terminal appearance", appearance], ["Keyboard shortcuts", shortcuts]];
+    const handlers = [["Show/hide Tabs pane", () => toggleSidebar()], ["Search tabs", searchTabs], ["Hidden tabs", hiddenTabs], ["Launch Codex in directories", commandPalette], ["Find in terminal", find], ["Settings · themes and fonts", appearance], ["Keyboard shortcuts", shortcuts]];
     window.addEventListener("keydown", event => {
       if (event.defaultPrevented || !event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey || root.querySelector("dialog[open]")) return;
       const action = { k: searchTabs, p: commandPalette, f: find }[event.key.toLowerCase()];

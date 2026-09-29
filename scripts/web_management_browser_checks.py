@@ -185,7 +185,7 @@ def check_management(page, *, origin, database, initial_id, created_id, output, 
     wait_until(lambda: database_row(database, first_id)["tab_index"] < database_row(database, second_id)["tab_index"], timeout=10, detail="keyboard tab reorder")
     result["assertions"]["drag_and_keyboard_reorder_persist"] = True
 
-    click_action(page, "Terminal appearance")
+    click_action(page, "Settings · themes and fonts")
     settings = page.locator("#workspace-tools-dialog")
     settings.get_by_label("Interface theme", exact=True).select_option("light")
     settings.get_by_label("Density", exact=True).select_option("comfortable")
@@ -220,7 +220,7 @@ def check_management(page, *, origin, database, initial_id, created_id, output, 
     if saved["chrome"] != "light" or saved["scrollback"] != 30000 or saved["cursorColor"] != "#00ff88" or saved["uiScale"] != 1.15:
         raise AssertionError(f"settings did not persist: {saved}")
     for width, height, scale, theme in [(1440, 900, 1.75, 'light'), (390, 760, 1, 'noir'), (320, 568, 1.75, 'dark')]:
-        click_action(page, "Terminal appearance")
+        click_action(page, "Settings · themes and fonts")
         settings.get_by_label("Interface scale", exact=True).fill(str(scale))
         settings.get_by_label("Interface scale", exact=True).press("Tab")
         settings.get_by_label("Interface theme", exact=True).select_option(theme)
@@ -235,7 +235,7 @@ def check_management(page, *, origin, database, initial_id, created_id, output, 
         page.screenshot(path=str(output / f"workspace-{theme}-{width}-scale-{scale}.png"))
         page.set_viewport_size({"width": 1440, "height": 900})
     result["assertions"]["responsive_chrome_and_maximum_interface_scale"] = True
-    click_action(page, "Terminal appearance")
+    click_action(page, "Settings · themes and fonts")
     settings.get_by_role("button", name="Reset to defaults", exact=True).click()
     settings.get_by_role("button", name="Close", exact=True).click()
     page.screenshot(path=str(output / "workspace-charcoal.png"), animations="disabled")

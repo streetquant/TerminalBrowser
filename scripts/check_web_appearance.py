@@ -84,12 +84,13 @@ def main():
                 page.add_script_tag(path=str(ASSETS / asset))
             attach(page)
             menu_names = page.locator("#menu button").all_text_contents()
-            assert menu_names.count("Terminal appearance") == 1, menu_names
+            assert menu_names.count("Settings · themes and fonts") == 1, menu_names
             assert "Codex accounts" in menu_names and "Client files" in menu_names, menu_names
-            assert "Settings" not in menu_names, menu_names
+            assert not any(name == "Terminal appearance" or name == "Settings" for name in menu_names), menu_names
             page.locator("#menu summary").focus()
             page.keyboard.press("Enter")
-            page.get_by_role("button", name="Terminal appearance").click()
+            page.get_by_role("button", name="Settings · themes and fonts").click()
+            assert "Current here:" in page.get_by_role("status").first.inner_text()
             page.get_by_label("Terminal text size (px)").fill("24")
             page.get_by_label("Terminal text size (px)").dispatch_event("change")
             page.get_by_label("Cursor shape").select_option("bar")
@@ -97,6 +98,11 @@ def main():
             page.get_by_label("Scrollback lines").dispatch_event("change")
             page.get_by_label("Terminal palette").select_option("nord")
             page.get_by_label("Terminal font", exact=True).select_option("system")
+            page.get_by_label("Interface theme").select_option("light")
+            page.get_by_label("Interface font", exact=True).fill("Liberation Sans")
+            page.get_by_label("Interface font", exact=True).dispatch_event("change")
+            assert "Applied here:" in page.get_by_role("status").first.inner_text()
+            assert page.locator("html").get_attribute("data-chrome") == "light"
             page.get_by_label("Cursor color").fill("#abcdef")
             page.get_by_label("Cursor color").dispatch_event("change")
             page.get_by_label("Blink cursor").uncheck()
@@ -148,7 +154,9 @@ def main():
             assert restored["palette"] == "#2e3440" and restored["scrollback"] == 1200, restored
             assert restored["cursorColor"] == "#abcdef" and restored["fontFamily"] == "monospace", restored
             page.locator("#menu summary").click()
-            page.get_by_role("button", name="Terminal appearance").click()
+            page.get_by_role("button", name="Settings · themes and fonts").click()
+            assert "Warm paper" in page.get_by_role("status").first.inner_text()
+            assert "Liberation Sans" in page.get_by_role("status").first.inner_text()
             page.get_by_role("button", name="Reset to defaults").click()
             reset = state(page)
             assert reset["fontSize"] == 13 and reset["cursorStyle"] == "block", reset
