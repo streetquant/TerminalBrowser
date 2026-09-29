@@ -100,10 +100,16 @@ def main() -> None:
                 new WheelEvent('wheel', {bubbles: true, cancelable: true, deltaY: -180}))""")
             page.wait_for_function("document.querySelector('.terminal-history-text').textContent.includes('No terminal history')")
             assert page.evaluate("input.length") == 0
+            page.evaluate("""() => {
+                probe.api.reset();
+                probe.api.write('Reconnected terminal');
+            }""")
+            page.wait_for_function("document.querySelector('.terminal-history').hidden")
+            assert page.evaluate("input.length") == 0
             page.evaluate("probe.scroll.dispose(); probe.api.dispose()")
             print(json.dumps({"ok": True, "viewer_input": 0, "wheel_and_slider": True,
                               "malformed_rejected": True, "unauthorized_rejected": True,
-                              "empty_history_explicit": True}))
+                              "empty_history_explicit": True, "reconnect_closes_stale_history": True}))
         finally:
             browser.close()
 
