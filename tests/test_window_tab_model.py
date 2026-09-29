@@ -480,7 +480,7 @@ class WindowTabModelTests(TestCase):
             finally:
                 store.close()
 
-    def test_new_shell_tab_uses_directory_basename(self) -> None:
+    def test_new_shell_tab_requests_automatic_directory_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             nested = Path(tmp) / "backend"
             nested.mkdir()
@@ -489,7 +489,7 @@ class WindowTabModelTests(TestCase):
 
             TermDeckWindow.new_shell_tab(window, nested)
 
-            self.assertEqual(calls[0][0], "backend")
+            self.assertEqual(calls[0][0], "")
             self.assertEqual(calls[0][1], "terminal")
             self.assertEqual(calls[0][3], str(nested.resolve()))
 
@@ -544,13 +544,13 @@ class WindowTabModelTests(TestCase):
             new_directory = Path(tmp) / "new-project"
             old_directory.mkdir()
             new_directory.mkdir()
-            record = SimpleNamespace(name="old-project", cwd=str(old_directory))
+            record = SimpleNamespace(name="old-project", cwd=str(old_directory), name_is_automatic=True)
 
             changes = TermDeckWindow._directory_tracking_changes(record, str(new_directory))
 
             self.assertEqual(
                 changes,
-                {"cwd": str(new_directory.resolve()), "name": "new-project"},
+                {"cwd": str(new_directory.resolve()), "name": "new-project", "automatic_name": True},
             )
 
     def test_custom_tab_name_remains_an_override_when_directory_changes(self) -> None:
@@ -559,7 +559,7 @@ class WindowTabModelTests(TestCase):
             new_directory = Path(tmp) / "new-project"
             old_directory.mkdir()
             new_directory.mkdir()
-            record = SimpleNamespace(name="API shell", cwd=str(old_directory))
+            record = SimpleNamespace(name="API shell", cwd=str(old_directory), name_is_automatic=False)
 
             changes = TermDeckWindow._directory_tracking_changes(record, str(new_directory))
 
@@ -574,7 +574,7 @@ class WindowTabModelTests(TestCase):
             new_directory.mkdir()
             store = SessionStore(root / "sessions.sqlite3")
             try:
-                record = store.create("old-project", "terminal", "bash", old_directory)
+                record = store.create("old-project", "terminal", "bash", old_directory, automatic_name=True)
                 original_opened_at = record.last_opened_at
                 calls = []
 
@@ -614,6 +614,24 @@ class WindowTabModelTests(TestCase):
             finally:
                 store.close()
 
+    def test_manual_basename_does_not_become_automatic_on_directory_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "arch"
+            original.mkdir()
+            store = SessionStore(root / "sessions.sqlite3", provision_auth_scopes=False)
+            try:
+                record = store.create("arch", "terminal", "bash", original, automatic_name=True)
+                # This rename has the same text as the original default.
+                record = store.update(record.id, name="arch", automatic_name=False)
+                changes = TermDeckWindow._directory_tracking_changes(record, str(root / "ipa"))
+                self.assertEqual(changes, {"cwd": str(root / "ipa")})
+                changed = store.update(record.id, **changes)
+                self.assertEqual(changed.name, "arch")
+                self.assertFalse(changed.name_is_automatic)
+            finally:
+                store.close()
+
     def test_close_snapshots_live_directory_before_detaching_tab(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -623,7 +641,7 @@ class WindowTabModelTests(TestCase):
             new_directory.mkdir()
             store = SessionStore(root / "sessions.sqlite3")
             try:
-                record = store.create("old-project", "terminal", "bash", old_directory)
+                record = store.create("old-project", "terminal", "bash", old_directory, automatic_name=True)
                 order = []
 
                 class Backend:

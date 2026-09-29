@@ -544,7 +544,7 @@ def test_normal_validation_tmux_argv_emits_no_debug_logs(
     tmux = runner.shutil.which("tmux")
     if tmux is None:
         pytest.skip("tmux is unavailable")
-    with runner.tempfile.TemporaryDirectory(prefix="tv-", dir="/tmp") as raw_base:
+    with runner.tempfile.TemporaryDirectory(prefix="tv-", dir=os.environ.get("TMPDIR")) as raw_base:
         runtime_base = Path(raw_base)
         runtime_base.chmod(0o700)
         monkeypatch.setenv(runner._TASK_RUNTIME_BASE_ENV, str(runtime_base))

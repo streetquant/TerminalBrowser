@@ -163,6 +163,7 @@ def open_workspace(
                     pinned=tab.pinned,
                     status="new" if existing.status == "stopped" else existing.status,
                     last_opened_at=utc_now(),
+                    automatic_name=tab.automatic_name,
                 )
                 created = False
                 reused = True
@@ -177,6 +178,7 @@ def open_workspace(
                     tab_index=tab_index,
                     visible=tab.visible,
                     pinned=tab.pinned,
+                    automatic_name=tab.automatic_name,
                 )
                 created = True
                 reused = False

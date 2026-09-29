@@ -87,6 +87,9 @@ const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v8/app.js";
 const CLIENT_FILES_PATH: &str = "/_termdeck/assets/v8/client-files.js";
 const ACCOUNTS_PATH: &str = "/_termdeck/assets/v8/accounts.js";
 const WORKSPACE_UI_PATH: &str = "/_termdeck/assets/v8/workspace-ui.js";
+const CODEX_PALETTE_PATH: &str = "/_termdeck/assets/v8/codex-palette.js";
+const TERMINAL_COPY_PATH: &str = "/_termdeck/assets/v8/terminal-copy.js";
+const TERMINAL_SCROLL_PATH: &str = "/_termdeck/assets/v8/terminal-scroll.js";
 const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v8/terminal.css";
 const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v8/terminal.js";
 const EXTERNAL_BASE_PATH: &str = "/t1000";
@@ -101,6 +104,9 @@ const APP_JS: &[u8] = include_bytes!("../assets/app.js");
 const CLIENT_FILES_JS: &[u8] = include_bytes!("../assets/client-files.js");
 const ACCOUNTS_JS: &[u8] = include_bytes!("../assets/accounts.js");
 const WORKSPACE_UI_JS: &[u8] = include_bytes!("../assets/workspace-ui.js");
+const CODEX_PALETTE_JS: &[u8] = include_bytes!("../assets/codex-palette.js");
+const TERMINAL_COPY_JS: &[u8] = include_bytes!("../assets/terminal-copy.js");
+const TERMINAL_SCROLL_JS: &[u8] = include_bytes!("../assets/terminal-scroll.js");
 const TERMINAL_CSS: &[u8] = include_bytes!("../assets/terminal.css");
 const TERMINAL_JS: &[u8] = include_bytes!("../assets/terminal.js");
 const _: () = {
@@ -109,6 +115,9 @@ const _: () = {
     assert!(CLIENT_FILES_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
     assert!(ACCOUNTS_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
     assert!(WORKSPACE_UI_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+    assert!(CODEX_PALETTE_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+    assert!(TERMINAL_COPY_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+    assert!(TERMINAL_SCROLL_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
     assert!(TERMINAL_CSS.len() <= MAX_TERMINAL_ASSET_BYTES);
     assert!(TERMINAL_JS.len() <= MAX_TERMINAL_ASSET_BYTES);
 };
@@ -938,6 +947,9 @@ fn build_router(state: AppState) -> Router {
         .route(CLIENT_FILES_PATH, get(client_files_js))
         .route(ACCOUNTS_PATH, get(accounts_js))
         .route(WORKSPACE_UI_PATH, get(workspace_ui_js))
+        .route(CODEX_PALETTE_PATH, get(codex_palette_js))
+        .route(TERMINAL_COPY_PATH, get(terminal_copy_js))
+        .route(TERMINAL_SCROLL_PATH, get(terminal_scroll_js))
         .route(TERMINAL_CSS_PATH, get(terminal_css))
         .route(TERMINAL_JS_PATH, get(terminal_js))
         .route("/_termdeck/healthz", get(healthz))
@@ -1165,6 +1177,9 @@ fn public_auth_route(path: &str) -> bool {
             | CLIENT_FILES_PATH
             | ACCOUNTS_PATH
             | WORKSPACE_UI_PATH
+            | CODEX_PALETTE_PATH
+            | TERMINAL_COPY_PATH
+            | TERMINAL_SCROLL_PATH
             | TERMINAL_CSS_PATH
             | TERMINAL_JS_PATH
             | "/_termdeck/healthz"
@@ -1267,6 +1282,30 @@ async fn workspace_ui_js() -> Response {
         StatusCode::OK,
         "text/javascript; charset=utf-8",
         Bytes::from_static(WORKSPACE_UI_JS),
+    )
+}
+
+async fn codex_palette_js() -> Response {
+    text_response(
+        StatusCode::OK,
+        "text/javascript; charset=utf-8",
+        Bytes::from_static(CODEX_PALETTE_JS),
+    )
+}
+
+async fn terminal_copy_js() -> Response {
+    text_response(
+        StatusCode::OK,
+        "text/javascript; charset=utf-8",
+        Bytes::from_static(TERMINAL_COPY_JS),
+    )
+}
+
+async fn terminal_scroll_js() -> Response {
+    text_response(
+        StatusCode::OK,
+        "text/javascript; charset=utf-8",
+        Bytes::from_static(TERMINAL_SCROLL_JS),
     )
 }
 
@@ -2074,7 +2113,13 @@ async fn terminal_page(
     output.push_str("\"></script><script defer src=\"");
     output.push_str(ACCOUNTS_PATH);
     output.push_str("\"></script><script defer src=\"");
+    output.push_str(CODEX_PALETTE_PATH);
+    output.push_str("\"></script><script defer src=\"");
     output.push_str(WORKSPACE_UI_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(TERMINAL_COPY_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(TERMINAL_SCROLL_PATH);
     output.push_str("\"></script><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
     output.push_str("\"></script></head><body class=\"terminal-page\"><main id=\"termdeck-app\" class=\"terminal-page-main\" data-termdeck-page=\"terminal\" data-termdeck-slug=\"");
@@ -3070,6 +3115,8 @@ struct PaneDto<'a> {
     cwd: &'a str,
     status: &'static str,
     pinned: bool,
+    /// The title follows the working directory until the user names the tab.
+    automatic_title: bool,
     tmux_target: Option<&'a str>,
     controller: Option<ControllerDto<'a>>,
 }
@@ -3115,6 +3162,7 @@ fn pane_dto(pane: &PaneSnapshot) -> PaneDto<'_> {
         cwd: pane.cwd(),
         status: pane_status_name(pane.status()),
         pinned: pane.pinned(),
+        automatic_title: pane.automatic_title(),
         tmux_target: pane.tmux_target(),
         controller: pane.controller().map(controller_dto),
     }
@@ -3155,7 +3203,13 @@ fn render_homepage(
     output.push_str("\"></script><script defer src=\"");
     output.push_str(ACCOUNTS_PATH);
     output.push_str("\"></script><script defer src=\"");
+    output.push_str(CODEX_PALETTE_PATH);
+    output.push_str("\"></script><script defer src=\"");
     output.push_str(WORKSPACE_UI_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(TERMINAL_COPY_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(TERMINAL_SCROLL_PATH);
     output.push_str("\"></script><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
     output.push_str("\"></script></head><body><main id=\"termdeck-app\" aria-busy=\"false\" data-termdeck-page=\"home\"><header class=\"host-header\"><p class=\"eyebrow\">t1000 host</p><h1>Windows</h1><p class=\"subtle\">");
@@ -3221,7 +3275,13 @@ fn render_window_page(
     output.push_str("\"></script><script defer src=\"");
     output.push_str(ACCOUNTS_PATH);
     output.push_str("\"></script><script defer src=\"");
+    output.push_str(CODEX_PALETTE_PATH);
+    output.push_str("\"></script><script defer src=\"");
     output.push_str(WORKSPACE_UI_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(TERMINAL_COPY_PATH);
+    output.push_str("\"></script><script defer src=\"");
+    output.push_str(TERMINAL_SCROLL_PATH);
     output.push_str("\"></script><script defer src=\"");
     output.push_str(FRONTEND_JS_PATH);
     output.push_str("\"></script></head><body><main id=\"termdeck-app\" aria-busy=\"false\" data-termdeck-page=\"window\" data-termdeck-slug=\"");
@@ -3483,12 +3543,13 @@ fn duration_ms(duration: Duration) -> Result<u64, ServerError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_CSS, APP_JS, AppState, CLIENT_FILES_JS, CLIENT_FILES_PATH, CONTENT_SECURITY_POLICY,
-        CacheAvailability, ConfigAction, EXTERNAL_BASE_PATH, FORWARDED_HOST_HEADER,
-        FORWARDED_PREFIX_HEADER, FORWARDED_PROTO_HEADER, FRONTEND_CSS_PATH, FRONTEND_JS_PATH,
-        MAX_FRONTEND_ASSET_BYTES, MAX_PASSWORD_OPERATIONS, RenderedSnapshot, ServerConfig,
-        ServerError, SnapshotCache, TERMINAL_JS_PATH, WORKSPACE_UI_JS, WORKSPACE_UI_PATH,
-        build_router, unix_ms,
+        APP_CSS, APP_JS, AppState, CLIENT_FILES_JS, CLIENT_FILES_PATH, CODEX_PALETTE_JS,
+        CODEX_PALETTE_PATH, CONTENT_SECURITY_POLICY, CacheAvailability, ConfigAction,
+        EXTERNAL_BASE_PATH, FORWARDED_HOST_HEADER, FORWARDED_PREFIX_HEADER, FORWARDED_PROTO_HEADER,
+        FRONTEND_CSS_PATH, FRONTEND_JS_PATH, MAX_FRONTEND_ASSET_BYTES, MAX_PASSWORD_OPERATIONS,
+        RenderedSnapshot, ServerConfig, ServerError, SnapshotCache, TERMINAL_COPY_JS,
+        TERMINAL_COPY_PATH, TERMINAL_JS_PATH, TERMINAL_SCROLL_JS, TERMINAL_SCROLL_PATH,
+        WORKSPACE_UI_JS, WORKSPACE_UI_PATH, build_router, unix_ms,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
@@ -3796,6 +3857,8 @@ mod tests {
             assert!(APP_CSS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(APP_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(WORKSPACE_UI_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+            assert!(CODEX_PALETTE_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
+            assert!(TERMINAL_COPY_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(CLIENT_FILES_JS.len() <= MAX_FRONTEND_ASSET_BYTES);
             assert!(CONTENT_SECURITY_POLICY.contains("script-src 'self'"));
             assert!(CONTENT_SECURITY_POLICY.contains("style-src 'self' 'unsafe-inline'"));
@@ -3863,6 +3926,35 @@ mod tests {
             assert_eq!(files.as_bytes(), CLIENT_FILES_JS);
             assert!(!files.contains("innerHTML"));
             assert!(!files.contains("eval("));
+            let palette = router
+                .clone()
+                .oneshot(request(Method::GET, CODEX_PALETTE_PATH, "localhost:7391"))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(palette.status(), StatusCode::OK);
+            let palette = body_text(palette).await;
+            assert_eq!(palette.as_bytes(), CODEX_PALETTE_JS);
+            assert!(!palette.contains("innerHTML"));
+            assert!(!palette.contains("eval("));
+            let copy = router
+                .clone()
+                .oneshot(request(Method::GET, TERMINAL_COPY_PATH, "localhost:7391"))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(copy.status(), StatusCode::OK);
+            let copy = body_text(copy).await;
+            assert_eq!(copy.as_bytes(), TERMINAL_COPY_JS);
+            assert!(!copy.contains("innerHTML"));
+            let scroll = router
+                .clone()
+                .oneshot(request(Method::GET, TERMINAL_SCROLL_PATH, "localhost:7391"))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(scroll.status(), StatusCode::OK);
+            let scroll = body_text(scroll).await;
+            assert_eq!(scroll.as_bytes(), TERMINAL_SCROLL_JS);
+            assert!(!scroll.contains("innerHTML"));
+            assert!(!scroll.contains("eval("));
             let workspace = router
                 .oneshot(request(Method::GET, WORKSPACE_UI_PATH, "localhost:7391"))
                 .await

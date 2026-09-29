@@ -72,6 +72,7 @@ pub struct PaneSnapshot {
     cwd: String,
     status: PaneStatus,
     pinned: bool,
+    automatic_title: bool,
     tmux_target: Option<String>,
     controller: Option<ControllerView>,
 }
@@ -100,6 +101,7 @@ impl PaneSnapshot {
             cwd,
             status,
             pinned: false,
+            automatic_title: false,
             tmux_target,
             controller,
         })
@@ -139,6 +141,19 @@ impl PaneSnapshot {
     #[must_use]
     pub fn pinned(&self) -> bool {
         self.pinned
+    }
+
+    /// Mark the title as derived from the working directory rather than a
+    /// name the user chose, so clients can offer to keep following it.
+    #[must_use]
+    pub fn with_automatic_title(mut self, automatic: bool) -> Self {
+        self.automatic_title = automatic;
+        self
+    }
+
+    #[must_use]
+    pub fn automatic_title(&self) -> bool {
+        self.automatic_title
     }
 
     #[must_use]

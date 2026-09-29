@@ -35,7 +35,7 @@ def test_control_resize_repairs_contained_tui_before_replay(tmp_path: Path) -> N
     if tmux is None:
         pytest.skip("tmux is unavailable")
     socket = f"termdeck-resize-{os.getpid()}-{uuid.uuid4().hex[:12]}"
-    tmux_tmp = Path(tempfile.mkdtemp(prefix="termdeck-resize-", dir="/tmp"))
+    tmux_tmp = Path(tempfile.mkdtemp(prefix="termdeck-resize-", dir=os.environ.get("TMPDIR")))
     tmux_tmp.chmod(0o700)
     env = os.environ.copy()
     env["TMUX_TMPDIR"] = str(tmux_tmp)

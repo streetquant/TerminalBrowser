@@ -234,10 +234,15 @@ def policy(state_root):
     finally: tree.close()
 
 
-def options(state_root):
+def options(state_root, directory=None):
     value,digest=policy(state_root)
-    return {"ok":True,"policy_revision":digest,"workspaces":value["workspaces"],"server_directory":True,
-            "runtimes":[{"id":"shell","label":"Native shell"}]+([{"id":"codex","label":"Codex (TermDeck private account)"}] if value["codex"] else [])}
+    result = {"ok":True,"policy_revision":digest,"workspaces":value["workspaces"],"server_directory":True,
+              "runtimes":[{"id":"shell","label":"Native shell"}]+([{"id":"codex","label":"Codex (TermDeck private account)"}] if value["codex"] else [])}
+    if directory is not None:
+        from .server_workspaces import immediate_directories
+        result["directory"] = server_workspaces.select(directory)["path"]
+        result["directories"] = immediate_directories(result["directory"])
+    return result
 
 
 def resume_identity(command):
@@ -317,7 +322,10 @@ def _verify_launcher_identity(plan):
 
 def _runtime_argv(value, plan, home, conversation=None):
     argv = [value["codex"]["executable"], "-c", f"sqlite_home={json.dumps(home)}",
-            "-c", f"log_dir={json.dumps(str(Path(home) / 'log'))}"]
+            "-c", f"log_dir={json.dumps(str(Path(home) / 'log'))}",
+            "--no-alt-screen"]
+    if plan.get("yolo") is True:
+        argv.append("--yolo")
     if conversation:
         return [*argv, "resume", conversation]
     prompt = plan["task"] + "\nAuthorized immutable files staged on the TermDeck host:\n" + "\n".join(a["server_path"] for a in plan["attachments"])
@@ -574,6 +582,9 @@ def prepare(store,db,tree,actor,request,machine,now):
     if not all(tabs): raise StagingError("Tab names are required")
     task=_text(request.get("task",""),8192,empty=True)
     if runtime=="shell" and task: raise StagingError("Shell task commands are not accepted")
+    yolo=request.get("yolo",False)
+    if type(yolo) is not bool or yolo and runtime!="codex":
+        raise StagingError("Invalid Codex launch mode")
     refs=request.get("attachments",[])
     if not isinstance(refs,list) or len(refs)>16: raise StagingError("Too many attachments")
     selected=[]
@@ -588,7 +599,7 @@ def prepare(store,db,tree,actor,request,machine,now):
     plan={"version":_PLAN_VERSION,"execution":_EXECUTION,
           "launch_id":launch_id,"actor":asdict(actor),"policy_revision":revision,"workspace":workspace,
           "launcher":str(Path(sys.executable).resolve(strict=True)),
-          "runtime":runtime,"task":task,"window_id":window_id,"name":name,"attachments":selected,
+          "runtime":runtime,"task":task,"yolo":yolo,"window_id":window_id,"name":name,"attachments":selected,
           "tabs":[{"id":"td-"+uuid.uuid4().hex,"name":tab} for tab in tabs]}
     managed = _managed_entrypoint()
     if managed is not None:

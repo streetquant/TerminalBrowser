@@ -10,6 +10,7 @@ This directory contains the Rust-first browser client for t1000/T1000. It expose
 - The terminal is rendered by a pinned xterm.js bundle. ANSI colors, cursor movement, alternate-screen applications, Unicode, IME input, mouse protocols, bracketed paste, selection, links, search, scrollback, and browser resizing are handled by a real terminal emulator rather than a text capture.
 - Ordinary keyboard, paste, mouse, and resize events flow directly through an authenticated WebSocket. There is no separate send-text form and no synthetic Enter/Ctrl+C button panel.
 - Controller leases are an internal safety mechanism. Focusing a vacant pane acquires it automatically; the first input on a remotely controlled pane explicitly takes it over. Many devices may remain viewers, but stale connections cannot write.
+- Automatically named tabs (as `t1000 new` without `--name` creates them) follow the basename of the server's live tmux working directory. Naming intent is stored separately, so an explicit name stays fixed even when it equals the launch directory's basename. Renaming a tab to an empty name restores the automatic title. Legacy records without naming intent retain basename inference until an explicit choice is saved; the read-only web mirror also accepts the older schema.
 - New Tab creates a persisted T1000 session in the current window. The tab `×` behaves like native T1000 and hides the tab without stopping its process. Rename, pause, resume, pin, unpin, hide, and the separately confirmed **Kill process…** action use fixed `t1000` executable and argv contracts; no shell command interpolation is used.
 
 ## Transport and consistency model
@@ -20,13 +21,14 @@ The browser opens a same-origin WebSocket with subprotocol:
 termdeck.terminal.v1
 ```
 
-The Rust backend attaches a dedicated tmux control-mode client to the selected session. Initial connection uses a pause/capture/continue transaction:
+The Rust backend attaches a dedicated tmux control-mode client to the selected session. Initial connection and every resync use a pause/capture/continue transaction:
 
-1. pause incremental pane output for that control client;
-2. set the exact browser grid;
-3. capture bounded scrollback, visible screen, terminal modes, alternate-screen state, and cursor position;
-4. send one deterministic ANSI replay to xterm.js;
-5. resume `%output`/`%extended-output` byte streaming.
+1. set the exact browser grid (writer only; viewers keep the canonical grid);
+2. in one tmux control line, pause incremental pane output for that control client, read terminal modes, alternate-screen state, and cursor position, capture bounded scrollback and the visible screen, and resume `%output`/`%extended-output` byte streaming. tmux runs a command list without reading pane output in between, so no pane byte can land between the capture and the resume; output queued before the pause is already in the capture and is discarded at a replay barrier;
+3. send one deterministic ANSI replay to xterm.js, re-emitting the SGR style that `capture-pane -e` carries from one captured row into the next;
+4. forward the output queued since the resume, coalesced into bounded frames and in order.
+
+Viewer output waiting for the browser is bounded by bytes rather than by tmux line count.
 
 Client input is binary and monotonically sequenced. Only the exact current device/pane/generation/lease/epoch authority may commit a sequence. An exact immediately preceding duplicate is acknowledged without re-execution when its digest-bound receipt exists. Gaps, changed duplicates, stale leases, and indeterminate outcomes fail closed. Ambiguous in-flight input is never replayed automatically after reconnect.
 

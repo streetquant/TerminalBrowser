@@ -5680,16 +5680,15 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         self.side.refresh()
 
     @staticmethod
-    def _directory_tracking_changes(record: SessionRecord, live_directory: str) -> dict[str, str]:
+    def _directory_tracking_changes(record: SessionRecord, live_directory: str) -> dict[str, object]:
         old_directory = normalise_directory(record.cwd)
         new_directory = normalise_directory(live_directory)
         if old_directory == new_directory:
             return {}
-        changes = {"cwd": new_directory}
-        # Default names follow cwd; a deliberate custom rename remains an
-        # override because it no longer matches the previous cwd basename.
-        if record.name == directory_tab_name(old_directory):
+        changes: dict[str, object] = {"cwd": new_directory}
+        if record.name_is_automatic:
             changes["name"] = directory_tab_name(new_directory)
+            changes["automatic_name"] = True
         return changes
 
     @staticmethod
@@ -5950,7 +5949,7 @@ class TermDeckWindow(Gtk.ApplicationWindow):
 
     def new_shell_tab(self, cwd: str | Path | None = None) -> SessionRecord:
         directory = normalise_directory(cwd or Path.home())
-        return self.create_session(directory_tab_name(directory), "terminal", default_shell(), directory)
+        return self.create_session("", "terminal", default_shell(), directory)
 
     def open_command_palette(self) -> None:
         items = build_palette_items(self.app_context.store.list())
@@ -6007,10 +6006,12 @@ class TermDeckWindow(Gtk.ApplicationWindow):
     def create_session(self, name: str, tag: str, command: str, cwd: str) -> SessionRecord:
         directory = normalise_directory(cwd)
         clean_name = name.strip()
-        if not clean_name or clean_name.casefold() in {"shell", "terminal"}:
+        automatic_name = not clean_name or clean_name.casefold() in {"shell", "terminal"}
+        if automatic_name:
             clean_name = directory_tab_name(directory)
         record = self.app_context.store.create(
             name=clean_name,
+            automatic_name=automatic_name,
             tag=tag.strip() or "terminal",
             command=command.strip() or default_shell(),
             cwd=directory,
@@ -10493,6 +10494,7 @@ class TermDeckApplication(Gtk.Application):
                 tab_index=tab_index,
                 visible=tab.visible,
                 pinned=tab.pinned,
+                automatic_name=tab.automatic_name,
             )
             if tab.visible:
                 # Let the VTE page settle before creating tmux. The callback in

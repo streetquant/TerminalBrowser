@@ -221,10 +221,11 @@ def test_native_codex_adapter_passes_only_server_paths_and_private_home(configur
     assert "/client/never-server/foo" not in " ".join(proof["argv"])
     assert str(path((store,actor),obj).parent.parent) in proof["argv"][-1]
     assert "$(not a shell command)" in proof["argv"][-1]
-    assert proof["argv"][:5] == ["-c", f"sqlite_home={json.dumps(str(private))}",
-                                  "-c", f"log_dir={json.dumps(str(private / 'log'))}", "--"]
+    assert proof["argv"][:6] == ["-c", f"sqlite_home={json.dumps(str(private))}",
+                                  "-c", f"log_dir={json.dumps(str(private / 'log'))}",
+                                  "--no-alt-screen", "--"]
     assert not {"--sandbox", "--ask-for-approval", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"}.intersection(proof["argv"])
-    assert len(proof["argv"]) == 6
+    assert len(proof["argv"]) == 7
 
 
 def test_concurrent_refresh_and_launch_either_binds_original_or_rejects_stale(configured):
@@ -297,6 +298,34 @@ def _codex_policy(configured, source):
         "account_source": str(source),
     }
     (store.root.parent / launch.POLICY).write_text(json.dumps(config))
+
+
+def test_yolo_launch_receipt_is_replay_safe_and_keeps_directory(configured):
+    store, actor, workspace, _ = configured
+    source = store.root.parent / "account-catalogue"
+    source.mkdir(mode=0o700)
+    _codex_policy(configured, source)
+    child = workspace / "selected child"
+    child.mkdir()
+    req = request(configured, runtime="codex", workspace_id=None,
+                  workspace_path=str(child), tabs=["selected child"],
+                  task="Inspect this directory", yolo=True)
+    req.pop("workspace_id")
+    receipt = store.handle(actor, req)
+    assert store.handle(actor, req)["launch_id"] == receipt["launch_id"]
+    backend = Backend()
+    assert launch.start(store, actor, receipt, backend=backend)["status"] == "started"
+    assert launch.start(store, actor, receipt, backend=backend)["status"] == "started"
+    assert len(backend.records) == 1
+    assert backend.records[0].cwd == str(child)
+    tree = cf.Directory(store.root)
+    try:
+        with cf._database(tree, "metadata.sqlite3", readonly=True) as db:
+            plan = json.loads(db.execute("SELECT plan FROM launches WHERE launch_id=?", (receipt["launch_id"],)).fetchone()[0])
+    finally:
+        tree.close()
+    assert plan["yolo"] is True
+    assert "--yolo" in launch._runtime_argv(launch.policy(store.root.parent)[0], plan, "/private")
 
 
 @pytest.mark.parametrize("descendant", [False, True])
@@ -507,6 +536,35 @@ def test_private_log_is_idempotent_and_native_paths_stay_private(tmp_path):
                                {"task": "task", "attachments": []}, str(private))
     assert "sqlite_home=" + json.dumps(str(private)) in argv
     assert "log_dir=" + json.dumps(str(private / "log")) in argv
+    assert argv[-3] == "--no-alt-screen"
+
+
+def test_yolo_is_a_separate_codex_argument_and_survives_resume(tmp_path):
+    plan = {"task": "check $(touch /tmp/never-execute)", "attachments": [], "yolo": True}
+    value = {"codex": {"executable": "/usr/bin/codex"}}
+    argv = launch._runtime_argv(value, plan, str(tmp_path))
+    assert argv.count("--no-alt-screen") == 1
+    assert argv[-3] == "--yolo"
+    assert argv[-2] == "--"
+    assert argv[-1].startswith(plan["task"])
+    resumed = launch._runtime_argv(value, plan, str(tmp_path), "conversation")
+    assert resumed.count("--no-alt-screen") == 1
+    assert resumed[-3:] == [
+        "--yolo", "resume", "conversation",
+    ]
+
+
+@pytest.mark.parametrize("mode", ["true", 1, [], None])
+def test_malformed_yolo_mode_is_rejected(configured, mode):
+    store, actor, _, _ = configured
+    with pytest.raises(cf.StagingError, match="Invalid Codex launch mode"):
+        store.handle(actor, request(configured, yolo=mode))
+
+
+def test_shell_cannot_request_yolo(configured):
+    store, actor, _, _ = configured
+    with pytest.raises(cf.StagingError, match="Invalid Codex launch mode"):
+        store.handle(actor, request(configured, yolo=True))
 
 
 @pytest.mark.parametrize("masked_source", [False, True])

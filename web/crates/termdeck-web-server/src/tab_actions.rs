@@ -382,7 +382,8 @@ impl TabActionService {
         name: &str,
     ) -> Result<TabActionResult, TabActionError> {
         validate_identity(session_id)?;
-        validate_text(name, MAX_TAB_NAME_BYTES, false).map_err(|_| TabActionError::InvalidName)?;
+        // An empty name returns the tab to its automatic directory name.
+        validate_text(name, MAX_TAB_NAME_BYTES, true).map_err(|_| TabActionError::InvalidName)?;
         let payload = self
             .run(&[
                 OsString::from("rename"),
@@ -547,6 +548,32 @@ mod tests {
             assert!(matches!(
                 service.manage(oversized).await,
                 Err(TabActionError::InvalidCommand)
+            ));
+        });
+    }
+
+    #[test]
+    fn rename_allows_empty_name_for_automatic_title_but_not_control_characters() {
+        let service = super::TabActionService::new(
+            std::path::PathBuf::from("/no-such-t1000-fixture"),
+            std::path::PathBuf::from("/tmp/no-such-registry-fixture"),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_or_else(|error| panic!("fixture: {error}"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("runtime: {error}"));
+        runtime.block_on(async {
+            assert!(matches!(
+                service.rename("td-fixture", "bad\u{7}name").await,
+                Err(TabActionError::InvalidName)
+            ));
+            // An empty name passes validation and reaches the (absent) CLI,
+            // which restores the automatic directory name.
+            assert!(!matches!(
+                service.rename("td-fixture", "").await,
+                Err(TabActionError::InvalidName)
             ));
         });
     }

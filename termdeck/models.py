@@ -91,6 +91,17 @@ class SessionRecord:
     # ``legacy`` is retained for ambiguous historical/start-error records and
     # is never sufficient on its own to authorize cold-start recovery.
     recovery_intent: str = RECOVERY_INTENT_LEGACY
+    # None identifies a legacy row whose intent was never recorded. New tabs
+    # and explicit renames persist a boolean, including names equal to cwd.
+    automatic_name: bool | None = None
+
+    @property
+    def name_is_automatic(self) -> bool:
+        if self.automatic_name is not None:
+            return self.automatic_name
+        from .command_render import directory_tab_name
+
+        return self.name == directory_tab_name(self.cwd)
 
 
 @dataclass(frozen=True)

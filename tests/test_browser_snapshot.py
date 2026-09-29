@@ -15,6 +15,61 @@ from termdeck.session_store import SessionStore
 
 
 class BrowserSnapshotTests(unittest.TestCase):
+    def test_snapshot_round_trip_preserves_automatic_and_same_basename_manual_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "source.sqlite3", provision_auth_scopes=False)
+            restored = SessionStore(Path(tmp) / "restored.sqlite3", provision_auth_scopes=False)
+            try:
+                cwd = str(Path(tmp) / "arch")
+                auto = store.create("arch", "automatic", "bash", cwd, automatic_name=True)
+                manual = store.create("arch", "manual", "bash", cwd, automatic_name=False)
+                store.update(auto.id, status="running", last_pid=123)
+                store.update(manual.id, status="stopped", pinned=True)
+                snapshot = json.loads(browser_snapshot_json(store.list(), name="names"))
+                planned = import_browser_snapshot(restored, snapshot, dry_run=True)
+                imported = import_browser_snapshot(restored, snapshot)
+                self.assertEqual(
+                    {row.tag: row.automatic_name for row in planned.rows},
+                    {"automatic": True, "manual": False},
+                )
+                self.assertEqual(
+                    {row["tag"]: row["automatic_name"] for row in imported.to_dict()["sessions"]},
+                    {"automatic": True, "manual": False},
+                )
+                for row in imported.rows:
+                    record = restored.get(row.session_id)
+                    self.assertEqual(record.name, "arch")
+                    self.assertEqual(record.cwd, cwd)
+                    self.assertEqual(record.automatic_name, row.tag == "automatic")
+                    self.assertIsNone(record.last_pid)
+                    self.assertEqual(record.status, "running" if row.tag == "automatic" else "stopped")
+            finally:
+                store.close()
+                restored.close()
+
+    def test_legacy_snapshots_infer_names_and_reject_malformed_explicit_intent(self):
+        for version in (1, 2):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
+                snapshot = {
+                    "schema": "termdeck.browser-snapshot", "schema_version": version,
+                    "windows": [{"title": "Names", "tabs": [
+                        {"name": "arch", "command": "bash", "cwd": "/home/arch"},
+                        {"name": "outreach", "command": "bash", "cwd": "/home/arch"},
+                    ]}],
+                }
+                store = SessionStore(Path(tmp) / "sessions.sqlite3", provision_auth_scopes=False)
+                try:
+                    imported = import_browser_snapshot(store, snapshot)
+                    self.assertEqual([store.get(row.session_id).automatic_name for row in imported.rows], [True, False])
+                    for invalid in ("false", 0, [], {}):
+                        with self.subTest(invalid=invalid):
+                            snapshot["windows"][0]["tabs"][0]["automatic_name"] = invalid
+                            with self.assertRaisesRegex(BrowserSnapshotError, "automatic_name must be true or false"):
+                                import_browser_snapshot(store, snapshot, mode="replace")
+                            self.assertEqual(len(store.list()), 2)
+                finally:
+                    store.close()
+
     def test_snapshot_exports_hidden_and_stopped_state_without_tmux_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")

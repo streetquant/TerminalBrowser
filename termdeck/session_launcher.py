@@ -27,6 +27,7 @@ class LaunchFields:
     command: str
     cwd: str
     source: str
+    automatic_name: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,7 @@ def resolve_launch_fields(
         command=final_command,
         cwd=directory,
         source="command" if explicit_command else "shell",
+        automatic_name=not _clean(name),
     )
 
 
@@ -173,6 +175,7 @@ def create_new_session(
         tab_index=final_tab_index,
         visible=visible,
         pinned=pinned,
+        automatic_name=fields.automatic_name,
     )
     if not start:
         return result_from_record(record, source=fields.source, started=False)

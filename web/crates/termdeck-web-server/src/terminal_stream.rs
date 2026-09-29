@@ -11,6 +11,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -31,13 +32,29 @@ const MAX_INITIAL_REPLAY_HISTORY_LINES: usize = 512;
 const MAX_INITIAL_REPLAY_JOINED_CELLS: usize = 32 * 1024;
 const _: () = assert!(MAX_INITIAL_REPLAY_HISTORY_LINES <= 512);
 const CONTROL_REQUEST_CAPACITY: usize = 64;
-const OUTPUT_QUEUE_CAPACITY: usize = 32;
+// Viewer output is bounded by queued bytes, not by tmux line count: a burst of
+// small `%output` lines must not disconnect a healthy browser while the stream
+// task awaits one input round trip or one WebSocket send.
+const MAX_PENDING_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+// Output already queued behind a send is coalesced into one browser frame.
+const MAX_OUTPUT_FRAME_BYTES: usize = 256 * 1024;
+// Non-output notifications are charged against the same byte bound.
+const NOTIFICATION_COST_BYTES: usize = 64;
+// One control line may carry a short, fixed tmux command list.
+const MAX_COMMAND_BLOCKS: usize = 8;
+// tmux emits short SGR parameter groups; longer ones are not replayed.
+const MAX_SGR_GROUP_BYTES: usize = 64;
+const SGR_ATTRIBUTE_SLOTS: usize = 9;
 const INPUT_CHUNK_BYTES: usize = 4 * 1024;
 const MIN_COLUMNS: u16 = 2;
 const MAX_COLUMNS: u16 = 1_000;
 const MIN_ROWS: u16 = 2;
 const MAX_ROWS: u16 = 500;
 const INPUT_FRAME_TYPE: u8 = 1;
+const MOUSE_WHEEL_FRAME_TYPE: u8 = 2;
+const MAX_MOUSE_WHEEL_BYTES: usize = 64;
+const MOUSE_REPORTING_FORMAT: &str =
+    "#{||:#{mouse_standard_flag},#{||:#{mouse_button_flag},#{mouse_all_flag}}}";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const CONTROL_MODE_ARGUMENT: &str = "-C";
 const CONTROL_FLAGS_VIEWER: &str = "active-pane,ignore-size,no-detach-on-destroy";
@@ -122,6 +139,23 @@ enum ClientEvent {
     Resync { cols: u16, rows: u16 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputKind {
+    Raw,
+    MouseWheel,
+    MouseMotion,
+}
+
+impl InputKind {
+    fn domain(self) -> &'static [u8] {
+        match self {
+            Self::Raw => b"websocket-raw",
+            Self::MouseWheel => b"websocket-wheel",
+            Self::MouseMotion => b"websocket-motion",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 struct TerminalGeometry {
     cols: u16,
@@ -143,6 +177,9 @@ struct ReplaySnapshot {
 enum ControlNotification {
     Output(Vec<u8>),
     LayoutChanged,
+    /// Queued when the first reply block of an atomic replay begins. Output
+    /// queued before it is already contained in that replay's capture.
+    ReplayBarrier(u64),
 }
 
 #[derive(Serialize)]
@@ -243,6 +280,8 @@ async fn run_terminal_socket_inner(
     control
         .set_writer_mode(control_view.mine, viewport_geometry)
         .await?;
+    // Output resumes inside the replay transaction; anything tmux emits while
+    // the replay is sent stays queued (byte-bounded) and follows it in order.
     let replay = control.initial_replay().await?;
     let mut geometry = replay.geometry;
     send_json(
@@ -254,10 +293,6 @@ async fn run_terminal_socket_inner(
     )
     .await?;
     send_message(socket, Message::Binary(replay.bytes.into())).await?;
-    control
-        .set_writer_mode(control_view.mine, viewport_geometry)
-        .await?;
-    control.continue_output().await?;
     send_json(
         socket,
         &ReadyEvent {
@@ -281,8 +316,10 @@ async fn run_terminal_socket_inner(
                 };
                 match notification {
                     ControlNotification::Output(output) => {
+                        let output = control.coalesce_output(output);
                         send_sink_message(&mut sender, Message::Binary(output.into())).await?;
                     }
+                    ControlNotification::ReplayBarrier(_) => {}
                     ControlNotification::LayoutChanged => {
                         let observed = control.current_geometry().await?;
                         if observed != geometry {
@@ -303,8 +340,11 @@ async fn run_terminal_socket_inner(
                 };
                 match message.map_err(|_| StreamError::ControlClosed)? {
                     Message::Binary(frame) => {
-                        let (sequence, bytes) = parse_input_frame(frame.as_ref())?;
-                        if !control_view.mine {
+                        let (sequence, bytes, kind) = parse_input_frame(frame.as_ref())?;
+                        // Passive mouse input must never take a pane from another
+                        // controller, including when the browser's lease view
+                        // is stale. authorize_input checks the current lease.
+                        if kind == InputKind::Raw && !control_view.mine {
                             control_view = terminal
                                 .acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), true)
                                 .await?;
@@ -316,7 +356,7 @@ async fn run_terminal_socket_inner(
                                 pane.pane_id.as_str(),
                                 actor.as_str(),
                                 sequence,
-                                b"websocket-raw",
+                                kind.domain(),
                                 bytes,
                                 unix_ms(),
                             )
@@ -327,7 +367,11 @@ async fn run_terminal_socket_inner(
                                 send_sink_json(&mut sender, &AckEvent { r#type: "ack", sequence, control: &control_view, duplicate: true }).await?;
                             }
                             InputDecision::Execute(permit) => {
-                                match control.send_input(bytes).await {
+                                let delivered = match kind {
+                                    InputKind::Raw | InputKind::MouseMotion => control.send_input(bytes).await,
+                                    InputKind::MouseWheel => control.send_mouse_wheel(bytes).await,
+                                };
+                                match delivered {
                                     Ok(()) => {
                                         control_view = terminal.complete_input(permit, InputOutcome::Committed, unix_ms()).await?;
                                         send_sink_json(&mut sender, &AckEvent { r#type: "ack", sequence, control: &control_view, duplicate: false }).await?;
@@ -428,6 +472,12 @@ where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: fmt::Debug,
 {
+    // Assert the writer grid before capturing so the replay is taken at the
+    // size the browser will display; resizing after the capture would force a
+    // second layout-change resync.
+    control
+        .set_writer_mode(control_view.mine, viewport_geometry)
+        .await?;
     let replay = control.initial_replay().await?;
     let geometry = replay.geometry;
     send_sink_json(
@@ -439,10 +489,6 @@ where
     )
     .await?;
     send_sink_message(sender, Message::Binary(replay.bytes.into())).await?;
-    control
-        .set_writer_mode(control_view.mine, viewport_geometry)
-        .await?;
-    control.continue_output().await?;
     send_sink_json(
         sender,
         &ResyncedEvent {
@@ -501,10 +547,15 @@ fn validate_geometry(columns: u16, rows: u16) -> Result<(), StreamError> {
     Ok(())
 }
 
-fn parse_input_frame(frame: &[u8]) -> Result<(u64, &[u8]), StreamError> {
-    if frame.len() < 10 || frame[0] != INPUT_FRAME_TYPE {
+fn parse_input_frame(frame: &[u8]) -> Result<(u64, &[u8], InputKind), StreamError> {
+    if frame.len() < 10 {
         return Err(StreamError::ClientProtocol("invalid terminal input frame"));
     }
+    let mut kind = match frame[0] {
+        INPUT_FRAME_TYPE => InputKind::Raw,
+        MOUSE_WHEEL_FRAME_TYPE => InputKind::MouseWheel,
+        _ => return Err(StreamError::ClientProtocol("invalid terminal input frame")),
+    };
     let sequence = u64::from_be_bytes(
         frame[1..9]
             .try_into()
@@ -516,7 +567,97 @@ fn parse_input_frame(frame: &[u8]) -> Result<(u64, &[u8]), StreamError> {
             "terminal input size is outside bounds",
         ));
     }
-    Ok((sequence, bytes))
+    if kind == InputKind::MouseWheel && !is_mouse_wheel_packet(bytes) {
+        return Err(StreamError::ClientProtocol("invalid terminal mouse wheel"));
+    }
+    // Mouse motion is generated while hovering, before a wheel gesture can
+    // reach its own handler. Even an older or stale browser must not turn a
+    // pure motion batch into an implicit control request. Clicks and mixed
+    // keyboard input keep their existing explicit-intent behavior.
+    if kind == InputKind::Raw && is_mouse_motion_payload(bytes) {
+        kind = InputKind::MouseMotion;
+    }
+    Ok((sequence, bytes, kind))
+}
+
+/// Admit one vertical wheel report, never keys or a concatenated paste. xterm
+/// emits SGR (also used by pixel mouse mode) or the six-byte legacy encoding.
+fn is_mouse_wheel_packet(bytes: &[u8]) -> bool {
+    mouse_packet(bytes)
+        .is_some_and(|(button, length)| length == bytes.len() && matches!(button & !28, 64 | 65))
+}
+
+fn is_mouse_motion_payload(mut bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    while !bytes.is_empty() {
+        let Some((button, length)) = mouse_packet(bytes) else {
+            return false;
+        };
+        if !matches!(button & !28, 32..=35) {
+            return false;
+        }
+        bytes = &bytes[length..];
+    }
+    true
+}
+
+fn mouse_packet(bytes: &[u8]) -> Option<(u32, usize)> {
+    if bytes.starts_with(b"\x1b[M") {
+        if bytes.len() >= 6 && bytes[3] >= 32 && bytes[4] >= 33 && bytes[5] >= 33 {
+            return Some((u32::from(bytes[3] - 32), 6));
+        }
+        return None;
+    }
+    let end = bytes
+        .iter()
+        .take(MAX_MOUSE_WHEEL_BYTES)
+        .position(|byte| *byte == b'M')?;
+    let bytes = &bytes[..=end];
+    if bytes.len() > MAX_MOUSE_WHEEL_BYTES {
+        return None;
+    }
+    let encoded = bytes
+        .strip_prefix(b"\x1b[<")
+        .and_then(|value| value.strip_suffix(b"M"))?;
+    let fields = encoded.split(|byte| *byte == b';').collect::<Vec<_>>();
+    if fields.len() != 3
+        || fields.iter().any(|field| {
+            field.is_empty() || field.len() > 6 || !field.iter().all(u8::is_ascii_digit)
+        })
+    {
+        return None;
+    }
+    let values = fields
+        .iter()
+        .map(|field| {
+            std::str::from_utf8(field)
+                .ok()
+                .and_then(|field| field.parse::<u32>().ok())
+        })
+        .collect::<Option<Vec<_>>>();
+    // SGR pixel coordinates are zero based, unlike cell coordinates.
+    values.map(|value| (value[0], bytes.len()))
+}
+
+fn mouse_wheel_command(pane_id: &str, bytes: &[u8]) -> Result<String, StreamError> {
+    validate_tmux_pane_id(pane_id)?;
+    if !is_mouse_wheel_packet(bytes) {
+        return Err(StreamError::ClientProtocol("invalid terminal mouse wheel"));
+    }
+    let mut input = format!("send-keys -t {pane_id} -H");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut input, " {byte:02x}")
+            .map_err(|_| StreamError::ControlProtocol("input encoding failed"))?;
+    }
+    // Check the application's mouse mode inside tmux's command queue. A mode
+    // change after browser rendering therefore cannot leak a wheel report to
+    // a shell or a prompt that has stopped accepting mouse events.
+    let sgr = u8::from(bytes.starts_with(b"\x1b[<"));
+    let format = format!("#{{&&:{MOUSE_REPORTING_FORMAT},#{{==:#{{mouse_sgr_flag}},{sgr}}}}}");
+    Ok(format!("if-shell -F -t {pane_id} '{format}' '{input}'"))
 }
 
 async fn send_json(socket: &mut WebSocket, value: &impl Serialize) -> Result<(), StreamError> {
@@ -553,7 +694,10 @@ where
 
 struct TmuxControl {
     request_tx: mpsc::Sender<CommandRequest>,
-    output_rx: mpsc::Receiver<ControlNotification>,
+    output_rx: mpsc::UnboundedReceiver<ControlNotification>,
+    pending_output: Arc<AtomicUsize>,
+    deferred: Option<ControlNotification>,
+    next_barrier: u64,
     shutdown_tx: Option<oneshot::Sender<()>>,
     actor: tokio::task::JoinHandle<()>,
     command_timeout: Duration,
@@ -561,21 +705,64 @@ struct TmuxControl {
     target: String,
 }
 
+type ReplySender = oneshot::Sender<Result<Vec<ControlReply>, StreamError>>;
+
 struct CommandRequest {
     command: String,
-    reply: oneshot::Sender<Result<ControlReply, StreamError>>,
+    /// Number of `%begin` reply blocks: one per command in a `;` list.
+    blocks: usize,
+    barrier: Option<u64>,
+    reply: ReplySender,
 }
 
 struct ControlReply {
     lines: Vec<Vec<u8>>,
 }
 
+struct PendingReply {
+    reply: ReplySender,
+    remaining: usize,
+    barrier: Option<u64>,
+    replies: Vec<ControlReply>,
+}
+
 struct ActiveBlock {
     identity: [Vec<u8>; 3],
-    reply: Option<oneshot::Sender<Result<ControlReply, StreamError>>>,
+    owned: bool,
     lines: Vec<Vec<u8>>,
     bytes: usize,
     greeting: bool,
+}
+
+/// Actor-side viewer output queue with an explicit byte bound.
+struct OutputQueue {
+    tx: mpsc::UnboundedSender<ControlNotification>,
+    pending_bytes: Arc<AtomicUsize>,
+}
+
+impl OutputQueue {
+    fn push(&self, notification: ControlNotification) -> Result<(), StreamError> {
+        let cost = notification_cost(&notification);
+        let queued = self
+            .pending_bytes
+            .fetch_add(cost, Ordering::AcqRel)
+            .saturating_add(cost);
+        if queued > MAX_PENDING_OUTPUT_BYTES {
+            return Err(StreamError::Backpressure);
+        }
+        self.tx
+            .send(notification)
+            .map_err(|_| StreamError::ControlClosed)
+    }
+}
+
+fn notification_cost(notification: &ControlNotification) -> usize {
+    match notification {
+        ControlNotification::Output(bytes) => bytes.len().max(NOTIFICATION_COST_BYTES),
+        ControlNotification::LayoutChanged | ControlNotification::ReplayBarrier(_) => {
+            NOTIFICATION_COST_BYTES
+        }
+    }
 }
 
 impl TmuxControl {
@@ -609,7 +796,12 @@ impl TmuxControl {
             .take()
             .ok_or(StreamError::ControlProtocol("tmux stdout unavailable"))?;
         let (request_tx, request_rx) = mpsc::channel(CONTROL_REQUEST_CAPACITY);
-        let (output_tx, output_rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+        let (output_tx, output_rx) = mpsc::unbounded_channel();
+        let pending_output = Arc::new(AtomicUsize::new(0));
+        let output = OutputQueue {
+            tx: output_tx,
+            pending_bytes: Arc::clone(&pending_output),
+        };
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let actor_pane = pane_id.clone();
@@ -619,7 +811,7 @@ impl TmuxControl {
                 stdin,
                 stdout,
                 request_rx,
-                output_tx,
+                output,
                 shutdown_rx,
                 ready_tx,
                 pane_id: actor_pane,
@@ -633,6 +825,9 @@ impl TmuxControl {
         Ok(Self {
             request_tx,
             output_rx,
+            pending_output,
+            deferred: None,
+            next_barrier: 0,
             shutdown_tx: Some(shutdown_tx),
             actor,
             command_timeout,
@@ -641,14 +836,78 @@ impl TmuxControl {
         })
     }
 
+    fn dequeued(&self, notification: ControlNotification) -> ControlNotification {
+        self.pending_output
+            .fetch_sub(notification_cost(&notification), Ordering::AcqRel);
+        notification
+    }
+
     async fn notification(&mut self) -> Option<ControlNotification> {
-        self.output_rx.recv().await
+        if let Some(notification) = self.deferred.take() {
+            return Some(notification);
+        }
+        let notification = self.output_rx.recv().await?;
+        Some(self.dequeued(notification))
+    }
+
+    fn try_notification(&mut self) -> Option<ControlNotification> {
+        if let Some(notification) = self.deferred.take() {
+            return Some(notification);
+        }
+        let notification = self.output_rx.try_recv().ok()?;
+        Some(self.dequeued(notification))
+    }
+
+    /// Append output that is already queued to one bounded browser frame.
+    /// The first non-output notification is deferred, preserving order.
+    fn coalesce_output(&mut self, mut output: Vec<u8>) -> Vec<u8> {
+        while output.len() < MAX_OUTPUT_FRAME_BYTES {
+            match self.try_notification() {
+                Some(ControlNotification::Output(next))
+                    if output.len().saturating_add(next.len()) <= MAX_OUTPUT_FRAME_BYTES =>
+                {
+                    output.extend_from_slice(&next);
+                }
+                Some(other) => {
+                    self.deferred = Some(other);
+                    break;
+                }
+                None => break,
+            }
+        }
+        output
+    }
+
+    /// Drop notifications queued before `barrier`; later output is kept.
+    fn discard_until_barrier(&mut self, barrier: u64) -> Result<(), StreamError> {
+        while let Some(notification) = self.try_notification() {
+            if matches!(notification, ControlNotification::ReplayBarrier(value) if value == barrier)
+            {
+                return Ok(());
+            }
+        }
+        Err(StreamError::ControlProtocol(
+            "replay barrier was not observed",
+        ))
     }
 
     async fn command(&self, command: String) -> Result<ControlReply, StreamError> {
+        self.command_blocks(command, 1, None)
+            .await?
+            .pop()
+            .ok_or(StreamError::ControlProtocol("tmux reply was empty"))
+    }
+
+    async fn command_blocks(
+        &self,
+        command: String,
+        blocks: usize,
+        barrier: Option<u64>,
+    ) -> Result<Vec<ControlReply>, StreamError> {
         if command.is_empty()
             || command.len() > MAX_CONTROL_LINE_BYTES
             || command.contains(['\n', '\r', '\0'])
+            || !(1..=MAX_COMMAND_BLOCKS).contains(&blocks)
         {
             return Err(StreamError::ControlProtocol("invalid control command"));
         }
@@ -656,14 +915,22 @@ impl TmuxControl {
         self.request_tx
             .send(CommandRequest {
                 command,
+                blocks,
+                barrier,
                 reply: reply_tx,
             })
             .await
             .map_err(|_| StreamError::ControlClosed)?;
-        timeout(self.command_timeout, reply_rx)
+        let replies = timeout(self.command_timeout, reply_rx)
             .await
             .map_err(|_| StreamError::Timeout("tmux control command"))?
-            .map_err(|_| StreamError::ControlClosed)?
+            .map_err(|_| StreamError::ControlClosed)??;
+        if replies.len() != blocks {
+            return Err(StreamError::ControlProtocol(
+                "tmux reply block count changed",
+            ));
+        }
+        Ok(replies)
     }
 
     async fn set_writer_mode(
@@ -702,17 +969,26 @@ impl TmuxControl {
         Ok(())
     }
 
-    async fn current_state(&self) -> Result<PaneState, StreamError> {
-        let state_reply = self
-            .command(format!(
-                "list-panes -t {} -F '{}'",
-                self.target, PANE_STATE_FORMAT
-            ))
+    async fn send_mouse_wheel(&self, bytes: &[u8]) -> Result<(), StreamError> {
+        self.command(mouse_wheel_command(self.pane_id.as_str(), bytes)?)
             .await?;
+        Ok(())
+    }
+
+    fn state_command(&self) -> String {
+        format!("list-panes -t {} -F '{}'", self.target, PANE_STATE_FORMAT)
+    }
+
+    async fn current_state(&self) -> Result<PaneState, StreamError> {
+        let state_reply = self.command(self.state_command()).await?;
+        self.select_state(state_reply.lines.as_slice())
+    }
+
+    fn select_state(&self, lines: &[Vec<u8>]) -> Result<PaneState, StreamError> {
         let mut selected = None;
         // list-panes returns every pane in the containing window, even for an
         // explicit adopted pane target. Match the identity pinned at attach.
-        for line in &state_reply.lines {
+        for line in lines {
             let state = PaneState::parse(line)?;
             if state.pane_id == self.pane_id && selected.replace(state).is_some() {
                 return Err(StreamError::ControlProtocol("duplicate pane identity"));
@@ -727,35 +1003,52 @@ impl TmuxControl {
         Ok(self.current_state().await?.geometry)
     }
 
+    /// Capture a replay without an output gap.
+    ///
+    /// tmux runs one control line's command list without reading pane output
+    /// in between, so pause, pane state, captures, and continue in a single
+    /// line leave no window in which pane bytes are applied after the capture
+    /// but before output resumes (those bytes were previously discarded by
+    /// the pause). Output queued before the pause is already part of the
+    /// capture and is discarded up to the replay barrier.
     async fn initial_replay(&mut self) -> Result<ReplaySnapshot, StreamError> {
-        self.command(refresh_pane_action(self.pane_id.as_str(), "pause")?)
-            .await?;
-        while self.output_rx.try_recv().is_ok() {}
-        let state = self.current_state().await?;
-        let geometry = state.geometry;
-        let history_lines = initial_replay_history_lines(state.history_size, geometry.cols);
-        let history_command = (history_lines > 0).then(|| {
-            format!(
+        let sizing = self.current_state().await?;
+        let requested_history =
+            initial_replay_history_lines(sizing.history_size, sizing.geometry.cols);
+        self.next_barrier = self.next_barrier.wrapping_add(1);
+        let barrier = self.next_barrier;
+        let mut commands = vec![
+            refresh_pane_action(self.pane_id.as_str(), "pause")?,
+            self.state_command(),
+        ];
+        if requested_history > 0 {
+            commands.push(format!(
                 "capture-pane -epq -t {} -J -S -{} -E -1",
-                self.pane_id, history_lines
-            )
-        });
-        let history_capture = async {
-            match history_command {
-                Some(command) => self.command(command).await,
-                None => Ok(ControlReply { lines: Vec::new() }),
-            }
-        };
-        let visible_capture = self.command(format!("capture-pane -epq -t {} -N", self.pane_id));
-        let (history, visible) = tokio::try_join!(history_capture, visible_capture)?;
-        let bytes = build_replay(&state, geometry.rows, history.lines, visible.lines)?;
-        Ok(ReplaySnapshot { geometry, bytes })
-    }
-
-    async fn continue_output(&self) -> Result<(), StreamError> {
-        self.command(refresh_pane_action(self.pane_id.as_str(), "continue")?)
+                self.pane_id, requested_history
+            ));
+        }
+        commands.push(format!("capture-pane -epq -t {} -N", self.pane_id));
+        commands.push(refresh_pane_action(self.pane_id.as_str(), "continue")?);
+        let count = commands.len();
+        let mut replies = self
+            .command_blocks(commands.join(" ; "), count, Some(barrier))
             .await?;
-        Ok(())
+        self.discard_until_barrier(barrier)?;
+        let visible = std::mem::take(&mut replies[count - 2].lines);
+        let mut history = if requested_history > 0 {
+            std::mem::take(&mut replies[2].lines)
+        } else {
+            Vec::new()
+        };
+        let state = self.select_state(replies[1].lines.as_slice())?;
+        let geometry = state.geometry;
+        // The pane may have been resized between sizing and the transaction.
+        let history_bound = initial_replay_history_lines(state.history_size, geometry.cols);
+        if history.len() > history_bound {
+            history.drain(..history.len() - history_bound);
+        }
+        let bytes = build_replay(&state, geometry.rows, history, visible)?;
+        Ok(ReplaySnapshot { geometry, bytes })
     }
 
     async fn shutdown(&mut self) {
@@ -796,7 +1089,7 @@ struct ControlActorContext {
     stdin: ChildStdin,
     stdout: ChildStdout,
     request_rx: mpsc::Receiver<CommandRequest>,
-    output_tx: mpsc::Sender<ControlNotification>,
+    output: OutputQueue,
     shutdown_rx: oneshot::Receiver<()>,
     ready_tx: oneshot::Sender<Result<(), StreamError>>,
     pane_id: String,
@@ -808,7 +1101,7 @@ async fn control_actor(context: ControlActorContext) -> Result<(), StreamError> 
         mut stdin,
         stdout,
         mut request_rx,
-        output_tx,
+        output,
         mut shutdown_rx,
         ready_tx,
         pane_id,
@@ -824,10 +1117,15 @@ async fn control_actor(context: ControlActorContext) -> Result<(), StreamError> 
             _ = &mut shutdown_rx => break Ok(()),
             request = request_rx.recv() => {
                 let Some(request) = request else { break Ok(()); };
-                pending.push_back(request.reply);
+                pending.push_back(PendingReply {
+                    reply: request.reply,
+                    remaining: request.blocks,
+                    barrier: request.barrier,
+                    replies: Vec::with_capacity(request.blocks),
+                });
                 if let Err(error) = stdin.write_all(request.command.as_bytes()).await {
-                    let reply = pending.pop_back();
-                    if let Some(reply) = reply { let _result = reply.send(Err(StreamError::Io(error))); }
+                    let entry = pending.pop_back();
+                    if let Some(entry) = entry { let _result = entry.reply.send(Err(StreamError::Io(error))); }
                     break Err(StreamError::ControlClosed);
                 }
                 if stdin.write_all(b"\n").await.is_err() || stdin.flush().await.is_err() {
@@ -846,7 +1144,7 @@ async fn control_actor(context: ControlActorContext) -> Result<(), StreamError> 
                     &mut ready_tx,
                     &mut pending,
                     &mut active,
-                    &output_tx,
+                    &output,
                 ) {
                     break Err(error);
                 }
@@ -857,13 +1155,8 @@ async fn control_actor(context: ControlActorContext) -> Result<(), StreamError> 
     if let Some(ready) = ready_tx.take() {
         let _result = ready.send(Err(StreamError::ControlClosed));
     }
-    if let Some(block) = active.take() {
-        if let Some(reply) = block.reply {
-            let _result = reply.send(Err(StreamError::ControlClosed));
-        }
-    }
-    while let Some(reply) = pending.pop_front() {
-        let _result = reply.send(Err(StreamError::ControlClosed));
+    while let Some(entry) = pending.pop_front() {
+        let _result = entry.reply.send(Err(StreamError::ControlClosed));
     }
     let _result = child.kill().await;
     result
@@ -874,9 +1167,9 @@ fn handle_control_line(
     pane_id: &str,
     greeting_pending: &mut bool,
     ready_tx: &mut Option<oneshot::Sender<Result<(), StreamError>>>,
-    pending: &mut VecDeque<oneshot::Sender<Result<ControlReply, StreamError>>>,
+    pending: &mut VecDeque<PendingReply>,
     active: &mut Option<ActiveBlock>,
-    output_tx: &mpsc::Sender<ControlNotification>,
+    output: &OutputQueue,
 ) -> Result<(), StreamError> {
     if let Some((kind, identity)) = parse_marker(line) {
         match kind {
@@ -889,9 +1182,16 @@ fn handle_control_line(
                 if greeting {
                     *greeting_pending = false;
                 }
+                // Reply blocks arrive in request order; the oldest pending
+                // request owns every block until its command list completes.
+                let owner = if greeting { None } else { pending.front_mut() };
+                let owned = owner.is_some();
+                if let Some(barrier) = owner.and_then(|entry| entry.barrier.take()) {
+                    output.push(ControlNotification::ReplayBarrier(barrier))?;
+                }
                 *active = Some(ActiveBlock {
                     identity,
-                    reply: if greeting { None } else { pending.pop_front() },
+                    owned,
                     lines: Vec::new(),
                     bytes: 0,
                     greeting,
@@ -913,13 +1213,8 @@ fn handle_control_line(
                     if let Some(ready) = ready_tx.take() {
                         let _result = ready.send(Ok(()));
                     }
-                } else if let Some(reply) = block.reply {
-                    let value = if kind == Marker::End {
-                        Ok(ControlReply { lines: block.lines })
-                    } else {
-                        Err(StreamError::Tmux(body_error(block.lines.as_slice())))
-                    };
-                    let _result = reply.send(value);
+                } else if block.owned {
+                    complete_block(pending, kind, block.lines)?;
                 }
                 return Ok(());
             }
@@ -934,16 +1229,12 @@ fn handle_control_line(
     {
         let bytes = decode_tmux_output(encoded);
         if !bytes.is_empty() {
-            output_tx
-                .try_send(ControlNotification::Output(bytes))
-                .map_err(|_| StreamError::Backpressure)?;
+            output.push(ControlNotification::Output(bytes))?;
         }
         return Ok(());
     }
     if line.starts_with(b"%layout-change ") {
-        output_tx
-            .try_send(ControlNotification::LayoutChanged)
-            .map_err(|_| StreamError::Backpressure)?;
+        output.push(ControlNotification::LayoutChanged)?;
         return Ok(());
     }
     if line.starts_with(b"%pause ") || line.starts_with(b"%continue ") {
@@ -951,6 +1242,34 @@ fn handle_control_line(
     }
     if line.starts_with(b"%exit") {
         return Err(StreamError::ControlClosed);
+    }
+    Ok(())
+}
+
+fn complete_block(
+    pending: &mut VecDeque<PendingReply>,
+    kind: Marker,
+    lines: Vec<Vec<u8>>,
+) -> Result<(), StreamError> {
+    let entry = pending
+        .front_mut()
+        .ok_or(StreamError::ControlProtocol("reply owner vanished"))?;
+    if kind == Marker::Error {
+        // tmux skips the rest of a command list after an error, so no more
+        // blocks will arrive for this request.
+        if let Some(entry) = pending.pop_front() {
+            let _result = entry
+                .reply
+                .send(Err(StreamError::Tmux(body_error(lines.as_slice()))));
+        }
+        return Ok(());
+    }
+    entry.replies.push(ControlReply { lines });
+    entry.remaining = entry.remaining.saturating_sub(1);
+    if entry.remaining == 0 {
+        if let Some(entry) = pending.pop_front() {
+            let _result = entry.reply.send(Ok(entry.replies));
+        }
     }
     Ok(())
 }
@@ -1186,15 +1505,173 @@ fn paint_rows(
     lines: &[Vec<u8>],
     final_newline: bool,
 ) -> Result<(), StreamError> {
+    // Each capture command starts from the default style.
+    let mut carried = SgrState::default();
     for (index, line) in lines.iter().enumerate() {
+        // Erase with the default background, then restore the style tmux
+        // considers active at the start of this captured row.
         extend_bounded(output, b"\x1b[0m\r\x1b[2K")?;
+        carried.write_to(output)?;
         extend_bounded(output, line)?;
         extend_bounded(output, b"\x1b[0m")?;
+        carried.advance(line);
         if final_newline || index + 1 < lines.len() {
             extend_bounded(output, b"\r\n")?;
         }
     }
     Ok(())
+}
+
+/// SGR state reconstructed from `capture-pane -e` rows.
+///
+/// tmux emits SGR changes relative to the previous cell of the same capture,
+/// including across row boundaries, so a row whose first cells continue the
+/// previous row's style carries no prefix of its own. Replay paints every row
+/// from a reset, so the style in effect at the end of the previous row has to
+/// be re-emitted; otherwise those cells lose their background (for example
+/// the space cells of a Codex popup) until the application repaints them.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SgrState {
+    // bold, dim, italic, underline, blink, inverse, hidden, strike, overline
+    attributes: [Option<Vec<u8>>; SGR_ATTRIBUTE_SLOTS],
+    foreground: Option<Vec<u8>>,
+    background: Option<Vec<u8>>,
+    underline_colour: Option<Vec<u8>>,
+}
+
+impl SgrState {
+    const BOLD: usize = 0;
+    const DIM: usize = 1;
+    const ITALIC: usize = 2;
+    const UNDERLINE: usize = 3;
+    const BLINK: usize = 4;
+    const INVERSE: usize = 5;
+    const HIDDEN: usize = 6;
+    const STRIKE: usize = 7;
+    const OVERLINE: usize = 8;
+
+    fn advance(&mut self, line: &[u8]) {
+        let mut index = 0;
+        while index + 1 < line.len() {
+            if line[index] != 0x1b || line[index + 1] != b'[' {
+                index += 1;
+                continue;
+            }
+            let start = index + 2;
+            let mut end = start;
+            while end < line.len() && matches!(line[end], b'0'..=b'9' | b';' | b':') {
+                end += 1;
+            }
+            if line.get(end) == Some(&b'm') {
+                self.apply(&line[start..end]);
+                index = end + 1;
+            } else {
+                // Another CSI sequence (for example a private mode); skip it.
+                index = start;
+            }
+        }
+    }
+
+    fn apply(&mut self, parameters: &[u8]) {
+        let groups: Vec<&[u8]> = parameters.split(|byte| *byte == b';').collect();
+        let mut index = 0;
+        while index < groups.len() {
+            let group = groups[index];
+            index += 1;
+            if group.len() > MAX_SGR_GROUP_BYTES {
+                continue;
+            }
+            let code_text = group.split(|byte| *byte == b':').next().unwrap_or_default();
+            let code = if code_text.is_empty() {
+                Some(0)
+            } else {
+                std::str::from_utf8(code_text)
+                    .ok()
+                    .and_then(|text| text.parse::<u16>().ok())
+            };
+            let Some(code) = code else {
+                continue;
+            };
+            match code {
+                0 => *self = Self::default(),
+                1 => self.attributes[Self::BOLD] = Some(group.to_vec()),
+                2 => self.attributes[Self::DIM] = Some(group.to_vec()),
+                3 => self.attributes[Self::ITALIC] = Some(group.to_vec()),
+                4 if group == b"4:0" => self.attributes[Self::UNDERLINE] = None,
+                4 | 21 => self.attributes[Self::UNDERLINE] = Some(group.to_vec()),
+                5 | 6 => self.attributes[Self::BLINK] = Some(group.to_vec()),
+                7 => self.attributes[Self::INVERSE] = Some(group.to_vec()),
+                8 => self.attributes[Self::HIDDEN] = Some(group.to_vec()),
+                9 => self.attributes[Self::STRIKE] = Some(group.to_vec()),
+                53 => self.attributes[Self::OVERLINE] = Some(group.to_vec()),
+                22 => {
+                    self.attributes[Self::BOLD] = None;
+                    self.attributes[Self::DIM] = None;
+                }
+                23 => self.attributes[Self::ITALIC] = None,
+                24 => self.attributes[Self::UNDERLINE] = None,
+                25 => self.attributes[Self::BLINK] = None,
+                27 => self.attributes[Self::INVERSE] = None,
+                28 => self.attributes[Self::HIDDEN] = None,
+                29 => self.attributes[Self::STRIKE] = None,
+                55 => self.attributes[Self::OVERLINE] = None,
+                30..=37 | 90..=97 => self.foreground = Some(group.to_vec()),
+                39 => self.foreground = None,
+                40..=47 | 100..=107 => self.background = Some(group.to_vec()),
+                49 => self.background = None,
+                59 => self.underline_colour = None,
+                38 | 48 | 58 => {
+                    let colour = if group.contains(&b':') {
+                        group.to_vec()
+                    } else {
+                        // Semicolon form consumes `5;n` or `2;r;g;b`.
+                        let extra = match groups.get(index).copied() {
+                            Some(b"5") => 2,
+                            Some(b"2") => 4,
+                            _ => 0,
+                        };
+                        let end = index.saturating_add(extra).min(groups.len());
+                        let mut value = group.to_vec();
+                        for part in &groups[index..end] {
+                            value.push(b';');
+                            value.extend_from_slice(part);
+                        }
+                        index = end;
+                        value
+                    };
+                    if colour.len() <= MAX_SGR_GROUP_BYTES {
+                        match code {
+                            38 => self.foreground = Some(colour),
+                            48 => self.background = Some(colour),
+                            _ => self.underline_colour = Some(colour),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn write_to(&self, output: &mut Vec<u8>) -> Result<(), StreamError> {
+        let mut sequence = Vec::new();
+        for part in self
+            .attributes
+            .iter()
+            .flatten()
+            .chain(self.foreground.iter())
+            .chain(self.background.iter())
+            .chain(self.underline_colour.iter())
+        {
+            let separator: &[u8] = if sequence.is_empty() { b"\x1b[" } else { b";" };
+            sequence.extend_from_slice(separator);
+            sequence.extend_from_slice(part);
+        }
+        if sequence.is_empty() {
+            return Ok(());
+        }
+        sequence.push(b'm');
+        extend_bounded(output, sequence.as_slice())
+    }
 }
 
 fn mode(output: &mut Vec<u8>, enabled: bool, set: &[u8], reset: &[u8]) -> Result<(), StreamError> {
@@ -1326,12 +1803,17 @@ fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_FLAGS_VIEWER, CONTROL_FLAGS_WRITER, CONTROL_MODE_ARGUMENT,
-        MAX_INITIAL_REPLAY_JOINED_CELLS, PANE_STATE_FORMAT, PaneState, StreamError,
-        TerminalGeometry, build_replay, decode_tmux_output, extended_output_payload,
-        initial_replay_history_lines, output_payload, parse_input_frame, parse_marker,
-        refresh_pane_action, validate_geometry,
+        CONTROL_FLAGS_VIEWER, CONTROL_FLAGS_WRITER, CONTROL_MODE_ARGUMENT, ControlNotification,
+        InputKind, MAX_INITIAL_REPLAY_JOINED_CELLS, MAX_OUTPUT_FRAME_BYTES,
+        MAX_PENDING_OUTPUT_BYTES, OutputQueue, PANE_STATE_FORMAT, PaneState, PendingReply,
+        StreamError, TerminalGeometry, build_replay, decode_tmux_output, extended_output_payload,
+        handle_control_line, initial_replay_history_lines, is_mouse_wheel_packet,
+        mouse_wheel_command, output_payload, parse_input_frame, parse_marker, refresh_pane_action,
+        validate_geometry,
     };
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn tmux_control_mode_and_state_format_are_pipe_safe() {
@@ -1394,7 +1876,7 @@ mod tests {
             let expected_success = lines.len() == 2 && lines[0].as_slice() == first;
             let (request_tx, mut request_rx) =
                 tokio::sync::mpsc::channel::<super::CommandRequest>(1);
-            let (_output_tx, output_rx) = tokio::sync::mpsc::channel(1);
+            let (_output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
             let actor = tokio::spawn(async move {
                 let request = request_rx
                     .recv()
@@ -1407,13 +1889,16 @@ mod tests {
                 assert!(
                     request
                         .reply
-                        .send(Ok(super::ControlReply { lines }))
+                        .send(Ok(vec![super::ControlReply { lines }]))
                         .is_ok()
                 );
             });
             let mut control = super::TmuxControl {
                 request_tx,
                 output_rx,
+                pending_output: Arc::new(AtomicUsize::new(0)),
+                deferred: None,
+                next_barrier: 0,
                 shutdown_tx: None,
                 actor,
                 command_timeout: std::time::Duration::from_secs(1),
@@ -1479,14 +1964,109 @@ mod tests {
         let mut frame = vec![1];
         frame.extend_from_slice(&7_u64.to_be_bytes());
         frame.extend_from_slice(b"abc");
-        let (sequence, bytes) =
+        let (sequence, bytes, kind) =
             parse_input_frame(frame.as_slice()).unwrap_or_else(|error| panic!("frame: {error}"));
         assert_eq!(sequence, 7);
         assert_eq!(bytes, b"abc");
+        assert_eq!(kind, InputKind::Raw);
         assert!(matches!(
             parse_input_frame(&[1; 9]),
             Err(StreamError::ClientProtocol(_))
         ));
+    }
+
+    #[test]
+    fn wheel_frames_admit_only_one_bounded_vertical_mouse_report() {
+        for packet in [
+            &b"\x1b[<64;1;2M"[..],
+            &b"\x1b[<65;1000;500M"[..],
+            &b"\x1b[<92;10;20M"[..],
+            &b"\x1b[<64;0;0M"[..],
+            &b"\x1b[M\x60\x21\x22"[..],
+            &b"\x1b[M\x61\xfe\xff"[..],
+        ] {
+            let mut frame = vec![2];
+            frame.extend_from_slice(&8_u64.to_be_bytes());
+            frame.extend_from_slice(packet);
+            let (sequence, bytes, kind) =
+                parse_input_frame(&frame).unwrap_or_else(|error| panic!("wheel frame: {error}"));
+            assert_eq!(sequence, 8);
+            assert_eq!(bytes, packet);
+            assert_eq!(kind, InputKind::MouseWheel);
+            assert_ne!(kind.domain(), InputKind::Raw.domain());
+        }
+        for packet in [
+            &b"\x1b[A"[..],
+            &b"\x14\x1b[A"[..],
+            &b"\x1b[<0;1;2M"[..],
+            &b"\x1b[<66;1;2M"[..],
+            &b"\x1b[<64;1;2m"[..],
+            &b"\x1b[<64;-1;2M"[..],
+            &b"\x1b[<64;1;2;3M"[..],
+            &b"\x1b[<64;1;2M\x1b[<65;1;2M"[..],
+            &b"\x1b[<64;1;2M\ncommand"[..],
+            &b"\x1b[M\x60\x20\x22"[..],
+            &b"\x1b[M\x20\x21\x22"[..],
+            &b"\x1b[<64;1234567;1M"[..],
+        ] {
+            let mut frame = vec![2];
+            frame.extend_from_slice(&8_u64.to_be_bytes());
+            frame.extend_from_slice(packet);
+            assert!(!is_mouse_wheel_packet(packet));
+            assert!(matches!(
+                parse_input_frame(&frame),
+                Err(StreamError::ClientProtocol(_))
+            ));
+        }
+        assert!(!is_mouse_wheel_packet(&[b'0'; 65]));
+    }
+
+    #[test]
+    fn wheel_commands_are_hex_encoded_and_guarded_by_current_mouse_mode() {
+        let command = mouse_wheel_command("%7", b"\x1b[<64;1;2M")
+            .unwrap_or_else(|error| panic!("wheel command: {error}"));
+        assert_eq!(
+            command,
+            "if-shell -F -t %7 '#{&&:#{||:#{mouse_standard_flag},#{||:#{mouse_button_flag},#{mouse_all_flag}}},#{==:#{mouse_sgr_flag},1}}' 'send-keys -t %7 -H 1b 5b 3c 36 34 3b 31 3b 32 4d'"
+        );
+        assert!(mouse_wheel_command("%7; kill-session", b"\x1b[<64;1;2M").is_err());
+        assert!(mouse_wheel_command("%7", b"\x1b[A").is_err());
+    }
+
+    #[test]
+    fn pure_mouse_motion_is_passive_but_click_and_keyboard_intent_are_preserved() {
+        for packet in [
+            &b"\x1b[<35;5;3M"[..],
+            &b"\x1b[<32;5;3M\x1b[<63;6;4M"[..],
+            &b"\x1b[MC\x22\x23"[..],
+            &b"\x1b[<35;5;3M\x1b[MC\x22\x23"[..],
+        ] {
+            let mut frame = vec![1];
+            frame.extend_from_slice(&1_u64.to_be_bytes());
+            frame.extend_from_slice(packet);
+            let (_, bytes, kind) =
+                parse_input_frame(&frame).unwrap_or_else(|error| panic!("motion frame: {error}"));
+            assert_eq!(bytes, packet);
+            assert_eq!(kind, InputKind::MouseMotion);
+            assert_ne!(kind.domain(), InputKind::Raw.domain());
+            frame[0] = 2;
+            assert!(parse_input_frame(&frame).is_err());
+        }
+        for packet in [
+            &b"\x1b[<0;5;3M"[..],
+            &b"\x1b[<0;5;3m"[..],
+            &b"\x1b[<35;5;3Mhello"[..],
+            &b"\x1b[<35;5;3M\x1b[<0;5;3M"[..],
+            &b"\x1b[<35;5;3"[..],
+            &b"hello"[..],
+        ] {
+            let mut frame = vec![1];
+            frame.extend_from_slice(&1_u64.to_be_bytes());
+            frame.extend_from_slice(packet);
+            let (_, _, kind) =
+                parse_input_frame(&frame).unwrap_or_else(|error| panic!("ordinary frame: {error}"));
+            assert_eq!(kind, InputKind::Raw);
+        }
     }
 
     #[test]
@@ -1538,5 +2118,287 @@ mod tests {
         assert!(validate_geometry(80, 24).is_ok());
         assert!(validate_geometry(1, 24).is_err());
         assert!(validate_geometry(80, 501).is_err());
+    }
+
+    fn plain_state() -> PaneState {
+        PaneState {
+            pane_id: "%1".to_owned(),
+            geometry: TerminalGeometry { cols: 80, rows: 24 },
+            alternate: false,
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: true,
+            keypad_cursor: false,
+            wrap: true,
+            insert: false,
+            origin: false,
+            mouse_standard: false,
+            mouse_button: false,
+            mouse_all: false,
+            mouse_sgr: false,
+            bracket_paste: false,
+            history_size: 0,
+        }
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn replay_carries_sgr_state_across_captured_rows() {
+        // tmux 3.7c `capture-pane -e -N`: a popup row that continues the
+        // previous row's background is captured without an SGR prefix.
+        let visible = vec![
+            b"\x1b[48;2;30;30;30m    AAA".to_vec(),
+            b"    BBB".to_vec(),
+            b"\x1b[1;38:2::216:230:242mX\x1b[22;49mY".to_vec(),
+            b"Z".to_vec(),
+            b"\x1b[4;7;38;5;196mQ\x1b[?25l\x1b[m".to_vec(),
+            b"R".to_vec(),
+        ];
+        let history = vec![b"\x1b[44mhistory".to_vec(), b"tail".to_vec()];
+        let mut state = plain_state();
+        state.history_size = 2;
+        let replay = build_replay(&state, 24, history, visible)
+            .unwrap_or_else(|error| panic!("replay: {error}"));
+        assert!(contains(
+            &replay,
+            b"\x1b[0m\r\x1b[2K\x1b[48;2;30;30;30m    BBB"
+        ));
+        assert!(contains(
+            &replay,
+            b"\x1b[0m\r\x1b[2K\x1b[48;2;30;30;30m\x1b[1;38:2::216:230:242mX"
+        ));
+        // 22 clears bold and 49 the background; only the colour is carried.
+        assert!(contains(
+            &replay,
+            b"\x1b[0m\r\x1b[2K\x1b[38:2::216:230:242mZ"
+        ));
+        // An empty SGR is a full reset, and private CSI sequences are ignored.
+        assert!(contains(&replay, b"\x1b[0m\r\x1b[2KR"));
+        // History and the visible screen are separate captures.
+        assert!(contains(&replay, b"\x1b[0m\r\x1b[2K\x1b[44mtail"));
+        assert!(contains(
+            &replay,
+            b"\x1b[2J\x1b[H\x1b[0m\r\x1b[2K\x1b[48;2;30;30;30m    AAA"
+        ));
+    }
+
+    fn output_queue() -> (
+        OutputQueue,
+        tokio::sync::mpsc::UnboundedReceiver<ControlNotification>,
+        Arc<AtomicUsize>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let pending_bytes = Arc::new(AtomicUsize::new(0));
+        (
+            OutputQueue {
+                tx,
+                pending_bytes: Arc::clone(&pending_bytes),
+            },
+            rx,
+            pending_bytes,
+        )
+    }
+
+    fn feed(lines: &[&[u8]], pending: &mut VecDeque<PendingReply>, output: &OutputQueue) {
+        let mut greeting = false;
+        let mut ready = None;
+        let mut active = None;
+        for line in lines {
+            handle_control_line(
+                line,
+                "%1",
+                &mut greeting,
+                &mut ready,
+                pending,
+                &mut active,
+                output,
+            )
+            .unwrap_or_else(|error| panic!("control line {line:?}: {error}"));
+        }
+    }
+
+    fn pending_reply(
+        remaining: usize,
+        barrier: Option<u64>,
+    ) -> (
+        PendingReply,
+        tokio::sync::oneshot::Receiver<Result<Vec<super::ControlReply>, StreamError>>,
+    ) {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        (
+            PendingReply {
+                reply,
+                remaining,
+                barrier,
+                replies: Vec::new(),
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn command_list_blocks_follow_the_replay_barrier() {
+        let (output, mut notifications, _pending_bytes) = output_queue();
+        let (entry, mut receiver) = pending_reply(3, Some(7));
+        let mut pending = VecDeque::from([entry]);
+        // Framing observed from tmux 3.7c for `pause ; list-panes ; continue`:
+        // one block per command, %pause/%continue inside their own block.
+        feed(
+            &[
+                b"%output %1 stale",
+                b"%begin 1790621011 300 1",
+                b"%pause %1",
+                b"%end 1790621011 300 1",
+                b"%begin 1790621011 301 1",
+                b"state",
+                b"%end 1790621011 301 1",
+                b"%begin 1790621011 302 1",
+                b"%continue %1",
+                b"%end 1790621011 302 1",
+                b"%output %1 fresh",
+            ],
+            &mut pending,
+            &output,
+        );
+        let replies = receiver
+            .try_recv()
+            .unwrap_or_else(|error| panic!("reply: {error}"))
+            .unwrap_or_else(|error| panic!("tmux: {error}"));
+        let bodies: Vec<Vec<Vec<u8>>> = replies.into_iter().map(|reply| reply.lines).collect();
+        assert_eq!(
+            bodies,
+            vec![
+                vec![b"%pause %1".to_vec()],
+                vec![b"state".to_vec()],
+                vec![b"%continue %1".to_vec()]
+            ]
+        );
+        assert!(pending.is_empty());
+        let mut order = Vec::new();
+        while let Ok(notification) = notifications.try_recv() {
+            order.push(match notification {
+                ControlNotification::Output(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                ControlNotification::ReplayBarrier(value) => format!("barrier-{value}"),
+                ControlNotification::LayoutChanged => "layout".to_owned(),
+            });
+        }
+        assert_eq!(order, ["stale", "barrier-7", "fresh"]);
+    }
+
+    #[test]
+    fn command_list_error_completes_request_and_keeps_replies_aligned() {
+        let (output, _notifications, _pending_bytes) = output_queue();
+        let (first, mut first_receiver) = pending_reply(3, None);
+        let (second, mut second_receiver) = pending_reply(1, None);
+        let mut pending = VecDeque::from([first, second]);
+        // tmux 3.7c skips the rest of a command list after `%error`.
+        feed(
+            &[
+                b"%begin 1 20 1",
+                b"A",
+                b"%end 1 20 1",
+                b"%begin 1 21 1",
+                b"can't find pane: %999",
+                b"%error 1 21 1",
+                b"%begin 1 22 1",
+                b"next",
+                b"%end 1 22 1",
+            ],
+            &mut pending,
+            &output,
+        );
+        assert!(matches!(
+            first_receiver.try_recv(),
+            Ok(Err(StreamError::Tmux(message))) if message == "can't find pane: %999"
+        ));
+        let second = second_receiver
+            .try_recv()
+            .unwrap_or_else(|error| panic!("reply: {error}"))
+            .unwrap_or_else(|error| panic!("tmux: {error}"));
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].lines, vec![b"next".to_vec()]);
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn viewer_output_is_coalesced_in_order_and_discarded_only_before_barrier() {
+        let (output, output_rx, pending_output) = output_queue();
+        let (request_tx, _request_rx) = tokio::sync::mpsc::channel(1);
+        let mut control = super::TmuxControl {
+            request_tx,
+            output_rx,
+            pending_output: Arc::clone(&pending_output),
+            deferred: None,
+            next_barrier: 0,
+            shutdown_tx: None,
+            actor: tokio::spawn(async {}),
+            command_timeout: std::time::Duration::from_secs(1),
+            pane_id: "%1".to_owned(),
+            target: "%1".to_owned(),
+        };
+        for notification in [
+            ControlNotification::Output(b"old".to_vec()),
+            ControlNotification::ReplayBarrier(1),
+            ControlNotification::Output(b"a".to_vec()),
+            ControlNotification::Output(b"b".to_vec()),
+            ControlNotification::LayoutChanged,
+            ControlNotification::Output(vec![b'x'; MAX_OUTPUT_FRAME_BYTES - 1]),
+            ControlNotification::Output(b"yy".to_vec()),
+        ] {
+            output
+                .push(notification)
+                .unwrap_or_else(|error| panic!("push: {error}"));
+        }
+        control
+            .discard_until_barrier(1)
+            .unwrap_or_else(|error| panic!("barrier: {error}"));
+        let Some(ControlNotification::Output(first)) = control.notification().await else {
+            panic!("expected output after the barrier");
+        };
+        assert_eq!(control.coalesce_output(first), b"ab");
+        assert!(matches!(
+            control.notification().await,
+            Some(ControlNotification::LayoutChanged)
+        ));
+        let Some(ControlNotification::Output(large)) = control.notification().await else {
+            panic!("expected large output");
+        };
+        assert_eq!(
+            control.coalesce_output(large).len(),
+            MAX_OUTPUT_FRAME_BYTES - 1
+        );
+        assert!(matches!(
+            control.notification().await,
+            Some(ControlNotification::Output(bytes)) if bytes == b"yy"
+        ));
+        assert_eq!(pending_output.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(control.discard_until_barrier(2).is_err());
+        control.shutdown().await;
+    }
+
+    #[test]
+    fn viewer_output_queue_is_bounded_by_bytes_not_line_count() {
+        let (output, _notifications, pending_bytes) = output_queue();
+        // Far beyond the previous 32-notification queue.
+        for _ in 0..4_096 {
+            output
+                .push(ControlNotification::Output(b"x".to_vec()))
+                .unwrap_or_else(|error| panic!("push: {error}"));
+        }
+        assert!(
+            pending_bytes.load(std::sync::atomic::Ordering::Acquire) < MAX_PENDING_OUTPUT_BYTES
+        );
+        assert!(matches!(
+            output.push(ControlNotification::Output(vec![
+                0;
+                MAX_PENDING_OUTPUT_BYTES
+            ])),
+            Err(StreamError::Backpressure)
+        ));
     }
 }

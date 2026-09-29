@@ -8,6 +8,14 @@ name, exactly one saved `workspace_id` or absolute server `workspace_path`,
 optional Codex task text, and at most 16 immutable staged references. Shell task
 commands and client-supplied argv are rejected.
 
+The web command palette lists a selected server directory's immediate child
+directories. Its dropdown offers each child and an explicit **All** choice.
+Submitting a prompt creates one authenticated Codex window per selected child;
+the prompt is one data argument, and each create request has its own durable
+replay identity. The palette's `--yolo` mode is an explicit Codex runtime flag,
+never shell syntax or an arbitrary client-supplied command. Existing launches
+without that flag keep their configured runtime behavior.
+
 **Native shell** opens a terminal as the host user. **Codex (TermDeck private
 account)** starts the configured native Codex runtime with the tab's own account
 home. Both use the host filesystem, network and process permissions. The selected
@@ -74,9 +82,9 @@ configuration and `codex-auth` account catalogue under the user's authorization.
 TermDeck uses its per-tab account adapter and private scope; it does not change
 the global active login or make standalone Codex depend on TermDeck. Resolve any
 configured executable/source alias to its actual host path. Qualify the runtime
-and its normal host dependencies before production activation. TermDeck does not
-add Codex sandbox or approval flags; the configured runtime retains its own
-configuration and behavior.
+and its normal host dependencies before production activation. Ordinary
+configured launches do not add Codex sandbox or approval flags; the explicit
+command-palette `--yolo` choice changes only those palette launches.
 
 The Codex adapter asks the existing TermDeck `SessionStore` to provision that
 tab's private `CODEX_HOME` from the configured account source. It passes a private
@@ -85,6 +93,12 @@ the host user's ordinary `HOME` and environment, with the intended per-tab
 `CODEX_HOME` and private account commands. Credential refresh can replace the tab-private
 `auth.json`; account lifecycle synchronization remains the TermDeck account
 controller's responsibility.
+
+New configured Codex tasks use the installed CLI's `--no-alt-screen` mode, so
+ordinary terminal scrollback can retain their output. The configured Codex
+executable must support this flag (the qualified 0.157.1 CLI does). This applies
+when those tasks start or resume; TermDeck does not restart an existing Codex
+process or rewrite commands typed manually into a shell tab.
 
 The selected host shell's normal startup files provide its settings and tool
 paths. Configured launches validate their saved authorization before login

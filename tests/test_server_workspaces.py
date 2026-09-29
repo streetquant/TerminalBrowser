@@ -38,6 +38,42 @@ def test_directory_selection_preserves_spaces_and_v2_identity(directories):
         directory.check()
 
 
+def test_immediate_directory_picker_excludes_links_files_and_nested_children(directories):
+    _, workspace = directories
+    (workspace / "z project").mkdir()
+    (workspace / "A project").mkdir()
+    (workspace / "z project" / "nested").mkdir()
+    (workspace / "file").write_text("data")
+    (workspace / "shortcut").symlink_to(workspace / "A project", target_is_directory=True)
+    assert workspaces.immediate_directories(str(workspace)) == [
+        {"name": "A project", "path": str(workspace / "A project")},
+        {"name": "z project", "path": str(workspace / "z project")},
+    ]
+    with pytest.raises(StagingError, match="Too many immediate directories"):
+        workspaces.immediate_directories(str(workspace), limit=1)
+
+
+def test_immediate_directory_picker_rejects_invalid_parent(directories):
+    _, workspace = directories
+    with pytest.raises(StagingError):
+        workspaces.immediate_directories(str(workspace / "absent"))
+    with pytest.raises(StagingError):
+        workspaces.immediate_directories("../relative")
+
+
+def test_authenticated_launch_options_list_only_requested_parent(stage, ordinary_workspace_root):
+    store, actor = stage
+    parent = ordinary_workspace_root / "picker"
+    parent.mkdir()
+    (parent / "first").mkdir()
+    (parent / "shortcut").symlink_to(parent / "first", target_is_directory=True)
+    options = call((store, actor), "launch-options", directory=str(parent))
+    assert options["directory"] == str(parent)
+    assert options["directories"] == [{"name": "first", "path": str(parent / "first")}]
+    with pytest.raises(StagingError):
+        call((store, actor), "launch-options", directory="/missing-termdeck-picker")
+
+
 def test_initial_symlink_and_parent_syntax_resolve_to_canonical_directory(directories):
     state, workspace = directories
     alias = workspace.with_name("shortcut")

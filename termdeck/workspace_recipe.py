@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .command_render import render_command
+from .command_render import directory_tab_name, render_command
 
 
 class WorkspaceRecipeError(ValueError):
@@ -24,6 +24,7 @@ class RecipeTab:
     cwd: str
     visible: bool = True
     pinned: bool = False
+    automatic_name: bool = False
 
 
 @dataclass(frozen=True)
@@ -87,7 +88,8 @@ def _parse_tab(item: Any, *, index: int, base_dir: Path) -> RecipeTab:
     name = _string(item.get("name"), f"tabs[{index}].name", default=command.split()[0] if command.split() else "task")
     visible = _bool(item.get("visible"), f"tabs[{index}].visible", default=True)
     pinned = _bool(item.get("pinned"), f"tabs[{index}].pinned", default=False)
-    return RecipeTab(name=name, tag=tag, command=command, cwd=cwd, visible=visible, pinned=pinned)
+    automatic_name = _bool(item.get("automatic_name"), f"tabs[{index}].automatic_name", default=name == directory_tab_name(cwd))
+    return RecipeTab(name=name, tag=tag, command=command, cwd=cwd, visible=visible, pinned=pinned, automatic_name=automatic_name)
 
 
 def _parse_tabs(items: Any, *, base_dir: Path, context: str) -> tuple[RecipeTab, ...]:
@@ -162,6 +164,7 @@ def recipe_summary_rows(recipe: WorkspaceRecipe) -> list[dict[str, object]]:
                     "cwd": tab.cwd,
                     "visible": tab.visible,
                     "pinned": tab.pinned,
+                    "automatic_name": tab.automatic_name,
                     "session_hint": f"{_slug(recipe.name)}-{window_index:02d}-{tab_index:02d}",
                 }
             )
@@ -241,6 +244,7 @@ def recipe_from_sessions(
                 cwd=record.cwd,
                 visible=record.visible,
                 pinned=record.pinned,
+                automatic_name=record.name_is_automatic,
             )
             for record in rows
         )

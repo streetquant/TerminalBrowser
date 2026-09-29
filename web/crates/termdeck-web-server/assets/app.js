@@ -134,6 +134,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       cwd: requiredString(value.cwd, MAX_CWD_CHARS, "pane cwd"),
       status,
       pinned: value.pinned === true,
+      automaticTitle: value.automatic_title === true,
       controllerActive: normalizeController(value.controller),
     };
   }
@@ -425,6 +426,8 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       writable: false,
     });
 
+    const disposeCopy = window.T1000TerminalCopy.install(host, terminalApi);
+
     let socket = null;
     let ready = false;
     let mine = false;
@@ -453,9 +456,12 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
     let outputChain = Promise.resolve();
     let outputChunks = [];
     let outputBytes = 0;
+    let outputWrites = 0;
     let canonicalGeometry = null;
     let lastViewportGeometry = null;
     let focusRequested = false;
+    const scroll = window.T1000TerminalScroll.install(host, terminalApi,
+      {isController: () => ready && mine && socketOpen()});
 
     function requestControl() {
       if (ready && socketOpen()) {
@@ -584,9 +590,9 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       }
     }
 
-    function binaryFrame(sequence, bytes) {
+    function binaryFrame(sequence, bytes, type = 1) {
       const frame = new Uint8Array(9 + bytes.length);
-      frame[0] = 1;
+      frame[0] = type;
       const view = new DataView(frame.buffer);
       view.setBigUint64(1, BigInt(sequence), false);
       frame.set(bytes, 9);
@@ -623,7 +629,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
         frame.sequence = nextSequence;
         nextSequence += 1;
         inFlight.set(frame.sequence, frame);
-        socket.send(binaryFrame(frame.sequence, frame.bytes));
+        socket.send(binaryFrame(frame.sequence, frame.bytes, frame.type));
         if (socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) {
           scheduleSocketDrain();
           break;
@@ -631,11 +637,11 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       }
     }
 
-    function queueFrame(bytes) {
+    function queueFrame(bytes, type = 1) {
       if (!(bytes instanceof Uint8Array) || bytes.length === 0) {
         return;
       }
-      queue.push({ bytes, sequence: null });
+      queue.push({ bytes, sequence: null, type });
     }
 
     function flushInputBatch(dispatch = true) {
@@ -683,11 +689,22 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
           flushInputBatch(false);
         }
       }
-      if (bytes.length >= 1024 || batchBytes >= 4096) {
+      if (bytes.length >= 1024 || batchBytes >= 4096 || (!inputBatchTimer && inFlight.size === 0)) {
         flushInputBatch(true);
       } else if (!inputBatchTimer) {
         inputBatchTimer = window.setTimeout(() => flushInputBatch(true), INPUT_BATCH_MS);
       }
+    }
+
+    function enqueueWheel(bytes) {
+      if (!ready || !mine || !socketOpen() || disposed || !(bytes instanceof Uint8Array)
+          || !bytes.length || bytes.length > 64 || queuedBytes + bytes.length > MAX_PENDING_BYTES) return;
+      flushInputBatch(true);
+      if (queue.length || inFlight.size >= MAX_IN_FLIGHT_FRAMES
+          || socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) return;
+      queuedBytes += bytes.length;
+      queueFrame(bytes, 2);
+      sendAvailable();
     }
 
     function cancelOutputSchedule() {
@@ -717,13 +734,18 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
         combined.set(chunk, cursor);
         cursor += chunk.length;
       }
+      outputWrites += 1;
       outputChain = outputChain.then(
         () => new Promise((resolve) => {
-          if (disposed || generation !== outputGeneration) {
+          const done = () => {
+            outputWrites -= 1;
             resolve();
+          };
+          if (disposed || generation !== outputGeneration) {
+            done();
             return;
           }
-          terminalApi.write(combined, resolve);
+          terminalApi.write(combined, done);
         }),
       );
       return outputChain;
@@ -733,11 +755,12 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       if (disposed || outputBytes === 0 || outputAnimationFrame || outputFlushTimer) {
         return;
       }
-      if (outputBytes >= MAX_OUTPUT_BATCH_BYTES) {
+      const visible = document.visibilityState === "visible";
+      if (outputBytes >= MAX_OUTPUT_BATCH_BYTES || (visible && outputWrites === 0 && outputBytes <= 32768)) {
         flushTerminalOutput();
         return;
       }
-      if (document.visibilityState === "visible") {
+      if (visible) {
         outputAnimationFrame = window.requestAnimationFrame(() => {
           outputAnimationFrame = 0;
           flushTerminalOutput();
@@ -833,7 +856,6 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
         return;
       }
       if (event.type === "ready" || event.type === "resynced") {
-        // Ordered replay must not delay the ready input pipeline.
         finishReady(event);
         flushTerminalOutput();
         return;
@@ -993,7 +1015,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       });
     }
 
-    terminalApi.onData(enqueue);
+    terminalApi.onData(bytes => scroll.isWheelInput() ? enqueueWheel(bytes) : enqueue(bytes));
     host.addEventListener("pointerdown", () => {
       terminalApi.focus();
     });
@@ -1025,7 +1047,6 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       if (document.visibilityState !== "visible" || !networkOnline) {
         return;
       }
-      // Resume starts a fresh liveness epoch after background timer suspension.
       lastPongAt = Date.now();
       reconnectAttempt = 0;
       window.clearTimeout(reconnectTimer);
@@ -1045,7 +1066,6 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
         return;
       }
       if (document.hidden) {
-        // Keep hidden sockets alive; probe liveness again on resume.
         sendJson({ type: "ping" });
         return;
       }
@@ -1073,6 +1093,8 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
         window.clearTimeout(socketDrainTimer);
         cancelOutputSchedule();
         window.clearInterval(heartbeatTimer);
+        disposeCopy();
+        scroll.dispose();
         window.removeEventListener("online", reconnectNow);
         window.removeEventListener("offline", pauseOffline);
         window.removeEventListener("pageshow", probeAfterResume);
@@ -1093,7 +1115,6 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
         try {
           delete host.termdeckTerminal;
         } catch (_ignored) {
-          // The host will be discarded with the workspace during navigation.
         }
         terminalApi.dispose();
       },
@@ -1228,11 +1249,6 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
     actionCancel.addEventListener("click", () => actionDialog.close());
     actionForm.addEventListener("submit", (event) => {
       event.preventDefault();
-      if (renameInput.required && !renameInput.value.trim()) {
-        renameInput.setCustomValidity("Enter a tab name.");
-        renameInput.reportValidity();
-        return;
-      }
       actionDialog.close("confirm");
     });
     renameInput.addEventListener("input", () => renameInput.setCustomValidity(""));
@@ -1251,12 +1267,12 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       const rename = action === "rename";
       actionTitle.textContent = rename ? "Rename tab" : "Kill process and close tab?";
       actionDescription.textContent = rename
-        ? "Give this tab a name you can find quickly. Its process will keep running."
+        ? "Give this tab a name you can find quickly, or leave it empty to name it after its working directory. Its process will keep running."
         : `This stops “${pane.title}” and removes its tab. Unsaved terminal work may be lost. To keep the process running, cancel and choose Hide tab instead.`;
       renameField.hidden = !rename;
-      renameInput.required = rename;
       renameInput.disabled = !rename;
-      renameInput.value = pane.title;
+      renameInput.value = pane.automaticTitle ? "" : pane.title;
+      renameInput.placeholder = pane.title;
       renameInput.setCustomValidity("");
       actionConfirm.textContent = rename ? "Save name" : "Kill process";
       actionConfirm.className = rename ? "" : "danger";
@@ -1294,6 +1310,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       getTerminal: () => terminalHost.termdeckTerminal,
       newTab: () => newButton.click(), runAction: runTabAction,
       getWindow: () => envelope?.window, refresh: () => refreshWindow(),
+      snapshot: async () => normalizeHost((await fetchJson(appPath("/_termdeck/api/v1/snapshot"))).payload), appPath,
       loadHidden: async () => (await fetchJson(appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(routeSlug)}/hidden-tabs`), { method: "GET" })).payload,
       restoreHidden: async (id) => {
         if (pendingAction) throw new Error("Wait for the current tab action to finish.");
@@ -1665,6 +1682,11 @@ ${pane.cwd}`;
         const next = normalizeWindowEnvelope(payload);
         if (next.window.slug !== routeSlug) {
           throw new Error("Window identity changed unexpectedly.");
+        }
+        if (envelope && next.generatedAt < envelope.generatedAt) {
+          workspaceStatus.textContent = `${envelope.window.panes.length} tabs · reconnecting`;
+          root.dataset.termdeckState = "stale";
+          return;
         }
         envelope = next;
         const selected = chooseActivePane(next.window);

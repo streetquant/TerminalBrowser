@@ -10,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 FILES = {
     "app": ROOT / "web/crates/termdeck-web-server/assets/app.js",
     "workspace_ui": ROOT / "web/crates/termdeck-web-server/assets/workspace-ui.js",
+    "terminal_scroll": ROOT / "web/crates/termdeck-web-server/assets/terminal-scroll.js",
+    "terminal_copy": ROOT / "web/crates/termdeck-web-server/assets/terminal-copy.js",
     "css": ROOT / "web/crates/termdeck-web-server/assets/app.css",
     "server": ROOT / "web/crates/termdeck-web-server/src/lib.rs",
     "stream": ROOT / "web/crates/termdeck-web-server/src/terminal_stream.rs",
@@ -65,11 +67,11 @@ def main() -> None:
         "terminalMount = mountTerminal(routeSlug, paneId, terminalHost, terminalStatus, terminalOverlay);",
         "if (activePaneId) {",
         "switchPane(activePaneId, false);",
-        "terminalApi.onData(enqueue)",
+        "terminalApi.onData(bytes => scroll.isWheelInput() ? enqueueWheel(bytes) : enqueue(bytes))",
         "new ResizeObserver",
         "fitViewport()",
         'new WebSocket(streamUrl(), "termdeck.terminal.v1")',
-        "binaryFrame(frame.sequence, frame.bytes)",
+        "binaryFrame(frame.sequence, frame.bytes, frame.type)",
         'node("button", "workspace-new-tab", "+")',
         '["Rename tab", "rename"]',
         '["Hide tab", "hide"]',
@@ -118,6 +120,9 @@ def main() -> None:
     require(text["app"], "MAX_IN_FLIGHT_FRAMES = 64", "bounded pipelined input")
     require(text["app"], "INPUT_BATCH_MS = 3", "interactive input batching")
     require(text["app"], "inFlight = new Map()", "multi-frame acknowledgement tracking")
+    require(text["app"], "window.T1000TerminalScroll.install(host, terminalApi", "scroll owner wiring")
+    require(text["terminal_scroll"], 'host.addEventListener("wheel", wheel, { capture: true, passive: false })', "wheel interception")
+    require(text["terminal_copy"], "navigator.clipboard.writeText", "explicit selection clipboard")
     require(text["terminal_source"], "fitGrid", "canonical-grid viewport fit")
     require(text["app"], "workspace-headerbar", "native compact workspace header")
     require(text["app"], "workspace-tab-close", "native tab close control")

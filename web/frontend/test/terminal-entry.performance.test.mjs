@@ -56,7 +56,7 @@ function mockModulesPlugin() {
         activate(terminal) { this.terminal = terminal; }
         proposeDimensions() {
           globalThis.__termdeckFitProposals += 1;
-          return { cols: 80, rows: 24 };
+          return { cols: globalThis.__termdeckWebglCols || 80, rows: 24 };
         }
         dispose() {}
       }
@@ -75,8 +75,9 @@ function mockModulesPlugin() {
     `,
     webgl: `
       export class WebglAddon {
-        onContextLoss() {}
-        dispose() {}
+        activate(terminal) { terminal.webglAddon = this; globalThis.__termdeckWebglCols = 100; }
+        onContextLoss(callback) { this.loss = callback; }
+        dispose() { globalThis.__termdeckWebglCols = 80; }
       }
     `,
     css: "",
@@ -239,8 +240,11 @@ test("canonical fit suppresses stable remeasurement and invalidates font/layout 
   }
   api.setAppearance({ ...appearance, palette: "t1000", font: "auto" });
   assert.deepEqual(api.terminal.options.theme, originalPalette);
-  api.fitGrid(120, 40);
-  assert.equal(api.terminal.options.fontSize, 7);
+  const overflowing = api.fitGrid(120, 40);
+  assert.equal(api.terminal.options.fontSize, 16);
+  assert.equal(overflowing.fits, false);
+  assert.equal(host.dataset.termdeckOverflow, "true");
+  assert.deepEqual(api.dimensions(), { cols: 120, rows: 40 });
   assert.deepEqual(api.fit(), { cols: 80, rows: 24 });
   assert.equal(api.terminal.options.fontSize, 16);
   assert.equal(host.dataset.termdeckColumns, "80");
@@ -285,6 +289,44 @@ test("terminal listeners are removed exactly once across individual and owner di
   assert.equal(api.terminal.stats.resizeDisposals, 1);
   assert.equal(api.terminal.stats.dataDisposals, 1);
   assert.equal(api.terminal.stats.binaryDisposals, 1);
+});
+
+test("WebGL cell-width change refits the controller and context loss refits again", async () => {
+  const frames = [];
+  globalThis.window = {
+    devicePixelRatio: 1,
+    location: { href: "http://termdeck.test/" },
+    getComputedStyle: () => ({ width: "800px", height: "600px" }),
+    requestAnimationFrame(callback) { frames.push(callback); return frames.length; },
+  };
+  globalThis.document = { fonts: { status: "loaded" } };
+  globalThis.HTMLElement = class HTMLElement {};
+  globalThis.__termdeckWebglCols = 80;
+  globalThis.__termdeckFitProposals = 0;
+  const { createTerminal } = await loadTerminalEntry();
+  const host = new globalThis.HTMLElement();
+  host.clientWidth = 800;
+  host.clientHeight = 600;
+  host.dataset = {};
+  host.style = { setProperty() {} };
+  let layoutChanges = 0;
+  let api;
+  api = createTerminal(host, {
+    onLayoutChange() { layoutChanges += 1; api.fit(); },
+  });
+  assert.deepEqual(api.dimensions(), { cols: 80, rows: 24 });
+  api.activateWebgl();
+  assert.deepEqual(api.dimensions(), { cols: 80, rows: 24 });
+  frames.shift()();
+  assert.deepEqual(api.dimensions(), { cols: 100, rows: 24 });
+  assert.equal(layoutChanges, 1);
+  api.activateWebgl();
+  assert.equal(frames.length, 0, "an already active renderer does not refit twice");
+  api.terminal.webglAddon.loss();
+  frames.shift()();
+  assert.deepEqual(api.dimensions(), { cols: 80, rows: 24 });
+  assert.equal(layoutChanges, 2);
+  api.dispose();
 });
 
 test("input encoding uses one shared encoder", async () => {

@@ -73,6 +73,7 @@ def create_task_session(
     tab_index: int = 0,
     visible: bool = True,
     pinned: bool = False,
+    automatic_name: bool = False,
     start: bool = True,
     fail_on_start_error: bool = False,
 ) -> LaunchResult:
@@ -92,6 +93,7 @@ def create_task_session(
         tab_index=tab_index,
         visible=visible,
         pinned=pinned,
+        automatic_name=automatic_name,
     )
     if not start:
         record = store.update(record.id, status="remembered", last_pid=None)
@@ -137,6 +139,7 @@ def create_workspace_sessions(
                     tab_index=tab_index,
                     visible=tab.visible,
                     pinned=getattr(tab, "pinned", False),
+                    automatic_name=tab.automatic_name,
                     start=start,
                     fail_on_start_error=fail_on_start_error,
                 )

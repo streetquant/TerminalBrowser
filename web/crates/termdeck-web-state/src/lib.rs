@@ -16,9 +16,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use termdeck_web_core::{
-    HostId, HostSnapshot, IdError, MAX_CWD_BYTES, OwnerId, PaneId, PaneSnapshot, PaneStatus,
-    RouteError, RouteRegistry, SessionId, SnapshotError, WindowId, WindowRouteInput,
-    WindowSnapshot,
+    HostId, HostSnapshot, IdError, MAX_CWD_BYTES, MAX_PANE_TITLE_BYTES, OwnerId, PaneId,
+    PaneSnapshot, PaneStatus, RouteError, RouteRegistry, SessionId, SnapshotError, WindowId,
+    WindowRouteInput, WindowSnapshot,
 };
 
 pub const DEFAULT_DATABASE_BUSY_TIMEOUT_MS: u64 = 1_000;
@@ -278,6 +278,7 @@ impl From<SnapshotError> for StateError {
 struct DatabasePane {
     id: String,
     name: String,
+    automatic_name: Option<bool>,
     cwd: String,
     tmux_name: String,
     status: String,
@@ -344,11 +345,12 @@ impl ReadOnlyStateMirror {
             let mut panes = Vec::with_capacity(window.panes.len());
             for pane in window.panes {
                 let live = inventory.get(&pane.tmux_name);
-                let cwd = live
+                let live_cwd = live
                     .map(TmuxPaneState::current_path)
-                    .filter(|value| !value.is_empty() && is_safe_live_cwd(value))
-                    .unwrap_or(&pane.cwd)
-                    .to_owned();
+                    .filter(|value| !value.is_empty() && is_safe_live_cwd(value));
+                let cwd = live_cwd.unwrap_or(&pane.cwd).to_owned();
+                let (title, automatic_title) =
+                    project_title(&pane.name, &pane.cwd, pane.automatic_name, live_cwd);
                 let target = pane
                     .pane_target
                     .filter(|value| !value.is_empty())
@@ -357,13 +359,14 @@ impl ReadOnlyStateMirror {
                     PaneSnapshot::new(
                         PaneId::new(pane.id.clone())?,
                         Some(SessionId::new(pane.id)?),
-                        pane.name,
+                        title,
                         cwd,
                         project_status(&pane.status, live, inventory.is_complete()),
                         target,
                         None,
                     )?
-                    .with_pinned(pane.pinned),
+                    .with_pinned(pane.pinned)
+                    .with_automatic_title(automatic_title),
                 );
             }
             projected.push(WindowSnapshot::new(
@@ -443,13 +446,26 @@ fn load_database_windows(path: &Path) -> Result<Vec<DatabaseWindow>, StateError>
 
     let mut row_count = 0usize;
     {
-        let mut statement = transaction.prepare(
+        // The mirror stays read-only and accepts registries not yet opened by
+        // the current Python writer. NULL retains legacy naming inference.
+        let has_automatic_name: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'automatic_name')",
+            [],
+            |row| row.get(0),
+        )?;
+        let automatic_name_column = if has_automatic_name {
+            "automatic_name"
+        } else {
+            "NULL"
+        };
+        let sql = format!(
             "SELECT id, name, cwd, tmux_name, status, window_id, window_title, \
-                    tab_index, pinned, pane_target, last_opened_at \
+                    tab_index, pinned, pane_target, last_opened_at, {automatic_name_column} \
              FROM sessions \
              WHERE visible = 1 AND status != 'archived' AND status != 'stopped' \
-             ORDER BY window_id, pinned DESC, tab_index, last_opened_at, id",
-        )?;
+             ORDER BY window_id, pinned DESC, tab_index, last_opened_at, id"
+        );
+        let mut statement = transaction.prepare(&sql)?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -463,6 +479,7 @@ fn load_database_windows(path: &Path) -> Result<Vec<DatabaseWindow>, StateError>
                 row.get::<_, i64>(8)?,
                 row.get::<_, Option<String>>(9)?,
                 row.get::<_, String>(10)?,
+                row.get::<_, Option<i64>>(11)?,
             ))
         })?;
         for row in rows {
@@ -485,7 +502,14 @@ fn load_database_windows(path: &Path) -> Result<Vec<DatabaseWindow>, StateError>
                 pinned,
                 pane_target,
                 last_opened_at,
+                automatic_name,
             ) = row?;
+            let automatic_name = match automatic_name {
+                None => None,
+                Some(0) => Some(false),
+                Some(1) => Some(true),
+                Some(_) => return Err(StateError::MalformedDatabaseRow("automatic_name")),
+            };
             let window = windows
                 .entry(window_id.clone())
                 .or_insert_with(|| DatabaseWindow {
@@ -496,6 +520,7 @@ fn load_database_windows(path: &Path) -> Result<Vec<DatabaseWindow>, StateError>
             window.panes.push(DatabasePane {
                 id,
                 name,
+                automatic_name,
                 cwd,
                 tmux_name,
                 status,
@@ -600,7 +625,38 @@ fn project_status(
 }
 
 fn is_safe_live_cwd(value: &str) -> bool {
-    value.len() <= MAX_CWD_BYTES && !value.chars().any(char::is_control)
+    value.starts_with('/') && value.len() <= MAX_CWD_BYTES && !value.chars().any(char::is_control)
+}
+
+/// Project a tab title and whether it is automatic.
+///
+/// New writers persist intent independently of the title. Only legacy NULL
+/// rows infer intent from the launch directory. The live path comes exclusively
+/// from the server's tmux inventory, never the browser.
+fn project_title(
+    name: &str,
+    launch_cwd: &str,
+    automatic_name: Option<bool>,
+    live_cwd: Option<&str>,
+) -> (String, bool) {
+    if !automatic_name.unwrap_or_else(|| name == directory_tab_name(launch_cwd)) {
+        return (name.to_owned(), false);
+    }
+    let title = live_cwd
+        .filter(|value| is_safe_live_cwd(value))
+        .map(directory_tab_name)
+        .filter(|title| title.len() <= MAX_PANE_TITLE_BYTES)
+        .unwrap_or_else(|| name.to_owned());
+    (title, true)
+}
+
+/// `termdeck.command_render.directory_tab_name` for a normalised absolute
+/// path: its final component, or `root` for the filesystem root.
+fn directory_tab_name(path: &str) -> String {
+    path.rsplit('/')
+        .find(|component| !component.is_empty() && *component != ".")
+        .unwrap_or("root")
+        .to_owned()
 }
 
 fn validate_bounded_text(
@@ -642,6 +698,7 @@ fn stable_revision(
             hash.text(pane.cwd());
             hash.text(pane_status_name(pane.status()));
             hash.byte(u8::from(pane.pinned()));
+            hash.byte(u8::from(pane.automatic_title()));
             hash.text(pane.tmux_target().unwrap_or(""));
         }
     }
@@ -692,12 +749,15 @@ impl StableHash {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadOnlyStateMirror, StateError, TmuxInventory, TmuxPaneState, open_read_only};
+    use super::{
+        ReadOnlyStateMirror, StateError, TmuxInventory, TmuxPaneState, directory_tab_name,
+        open_read_only, project_title,
+    };
     use rusqlite::{Connection, OpenFlags};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use termdeck_web_core::{HostId, OwnerId, PaneId, PaneStatus};
+    use termdeck_web_core::{HostId, MAX_PANE_TITLE_BYTES, OwnerId, PaneId, PaneStatus};
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -945,5 +1005,242 @@ mod tests {
         };
         assert_eq!(random.panes()[0].status(), PaneStatus::Running);
         assert_eq!(random.panes()[1].status(), PaneStatus::Paused);
+    }
+
+    #[test]
+    fn automatic_tab_title_follows_live_directory_and_manual_name_is_kept() {
+        assert_eq!(directory_tab_name("/home/arch"), "arch");
+        assert_eq!(directory_tab_name("/home/arch/"), "arch");
+        assert_eq!(directory_tab_name("/"), "root");
+        let live = Some("/cyber-a/bug-bounty/ipa");
+        // `t1000 new` without --name in /home/arch stored `arch`.
+        assert_eq!(
+            project_title("arch", "/home/arch", None, live),
+            ("ipa".to_owned(), true)
+        );
+        assert_eq!(
+            project_title("outreach", "/home/arch", None, live),
+            ("outreach".to_owned(), false)
+        );
+        // Case differs from the directory, so this was chosen explicitly.
+        assert_eq!(
+            project_title("Arch", "/home/arch", None, live),
+            ("Arch".to_owned(), false)
+        );
+        assert_eq!(
+            project_title("arch", "/home/arch", None, None),
+            ("arch".to_owned(), true)
+        );
+        assert_eq!(
+            project_title("arch", "/home/arch", None, Some("/")),
+            ("root".to_owned(), true)
+        );
+        let long = format!("/{}", "x".repeat(MAX_PANE_TITLE_BYTES + 1));
+        assert_eq!(
+            project_title("arch", "/home/arch", None, Some(long.as_str())),
+            ("arch".to_owned(), true)
+        );
+        // The same text can be explicitly manual or automatic.
+        assert_eq!(
+            project_title("arch", "/home/arch", Some(false), live),
+            ("arch".to_owned(), false)
+        );
+        assert_eq!(
+            project_title("outreach", "/home/arch", Some(true), live),
+            ("ipa".to_owned(), true)
+        );
+        for invalid in ["", "relative/path", "/bad\u{7}", "/line\nbreak"] {
+            assert_eq!(
+                project_title("arch", "/home/arch", Some(true), Some(invalid)),
+                ("arch".to_owned(), true)
+            );
+        }
+        for (path, expected) in [
+            ("/tmp/project with spaces", "project with spaces"),
+            ("/tmp/<img onerror=alert(1)>", "<img onerror=alert(1)>"),
+            ("/tmp/日本語", "日本語"),
+        ] {
+            assert_eq!(
+                project_title("arch", "/home/arch", Some(true), Some(path)),
+                (expected.to_owned(), true)
+            );
+        }
+    }
+
+    #[test]
+    fn projected_automatic_tab_follows_tmux_current_path() {
+        let fixture = Fixture::new(true);
+        let connection = match Connection::open(&fixture.database) {
+            Ok(value) => value,
+            Err(error) => panic!("could not open fixture: {error}"),
+        };
+        if let Err(error) = connection.execute_batch(
+            "INSERT INTO sessions VALUES (\
+                'session-auto', 'arch', '/home/arch', 'tmux-auto', 'running', \
+                'window-random', 'Random', 3, 1, 0, '2026-08-26T00:00:05Z', NULL\
+             );\
+             INSERT INTO sessions VALUES (\
+                'session-manual', 'outreach', '/home/arch', 'tmux-manual', 'running', \
+                'window-random', 'Random', 4, 1, 0, '2026-08-26T00:00:06Z', NULL\
+             );",
+        ) {
+            panic!("could not add fixture rows: {error}");
+        }
+        drop(connection);
+        let mut inventory = TmuxInventory::complete();
+        for (tmux_name, pane_id, path) in [
+            ("tmux-auto", "%51", "/cyber-a/bug-bounty/ipa"),
+            ("tmux-manual", "%52", "/cyber-a/bug-bounty/ipa"),
+            ("tmux-pinned", "%53", "/live/pinned"),
+        ] {
+            let pane_id = match PaneId::new(pane_id) {
+                Ok(value) => value,
+                Err(error) => panic!("invalid pane id: {error}"),
+            };
+            let live = match TmuxPaneState::new(pane_id, path, false) {
+                Ok(value) => value,
+                Err(error) => panic!("invalid tmux state: {error}"),
+            };
+            if let Err(error) = inventory.insert(tmux_name, live) {
+                panic!("could not add tmux state: {error}");
+            }
+        }
+        let first = match mirror(&fixture.database).load(&inventory, 100) {
+            Ok(value) => value,
+            Err(error) => panic!("could not load snapshot: {error}"),
+        };
+        let pane = |id: &str| {
+            first.windows()[1]
+                .panes()
+                .iter()
+                .find(|pane| pane.id().as_str() == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing pane {id}"))
+        };
+        let automatic = pane("session-auto");
+        assert_eq!(automatic.title(), "ipa");
+        assert!(automatic.automatic_title());
+        assert_eq!(automatic.cwd(), "/cyber-a/bug-bounty/ipa");
+        let manual = pane("session-manual");
+        assert_eq!(manual.title(), "outreach");
+        assert!(!manual.automatic_title());
+        let pinned = pane("session-pinned");
+        assert_eq!(pinned.title(), "Pinned");
+        assert!(!pinned.automatic_title());
+
+        // Moving the automatic tab changes its title and the revision.
+        let mut moved = TmuxInventory::complete();
+        for (tmux_name, pane_id, path) in [
+            ("tmux-auto", "%51", "/srv/other"),
+            ("tmux-manual", "%52", "/srv/other"),
+            ("tmux-pinned", "%53", "/live/pinned"),
+        ] {
+            let pane_id = match PaneId::new(pane_id) {
+                Ok(value) => value,
+                Err(error) => panic!("invalid pane id: {error}"),
+            };
+            let live = match TmuxPaneState::new(pane_id, path, false) {
+                Ok(value) => value,
+                Err(error) => panic!("invalid tmux state: {error}"),
+            };
+            if let Err(error) = moved.insert(tmux_name, live) {
+                panic!("could not add tmux state: {error}");
+            }
+        }
+        let second = match mirror(&fixture.database).load(&moved, 100) {
+            Ok(value) => value,
+            Err(error) => panic!("could not load snapshot: {error}"),
+        };
+        let titles: Vec<&str> = second.windows()[1]
+            .panes()
+            .iter()
+            .map(|pane| pane.title())
+            .collect();
+        assert!(titles.contains(&"other"));
+        assert!(titles.contains(&"outreach"));
+        assert_ne!(first.revision(), second.revision());
+    }
+
+    #[test]
+    fn explicit_name_intent_survives_reload_and_cross_window_move() {
+        let fixture = Fixture::new(true);
+        let connection = Connection::open(&fixture.database)
+            .unwrap_or_else(|error| panic!("open fixture: {error}"));
+        connection
+            .execute_batch(
+                "ALTER TABLE sessions ADD COLUMN automatic_name INTEGER;\
+             UPDATE sessions SET name = 'pinned', automatic_name = 0 WHERE id = 'session-pinned';\
+             UPDATE sessions SET name = 'paused', automatic_name = 1 WHERE id = 'session-paused';",
+            )
+            .unwrap_or_else(|error| panic!("set naming intent: {error}"));
+        let mut inventory = TmuxInventory::complete();
+        for (name, id, path) in [
+            ("tmux-pinned", "%1", "/server/changed"),
+            ("tmux-paused", "%2", "/server/ipa"),
+        ] {
+            let id = PaneId::new(id).unwrap_or_else(|error| panic!("pane id: {error}"));
+            let pane = TmuxPaneState::new(id, path, false)
+                .unwrap_or_else(|error| panic!("pane state: {error}"));
+            inventory
+                .insert(name, pane)
+                .unwrap_or_else(|error| panic!("inventory: {error}"));
+        }
+        let load = |at| {
+            mirror(&fixture.database)
+                .load(&inventory, at)
+                .unwrap_or_else(|error| panic!("load fixture: {error}"))
+        };
+        let first = load(100);
+        let first_window = &first.windows()[1];
+        assert_eq!(first_window.panes()[0].title(), "pinned");
+        assert!(!first_window.panes()[0].automatic_title());
+        assert_eq!(first_window.panes()[1].title(), "ipa");
+        assert!(first_window.panes()[1].automatic_title());
+        // No write occurs during projection; timestamp changes do not create
+        // revision churn or require registry updates at directory poll speed.
+        let database_before =
+            fs::read(&fixture.database).unwrap_or_else(|error| panic!("read fixture: {error}"));
+        let reloaded = load(200);
+        assert_eq!(reloaded.revision(), first.revision());
+        assert_eq!(fs::read(&fixture.database).ok(), Some(database_before));
+
+        connection.execute_batch(
+            "UPDATE sessions SET window_id = 'window-empty', window_title = 'Empty', tab_index = 0 \
+             WHERE id = 'session-paused';",
+        ).unwrap_or_else(|error| panic!("move fixture tab: {error}"));
+        let moved = load(300);
+        let moved_pane = &moved.windows()[0].panes()[0];
+        assert_eq!(moved_pane.id().as_str(), "session-paused");
+        assert_eq!(moved_pane.title(), "ipa");
+        assert!(moved_pane.automatic_title());
+        assert_eq!(moved_pane.cwd(), "/server/ipa");
+        assert_eq!(
+            moved_pane.tmux_target(),
+            first_window.panes()[1].tmux_target()
+        );
+        assert_eq!(moved.windows()[0].route(), first.windows()[0].route());
+        assert_eq!(moved.windows()[1].panes().len(), 1);
+        assert_eq!(moved.windows()[1].panes()[0].title(), "pinned");
+        assert_ne!(moved.revision(), first.revision());
+
+        // The rendered title can stay identical while intent changes; clients
+        // must still get the flag needed by the rename dialog.
+        connection
+            .execute_batch(
+                "UPDATE sessions SET name = 'ipa', automatic_name = 0 WHERE id = 'session-paused';",
+            )
+            .unwrap_or_else(|error| panic!("rename fixture: {error}"));
+        let manual = load(400);
+        assert_eq!(manual.windows()[0].panes()[0].title(), "ipa");
+        assert!(!manual.windows()[0].panes()[0].automatic_title());
+        assert_ne!(manual.revision(), moved.revision());
+
+        connection
+            .execute_batch("UPDATE sessions SET automatic_name = 2 WHERE id = 'session-paused';")
+            .unwrap_or_else(|error| panic!("malformed fixture: {error}"));
+        assert!(matches!(
+            mirror(&fixture.database).load(&inventory, 500),
+            Err(StateError::MalformedDatabaseRow("automatic_name"))
+        ));
     }
 }

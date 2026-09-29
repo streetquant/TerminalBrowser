@@ -13,6 +13,18 @@ from termdeck.workspace_recipe import WorkspaceRecipeError, load_recipe, parse_r
 
 
 class WorkspaceRecipeTests(unittest.TestCase):
+    def test_legacy_recipe_name_inference_and_explicit_override(self) -> None:
+        recipe = parse_recipe({"tabs": [
+            {"name": "arch", "command": "bash"},
+            {"name": "outreach", "command": "bash"},
+            {"name": "arch", "command": "bash", "automatic_name": False},
+            {"name": "initial", "command": "bash", "automatic_name": True},
+        ]}, base_dir="/home/arch")
+        self.assertEqual([tab.automatic_name for tab in recipe.windows[0].tabs], [True, False, False, True])
+        for invalid in ("false", 0, [], {}):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(WorkspaceRecipeError, "automatic_name must be true or false"):
+                parse_recipe({"tabs": [{"command": "bash", "automatic_name": invalid}]})
+
     def test_top_level_tabs_are_normalised_to_main_window(self) -> None:
         recipe = parse_recipe(
             {

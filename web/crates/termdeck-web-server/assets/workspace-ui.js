@@ -95,7 +95,7 @@ window.T1000UI = (() => {
       if (focused) rows.find(row => row.dataset.id === focused)?.firstChild.focus();
     }
   }
-  function attachWorkspace({ root, toolbar, menu, getPanes, selectPane, getTerminal, newTab, runAction, loadHidden, restoreHidden, getWindow, refresh }) {
+  function attachWorkspace({ root, toolbar, menu, getPanes, selectPane, getTerminal, newTab, runAction, loadHidden, restoreHidden, getWindow, refresh, snapshot, appPath }) {
     const management = window.T1000Management.workspace({root, toolbar, menu, getWindow, refresh, getTerminal});
     const modal = element("dialog", "workspace-dialog workspace-tools-dialog");
     modal.id = "workspace-tools-dialog";
@@ -239,11 +239,11 @@ window.T1000UI = (() => {
       modal.showModal();
       return true;
     }
-    function searchTabs(commands = false) {
-      if (!open(commands ? "Command palette" : "Search tabs")) return;
+    function searchTabs() {
+      if (!open("Search tabs")) return;
       const input = element("input", "");
       input.type = "search";
-      input.placeholder = commands ? "Search commands or tabs" : "Tab name or working directory";
+      input.placeholder = "Tab name or working directory";
       input.setAttribute("aria-label", input.placeholder);
       const results = element("div", "workspace-picker-results");
       const status = element("p", "subtle");
@@ -252,13 +252,6 @@ window.T1000UI = (() => {
       function render() {
         const query = input.value.trim().toLocaleLowerCase();
         const rows = [];
-        const actions = commands ? [
-          ["New tab", newTab], ["Show/hide Tabs pane", () => toggleSidebar()], ["Hidden tabs", hiddenTabs], ["Find in terminal", find], ["Terminal appearance", appearance], ["Keyboard shortcuts", shortcuts],
-          ["Rename tab", () => runAction("rename")], ["Hide tab", () => runAction("hide")],
-        ] : [];
-        for (const [name, action] of actions) {
-          if (name.toLocaleLowerCase().includes(query)) rows.push(button(name, () => { modal.close(); action(); }));
-        }
         for (const pane of getPanes()) {
           if (!`${pane.title} ${pane.cwd}`.toLocaleLowerCase().includes(query)) continue;
           const row = button("", () => { returnToTerminal = true; modal.close(); selectPane(pane.id); });
@@ -288,6 +281,11 @@ window.T1000UI = (() => {
       render();
       input.focus();
     }
+    const commandPalette = window.T1000CodexPalette({
+      open, element, button, body, modal, getPanes,
+      getSelectedId: () => selectedId, getGeneration: () => generation,
+      snapshot, appPath,
+    });
     function find() {
       if (!open("Find in terminal")) return;
       modal.onkeydown = null;
@@ -410,7 +408,7 @@ window.T1000UI = (() => {
       const side = select(["left", "right"].map(value => ({value, label: value})), shell.dataset.sidebarSide);
       const paneVisible = element("input"); paneVisible.type = "checkbox"; paneVisible.checked = !sidebar.hidden;
       body.append(element("h3", "settings-section", "Terminal"));
-      for (const [text, control] of [["Terminal palette", palette], ["Terminal font", font], ["Maximum text size (px)", size], ["Cursor shape", cursor], ["Blink cursor", blink]]) {
+      for (const [text, control] of [["Terminal palette", palette], ["Terminal font", font], ["Terminal text size (px)", size], ["Cursor shape", cursor], ["Blink cursor", blink]]) {
         control.setAttribute("aria-label", text);
         const label = element("label", control === blink ? "workspace-check" : "workspace-field");
         label.append(element("span", "", text), control);
@@ -423,7 +421,7 @@ window.T1000UI = (() => {
       for (const [text, control] of [["Interface theme", chrome], ["Density", density], ["Interface font", uiFont], ["Interface scale", scale], ["Sidebar position", side], ["Show Tabs pane", paneVisible], ["Reduce motion", motion]]) {
         control.setAttribute("aria-label", text); const label = element("label", control.type === "checkbox" ? "workspace-check" : "workspace-field"); label.append(element("span", "", text), control); body.append(label);
       }
-      const status = element("p", "subtle", "Saved only in this browser. Palettes match the desktop app. Fonts must be installed on this computer; otherwise monospace is used. Text fits the desktop terminal’s grid without resizing your desktop session.");
+      const status = element("p", "subtle", "Saved only in this browser. Fonts must be installed here. A larger font may make a remote client's fixed grid scroll inside this browser.");
       status.setAttribute("role", "status");
       body.append(status);
       function apply() {
@@ -485,7 +483,7 @@ window.T1000UI = (() => {
       if (!open("Keyboard shortcuts")) return;
       modal.onkeydown = null;
       const table = element("dl", "workspace-shortcuts");
-      for (const [action, keys] of [["New tab", "Ctrl + Alt + T"], ["Search tabs", "Ctrl + Shift + K"], ["Command palette", "Ctrl + Shift + P"], ["Find in terminal", "Ctrl + Shift + F"], ["Switch to tab 1–9", "Alt + 1–9"], ["Previous / next tab", "Ctrl + Page Up / Down"], ["Rename tab", "Double-click tab"], ["Tab actions", "Right-click tab"], ["Close menu or dialog", "Escape"]]) {
+      for (const [action, keys] of [["New tab", "Ctrl + Alt + T"], ["Search tabs", "Ctrl + Shift + K"], ["Launch Codex in directories", "Ctrl + Shift + P"], ["Find in terminal", "Ctrl + Shift + F"], ["Switch to tab 1–9", "Alt + 1–9"], ["Previous / next tab", "Ctrl + Page Up / Down"], ["Rename tab", "Double-click tab"], ["Tab actions", "Right-click tab"], ["Close menu or dialog", "Escape"]]) {
         table.append(element("dt", "", action), element("dd", "", keys));
       }
       body.append(table, element("p", "subtle", "Other keys are sent to the terminal. Browser-reserved shortcuts may vary by operating system."));
@@ -496,10 +494,10 @@ window.T1000UI = (() => {
     searchButton.title = "Search tabs (Ctrl+Shift+K)";
     searchButton.setAttribute("aria-label", "Search tabs");
     toolbar.append(searchButton);
-    const handlers = [["Show/hide Tabs pane", () => toggleSidebar()], ["Search tabs", () => searchTabs()], ["Hidden tabs", hiddenTabs], ["Command palette", () => searchTabs(true)], ["Find in terminal", find], ["Terminal appearance", appearance], ["Keyboard shortcuts", shortcuts]];
+    const handlers = [["Show/hide Tabs pane", () => toggleSidebar()], ["Search tabs", searchTabs], ["Hidden tabs", hiddenTabs], ["Launch Codex in directories", commandPalette], ["Find in terminal", find], ["Terminal appearance", appearance], ["Keyboard shortcuts", shortcuts]];
     window.addEventListener("keydown", event => {
       if (event.defaultPrevented || !event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey || root.querySelector("dialog[open]")) return;
-      const action = { k: () => searchTabs(), p: () => searchTabs(true), f: find }[event.key.toLowerCase()];
+      const action = { k: searchTabs, p: commandPalette, f: find }[event.key.toLowerCase()];
       if (action) { event.preventDefault(); event.stopPropagation(); action(); }
     }, true);
     return {

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
+from .command_render import directory_tab_name
 from .models import RECOVERY_INTENT_INACTIVE, SessionRecord
 from .session_store import SessionStore, utc_now
 
@@ -229,8 +230,11 @@ def move_records(
 def rename_record(store: SessionStore, record: SessionRecord, new_name: str) -> LifecycleResult:
     clean = new_name.strip()
     if not clean:
-        return LifecycleResult.from_record(record, "rename", ok=False, detail="new name is empty")
-    updated = store.update(record.id, name=clean, last_opened_at=utc_now())
+        # Persist intent independently of the text so a later explicit rename
+        # to the same basename can remain manual.
+        updated = store.update(record.id, name=directory_tab_name(record.cwd), automatic_name=True, last_opened_at=utc_now())
+        return LifecycleResult.from_record(updated, "rename", detail="restored automatic directory name; process state unchanged")
+    updated = store.update(record.id, name=clean, automatic_name=False, last_opened_at=utc_now())
     return LifecycleResult.from_record(updated, "rename", detail="renamed browser tab; process state unchanged")
 
 

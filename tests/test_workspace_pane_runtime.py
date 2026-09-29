@@ -47,6 +47,13 @@ class ProjectPaneRuntimeTest(TestCase):
                     command="{shell}",
                     cwd="/tmp/project",
                 ),
+                RecipeTab(
+                    name="project",
+                    tag="default",
+                    command="{shell}",
+                    cwd="/tmp/project",
+                    automatic_name=True,
+                ),
             ),
         )
 
@@ -55,6 +62,7 @@ class ProjectPaneRuntimeTest(TestCase):
 
         self.assertEqual(store.created[0]["command"], os.environ.get("SHELL", "/bin/sh"))
         self.assertNotIn("{shell}", store.created[0]["command"])
+        self.assertEqual([record["automatic_name"] for record in store.created], [False, True])
 
 
 if __name__ == "__main__":

@@ -140,6 +140,48 @@ def select(path, *, state_root=None, protected=()):
         directory.close()
 
 
+def immediate_directories(path, *, limit=128):
+    """List searchable direct children of an admitted host directory.
+
+    The list is only a picker snapshot. Each chosen path is admitted and pinned
+    again when its launch plan is created, so a renamed child cannot redirect a
+    launch to a replacement object.
+    """
+    parent = WorkspaceDirectory(path)
+    descriptor = -1
+    try:
+        descriptor = os.open(parent.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        if _identity(os.fstat(descriptor)) != parent.chain[-1]:
+            raise StagingError("Server directory changed while listing", "conflict")
+        children = []
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                if entry.name in {".", ".."} or "/" in entry.name or "\x00" in entry.name:
+                    continue
+                try:
+                    info = os.stat(entry.name, dir_fd=descriptor, follow_symlinks=False)
+                    if not stat.S_ISDIR(info.st_mode):
+                        continue
+                    child = WorkspaceDirectory(str(parent.path / entry.name))
+                    try:
+                        if child.chain[:-1] != parent.chain or child.chain[-1] != _identity(info):
+                            continue
+                        children.append({"name": entry.name, "path": str(child.path)})
+                    finally:
+                        child.close()
+                except (OSError, StagingError):
+                    # A child may be private or change during the listing.
+                    continue
+                if len(children) > limit:
+                    raise StagingError("Too many immediate directories; choose a narrower parent", "capacity")
+        parent.check()
+        return sorted(children, key=lambda item: (item["name"].casefold(), item["name"]))
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        parent.close()
+
+
 @contextmanager
 def open_workspace(workspace, *, state_root=None, protected=(), inspect=True):
     if "pin" not in workspace:

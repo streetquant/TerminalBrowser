@@ -20,10 +20,9 @@ from termdeck import client_files as cf
 
 @pytest.fixture
 def ordinary_workspace_root():
-    # The validation runner deliberately places tmp_path below /run, which is
-    # protected control storage. Only positive workspace scenarios use this
-    # owned ordinary tree; their staging/runtime fixtures retain runner isolation.
-    with tempfile.TemporaryDirectory(prefix="termdeck-workspace-", dir="/tmp") as directory:
+    # Use the runner's private temporary storage when configured. A fixed /tmp
+    # bypasses its quota and isolation controls on production hosts.
+    with tempfile.TemporaryDirectory(prefix="termdeck-workspace-", dir=os.environ.get("TMPDIR")) as directory:
         yield Path(directory)
 
 

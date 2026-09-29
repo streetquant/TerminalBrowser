@@ -12,6 +12,7 @@ import sqlite3
 import time
 import uuid
 
+from .command_render import directory_tab_name
 from .session_store import SessionStore, utc_now
 from .tmux_backend import TmuxBackend, TmuxError
 
@@ -262,7 +263,10 @@ def handle(store: SessionStore, request: object, *, backend=None):
     if any(row is None for row in rows):
         raise ManagementError("A selected tab no longer exists")
     if operation == "rename":
-        store.update(ids[0], name=text(request.get("name")))
+        # An empty name restores the automatic, directory-following name.
+        requested_name = text(request.get("name"), empty=True)
+        name = requested_name or directory_tab_name(rows[0].cwd)
+        store.update(ids[0], name=name, automatic_name=not requested_name)
         return {"ok": True}
     backend = backend or TmuxBackend()
     if operation == "capture":

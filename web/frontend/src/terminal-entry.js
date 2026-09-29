@@ -92,6 +92,15 @@ export function createTerminal(element, options = {}) {
   terminal.open(element);
 
   let webglAddon = null;
+  const notifyRendererLayout = () => {
+    // WebGL and canvas can measure a different cell width. Refit after the
+    // renderer has had a frame to settle, so the controller advertises the
+    // grid that actually fills its viewport to tmux.
+    window.requestAnimationFrame(() => {
+      invalidateFontMetrics();
+      options.onLayoutChange?.();
+    });
+  };
   const activateWebgl = () => {
     if (options.webgl === false || webglAddon) {
       return;
@@ -105,8 +114,10 @@ export function createTerminal(element, options = {}) {
           // The canvas renderer remains authoritative after a context loss.
         }
         webglAddon = null;
+        notifyRendererLayout();
       });
       terminal.loadAddon(webglAddon);
+      notifyRendererLayout();
     } catch (_ignored) {
       webglAddon = null;
     }
@@ -213,21 +224,15 @@ export function createTerminal(element, options = {}) {
     ) {
       return { ...lastGridFit.result };
     }
-    const maximum = Number.isFinite(options.fontSize)
+    // A passive viewer keeps the writer's canonical grid. Honour this
+    // browser's selected text size and expose overflow for scrolling instead
+    // of silently shrinking the font until the setting appears ineffective.
+    const chosen = Number.isFinite(options.fontSize)
       ? Math.max(MIN_FONT_SIZE, Math.floor(options.fontSize))
       : DEFAULT_FONT_SIZE;
-    let chosen = MIN_FONT_SIZE;
-    let fits = false;
-    for (let fontSize = maximum; fontSize >= MIN_FONT_SIZE; fontSize -= 1) {
-      terminal.options.fontSize = fontSize;
-      const proposed = proposedDimensions();
-      if (proposed && proposed.cols >= columns && proposed.rows >= rows) {
-        chosen = fontSize;
-        fits = true;
-        break;
-      }
-    }
     terminal.options.fontSize = chosen;
+    const proposed = proposedDimensions();
+    const fits = !!proposed && proposed.cols >= columns && proposed.rows >= rows;
     if (terminal.cols !== columns || terminal.rows !== rows) {
       terminal.resize(columns, rows);
     }

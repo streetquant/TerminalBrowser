@@ -335,8 +335,8 @@ class StagingStore:
             "detach": {"request_id", "reference", "attachment_id"},
             "download": {"reference", "file_index", "offset"},
             "cleanup": {"request_id"},
-            "launch-options": set(),
-            "create-window": {"request_id", "policy_revision", "name", "workspace_id", "workspace_path", "runtime", "tabs", "task", "attachments"},
+            "launch-options": {"directory"},
+            "create-window": {"request_id", "policy_revision", "name", "workspace_id", "workspace_path", "runtime", "tabs", "task", "attachments", "yolo"},
         }
         operation = request.get("operation")
         if not isinstance(operation, str) or operation not in allowed or set(request) - allowed[operation] - {"operation"}:
@@ -423,7 +423,7 @@ class StagingStore:
         op = request["operation"]
         if op == "launch-options":
             from .agent_launch import options
-            return options(self.root.parent)
+            return options(self.root.parent, request.get("directory"))
         if op == "create-window":
             from .agent_launch import prepare
             return prepare(self, db, tree, actor, request, machine, now)

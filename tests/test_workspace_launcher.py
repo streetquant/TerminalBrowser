@@ -1,10 +1,12 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from termdeck.session_actions import create_workspace_sessions
 from termdeck.session_store import SessionStore
 from termdeck.workspace_launcher import dry_run_workspace, open_workspace, open_workspace_file
-from termdeck.workspace_recipe import parse_recipe
+from termdeck.workspace_recipe import parse_recipe, recipe_export_json
 
 
 class FakeBackend:
@@ -21,6 +23,32 @@ class FakeBackend:
 
 
 class WorkspaceLauncherTests(unittest.TestCase):
+    def test_exported_recipe_preserves_name_intent_through_both_launch_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = SessionStore(Path(tmp) / "source.sqlite3", provision_auth_scopes=False)
+            restored = SessionStore(Path(tmp) / "restored.sqlite3", provision_auth_scopes=False)
+            actions = SessionStore(Path(tmp) / "actions.sqlite3", provision_auth_scopes=False)
+            try:
+                cwd = str(Path(tmp) / "arch")
+                source.create("arch", "automatic", "bash", cwd, automatic_name=True)
+                source.create("arch", "manual", "bash", cwd, automatic_name=False)
+                recipe = parse_recipe(json.loads(recipe_export_json(source.list())), base_dir=tmp)
+                first = open_workspace(recipe, restored, start=False)
+                second = open_workspace(recipe, restored, start=False, reuse=True)
+                self.assertEqual([row.session_id for row in first.rows], [row.session_id for row in second.rows])
+                self.assertEqual(len(restored.list()), 2)
+                create_workspace_sessions(actions, FakeBackend(), recipe, start=False)
+                for store in (restored, actions):
+                    self.assertEqual(
+                        {record.tag: record.automatic_name for record in store.list()},
+                        {"automatic": True, "manual": False},
+                    )
+                    self.assertTrue(all(record.name == "arch" and record.cwd == cwd for record in store.list()))
+            finally:
+                source.close()
+                restored.close()
+                actions.close()
+
     def _recipe(self, tmp):
         return parse_recipe(
             {

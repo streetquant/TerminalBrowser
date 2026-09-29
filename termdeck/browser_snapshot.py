@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .command_render import directory_tab_name
 from .models import (
     RECOVERY_INTENT_INACTIVE,
     RECOVERY_INTENT_LEGACY,
@@ -46,6 +47,7 @@ class SnapshotImportRow:
     created: bool
     planned: bool
     recovery_intent: str = RECOVERY_INTENT_LEGACY
+    automatic_name: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -65,6 +67,7 @@ class SnapshotImportRow:
             "created": self.created,
             "planned": self.planned,
             "recovery_intent": self.recovery_intent,
+            "automatic_name": self.automatic_name,
         }
 
 
@@ -129,6 +132,7 @@ def _record_to_tab(record: SessionRecord) -> dict[str, object]:
         "last_opened_at": record.last_opened_at,
         "selected_account": record.selected_account,
         "recovery_intent": record.recovery_intent,
+        "automatic_name": record.name_is_automatic,
     }
 
 
@@ -284,15 +288,20 @@ def parse_snapshot(data: Any) -> dict[str, Any]:
         for tab_index, raw_tab in enumerate(tabs):
             tab = _expect_dict(raw_tab, f"windows[{window_index}].tabs[{tab_index}]")
             command = _string(tab.get("command"), f"windows[{window_index}].tabs[{tab_index}].command")
+            name = _string(tab.get("name"), f"windows[{window_index}].tabs[{tab_index}].name", default=command.split()[0] if command.split() else "task")
+            cwd = _normalise_cwd(tab.get("cwd"), f"windows[{window_index}].tabs[{tab_index}].cwd")
             raw_status = str(tab.get("status") or "new").strip().lower()
             status = _normalise_status(tab.get("status"))
             parsed_tabs.append(
                 {
                     "original_id": _string(tab.get("session_id"), f"windows[{window_index}].tabs[{tab_index}].session_id", default=f"snapshot-{window_index + 1}-{tab_index + 1}"),
-                    "name": _string(tab.get("name"), f"windows[{window_index}].tabs[{tab_index}].name", default=command.split()[0] if command.split() else "task"),
+                    "name": name,
                     "tag": _string(tab.get("tag"), f"windows[{window_index}].tabs[{tab_index}].tag", default="default"),
                     "command": command,
-                    "cwd": _normalise_cwd(tab.get("cwd"), f"windows[{window_index}].tabs[{tab_index}].cwd"),
+                    "cwd": cwd,
+                    # Older snapshots predate explicit naming intent. Match
+                    # their legacy directory-name behavior when it is absent.
+                    "automatic_name": _bool(tab.get("automatic_name"), f"windows[{window_index}].tabs[{tab_index}].automatic_name", default=name == directory_tab_name(cwd)),
                     "status": status,
                     "visible": _bool(tab.get("visible"), f"windows[{window_index}].tabs[{tab_index}].visible", default=True),
                     "pinned": _bool(tab.get("pinned"), f"windows[{window_index}].tabs[{tab_index}].pinned", default=False),
@@ -380,6 +389,7 @@ def import_browser_snapshot(
                     tab_index=tab_index,
                     visible=visible,
                     pinned=bool(tab.get("pinned", False)),
+                    automatic_name=bool(tab["automatic_name"]),
                 )
                 requested_account = tab.get("selected_account")
                 record = store.update(
@@ -411,6 +421,7 @@ def import_browser_snapshot(
                     created=created,
                     planned=dry_run,
                     recovery_intent=recovery_intent,
+                    automatic_name=bool(tab["automatic_name"]),
                 )
             )
     return SnapshotImportResult(name=str(parsed["name"]), mode=clean_mode, dry_run=dry_run, count=len(rows), rows=tuple(rows))

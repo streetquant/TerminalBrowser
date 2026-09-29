@@ -2313,7 +2313,8 @@ class SessionStore:
                 recovery_attempts INTEGER NOT NULL DEFAULT 0,
                 recovery_last_attempt_at TEXT,
                 recovery_last_error TEXT,
-                recovery_intent TEXT NOT NULL DEFAULT 'legacy'
+                recovery_intent TEXT NOT NULL DEFAULT 'legacy',
+                automatic_name INTEGER CHECK (automatic_name IN (0, 1))
             )
             """
         )
@@ -2340,6 +2341,9 @@ class SessionStore:
         self._ensure_column("tab_index", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("visible", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column("pinned", "INTEGER NOT NULL DEFAULT 0")
+        # Leave historical rows NULL: old registries did not distinguish a
+        # default title from a manual title equal to the directory basename.
+        self._ensure_column("automatic_name", "INTEGER CHECK (automatic_name IN (0, 1))")
         self._ensure_column("pane_target", "TEXT")
         self._ensure_column("external", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("recovery_command", "TEXT")
@@ -2790,6 +2794,7 @@ class SessionStore:
         tab_index: int = 0,
         visible: bool = True,
         pinned: bool = False,
+        automatic_name: bool = False,
         environment: Mapping[str, str] | None = None,
         restart_policy: str = DEFAULT_RESTART_POLICY,
     ) -> SessionRecord:
@@ -2843,12 +2848,18 @@ class SessionStore:
             recovery_last_attempt_at=None,
             recovery_last_error=None,
             recovery_intent=RECOVERY_INTENT_INACTIVE,
+            automatic_name=bool(automatic_name),
         )
         self.upsert(record)
         return record
 
     def upsert(self, record: SessionRecord, *, preserve_legacy_intent: bool = False) -> None:
         existing = self.get(record.id)
+        if existing is not None and record.automatic_name is None:
+            # A legacy snapshot cannot erase naming intent recorded by a
+            # newer writer or change the old inference by updating cwd.
+            # Explicit renames use update with a boolean.
+            record = replace(record, automatic_name=existing.name_is_automatic)
         record = self._record_with_recovery_intent(
             record,
             existing=existing,
@@ -2887,6 +2898,7 @@ class SessionStore:
         payload["external"] = 1 if getattr(record, "external", False) else 0
         payload["auth_restart_required"] = 1 if getattr(record, "auth_restart_required", False) else 0
         payload["recovery_attempts"] = max(0, int(getattr(record, "recovery_attempts", 0)))
+        payload["automatic_name"] = None if record.automatic_name is None else int(record.automatic_name)
         self.conn.execute(
             """
             INSERT INTO sessions (
@@ -2895,7 +2907,7 @@ class SessionStore:
                 recovery_command, recovery_cwd, auth_scope_id, codex_home, selected_account,
                 pending_account, auth_restart_required, auth_changed_at,
                 recovery_recipe, recovery_recipe_sha256, restart_policy, recovery_attempts,
-                recovery_last_attempt_at, recovery_last_error, recovery_intent
+                recovery_last_attempt_at, recovery_last_error, recovery_intent, automatic_name
             )
             VALUES (
                 :id, :name, :tag, :command, :cwd, :tmux_name, :created_at, :last_opened_at,
@@ -2903,7 +2915,7 @@ class SessionStore:
                 :recovery_command, :recovery_cwd, :auth_scope_id, :codex_home, :selected_account,
                 :pending_account, :auth_restart_required, :auth_changed_at,
                 :recovery_recipe, :recovery_recipe_sha256, :restart_policy, :recovery_attempts,
-                :recovery_last_attempt_at, :recovery_last_error, :recovery_intent
+                :recovery_last_attempt_at, :recovery_last_error, :recovery_intent, :automatic_name
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -2933,7 +2945,8 @@ class SessionStore:
                 recovery_attempts = excluded.recovery_attempts,
                 recovery_last_attempt_at = excluded.recovery_last_attempt_at,
                 recovery_last_error = excluded.recovery_last_error,
-                recovery_intent = excluded.recovery_intent
+                recovery_intent = excluded.recovery_intent,
+                automatic_name = excluded.automatic_name
             """,
             payload,
         )
@@ -2968,6 +2981,11 @@ class SessionStore:
                 raise ValueError(f"{field} is immutable for terminal {session_id}")
         data: dict[str, Any] = dict(current.__dict__)
         data.update(changes)
+        if "automatic_name" not in changes:
+            # Name writes express a manual rename unless a directory observer
+            # explicitly retains automatic mode. Other changes freeze legacy
+            # inference before a cwd update can alter its meaning.
+            data["automatic_name"] = False if "name" in changes else current.name_is_automatic
         if "recovery_intent" in changes:
             data["recovery_intent"] = normalise_recovery_intent(
                 changes["recovery_intent"]
@@ -3481,6 +3499,7 @@ class SessionStore:
         return SessionRecord(
             id=row["id"],
             name=row["name"],
+            automatic_name=None if row["automatic_name"] is None else bool(row["automatic_name"]),
             tag=row["tag"],
             command=row["command"],
             cwd=row["cwd"],
