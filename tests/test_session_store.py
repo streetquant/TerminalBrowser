@@ -1,11 +1,14 @@
+import errno
 import json
 import os
+import select
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
 from unittest import mock
 
@@ -304,6 +307,452 @@ class SessionStoreTests(unittest.TestCase):
                 },
                 source_before,
             )
+
+    @staticmethod
+    def _stale_migration_pair(root: Path) -> tuple[Path, Path]:
+        legacy = root / "legacy" / "sessions.sqlite3"
+        target = root / "managed" / "sessions.sqlite3"
+        legacy_store = SessionStore(legacy)
+        try:
+            legacy_store.create("legacy", "dev", "codex", root)
+        finally:
+            legacy_store.close()
+        stale_store = SessionStore(target)
+        stale_store.close()
+        return legacy, target
+
+    def test_empty_wal_ctime_transition_is_validated_under_exclusive_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy, target = self._stale_migration_pair(Path(tmp))
+            real_open = session_store_module._open_exclusive_database
+            observed = []
+
+            def open_and_check_lock(destination):
+                wal = target.with_name(f"{target.name}-wal")
+                before = wal.stat()
+                connection = real_open(destination)
+                self.addCleanup(connection.close)
+                self.assertEqual(
+                    connection.execute("PRAGMA locking_mode").fetchone()[0],
+                    "exclusive",
+                )
+                competitor = sqlite3.connect(target, timeout=0.0)
+                try:
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                        competitor.execute("BEGIN IMMEDIATE")
+                finally:
+                    competitor.close()
+                # Deterministically reproduce SQLite's metadata-only WAL touch.
+                os.chmod(wal, before.st_mode & 0o777)
+                after = wal.stat()
+                self.assertEqual(wal.read_bytes(), b"")
+                self.assertEqual(
+                    session_store_module._file_signature(before)[:4],
+                    session_store_module._file_signature(after)[:4],
+                )
+                self.assertNotEqual(before.st_ctime_ns, after.st_ctime_ns)
+                observed.append((before.st_ctime_ns, after.st_ctime_ns))
+                return connection
+
+            with mock.patch.object(
+                session_store_module,
+                "_open_exclusive_database",
+                side_effect=open_and_check_lock,
+            ):
+                result = migrate_legacy_database(destination=target, legacy_path=legacy)
+            self.assertEqual(result.status, "repaired_existing")
+            self.assertEqual(len(observed), 1)
+            repaired = SessionStore(target)
+            try:
+                self.assertEqual([record.name for record in repaired.list()], ["legacy"])
+            finally:
+                repaired.close()
+
+    def test_migration_factories_close_descriptors_on_initialization_error(self):
+        faults = (
+            "regular-fstat", "snapshot-fstat", "snapshot-hash",
+            "sidecar-hash", "backup-fstat", "snapshot-hash-close-error",
+            "regular-fstat-close-error", "backup-fstat-close-error", "sidecar-hash-close-error",
+        )
+        for fault in faults:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "sessions.sqlite3"
+                source.write_bytes(b"owned descriptor fault fixture")
+                source.chmod(0o600)
+                source.with_name(f"{source.name}-wal").write_bytes(b"")
+                parent = session_store_module._open_pinned_directory(root, create=False)
+                real_open, real_fstat, real_close = os.open, os.fstat, os.close
+                real_hash = session_store_module._sha256_descriptor
+                opened = []
+                stat_calls = {}
+                hash_calls = []
+                failure = OSError(errno.EIO, "injected initialization failure")
+
+                def capture_open(*args, **kwargs):
+                    descriptor = real_open(*args, **kwargs)
+                    opened.append(descriptor)
+                    return descriptor
+
+                def failing_stat(descriptor):
+                    stat_calls[descriptor] = stat_calls.get(descriptor, 0) + 1
+                    if descriptor in opened and (
+                        fault.startswith(("regular-fstat", "backup-fstat"))
+                        or (fault == "snapshot-fstat" and stat_calls[descriptor] == 2)
+                    ):
+                        raise failure
+                    return real_fstat(descriptor)
+
+                def failing_hash(descriptor):
+                    hash_calls.append(descriptor)
+                    if fault in {"snapshot-hash", "snapshot-hash-close-error"} or (
+                        fault.startswith("sidecar-hash") and len(hash_calls) == 2
+                    ):
+                        raise failure
+                    return real_hash(descriptor)
+
+                def failing_close(descriptor):
+                    real_close(descriptor)
+                    if fault.endswith("close-error"):
+                        raise OSError(errno.EBADF, "injected secondary close failure")
+
+                try:
+                    with mock.patch.object(session_store_module.os, "open", side_effect=capture_open), \
+                        mock.patch.object(session_store_module.os, "fstat", side_effect=failing_stat), \
+                        mock.patch.object(session_store_module.os, "close", side_effect=failing_close), \
+                        mock.patch.object(session_store_module, "_sha256_descriptor", side_effect=failing_hash):
+                        with self.assertRaises(OSError) as observed:
+                            if fault.startswith("regular-fstat"):
+                                session_store_module._open_regular_at(
+                                    parent, source.name, label="owned test fixture", required=True,
+                                )
+                            elif fault.startswith("backup-fstat"):
+                                session_store_module._create_backup_directory(parent, source)
+                            else:
+                                session_store_module._open_legacy_snapshot_files(source, parent)
+                    self.assertIs(observed.exception, failure)
+                    self.assertGreater(len(opened), 0)
+                    for descriptor in opened:
+                        with self.assertRaises(OSError) as closed:
+                            real_fstat(descriptor)
+                        self.assertEqual(closed.exception.errno, errno.EBADF)
+                finally:
+                    # Red-before runs must also release only their own leaked fds.
+                    for descriptor in opened:
+                        try:
+                            real_close(descriptor)
+                        except OSError:
+                            pass
+                    parent.close()
+
+    def test_exclusive_open_rejects_mutated_database_files_before_replacement(self):
+        faults = (
+            "wal-replace", "wal-symlink", "wal-write", "wal-mtime",
+            "wal-mode", "wal-hardlink", "main-replace", "main-write",
+            "main-ctime", "shm-ctime", "journal-appeared",
+        )
+        for fault in faults:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                legacy, target = self._stale_migration_pair(root)
+                legacy_before = legacy.read_bytes()
+                real_open = session_store_module._open_exclusive_database
+                injected = []
+
+                def mutate_after_lock(destination):
+                    connection = real_open(destination)
+                    self.addCleanup(connection.close)
+                    wal = target.with_name(f"{target.name}-wal")
+                    before = wal.stat()
+                    self.assertEqual(wal.read_bytes(), b"")
+                    if fault in {"wal-replace", "wal-symlink"}:
+                        moved = wal.with_name("old-wal")
+                        wal.replace(moved)
+                        if fault == "wal-replace":
+                            wal.write_bytes(b"")
+                            wal.chmod(0o600)
+                        else:
+                            wal.symlink_to(moved)
+                    elif fault == "wal-write":
+                        wal.write_bytes(b"external writer")
+                        os.utime(wal, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    elif fault == "wal-mtime":
+                        os.utime(wal, ns=(before.st_atime_ns, before.st_mtime_ns + 1000000))
+                    elif fault == "wal-mode":
+                        wal.chmod(0o666)
+                    elif fault == "wal-hardlink":
+                        os.link(wal, root / "wal-alias")
+                    elif fault == "main-replace":
+                        before_main = target.read_bytes()
+                        target.replace(root / "old-main")
+                        target.write_bytes(before_main)
+                        target.chmod(0o600)
+                    elif fault == "main-write":
+                        before_main = target.stat()
+                        content = target.read_bytes()
+                        target.write_bytes(content[:-1] + bytes([content[-1] ^ 1]))
+                        os.utime(target, ns=(before_main.st_atime_ns, before_main.st_mtime_ns))
+                    elif fault == "main-ctime":
+                        target.chmod(target.stat().st_mode & 0o777)
+                    elif fault == "shm-ctime":
+                        shm = target.with_name(f"{target.name}-shm")
+                        shm.chmod(shm.stat().st_mode & 0o777)
+                    else:
+                        target.with_name(f"{target.name}-journal").write_bytes(b"")
+                    injected.append(target.read_bytes())
+                    return connection
+
+                with mock.patch.object(
+                    session_store_module, "_open_exclusive_database",
+                    side_effect=mutate_after_lock,
+                ), mock.patch.object(
+                    session_store_module, "_replace_database_from_snapshot",
+                ) as replace_database, self.assertRaises(SessionDatabaseMigrationError):
+                    migrate_legacy_database(destination=target, legacy_path=legacy)
+                replace_database.assert_not_called()
+                self.assertEqual(len(injected), 1)
+                self.assertEqual(target.read_bytes(), injected[0])
+                self.assertEqual(legacy.read_bytes(), legacy_before)
+                self.assertFalse(target.with_name(f".{target.name}.migration-receipt.json").exists())
+
+    def test_empty_wal_foreign_owner_and_backward_ctime_are_rejected(self):
+        for fault in ("foreign-owner", "backward-ctime"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                legacy, target = self._stale_migration_pair(Path(tmp))
+                real_open = session_store_module._open_exclusive_database
+                real_fstat = os.fstat
+                changed_identity = []
+
+                def open_with_changed_metadata(destination):
+                    wal = target.with_name(f"{target.name}-wal")
+                    before = wal.stat()
+                    connection = real_open(destination)
+                    self.addCleanup(connection.close)
+                    changed_identity.append((before.st_dev, before.st_ino, before.st_ctime_ns))
+                    return connection
+
+                def changed_fstat(descriptor):
+                    metadata = real_fstat(descriptor)
+                    for device, inode, ctime in changed_identity:
+                        if (metadata.st_dev, metadata.st_ino) != (device, inode):
+                            continue
+                        values = {
+                            field: getattr(metadata, field)
+                            for field in (
+                                "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns",
+                                "st_mode", "st_uid", "st_gid", "st_nlink",
+                            )
+                        }
+                        if fault == "foreign-owner":
+                            values["st_uid"] = os.geteuid() + 1
+                        else:
+                            values["st_ctime_ns"] = ctime - 1
+                        return SimpleNamespace(**values)
+                    return metadata
+
+                with mock.patch.object(
+                    session_store_module, "_open_exclusive_database",
+                    side_effect=open_with_changed_metadata,
+                ), mock.patch.object(
+                    session_store_module.os, "fstat", side_effect=changed_fstat,
+                ), mock.patch.object(
+                    session_store_module, "_replace_database_from_snapshot",
+                ) as replace_database, self.assertRaises(SessionDatabaseMigrationError):
+                    migrate_legacy_database(destination=target, legacy_path=legacy)
+                replace_database.assert_not_called()
+                self.assertEqual(len(changed_identity), 1)
+
+    def test_nonempty_wal_ctime_change_is_never_rebased(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy, target = self._stale_migration_pair(root)
+            origin = SessionStore(root / "origin" / "sessions.sqlite3")
+            try:
+                for suffix in ("", "-wal", "-shm"):
+                    component = origin.path.with_name(f"{origin.path.name}{suffix}")
+                    copied = target.with_name(f"{target.name}{suffix}")
+                    copied.write_bytes(component.read_bytes())
+                    copied.chmod(0o600)
+            finally:
+                origin.close()
+            real_open = session_store_module._open_exclusive_database
+            touched = []
+
+            def touch_nonempty_wal(destination):
+                wal = target.with_name(f"{target.name}-wal")
+                before = wal.stat()
+                self.assertGreater(before.st_size, 0)
+                connection = real_open(destination)
+                self.addCleanup(connection.close)
+                wal.chmod(before.st_mode & 0o777)
+                touched.append(True)
+                return connection
+
+            with mock.patch.object(
+                session_store_module, "_open_exclusive_database",
+                side_effect=touch_nonempty_wal,
+            ), mock.patch.object(
+                session_store_module, "_replace_database_from_snapshot",
+            ) as replace_database, self.assertRaises(SessionDatabaseMigrationError):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+            replace_database.assert_not_called()
+            self.assertEqual(touched, [True])
+
+    def test_target_change_before_exclusive_probe_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy, target = self._stale_migration_pair(Path(tmp))
+            target_inode = target.stat().st_ino
+            real_quiescent = session_store_module._assert_legacy_snapshot_quiescent
+            checks = []
+
+            def mutate_before_probe(files):
+                real_quiescent(files)
+                if files[""].signature[1] == target_inode:
+                    checks.append(True)
+                    if len(checks) == 2:
+                        wal = target.with_name(f"{target.name}-wal")
+                        metadata = wal.stat()
+                        os.utime(wal, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1000000))
+
+            with mock.patch.object(
+                session_store_module, "_assert_legacy_snapshot_quiescent",
+                side_effect=mutate_before_probe,
+            ), mock.patch.object(
+                session_store_module, "_open_exclusive_database",
+            ) as open_database, self.assertRaises(SessionDatabaseMigrationError):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+            open_database.assert_not_called()
+            self.assertEqual(len(checks), 2)
+
+    def test_repaired_target_swap_after_replacement_fails_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy, target = self._stale_migration_pair(root)
+            source_before = legacy.read_bytes()
+            target_before = target.read_bytes()
+            prior = sqlite3.connect(target.as_uri() + "?mode=ro", uri=True)
+            prior.row_factory = sqlite3.Row
+            try:
+                prior_summary = session_store_module._database_summary(prior)
+            finally:
+                prior.close()
+            moved = root / "original-target.sqlite3"
+            real_replace = session_store_module._replace_database_from_snapshot
+            calls = []
+
+            def replace_and_swap(snapshot, connection):
+                summary = real_replace(snapshot, connection)
+                calls.append(True)
+                if len(calls) == 1:
+                    target.replace(moved)
+                    target.write_bytes(target_before)
+                    target.chmod(0o600)
+                return summary
+
+            with mock.patch.object(
+                session_store_module, "_replace_database_from_snapshot",
+                side_effect=replace_and_swap,
+            ), self.assertRaisesRegex(SessionDatabaseMigrationError, "identity changed"):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+            self.assertEqual(len(calls), 2)  # replacement then rollback of the bound inode
+            self.assertEqual(target.read_bytes(), target_before)
+            restored = sqlite3.connect(moved.as_uri() + "?mode=ro", uri=True)
+            restored.row_factory = sqlite3.Row
+            try:
+                self.assertEqual(restored.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                self.assertEqual(session_store_module._database_summary(restored), prior_summary)
+            finally:
+                restored.close()
+            self.assertEqual(legacy.read_bytes(), source_before)
+            self.assertFalse(target.with_name(f".{target.name}.migration-receipt.json").exists())
+
+    def test_empty_wal_ctime_change_after_lock_validation_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy, target = self._stale_migration_pair(Path(tmp))
+            real_marker = session_store_module._install_migration_marker
+            touched = []
+
+            def touch_after_validation(snapshot, **kwargs):
+                real_marker(snapshot, **kwargs)
+                wal = target.with_name(f"{target.name}-wal")
+                wal.chmod(wal.stat().st_mode & 0o777)
+                touched.append(True)
+
+            with mock.patch.object(
+                session_store_module, "_install_migration_marker",
+                side_effect=touch_after_validation,
+            ), mock.patch.object(
+                session_store_module, "_replace_database_from_snapshot",
+            ) as replace_database, self.assertRaises(SessionDatabaseMigrationError):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+            replace_database.assert_not_called()
+            self.assertEqual(touched, [True])
+
+    def test_empty_wal_repair_requires_exclusive_connection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy, target = self._stale_migration_pair(Path(tmp))
+            opened = []
+
+            def open_without_exclusive_lock(destination):
+                connection = sqlite3.connect(str(destination), timeout=0.0)
+                connection.row_factory = sqlite3.Row
+                self.addCleanup(connection.close)
+                opened.append(True)
+                return connection
+
+            with mock.patch.object(
+                session_store_module, "_open_exclusive_database",
+                side_effect=open_without_exclusive_lock,
+            ), mock.patch.object(
+                session_store_module, "_replace_database_from_snapshot",
+            ) as replace_database, self.assertRaises(SessionDatabaseMigrationError):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+            replace_database.assert_not_called()
+            self.assertEqual(opened, [True])
+
+    def test_concurrent_managed_writer_prevents_empty_wal_repair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy, target = self._stale_migration_pair(Path(tmp))
+            real_open = session_store_module._open_exclusive_database
+            writers = []
+            child = (
+                "import sqlite3,sys; c=sqlite3.connect(sys.argv[1],timeout=0); "
+                "c.execute('BEGIN IMMEDIATE'); print('locked',flush=True); "
+                "sys.stdin.readline(); c.rollback(); c.close()"
+            )
+
+            def open_with_competing_writer(destination):
+                writer = subprocess.Popen(
+                    [sys.executable, "-c", child, str(target)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True,
+                )
+                writers.append(writer)
+                try:
+                    ready, _, _ = select.select([writer.stdout], [], [], 5)
+                    self.assertTrue(ready, "disposable writer did not signal readiness")
+                    self.assertEqual(writer.stdout.readline().strip(), "locked")
+                    return real_open(destination)
+                finally:
+                    try:
+                        writer.communicate("release\n", timeout=5)
+                    except subprocess.TimeoutExpired:
+                        writer.kill()
+                        writer.communicate(timeout=5)
+                        raise
+                    self.assertEqual(writer.returncode, 0)
+
+            with mock.patch.object(
+                session_store_module, "_open_exclusive_database",
+                side_effect=open_with_competing_writer,
+            ), mock.patch.object(
+                session_store_module, "_replace_database_from_snapshot",
+            ) as replace_database, self.assertRaisesRegex(
+                SessionDatabaseMigrationError, "changed or became busy",
+            ):
+                migrate_legacy_database(destination=target, legacy_path=legacy)
+            replace_database.assert_not_called()
+            self.assertEqual(len(writers), 1)
 
     def test_divergent_managed_database_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -830,6 +1279,7 @@ finally:
                 child = subprocess.run(
                     [sys.executable, "-c", writer_script, str(legacy)],
                     check=False,
+                    timeout=10,
                 )
                 observed.append(child.returncode)
                 return real_link(*args, **kwargs)
@@ -879,6 +1329,8 @@ connection.close()
                 text=True,
             )
             try:
+                ready, _, _ = select.select([holder.stdout], [], [], 5)
+                self.assertTrue(ready, "disposable holder did not signal readiness")
                 self.assertEqual(holder.stdout.readline().strip(), "READY")  # type: ignore[union-attr]
                 with mock.patch.object(
                     session_store_module,
@@ -897,7 +1349,12 @@ connection.close()
                             legacy_path=legacy,
                         )
             finally:
-                holder.communicate("\n", timeout=5)
+                try:
+                    holder.communicate("\n", timeout=5)
+                except subprocess.TimeoutExpired:
+                    holder.kill()
+                    holder.communicate(timeout=5)
+                    raise
 
     def test_copied_component_hash_mismatch_never_publishes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1169,6 +1626,7 @@ os._exit(0)
             subprocess.run(
                 [sys.executable, "-c", script, str(legacy)],
                 check=True,
+                timeout=10,
             )
             journal = legacy.with_name(f"{legacy.name}-journal")
             self.assertTrue(journal.is_file())

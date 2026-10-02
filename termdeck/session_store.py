@@ -300,11 +300,17 @@ def _open_regular_at(
         return None
     except OSError as exc:
         raise SessionDatabaseMigrationError(f"cannot open {label}: {exc}") from exc
-    metadata = os.fstat(descriptor)
-    if not stat.S_ISREG(metadata.st_mode):
-        os.close(descriptor)
-        raise SessionDatabaseMigrationError(f"{label} must be a regular file")
-    return descriptor
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SessionDatabaseMigrationError(f"{label} must be a regular file")
+        return descriptor
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
 
 
 def _open_legacy_snapshot_files(
@@ -326,25 +332,34 @@ def _open_legacy_snapshot_files(
             )
             if descriptor is None:
                 continue
-            metadata = os.fstat(descriptor)
-            if require_private and (
-                metadata.st_uid != os.geteuid()
-                or stat.S_IMODE(metadata.st_mode) & 0o022
-            ):
-                os.close(descriptor)
-                raise SessionDatabaseMigrationError(
-                    "cannot prove that the legacy session database is private"
+            try:
+                metadata = os.fstat(descriptor)
+                if require_private and (
+                    metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o022
+                ):
+                    raise SessionDatabaseMigrationError(
+                        "cannot prove that the legacy session database is private"
+                    )
+                files[suffix] = _LegacySnapshotFile(
+                    name=name,
+                    descriptor=descriptor,
+                    signature=_file_signature(metadata),
+                    sha256=_sha256_descriptor(descriptor),
                 )
-            files[suffix] = _LegacySnapshotFile(
-                name=name,
-                descriptor=descriptor,
-                signature=_file_signature(metadata),
-                sha256=_sha256_descriptor(descriptor),
-            )
+            except Exception:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                raise
         return files
     except Exception:
         for item in files.values():
-            item.close()
+            try:
+                item.close()
+            except OSError:
+                pass
         raise
 
 
@@ -1538,6 +1553,70 @@ def _open_exclusive_database(destination: Path) -> sqlite3.Connection:
         ) from exc
 
 
+def _open_validated_exclusive_database(
+    destination: Path,
+    parent: _PinnedDirectory,
+    files: dict[str, _LegacySnapshotFile],
+) -> sqlite3.Connection:
+    """Bind only SQLite's empty-WAL ctime touch to its exclusive lock probe.
+
+    All files must pass the original snapshot checks immediately before the
+    probe. SQLite may truncate an already empty WAL while acquiring its lock,
+    changing ctime without changing mtime or bytes. Revalidate every component
+    with that one new ctime, then retain the full signature for publication.
+    """
+
+    wal = files.get("-wal")
+    wal_before = os.fstat(wal.descriptor) if wal is not None else None
+    _validate_legacy_snapshot_files(destination, parent, files)
+    connection = _open_exclusive_database(parent.proc_path / destination.name)
+    try:
+        locking_mode = connection.execute("PRAGMA locking_mode").fetchone()
+        if locking_mode is None or str(locking_mode[0]).casefold() != "exclusive":
+            raise SessionDatabaseMigrationError(
+                "managed session database exclusive lock was not established"
+            )
+        validated_files = dict(files)
+        if wal is not None and wal.signature[2] == 0:
+            assert wal_before is not None
+            wal_after = os.fstat(wal.descriptor)
+            signature = _file_signature(wal_after)
+            if (
+                _file_signature(wal_before) != wal.signature
+                or signature[:4] != wal.signature[:4]
+                or signature[4] < wal.signature[4]
+                or wal_before.st_uid != os.geteuid()
+                or stat.S_IMODE(wal_before.st_mode) != 0o600
+                or wal_before.st_nlink != 1
+                or (
+                    wal_before.st_mode,
+                    wal_before.st_uid,
+                    wal_before.st_gid,
+                    wal_before.st_nlink,
+                ) != (
+                    wal_after.st_mode,
+                    wal_after.st_uid,
+                    wal_after.st_gid,
+                    wal_after.st_nlink,
+                )
+            ):
+                raise SessionDatabaseMigrationError(
+                    "managed session database WAL changed during exclusive locking"
+                )
+            validated_files["-wal"] = replace(wal, signature=signature)
+        _validate_legacy_snapshot_files(destination, parent, validated_files)
+        if wal is not None:
+            wal.signature = validated_files["-wal"].signature
+        return connection
+    except Exception as exc:
+        connection.close()
+        if isinstance(exc, sqlite3.Error):
+            raise SessionDatabaseMigrationError(
+                "managed session database changed or became busy during migration"
+            ) from exc
+        raise
+
+
 def _replace_database_from_snapshot(
     source: Path,
     destination_connection: sqlite3.Connection,
@@ -1638,7 +1717,14 @@ def _create_backup_directory(
         raise SessionDatabaseMigrationError(
             "cannot create managed session database backup"
         ) from exc
-    metadata = os.fstat(descriptor)
+    try:
+        metadata = os.fstat(descriptor)
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
     backup_path = destination.parent / name
     return (
         _PinnedDirectory(
@@ -1936,8 +2022,10 @@ def migrate_legacy_database(
                     destination_connection.close()
                 _validate_legacy_snapshot_files(target, target_parent, target_files)
                 _assert_legacy_snapshot_quiescent(target_files)
-                target_connection = _open_exclusive_database(
-                    target_parent.proc_path / target.name
+                target_connection = _open_validated_exclusive_database(
+                    target,
+                    target_parent,
+                    target_files,
                 )
                 _validate_bound_path(
                     target_parent,
