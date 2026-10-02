@@ -99,10 +99,126 @@ the host user's ordinary `HOME` and environment, with the intended per-tab
 controller's responsibility.
 
 New configured Codex tasks use the installed CLI's `--no-alt-screen` mode, so
-ordinary terminal scrollback can retain their output. The configured Codex
-executable must support this flag (the qualified 0.157.1 CLI does). This applies
-when those tasks start or resume; TermDeck does not restart an existing Codex
-process or rewrite commands typed manually into a shell tab.
+ordinary terminal scrollback can retain their output. They also pass
+`--no-daemon` on initial launch and resume: a shared daemon can retain another
+home's startup account and state. The configured executable must advertise both
+arguments. TermDeck does not restart an existing Codex process or rewrite
+commands typed manually into a shell tab.
+
+### Reviewed native policy upgrades
+
+After a global `npm install -g @openai/codex` changes the native executable, the
+next policy admission automatically runs the same native qualification used by
+the policy producer. For a stored npm runtime it first runs the pinned shared
+preflight helper at `/home/arch/.local/libexec/codex-npm-platform-preflight.py`
+(SHA-256 `f50a5b962bd651fe215ebbf96792e74cfbe7c14f497bb1952d8f1dea583890db`)
+against the same prefix's `bin/codex` entrypoint. That helper uses Node's current
+`createRequire` result, so it selects a same-prefix nested or flat platform
+package, or the supported bundled fallback. It does not follow a stale native
+path when an npm update leaves the old package behind, and it can resolve the
+replacement when that old file has been removed. TermDeck then requires the
+resolved path to match one of those layouts under the already approved prefix,
+qualifies an executable x86_64 ELF, checks `--version` and the required help
+flags, and uses a locked compare-and-swap to change only the saved executable
+path and digest. It probes in fresh private homes without inherited credentials
+or configuration. If the helper is missing, changed, or rejects the package,
+the saved policy stays unchanged and configured launches fail closed. A policy
+revision change invalidates plans made against the old digest; retry the policy
+read and create a fresh launch plan.
+
+Policies that explicitly pin an executable outside these npm layouts retain
+their existing exact-digest admission and do not use the automatic npm refresh.
+An executable inside a recognized npm layout cannot fall back to that behavior
+when the shared preflight rejects its entrypoint or package ancestry.
+
+Each successful automatic refresh retains a private `.web-launch-policy-auto-*`
+bundle inside the TermDeck state directory with the exact before/after policy,
+native source receipts, validation copy, and manifest. This local qualification
+checks the installed package layout and executable behavior. It does not
+authenticate the npm publisher, prove provider login, or establish successful
+interactive execution. Existing terminals remain pinned to their running
+processes. The refresh does not edit npm's installation, select an account, or
+restart tabs or services.
+
+Rollback restores the exact previous policy and writes a private pause record
+bound to that policy digest, executable path, qualified native digest, and
+version. The same installed binary will remain held after rollback instead of
+being immediately refreshed again. A different package binary can be qualified
+on a later policy read. To intentionally re-admit the held binary, use the
+operator-reviewed `launch-policy prepare` and `apply` route below.
+
+The `t1000 launch-policy` command also supports an operator-reviewed policy
+upgrade. It does not install Codex, select an account, start a terminal, restart
+a service, or change managed release attestations. Build and install the
+TermDeck CLI through the normal verified release workflow before using the
+command in an installed system. This explicit route is useful when an operator
+wants to qualify a package before the next launch admission.
+
+Preparation requires the exact existing policy digest, the absolute native ELF
+path currently selected by the same-prefix `bin/codex` entrypoint, and a new
+output directory inside an owned 0700 directory. It uses the pinned shared
+preflight helper and accepts only its nested, flat or bundled Linux x64 result.
+It discovers the stable version from the current main npm package and requires
+the native version/help probes to agree. An optional `--version` pins an
+independently reviewed expected version. It saves the exact policy backup,
+candidate and review manifest without changing the target policy:
+
+```sh
+t1000 launch-policy prepare \
+  --state-dir /absolute/session-state \
+  --expected-policy-sha256 <reviewed-current-policy-digest> \
+  --native /absolute/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex \
+  --output /absolute/private-review/new-bundle
+```
+
+Review `before.json`, `after.json` and `manifest.json`. Only the Codex executable
+path and digest may differ; workspaces and the account source must remain the
+same. The shared preflight checks the main and Linux x64 npm package names,
+versions, dependency relationship and physical ancestry. TermDeck checks file
+owners and permissions, descriptor/path identity, and a native ELF header.
+Version/help probes execute the pinned descriptor in fresh private homes
+without inherited credentials or configuration. Those checks
+establish local identity and argument support; they do not authenticate a package
+publisher, prove provider login, or establish successful interactive execution.
+If the main and platform package metadata disagree, the executable probes fail,
+or the reviewed preimage has changed, prepare refuses to create a publishable
+manifest. This is a digest refresh after qualification, not a way to bless an
+arbitrary executable or bypass the pinned package layout.
+
+After reviewing the manifest digest returned by preparation, publication uses:
+
+```sh
+t1000 launch-policy apply --state-dir /absolute/session-state \
+  --bundle /absolute/private-review/new-bundle \
+  --manifest-sha256 <reviewed-manifest-digest>
+```
+
+The command requalifies the native files and the existing launch reader before
+publication. It uses a fixed native flock, checks the exact old bytes and file
+identity, fsyncs an exclusively created temporary file, atomically replaces the
+policy, and fsyncs its parent. Changes to the old policy, review files, package
+files or directory identities require a fresh preparation. Symlinks, hardlinks,
+foreign ownership, writable-by-others package paths and ambiguous paths are
+rejected. The flock serializes this supported producer; unrelated processes
+running as the same host UID must not write the policy concurrently.
+
+For an exact rollback, use the same bundle and reviewed digest:
+
+```sh
+t1000 launch-policy rollback --state-dir /absolute/session-state \
+  --bundle /absolute/private-review/new-bundle \
+  --manifest-sha256 <reviewed-manifest-digest>
+```
+
+Rollback requires the current policy to equal the reviewed candidate and restores
+the backup bytes, including an old digest that may intentionally fail native
+admission. It does not downgrade the executable or overwrite later operator
+edits. The exact-binary pause record prevents an automatic refresh from undoing
+that rollback. Retain the bundle until acceptance and any rollback are complete.
+A failed publication, especially a post-rename durability failure, requires
+inspecting the retained evidence and actual policy; an error does not promise
+that the old policy remains active. No automatic reset or service restart is
+attempted.
 
 The selected host shell's normal startup files provide its settings and tool
 paths. Configured launches validate their saved authorization before login

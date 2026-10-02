@@ -9,6 +9,13 @@ import unittest
 from termdeck.cli import _persist_auth_update_with_retry, _prepare_managed_session_database, _select_records, build_parser, cmd_activity, cmd_archive, cmd_auth, cmd_auth_gc, cmd_budget_plan, cmd_capture, cmd_checkpoint, cmd_control_plan, cmd_diagnose_freeze, cmd_diagnostics, cmd_gui, cmd_health, cmd_hide, cmd_kill, cmd_move, cmd_new, cmd_palette, cmd_pause_over_budget, cmd_pin, cmd_reconcile, cmd_recovery_intent, cmd_recently_closed, cmd_rename, cmd_reopen_closed, cmd_retag, cmd_search, cmd_send, cmd_sessions, cmd_settings_sample, cmd_shortcuts, cmd_show, cmd_tasks, cmd_terminator_workspace, cmd_unpin, cmd_windows, cmd_workspace_export, cmd_workspace_open, cmd_workspace_plan
 
 
+def _json_from_cli(raw):
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
+        raise AssertionError("CLI output or fixture must contain valid JSON") from exc
+
+
 class CliTests(unittest.TestCase):
     def test_managed_cli_defers_without_touching_legacy_registry(self):
         from pathlib import Path
@@ -100,7 +107,10 @@ class CliTests(unittest.TestCase):
         self.assertTrue(management._uses_session_db)
         staging = parser.parse_args(["client-files", "--db", "/private/state/sessions.sqlite3", "--auth-dir", "/private/auth"])
         self.assertTrue(staging._uses_session_db)
-        self.assertEqual(choices, ['activity', 'adopt-tmux', 'agent-launch', 'archive', 'auth', 'auth-gc', 'auth-rebind-config', 'budget-plan', 'capture', 'checkpoint', 'client-files', 'control-plan', 'diagnose-freeze', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-checkpoint-service', 'install-desktop', 'kill', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'quickstart', 'recently-closed', 'reconcile', 'recovery-intent', 'recovery-qualification', 'release', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'terminator-workspace', 'uninstall-checkpoint-service', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
+        policy = parser.parse_args(["launch-policy", "apply", "--state-dir", "/private/state",
+                                   "--bundle", "/private/review", "--manifest-sha256", "0" * 64])
+        self.assertFalse(policy._uses_session_db)
+        self.assertEqual(choices, ['activity', 'adopt-tmux', 'agent-launch', 'archive', 'auth', 'auth-gc', 'auth-rebind-config', 'budget-plan', 'capture', 'checkpoint', 'client-files', 'control-plan', 'diagnose-freeze', 'diagnostics', 'doctor', 'gui', 'health', 'hide', 'install-checkpoint-service', 'install-desktop', 'kill', 'launch-policy', 'move', 'new', 'palette', 'parse-terminator', 'pause', 'pause-hot', 'pause-over-budget', 'pin', 'quickstart', 'recently-closed', 'reconcile', 'recovery-intent', 'recovery-qualification', 'release', 'rename', 'reopen-closed', 'restore-plan', 'resume', 'retag', 'search', 'search-output', 'send', 'sessions', 'settings-sample', 'shortcuts', 'show', 'snapshot-export', 'snapshot-import', 'tasks', 'terminator-workspace', 'uninstall-checkpoint-service', 'uninstall-desktop', 'unpin', 'windows', 'workspace-export', 'workspace-open', 'workspace-plan'])
 
 
     def test_shortcuts_command_outputs_json_with_terminator_override(self):
@@ -118,7 +128,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_shortcuts(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload["action"], "shortcuts")
             self.assertTrue(any(row["source"] == "terminator" and row["accelerator"] == "<Alt>t" for row in payload["shortcuts"]))
 
@@ -147,7 +157,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_terminator_workspace(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload["name"], "terminator-default")
             self.assertEqual(payload["windows"][0]["title"], "Agents")
             self.assertEqual(payload["windows"][0]["tabs"][0]["command"], "codex")
@@ -172,7 +182,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_tasks(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(len(payload), 1)
             self.assertEqual(payload[0]["name"], "codex-one")
             self.assertEqual(payload[0]["window"], "Agents")
@@ -204,7 +214,7 @@ class CliTests(unittest.TestCase):
                 with contextlib.redirect_stdout(buffer):
                     code = cmd_activity(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload[0]["state"], "needs input")
             self.assertTrue(payload[0]["redacted"])
             self.assertNotIn("sk-proj-1234567890abcdefghijk", payload[0]["preview"])
@@ -233,7 +243,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_new(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["action"], "new")
             tab = payload["tabs"][0]
@@ -279,7 +289,7 @@ class CliTests(unittest.TestCase):
                 code = cmd_auth(args)
 
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload["selected_account"], "work")
             self.assertTrue(payload["auth_restart_required"])
             store = SessionStore(db_path, account_source=pathlib.Path(tmp) / "empty-source")
@@ -376,7 +386,7 @@ class CliTests(unittest.TestCase):
                 calls,
                 ["state", "plan", "quiesce", ("switch", "work"), "apply"],
             )
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["selected_account"], "work")
             self.assertTrue(payload["auth_activation_ok"])
@@ -460,7 +470,7 @@ class CliTests(unittest.TestCase):
                 code = cmd_auth(args)
 
             self.assertEqual(code, 1)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertFalse(payload["ok"])
             self.assertIsNone(payload["selected_account"])
             self.assertTrue(payload["auth_restart_required"])
@@ -535,7 +545,7 @@ class CliTests(unittest.TestCase):
             manager.state.assert_called_once()
             manager.switch.assert_not_called()
             manager.restore.assert_not_called()
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertFalse(payload["ok"])
             self.assertEqual(payload["selected_account"], "personal")
             self.assertIn("not exact", payload["error"])
@@ -638,7 +648,7 @@ class CliTests(unittest.TestCase):
                     "apply",
                 ],
             )
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertFalse(payload["ok"])
             self.assertEqual(payload["selected_account"], "personal")
             self.assertFalse(payload["auth_restart_required"])
@@ -861,7 +871,7 @@ class CliTests(unittest.TestCase):
                 code = cmd_auth(args)
 
             self.assertEqual(code, 2)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertFalse(payload["ok"])
             self.assertIn("cannot be retroactively isolated", payload["error"])
             manager.assert_not_called()
@@ -895,7 +905,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_windows(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual([row["title"] for row in payload], ["Agents", "Dev"])
             self.assertEqual(payload[0]["tab_count"], 1)
             self.assertIn("cpu_percent", payload[1])
@@ -920,7 +930,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_diagnostics(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload["schema"], "termdeck.diagnostics")
             self.assertEqual(payload["sessions"]["counts"]["total"], 1)
             self.assertFalse(payload["privacy"]["captures_included"])
@@ -931,7 +941,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_diagnostics(zip_args)
             self.assertEqual(code, 0)
-            bundle = json.loads(buffer.getvalue())
+            bundle = _json_from_cli(buffer.getvalue())
             self.assertTrue(bundle["ok"])
             self.assertTrue(out_path.exists())
             with zipfile.ZipFile(out_path) as archive:
@@ -950,7 +960,7 @@ class CliTests(unittest.TestCase):
             code = cmd_diagnose_freeze(args)
 
         self.assertEqual(code, 0)
-        payload = json.loads(buffer.getvalue())
+        payload = _json_from_cli(buffer.getvalue())
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["action"], "diagnose-freeze")
         build.assert_called_once_with(db_path=args.db, auth_root=args.auth_root)
@@ -971,7 +981,7 @@ class CliTests(unittest.TestCase):
             code = cmd_auth_gc(args)
 
         self.assertEqual(code, 0)
-        payload = json.loads(buffer.getvalue())
+        payload = _json_from_cli(buffer.getvalue())
         self.assertTrue(payload["dry_run"])
         self.assertFalse(payload["mutation_available"])
         self.assertIn("dry-run only", payload["detail"])
@@ -986,7 +996,7 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stdout(buffer):
             code = cmd_settings_sample(argparse.Namespace())
         self.assertEqual(code, 0)
-        payload = json.loads(buffer.getvalue())
+        payload = _json_from_cli(buffer.getvalue())
         self.assertIn("health", payload)
         self.assertIn("tags", payload)
 
@@ -1018,7 +1028,7 @@ class CliTests(unittest.TestCase):
             ), contextlib.redirect_stdout(buffer):
                 code = cmd_reconcile(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload["action"], "reconcile")
             self.assertEqual(payload["changed"], 1)
             self.assertEqual(payload["sessions"][0]["after_status"], "stopped")
@@ -1038,7 +1048,7 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stdout(buffer):
             code = cmd_health(args)
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(buffer.getvalue()), [])
+        self.assertEqual(_json_from_cli(buffer.getvalue()), [])
 
     def test_palette_command_outputs_actions(self):
         args = argparse.Namespace(query="master", db=":memory:", all=False, limit=50)
@@ -1046,7 +1056,7 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stdout(buffer):
             code = cmd_palette(args)
         self.assertEqual(code, 0)
-        payload = json.loads(buffer.getvalue())
+        payload = _json_from_cli(buffer.getvalue())
         self.assertEqual(payload[0]["id"], "builtin:master")
         self.assertEqual(payload[0]["kind"], "builtin")
 
@@ -1068,7 +1078,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_workspace_export(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload["name"], "demo")
             self.assertEqual(payload["windows"][0]["title"], "Dev")
             self.assertEqual(payload["windows"][0]["tabs"][0]["name"], "api")
@@ -1099,7 +1109,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_workspace_open(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload["action"], "workspace-open")
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["count"], 2)
@@ -1128,7 +1138,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_workspace_open(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertTrue(payload["dry_run"])
             self.assertEqual(payload["sessions"][0]["status"], "planned-register")
 
@@ -1144,7 +1154,7 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stdout(buffer):
             code = cmd_workspace_plan(args)
         self.assertEqual(code, 0)
-        payload = json.loads(buffer.getvalue())
+        payload = _json_from_cli(buffer.getvalue())
         self.assertIn("windows", payload)
 
     def test_select_records_targets_by_tag_name_and_prefix(self):
@@ -1216,7 +1226,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_sessions(argparse.Namespace(db=db_path, all=True, window_id="win-a"))
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual([row["id"] for row in payload], [expected.id])
 
     def test_control_plan_command_outputs_safety_json(self):
@@ -1237,7 +1247,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_control_plan(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload["action"], "send")
             self.assertEqual(payload["count"], 2)
             self.assertTrue(payload["requires_confirmation"])
@@ -1261,7 +1271,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_send(args)
             self.assertEqual(code, 2)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload["action"], "send")
             self.assertTrue(payload["requires_confirmation"])
 
@@ -1278,7 +1288,7 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stdout(sample_buffer):
             sample_code = cmd_budget_plan(sample_args)
         self.assertEqual(sample_code, 0)
-        self.assertIn("budgets", json.loads(sample_buffer.getvalue()))
+        self.assertIn("budgets", _json_from_cli(sample_buffer.getvalue()))
 
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "sessions.sqlite3"
@@ -1295,7 +1305,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_budget_plan(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload["action"], "budget-plan")
             self.assertEqual(payload["count"], 1)
             self.assertTrue(payload["sessions"][0]["over_budget"])
@@ -1322,7 +1332,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_pause_over_budget(args)
             self.assertEqual(code, 2)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload["action"], "pause-over-budget")
             self.assertTrue(payload["requires_confirmation"])
             self.assertIn("budget_reasons", payload)
@@ -1351,7 +1361,7 @@ class CliTests(unittest.TestCase):
                 with contextlib.redirect_stdout(buffer):
                     code = cmd_capture(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertTrue(payload[0]["redacted"])
             self.assertTrue({"Authorization header", "Bearer token"} & set(payload[0]["redaction_labels"]))
             self.assertNotIn("abcdefghijklmnopqrstuvwxyz", payload[0]["capture"])
@@ -1375,25 +1385,25 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_rename(argparse.Namespace(db=db_path, selector=record.id, name="codex-main"))
             self.assertEqual(code, 0)
-            self.assertEqual(json.loads(buffer.getvalue())["sessions"][0]["name"], "codex-main")
+            self.assertEqual(_json_from_cli(buffer.getvalue())["sessions"][0]["name"], "codex-main")
 
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
                 code = cmd_retag(argparse.Namespace(db=db_path, new_tag="bugbounty", selectors=[record.id], tag=None, all=False))
             self.assertEqual(code, 0)
-            self.assertEqual(json.loads(buffer.getvalue())["sessions"][0]["tag"], "bugbounty")
+            self.assertEqual(_json_from_cli(buffer.getvalue())["sessions"][0]["tag"], "bugbounty")
 
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
                 code = cmd_hide(argparse.Namespace(db=db_path, selectors=[record.id], tag=None, all=False))
             self.assertEqual(code, 0)
-            self.assertFalse(json.loads(buffer.getvalue())["sessions"][0]["visible"])
+            self.assertFalse(_json_from_cli(buffer.getvalue())["sessions"][0]["visible"])
 
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
                 code = cmd_show(argparse.Namespace(db=db_path, selectors=[record.id], tag=None, all=False, window_id="visible", window_title="Visible", tab_index=None))
             self.assertEqual(code, 0)
-            shown = json.loads(buffer.getvalue())["sessions"][0]
+            shown = _json_from_cli(buffer.getvalue())["sessions"][0]
             self.assertTrue(shown["visible"])
             self.assertEqual(shown["window_title"], "Visible")
 
@@ -1401,14 +1411,14 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_move(argparse.Namespace(db=db_path, selectors=[record.id, second.id], tag=None, all=False, window_id="ops", window_title="Ops", tab_index=4, hidden=False))
             self.assertEqual(code, 0)
-            moved = json.loads(buffer.getvalue())["sessions"]
+            moved = _json_from_cli(buffer.getvalue())["sessions"]
             self.assertEqual([row["tab_index"] for row in moved], [0, 1])
 
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
                 code = cmd_archive(argparse.Namespace(db=db_path, selectors=[record.id], tag=None, all=False))
             self.assertEqual(code, 0)
-            archived = json.loads(buffer.getvalue())["sessions"][0]
+            archived = _json_from_cli(buffer.getvalue())["sessions"][0]
             self.assertEqual(archived["status"], "archived")
             self.assertFalse(archived["visible"])
 
@@ -1430,7 +1440,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_pin(argparse.Namespace(db=db_path, selectors=[agent.id], tag=None, all=False))
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertTrue(payload["sessions"][0]["pinned"])
 
             store = SessionStore(db_path)
@@ -1444,7 +1454,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_kill(argparse.Namespace(db=db_path, selectors=[agent.id], tag=None, all=False, dry_run=False, yes=True, include_pinned=False))
             self.assertEqual(code, 1)
-            protected = json.loads(buffer.getvalue())["sessions"][0]
+            protected = _json_from_cli(buffer.getvalue())["sessions"][0]
             self.assertFalse(protected["ok"])
             self.assertTrue(protected["pinned"])
             self.assertIn("protected", protected["detail"])
@@ -1453,7 +1463,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_unpin(argparse.Namespace(db=db_path, selectors=[agent.id], tag=None, all=False))
             self.assertEqual(code, 0)
-            self.assertFalse(json.loads(buffer.getvalue())["sessions"][0]["pinned"])
+            self.assertFalse(_json_from_cli(buffer.getvalue())["sessions"][0]["pinned"])
 
     def test_recently_closed_and_reopen_closed_cli_are_browser_like(self):
         from pathlib import Path
@@ -1475,7 +1485,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_recently_closed(argparse.Namespace(db=db_path, tag=None, limit=5, json=True))
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload["count"], 1)
             self.assertEqual(payload["sessions"][0]["id"], hidden.id)
 
@@ -1483,7 +1493,7 @@ class CliTests(unittest.TestCase):
             with contextlib.redirect_stdout(buffer):
                 code = cmd_reopen_closed(argparse.Namespace(db=db_path, tag=None, limit=1, window_id="main", window_title="Main"))
             self.assertEqual(code, 0)
-            reopened = json.loads(buffer.getvalue())["sessions"][0]
+            reopened = _json_from_cli(buffer.getvalue())["sessions"][0]
             self.assertEqual(reopened["action"], "reopen-closed")
             self.assertTrue(reopened["visible"])
             self.assertEqual(reopened["window_title"], "Main")
@@ -1526,7 +1536,7 @@ class CliTests(unittest.TestCase):
                 with contextlib.redirect_stdout(buffer):
                     code = cmd_search(args)
             self.assertEqual(code, 0)
-            payload = json.loads(buffer.getvalue())
+            payload = _json_from_cli(buffer.getvalue())
             self.assertEqual(payload["schema"], "termdeck.session-search")
             self.assertEqual(payload["count"], 1)
             match = payload["matches"][0]

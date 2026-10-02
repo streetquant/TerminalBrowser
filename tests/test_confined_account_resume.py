@@ -19,7 +19,7 @@ from termdeck.codex_auth import CodexAuthManager
 from termdeck.session_store import SessionStore
 from termdeck.tmux_backend import TmuxBackend, TmuxError, _AuthPaneIdentity, auth_transaction_lock, execute_auth_change
 from termdeck.web_accounts import handle
-from test_agent_launch import Backend, configured, request as launch_request  # noqa: F401
+from test_agent_launch import Backend, _fixture_object, configured, request as launch_request  # noqa: F401
 from test_client_files import stage, upload, path, ordinary_workspace_root  # noqa: F401
 from test_codex_auth import _write_native_source, _bind_native_source_default
 
@@ -36,10 +36,13 @@ NATIVE_FIXTURE = r'''
 int main(int argc, char **argv) {
     char filename[PATH_MAX], cwd[PATH_MAX], auth[4096] = {0}, bytes[128] = {0};
     const char *home = getenv("CODEX_HOME"), *id = CONVERSATION;
-    int resumed = 0;
+    int resumed = 0, private_daemon = 0;
     if (!home || !getcwd(cwd, sizeof(cwd))) return 30;
     for (int i = 1; i + 1 < argc; ++i)
         if (!strcmp(argv[i], "resume")) { id = argv[i+1]; resumed = 1; }
+    for (int i = 1; i < argc; ++i)
+        if (!strcmp(argv[i], "--no-daemon")) private_daemon++;
+    if (private_daemon != 1) return 38;
     snprintf(filename, sizeof(filename), "%s/auth.json", home);
     FILE *credential = fopen(filename, "r");
     if (!credential) return 31;
@@ -78,7 +81,7 @@ class ProcessPane(TmuxBackend):
         self.launched_specs = []
 
     def launch(self, command, environment=()):
-        self.process = subprocess.Popen(
+        self.process = subprocess.Popen(  # ubs:ignore[python.lifecycle.popen_handle] -- ProcessPane.close kills and waits on this instance-owned child before teardown or respawn
             ["/bin/bash", "--noprofile", "--norc", "-c", command],
             cwd=self.workspace, env={**self.environment, **dict(environment)},
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -86,9 +89,19 @@ class ProcessPane(TmuxBackend):
         )
 
     def close(self):
-        if self.process is not None and self.process.poll() is None:
-            os.killpg(self.process.pid, signal.SIGKILL)
+        if self.process is None:
+            return
+        if self.process.poll() is None:
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
             self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=5)
+        assert self.process.returncode is not None, "fixture-owned process was not reaped"
 
     def _auth_session_exists(self, _record):
         return self.process is not None and self.process.poll() is None
@@ -230,7 +243,8 @@ def test_configured_task_switch_uses_real_native_argv_and_exact_guarded_resume(c
     persisted = f.sessions.get(record.id)
     assert persisted.command == record.command
     assert persisted.recovery_command == record.recovery_command
-    proofs = [json.loads(line) for line in (f.workspace / "observations.jsonl").read_text().splitlines()]
+    proofs = [_fixture_object(line, context="account-switch observation")
+              for line in (f.workspace / "observations.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [(p["account"], p["resumed"]) for p in proofs] == [("alpha", 0), ("beta", 1)]
     assert all(p["conversation"] == CONVERSATION and p["cwd"] == str(f.workspace) and p["bytes"] == "original" for p in proofs)
     assert f.attachment.read_bytes() == b"original"
@@ -295,7 +309,8 @@ def test_untouched_private_defaults_refresh_after_exact_confined_account_resume(
     assert result["results"][0]["restarted"] and len(f.backend.launched_specs) == 1
     assert private.read_bytes().endswith(defaults.read_bytes())
     assert private.read_bytes().splitlines()[0] == before.splitlines()[0]
-    proofs = [json.loads(line) for line in (f.workspace / "observations.jsonl").read_text().splitlines()]
+    proofs = [_fixture_object(line, context="account-switch observation")
+              for line in (f.workspace / "observations.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [(p["account"], p["resumed"], p["conversation"]) for p in proofs] == [
         ("alpha", 0, CONVERSATION), ("beta", 1, CONVERSATION),
     ]
@@ -327,7 +342,7 @@ def test_resume_revalidates_original_authority_before_prepare_and_execute(confin
     elif mutation == "legacy-plan":
         with sqlite3.connect(f.store.root / "metadata.sqlite3") as db:
             row = db.execute("SELECT plan FROM launches WHERE launch_id=?", (f.receipt["launch_id"],)).fetchone()
-            old = json.loads(row[0])
+            old = _fixture_object(row[0], context="legacy-plan fixture")
             old.pop("version")
             old.pop("execution")
             db.execute("UPDATE launches SET plan=? WHERE launch_id=?", (json.dumps(old), f.receipt["launch_id"]))
@@ -365,8 +380,13 @@ def test_resume_permits_are_single_use_superseded_and_cancelled(confined, monkey
     commands = []
     class Executed(Exception):
         pass
-    def execute(executable, argv, environment):
-        commands.append((executable, argv, environment))
+    def execute(descriptor, argv, environment):
+        info = os.fstat(descriptor)
+        pinned = Path(os.readlink(f"/proc/self/fd/{descriptor}")).resolve(strict=True)
+        assert pinned == Path(f.config["codex"]["executable"]).resolve(strict=True)
+        assert info.st_uid in {0, os.geteuid()} and info.st_mode & 0o111 and not info.st_mode & 0o022
+        assert hashlib.sha256(os.pread(descriptor, info.st_size, 0)).hexdigest() == f.config["codex"]["sha256"]
+        commands.append((str(pinned), argv, environment))
         raise Executed()
     monkeypatch.setattr(os, "execve", execute)
     with pytest.raises(Executed):

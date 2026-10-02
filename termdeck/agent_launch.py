@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 import hashlib
 import json
 import os
@@ -10,6 +10,7 @@ from pathlib import Path
 import pwd
 import shlex
 import stat
+import subprocess
 import sys
 import time
 import uuid
@@ -53,6 +54,38 @@ def _require_host_plan(plan):
     if (type(plan.get("version")) is not int or plan["version"] != _PLAN_VERSION
             or plan.get("execution") != _EXECUTION):
         raise StagingError(_LEGACY_PLAN_ERROR, "conflict")
+
+
+def _unique_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise StagingError("Duplicate fields in saved launch state", "unsafe-storage")
+        value[key] = item
+    return value
+
+
+def _load_object(raw, label):
+    try:
+        value = json.loads(raw, object_pairs_hook=_unique_json_object)
+    except StagingError:
+        raise
+    except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
+        raise StagingError(f"Invalid saved {label}", "unsafe-storage") from exc
+    if not isinstance(value, dict):
+        raise StagingError(f"Invalid saved {label}", "unsafe-storage")
+    return value
+
+
+def _actor_from_plan(value):
+    fields = {"account_id", "machine_id", "session_id", "credential_hash", "credential_generation"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise StagingError("Invalid launch actor", "unauthorized")
+    actor = Actor(account_id=value["account_id"], machine_id=value["machine_id"],
+                  session_id=value["session_id"], credential_hash=value["credential_hash"],
+                  credential_generation=value["credential_generation"])
+    actor.validate()
+    return actor
 
 
 @contextmanager
@@ -159,6 +192,7 @@ def _prepare_private_log_directory(home):
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     root = log = None
     try:
+        # ubs:ignore[py.io.open-missing-with] -- directory FDs are validated with fstat and closed in the enclosing finally; fdopen cannot wrap O_DIRECTORY descriptors.
         root = os.open(home, flags)
         info = os.fstat(root)
         if info.st_uid != os.geteuid() or info.st_mode & 0o077:
@@ -167,6 +201,7 @@ def _prepare_private_log_directory(home):
             os.mkdir("log", 0o700, dir_fd=root)
         except FileExistsError:
             pass
+        # ubs:ignore[py.io.open-missing-with] -- directory FDs are validated with fstat and closed in the enclosing finally; fdopen cannot wrap O_DIRECTORY descriptors.
         log = os.open("log", flags, dir_fd=root)
         info = os.fstat(log)
         if info.st_uid != os.geteuid() or info.st_mode & 0o077:
@@ -194,44 +229,76 @@ def _host_path(value, *, directory=False):
     return path
 
 
-def policy(state_root):
-    tree=Directory(state_root)
-    try:
+def policy(state_root, *, _auto_refresh=True):
+    refresh = None
+    with closing(Directory(state_root)) as tree:
         try:
-            with tree.file(POLICY) as (fd,_):
-                raw=os.read(fd,65537)
+            with tree.file(POLICY) as (fd, _):
+                raw = os.read(fd, 65537)
         except FileNotFoundError:
-            return {"version":1,"workspaces":[],"codex":None}, hashlib.sha256(_POLICY_CONTEXT).hexdigest()
-        if len(raw)>65536: raise StagingError("Launch policy is too large", "unsafe-storage")
-        value=json.loads(raw)
-        if not isinstance(value,dict) or set(value)!={"version","workspaces","codex"} or value["version"]!=1:
+            return {"version": 1, "workspaces": [], "codex": None}, hashlib.sha256(_POLICY_CONTEXT).hexdigest()
+        if len(raw) > 65536:
+            raise StagingError("Launch policy is too large", "unsafe-storage")
+        value = _load_object(raw, "launch policy")
+        if (set(value) != {"version", "workspaces", "codex"}
+                or isinstance(value["version"], bool) or not isinstance(value["version"], int)
+                or value["version"] != 1):
             raise StagingError("Invalid launch policy", "unsafe-storage")
-        if not isinstance(value["workspaces"],list) or len(value["workspaces"])>64:
+        if not isinstance(value["workspaces"], list) or len(value["workspaces"]) > 64:
             raise StagingError("Invalid workspace policy", "unsafe-storage")
-        seen=set()
+        seen = set()
         for workspace in value["workspaces"]:
-            if not isinstance(workspace,dict) or set(workspace)!={"id","label","path"}:
+            if not isinstance(workspace, dict) or set(workspace) != {"id", "label", "path"}:
                 raise StagingError("Invalid workspace policy", "unsafe-storage")
-            _id(workspace["id"],"ws_")
-            _text(workspace["label"],256)
+            _id(workspace["id"], "ws_")
+            _text(workspace["label"], 256)
             directory = server_workspaces.WorkspaceDirectory(workspace["path"], state_root=state_root, inspect=False)
             try:
                 workspace["path"] = str(directory.path)
             finally:
                 directory.close()
-            if workspace["id"] in seen: raise StagingError("Duplicate workspace identity", "unsafe-storage")
+            if workspace["id"] in seen:
+                raise StagingError("Duplicate workspace identity", "unsafe-storage")
             seen.add(workspace["id"])
-        codex=value["codex"]
+        codex = value["codex"]
         if codex is not None:
-            if not isinstance(codex,dict) or set(codex)!={"executable","sha256","account_source"}:
+            if not isinstance(codex, dict) or set(codex) != {"executable", "sha256", "account_source"}:
                 raise StagingError("Invalid TermDeck Codex runtime policy", "unsafe-storage")
-            executable=_host_path(codex["executable"])
-            _id(codex["sha256"],"",64)
-            if hashlib.sha256(executable.read_bytes()).hexdigest()!=codex["sha256"] or not os.access(executable,os.X_OK):
-                raise StagingError("TermDeck Codex runtime identity changed", "unsafe-storage")
-            _host_path(codex["account_source"],directory=True)
-        return value,hashlib.sha256(_POLICY_CONTEXT + raw).hexdigest()
-    finally: tree.close()
+            _id(codex["sha256"], "", 64)
+            from .launch_policy import current_npm_runtime, is_npm_native_path, native_digest
+            if is_npm_native_path(codex["executable"]):
+                try:
+                    runtime = current_npm_runtime(codex["executable"])
+                    executable = Path(runtime["native"])
+                    actual_sha256 = native_digest(executable)
+                except (OSError, RuntimeError, ValueError, TypeError, KeyError,
+                        subprocess.TimeoutExpired):
+                    raise StagingError("TermDeck Codex runtime identity changed", "unsafe-storage") from None
+                if str(executable) != codex["executable"] or actual_sha256 != codex["sha256"]:
+                    if not _auto_refresh:
+                        raise StagingError("TermDeck Codex runtime identity changed", "unsafe-storage")
+                    refresh = (raw, executable, Path(runtime["entrypoint"]))
+            else:
+                # Preserve pre-existing exact-digest policy behavior for deliberately
+                # configured non-npm runtimes; npm installations always take the
+                # official current-entrypoint path above and cannot fall back.
+                executable = _host_path(codex["executable"])
+                if not os.access(executable, os.X_OK):
+                    raise StagingError("TermDeck Codex runtime identity changed", "unsafe-storage")
+                actual_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
+                if actual_sha256 != codex["sha256"]:
+                    raise StagingError("TermDeck Codex runtime identity changed", "unsafe-storage")
+            _host_path(codex["account_source"], directory=True)
+        revision = hashlib.sha256(_POLICY_CONTEXT + raw).hexdigest()
+    if refresh is not None:
+        try:
+            from .launch_policy import refresh_native_policy
+            refresh_native_policy(state_root, refresh[0], refresh[1], refresh[2])
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError, StagingError,
+                subprocess.TimeoutExpired):
+            raise StagingError("TermDeck Codex runtime identity changed", "unsafe-storage") from None
+        return policy(state_root, _auto_refresh=False)
+    return value, revision
 
 
 def options(state_root, directory=None):
@@ -321,15 +388,65 @@ def _verify_launcher_identity(plan):
 
 
 def _runtime_argv(value, plan, home, conversation=None):
+    # A shared daemon retains its startup account and state paths. Both new
+    # tasks and exact resumes must load this tab's private home themselves.
     argv = [value["codex"]["executable"], "-c", f"sqlite_home={json.dumps(home)}",
             "-c", f"log_dir={json.dumps(str(Path(home) / 'log'))}",
-            "--no-alt-screen"]
+            "--no-daemon", "--no-alt-screen"]
     if plan.get("yolo") is True:
         argv.append("--yolo")
     if conversation:
         return [*argv, "resume", conversation]
     prompt = plan["task"] + "\nAuthorized immutable files staged on the TermDeck host:\n" + "\n".join(a["server_path"] for a in plan["attachments"])
     return [*argv, "--", prompt]
+
+
+@contextmanager
+def _pinned_executable(runtime, expected_sha256=None):
+    if (not isinstance(runtime, list) or not runtime or not isinstance(runtime[0], str)
+            or not runtime[0].startswith("/")):
+        raise StagingError("Native executable binding is invalid", "unsafe-storage")
+    path = _host_path(runtime[0])
+    before = path.stat(follow_symlinks=False)
+    if (before.st_uid not in {0, os.geteuid()} or before.st_mode & 0o022
+            or not before.st_mode & 0o111 or not os.access(path, os.X_OK)):
+        raise StagingError("Native executable authority is unsafe", "unsafe-storage")
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK),
+                    "rb", buffering=0) as handle:
+        descriptor = handle.fileno()
+        opened = os.fstat(descriptor)
+        identity = (before.st_dev, before.st_ino, before.st_uid, before.st_gid, before.st_mode,
+                    before.st_nlink, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        opened_identity = (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_gid, opened.st_mode,
+                           opened.st_nlink, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+        if identity != opened_identity:
+            raise StagingError("Native executable changed while opening", "unsafe-storage")
+        header = os.read(descriptor, 20)
+        is_native_elf = (header[:6] == b"\x7fELF\x02\x01" and header[18:20] == b"\x3e\x00")
+        is_shebang = header.startswith(b"#!")
+        if not is_native_elf and not is_shebang:
+            raise StagingError("Executable is neither a supported ELF nor a shebang script", "unsafe-storage")
+        if expected_sha256 is not None:
+            digest = hashlib.sha256()
+            size = 0
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            while chunk := os.read(descriptor, 1024 * 1024):  # ubs:ignore[py.perf.io-in-loop] -- Streaming keeps the 512-MiB executable hash bound to one-MiB memory chunks.
+                size += len(chunk)
+                if size > 512 * 1024 * 1024:
+                    raise StagingError("Native executable exceeds the verified size limit", "unsafe-storage")
+                digest.update(chunk)
+            if digest.hexdigest() != expected_sha256:
+                raise StagingError("Qualified Codex executable changed before launch", "unsafe-storage")
+        after = path.stat(follow_symlinks=False)
+        after_identity = (after.st_dev, after.st_ino, after.st_uid, after.st_gid, after.st_mode,
+                          after.st_nlink, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        if after_identity != identity:
+            raise StagingError("Native executable changed during verification", "unsafe-storage")
+        if is_shebang:
+            # Linux must pass the script FD through to its interpreter. The
+            # descriptor is read-only and names only this already-verified file.
+            os.set_inheritable(descriptor, True)
+        yield descriptor, [str(path), *runtime[1:]]
 
 
 def _launcher_command(store, plan, tab_id):
@@ -355,14 +472,14 @@ def validate_native_launch(record):
             row = db.execute("SELECT plan,status FROM launches WHERE launch_id=?", (_id(args.launch, "launch_"),)).fetchone()
             if not row or row["status"] not in {"starting", "started"}:
                 raise StagingError("Configured launch is not starting or started", "conflict")
-            plan = json.loads(row["plan"])
+            plan = _load_object(row["plan"], "launch plan")
             _require_host_plan(plan)
             _verify_launcher_identity(plan)
             if (record.command != _launcher_command(store, plan, record.id)
                     or record.cwd != plan["workspace"]["path"] or record.window_id != plan["window_id"]
                     or record.id not in [tab["id"] for tab in plan["tabs"]]):
                 raise StagingError("Configured launch binding changed", "unauthorized")
-            actor = Actor(**plan["actor"])
+            actor = _actor_from_plan(plan["actor"])
             with authorized(store.auth_directory, actor, readonly=True):
                 value, revision = policy(store.root.parent)
                 if revision != plan["policy_revision"]:
@@ -465,9 +582,9 @@ def _resume_context(record):
             row = db.execute("SELECT plan,status FROM launches WHERE launch_id=?", (_id(args.launch, "launch_"),)).fetchone()
             if not row or row["status"] != "started":
                 raise StagingError("Configured launch is not started", "conflict")
-            plan = json.loads(row["plan"])
+            plan = _load_object(row["plan"], "launch plan")
             _require_host_plan(plan)
-            actor = Actor(**plan["actor"])
+            actor = _actor_from_plan(plan["actor"])
             with _resume_authorized(store, actor):
                 value, revision = policy(store.root.parent)
                 if revision != plan["policy_revision"] or plan["runtime"] != "codex" or not value["codex"]:
@@ -583,7 +700,7 @@ def prepare(store,db,tree,actor,request,machine,now):
     task=_text(request.get("task",""),8192,empty=True)
     if runtime=="shell" and task: raise StagingError("Shell task commands are not accepted")
     yolo=request.get("yolo",False)
-    if type(yolo) is not bool or yolo and runtime!="codex":
+    if not isinstance(yolo, bool) or yolo and runtime!="codex":
         raise StagingError("Invalid Codex launch mode")
     refs=request.get("attachments",[])
     if not isinstance(refs,list) or len(refs)>16: raise StagingError("Too many attachments")
@@ -630,7 +747,7 @@ def start(store,actor,result,*,backend=None):
             with _database(tree,"metadata.sqlite3") as db:
                 row=db.execute("SELECT plan,status FROM launches WHERE launch_id=? AND account_id=? AND machine_id=? AND session_id=?",(result["launch_id"],actor.account_id,actor.machine_id,actor.session_id)).fetchone()
                 if not row: raise StagingError("Launch is unavailable", "unauthorized")
-                plan=json.loads(row["plan"])
+                plan=_load_object(row["plan"], "launch plan")
                 _require_host_plan(plan)
                 _verify_launcher_identity(plan)
                 if row["status"]!="prepared":
@@ -655,6 +772,7 @@ def start(store,actor,result,*,backend=None):
                         if sessions.get(record.id) is not None: raise StagingError("Launch registry identity conflicts", "conflict")
                         sessions.upsert(record)
                         (backend or TmuxBackend()).create_or_resume(record)
+                        # ubs:ignore[py.security.mass-assignment] -- only this fixed server-owned launch status is written; request keys never enter this model update.
                         sessions.update(record.id,status="running")
                     db.execute("UPDATE launches SET status='started' WHERE launch_id=?",(plan["launch_id"],)); db.commit()
                 except Exception:
@@ -677,8 +795,8 @@ def _native_shell_argv():
         if not candidate or not Path(candidate).is_absolute():
             continue
         try:
-            path = Path(candidate).resolve(strict=True)
-        except (OSError, RuntimeError):
+            path = _host_path(str(Path(candidate).resolve(strict=True)))
+        except (OSError, RuntimeError, StagingError):
             continue
         if path.is_file() and os.access(path, os.X_OK):
             return [str(path), "-i"]
@@ -698,10 +816,8 @@ def _scope_environment(record):
 def _shell_launch(store, plan, tab_id):
     runtime = _native_shell_argv()
     sessions = SessionStore(store.session_database, provision_auth_scopes=False)
-    try:
+    with closing(sessions):
         record = sessions.get(tab_id)
-    finally:
-        sessions.close()
     if record is None or not record.codex_home:
         return runtime, {}
     # New shell tabs are unscoped. An account scope deliberately assigned later
@@ -731,10 +847,10 @@ def execute(args):
         with _database(tree,"metadata.sqlite3") as db:
             row=db.execute("SELECT plan FROM launches WHERE launch_id=?",(_id(args.launch,"launch_"),)).fetchone()
             if not row: raise StagingError("Launch is unavailable", "unauthorized")
-            plan=json.loads(row["plan"])
+            plan=_load_object(row["plan"], "launch plan")
             _require_host_plan(plan)
             _verify_launcher_identity(plan)
-        actor=Actor(**plan["actor"])
+        actor=_actor_from_plan(plan["actor"])
         permit = getattr(args, "resume_permit", None)
         resume_record = None
         with (_resume_authorized(store, actor) if permit else authorized(store.auth_directory, actor)):
@@ -769,10 +885,9 @@ def execute(args):
             if plan["runtime"]=="codex":
                 if not value["codex"]: raise StagingError("TermDeck Codex runtime unavailable")
                 sessions=SessionStore(store.session_database,account_source=value["codex"]["account_source"],provision_auth_scopes=False)
-                try:
+                with closing(sessions):
                     record=sessions.ensure_auth_scope(args.tab, private_history=True)
                     codex_home=record.codex_home
-                finally: sessions.close()
                 _validate_shared_assets(
                     codex_home, state_root=store.root.parent, auth_directory=store.auth_directory,
                     account_source=value["codex"]["account_source"], workspace=plan["workspace"]["path"],
@@ -797,7 +912,10 @@ def execute(args):
                 tree.check()
                 with directory.entered():
                     environment = {**os.environ, **scope_environment, "PWD": str(directory.path)}
-                    os.execve(runtime[0], runtime, environment)
+                    expected_runtime_sha = value["codex"]["sha256"] if plan["runtime"] == "codex" else None
+                    with _pinned_executable(runtime, expected_runtime_sha) as (descriptor, argv):
+                        # ubs:ignore[python.taint.command] -- os.execve receives the pinned O_NOFOLLOW file descriptor; its inode, owner, mode, path and policy digest were rechecked above, with no shell parsing.
+                        os.execve(descriptor, argv, environment)
     finally: tree.close()
 
 

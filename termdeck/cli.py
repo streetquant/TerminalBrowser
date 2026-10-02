@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import json
 import os
 import sqlite3
@@ -206,7 +207,7 @@ def _budget_assessments_from_args(args: argparse.Namespace):
     store = SessionStore(args.db)
     backend = TmuxBackend()
     sampler = ResourceSampler()
-    try:
+    with closing(store):
         budgets = load_budgets(getattr(args, "path", None))
         records = store.list(
             include_archived=bool(getattr(args, "all", False)),
@@ -220,8 +221,6 @@ def _budget_assessments_from_args(args: argparse.Namespace):
             pid = _live_pid(backend, record)
             snapshots[record.id] = sampler.snapshot(pid)
         return assess_budgets(records, snapshots, budgets)
-    finally:
-        store.close()
 
 
 def _should_only_plan(args: argparse.Namespace, plan) -> bool:
@@ -232,7 +231,7 @@ def _should_only_plan(args: argparse.Namespace, plan) -> bool:
 def cmd_search(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
     backend = TmuxBackend()
-    try:
+    with closing(store):
         records = store.list(
             include_archived=bool(getattr(args, "all", False)),
             visible_only=bool(getattr(args, "visible_only", False)),
@@ -257,8 +256,6 @@ def cmd_search(args: argparse.Namespace) -> int:
             max_results=int(getattr(args, "limit", 100)),
             max_snippets=int(getattr(args, "snippets", 3)),
         )
-    finally:
-        store.close()
     if getattr(args, "json", False):
         _print_json(result.as_dict())
     else:
@@ -609,11 +606,9 @@ def cmd_quickstart(args: argparse.Namespace) -> int:
 
 def cmd_palette(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
-    try:
+    with closing(store):
         rows = search_palette(args.query or "", build_palette_items(store.list(include_archived=args.all)), limit=getattr(args, "limit", 50))
         _print_json(serialise_palette_items(rows))
-    finally:
-        store.close()
     return 0
 
 
@@ -621,7 +616,7 @@ def cmd_tasks(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
     backend = TmuxBackend()
     sampler = ResourceSampler()
-    try:
+    with closing(store):
         records = store.list(include_archived=bool(getattr(args, "all", False)), visible_only=bool(getattr(args, "visible_only", False)), include_stopped=not bool(getattr(args, "running_only", False)))
         if getattr(args, "tag", None):
             records = [record for record in records if record.tag == args.tag]
@@ -629,8 +624,6 @@ def cmd_tasks(args: argparse.Namespace) -> int:
         items = filter_task_snapshot(items, getattr(args, "query", "") or "")
         items = sort_task_snapshot(items, getattr(args, "sort", "health"))
         rows = task_snapshot_to_dicts(items)
-    finally:
-        store.close()
     if getattr(args, "json", False):
         _print_json(rows)
     else:
@@ -645,7 +638,7 @@ def cmd_windows(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
     backend = TmuxBackend()
     sampler = ResourceSampler()
-    try:
+    with closing(store):
         records = store.list(
             include_archived=bool(getattr(args, "all", False)),
             visible_only=bool(getattr(args, "visible_only", False)),
@@ -657,8 +650,6 @@ def cmd_windows(args: argparse.Namespace) -> int:
         windows = build_window_snapshots(items)
         windows = filter_window_snapshots(windows, getattr(args, "query", "") or "")
         windows = sort_window_snapshots(windows, getattr(args, "sort", "health"))
-    finally:
-        store.close()
     if getattr(args, "json", False):
         _print_json(window_snapshots_to_dicts(windows))
     else:
@@ -670,7 +661,7 @@ def cmd_activity(args: argparse.Namespace) -> int:
 
     store = SessionStore(args.db)
     backend = TmuxBackend()
-    try:
+    with closing(store):
         records = store.list(
             include_archived=bool(getattr(args, "all", False)),
             visible_only=bool(getattr(args, "visible_only", False)),
@@ -686,8 +677,6 @@ def cmd_activity(args: argparse.Namespace) -> int:
         )
         items = filter_activities(items, getattr(args, "query", "") or "")
         items = sort_activities(items, getattr(args, "sort", "severity"))
-    finally:
-        store.close()
     if getattr(args, "json", False):
         _print_json(activity_to_dicts(items))
     else:
@@ -698,7 +687,7 @@ def cmd_activity(args: argparse.Namespace) -> int:
 def cmd_search_output(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
     backend = TmuxBackend()
-    try:
+    with closing(store):
         records = _target_records_from_args(store, args)
         if not records:
             records = store.list(
@@ -717,8 +706,6 @@ def cmd_search_output(args: argparse.Namespace) -> int:
             include_empty=bool(getattr(args, "include_empty", False)),
             case_sensitive=bool(getattr(args, "case_sensitive", False)),
         )
-    finally:
-        store.close()
     if getattr(args, "json", False):
         _print_json(summary.as_dict())
     else:
@@ -730,7 +717,7 @@ def cmd_health(args: argparse.Namespace) -> int:
     backend = TmuxBackend()
     sampler = ResourceSampler()
     rows = []
-    try:
+    with closing(store):
         for record in store.list(include_archived=getattr(args, "all", False)):
             pid = _live_pid(backend, record)
             snap = sampler.snapshot(pid)
@@ -753,8 +740,6 @@ def cmd_health(args: argparse.Namespace) -> int:
                 "process_count": snap.process_count if snap.exists else 0,
                 "runtime": snap.runtime_label if snap.exists else "",
             })
-    finally:
-        store.close()
     if getattr(args, "json", False):
         _print_json(rows)
         return 0
@@ -770,7 +755,7 @@ def _run_targeted_control(args: argparse.Namespace, action: str) -> int:
     store = SessionStore(args.db)
     backend = TmuxBackend()
     rows: list[dict[str, object]] = []
-    try:
+    with closing(store):
         records = _target_records_from_args(store, args)
         if not records:
             _print_control_result(action, rows)
@@ -822,8 +807,6 @@ def _run_targeted_control(args: argparse.Namespace, action: str) -> int:
                     rows.append(_control_row(record, action, True, pid=record.last_pid, detail=detail))
             except TmuxError as exc:
                 rows.append(_control_row(record, action, False, pid=record.last_pid, detail=str(exc)))
-    finally:
-        store.close()
     _print_control_result(action, rows)
     return 0 if rows and all(bool(row["ok"]) for row in rows) else 1
 
@@ -845,7 +828,7 @@ def cmd_pause_hot(args: argparse.Namespace) -> int:
     backend = TmuxBackend()
     sampler = ResourceSampler()
     rows: list[dict[str, object]] = []
-    try:
+    with closing(store):
         records = []
         health_by_id = {}
         for record in store.list(include_archived=getattr(args, "all", False)):
@@ -874,8 +857,6 @@ def cmd_pause_hot(args: argparse.Namespace) -> int:
                     rows.append(_control_row(record, "pause-hot", False, pid=pid, detail="no live tmux pane found"))
             except TmuxError as exc:
                 rows.append(_control_row(record, "pause-hot", False, pid=pid, detail=str(exc)))
-    finally:
-        store.close()
     _print_control_result("pause-hot", rows)
     return 0 if rows and all(bool(row["ok"]) for row in rows) else 1
 
@@ -885,7 +866,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     backend = TmuxBackend()
     rows: list[dict[str, object]] = []
     text = " ".join(args.text).strip()
-    try:
+    with closing(store):
         records = _target_records_from_args(store, args)
         if not records or not text:
             _print_control_result("send", rows)
@@ -901,8 +882,6 @@ def cmd_send(args: argparse.Namespace) -> int:
                 rows.append(_control_row(record, "send", True, pid=record.last_pid, detail="sent text"))
             except TmuxError as exc:
                 rows.append(_control_row(record, "send", False, pid=record.last_pid, detail=str(exc)))
-    finally:
-        store.close()
     _print_control_result("send", rows)
     return 0 if rows and all(bool(row["ok"]) for row in rows) else 1
 
@@ -910,7 +889,7 @@ def cmd_send(args: argparse.Namespace) -> int:
 def cmd_capture(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
     backend = TmuxBackend()
-    try:
+    with closing(store):
         records = _target_records_from_args(store, args)
         if not records:
             return 1
@@ -930,8 +909,6 @@ def cmd_capture(args: argparse.Namespace) -> int:
                 "redacted": bool(redacted and redacted.replacements),
                 "redaction_labels": list(redacted.labels) if redacted else [],
             })
-    finally:
-        store.close()
     _print_json(payload)
     return 0
 
@@ -971,7 +948,7 @@ def cmd_adopt_tmux(args: argparse.Namespace) -> int:
         return 0
 
     store = SessionStore(args.db)
-    try:
+    with closing(store):
         results = adopt_tmux_sessions(
             store,
             discovered,
@@ -983,8 +960,6 @@ def cmd_adopt_tmux(args: argparse.Namespace) -> int:
             include_termdeck=bool(getattr(args, "include_termdeck", False)),
             dry_run=bool(getattr(args, "dry_run", False)),
         )
-    finally:
-        store.close()
 
     rows = [result.to_dict() for result in results]
     ok = all(result.ok for result in results)
@@ -1000,7 +975,7 @@ def cmd_adopt_tmux(args: argparse.Namespace) -> int:
 
 def _run_lifecycle_targets(args: argparse.Namespace, action: str) -> int:
     store = SessionStore(args.db)
-    try:
+    with closing(store):
         records = _target_records_from_args(store, args)
         if not records:
             _print_lifecycle_result(action, [])
@@ -1032,8 +1007,6 @@ def _run_lifecycle_targets(args: argparse.Namespace, action: str) -> int:
             results = unpin_records(store, records)
         else:  # pragma: no cover - defensive guard for future actions
             raise ValueError(action)
-    finally:
-        store.close()
     _print_lifecycle_result(action, results)
     return 0 if results and all(row.ok for row in results) else 1
 
@@ -1064,28 +1037,24 @@ def cmd_unpin(args: argparse.Namespace) -> int:
 
 def cmd_rename(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
-    try:
+    with closing(store):
         records = _select_records(store, [args.selector])
         if len(records) != 1:
             _print_lifecycle_result("rename", [])
             return 1
         result = rename_record(store, records[0], args.name)
-    finally:
-        store.close()
     _print_lifecycle_result("rename", [result])
     return 0 if result.ok else 1
 
 
 def cmd_retag(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
-    try:
+    with closing(store):
         records = _target_records_from_args(store, args)
         if not records:
             _print_lifecycle_result("retag", [])
             return 1
         results = retag_records(store, records, args.new_tag)
-    finally:
-        store.close()
     _print_lifecycle_result("retag", results)
     return 0 if results and all(row.ok for row in results) else 1
 
@@ -1142,11 +1111,9 @@ def _render_recently_closed_table(records) -> str:
 
 def cmd_recently_closed(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
-    try:
+    with closing(store):
         records = recently_closed_records(store, limit=getattr(args, "limit", 20), tag=getattr(args, "tag", None))
         rows = [_recently_closed_row(record) for record in records]
-    finally:
-        store.close()
     if getattr(args, "json", False):
         _print_json({"action": "recently-closed", "count": len(rows), "sessions": rows})
     else:
@@ -1156,7 +1123,7 @@ def cmd_recently_closed(args: argparse.Namespace) -> int:
 
 def cmd_reopen_closed(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
-    try:
+    with closing(store):
         records = recently_closed_records(store, limit=getattr(args, "limit", 1), tag=getattr(args, "tag", None))
         results = reopen_closed_records(
             store,
@@ -1164,15 +1131,13 @@ def cmd_reopen_closed(args: argparse.Namespace) -> int:
             window_id=getattr(args, "window_id", None),
             window_title=getattr(args, "window_title", None),
         )
-    finally:
-        store.close()
     _print_lifecycle_result("reopen-closed", results)
     return 0 if results and all(row.ok for row in results) else 1
 
 
 def cmd_control_plan(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
-    try:
+    with closing(store):
         if args.action == "pause-hot":
             backend = TmuxBackend()
             sampler = ResourceSampler()
@@ -1186,8 +1151,6 @@ def cmd_control_plan(args: argparse.Namespace) -> int:
         else:
             records = _target_records_from_args(store, args)
         plan = build_control_plan(records, args.action, text=getattr(args, "text", "") or "", enter=not getattr(args, "no_enter", False) if args.action == "send" else False, selectors=getattr(args, "selectors", None), tag=getattr(args, "tag", None), all_sessions=bool(getattr(args, "all", False)))
-    finally:
-        store.close()
     _print_json(plan.as_dict())
     return 0
 
@@ -1210,10 +1173,8 @@ def cmd_new(args: argparse.Namespace) -> int:
         return 2
     store = SessionStore(args.db)
     backend = TmuxBackend()
-    try:
+    with closing(store):
         result = create_new_session(store, backend, fields, window_id=getattr(args, "window_id", None) or "main", window_title=getattr(args, "window_title", None) or "Main", tab_index=getattr(args, "tab_index", None), visible=not bool(getattr(args, "hidden", False)), pinned=bool(getattr(args, "pinned", False)), start=not bool(getattr(args, "no_start", False)))
-    finally:
-        store.close()
     _print_json(launch_payload("new", [result]))
     return 0 if result.ok else 1
 
@@ -1279,7 +1240,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     """Repair stale browser session state against the hidden backend."""
 
     store = SessionStore(args.db)
-    try:
+    with closing(store):
         result = reconcile_store(
             store,
             backend=TmuxBackend(),
@@ -1290,8 +1251,6 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             include_archived=bool(getattr(args, "all", False)),
             tag=getattr(args, "tag", None),
         )
-    finally:
-        store.close()
     _print_json(result.as_dict())
     return 0
 
@@ -1300,7 +1259,7 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
     """Persist exact resumable state for selected live managed tabs."""
 
     store = SessionStore(args.db)
-    try:
+    with closing(store):
         targeted = bool(
             getattr(args, "selectors", None)
             or getattr(args, "tag", None)
@@ -1316,28 +1275,24 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
         else:
             selected = persistence_candidates(store)
         result = persist_live_sessions(store, TmuxBackend(), records=selected)
-    finally:
-        store.close()
     _print_json(result.as_dict())
     return 0 if result.failed_count == 0 else 1
 
 
 def cmd_restore_plan(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
-    try:
+    with closing(store):
         records = store.list(include_archived=bool(getattr(args, "all", False)))
         if getattr(args, "tag", None):
             records = [record for record in records if record.tag == args.tag]
         payload = restore_plan(records, limit=getattr(args, "limit", 50))
-    finally:
-        store.close()
     _print_json(payload)
     return 0
 
 
 def cmd_snapshot_export(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
-    try:
+    with closing(store):
         records = store.list(include_archived=bool(getattr(args, "all", False)))
         if getattr(args, "tag", None):
             records = [record for record in records if record.tag == args.tag]
@@ -1347,8 +1302,6 @@ def cmd_snapshot_export(args: argparse.Namespace) -> int:
             include_hidden=not bool(getattr(args, "visible_only", False)),
             include_stopped=not bool(getattr(args, "running_only", False)),
         )
-    finally:
-        store.close()
     output = getattr(args, "output", None)
     if output:
         Path(output).expanduser().write_text(payload + "\n", encoding="utf-8")
@@ -1407,7 +1360,7 @@ def cmd_pause_over_budget(args: argparse.Namespace) -> int:
     backend = TmuxBackend()
     sampler = ResourceSampler()
     rows: list[dict[str, object]] = []
-    try:
+    with closing(store):
         try:
             budgets = load_budgets(getattr(args, "path", None))
         except BudgetConfigError as exc:
@@ -1454,8 +1407,6 @@ def cmd_pause_over_budget(args: argparse.Namespace) -> int:
                     rows.append(_control_row(record, "pause-over-budget", False, pid=record.last_pid, detail="no live tmux pane found"))
             except TmuxError as exc:
                 rows.append(_control_row(record, "pause-over-budget", False, pid=record.last_pid, detail=str(exc)))
-    finally:
-        store.close()
     _print_control_result("pause-over-budget", rows)
     return 0 if rows and all(bool(row["ok"]) for row in rows) else 1
 
@@ -1489,7 +1440,7 @@ def cmd_shortcuts(args: argparse.Namespace) -> int:
 
 def cmd_sessions(args: argparse.Namespace) -> int:
     store = SessionStore(args.db)
-    try:
+    with closing(store):
         _print_json(
             [
                 record.__dict__
@@ -1499,8 +1450,6 @@ def cmd_sessions(args: argparse.Namespace) -> int:
                 )
             ]
         )
-    finally:
-        store.close()
     return 0
 
 
@@ -1816,6 +1765,10 @@ def build_parser() -> argparse.ArgumentParser:
     agent_launch = sub.add_parser("agent-launch", help="run one authorized native terminal launch")
     agent_launch_arguments(agent_launch)
     agent_launch.set_defaults(func=agent_launch_command)
+
+    from .launch_policy import add_arguments as launch_policy_arguments
+    launch_policy = sub.add_parser("launch-policy", help="qualify and publish an operator-reviewed Codex runtime policy")
+    launch_policy_arguments(launch_policy)
 
     doctor = sub.add_parser("doctor", help="check system dependencies")
     doctor.set_defaults(func=cmd_doctor)

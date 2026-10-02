@@ -21,6 +21,18 @@ from termdeck.tmux_backend import TmuxBackend
 from test_client_files import stage, call, upload, path, ordinary_workspace_root  # noqa: F401
 
 
+def _fixture_object(source, *, context):
+    """Parse one generated JSON object with a useful failure at the fixture edge."""
+    try:
+        raw = source.read_text(encoding="utf-8") if isinstance(source, Path) else source
+        value = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as error:
+        pytest.fail(f"{context} is not valid fixture JSON: {error}", pytrace=False)
+    if not isinstance(value, dict):
+        pytest.fail(f"{context} must be a JSON object", pytrace=False)
+    return value
+
+
 @pytest.fixture
 def configured(stage, ordinary_workspace_root):
     store,actor=stage
@@ -100,7 +112,7 @@ def test_refresh_preserves_authorized_original_and_gate_is_one_use(configured,mo
     with pytest.raises(Executed): launch.execute(args)
     argv=captured[0][1]
     assert argv == launch._native_shell_argv()
-    assert captured[0][2]["PWD"] == str(configured[2])
+    assert Path(captured[0][2]["PWD"]).resolve(strict=True) == Path(configured[2]).resolve(strict=True)
     assert path((store,actor),obj).read_bytes()==b"original"
     with pytest.raises(cf.StagingError,match="consumed"): launch.execute(args)
 
@@ -139,7 +151,13 @@ def test_real_native_shell_has_host_identity_environment_and_filesystem(configur
     elif selection == "symlink":
         chosen = workspace.with_name("workspace-alias")
         chosen.symlink_to(workspace, target_is_directory=True)
-        workspace.chmod(0o777)
+        before = workspace.stat()
+        assert before.st_uid == os.geteuid() and before.st_mode & 0o777 == 0o700
+        # This is a disposable pytest-owned directory used to exercise a hostile mode through a symlink.
+        workspace.chmod(0o777)  # ubs:ignore[py.security.file-permissions] -- the exact owned fixture is intentionally made world-writable
+        after = workspace.stat()
+        assert after.st_dev == before.st_dev and after.st_ino == before.st_ino
+        assert after.st_uid == os.geteuid() and after.st_mode & 0o777 == 0o777
     req = request(configured)
     req.pop("workspace_id")
     req["workspace_path"] = str(chosen)
@@ -163,7 +181,7 @@ proof.write_text(json.dumps(dict(cwd=os.getcwd(),uid=os.getuid(),euid=os.geteuid
     typed = shlex.join([sys.executable, str(probe), str(outside), str(proof), str(workspace)]) + "\nexit\n"
     completed = subprocess.run(command, input=typed, env=environment, capture_output=True, text=True, timeout=15)
     assert completed.returncode == 0, completed.stderr
-    observed = json.loads(proof.read_text())
+    observed = _fixture_object(proof, context="host-shell proof")
     assert observed["cwd"] == str(chosen.resolve())
     assert [observed[key] for key in ("uid", "euid", "gid", "egid")] == [os.getuid(), os.geteuid(), os.getgid(), os.getegid()]
     assert observed["groups"] == os.getgroups()
@@ -207,25 +225,29 @@ def test_native_codex_adapter_passes_only_server_paths_and_private_home(configur
     class Executed(Exception): pass
     captured=[]
     completed=[]
-    def execve(_executable,argv,environment):
+    def execve(_descriptor,argv,environment):
+        info=os.fstat(_descriptor)
+        pinned=Path(os.readlink(f"/proc/self/fd/{_descriptor}")).resolve(strict=True)
+        assert pinned==executable.resolve(strict=True)
+        assert info.st_uid in {0,os.geteuid()} and info.st_mode & 0o111 and not info.st_mode & 0o022
+        assert hashlib.sha256(os.pread(_descriptor,info.st_size,0)).hexdigest()==config["codex"]["sha256"]
         captured.append(argv)
-        assert _executable == str(executable)
         completed.append(subprocess.run(argv,env=environment,capture_output=True,text=True,timeout=10))
         raise Executed()
     monkeypatch.setattr(os,"execve",execve)
     args=argparse.Namespace(state=str(store.root.parent),auth_dir=str(store.auth_directory),db=str(store.session_database),launch=result["launch_id"],tab=result["tabs"][0])
     with pytest.raises(Executed): launch.execute(args)
     assert completed[0].returncode==0,completed[0].stderr
-    proof=json.loads((workspace/"codex-proof").read_text())
+    proof=_fixture_object(workspace/"codex-proof", context="native Codex proof")
     assert proof["home"]==str(private) and proof["auth"]=={"fixture":True}
     assert "/client/never-server/foo" not in " ".join(proof["argv"])
     assert str(path((store,actor),obj).parent.parent) in proof["argv"][-1]
     assert "$(not a shell command)" in proof["argv"][-1]
-    assert proof["argv"][:6] == ["-c", f"sqlite_home={json.dumps(str(private))}",
+    assert proof["argv"][:7] == ["-c", f"sqlite_home={json.dumps(str(private))}",
                                   "-c", f"log_dir={json.dumps(str(private / 'log'))}",
-                                  "--no-alt-screen", "--"]
-    assert not {"--sandbox", "--ask-for-approval", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"}.intersection(proof["argv"])
-    assert len(proof["argv"]) == 7
+                                  "--no-daemon", "--no-alt-screen", "--"]
+    assert not {"--sandbox", "--ask-for-approval", "--dangerously-bypass-approvals-and-sandbox"}.intersection(proof["argv"])
+    assert len(proof["argv"]) == 8
 
 
 def test_concurrent_refresh_and_launch_either_binds_original_or_rejects_stale(configured):
@@ -321,7 +343,7 @@ def test_yolo_launch_receipt_is_replay_safe_and_keeps_directory(configured):
     tree = cf.Directory(store.root)
     try:
         with cf._database(tree, "metadata.sqlite3", readonly=True) as db:
-            plan = json.loads(db.execute("SELECT plan FROM launches WHERE launch_id=?", (receipt["launch_id"],)).fetchone()[0])
+            plan = _fixture_object(db.execute("SELECT plan FROM launches WHERE launch_id=?", (receipt["launch_id"],)).fetchone()[0], context="stored launch plan")
     finally:
         tree.close()
     assert plan["yolo"] is True
@@ -536,6 +558,7 @@ def test_private_log_is_idempotent_and_native_paths_stay_private(tmp_path):
                                {"task": "task", "attachments": []}, str(private))
     assert "sqlite_home=" + json.dumps(str(private)) in argv
     assert "log_dir=" + json.dumps(str(private / "log")) in argv
+    assert argv.count("--no-daemon") == 1
     assert argv[-3] == "--no-alt-screen"
 
 
@@ -544,11 +567,13 @@ def test_yolo_is_a_separate_codex_argument_and_survives_resume(tmp_path):
     value = {"codex": {"executable": "/usr/bin/codex"}}
     argv = launch._runtime_argv(value, plan, str(tmp_path))
     assert argv.count("--no-alt-screen") == 1
+    assert argv.count("--no-daemon") == 1
     assert argv[-3] == "--yolo"
     assert argv[-2] == "--"
     assert argv[-1].startswith(plan["task"])
     resumed = launch._runtime_argv(value, plan, str(tmp_path), "conversation")
     assert resumed.count("--no-alt-screen") == 1
+    assert resumed.count("--no-daemon") == 1
     assert resumed[-3:] == [
         "--yolo", "resume", "conversation",
     ]
@@ -628,7 +653,7 @@ def test_old_or_unknown_plan_cannot_gain_host_user_authority(configured, monkeyp
         launch.start(store, actor, result, backend=backend)
     with sqlite3.connect(store.root / "metadata.sqlite3") as db:
         row = db.execute("SELECT plan FROM launches WHERE launch_id=?", (result["launch_id"],)).fetchone()
-        plan = json.loads(row[0])
+        plan = _fixture_object(row[0], context="legacy-plan fixture")
         assert plan["version"] == 2 and plan["execution"] == "host-user"
         if kind == "unversioned":
             plan.pop("version")
@@ -690,7 +715,7 @@ def test_assigned_private_bash_scope_survives_normal_user_startup(configured, mo
                                input=shlex.join([sys.executable, "-c", program])+"\nexit\n",
                                env=environment, text=True, capture_output=True, timeout=15)
     assert completed.returncode == 0, completed.stderr
-    observed = json.loads(proof.read_text())
+    observed = _fixture_object(proof, context="scoped-shell proof")
     assert observed["CODEX_HOME"] == str(private)
     assert observed["TERMDECK_AUTH_SCOPE_ID"] == scope
     assert observed["PATH"] == str(private / "bin") + ":/usr/bin:/bin"
@@ -731,7 +756,7 @@ def test_profile_admission_refuses_invalid_authority(configured, mutation, detai
     launch.start(store, actor, receipt, backend=backend)
     if mutation == "legacy":
         with sqlite3.connect(store.root / "metadata.sqlite3") as db:
-            plan = json.loads(db.execute("SELECT plan FROM launches WHERE launch_id=?", (receipt["launch_id"],)).fetchone()[0])
+            plan = _fixture_object(db.execute("SELECT plan FROM launches WHERE launch_id=?", (receipt["launch_id"],)).fetchone()[0], context="stored launch plan")
             plan.pop("version")
             db.execute("UPDATE launches SET plan=? WHERE launch_id=?", (json.dumps(plan), receipt["launch_id"]))
     elif mutation == "policy":
@@ -865,7 +890,7 @@ def test_managed_command_binds_verified_stable_entrypoint_and_allows_release_upg
         "--state", str(store.root.parent), "--auth-dir", str(store.auth_directory),
         "--db", str(store.session_database), "--launch", result["launch_id"], "--tab", record.id]
     with sqlite3.connect(store.root / "metadata.sqlite3") as db:
-        plan = json.loads(db.execute("SELECT plan FROM launches").fetchone()[0])
+        plan = _fixture_object(db.execute("SELECT plan FROM launches").fetchone()[0], context="managed launch plan")
     assert plan["managed_entrypoint"] == {"root": str(root), "launcher": str(launcher)}
     launch.validate_native_launch(record)
     activate("b")
