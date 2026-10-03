@@ -277,15 +277,24 @@ def read_profiles(root: Path, legacy: dict[str, Path], registry: dict | None) ->
                 entries[name] = value
                 snapshots.append((name, *value))
 
+            # Native aliases are authoritative for their exact names. Validate
+            # each target before considering a legacy credential with that name.
+            alias_credentials = {}
+            for name, value in aliases.items():
+                _name(name)
+                alias_names.add(name)
+                alias_credentials[name] = snapshot.credential(snapshot.profile(value))
             if legacy:
                 if len(legacy) > _LIMIT:
                     raise CredentialError("System account catalogue exceeds the entry limit")
                 for name, path in legacy.items():
-                    add(name, snapshot.credential(path.parent, path.name))
-            for name, value in aliases.items():
-                _name(name)
-                alias_names.add(name)
-                add(name, snapshot.credential(snapshot.profile(value)), alias=True)
+                    value = snapshot.credential(path.parent, path.name)
+                    authoritative = alias_credentials.get(name)
+                    if authoritative is not None and not _same_account(authoritative[1], value[1]):
+                        continue  # A shadowed snapshot cannot retain this selector.
+                    add(name, value)
+            for name, value in alias_credentials.items():
+                add(name, value, alias=True)
             if present["login-homes"] is not None:
                 profiles = root / "login-homes"
                 for name in snapshot.entries(profiles):

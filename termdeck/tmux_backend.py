@@ -4896,6 +4896,142 @@ class TmuxBackend:
             path_first_matches=environment.get(b"PATH", "").split(os.pathsep)[0] == str(Path(home) / "bin"))
         return result
 
+
+    @staticmethod
+    def _auth_readiness_entrypoint_category(raw: str, exit_status: int | None) -> str:
+        """Classify closed public literals only; output text has no authority."""
+        categories = set()
+        if exit_status == 78:
+            prefix = "TermDeck native task could not start: "
+            messages = {
+                "Launch is unavailable": "launch-authority",
+                "Launch permit was already consumed": "launch-authority",
+                "Launch policy changed": "policy-authority",
+                "Configured launch policy changed": "policy-authority",
+                "Resume permit is unavailable or consumed": "resume-authority",
+                "Resume permit was already consumed": "resume-authority",
+                "Private account binding needs repair": "private-account-binding",
+                "Resume private scope changed": "private-scope",
+                "Configured private scope changed": "private-scope",
+                "Private native configuration has no validated provenance": "private-configuration",
+                "Private native configuration authority cannot be validated": "private-configuration",
+                "Shared asset catalogue cannot be validated": "shared-assets",
+                "Shared asset binding changed": "shared-assets",
+                "Configured launch binding changed": "configured-binding",
+                "Configured tab is unavailable": "configured-binding",
+                "Configured tab binding changed": "configured-binding",
+                "Configured launcher identity changed": "configured-binding",
+                "Tab is not authorized": "configured-binding",
+                "Configured account source changed": "configured-binding",
+                "Configured Codex runtime changed": "configured-binding",
+                "Original launch machine was revoked; authorize a new launch": "original-launch-auth",
+                "Original launch login expired; authorize a new launch with the current login": "original-launch-auth",
+                "Original launch login was revoked; authorize a new launch with the current login": "original-launch-auth",
+                "Original launch authorization changed; authorize a new launch": "original-launch-auth",
+                "Native executable binding is invalid": "native-authority",
+                "Native executable authority is unsafe": "native-authority",
+                "Native executable changed while opening": "native-authority",
+                "Qualified Codex executable changed before launch": "native-authority",
+                "Native executable changed during verification": "native-authority",
+            }
+            generic = "TermDeck native task could not start; review its launch policy and attachment authorization."
+            for line in raw.splitlines():
+                if line.startswith(prefix):
+                    categories.add(messages.get(line[len(prefix):], "unknown"))
+                elif line == generic:
+                    categories.add("entrypoint-io-or-value-refusal")
+        elif exit_status == 1 and "Traceback (most recent call last):" in raw.splitlines():
+            exceptions = {"KeyError": "python-key-error", "AttributeError": "python-attribute-error",
+                "TypeError": "python-type-error", "NameError": "python-name-error",
+                "RuntimeError": "python-runtime-error", "ImportError": "python-import-error",
+                "ModuleNotFoundError": "python-import-error", "MemoryError": "python-memory-error",
+                "ValueError": "python-value-error", "OSError": "python-os-error",
+                "FileNotFoundError": "python-os-error", "PermissionError": "python-os-error"}
+            for line in raw.splitlines():
+                kind, separator, _private_message = line.partition(":")
+                if separator and kind in exceptions:
+                    categories.add(exceptions[kind])
+        return next(iter(categories)) if len(categories) == 1 else "unknown"
+
+    def _auth_readiness_exit_diagnostic(
+        self, record: SessionRecord, identity: _AuthPaneIdentity | None, start_time: int | None,
+    ) -> dict[str, object]:
+        """Observe only the failed managed pane; never retain its captured text."""
+        result: dict[str, object] = {"pane_identity": "unobserved", "dead_pane": None,
+            "exit_status": None, "exit_signal": None, "category_read": "not-read",
+            "entrypoint_error_category": "unknown"}
+        if (record.external or record.tag != "web-agent" or not self._private_auth_scope_configured(record)
+                or identity is None or start_time is None or not re.fullmatch(r"%[0-9]+", identity.pane_id)):
+            return result
+        timeout = min(0.25, self.query_timeout)
+        format_text = ("#{session_name}\t#{session_created}\t#{pane_id}\t#{pane_pid}\t"
+            "#{pane_current_path}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\t#{pane_width}")
+        def read_pane():
+            response = self._run(["display-message", "-p", "-t", self.pane_target(record), format_text],
+                check=False, timeout=timeout)
+            if response.returncode != 0:
+                return None
+            fields = response.stdout.rstrip("\n").split("\t")
+            if (len(fields) != 9 or fields[:4] != [record.tmux_name, identity.session_created,
+                    identity.pane_id, str(identity.pane_pid)]
+                    or self._normalise_pane_directory(fields[4]) != identity.current_path
+                    or self._normalise_pane_directory(fields[4]) != self._normalise_pane_directory(record.cwd)
+                    or fields[5] not in {"0", "1"} or not re.fullmatch(r"[0-9]{1,4}", fields[8])
+                    or not 1 <= int(fields[8]) <= 1000):
+                return None
+            return fields
+        def exited_or_absent():
+            process = self._auth_process_identity(identity.pane_pid)
+            if process is not None:
+                return process[1] == start_time and process[0] in {"Z", "X", "x"}
+            try:
+                Path(f"/proc/{identity.pane_pid}").stat()
+            except FileNotFoundError:
+                return True
+            except OSError:
+                pass
+            return False
+        before = read_pane()
+        if before is None:
+            result["pane_identity"] = "ambiguous"
+            return result
+        if before[5] == "0":
+            result.update(pane_identity="bound", dead_pane=False)
+            return result
+        status, dead_signal = None, None
+        if before[6]:
+            if not re.fullmatch(r"[0-9]{1,3}", before[6]) or int(before[6]) > 255:
+                result["pane_identity"] = "ambiguous"
+                return result
+            status = int(before[6])
+        if before[7]:
+            names = {name.removeprefix("SIG"): int(value)
+                for name, value in signal.Signals.__members__.items()}
+            dead_signal = names.get(before[7])
+            if dead_signal is None:
+                result["pane_identity"] = "ambiguous"
+                return result
+        if (status is not None and dead_signal is not None) or not exited_or_absent():
+            result["pane_identity"] = "ambiguous"
+            return result
+        category, category_read = "unknown", "not-read"
+        if status in {1, 78} and dead_signal is None:
+            captured = self._run(["capture-pane", "-p", "-t", identity.pane_id, "-S", "-32", "-E", "32"],
+                check=False, timeout=timeout)
+            if captured.returncode != 0:
+                category_read = "unavailable"
+            elif len(captured.stdout.encode("utf-8")) > 65536:
+                category_read = "too-large"
+            else:
+                category_read = "observed"
+                category = self._auth_readiness_entrypoint_category(captured.stdout, status)
+        if read_pane() != before or not exited_or_absent():
+            result["pane_identity"] = "ambiguous"
+            return result
+        result.update(pane_identity="bound", dead_pane=True, exit_status=status,
+            exit_signal=dead_signal, category_read=category_read, entrypoint_error_category=category)
+        return result
+
     def _record_auth_readiness_failure(
         self, record: SessionRecord, *, identity: _AuthPaneIdentity | None,
         start_time: int | None, pane_observed: bool, reason: str,
@@ -4917,14 +5053,15 @@ class TmuxBackend:
                     child = self._auth_process_identity(pid)
                     if child is not None:
                         processes.append(self._auth_readiness_process_diagnostic(record, pid, child[1]))
-        value = {"schema": "t1000.auth-readiness-failure.v1",
+        value = {"schema": "t1000.auth-readiness-failure.v2",
             "phase": "exact-recovery" if exact_recovery else "launcher-scope",
             "last_failed_gate": reason, "deadline_reached": True,
             "timeout_seconds": max(0.05, timeout), "elapsed_seconds": round(elapsed, 3),
             "pane_observed_at_deadline": pane_observed,
             "recovery_observed": recovery_observed,
             "conversation_matches": conversation_matches, "cwd_matches": cwd_matches,
-            "processes": processes}
+            "processes": processes,
+            "candidate_exit": self._auth_readiness_exit_diagnostic(record, identity, start_time)}
         failures = getattr(self, "_auth_readiness_failures", {})
         if record.id not in failures and len(failures) >= 128:
             failures.pop(next(iter(failures)))

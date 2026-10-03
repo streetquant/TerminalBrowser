@@ -220,8 +220,16 @@ def test_conflicting_source_snapshots_fail_closed(source, conflict):
         value.pop("last_refresh")
     elif conflict == "malformed":
         value = {"tokens": {"account_id": "work"}}
-    selected = profile(source, "login-work", value)
-    write(source / "account-profiles.json", {"work": str(selected)})
+    if conflict == "identity":
+        # A native alias may supersede a legacy saved name, but it cannot
+        # give a different identity to an existing physical-home selector.
+        profile(source, "login-work", credential("work"))
+        selected = profile(source, "login-other", value)
+        alias = "login-work"
+    else:
+        selected = profile(source, "login-work", value)
+        alias = "work"
+    write(source / "account-profiles.json", {alias: str(selected)})
     with pytest.raises(auth.CodexAuthError):
         prepare(source)
 
@@ -458,3 +466,142 @@ def test_private_registry_must_be_direct_valid_metadata(source, malformed):
     with pytest.raises(auth.CodexAuthError):
         auth.read_auth_state(home, account_source=source)
     assert tree(source) == before
+
+
+def test_native_alias_replacement_preserves_archive_and_selected_identity(source):
+    legacy = saved(source, "24", credential("previous", token="legacy-private-fixture"))
+    previous = profile(source, "login-previous", credential("previous"))
+    selected = profile(source, "login-selected", credential("new"))
+    other = profile(source, "login-other", credential("other"))
+    (source / "auth.json").symlink_to(legacy)
+    write(source / "current", "24\n")
+    write(source / "next-login-home", str(selected))
+    write(source / "account-profiles.json", {
+        "24": str(selected), "24.previous-fixture": str(previous), "other": str(other),
+    })
+    before = tree(source)
+    state = auth.read_auth_state(prepare(source), account_source=source)
+    selected_row = auth.resolve_account(state, "24")
+    assert selected_row.account_key == state.selected_account_key == state.canonical_account_key == "24"
+    assert read(Path(state.codex_home) / "accounts" / "24.json").identity == read(selected / "auth.json").identity
+    assert auth.resolve_account(state, "login-selected").account_key == "24"
+    old_row = auth.resolve_account(state, "24.previous-fixture")
+    assert old_row.account_key == auth.resolve_account(state, "login-previous").account_key != "24"
+    assert read(Path(state.codex_home) / "accounts" / (old_row.account_key + ".json")).identity == read(previous / "auth.json").identity
+    rows = {item["account_key"]: set(item["selectors"])
+            for item in auth._source_account_catalog(source).registry["accounts"]}
+    assert rows["24"] == {"24", "login-selected"}
+    assert rows[old_row.account_key] == {"24.previous-fixture", "login-previous"}
+    assert all(not names & rows["24"] for key, names in rows.items() if key != "24")
+    with pytest.raises(auth.CodexAuthError):
+        auth.resolve_account(state, "arbitrary-not-an-account")
+    assert state.credential_status == state.canonical_credential_status == "current"
+    assert tree(source) == before
+
+
+@pytest.mark.parametrize("damage", [
+    "missing-home", "missing-auth", "malformed-auth", "foreign-home",
+    "relative-home", "profile-link", "credential-mode", "alias-type",
+])
+def test_authoritative_alias_damage_never_falls_back_to_valid_legacy(source, damage):
+    saved(source, "24", credential("previous"))
+    selected = profile(source, "login-selected", credential("new"))
+    target = str(selected)
+    if damage == "missing-home":
+        target = str(selected.parent / "login-missing")
+    elif damage == "missing-auth":
+        (selected / "auth.json").unlink()
+    elif damage == "malformed-auth":
+        write(selected / "auth.json", {"tokens": {"account_id": "new"}})
+    elif damage == "foreign-home":
+        outside = source.parent / "foreign"
+        outside.mkdir(mode=0o700)
+        write(outside / "auth.json", credential("new"))
+        target = str(outside)
+    elif damage == "relative-home":
+        target = "login-homes/login-selected"
+    elif damage == "profile-link":
+        selected.rename(source / "held")
+        selected.symlink_to(source / "held", target_is_directory=True)
+    elif damage == "credential-mode":
+        (selected / "auth.json").chmod(0o666)
+    else:
+        target = 24
+    write(source / "account-profiles.json", {"24": target})
+    before = tree(source)
+    with pytest.raises(auth.CodexAuthError):
+        auth.read_auth_state(source.parent / "uncreated-tab", account_source=source)
+    assert tree(source) == before
+    assert not (source.parent / "uncreated-tab").exists()
+
+
+def test_authoritative_alias_different_case_cannot_shadow_legacy_selector(source):
+    saved(source, "Work", credential("previous"))
+    selected = profile(source, "login-selected", credential("new"))
+    write(source / "account-profiles.json", {"work": str(selected)})
+    before = tree(source)
+    with pytest.raises(auth.CodexAuthError, match="differ only by case"):
+        auth.read_auth_state(source.parent / "uncreated-tab", account_source=source)
+    assert tree(source) == before
+
+
+@pytest.mark.parametrize("newer", ["legacy", "profile", "equal"])
+def test_alias_same_principal_retains_generation_order_and_stale_selection(source, newer):
+    legacy_value = credential("same")
+    profile_value = credential("same")
+    if newer == "legacy":
+        legacy_value = credential("same", refresh="2026-02-01T00:00:00Z", token="new-legacy")
+    elif newer == "profile":
+        profile_value = credential("same", refresh="2026-02-01T00:00:00Z", token="new-profile")
+    legacy = saved(source, "24", legacy_value)
+    selected = profile(source, "login-selected", profile_value)
+    write(source / "account-profiles.json", {"24": str(selected)})
+    write(source / "next-login-home", str(selected))
+    before = tree(source)
+    system = auth._source_account_catalog(source)
+    assert system.canonical.key == "24"
+    expected = legacy if newer == "legacy" else selected / "auth.json"
+    assert system.credentials["24"] == expected
+    assert system.canonical.status == ("stale" if newer == "legacy" else "current")
+    assert set(system.alternate_credentials["24"]) == {legacy, selected / "auth.json"}
+    assert tree(source) == before
+
+
+def test_alias_replacement_cannot_reuse_previous_principal_private_copy(source):
+    legacy = saved(source, "24", credential("previous"))
+    previous = profile(source, "login-previous", credential("previous"))
+    (source / "auth.json").symlink_to(legacy)
+    write(source / "account-profiles.json", {"24": str(previous)})
+    write(source / "next-login-home", str(previous))
+    home = prepare(source)
+    selected = profile(source, "login-selected", credential("new"))
+    write(source / "account-profiles.json", {
+        "24": str(selected), "24.previous-fixture": str(previous),
+    })
+    write(source / "next-login-home", str(selected))
+    before, private = tree(source), tree(home)
+    with pytest.raises(auth.CodexAuthError, match="conflicts with its current system identity"):
+        auth.read_auth_state(home, account_source=source)
+    assert tree(source) == before and tree(home) == private
+
+
+def test_alias_credential_replacement_during_validation_is_refused(source, monkeypatch):
+    saved(source, "24", credential("previous"))
+    selected = profile(source, "login-selected", credential("new"))
+    write(source / "account-profiles.json", {"24": str(selected)})
+    original = catalogue.read
+    changed = False
+
+    def replace_after_read(path, **kwargs):
+        nonlocal changed
+        result = original(path, **kwargs)
+        if not changed:
+            changed = True
+            replace_auth(selected, credential("new", token="concurrent-fixture"))
+        return result
+
+    monkeypatch.setattr(catalogue, "read", replace_after_read)
+    with pytest.raises(auth.CodexAuthError, match="changed during observation"):
+        auth.read_auth_state(source.parent / "uncreated-tab", account_source=source)
+    assert changed
+    assert not (source.parent / "uncreated-tab").exists()
