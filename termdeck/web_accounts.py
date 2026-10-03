@@ -85,6 +85,14 @@ def handle(store, request, *, manager=None, backend=None):
     backend = backend or TmuxBackend()
     for session_id in ids:
         record = store.get(session_id)
+        diagnostics_enabled = False
+        if isinstance(backend, TmuxBackend):
+            try:
+                backend.take_auth_readiness_diagnostics(session_id)
+                diagnostics_enabled = True
+            except Exception:
+                # A failed clear has no account authority and cannot attach stale evidence.
+                pass
         try:
             if record is None:
                 raise ManagementError("Selected tab disappeared before account switching")
@@ -114,6 +122,14 @@ def handle(store, request, *, manager=None, backend=None):
             # No exception repr/credential payload reaches the API.
             from .redaction import redact_text
             results.append({"id": session_id, "ok": False, "error": redact_text(str(exc)).text[:512]})
+        if diagnostics_enabled:
+            try:
+                diagnostics = backend.take_auth_readiness_diagnostics(session_id)
+                if diagnostics:
+                    results[-1]["readiness_diagnostics"] = diagnostics
+            except Exception:
+                # Telemetry cannot replace the account result or its receipt publication.
+                pass
     result = {"ok": all(row["ok"] for row in results), "results": results}
     with store.conn:
         store.conn.execute("UPDATE web_account_requests SET result=? WHERE session_id=? AND request_id=?", (json.dumps(result), session, request_id))

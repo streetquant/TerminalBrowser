@@ -4829,6 +4829,108 @@ class TmuxBackend:
                 return False, "failed terminal process remained live after cleanup"
             time.sleep(0.025)
 
+    def take_auth_readiness_diagnostics(self, session_id: str) -> list[dict[str, object]]:
+        """Consume only this tab's bounded, secret-free failed-readiness evidence."""
+        return getattr(self, "_auth_readiness_failures", {}).pop(session_id, [])
+
+    def _auth_readiness_process_diagnostic(
+        self, record: SessionRecord, pid: int, expected_start: int,
+    ) -> dict[str, object]:
+        """Report equality facts only; never return environment or command values."""
+        result: dict[str, object] = {"pid": pid, "start_time": expected_start,
+            "process_state": "unavailable", "environment_read": "not-read",
+            "home_matches": None, "scope_matches": None,
+            "gate_matches": None, "path_first_matches": None}
+        before = self._auth_process_identity(pid)
+        if before is None:
+            try:
+                Path(f"/proc/{pid}").stat()
+            except FileNotFoundError:
+                result["process_state"] = "exited"
+            except OSError:
+                pass
+            return result
+        if before[1] != expected_start:
+            result["process_state"] = "incarnation-changed"
+            return result
+        if before[0] in {"Z", "X", "x"}:
+            result["process_state"] = "exited"
+            return result
+        result["process_state"] = "stopped" if before[0] in {"T", "t"} else "live"
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as handle:
+                raw = handle.read(1024 * 1024 + 1)
+        except OSError:
+            result["environment_read"] = "unavailable"
+            return result
+        if len(raw) > 1024 * 1024:
+            result["environment_read"] = "too-large"
+            return result
+        wanted = {b"CODEX_HOME", b"TERMDECK_AUTH_SCOPE_ID", b"CODEX_TERMDECK_GATE_ROOT", b"PATH"}
+        environment = {}
+        for entry in raw.split(b"\0"):
+            key, separator, value = entry.partition(b"=")
+            if separator and key in wanted:
+                environment[key] = os.fsdecode(value)
+        after = self._auth_process_identity(pid)
+        if after is None or after[1] != expected_start:
+            result["process_state"] = "unavailable" if after is None else "incarnation-changed"
+            if after is None:
+                try:
+                    Path(f"/proc/{pid}").stat()
+                except FileNotFoundError:
+                    result["process_state"] = "exited"
+                except OSError:
+                    pass
+            result["environment_read"] = "identity-ambiguous"
+            return result
+        if after[0] in {"Z", "X", "x"}:
+            result["process_state"] = "exited"
+            result["environment_read"] = "identity-ambiguous"
+            return result
+        home = str(Path(record.codex_home or "").expanduser().resolve(strict=False))
+        result.update(environment_read="observed",
+            home_matches=environment.get(b"CODEX_HOME") == home,
+            scope_matches=environment.get(b"TERMDECK_AUTH_SCOPE_ID") == record.auth_scope_id,
+            gate_matches=environment.get(b"CODEX_TERMDECK_GATE_ROOT") == str(auth_lifetime_gate_root(record)),
+            path_first_matches=environment.get(b"PATH", "").split(os.pathsep)[0] == str(Path(home) / "bin"))
+        return result
+
+    def _record_auth_readiness_failure(
+        self, record: SessionRecord, *, identity: _AuthPaneIdentity | None,
+        start_time: int | None, pane_observed: bool, reason: str,
+        exact_recovery: bool, timeout: float, elapsed: float,
+        recovery_observed: bool | None, conversation_matches: bool | None,
+        cwd_matches: bool | None,
+    ) -> None:
+        """Capture only after the original deadline has already refused readiness."""
+        processes = []
+        if identity is not None and start_time is not None:
+            root = self._auth_readiness_process_diagnostic(record, identity.pane_pid, start_time)
+            processes.append(root)
+            if root["process_state"] in {"live", "stopped"}:
+                for pid in process_tree(identity.pane_pid):
+                    if pid == identity.pane_pid:
+                        continue
+                    if len(processes) >= 8:
+                        break
+                    child = self._auth_process_identity(pid)
+                    if child is not None:
+                        processes.append(self._auth_readiness_process_diagnostic(record, pid, child[1]))
+        value = {"schema": "t1000.auth-readiness-failure.v1",
+            "phase": "exact-recovery" if exact_recovery else "launcher-scope",
+            "last_failed_gate": reason, "deadline_reached": True,
+            "timeout_seconds": max(0.05, timeout), "elapsed_seconds": round(elapsed, 3),
+            "pane_observed_at_deadline": pane_observed,
+            "recovery_observed": recovery_observed,
+            "conversation_matches": conversation_matches, "cwd_matches": cwd_matches,
+            "processes": processes}
+        failures = getattr(self, "_auth_readiness_failures", {})
+        if record.id not in failures and len(failures) >= 128:
+            failures.pop(next(iter(failures)))
+        failures[record.id] = (failures.get(record.id, []) + [value])[-4:]
+        self._auth_readiness_failures = failures
+
     def _await_auth_recreation_ready(
         self,
         record: SessionRecord,
@@ -4851,7 +4953,11 @@ class TmuxBackend:
 
         deadline = time.monotonic() + max(0.05, timeout)
         last_detail = "fresh tmux pane was not ready"
+        last_identity = None
+        last_start = None
+        recovery_observed = conversation_matches = cwd_matches = None
         while True:
+            recovery_observed = conversation_matches = cwd_matches = None
             try:
                 identity = self._inspect_auth_pane(record)
             except (OSError, TmuxError) as exc:
@@ -4859,6 +4965,10 @@ class TmuxBackend:
                 last_detail = f"fresh tmux pane could not be inspected: {exc}"
             if identity is not None:
                 process_identity = self._auth_process_identity(identity.pane_pid)
+                if process_identity is not None:
+                    last_identity, last_start = identity, process_identity[1]
+                elif last_identity is None or last_identity.pane_pid != identity.pane_pid:
+                    last_identity, last_start = identity, None
                 reused_previous_identity = bool(
                     previous_session_created
                     and previous_pane_id
@@ -4905,6 +5015,9 @@ class TmuxBackend:
                     except (OSError, RuntimeError, ValueError) as exc:
                         last_detail = f"exact Codex recovery could not be observed: {exc}"
                     else:
+                        recovery_observed = observed
+                        conversation_matches = recovery_command == expected_recovery_command
+                        cwd_matches = recovery_cwd == expected_recovery_cwd
                         if (
                             observed
                             and recovery_command == expected_recovery_command
@@ -4913,6 +5026,25 @@ class TmuxBackend:
                             return identity, ""
                         last_detail = "fresh pane has not taken over the exact Codex recovery UUID"
             if time.monotonic() >= deadline:
+                try:
+                    reasons = {
+                        "fresh tmux pane was not ready": "pane-unavailable",
+                        "tmux reused the old session, pane, and process identity": "old-incarnation",
+                        "fresh pane process identity was unavailable": "process-read-ambiguous",
+                        "private auth handoff launcher did not become ready": "private-environment",
+                        "fresh pane has not taken over the exact Codex recovery UUID": "conversation-or-cwd",
+                    }
+                    reason = reasons.get(last_detail, "recovery-read-ambiguous" if last_detail.startswith(
+                        "exact Codex recovery could not be observed:") else "pane-read-ambiguous")
+                    self._record_auth_readiness_failure(record, identity=last_identity,
+                        start_time=last_start, pane_observed=identity is not None, reason=reason,
+                        exact_recovery=expected_recovery_command is not None, timeout=timeout,
+                        elapsed=time.monotonic() - (deadline - max(0.05, timeout)),
+                        recovery_observed=recovery_observed,
+                        conversation_matches=conversation_matches, cwd_matches=cwd_matches)
+                except Exception:
+                    # Diagnostic collection has no account authority and cannot replace refusal.
+                    pass
                 return identity, last_detail
             time.sleep(0.025)
 
