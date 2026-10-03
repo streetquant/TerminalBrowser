@@ -545,7 +545,8 @@ def _validate_resume_record(store, args, db, plan, value, expected=None):
     if "launcher" in plan and current.command != _launcher_command(store, plan, args.tab):
         raise StagingError("Configured launcher identity changed", "unauthorized")
     binding = _launch_binding(current)
-    if (any(getattr(binding, key) != getattr(args, key) for key in ("state", "auth_dir", "db", "launch", "tab"))
+    if (any(getattr(binding, key) != (os.fspath(args.db) if key == "db" else getattr(args, key))
+            for key in ("state", "auth_dir", "db", "launch", "tab"))
             or not Path(args.db).is_absolute() or Path(args.db).parent != Path(args.state)
             or current.window_id != plan["window_id"] or current.cwd != plan["workspace"]["path"]
             or args.tab not in [t["id"] for t in plan["tabs"]]

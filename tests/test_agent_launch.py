@@ -986,3 +986,136 @@ def test_present_invalid_managed_context_never_falls_back_to_source_launch(confi
     with pytest.raises(cf.StagingError, match="Managed launch authority"):
         store.handle(actor, request(configured))
     assert not store.session_database.exists()
+
+
+@pytest.fixture
+def managed_resume_database_case(tmp_path, monkeypatch, managed_launch_context):
+    """Provider-free boundary fixture; no login, permit consumption, or exec."""
+    from types import SimpleNamespace
+    from termdeck import cli
+    from termdeck.codex_config_scope import _CANONICAL_HOME_BINDING
+
+    root, launcher, _, _ = managed_launch_context
+    state = tmp_path / "resume-state"
+    state.mkdir(mode=0o700)
+    database = state / "sessions.sqlite3"
+    with sqlite3.connect(database) as fixture:
+        fixture.execute("CREATE TABLE fixture_identity(value TEXT)")
+    database.chmod(0o600)
+    workspace = tmp_path / "resume-workspace"
+    workspace.mkdir(mode=0o700)
+    source = tmp_path / "resume-canonical"
+    source.mkdir(mode=0o700)
+    scope = "auth-" + "a" * 32
+    home = state / "terminal-auth" / scope
+    home.mkdir(parents=True, mode=0o700)
+    (home / _CANONICAL_HOME_BINDING).symlink_to(source, target_is_directory=True)
+    store = SimpleNamespace(root=state / "client-files",
+                            auth_directory=tmp_path / "resume-auth",
+                            session_database=database)
+    tab = "td-" + "a" * 32
+    launch_id = "launch_" + "a" * 32
+    plan = dict(launcher=str(Path(sys.executable).resolve()),
+                managed_entrypoint=dict(root=str(root), launcher=str(launcher)),
+                launch_id=launch_id, window_id="win-" + "a" * 32,
+                workspace=dict(path=str(workspace)), tabs=[dict(id=tab)],
+                runtime="codex")
+    record = launch.SessionRecord(
+        id=tab, name="Synthetic resume", tag="web-agent",
+        command=launch._launcher_command(store, plan, tab),
+        cwd=str(workspace), tmux_name="synthetic_resume",
+        created_at="fixture", last_opened_at="fixture",
+        window_id=plan["window_id"], codex_home=str(home), auth_scope_id=scope)
+    current = [record]
+    reads = []
+
+    class BoundRecordReader:
+        def __init__(self, path, *, provision_auth_scopes):
+            assert provision_auth_scopes is False
+            reads.append(path)
+
+        def get(self, _tab):
+            # Supply the exact owned fixture record to isolate the binding gate.
+            return current[0]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(launch, "SessionStore", BoundRecordReader)
+    attestations = []
+    monkeypatch.setattr(cli, "require_hot_storage",
+                        lambda **values: attestations.append(values))
+    monkeypatch.setattr(cli, "default_db_path", lambda: database)
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE launches(launch_id TEXT, status TEXT)")
+    db.execute("CREATE TABLE launch_runs(launch_id TEXT, tab_id TEXT)")
+    db.execute("INSERT INTO launches VALUES(?, 'started')", (launch_id,))
+    db.execute("INSERT INTO launch_runs VALUES(?, ?)", (launch_id, tab))
+    value = dict(codex=dict(account_source=str(source)))
+    args = cli.build_parser().parse_args(shlex.split(record.command)[2:])
+    assert args._uses_session_db is True
+    assert type(args.db) is str
+    cli._prepare_managed_session_database(args)
+    assert type(args.db) is type(database)
+    assert attestations == [dict(managed_root=root, db_path=database, production=True)]
+    try:
+        yield SimpleNamespace(store=store, plan=plan, record=record, current=current,
+                              args=args, db=db, value=value, source=source,
+                              reads=reads, home=home)
+    finally:
+        db.close()
+
+
+def test_managed_resume_database_preparation_preserves_exact_binding(managed_resume_database_case):
+    f = managed_resume_database_case
+    assert launch._validate_resume_record(f.store, f.args, f.db, f.plan, f.value,
+                                          f.record) is f.record
+    assert f.reads == [f.args.db]
+
+
+def test_managed_resume_database_source_string_remains_supported(managed_resume_database_case):
+    f = managed_resume_database_case
+    args = launch._launch_binding(f.record)
+    assert type(args.db) is str
+    assert launch._validate_resume_record(f.store, args, f.db, f.plan, f.value,
+                                          f.record) is f.record
+
+
+@pytest.mark.parametrize("changed", [
+    "foreign-db", "relative-db", "symlink-db", "state", "auth_dir", "launch", "tab",
+    "window", "cwd", "launch-status", "launch-run", "runtime", "account-source",
+    "private-home", "expected-record", "launcher-command",
+])
+def test_managed_resume_database_foreign_bindings_still_refuse(managed_resume_database_case, changed):
+    f = managed_resume_database_case
+    expected = f.record
+    if changed == "foreign-db":
+        f.args.db = f.args.db.with_name("foreign.sqlite3")
+    elif changed == "relative-db":
+        f.args.db = Path("sessions.sqlite3")
+    elif changed == "symlink-db":
+        alias = f.args.db.with_name("database-alias.sqlite3")
+        alias.symlink_to(f.args.db)
+        f.args.db = alias
+    elif changed in {"state", "auth_dir", "launch", "tab"}:
+        setattr(f.args, changed, getattr(f.args, changed) + "-foreign")
+    elif changed == "window":
+        f.current[0] = replace(f.record, window_id="foreign")
+    elif changed == "cwd":
+        f.current[0] = replace(f.record, cwd=str(f.source))
+    elif changed == "launch-status":
+        f.db.execute("UPDATE launches SET status='failed'")
+    elif changed == "launch-run":
+        f.db.execute("DELETE FROM launch_runs")
+    elif changed == "runtime":
+        f.plan["runtime"] = "shell"
+    elif changed == "account-source":
+        f.value["codex"]["account_source"] = str(f.home.parent)
+    elif changed == "private-home":
+        f.current[0] = replace(f.record, codex_home=str(f.source))
+    elif changed == "expected-record":
+        expected = replace(f.record, auth_scope_id="auth-" + "b" * 32)
+    elif changed == "launcher-command":
+        f.current[0] = replace(f.record, command=f.record.command + " --foreign value")
+    with pytest.raises(cf.StagingError):
+        launch._validate_resume_record(f.store, f.args, f.db, f.plan, f.value, expected)
