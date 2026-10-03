@@ -4959,9 +4959,16 @@ class TmuxBackend:
         """Observe only the failed managed pane; never retain its captured text."""
         result: dict[str, object] = {"pane_identity": "unobserved", "dead_pane": None,
             "exit_status": None, "exit_signal": None, "category_read": "not-read",
-            "entrypoint_error_category": "unknown"}
+            "entrypoint_error_category": "unknown", "pane_read": "not-read",
+            "cwd_read": "not-read", "last_live_cwd_matches": None}
         if (record.external or record.tag != "web-agent" or not self._private_auth_scope_configured(record)
                 or identity is None or start_time is None or not re.fullmatch(r"%[0-9]+", identity.pane_id)):
+            return result
+        expected_cwd = self._normalise_pane_directory(record.cwd)
+        result["last_live_cwd_matches"] = bool(expected_cwd
+            and self._normalise_pane_directory(identity.current_path) == expected_cwd)
+        if not result["last_live_cwd_matches"]:
+            result.update(pane_identity="ambiguous", pane_read="last-live-cwd-mismatch")
             return result
         timeout = min(0.25, self.query_timeout)
         format_text = ("#{session_name}\t#{session_created}\t#{pane_id}\t#{pane_pid}\t"
@@ -4970,15 +4977,37 @@ class TmuxBackend:
             response = self._run(["display-message", "-p", "-t", self.pane_target(record), format_text],
                 check=False, timeout=timeout)
             if response.returncode != 0:
+                result["pane_read"] = "query-failed"
                 return None
             fields = response.stdout.rstrip("\n").split("\t")
-            if (len(fields) != 9 or fields[:4] != [record.tmux_name, identity.session_created,
-                    identity.pane_id, str(identity.pane_pid)]
-                    or self._normalise_pane_directory(fields[4]) != identity.current_path
-                    or self._normalise_pane_directory(fields[4]) != self._normalise_pane_directory(record.cwd)
-                    or fields[5] not in {"0", "1"} or not re.fullmatch(r"[0-9]{1,4}", fields[8])
-                    or not 1 <= int(fields[8]) <= 1000):
+            if len(fields) != 9:
+                result["pane_read"] = "format-invalid"
                 return None
+            if fields[:2] != [record.tmux_name, identity.session_created]:
+                result["pane_read"] = "session-mismatch"
+                return None
+            if fields[2] != identity.pane_id:
+                result["pane_read"] = "pane-mismatch"
+                return None
+            if fields[3] != str(identity.pane_pid):
+                result["pane_read"] = "pid-mismatch"
+                return None
+            if fields[5] not in {"0", "1"}:
+                result["pane_read"] = "dead-state-invalid"
+                return None
+            if not re.fullmatch(r"[0-9]{1,4}", fields[8]) or not 1 <= int(fields[8]) <= 1000:
+                result["pane_read"] = "width-invalid"
+                return None
+            if fields[4] == "" and fields[5] == "1":
+                # tmux closes the retained dead pane's FD: current_path is unavailable.
+                # The exact last live cwd above, pane/PID binding and double read remain required.
+                result["cwd_read"] = "unavailable-after-exit"
+            elif self._normalise_pane_directory(fields[4]) != expected_cwd:
+                result.update(pane_read="cwd-mismatch", cwd_read="mismatch")
+                return None
+            else:
+                result["cwd_read"] = "matched"
+            result["pane_read"] = "observed"
             return fields
         def exited_or_absent():
             process = self._auth_process_identity(identity.pane_pid)
@@ -5001,7 +5030,7 @@ class TmuxBackend:
         status, dead_signal = None, None
         if before[6]:
             if not re.fullmatch(r"[0-9]{1,3}", before[6]) or int(before[6]) > 255:
-                result["pane_identity"] = "ambiguous"
+                result.update(pane_identity="ambiguous", pane_read="exit-status-invalid")
                 return result
             status = int(before[6])
         if before[7]:
@@ -5009,10 +5038,13 @@ class TmuxBackend:
                 for name, value in signal.Signals.__members__.items()}
             dead_signal = names.get(before[7])
             if dead_signal is None:
-                result["pane_identity"] = "ambiguous"
+                result.update(pane_identity="ambiguous", pane_read="exit-signal-invalid")
                 return result
-        if (status is not None and dead_signal is not None) or not exited_or_absent():
-            result["pane_identity"] = "ambiguous"
+        if status is not None and dead_signal is not None:
+            result.update(pane_identity="ambiguous", pane_read="exit-ambiguous")
+            return result
+        if not exited_or_absent():
+            result.update(pane_identity="ambiguous", pane_read="process-ambiguous")
             return result
         category, category_read = "unknown", "not-read"
         if status in {1, 78} and dead_signal is None:
@@ -5025,8 +5057,14 @@ class TmuxBackend:
             else:
                 category_read = "observed"
                 category = self._auth_readiness_entrypoint_category(captured.stdout, status)
-        if read_pane() != before or not exited_or_absent():
+        after = read_pane()
+        if after != before:
             result["pane_identity"] = "ambiguous"
+            if after is not None:
+                result["pane_read"] = "pane-changed"
+            return result
+        if not exited_or_absent():
+            result.update(pane_identity="ambiguous", pane_read="process-ambiguous")
             return result
         result.update(pane_identity="bound", dead_pane=True, exit_status=status,
             exit_signal=dead_signal, category_read=category_read, entrypoint_error_category=category)
@@ -5053,7 +5091,7 @@ class TmuxBackend:
                     child = self._auth_process_identity(pid)
                     if child is not None:
                         processes.append(self._auth_readiness_process_diagnostic(record, pid, child[1]))
-        value = {"schema": "t1000.auth-readiness-failure.v2",
+        value = {"schema": "t1000.auth-readiness-failure.v3",
             "phase": "exact-recovery" if exact_recovery else "launcher-scope",
             "last_failed_gate": reason, "deadline_reached": True,
             "timeout_seconds": max(0.05, timeout), "elapsed_seconds": round(elapsed, 3),
