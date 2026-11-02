@@ -191,8 +191,8 @@ def check_management(page, *, origin, database, initial_id, created_id, output, 
     settings.get_by_label("Density", exact=True).select_option("comfortable")
     settings.get_by_label("Scrollback lines", exact=True).fill("30000")
     settings.get_by_label("Scrollback lines", exact=True).press("Tab")
-    settings.get_by_label("Cursor color", exact=True).fill("#00ff88")
-    settings.get_by_label("Cursor color", exact=True).press("Tab")
+    if not settings.get_by_label("Cursor color", exact=True).is_disabled():
+        raise AssertionError("cursor color must automatically match terminal text")
     settings.get_by_label("Interface scale", exact=True).fill("1.15")
     settings.get_by_label("Interface scale", exact=True).press("Tab")
     settings.get_by_label("Reduce motion", exact=True).check()
@@ -217,7 +217,7 @@ def check_management(page, *, origin, database, initial_id, created_id, output, 
     page.reload()
     page.wait_for_function("() => document.querySelector('#workspace-terminal')?.termdeckTerminal || document.querySelector('.xterm-host')?.termdeckTerminal")
     saved = page.evaluate("JSON.parse(localStorage.getItem('t1000.appearance'))")
-    if saved["chrome"] != "light" or saved["scrollback"] != 30000 or saved["cursorColor"] != "#00ff88" or saved["uiScale"] != 1.15:
+    if saved["chrome"] != "light" or saved["scrollback"] != 30000 or saved["cursorColor"] != "" or saved["uiScale"] != 1.15:
         raise AssertionError(f"settings did not persist: {saved}")
     for width, height, scale, theme in [(1440, 900, 1.75, 'light'), (390, 760, 1, 'noir'), (320, 568, 1.75, 'dark')]:
         click_action(page, "Settings · themes and fonts")

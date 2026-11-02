@@ -149,6 +149,7 @@ def check_cursor_visibility(page):
                 state = page.evaluate("({cursor:api.terminal.options.theme.cursor, blink:api.terminal.options.cursorBlink, width:api.terminal.options.cursorWidth})")
                 ratio = contrast(rgb(state["cursor"]), rgb(pack["background"]))
                 assert ratio >= 3, ("cursor contrast", palette, shape, color, ratio)
+                assert state["cursor"] == pack["foreground"], state
                 assert state["blink"] is False, state
                 assert state["width"] >= 2, state
                 results.append({"palette": palette, "shape": shape, "requested_color": color,

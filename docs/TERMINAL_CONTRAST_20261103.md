@@ -137,3 +137,20 @@ Fresh regression evidence is private under
 `.termdeck/qualification/cursor-20261103/`, including the original start commit,
 task-start snapshot, native runtime operation export and completion audit.
 Installed correction results are recorded after supported activation.
+
+## Text-matching cursor requirement
+
+The user then required the cursor to have the same color as terminal text.
+The final policy derives the cursor directly from the selected theme foreground
+and its block accent from the background, replacing the earlier custom-color
+contrast fallback. This also neutralizes stale saved cursor colors. Settings
+show an automatic text-matching color instead of an editable override. Shape,
+two-pixel bar width, application hiding and the steady cursor policy remain.
+Strict tests now require foreground equality as well as positive visible pixels.
+No per-input, output, timer or frame work was added.
+
+Final source qualification for text matching: 87 frontend tests, 42 browser
+integration assertions, 28 text configurations, 126 focused cursor cases and 42
+unfocused cursor cases pass. The settings/apply/reload/reset browser test confirms
+foreground-colored cursors and the automatic color control. The new backend
+SHA-256 is `42b6d4c039bd093a884cea00d4aeaa85ecaeb8f7deb97e6b6e065c557a7e7168`.

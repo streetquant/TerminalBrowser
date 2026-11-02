@@ -24,7 +24,7 @@ window.T1000UI = (() => {
         palette: choices?.palettes.some(item => item.value === value?.palette) ? value.palette : "t1000",
         font: choices?.fonts.some(item => item.value === value?.font) ? value.font : "auto",
         fontFamily: typeof value?.fontFamily === "string" && value.fontFamily.length <= 128 ? value.fontFamily : "",
-        cursorColor: /^#[0-9a-f]{6}$/i.test(value?.cursorColor) ? value.cursorColor : "",
+        cursorColor: "",
         scrollback: Number.isInteger(value?.scrollback) && value.scrollback >= 100 && value.scrollback <= 500000 ? value.scrollback : 20000,
         chrome: ["noir", "dark", "light", "system"].includes(value?.chrome) ? value.chrome : "noir",
         density: value?.density === "comfortable" ? "comfortable" : "compact",
@@ -353,7 +353,7 @@ window.T1000UI = (() => {
       const uiFont = text(settings.uiFont), customFont = text(settings.fontFamily);
       uiFont.placeholder = "System interface font"; customFont.placeholder = "Optional installed font family";
       const scale = number(settings.uiScale, .75, 1.75, .05), scrollback = number(settings.scrollback, 100, 500000, 100);
-      const color = text(settings.cursorColor); color.placeholder = "Palette default or #rrggbb"; color.pattern = "(?:#[0-9a-fA-F]{6})?";
+      const color = text(""); color.placeholder = "Matches terminal text"; color.disabled = true;
       const motion = element("input"); motion.type = "checkbox"; motion.checked = settings.reduceMotion;
       const side = select(["left", "right"].map(value => ({value, label: value})), shell.dataset.sidebarSide);
       const paneVisible = element("input"); paneVisible.type = "checkbox"; paneVisible.checked = !sidebar.hidden;
@@ -378,7 +378,7 @@ window.T1000UI = (() => {
       function apply() {
         if (![size, scale, scrollback, color].every(control => control.reportValidity()) || !Number.isInteger(Number(size.value))) return;
         const next = { fontSize: Number(size.value), cursorStyle: cursor.value, cursorBlink: false, palette: palette.value, font: font.value,
-          fontFamily: customFont.value.trim(), cursorColor: color.value, scrollback: Number(scrollback.value), chrome: chrome.value, density: density.value, uiFont: uiFont.value.trim(), uiScale: Number(scale.value), reduceMotion: motion.checked };
+          fontFamily: customFont.value.trim(), cursorColor: "", scrollback: Number(scrollback.value), chrome: chrome.value, density: density.value, uiFont: uiFont.value.trim(), uiScale: Number(scale.value), reduceMotion: motion.checked };
         getTerminal()?.setAppearance(next);
         applyChrome(next);
         shell.dataset.sidebarSide = side.value; sidebar.hidden = !paneVisible.checked; shell.dataset.sidebar = sidebar.hidden ? "closed" : "open"; saveLayout(); updateTabs(getPanes(), selectedId);
@@ -408,7 +408,7 @@ window.T1000UI = (() => {
           const value = data.values;
           size.value = value.fontSize; cursor.value = value.cursorStyle;
           palette.value = value.palette; font.value = value.font; customFont.value = value.fontFamily;
-          color.value = value.cursorColor; scrollback.value = value.scrollback; chrome.value = value.chrome;
+          color.value = ""; scrollback.value = value.scrollback; chrome.value = value.chrome;
           density.value = value.density; uiFont.value = value.uiFont; scale.value = value.uiScale;
           motion.checked = value.reduceMotion; side.value = value.side; paneVisible.checked = value.tabsPane;
           apply(); syncStatus.textContent = "Desktop settings loaded into this browser. Fonts still need to be installed on this computer.";

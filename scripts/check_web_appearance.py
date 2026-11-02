@@ -125,8 +125,8 @@ def main():
             page.get_by_label("Interface font", exact=True).dispatch_event("change")
             assert "Applied here:" in page.get_by_role("status").first.inner_text()
             assert page.locator("html").get_attribute("data-chrome") == "light"
-            page.get_by_label("Cursor color").fill("#abcdef")
-            page.get_by_label("Cursor color").dispatch_event("change")
+            assert page.get_by_label("Cursor color").is_disabled()
+            assert page.get_by_label("Cursor color").get_attribute("placeholder") == "Matches terminal text"
             assert page.get_by_label("Blink cursor").count() == 0
             applied = state(page)
             assert applied["fontSize"] == 24 and applied["saved"]["fontSize"] == 24, applied
@@ -135,7 +135,7 @@ def main():
             assert applied["cursorStyle"] == "bar" and applied["scrollback"] == 1200, applied
             assert applied["fontFamily"] == "monospace" and not applied["blink"], applied
             assert applied["palette"] == "#2e3440", applied
-            assert applied["cursorColor"] == "#abcdef", applied
+            assert applied["cursorColor"] == "#d8dee9", applied
             switched = page.evaluate("""() => {
                 const host = document.createElement('div');
                 host.style.cssText = 'width:760px;height:400px;overflow:auto';
@@ -174,7 +174,7 @@ def main():
             restored = state(page)
             assert restored["fontSize"] == 24 and restored["cursorStyle"] == "bar", restored
             assert restored["palette"] == "#2e3440" and restored["scrollback"] == 1200, restored
-            assert restored["cursorColor"] == "#abcdef" and restored["fontFamily"] == "monospace", restored
+            assert restored["cursorColor"] == "#d8dee9" and restored["fontFamily"] == "monospace", restored
             page.locator("#menu summary").click()
             assert page.evaluate("""() => {
                 const panel = document.querySelector('#menu .workspace-action-panel');

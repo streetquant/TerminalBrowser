@@ -31,32 +31,10 @@ function paletteTheme(name) {
   };
 }
 
-// Resolve only when appearance changes. A saved cursor color can otherwise
-// disappear into a newly selected palette, even though cursorBlink is false.
-function visibleCursorTheme(theme, requestedColor) {
-  const luminance = (color) => {
-    if (!/^#[0-9a-f]{6}$/i.test(color)) return null;
-    const channels = [1, 3, 5].map(offset => parseInt(color.slice(offset, offset + 2), 16) / 255)
-      .map(value => value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4);
-    return channels[0] * .2126 + channels[1] * .7152 + channels[2] * .0722;
-  };
-  const contrast = (first, second) => (Math.max(first, second) + .05) / (Math.min(first, second) + .05);
-  const background = luminance(theme.background);
-  let cursor = requestedColor || theme.cursor;
-  if (background !== null) {
-    const current = luminance(cursor);
-    if (current !== null && contrast(current, background) < 3) {
-      const foreground = luminance(theme.foreground);
-      cursor = foreground !== null && contrast(foreground, background) >= 3
-        ? theme.foreground : (contrast(1, background) >= contrast(0, background) ? "#ffffff" : "#000000");
-    }
-  }
-  let cursorAccent = theme.cursorAccent;
-  const fill = luminance(cursor), accent = luminance(cursorAccent);
-  if (fill !== null && accent !== null && contrast(fill, accent) < 3) {
-    cursorAccent = contrast(1, fill) >= contrast(0, fill) ? "#ffffff" : "#000000";
-  }
-  return { ...theme, cursor, cursorAccent };
+// Follow the terminal text color, including when legacy saved colors exist.
+// Resolve at appearance changes; no extra work on input or rendering frames.
+function textCursorTheme(theme) {
+  return { ...theme, cursor: theme.foreground, cursorAccent: theme.background };
 }
 
 export function appearanceOptions() {
@@ -132,7 +110,7 @@ export function createTerminal(element, options = {}) {
     rightClickSelectsWord: false,
     scrollback: Number.isSafeInteger(options.scrollback) ? options.scrollback : 10000,
     smoothScrollDuration: 0,
-    theme: visibleCursorTheme({ ...paletteTheme(options.palette), ...(options.cursorColor ? {cursor: options.cursorColor} : {}), ...(options.theme || {}) }),
+    theme: textCursorTheme({ ...paletteTheme(options.palette), ...(options.theme || {}) }),
     windowsMode: false,
   });
   const fitAddon = new FitAddon();
@@ -499,10 +477,7 @@ export function createTerminal(element, options = {}) {
       terminal.options.cursorStyle = value.cursorStyle;
       terminal.options.cursorBlink = false;
       if (value.palette !== undefined || value.cursorColor) {
-        terminal.options.theme = visibleCursorTheme(
-          value.palette !== undefined ? paletteTheme(value.palette) : terminal.options.theme,
-          value.cursorColor,
-        );
+        terminal.options.theme = textCursorTheme(value.palette !== undefined ? paletteTheme(value.palette) : terminal.options.theme);
       }
       if (value.font !== undefined) terminal.options.fontFamily = FONTS[value.font][1];
       if (value.fontFamily) terminal.options.fontFamily = `${value.fontFamily}, monospace`;
