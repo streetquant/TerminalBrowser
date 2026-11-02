@@ -94,6 +94,10 @@ class SessionRecord:
     # None identifies a legacy row whose intent was never recorded. New tabs
     # and explicit renames persist a boolean, including names equal to cwd.
     automatic_name: bool | None = None
+    # Optional nonsecret native observations, independent of the v1 recipe.
+    # Old rows remain NULL; a digest proves integrity, not launch authority.
+    recovery_authority_context: str | None = None
+    recovery_authority_context_sha256: str | None = None
 
     @property
     def name_is_automatic(self) -> bool:

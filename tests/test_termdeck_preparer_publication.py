@@ -1246,3 +1246,165 @@ def test_postcommit_backup_cleanup_failure_is_a_warning_not_false_rollback(
     ]
     assert len(retained) == 1
     retained[0].unlink()
+
+
+def _published_tls_snapshot(consumer: Path) -> dict[str, object]:
+    return _snapshot(
+        consumer,
+        ("tls",) + tuple(
+            "tls/" + path.name for path in sorted((consumer / "tls").iterdir())
+        ),
+    )
+
+
+def test_publish_reuses_exact_consumer_tls_without_staging(layout, monkeypatch) -> None:
+    config, producer, consumer = layout
+    publication.seed(config)
+    _prepare_generation(producer)
+    publication.publish(config)
+    before = _published_tls_snapshot(consumer)
+
+    def forbid_tls_stage(*_args, **_kwargs):
+        raise AssertionError("an exact consumer TLS copy must retain its inodes")
+
+    monkeypatch.setattr(publication, "_stage_tls", forbid_tls_stage)
+    result = publication.publish(config)
+
+    assert _published_tls_snapshot(consumer) == before
+    assert result["tls"]["identity"][1] != (producer / "tls").stat().st_ino
+    assert publication.verify(config)["tls"] == result["tls"]
+
+
+def test_publish_reuses_tls_across_a_fresh_runtime_receipt(layout) -> None:
+    config, producer, consumer = layout
+    publication.seed(config)
+    _prepare_generation(producer)
+    publication.publish(config)
+    before = _published_tls_snapshot(consumer)
+    _write(producer / "nginx" / "allowed-hosts.map", b"192.168.50.9 1;\nlocalhost 1;\n", 0o600)
+    receipt = _receipt(producer)
+    receipt["runtime_publication"]["generation"] = "1" * 32
+    _write(producer / "build-receipt.json", _canonical(receipt), 0o644)
+
+    result = publication.publish(config)
+
+    assert result["generation"] == "1" * 32
+    assert _published_tls_snapshot(consumer) == before
+    assert (consumer / "nginx" / "allowed-hosts.map").read_bytes().endswith(b"localhost 1;\n")
+    assert publication.verify(config)["tls"] == result["tls"]
+
+
+def test_publish_reuses_optional_tls_serial_inode(layout) -> None:
+    config, producer, consumer = layout
+    _write(consumer / "tls" / "ca.srl", b"1000\n", 0o644)
+    publication.seed(config)
+    _prepare_generation(producer)
+    publication.publish(config)
+    before = _published_tls_snapshot(consumer)
+
+    publication.publish(config)
+
+    assert _published_tls_snapshot(consumer) == before
+    assert (consumer / "tls" / "ca.srl").read_bytes() == b"1000\n"
+
+
+@pytest.mark.parametrize("fault", ("mode", "hard-link", "symlink", "unapproved-leaf"))
+def test_publish_refuses_unsafe_existing_tls_before_consumer_writes(layout, fault: str) -> None:
+    config, producer, consumer = layout
+    publication.seed(config)
+    _prepare_generation(producer)
+    publication.publish(config)
+    key = consumer / "tls" / "server.key"
+    if fault == "mode":
+        key.chmod(0o644)
+    elif fault == "hard-link":
+        os.link(key, consumer.parent / "owned-key-link")
+    elif fault == "symlink":
+        retained = consumer.parent / "owned-retained-key"
+        key.rename(retained)
+        key.symlink_to(retained)
+    else:
+        _write(consumer / "tls" / "unrelated", b"owned fixture evidence", 0o600)
+    generated = _snapshot(
+        consumer, ("build-receipt.json", "current-lan-ip", "nginx/allowed-hosts.map")
+    )
+    before = (consumer / "tls").stat().st_ino
+
+    with pytest.raises(publication.PublicationError):
+        publication.publish(config)
+
+    assert (consumer / "tls").stat().st_ino == before
+    assert _snapshot(
+        consumer, ("build-receipt.json", "current-lan-ip", "nginx/allowed-hosts.map")
+    ) == generated
+
+
+@pytest.mark.parametrize("replacement", ("leaf", "directory", "unapproved-leaf"))
+def test_publish_tls_reuse_refuses_and_preserves_concurrent_writer(
+    layout, monkeypatch, replacement: str,
+) -> None:
+    import shutil
+
+    config, producer, consumer = layout
+    publication.seed(config)
+    _prepare_generation(producer)
+    publication.publish(config)
+    generated = _snapshot(
+        consumer, ("build-receipt.json", "current-lan-ip", "nginx/allowed-hosts.map")
+    )
+    original = publication.Transaction.replace_file
+    changed = False
+    foreign = None
+
+    def concurrent_write(self, *args, label: str, **kwargs):
+        nonlocal changed, foreign
+        if label == "consumer output current-lan-ip" and not changed:
+            changed = True
+            if replacement == "directory":
+                retained = consumer.parent / "owned-retained-tls"
+                (consumer / "tls").rename(retained)
+                shutil.copytree(retained, consumer / "tls")
+            elif replacement == "leaf":
+                key = consumer / "tls" / "server.key"
+                key.rename(consumer.parent / "owned-retained-key")
+                _write(key, b"concurrent owned fixture key", 0o600)
+            else:
+                _write(consumer / "tls" / "unrelated", b"concurrent owned evidence", 0o600)
+            foreign = _published_tls_snapshot(consumer)
+        return original(self, *args, label=label, **kwargs)
+
+    monkeypatch.setattr(publication.Transaction, "replace_file", concurrent_write)
+    with pytest.raises(publication.PublicationError, match="TLS.*changed"):
+        publication.publish(config)
+
+    assert changed
+    assert foreign == _published_tls_snapshot(consumer)
+    assert _snapshot(
+        consumer, ("build-receipt.json", "current-lan-ip", "nginx/allowed-hosts.map")
+    ) == generated
+
+
+def test_publish_failure_during_tls_reuse_retains_exact_tls_preimages(layout, monkeypatch) -> None:
+    config, producer, consumer = layout
+    publication.seed(config)
+    _prepare_generation(producer)
+    publication.publish(config)
+    before = _published_tls_snapshot(consumer)
+    generated = _snapshot(
+        consumer, ("build-receipt.json", "current-lan-ip", "nginx/allowed-hosts.map")
+    )
+    original = publication.Transaction.replace_file
+
+    def fail_after_reuse(self, *args, label: str, **kwargs):
+        if label == "consumer output nginx/allowed-hosts.map":
+            raise publication.PublicationError("owned reuse fault")
+        return original(self, *args, label=label, **kwargs)
+
+    monkeypatch.setattr(publication.Transaction, "replace_file", fail_after_reuse)
+    with pytest.raises(publication.PublicationError, match="owned reuse fault"):
+        publication.publish(config)
+
+    assert _published_tls_snapshot(consumer) == before
+    assert _snapshot(
+        consumer, ("build-receipt.json", "current-lan-ip", "nginx/allowed-hosts.map")
+    ) == generated

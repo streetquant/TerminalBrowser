@@ -1,7 +1,8 @@
 """Receipt-backed writable configuration for a confined native Codex tab.
 
-Only the confined launcher initializes or refreshes a view, before starting its
-native process. Ordinary scope preparation and resume planning only inspect it.
+The confined launcher and an explicit stopped-scope owning provisioning entry
+initialize or refresh a view before any native process starts. Ordinary scope
+preparation and live resume planning only inspect it.
 The canonical source is never written. Native edits remain private; a changed
 source and an edited view require explicit reconciliation instead of a merge.
 """
@@ -164,7 +165,7 @@ def is_managed_private_config(home, source):
 
     No receipt leaves legacy behavior intact. A receipt can never bless a
     foreign file, unsafe object, or another home/source. Source refresh is a
-    separate confined-launch operation and is never performed here.
+    separate pre-launch or stopped-scope operation and is never performed here.
     """
     if not os.path.lexists(Path(home) / RECEIPT):
         return False
@@ -245,14 +246,19 @@ def _receipt_bytes(receipt):
     return (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
-def prepare_private_config(home, source, source_file, *, write=True):
+def prepare_private_config(home, source, source_file, *, write=True, expected_source_sha256=None):
     """Initialize/refresh before launch, or preflight without writes.
 
     The caller validates ``source_file`` with the same protected-target grant
     policy used for shared mounts before this function may read it. Mutating
     calls run only before starting a new native process in this exact scope;
-    live resume/account-switch planning passes ``write=False``.
+    live resume/account-switch planning passes ``write=False``. An explicit
+    owning provisioning request can additionally bind the exact source digest;
+    mismatch is refused before any receipt or configuration publication.
     """
+    if expected_source_sha256 is not None and (
+            not isinstance(expected_source_sha256, str) or not _DIGEST.fullmatch(expected_source_sha256)):
+        raise CodexConfigScopeError("An exact expected configuration source digest is required")
     with _scope(home, source) as (tree, source):
         # Share the configuration preparer's lock. Read-only recognition does
         # not reacquire it, so it is also safe from within scope preparation.
@@ -261,6 +267,8 @@ def prepare_private_config(home, source, source_file, *, write=True):
             current, current_identity = _current(tree, source, receipt)
             defaults = _source_bytes(source, source_file)
             source_digest = _sha(defaults)
+            if expected_source_sha256 is not None and source_digest != expected_source_sha256:
+                raise CodexConfigScopeError("System Codex configuration differs from the expected source digest")
             source_file = str(source_file) if source_file is not None else None
             unchanged = receipt is not None and receipt["source_sha256"] == source_digest and receipt["source_file"] == source_file
             if receipt is not None and receipt["state"] == "ready" and unchanged:

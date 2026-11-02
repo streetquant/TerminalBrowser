@@ -29,6 +29,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header}
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::serve::ListenerExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -39,6 +40,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tab_actions::{ExistingTabAction, TabActionError, TabActionService};
 use termdeck_web_auth::{
@@ -58,7 +60,10 @@ use termdeck_web_state::{
     MAX_DATABASE_ROWS, ReadOnlyStateMirror, StateError, TmuxInventory, TmuxPaneState,
 };
 use tokio::net::TcpListener;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, timeout};
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7391";
@@ -574,6 +579,85 @@ struct RefreshEngine {
     cache: SnapshotCache,
     tmux_executable: PathBuf,
     tmux_timeout: Duration,
+    recovery_context: Option<RecoveryContextRefresh>,
+}
+
+/// Optional observation inside the existing mirror refresh lifecycle. The CLI
+/// verifies the owning manifest and all native source pins before its shared CAS.
+#[derive(Clone)]
+struct RecoveryContextRefresh {
+    executable: PathBuf,
+    database: PathBuf,
+    cursor: Arc<AtomicUsize>,
+    command_timeout: Duration,
+}
+
+impl RecoveryContextRefresh {
+    fn configured(config: &ServerConfig, manifest: Option<OsString>, digest: Option<OsString>) -> Option<Self> {
+        let manifest = manifest?;
+        let digest = digest?.into_string().ok()?;
+        if !Path::new(&manifest).is_absolute()
+            || digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        Some(Self {
+            executable: config.t1000_executable.clone(), database: config.database_path.clone(),
+            cursor: Arc::new(AtomicUsize::new(0)), command_timeout: Duration::from_secs(5),
+        })
+    }
+
+    async fn observe(&self) -> Result<(), &'static str> {
+        let mut child = Command::new(&self.executable)
+            .arg("observe-recovery-context").arg("--db").arg(&self.database)
+            .arg("--cursor").arg(self.cursor.load(Ordering::Relaxed).to_string())
+            .arg("--limit").arg("1")
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()).kill_on_drop(true)
+            .spawn().map_err(|_| "observer spawn failed")?;
+        let output = child.stdout.take().ok_or("observer output unavailable")?;
+        let result = timeout(self.command_timeout, async {
+            let mut bytes = Vec::new();
+            output.take(4097).read_to_end(&mut bytes).await.map_err(|_| "observer output failed")?;
+            if bytes.len() > 4096 { return Err("observer output exceeded bound"); }
+            if !child.wait().await.map_err(|_| "observer wait failed")?.success() {
+                return Err("observer unavailable");
+            }
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "observer output malformed")?;
+            if value.get("schema_version").and_then(|v| v.as_str()) != Some("termdeck.recovery-context-refresh.v1")
+                || value.get("enabled").and_then(|v| v.as_bool()) != Some(true)
+                || value.get("selected").and_then(|v| v.as_u64()).is_none_or(|v| v > 1)
+                || value.get("updated").and_then(|v| v.as_u64()).is_none_or(|v| v > 1)
+            {
+                return Err("observer output invalid");
+            }
+            let cursor = value.get("next_cursor").and_then(|v| v.as_u64())
+                .and_then(|v| usize::try_from(v).ok()).ok_or("observer cursor invalid")?;
+            self.cursor.store(cursor, Ordering::Relaxed);
+            Ok(())
+        }).await.map_err(|_| "observer deadline exceeded");
+        match result {
+            Ok(Ok(())) => Ok(()),
+            failure => {
+                let _signal = child.start_kill();
+                let _reaped = timeout(Duration::from_millis(200), child.wait()).await;
+                failure.and_then(|value| value)
+            }
+        }
+    }
+
+    fn refresh_tick(&self, jobs: &mut JoinSet<()>) {
+        while jobs.try_join_next().is_some() {}
+        if jobs.is_empty() {
+            let capture = self.clone();
+            jobs.spawn(async move {
+                if capture.observe().await.is_err() {
+                    eprintln!("t1000 native recovery context observation unavailable");
+                }
+            });
+        }
+    }
 }
 
 impl RefreshEngine {
@@ -598,11 +682,15 @@ impl RefreshEngine {
     }
 
     async fn run_periodic(self, refresh_interval: Duration) {
+        let mut observation_jobs = JoinSet::new();
         let mut interval = tokio::time::interval(refresh_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         interval.tick().await;
         loop {
             interval.tick().await;
+            if let Some(capture) = &self.recovery_context {
+                capture.refresh_tick(&mut observation_jobs);
+            }
             if let Err(error) = self.refresh().await {
                 match self.cache.record_error(error.to_string(), unix_ms()) {
                     Ok(true) => eprintln!("t1000 web refresh failed: {error}"),
@@ -880,6 +968,9 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
         cache: cache.clone(),
         tmux_executable: config.tmux_executable.clone(),
         tmux_timeout: config.tmux_timeout,
+        recovery_context: RecoveryContextRefresh::configured(
+            &config, std::env::var_os("TERMDECK_NATIVE_CONTEXT_CONFIG"),
+            std::env::var_os("TERMDECK_NATIVE_CONTEXT_CONFIG_SHA256")),
     };
     engine.refresh().await?;
     let state = AppState {
@@ -897,6 +988,13 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
         listener.local_addr()?
     );
     let refresher = tokio::spawn(engine.run_periodic(config.refresh_interval));
+    // WebSocket echo and input acknowledgements are small adjacent writes.
+    // Nagle otherwise holds the second frame behind a delayed TCP ACK.
+    let listener = listener.tap_io(|stream| {
+        if let Err(error) = stream.set_nodelay(true) {
+            eprintln!("could not enable TCP_NODELAY: {error}");
+        }
+    });
     let result = axum::serve(listener, application)
         .with_graceful_shutdown(shutdown_signal())
         .await;
@@ -3562,6 +3660,129 @@ fn unix_ms() -> u64 {
 
 fn duration_ms(duration: Duration) -> Result<u64, ServerError> {
     u64::try_from(duration.as_millis()).map_err(|_| ServerError::NumericOverflow)
+}
+
+#[cfg(test)]
+mod recovery_context_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicUsize;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("termdeck-recovery-context-{}-{}",
+                std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            fs::create_dir(&path).unwrap_or_else(|error| panic!("fixture creation: {error}"));
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .unwrap_or_else(|error| panic!("fixture permissions: {error}"));
+            Self(path)
+        }
+        fn helper(&self, body: &str) -> PathBuf {
+            let path = self.0.join("observe-fixture.py");
+            fs::write(&path, format!("#!/usr/bin/python3\n{body}\n"))
+                .unwrap_or_else(|error| panic!("fixture helper: {error}"));
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .unwrap_or_else(|error| panic!("fixture helper permissions: {error}"));
+            path
+        }
+        fn capture(&self, helper: PathBuf) -> RecoveryContextRefresh {
+            RecoveryContextRefresh { executable: helper, database: self.0.join("sessions.sqlite3"),
+                cursor: Arc::new(AtomicUsize::new(0)), command_timeout: Duration::from_secs(1) }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) { let _removed = fs::remove_dir_all(&self.0); }
+    }
+    fn run<F: std::future::Future<Output = ()>>(future: F) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            .unwrap_or_else(|error| panic!("fixture runtime: {error}"));
+        runtime.block_on(future);
+    }
+    const RESPONSE: &str = "print('{\"schema_version\":\"termdeck.recovery-context-refresh.v1\",\"enabled\":true,\"selected\":1,\"updated\":1,\"next_cursor\":7}')";
+
+    #[test]
+    fn recovery_context_absent_or_partial_activation_has_no_capture_hook() {
+        let config = match ServerConfig::parse_with_home(Vec::<OsString>::new(), PathBuf::from("/owned-fixture")) {
+            Ok(ConfigAction::Run(config)) => config,
+            _ => panic!("fixture configuration did not return a server"),
+        };
+        assert!(RecoveryContextRefresh::configured(&config, None, None).is_none());
+        assert!(RecoveryContextRefresh::configured(&config, Some("/owned/manifest".into()), None).is_none());
+        assert!(RecoveryContextRefresh::configured(&config, Some("relative".into()), Some("a".repeat(64).into())).is_none());
+        assert!(RecoveryContextRefresh::configured(&config, Some("/owned/manifest".into()), Some("a".repeat(64).into())).is_some());
+    }
+
+    #[test]
+    fn recovery_context_runs_bounded_shared_cli_and_retains_cursor() {
+        let fixture = Fixture::new();
+        let record = fixture.0.join("argv.json");
+        let helper = fixture.helper(&format!("import json,sys\nfrom pathlib import Path\nPath({:?}).write_text(json.dumps(sys.argv[1:]))\n{RESPONSE}", record.to_string_lossy()));
+        let capture = fixture.capture(helper);
+        run(async { assert!(capture.observe().await.is_ok()); });
+        let arguments: Vec<String> = serde_json::from_slice(&fs::read(record)
+            .unwrap_or_else(|error| panic!("fixture argv read: {error}")))
+            .unwrap_or_else(|error| panic!("fixture argv parse: {error}"));
+        assert_eq!(arguments, vec!["observe-recovery-context", "--db", capture.database.to_str()
+            .unwrap_or_else(|| panic!("fixture path utf8")), "--cursor", "0", "--limit", "1"]);
+        assert_eq!(capture.cursor.load(Ordering::Relaxed), 7);
+    }
+
+    #[test]
+    fn recovery_context_timeout_and_oversize_leave_cursor_and_reap_owned_child() {
+        let fixture = Fixture::new();
+        let pid_path = fixture.0.join("pid");
+        for body in ["import time; time.sleep(5)", "print('x'*5000)"] {
+            let helper = fixture.helper(&format!("import os\nfrom pathlib import Path\nPath({:?}).write_text(str(os.getpid()))\n{body}", pid_path.to_string_lossy()));
+            let mut capture = fixture.capture(helper);
+            capture.command_timeout = Duration::from_millis(100);
+            run(async { assert!(capture.observe().await.is_err()); });
+            assert_eq!(capture.cursor.load(Ordering::Relaxed), 0);
+            let pid = fs::read_to_string(&pid_path).unwrap_or_else(|error| panic!("fixture pid: {error}"));
+            assert!(!Path::new("/proc").join(pid).exists());
+        }
+    }
+
+    #[test]
+    fn recovery_context_refresh_tick_never_overlaps_observers() {
+        let fixture = Fixture::new();
+        let helper = fixture.helper(&format!("import time\ntime.sleep(0.1)\n{RESPONSE}"));
+        let capture = fixture.capture(helper);
+        run(async {
+            let mut jobs = JoinSet::new();
+            capture.refresh_tick(&mut jobs);
+            capture.refresh_tick(&mut jobs);
+            assert_eq!(jobs.len(), 1);
+            while jobs.join_next().await.is_some() {}
+            assert_eq!(capture.cursor.load(Ordering::Relaxed), 7);
+        });
+    }
+
+    #[test]
+    fn recovery_context_existing_periodic_mirror_loop_triggers_observation() {
+        let fixture = Fixture::new();
+        let marker = fixture.0.join("captured");
+        let helper = fixture.helper(&format!("from pathlib import Path\nPath({:?}).write_text('observed')\n{RESPONSE}", marker.to_string_lossy()));
+        let capture = fixture.capture(helper);
+        fs::write(&capture.database, b"").unwrap_or_else(|error| panic!("fixture database: {error}"));
+        let mirror = ReadOnlyStateMirror::new(&capture.database,
+            HostId::new("fixture").unwrap_or_else(|error| panic!("fixture host: {error}")),
+            OwnerId::new("fixture").unwrap_or_else(|error| panic!("fixture owner: {error}")))
+            .unwrap_or_else(|error| panic!("fixture mirror: {error}"));
+        let engine = RefreshEngine { mirror: Arc::new(Mutex::new(mirror)),
+            cache: SnapshotCache::new(Duration::from_secs(1)).unwrap_or_else(|error| panic!("fixture cache: {error}")),
+            tmux_executable: PathBuf::from("/absent-fixture-tmux"), tmux_timeout: Duration::from_millis(10),
+            recovery_context: Some(capture) };
+        run(async {
+            let job = tokio::spawn(engine.run_periodic(Duration::from_millis(20)));
+            assert!(timeout(Duration::from_secs(1), async {
+                while !marker.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }).await.is_ok());
+            job.abort();
+            let _joined = job.await;
+        });
+    }
 }
 
 #[cfg(test)]

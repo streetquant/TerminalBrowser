@@ -132,7 +132,15 @@ impl Runtime {
             UnixStream::connect(self.socket()),
         )
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tmux peer check timed out"))??;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tmux peer check timed out"))?
+        .map_err(|error| {
+            if matches!(error.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound) {
+                io::Error::new(io::ErrorKind::NotConnected,
+                    "tmux server is unavailable; saved terminals await recovery")
+            } else {
+                error
+            }
+        })?;
         let peer = stream.peer_cred()?;
         let pid = peer
             .pid()
@@ -268,6 +276,23 @@ mod tests {
         fixture.0.inode -= 1;
         fs::set_permissions(&fixture.0.root, fs::Permissions::from_mode(0o755))?;
         assert!(fixture.0.validate(true).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_socket_reports_absent_owner_without_deleting_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        drop(fixture.listen()?);
+        let before = fs::symlink_metadata(fixture.0.socket())?;
+        fixture.0.validate(true)?;
+        let error = fixture.0.validate_peer(Path::new("/usr/bin/tmux"))
+            .await.err().ok_or_else(|| refused("stale socket was accepted"))?;
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(error.to_string(), "tmux server is unavailable; saved terminals await recovery");
+        let after = fs::symlink_metadata(fixture.0.socket())?;
+        assert_eq!((before.dev(), before.ino(), before.mode()),
+                   (after.dev(), after.ino(), after.mode()));
         Ok(())
     }
 

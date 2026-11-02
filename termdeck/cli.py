@@ -1255,6 +1255,55 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_observe_recovery_context(args: argparse.Namespace) -> int:
+    """Capture one bounded live observation through the shared metadata CAS.
+
+    The normal web refresh may opt in using the owning consumer's approved
+    activation manifest. No manifest means no store open or schema mutation.
+    This route observes existing processes; it never launches or checkpoints.
+    """
+    from .recovery_authority_context import NativeContextObserver, RecoveryAuthorityError, parse_context
+
+    payload = {"schema_version": "termdeck.recovery-context-refresh.v1", "enabled": False,
+               "selected": 0, "updated": 0, "next_cursor": 0}
+    limit, cursor = getattr(args, "limit", 1), getattr(args, "cursor", 0)
+    if type(limit) is not int or limit != 1 or type(cursor) is not int or cursor < 0:
+        _print_json({**payload, "code": "INVALID_OBSERVATION_BOUND"})
+        return 2
+    try:
+        observer = NativeContextObserver.from_environment()
+    except (OSError, ValueError, RecoveryAuthorityError):
+        _print_json({**payload, "code": "OBSERVER_ACTIVATION_INVALID"})
+        return 78
+    if observer is None:
+        _print_json(payload)
+        return 0
+    with closing(SessionStore(args.db, provision_auth_scopes=False)) as store:
+        records = sorted((record for record in store.list()
+                          if record.status == "running" and not record.external), key=lambda record: record.id)
+        selected = records[cursor % len(records):cursor % len(records) + 1] if records else []
+        payload.update(enabled=True, selected=len(selected),
+                       next_cursor=((cursor % len(records) + 1) % len(records)) if records else 0)
+        if selected:
+            backend = TmuxBackend(native_context_observer=observer)
+            batch = backend.recovery_observations(selected)
+            authority = {}
+            updates = []
+            for record in selected:
+                observation = batch.authority.get(record.id)
+                if observation is None or observation.encoded is None or observation.is_current is None:
+                    continue
+                value = parse_context(observation.encoded, observation.sha256)
+                if value["native_producer"] is None or record.id not in batch.metadata:
+                    continue
+                authority[record.id] = observation
+                updates.append((record.id, *batch.metadata[record.id]))
+            if updates:
+                payload["updated"] = store.update_recovery_metadata(updates, authority_observations=authority)
+    _print_json(payload)
+    return 0
+
+
 def cmd_checkpoint(args: argparse.Namespace) -> int:
     """Persist exact resumable state for selected live managed tabs."""
 
@@ -1692,6 +1741,23 @@ def cmd_recovery_intent(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_startup_recover(args: argparse.Namespace) -> int:
+    from .startup_recovery import main as recovery_main
+
+    argv = ["--db", str(args.db or default_db_path()),
+            "--managed-root", str(args.managed_root),
+            "--max-workers", str(args.max_workers),
+            "--readiness-timeout", str(args.readiness_timeout)]
+    for session_id in args.session_id or ():
+        argv.extend(["--session-id", session_id])
+    if args.retry_quiescent:
+        argv.append("--retry-quiescent")
+    argv.extend(["--overall-timeout", str(args.overall_timeout)])
+    for account in args.defer_native_account:
+        argv.extend(["--defer-native-account", account])
+    return recovery_main(argv)
+
+
 def cmd_recovery_qualification(args: argparse.Namespace) -> int:
     """Audit every remembered pane without opening a backend or mutating state."""
 
@@ -1781,6 +1847,19 @@ def build_parser() -> argparse.ArgumentParser:
     recovery_intent.add_argument("--name", required=True)
     recovery_intent.add_argument("--cwd", required=True)
     recovery_intent.set_defaults(func=cmd_recovery_intent)
+
+    startup_recover = sub.add_parser(
+        "startup-recover", help="restore eligible saved terminals without opening GTK",
+    )
+    startup_recover.add_argument("--db", type=Path, default=None)
+    startup_recover.add_argument("--managed-root", type=Path, required=True)
+    startup_recover.add_argument("--max-workers", type=int, choices=range(1, 17), default=4)
+    startup_recover.add_argument("--readiness-timeout", type=float, default=120)
+    startup_recover.add_argument("--session-id", action="append", default=None)
+    startup_recover.add_argument("--retry-quiescent", action="store_true")
+    startup_recover.add_argument("--overall-timeout", type=float, default=1800)
+    startup_recover.add_argument("--defer-native-account", action="append", default=[])
+    startup_recover.set_defaults(func=cmd_startup_recover)
 
     recovery_qualification = sub.add_parser(
         "recovery-qualification",
@@ -2221,6 +2300,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="preserve eligible previously-active rows for automatic startup recovery",
     )
     reconcile.set_defaults(func=cmd_reconcile)
+
+    observe_context = sub.add_parser(
+        "observe-recovery-context", help="capture one approved live native context without launching terminals")
+    observe_context.add_argument("--db", type=Path, default=None)
+    observe_context.add_argument("--cursor", type=int, default=0)
+    observe_context.add_argument("--limit", type=int, choices=(1,), default=1)
+    observe_context.set_defaults(func=cmd_observe_recovery_context)
 
     checkpoint = sub.add_parser(
         "checkpoint",

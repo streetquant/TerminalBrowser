@@ -264,6 +264,12 @@ def _assert_execution_binding(layout: "WrapperLayout") -> None:
     bound_names = {name for name, _digest, _size in layout.execution_binding}
     if not _REQUIRED_EXECUTION_MODULES.issubset(bound_names):
         raise WrapperError("wrapper execution binding omits a required module")
+    # Historical release inverses do not contain the new worker. Preserve
+    # their original binding, but never import an unbound worker when present.
+    if (layout.execution_root / "termdeck/startup_recovery.py").exists() and (
+        "termdeck/startup_recovery.py" not in bound_names
+    ):
+        raise WrapperError("wrapper execution binding omits saved terminal recovery")
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not isinstance(nofollow, int) or isinstance(nofollow, bool) or nofollow == 0:
         raise WrapperError("wrapper execution binding requires O_NOFOLLOW")
@@ -2363,6 +2369,31 @@ def _admit_backend_tmux_runtime(layout: WrapperLayout) -> None:
     os.environ.pop("TMUX", None)
 
 
+def _start_backend_recovery(layout: WrapperLayout) -> subprocess.Popen | None:
+    """Run the shared cold-recovery owner without delaying HTTP startup.
+
+    The worker remains in the backend's unit. Tmux's existing backend isolates
+    new terminal ownership in its own persistent user scope. No GUI import or
+    empty tmux server is used to claim recovery.
+    """
+    _assert_execution_binding(layout)
+    if not (layout.execution_root / "termdeck/startup_recovery.py").exists():
+        return None  # Exact historical release rollback keeps its old behavior.
+    _regular_input(layout.execution_root / "termdeck/startup_recovery.py",
+                   label="saved terminal recovery worker")
+    bootstrap = (
+        "import sys; sys.path.insert(0, sys.argv.pop(1)); "
+        "from termdeck.startup_recovery import main; raise SystemExit(main())"
+    )
+    command = ["/usr/bin/python3", "-I", "-B", "-c", bootstrap,
+               str(layout.execution_root), "--db", str(layout.state_root / "sessions.sqlite3"),
+               "--managed-root", str(layout.managed_root)]
+    try:
+        return subprocess.Popen(command, stdin=subprocess.DEVNULL, close_fds=True)
+    except OSError as exc:
+        raise WrapperError("could not start saved terminal recovery worker") from exc
+
+
 def _preflight_unit_start(spec: UnitSpec, layout: WrapperLayout) -> tuple[str, ...]:
     paths = _runtime_paths(layout)
     if spec.kind == "checkpoint":
@@ -2840,15 +2871,20 @@ def _validate_recorded_command(
         raise WrapperError(f"{spec.name} recorded executable does not match its command policy")
 
 
-def _read_nginx_pid(layout: WrapperLayout) -> int:
+def _read_nginx_pid(layout: WrapperLayout, *, allow_empty: bool = False) -> int | None:
     pid_path = _runtime_paths(layout)["nginx_pid"]
     _assert_destination(pid_path, label="nginx pid file")
     if not os.path.lexists(pid_path):
         raise WrapperError(f"nginx pid file is missing: {pid_path}")
     try:
-        raw = pid_path.read_text(encoding="ascii").strip()
+        contents = pid_path.read_text(encoding="ascii")
     except (OSError, UnicodeError) as exc:
         raise WrapperError(f"could not read nginx pid file: {pid_path}") from exc
+    # nginx creates/truncates this file before writing its PID. Only startup
+    # readiness may wait for that exact empty-file window; stop stays strict.
+    if allow_empty and contents == "":
+        return None
+    raw = contents.strip()
     if not raw.isdecimal():
         raise WrapperError(f"nginx pid file is malformed: {pid_path}")
     pid = int(raw)
@@ -3960,9 +3996,21 @@ def run_wrapper(
         _validate_manifest_entries(layout, manifest)
     command = _preflight_unit_start(spec, layout)
     _record_start_identity(spec, layout, expected_release, command)
+    recovery_worker = None
     try:
+        if spec.kind == "backend":
+            recovery_worker = _start_backend_recovery(layout)
         os.execv(command[0], list(command))
-    except OSError as exc:
+    except (OSError, WrapperError) as exc:
+        if recovery_worker is not None and recovery_worker.poll() is None:
+            # Popen owns an unreaped child, so numeric PID reuse cannot select
+            # an unrelated process. Never signal any terminal/server process.
+            recovery_worker.terminate()
+            try:
+                recovery_worker.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                recovery_worker.kill()
+                recovery_worker.wait(timeout=5)
         # The process remains this wrapper only when exec fails.  Preserve a
         # stopped/failed marker for a subsequent bounded stop call.
         config_path = layout.config_path(spec)

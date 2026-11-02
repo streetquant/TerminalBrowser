@@ -681,6 +681,8 @@ def _primary_claude_session_id(pid: int) -> str | None:
 
 def observe_recovery_metadata(
     root_pid: int,
+    *,
+    authority_callback=None,
 ) -> tuple[bool, str | None, str | None]:
     """Observe a safe resumable command and its cwd below a managed pane.
 
@@ -719,6 +721,8 @@ def observe_recovery_metadata(
                 # TTY. Its open primary rollout (source="cli") is stronger
                 # identity evidence than host TTY ownership and already excludes
                 # structured subagent rollouts.
+                if authority_callback is not None and cwd is not None:
+                    authority_callback(pid, command, cwd)
                 return True, command, cwd
             stat = _parse_stat(pid)
             if not stat:
@@ -757,6 +761,29 @@ def observe_recovery_metadata(
     if weaker_codex is not None:
         return True, weaker_codex[0], weaker_codex[1]
     return observed, None, None
+
+
+def observe_recovery_metadata_with_context(record, root_pid: int, *, native_observer=None):
+    """Observe context at the same primary-native boundary; keep tuple callers."""
+    from .recovery_authority_context import RecoveryAuthorityError, capture_codex_context
+    context = None
+
+    def capture(pid, command, cwd):
+        nonlocal context
+        context = capture_codex_context(record, pid, command, cwd, proc=_PROC, native_observer=native_observer)
+
+    try:
+        observed, command, cwd = observe_recovery_metadata(root_pid, authority_callback=capture)
+    except RecoveryAuthorityError as exc:
+        if str(exc) in {"native process generation changed during observation", "foreign process owner"}:
+            # Positive reused/foreign owner evidence invalidates its transient
+            # context while leaving the exact saved recipe untouched.
+            return True, record.recovery_command, record.recovery_cwd, (None, None)
+        return False, None, None, None
+    except (OSError, ValueError, TypeError):
+        # A raced process or source snapshot cannot strengthen its command.
+        return False, None, None, None
+    return observed, command, cwd, context
 
 
 def observe_recovery_command(root_pid: int) -> tuple[bool, str | None]:

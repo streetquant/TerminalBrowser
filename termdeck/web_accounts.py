@@ -7,7 +7,8 @@ import re
 from pathlib import Path
 
 from .codex_auth import CodexAuthManager, CodexAuthError, resolve_account
-from .tmux_backend import TmuxBackend, auth_transaction_lock, execute_auth_change
+from .tmux_backend import (TmuxBackend, auth_transaction_lock, execute_auth_change,
+    _project_auth_activation_receipt_failure)
 from .session_store import utc_now
 
 
@@ -118,6 +119,15 @@ def handle(store, request, *, manager=None, backend=None):
                 results.append({"id": session_id, "ok": transaction.ok, "error": transaction.error,
                                 "restarted": bool(transaction.activation and transaction.activation.restarted),
                                 "state": _row(manager, record)})
+                if not transaction.ok:
+                    try:
+                        receipt_failure = _project_auth_activation_receipt_failure(
+                            transaction.activation_receipt_failure)
+                        if receipt_failure is not None:
+                            results[-1]["activation_receipt_failure"] = receipt_failure
+                    except Exception:
+                        # Optional receipt telemetry cannot affect the account result.
+                        pass
         except (CodexAuthError, OSError, ValueError, RuntimeError) as exc:
             # No exception repr/credential payload reaches the API.
             from .redaction import redact_text

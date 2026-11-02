@@ -46,6 +46,26 @@ function byteStringToUint8Array(value) {
   return bytes;
 }
 
+// A software WebGL context can be much slower than xterm's DOM renderer,
+// especially for full-screen apps. A successful context alone is insufficient.
+function acceleratedWebglAvailable() {
+  let gl;
+  try {
+    gl = document.createElement("canvas").getContext("webgl2", {
+      antialias: false, depth: false, failIfMajorPerformanceCaveat: true,
+    });
+    if (!gl) return false;
+    const info = gl.getExtension("WEBGL_debug_renderer_info");
+    const renderer = String(gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER));
+    return !/swiftshader|llvmpipe|softpipe|software|basic render/i.test(renderer);
+  } catch (_ignored) {
+    return false;
+  } finally {
+    // This probe owns its context; do not retain one per cached terminal.
+    try { gl?.getExtension("WEBGL_lose_context")?.loseContext(); } catch (_ignored) { /* Best effort */ }
+  }
+}
+
 export function createTerminal(element, options = {}) {
   if (!(element instanceof HTMLElement)) {
     throw new TypeError("A terminal host element is required.");
@@ -92,6 +112,9 @@ export function createTerminal(element, options = {}) {
   terminal.open(element);
 
   let webglAddon = null;
+  let webglBlocked = false;
+  let renderMonitor = null;
+  element.dataset.termdeckRenderer = "dom";
   const notifyRendererLayout = () => {
     // WebGL and canvas can measure a different cell width. Refit after the
     // renderer has had a frame to settle, so the controller advertises the
@@ -101,25 +124,72 @@ export function createTerminal(element, options = {}) {
       options.onLayoutChange?.();
     });
   };
+  const useDomRenderer = () => {
+    renderMonitor?.dispose();
+    renderMonitor = null;
+    try { webglAddon?.dispose(); } catch (_ignored) { /* DOM fallback */ }
+    webglAddon = null;
+    webglBlocked = true;
+    element.dataset.termdeckRenderer = "dom";
+    notifyRendererLayout();
+  };
+  const monitorRenderer = () => {
+    let frame = 0;
+    let previous = window.performance.now();
+    let lastRender = -Infinity;
+    let renders = 0;
+    let previousRenders = 0;
+    let wasHidden = document.hidden;
+    let slowFrames = [];
+    const rendered = terminal.onRender(() => { renders++; lastRender = window.performance.now(); });
+    const sample = () => {
+      frame = 0;
+      if (!webglAddon) return;
+      const now = window.performance.now();
+      if (document.hidden || wasHidden) {
+        slowFrames = [];
+      } else if (renders !== previousRenders) {
+        // Sampling only from onWriteParsed misses work performed before that
+        // callback. Follow painted-frame gaps while this terminal is rendering
+        // instead; the network is outside this local measurement.
+        slowFrames.push(now - previous > 80);
+        if (slowFrames.length > 6) slowFrames.shift();
+        if (slowFrames.filter(Boolean).length >= 3) {
+          useDomRenderer();
+          return;
+        }
+      } else if (now - lastRender > 1000) {
+        slowFrames = [];
+      }
+      wasHidden = document.hidden;
+      previousRenders = renders;
+      previous = now;
+      frame = window.requestAnimationFrame(sample);
+    };
+    frame = window.requestAnimationFrame(sample);
+    renderMonitor = { dispose() {
+      rendered.dispose();
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = 0;
+    } };
+  };
   const activateWebgl = () => {
-    if (options.webgl === false || webglAddon) {
+    if (options.webgl === false || webglAddon || webglBlocked) {
+      return;
+    }
+    if (!acceleratedWebglAvailable()) {
+      webglBlocked = true;
       return;
     }
     try {
       webglAddon = new WebglAddon();
-      webglAddon.onContextLoss(() => {
-        try {
-          webglAddon.dispose();
-        } catch (_ignored) {
-          // The canvas renderer remains authoritative after a context loss.
-        }
-        webglAddon = null;
-        notifyRendererLayout();
-      });
+      webglAddon.onContextLoss(useDomRenderer);
       terminal.loadAddon(webglAddon);
+      element.dataset.termdeckRenderer = "webgl";
       notifyRendererLayout();
+      monitorRenderer();
     } catch (_ignored) {
-      webglAddon = null;
+      useDomRenderer();
     }
   };
   const proposedDimensions = () => {
@@ -267,6 +337,20 @@ export function createTerminal(element, options = {}) {
     subscriptions.add(tracked);
     return tracked;
   };
+  // This view renders a tmux pane's raw output, including queries tmux has
+  // already answered. A second reply can arrive after an app exits and become
+  // shell input. Consume query instructions in the output parser; never filter
+  // input bytes, since a cursor reply can be identical to a real function key.
+  for (const id of [
+    { final: "c" }, { prefix: ">", final: "c" },
+    { final: "n" }, { prefix: "?", final: "n" },
+    { intermediates: "$", final: "p" },
+    { prefix: "?", intermediates: "$", final: "p" },
+  ]) {
+    trackSubscription(terminal.parser.registerCsiHandler(id, () => true));
+  }
+  trackSubscription(terminal.parser.registerEscHandler({ final: "Z" }, () => true));
+  trackSubscription(terminal.parser.registerDcsHandler({ intermediates: "$", final: "q" }, () => true));
   const fontSet = document.fonts;
   if (fontSet?.addEventListener) {
     const fontChanged = () => {
@@ -369,6 +453,8 @@ export function createTerminal(element, options = {}) {
       return lines.join("\n");
     },
     dispose() {
+      renderMonitor?.dispose();
+      renderMonitor = null;
       for (const subscription of subscriptions) {
         try {
           subscription.dispose();

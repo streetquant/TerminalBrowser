@@ -6851,6 +6851,8 @@ def _release_wrapper_execution_kwargs(
         str(name): (digest, size)
         for name, digest, size in site_manifest["files"]
     }
+    if "termdeck/startup_recovery.py" in file_rows:
+        required += ("termdeck/startup_recovery.py",)
     missing = [name for name in required if name not in file_rows]
     frozen = verification.get("frozen_directories") is True
     if missing or not frozen:

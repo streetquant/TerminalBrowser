@@ -849,13 +849,20 @@ def test_wrapper_publication_destinations_cover_all_managed_units(tmp_path: Path
     assert all(path.parent == paths.database.parent for path in destinations[12:18])
 
 
+@pytest.mark.parametrize("canonical_runtime", (False, True))
 def test_release_bound_wrapper_render_ignores_checkout_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    canonical_runtime: bool,
 ) -> None:
     """Recovery wrappers import the frozen release site, never checkout bytes."""
 
     paths = _paths(tmp_path)
+    canonical_source = tmp_path / "canonical-source"
+    if canonical_runtime:
+        paths = dataclasses.replace(paths, runtime=tmp_path / "canonical-runtime")
+        monkeypatch.setattr(activation.service_wrappers, "CANONICAL_RUNTIME_ROOT", paths.runtime)
+        monkeypatch.setattr(activation.service_wrappers, "CANONICAL_SOURCE_ROOT", canonical_source)
     paths.target.mkdir()
     checkout_module = paths.target / "termdeck" / "web_activation.py"
     checkout_module.parent.mkdir()
@@ -903,6 +910,8 @@ def test_release_bound_wrapper_render_ignores_checkout_drift(
     assert f"sys.path.insert(0, {json.dumps(str(execution_root))})".encode() in recovery
     assert b"CHECKOUT_B" not in recovery
     manifest = json.loads(before.manifest)
+    assert manifest["source_root"] == str(canonical_source if canonical_runtime else paths.target)
+    assert kwargs["runtime_root"] == (paths.runtime if canonical_runtime else paths.runtime.parent)
     assert manifest["execution_root"] == str(execution_root)
     assert manifest["execution_binding"] == binding
 
@@ -4089,3 +4098,175 @@ def test_stage_cargo_binary_accepts_only_its_private_build_hardlink(tmp_path: Pa
     binary.symlink_to(outsider)
     with pytest.raises(activation.WebActivationError):
         activation._stage_cargo_binary(binary, cargo_target, tmp_path / "symlink-bad")
+
+
+def _tls_preservation_admission_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from test_termdeck_web_prepare_runtime import LAN_IP, _make_layout, _run
+
+    layout = _make_layout(tmp_path / "owned-real-TLS")
+    result = _run(layout)
+    assert result.returncode == 0, result.stderr
+    paths = dataclasses.replace(_paths(tmp_path), runtime=layout.runtime)
+    receipt = json.loads((layout.runtime / "build-receipt.json").read_bytes())
+    current = receipt["tls_publication"]["current"]
+    publication = {
+        "generation": receipt["tls_publication"]["generation"],
+        "tls": {
+            "path": current["path"],
+            "identity": current["identity"],
+            "manifest": {
+                name: {**claim, "path": name}
+                for name, claim in current["manifest"].items()
+            },
+        },
+    }
+    # This fixture isolates admission from the already separately qualified
+    # signed broker boundary. Its certificates and descriptor checks are real.
+    monkeypatch.setattr(activation.service_wrappers, "CANONICAL_RUNTIME_ROOT", paths.runtime)
+    monkeypatch.setattr(
+        activation, "_installed_tls_reuse_publisher_sha256", lambda _paths: "a" * 64,
+    )
+    monkeypatch.setattr(
+        activation, "_broker_runtime_receipt", lambda _paths: (receipt, None, publication),
+    )
+    monkeypatch.setattr(activation, "_observed_primary_lan_ipv4", lambda _paths: LAN_IP)
+    return paths
+
+
+def test_tls_preservation_admission_accepts_actual_owned_certificate_and_inodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _tls_preservation_admission_fixture(tmp_path, monkeypatch)
+    before = {p.name: (p.stat().st_ino, p.read_bytes()) for p in (paths.runtime / "tls").iterdir()}
+
+    result = activation._require_preserved_tls_preparation(paths)
+
+    assert result is not None
+    activation._runtime_tls_publication(paths, result["consumer_tls"])
+    assert {p.name: (p.stat().st_ino, p.read_bytes()) for p in (paths.runtime / "tls").iterdir()} == before
+
+
+def test_tls_preservation_admission_refuses_route_rotation_without_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _tls_preservation_admission_fixture(tmp_path, monkeypatch)
+    before = {p.name: (p.stat().st_ino, p.read_bytes()) for p in (paths.runtime / "tls").iterdir()}
+    monkeypatch.setattr(activation, "_observed_primary_lan_ipv4", lambda _paths: "192.168.50.10")
+
+    with pytest.raises(activation.WebActivationError, match="changed LAN address"):
+        activation._require_preserved_tls_preparation(paths)
+
+    assert {p.name: (p.stat().st_ino, p.read_bytes()) for p in (paths.runtime / "tls").iterdir()} == before
+
+
+def test_tls_preservation_admission_refuses_expiring_certificate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _tls_preservation_admission_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        activation.subprocess, "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 1, b"", b""),
+    )
+
+    with pytest.raises(activation.WebActivationError, match="expiring protected TLS"):
+        activation._require_preserved_tls_preparation(paths)
+
+
+def test_tls_preservation_admission_preserves_concurrent_certificate_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _tls_preservation_admission_fixture(tmp_path, monkeypatch)
+    original_run = activation.subprocess.run
+    certificate = paths.runtime / "tls" / "server.crt"
+
+    def replace_after_expiry_check(argv, **kwargs):
+        result = original_run(argv, **kwargs)
+        certificate.write_bytes(b"owned concurrent writer")
+        return result
+
+    monkeypatch.setattr(activation.subprocess, "run", replace_after_expiry_check)
+    with pytest.raises(activation.WebActivationError):
+        activation._require_preserved_tls_preparation(paths)
+    assert certificate.read_bytes() == b"owned concurrent writer"
+
+
+@pytest.mark.parametrize(
+    ("route", "addresses", "expected"),
+    (
+        ("1.1.1.1 via 192.168.50.1 dev test0 src 192.168.50.9\n", None, "192.168.50.9"),
+        ("", "2: test0 inet 192.168.50.10/24 scope global test0\n", "192.168.50.10"),
+        ("1.1.1.1 dev test0 src 8.8.8.8\n", None, None),
+        ("", "", None),
+    ),
+)
+def test_tls_preservation_primary_ip_matches_fixed_preparer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route, addresses, expected,
+) -> None:
+    calls = []
+
+    def observed(argv, **kwargs):
+        calls.append(argv)
+        assert kwargs["timeout"] == 5
+        output = route if argv[2:4] == ["route", "get"] else addresses
+        return subprocess.CompletedProcess(argv, 0, output or "", "")
+
+    monkeypatch.setattr(activation, "_run", observed)
+    if expected is None:
+        with pytest.raises(activation.WebActivationError):
+            activation._observed_primary_lan_ipv4(_paths(tmp_path))
+    else:
+        assert activation._observed_primary_lan_ipv4(_paths(tmp_path)) == expected
+    assert len(calls) == (1 if addresses is None else 2)
+
+
+def test_tls_preservation_publisher_refuses_user_owned_image(tmp_path: Path, monkeypatch) -> None:
+    image = tmp_path / "owned-publisher-fixture"
+    activation._atomic(image, b"owned test image\n", 0o755)
+    _, capture = activation._read_regular(image, label="owned publisher fixture")
+    monkeypatch.setattr(activation, "_read_regular", lambda *_args, **_kwargs: (image, capture))
+
+    with pytest.raises(activation.WebActivationError, match="ownership or identity"):
+        activation._installed_tls_reuse_publisher_sha256(_paths(tmp_path))
+
+
+def test_execute_tls_admission_precedes_recovery_package_and_service_mutations(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    paths = _paths(tmp_path)
+    monkeypatch.setenv("TERMDECK_ACTIVATION_APPROVED", "1")
+    monkeypatch.setattr(
+        activation, "load_transaction", lambda *_args: (tmp_path / "tx", {"status": "artifacts-staged"}),
+    )
+
+    def refuse(_paths):
+        raise activation.WebActivationError("owned TLS admission refusal")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("TLS rejection must precede any recovery or package mutation")
+
+    from termdeck import legacy_activation
+
+    monkeypatch.setattr(activation, "_require_preserved_tls_preparation", refuse)
+    monkeypatch.setattr(legacy_activation, "prepare", forbidden)
+    monkeypatch.setattr(activation, "_install", forbidden)
+    monkeypatch.setattr(activation, "_systemd", forbidden)
+
+    with pytest.raises(activation.WebActivationError, match="owned TLS admission refusal"):
+        activation.execute(paths, tmp_path / "tx")
+
+
+def test_tls_preservation_crypto_uses_fixed_environment(tmp_path: Path, monkeypatch) -> None:
+    paths = _tls_preservation_admission_fixture(tmp_path, monkeypatch)
+    original_run = activation.subprocess.run
+    monkeypatch.setenv("OPENSSL_CONF", str(tmp_path / "untrusted-caller-configuration"))
+    calls = []
+
+    def check_environment(argv, **kwargs):
+        assert kwargs["env"] == {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+        calls.append(argv)
+        return original_run(argv, **kwargs)
+
+    monkeypatch.setattr(activation.subprocess, "run", check_environment)
+
+    assert activation._require_preserved_tls_preparation(paths) is not None
+    assert calls == [["/usr/bin/openssl", "x509", "-noout", "-checkend", "2592000"]]

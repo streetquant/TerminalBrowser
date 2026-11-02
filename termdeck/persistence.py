@@ -80,13 +80,30 @@ def persist_live_sessions(
     selected = prepared
     metadata_updates = 0
     observe = getattr(backend, "recovery_metadata", None)
+    observe_batch = getattr(backend, "recovery_observations", None)
+    authority = {}
+    if callable(observe_batch):
+        observe = observe_batch
     if selected and callable(observe):
         try:
-            observed = dict(observe(selected, bounded=False))
+            if callable(observe_batch):
+                result = observe(selected, bounded=False, native_capture=False)
+            else:
+                result = observe(selected, bounded=False)
+            if callable(observe_batch):
+                authority = dict(result.authority)
+                observed = dict(result.metadata)
+            else:
+                observed = dict(result)
         except TypeError:
             # Compatibility with small third-party/fake backends that predate
             # the explicit unbounded shutdown scan.
-            observed = dict(observe(selected))
+            result = observe(selected)
+            if callable(observe_batch):
+                authority = dict(result.authority)
+                observed = dict(result.metadata)
+            else:
+                observed = dict(result)
         except Exception:
             observed = {}
         # Shutdown observation races with desktop/session teardown. A readable
@@ -100,7 +117,10 @@ def persist_live_sessions(
             if command is not None
         ]
         if updates:
-            metadata_updates = store.update_recovery_metadata(updates)
+            if authority:
+                metadata_updates = store.update_recovery_metadata(updates, authority_observations=authority)
+            else:
+                metadata_updates = store.update_recovery_metadata(updates)
 
     refreshed: list[SessionRecord] = []
     for record in selected:

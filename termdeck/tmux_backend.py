@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import inspect
 import os
@@ -35,6 +36,7 @@ from .codex_config_scope import (
     prepare_private_bash_launch_command,
     validate_existing_private_bash_scope,
 )
+from .terminal_launch_environment import ACCOUNT_SELECTORS, bind_account_environment
 from .gateway_models import (
     GatewayModelStatus,
     gateway_model_status as classify_gateway_model_status,
@@ -522,6 +524,78 @@ class AuthTransactionResult:
     activation: AuthActivationResult | None = None
     error: str = ""
     rolled_back: bool = False
+    activation_receipt_failure: dict[str, object] | None = None
+
+
+_AUTH_ACTIVATION_RECEIPT_MESSAGES = {
+    "Account activation has no verified lifecycle kind": "lifecycle-kind-unverified",
+    "Account activation process does not match its lifecycle": "lifecycle-process-mismatch",
+    "Credentials changed during account activation; inspect before retrying": "credential-changed",
+    "Account activation process is no longer observable": "process-unobservable",
+    "Account activation process tree is no longer observable": "process-tree-unobservable",
+    "Account activation process tree changed after handoff": "process-tree-changed",
+    "Credential storage is unsafe": "credential-storage-unsafe",
+    "Credentials changed during observation": "credential-observation-changed",
+    "Credential JSON contains duplicate fields": "credential-json-duplicate",
+    "Credentials are malformed or internally conflicting": "credential-malformed",
+}
+_AUTH_ACTIVATION_RECEIPT_REASONS = frozenset(_AUTH_ACTIVATION_RECEIPT_MESSAGES.values()) | {
+    "receipt-path-unsafe", "receipt-path-unavailable", "io-error", "unknown",
+}
+
+
+def _project_auth_activation_receipt_failure(value):
+    """Accept only closed facts; malformed telemetry has no account authority."""
+    if type(value) is not dict or set(value) != {
+        "schema", "phase", "reason", "errno", "lifecycle_kind", "candidate_pid",
+    }:
+        return None
+    if (type(value["schema"]) is not str
+            or value["schema"] != "t1000.auth-activation-receipt-failure.v1"
+            or type(value["phase"]) is not str or value["phase"] != "record-activation"
+            or type(value["reason"]) is not str or value["reason"] not in _AUTH_ACTIVATION_RECEIPT_REASONS
+            or type(value["lifecycle_kind"]) is not str
+            or value["lifecycle_kind"] not in {"stopped", "idle-shell", "codex-restart", "unknown"}):
+        return None
+    code, pid = value["errno"], value["candidate_pid"]
+    if (code is not None and (type(code) is not int or code not in errno.errorcode
+            or value["reason"] not in {"io-error", "receipt-path-unavailable"})):
+        return None
+    if pid is not None and (type(pid) is not int or pid <= 0):
+        return None
+    return dict(value)
+
+
+def _auth_activation_receipt_failure(error, activation):
+    """Classify only the failed receipt; never stringify unknown exceptions."""
+    reason, code = "unknown", None
+    if isinstance(error, OSError):
+        reason = "io-error"
+        observed = OSError.errno.__get__(error, OSError)
+        if type(observed) is int and observed in errno.errorcode:
+            code = observed
+    else:
+        arguments = BaseException.args.__get__(error, BaseException)
+        if len(arguments) == 1 and type(arguments[0]) is str:
+            message = arguments[0]
+            reason = _AUTH_ACTIVATION_RECEIPT_MESSAGES.get(message, "unknown")
+            if isinstance(error, CodexAuthError):
+                if message.startswith("private Codex file is unsafe: "):
+                    reason = "receipt-path-unsafe"
+                elif message.startswith("private Codex file cannot be inspected safely: "):
+                    reason = "receipt-path-unavailable"
+                    cause = BaseException.__cause__.__get__(error, BaseException)
+                    if isinstance(cause, OSError):
+                        observed = OSError.errno.__get__(cause, OSError)
+                        if type(observed) is int and observed in errno.errorcode:
+                            code = observed
+    kind, pid = activation.credential_lifecycle, activation.pid
+    return _project_auth_activation_receipt_failure({
+        "schema": "t1000.auth-activation-receipt-failure.v1", "phase": "record-activation",
+        "reason": reason, "errno": code,
+        "lifecycle_kind": kind if type(kind) is str and kind in {"stopped", "idle-shell", "codex-restart"} else "unknown",
+        "candidate_pid": pid if type(pid) is int and pid > 0 else None,
+    })
 
 
 @dataclass(frozen=True)
@@ -611,6 +685,7 @@ class TmuxBackend:
         max_capture_lines: int = 10000,
         recovery_scan_limit: int = 128,
         checkpoint_manager: DmtcpCheckpointManager | None = None,
+        native_context_observer=None,
     ) -> None:
         self.executable = executable
         self.pane_cache_ttl = max(0.0, float(pane_cache_ttl))
@@ -621,7 +696,22 @@ class TmuxBackend:
         self.max_capture_lines = max(100, int(max_capture_lines))
         self.recovery_scan_limit = max(1, int(recovery_scan_limit))
         self.checkpoints = checkpoint_manager or DmtcpCheckpointManager()
+        from .recovery_authority_context import NativeContextObserver
+        self.native_context_observer = native_context_observer
+        self.native_context_observer_error = None
+        if native_context_observer is None:
+            try:
+                self.native_context_observer = NativeContextObserver.from_environment()
+            except (OSError, ValueError, TypeError):
+                # Missing/unqualified activation cannot disable generic terminals
+                # or manufacture native authority from a child environment.
+                self.native_context_observer_error = "native context activation is unavailable"
         self._recovery_scan_cursor = 0
+        self._native_context_job_lock = threading.Lock()
+        self._native_context_job = None
+        self._native_context_cursor = 0
+        self._native_context_job_error = None
+        self._native_context_job_updated = 0
         self._pane_cache_expires_at = 0.0
         self._pane_cache_by_target: dict[str, int] = {}
         self._pane_cache_by_session_active: dict[str, int] = {}
@@ -934,6 +1024,129 @@ class TmuxBackend:
         return False
 
     @staticmethod
+    def _private_auth_idle_scope_snapshot(root_pid: int) -> tuple[dict, dict] | None:
+        """Observe exactly one owned interactive TCsh descendant, without a cache."""
+
+        def direct_children(pid: int) -> set[int]:
+            tasks = list(Path(f"/proc/{pid}/task").iterdir())
+            if not tasks or len(tasks) > 32:
+                raise ValueError("idle shell task set unavailable or unbounded")
+            result: set[int] = set()
+            for task in tasks:
+                with (task / "children").open("rb") as handle:
+                    raw = handle.read(8193)
+                if len(raw) > 8192:
+                    raise ValueError("idle shell children set exceeds bound")
+                result.update(int(value) for value in raw.split())
+            return result
+
+        def node(pid: int) -> dict:
+            root = Path(f"/proc/{pid}")
+            with (root / "stat").open("rb") as handle:
+                raw = handle.read(8193)
+            if len(raw) > 8192 or b")" not in raw:
+                raise ValueError("idle shell process identity unavailable")
+            fields = raw.rsplit(b")", 1)[1].split()
+            if len(fields) <= 19:
+                raise ValueError("idle shell process identity incomplete")
+            with (root / "cmdline").open("rb") as handle:
+                command = handle.read(8193)
+            if len(command) > 8192:
+                raise ValueError("idle shell argv exceeds bound")
+            executable = root / "exe"
+            executable_metadata = executable.stat()
+            return {
+                "pid": pid, "ppid": int(fields[1]), "start": int(fields[19]),
+                "state": fields[0], "uid": root.stat().st_uid,
+                "exe": str(executable.resolve(strict=True)),
+                "exe_device": executable_metadata.st_dev,
+                "exe_inode": executable_metadata.st_ino,
+                "cwd": str((root / "cwd").resolve(strict=True)),
+                "argv": tuple(os.fsdecode(value) for value in command.split(b"\0") if value),
+            }
+
+        try:
+            children = direct_children(root_pid)
+            if len(children) != 1:
+                return None
+            child_pid = next(iter(children))
+            before = (node(root_pid), node(child_pid))
+            if direct_children(child_pid) or direct_children(root_pid) != children:
+                return None
+            return before if before == (node(root_pid), node(child_pid)) else None
+        except (OSError, ValueError, UnicodeError, IndexError):
+            return None
+
+    @classmethod
+    def _private_auth_idle_tcsh_tree_environment_ready(
+        cls, record: SessionRecord, pane: _AuthPaneIdentity, expected_start: int,
+    ) -> bool:
+        """Use the existing scope predicate only for an exact stable idle shell tree."""
+
+        if Path(pane.current_command).name.casefold().removeprefix("-") != "tcsh":
+            return False
+        try:
+            if shlex.split(record.command) != ["/usr/bin/tcsh", "-f", "-i"]:
+                return False
+            before = cls._private_auth_idle_scope_snapshot(pane.pane_pid)
+            if before is None:
+                return False
+            root, child = before
+            shell = Path("/usr/bin/tcsh").lstat()
+            if (
+                not stat_module.S_ISREG(shell.st_mode) or shell.st_uid != 0
+                or shell.st_mode & (stat_module.S_IWGRP | stat_module.S_IWOTH)
+            ):
+                return False
+            cwd = str(Path(record.cwd).expanduser().resolve(strict=False))
+            if (
+                root["pid"] != pane.pane_pid or root["start"] != expected_start
+                or child["ppid"] != root["pid"] or len(root["argv"]) != 3
+                or root["argv"][:2] != ("-csh", "-c")
+            ):
+                return False
+            payload = shlex.split(root["argv"][2])
+            if len(payload) != 10 or not payload[4].startswith("PATH="):
+                return False
+            private_home = Path(record.codex_home).expanduser().resolve(strict=True)
+            private_bin = str(private_home / "bin")
+            private_path = payload[4][5:]
+            if private_path.split(os.pathsep)[0] != private_bin:
+                return False
+            environment = (
+                ("CODEX_HOME", str(private_home)),
+                ("TERMDECK_AUTH_SCOPE_ID", record.auth_scope_id),
+                ("CODEX_TERMDECK_GATE_ROOT", str(auth_lifetime_gate_root(record))),
+                ("PATH", private_path),
+            )
+            if root["argv"][2] != cls._with_explicit_private_environment(
+                record.command, environment,
+            ):
+                return False
+            for node in before:
+                if (
+                    node["uid"] != os.geteuid() or node["state"] not in {b"R", b"S"}
+                    or node["cwd"] != cwd or pane.current_path != cwd
+                    or node["exe"] != "/usr/bin/tcsh"
+                    or (node["exe_device"], node["exe_inode"]) != (shell.st_dev, shell.st_ino)
+                    or (node is child and (
+                        len(node["argv"]) != 3 or Path(node["argv"][0]).name != "tcsh"
+                        or node["argv"][1:] != ("-f", "-i")
+                    ))
+                    or not cls._private_auth_process_environment_ready(
+                        record, node["pid"], node["start"], require_private_path=node is child,
+                    )
+                ):
+                    return False
+            # This is the same authoritative full-tree predicate used by quiesce/apply.
+            return (
+                cls._private_auth_process_tree_environment_ready(record, pane.pane_pid)
+                and cls._private_auth_idle_scope_snapshot(pane.pane_pid) == before
+            )
+        except (OSError, ValueError, TypeError, KeyError, IndexError):
+            return False
+
+    @staticmethod
     def _private_auth_path(codex_home: Path, *, base_path: str | None = None) -> str:
         """Prepend this scope without discarding ordinary host PATH entries."""
 
@@ -1141,10 +1354,13 @@ class TmuxBackend:
                 raise TmuxError("tmux reconciliation snapshot is malformed")
             server, session, window, pane, pane_id, pid, dead = parts
             try:
-                server_pid, pane_pid = int(server), int(pid)
+                server_pid = int(server)
+                # Newer tmux clears pane_pid after a retained pane exits.
+                # A completed application has no process identity to attest.
+                pane_pid = None if dead == "1" and not pid else int(pid)
             except ValueError as exc:
                 raise TmuxError("tmux reconciliation process identity is malformed") from exc
-            if min(server_pid, pane_pid) <= 1 or not pane_id.startswith("%"):
+            if server_pid <= 1 or (pane_pid is not None and pane_pid <= 1) or not pane_id.startswith("%"):
                 raise TmuxError("tmux reconciliation process identity is invalid")
             evidence: dict[str, object] = {"pid": pane_pid, "server_pid": server_pid, "state": "dead"}
             if dead == "0":
@@ -1762,6 +1978,9 @@ class TmuxBackend:
         """
 
         recipe = self._durable_recipe(record)
+        from .recovery_authority_context import context_matches_record
+        if not context_matches_record(record):
+            raise TmuxError("retained native authority context contradicts the saved recipe")
         try:
             resolved = resolve_working_directory(recipe)
         except SessionRecipeError as exc:
@@ -1779,7 +1998,7 @@ class TmuxBackend:
         # environment, with explicit durable recipe choices still authoritative.
         environment = {
             key: os.environ[key]
-            for key in ("HOME", "USER", "LOGNAME", "SHELL", "PATH")
+            for key in ("HOME", "USER", "LOGNAME", "SHELL", "PATH", *ACCOUNT_SELECTORS)
             if key in os.environ
         }
         environment.update(recipe.environment_dict())
@@ -1990,7 +2209,8 @@ class TmuxBackend:
             lifetime_lease.release()
         args = ["respawn-pane", "-t", lifecycle.pane_id]
         args.extend(self._environment_args(spec.environment))
-        args.extend(["-c", str(spec.directory), spec.command])
+        args.extend(["-c", str(spec.directory),
+                     *bind_account_environment(spec.command, dict(spec.environment))])
         self._run(args)
         self._run(
             ["set-option", "-t", record.tmux_name, "remain-on-exit", "on"],
@@ -2085,7 +2305,8 @@ class TmuxBackend:
             lifetime_lease.release()
         args = ["respawn-pane", "-t", lifecycle.pane_id]
         args.extend(self._environment_args(spec.environment))
-        args.extend(["-c", str(spec.directory), spec.command])
+        args.extend(["-c", str(spec.directory),
+                     *bind_account_environment(spec.command, dict(spec.environment))])
         self._run(args)
         self._run(
             ["set-option", "-t", record.tmux_name, "remain-on-exit", "on"],
@@ -2426,7 +2647,8 @@ class TmuxBackend:
                 lifetime_lease = None
             args = ["respawn-pane", "-k", "-t", identity.pane_id]
             args.extend(self._environment_args(spec.environment))
-            args.extend(["-c", str(spec.directory), spec.command])
+            args.extend(["-c", str(spec.directory),
+                     *bind_account_environment(spec.command, dict(spec.environment))])
             self._run(args)
             respawned = True
             self._run(
@@ -2826,7 +3048,7 @@ class TmuxBackend:
         launch_args.extend([
             "-c",
             str(launch_directory),
-            command,
+            *bind_account_environment(command, dict(spec.environment)),
         ])
         if raw_codex_home and lifetime_lease is not None:
             lifetime_lease.release()
@@ -3649,6 +3871,7 @@ class TmuxBackend:
         records: Sequence[SessionRecord],
         *,
         bounded: bool = True,
+        _authority_observations=None,
     ) -> dict[str, tuple[str | None, str | None]]:
         """Observe safe crash-relaunch commands and cwd values together.
 
@@ -3678,7 +3901,23 @@ class TmuxBackend:
             pid = pids.get(record.id)
             assert pid is not None
             try:
-                observed, command, cwd = self._auth_recovery_metadata(record, pid)
+                if _authority_observations is not None and record.tag != "web-agent":
+                    from .resources import observe_recovery_metadata_with_context
+                    from .recovery_authority_context import AuthorityObservation, observation_is_current, record_cas
+                    observed, command, cwd, context = observe_recovery_metadata_with_context(
+                        record, pid, native_observer=self.native_context_observer)
+                    if observed and context is not None:
+                        check = None
+                        if context[0] is not None:
+                            from . import resources
+                            # Capture the same source record; a later row change
+                            # is separately rejected under the SQLite CAS lock.
+                            check_record = replace(record, recovery_command=command, recovery_cwd=cwd)
+                            check = lambda r=check_record, pair=context, proc=resources._PROC, native=self.native_context_observer: observation_is_current(r, *pair, proc=proc, native_observer=native)
+                        _authority_observations[record.id] = AuthorityObservation(
+                            record_cas(record), *(context or (None, None)), is_current=check)
+                else:
+                    observed, command, cwd = self._auth_recovery_metadata(record, pid)
             except (OSError, TmuxError, ValueError):
                 # Expired/revoked configured authority does not erase the
                 # durable conversation or authorize an alternate launch.
@@ -3686,6 +3925,72 @@ class TmuxBackend:
             if observed:
                 out[record.id] = (command, cwd if command else None)
         return out
+
+    def recovery_observations(self, records: Sequence[SessionRecord], *, bounded: bool = True, native_capture: bool = True):
+        """Return compatible metadata plus its optional CAS-bound context."""
+        from .recovery_authority_context import RecoveryObservationBatch
+        if not native_capture:
+            # UI and shutdown keep their established generic metadata scan.
+            # Qualified helpers and their write-boundary recapture run only in
+            # a bounded owning worker, never in the GTK refresh callback.
+            return RecoveryObservationBatch(self.recovery_metadata(records, bounded=bounded), {})
+        authority = {}
+        metadata = self.recovery_metadata(records, bounded=bounded, _authority_observations=authority)
+        return RecoveryObservationBatch(metadata, authority)
+
+    def queue_native_context_observation(self, database_path: Path, records: Sequence[SessionRecord]) -> bool:
+        """Schedule one finite native observation/CAS away from the GTK thread."""
+        if self.native_context_observer is None or str(database_path) == ":memory:":
+            return False
+        candidates = sorted((record for record in records if record.status == "running"
+                             and not record.external), key=lambda record: record.id)
+        if not candidates:
+            return False
+        with self._native_context_job_lock:
+            if self._native_context_job is not None and self._native_context_job.is_alive():
+                return False
+            selected = candidates[self._native_context_cursor % len(candidates)]
+            self._native_context_cursor = (self._native_context_cursor + 1) % len(candidates)
+            self._native_context_job_error = None
+            self._native_context_job_updated = 0
+
+            def observe_one():
+                from .recovery_authority_context import parse_context, record_cas
+                from .session_store import SessionStore
+                worker_store = None
+                try:
+                    worker_store = SessionStore(database_path, provision_auth_scopes=False)
+                    current = worker_store.get(selected.id)
+                    if current is None or record_cas(current) != record_cas(selected):
+                        return
+                    # Keep tmux caches and scan cursors off the shared GUI
+                    # backend. Only the immutable approved observer is shared.
+                    worker_backend = TmuxBackend(self.executable, query_timeout=self.query_timeout,
+                        recovery_scan_limit=1, checkpoint_manager=self.checkpoints,
+                        native_context_observer=self.native_context_observer)
+                    batch = worker_backend.recovery_observations([current])
+                    observation = batch.authority.get(current.id)
+                    if (observation is None or observation.encoded is None or observation.is_current is None
+                            or current.id not in batch.metadata
+                            or parse_context(observation.encoded, observation.sha256)["native_producer"] is None):
+                        return
+                    self._native_context_job_updated = worker_store.update_recovery_metadata(
+                        [(current.id, *batch.metadata[current.id])], authority_observations={current.id: observation})
+                except (OSError, ValueError, TmuxError, sqlite3.DatabaseError):
+                    self._native_context_job_error = "native-context-observation-unavailable"
+                finally:
+                    if worker_store is not None:
+                        worker_store.close()
+
+            job = threading.Thread(target=observe_one, name="termdeck-native-context-observation", daemon=False)
+            self._native_context_job = job
+            try:
+                job.start()
+            except RuntimeError:
+                self._native_context_job = None
+                self._native_context_job_error = "native-context-worker-unavailable"
+                return False
+            return True
 
     def recovery_commands(self, records: Sequence[SessionRecord]) -> dict[str, str | None]:
         """Return command-only recovery observations for older callers."""
@@ -3883,6 +4188,10 @@ class TmuxBackend:
             identity.pane_pid,
             pane_start_time,
         )
+        if not environment_ready:
+            environment_ready = self._private_auth_idle_tcsh_tree_environment_ready(
+                record, identity, pane_start_time,
+            )
         base = dict(
             live=True,
             environment_ready=environment_ready,
@@ -4467,7 +4776,8 @@ class TmuxBackend:
         command = self._gated_auth_launch_command(spec, gate_path)
         args = ["respawn-pane", "-k", "-t", plan.pane_id]
         args.extend(self._environment_args(spec.environment))
-        args.extend(["-c", str(spec.directory), command])
+        args.extend(["-c", str(spec.directory),
+                     *bind_account_environment(command, dict(spec.environment))])
         result = self._run(args, check=False, timeout=15.0)
         if result.returncode != 0:
             raise TmuxError(result.stderr.strip() or "could not replace the pane in place")
@@ -6037,11 +6347,18 @@ def execute_auth_change(
                 if callable(recorder):
                     try:
                         manager.record_activation(record, switched.state, activation)
-                    except (OSError, ValueError, RuntimeError):
-                        return AuthTransactionResult(
+                    except (OSError, ValueError, RuntimeError) as exc:
+                        failure = AuthTransactionResult(
                             False, switch_result=switched, activation=replace(activation, ok=False),
                             error="Account selection was applied, but its activation receipt could not be saved; inspect before retrying",
                         )
+                        try:
+                            failure = replace(failure, activation_receipt_failure=
+                                _auth_activation_receipt_failure(exc, activation))
+                        except Exception:
+                            # Receipt telemetry cannot replace the original refusal.
+                            pass
+                        return failure
                 return AuthTransactionResult(
                     True,
                     switch_result=switched,

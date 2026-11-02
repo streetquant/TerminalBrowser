@@ -251,13 +251,15 @@ _AUTHORIZATION_FENCE = ContextVar("termdeck_staging_authorization", default=None
 
 
 @contextmanager
-def authorized(auth_directory, actor, *, now_ms=None, readonly=False):
+def authorized(auth_directory, actor, *, now_ms=None, readonly=False, lock_timeout_ms=2000):
     """Revalidate both credentials; mutations retain revocation serialization.
 
     Read-only launch admission can run inside an existing serialized operation.
     It does not replace the final execution or mutation authorization fence.
     """
     actor.validate()
+    if type(lock_timeout_ms) is not int or not 0 <= lock_timeout_ms <= 30000:
+        raise ValueError("Invalid authorization lock wait")
     current = _AUTHORIZATION_FENCE.get()
     if readonly and current is not None and current.active and Path(auth_directory) == current.directory.path:
         if actor != current.actor:
@@ -271,7 +273,16 @@ def authorized(auth_directory, actor, *, now_ms=None, readonly=False):
     directory = Directory(auth_directory)
     try:
         with _database(directory, "termdeck-web-auth-v1.sqlite3", readonly=True) as auth, _database(directory, "termdeck-machines-v1.sqlite3", readonly=readonly) as machines:
-            machines.execute("BEGIN" if readonly else "BEGIN IMMEDIATE")
+            # Native multi-tab starts serialize private preparation with revocation.
+            # Their explicit budget accommodates another tab's preparation; every
+            # credential is checked after acquiring this same exclusive fence.
+            machines.execute(f"PRAGMA busy_timeout={lock_timeout_ms}")
+            try:
+                machines.execute("BEGIN" if readonly else "BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                if getattr(exc, "sqlite_errorcode", 0) & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise StagingError("Another authenticated operation is busy; retry this launch after it finishes", "busy") from None
+                raise
             auth.execute("BEGIN")
             metadata = auth.execute("SELECT host_id,owner_id,last_observed_at_ms FROM auth_metadata WHERE singleton=1").fetchone()
             now = max(int(time.time() * 1000) if now_ms is None else now_ms, metadata["last_observed_at_ms"])

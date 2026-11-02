@@ -18,11 +18,12 @@ def actual_clipboard(browser):
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            content = asset if self.path == "/terminal-copy.js" else (
+            extra = {"/terminal.js": SCRIPT.with_name("terminal.js"), "/terminal.css": SCRIPT.with_name("terminal.css")}
+            content = extra[self.path].read_bytes() if self.path in extra else asset if self.path == "/terminal-copy.js" else (
                 b'<div id="terminal"></div><script src="/terminal-copy.js"></script>'
             )
             self.send_response(200)
-            self.send_header("Content-Type", "text/javascript" if self.path.endswith(".js") else "text/html")
+            self.send_header("Content-Type", "text/css" if self.path.endswith(".css") else "text/javascript" if self.path.endswith(".js") else "text/html")
             self.send_header("Content-Length", str(len(content)))
             self.end_headers()
             self.wfile.write(content)
@@ -47,8 +48,50 @@ def actual_clipboard(browser):
                 notice: document.body.textContent.includes('Selection copied')};
         }""")
         assert result == {"secure": True, "exact": True, "notice": True}, result
+        # Reload to remove the synthetic terminal API, then select real xterm
+        # text using actual mouse events and read the browser clipboard back.
+        page.reload()
+        page.add_style_tag(url=f"http://127.0.0.1:{server.server_port}/terminal.css")
+        page.add_style_tag(content="#terminal {width:720px;height:240px;margin:32px}")
+        page.add_script_tag(url=f"http://127.0.0.1:{server.server_port}/terminal.js")
+        page.evaluate("""() => new Promise(resolve => {
+            const host = document.querySelector('#terminal');
+            window.api = TermDeckTerminal.createTerminal(host, {fontSize: 18});
+            window.disposeCopy = T1000TerminalCopy.install(host, window.api);
+            window.api.write('ALPHA BETA GAMMA\\r\\nSECOND LINE SELECTION\\r\\n', resolve);
+        })""")
+        screen = page.locator('.xterm-screen').bounding_box()
+        dimensions = page.evaluate("({cols: api.terminal.cols, rows: api.terminal.rows})")
+        assert screen
+        cell = screen['width'] / dimensions['cols']
+        row = screen['height'] / dimensions['rows']
+        x, y = screen['x'], screen['y'] + row / 2
+        cases = []
+        for name, clicks in (("double-click", 2), ("triple-click", 3)):
+            page.evaluate("api.terminal.clearSelection(); navigator.clipboard.writeText('before')")
+            page.mouse.click(x + cell * 7, y, click_count=clicks)
+            page.wait_for_function("async () => api.selection().length > 0 && await navigator.clipboard.readText() === api.selection()")
+            selected = page.evaluate("api.selection()")
+            assert 'BETA' in selected, (name, selected)
+            cases.append({"gesture": name, "exact": True, "selection": selected})
+        page.evaluate("api.terminal.clearSelection(); navigator.clipboard.writeText('before')")
+        page.mouse.move(x + cell / 2, y)
+        page.mouse.down()
+        page.mouse.move(x + cell * 5.5, y, steps=8)
+        page.mouse.up()
+        page.wait_for_function("async () => api.selection().length > 0 && await navigator.clipboard.readText() === api.selection()")
+        cases.append({"gesture": "drag", "exact": True, "selection": page.evaluate("api.selection()")})
+        page.evaluate("api.terminal.clearSelection(); navigator.clipboard.writeText('before')")
+        page.mouse.move(x + cell / 2, y)
+        page.mouse.down()
+        page.mouse.move(x + screen['width'] + 20, y + row, steps=12)
+        page.mouse.up()
+        page.wait_for_function("async () => api.selection().length > 0 && await navigator.clipboard.readText() === api.selection()")
+        cases.append({"gesture": "outside-release", "exact": True, "selection": page.evaluate("api.selection()")})
+        assert page.get_by_text("Selection copied", exact=True).is_visible()
+        page.evaluate("disposeCopy(); api.dispose()")
         context.close()
-        return result
+        return {**result, "real_xterm": cases}
     finally:
         server.shutdown()
         server.server_close()

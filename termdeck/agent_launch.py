@@ -507,12 +507,14 @@ def _validate_attachments(store, tree, db, actor, plan):
 
 
 @contextmanager
-def _resume_authorized(store, actor):
+def _resume_authorized(store, actor, *, lock_timeout_ms=2000):
     """Keep the original grant; fresh UI authentication cannot replace it."""
     with ExitStack() as stack:
         try:
-            stack.enter_context(authorized(store.auth_directory, actor))
+            stack.enter_context(authorized(store.auth_directory, actor, lock_timeout_ms=lock_timeout_ms))
         except StagingError as exc:
+            if exc.code == "busy":
+                raise
             # This read only classifies a refusal. It never grants authority.
             directory = Directory(store.auth_directory)
             try:
@@ -854,7 +856,8 @@ def execute(args):
         actor=_actor_from_plan(plan["actor"])
         permit = getattr(args, "resume_permit", None)
         resume_record = None
-        with (_resume_authorized(store, actor) if permit else authorized(store.auth_directory, actor)):
+        with (_resume_authorized(store, actor, lock_timeout_ms=30000) if permit
+              else authorized(store.auth_directory, actor, lock_timeout_ms=30000)):
             value,revision=policy(store.root.parent)
             if revision!=plan["policy_revision"]: raise StagingError("Launch policy changed", "conflict")
             with _plan_workspace(store, plan, value) as directory:

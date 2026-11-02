@@ -138,19 +138,29 @@ window.T1000UI = (() => {
     const sidebarDetail = element("div", "workspace-sidebar-detail");
     sidebar.append(sidebarHeader, sidebarSearch, sidebarCount, sidebarList, sidebarDetail);
     shell.append(sidebar);
-    let selectedId = "";
-    let sidebarSignature = "";
+    let selectedId = "", sidebarPanes = null, sidebarQuery = null;
+    let sidebarMatches = [], sidebarLookup = new Map(), sidebarDetailSignature = "";
+    const sidebarChrome = window.T1000TabChrome(sidebarList, {
+      sidebar: true, selectPane, runAction,
+      openMenu: () => { menu.open = true; menu.querySelector("summary").focus(); },
+    });
     shell.dataset.sidebarSide = "right";
+    let sidebarWidth = 280;
     try {
       const saved = JSON.parse(localStorage.getItem("t1000.layout") || "{}");
       if (saved?.side === "left") shell.dataset.sidebarSide = "left";
       sidebar.hidden = saved?.tabsPane !== true;
+      if (Number.isFinite(saved?.width)) sidebarWidth = saved.width;
     } catch (_) { /* Storage is optional; use the desktop defaults. */ }
     shell.dataset.sidebar = sidebar.hidden ? "closed" : "open";
+    window.T1000SidebarResize(shell, sidebar, {
+      initial: sidebarWidth,
+      onChange: width => { sidebarWidth = width; saveLayout(); },
+    });
     function saveLayout() {
       sidebarMove.setAttribute("aria-label", `Move Tabs pane to ${shell.dataset.sidebarSide === "left" ? "right" : "left"}`);
       sidebarMove.title = sidebarMove.getAttribute("aria-label");
-      try { localStorage.setItem("t1000.layout", JSON.stringify({ tabsPane: !sidebar.hidden, side: shell.dataset.sidebarSide })); }
+      try { localStorage.setItem("t1000.layout", JSON.stringify({ tabsPane: !sidebar.hidden, side: shell.dataset.sidebarSide, width: Math.round(sidebarWidth) })); }
       catch (_) { /* The pane still works without persistent browser storage. */ }
     }
     function toggleSidebar(show = sidebar.hidden) {
@@ -166,38 +176,33 @@ window.T1000UI = (() => {
       selectedId = activeId;
       if (sidebar.hidden) return;
       const query = sidebarSearch.value.trim().toLocaleLowerCase();
-      const signature = JSON.stringify([query, activeId, panes.map(pane => [pane.id, pane.title, pane.cwd, pane.status, pane.pinned])]);
-      if (signature === sidebarSignature) return;
-      sidebarSignature = signature;
-      const matches = panes.filter(pane => `${pane.title} ${pane.cwd}`.toLocaleLowerCase().includes(query));
-      sidebarCount.textContent = `${Math.min(100, matches.length)} of ${panes.length} tabs`;
-      const focusedId = sidebarList.contains(document.activeElement) ? document.activeElement.dataset.paneId : null;
-      const rows = matches.slice(0, 100).map(pane => {
-        const row = button("", () => selectPane(pane.id));
-        row.className = "workspace-sidebar-tab";
-        row.dataset.paneId = pane.id;
-        row.setAttribute("aria-current", String(pane.id === activeId));
-        row.title = `${pane.title}\n${pane.cwd}\n${pane.status}`;
-        row.append(element("strong", "", `${pane.pinned ? "◆ " : ""}${pane.title}`), element("span", "", pane.cwd));
-        row.addEventListener("dblclick", () => runAction("rename", pane));
-        row.addEventListener("contextmenu", event => {
-          event.preventDefault();
-          selectPane(pane.id);
-          menu.open = true;
-          menu.querySelector("summary").focus();
-        });
-        return row;
-      });
-      sidebarList.replaceChildren(...rows);
-      if (!rows.length) sidebarList.append(element("p", "subtle", "No matching tabs"));
-      rows.find(row => row.dataset.paneId === focusedId)?.focus();
-      const active = panes.find(pane => pane.id === activeId);
+      const changed = panes !== sidebarPanes;
+      if (changed) sidebarLookup = new Map(panes.map(pane => [pane.id, pane]));
+      if (changed || query !== sidebarQuery) {
+        sidebarMatches = [];
+        for (const pane of panes) {
+          if (!query || `${pane.title} ${pane.cwd}`.toLocaleLowerCase().includes(query)) sidebarMatches.push(pane);
+          if (sidebarMatches.length === 100) break;
+        }
+        sidebarPanes = panes;
+        sidebarQuery = query;
+        const count = `${sidebarMatches.length} of ${panes.length} tabs`;
+        if (sidebarCount.textContent !== count) sidebarCount.textContent = count;
+      }
+      sidebarChrome.render(sidebarMatches, activeId);
+      const active = sidebarLookup.get(activeId);
+      const signature = JSON.stringify(active ? [active.id, active.title, active.status, active.cwd, active.pinned] : null);
+      if (signature === sidebarDetailSignature) return;
+      sidebarDetailSignature = signature;
       sidebarDetail.replaceChildren();
       if (active) {
         sidebarDetail.append(element("strong", "", active.title), element("span", "", `${active.status} · ${active.cwd}`));
         const actions = element("div", "workspace-sidebar-actions");
         for (const [label, action] of [["Rename", "rename"], [active.pinned ? "Unpin" : "Pin", active.pinned ? "unpin" : "pin"], ["Hide", "hide"]]) {
-          actions.append(button(label, () => runAction(action, active)));
+          actions.append(button(label, () => {
+            const latest = sidebarLookup.get(selectedId);
+            if (latest) runAction(action, latest);
+          }));
         }
         sidebarDetail.append(actions);
       }

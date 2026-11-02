@@ -193,6 +193,32 @@ while True:
                 expected = PACKET + LEGACY + MOTION
                 result["controller_motion_preserved_and_not_replayed"] = True
 
+                batch = PACKET * 8
+                assert send_frame(controller, "writer", 7, batch)["duplicate"] is False
+                expected += batch
+                delivered(expected)
+                assert send_frame(controller, "writer", 7, batch)["duplicate"] is True
+                controller.wait_for_timeout(50)
+                assert inputs[0].read_bytes() == expected
+                mode("off")
+                send_frame(controller, "writer", 8, batch)
+                assert inputs[0].read_bytes() == expected
+                mode("legacy")
+                send_frame(controller, "writer", 9, batch)
+                assert inputs[0].read_bytes() == expected
+                send_frame(controller, "writer", 10, LEGACY * 8)
+                expected += LEGACY * 8
+                delivered(expected)
+                mode("any")
+                result["bounded_batch_delivered_once_and_mode_fenced"] = True
+                for index, invalid in enumerate((PACKET * 9, PACKET + LEGACY, PACKET + b"typed", PACKET + PACKET[:-1])):
+                    name = f"invalid-batch-{index}"
+                    attached = attach(controller, name)
+                    answer = send_frame(controller, name, 1, invalid, result="error")
+                    assert answer["code"] == "invalid-client-message", answer
+                    assert inputs[0].read_bytes() == expected
+                result["oversized_mixed_and_truncated_batches_rejected"] = True
+
                 denied = send_frame(viewer, "viewer", 1, PACKET, result="error")
                 assert denied["code"] == "controller-changed", denied
                 assert current_controller(controller)["controller_device_id"] == owner
@@ -222,10 +248,10 @@ while True:
                 takeover = attach(viewer, "intent")
                 assert not takeover["control"]["mine"]
                 viewer.evaluate("streams.intent.socket.send(JSON.stringify({type:'focus'}))")
-                viewer.wait_for_function("streams.intent.events.some(e => e.type === 'control' && e.control.mine)")
+                viewer.wait_for_function("() => streams.intent.events.some(e => e.type === 'control' && e.control.mine)")
                 new_owner = current_controller(viewer)["controller_device_id"]
                 assert new_owner != owner
-                stale = send_frame(controller, "writer", 7, PACKET, result="error")
+                stale = send_frame(controller, "writer", 11, PACKET, result="error")
                 assert stale["code"] == "controller-changed", stale
                 assert current_controller(viewer)["controller_device_id"] == new_owner
                 assert inputs[0].read_bytes() == expected

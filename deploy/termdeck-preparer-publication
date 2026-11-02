@@ -1692,6 +1692,58 @@ def _observe_consumer(
     }
 
 
+
+def _consumer_tls_reuse(
+    config: Config, consumer: RootLease, tls_leaves: Mapping[str, Leaf],
+) -> tuple[int, tuple[int, int, int, int, int], dict[str, Leaf]] | None:
+    """Retain an exact consumer copy instead of replacing its TLS inodes."""
+    try:
+        os.stat("tls", dir_fd=consumer.descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    descriptor = _open_named_directory(
+        consumer.descriptor, "tls", uid=config.consumer_uid,
+        gid=config.consumer_gid, mode=0o700, label="consumer TLS reuse",
+    )
+    keep = False
+    try:
+        names = set(os.listdir(descriptor))
+        if not names.issubset(TLS_REQUIRED | TLS_OPTIONAL):
+            raise PublicationError("consumer TLS reuse contains unexpected entries")
+        identity = _directory_identity(os.fstat(descriptor), label="consumer TLS reuse")
+        observed = _tls_leaves(config, descriptor, consumer=True)
+        _check_tls_snapshot(
+            config, consumer.descriptor, "tls", descriptor, identity, observed,
+            consumer=True,
+        )
+        if names != set(tls_leaves) or any(
+            observed[name].content != expected.content
+            or observed[name].identity.mode != expected.identity.mode
+            for name, expected in tls_leaves.items()
+            if name in observed
+        ):
+            return None
+        keep = True
+        return descriptor, identity, observed
+    finally:
+        if not keep:
+            os.close(descriptor)
+
+
+def _assert_consumer_tls_reuse(
+    config: Config, consumer: RootLease,
+    reuse: tuple[int, tuple[int, int, int, int, int], dict[str, Leaf]],
+) -> None:
+    descriptor, identity, observed = reuse
+    consumer.revalidate()
+    if set(os.listdir(descriptor)) != set(observed):
+        raise PublicationError("consumer TLS reuse leaf set changed")
+    _check_tls_snapshot(
+        config, consumer.descriptor, "tls", descriptor, identity, observed,
+        consumer=True,
+    )
+
+
 def _publish_full(config: Config) -> dict[str, object]:
     producer = _open_root(
         config.producer_root,
@@ -1709,10 +1761,15 @@ def _publish_full(config: Config) -> dict[str, object]:
     )
     transaction = Transaction()
     staged_tls = ""
+    reuse = None
     try:
         receipt, receipt_leaf, output_leaves, tls_leaves = _collect_producer(config, producer)
         _verify_consumer_sources(config, consumer, receipt)
-        staged_tls = _stage_tls(config, consumer, tls_leaves)
+        reuse = _consumer_tls_reuse(config, consumer, tls_leaves)
+        if reuse is None:
+            staged_tls = _stage_tls(config, consumer, tls_leaves)
+        else:
+            _assert_consumer_tls_reuse(config, consumer, reuse)
         transaction.detach_file(
             consumer.descriptor,
             "build-receipt.json",
@@ -1721,16 +1778,17 @@ def _publish_full(config: Config) -> dict[str, object]:
             allowed_modes=frozenset({0o644}),
             label="consumer build receipt",
         )
-        transaction.swap_directory(
-            consumer.descriptor,
-            "tls",
-            staged_tls,
-            owner_uid=config.consumer_uid,
-            owner_gid=config.consumer_gid,
-            mode=0o700,
-            label="consumer TLS directory",
-        )
-        staged_tls = ""
+        if reuse is None:
+            transaction.swap_directory(
+                consumer.descriptor,
+                "tls",
+                staged_tls,
+                owner_uid=config.consumer_uid,
+                owner_gid=config.consumer_gid,
+                mode=0o700,
+                label="consumer TLS directory",
+            )
+            staged_tls = ""
         for relative, mode in OUTPUT_MODES.items():
             parent, name, close_parent = _parent_and_name(
                 consumer.descriptor,
@@ -1763,7 +1821,11 @@ def _publish_full(config: Config) -> dict[str, object]:
         )
         producer.revalidate()
         consumer.revalidate()
+        if reuse is not None:
+            _assert_consumer_tls_reuse(config, consumer, reuse)
         result = _observe_consumer(config, consumer, receipt_leaf, output_leaves, tls_leaves)
+        if reuse is not None:
+            _assert_consumer_tls_reuse(config, consumer, reuse)
         publication = receipt["runtime_publication"]
         assert isinstance(publication, Mapping)
         result["generation"] = publication["generation"]
@@ -1785,6 +1847,8 @@ def _publish_full(config: Config) -> dict[str, object]:
                 exc.add_note(str(rollback_exc))
         raise
     finally:
+        if reuse is not None:
+            os.close(reuse[0])
         consumer.close()
         producer.close()
 

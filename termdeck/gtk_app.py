@@ -5707,6 +5707,9 @@ class TermDeckWindow(Gtk.ApplicationWindow):
         records = [tab.record for tab in self.tabs.values()]
         resolve_many = getattr(self.app_context.backend, "current_directories", None)
         observe_recovery = getattr(self.app_context.backend, "recovery_metadata", None)
+        observe_batch = getattr(self.app_context.backend, "recovery_observations", None)
+        if callable(observe_batch):
+            observe_recovery = observe_batch
         if not records or (not callable(resolve_many) and not callable(observe_recovery)):
             return 0
         live_by_id: dict[str, str | None] = {}
@@ -5716,9 +5719,21 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             except Exception:
                 live_by_id = {}
         recovery_by_id: dict[str, tuple[str | None, str | None]] = {}
+        authority_by_id = {}
         if callable(observe_recovery):
             try:
-                recovery_by_id = dict(observe_recovery(records))
+                if callable(observe_batch):
+                    try:
+                        result = observe_recovery(records, native_capture=False)
+                    except TypeError:
+                        result = observe_recovery(records)
+                else:
+                    result = observe_recovery(records)
+                if callable(observe_batch):
+                    authority_by_id = dict(result.authority)
+                    recovery_by_id = dict(result.metadata)
+                else:
+                    recovery_by_id = dict(result)
             except Exception:
                 recovery_by_id = {}
         changed_ids: set[str] = set()
@@ -5746,12 +5761,16 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             if tab is None:
                 continue
             record = self.app_context.store.get(session_id) or tab.record
-            if not TermDeckWindow._should_update_recovery_metadata(record, command, recovery_cwd):
+            if (session_id not in authority_by_id
+                    and not TermDeckWindow._should_update_recovery_metadata(record, command, recovery_cwd)):
                 continue
             recovery_updates.append((session_id, command, recovery_cwd))
         if recovery_updates:
             try:
-                self.app_context.store.update_recovery_metadata(recovery_updates)
+                if authority_by_id:
+                    self.app_context.store.update_recovery_metadata(recovery_updates, authority_observations=authority_by_id)
+                else:
+                    self.app_context.store.update_recovery_metadata(recovery_updates)
             except Exception:
                 recovery_updates = []
             else:
@@ -5762,6 +5781,10 @@ class TermDeckWindow(Gtk.ApplicationWindow):
                     updated = self.app_context.store.get(session_id)
                     if updated is not None:
                         self.refresh_tab_label(updated)
+        queue_native = getattr(self.app_context.backend, "queue_native_context_observation", None)
+        if callable(queue_native):
+            fresh = [self.app_context.store.get(record.id) or record for record in records]
+            queue_native(self.app_context.store.path, fresh)
         if changed_ids:
             self.side.refresh()
             if self.master_window is not None and self.master_window.get_visible():

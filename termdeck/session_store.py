@@ -10,7 +10,7 @@ import stat
 import struct
 import tempfile
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,8 +27,19 @@ from .session_recipe import (
     DEFAULT_RESTART_POLICY,
     SessionRecipeError,
     parse_session_recipe,
+    receipt_reenrollment,
     record_recipe_fields,
     recovery_command_specificity,
+)
+from .recovery_authority_context import (
+    AuthorityObservation,
+    RecoveryAuthorityError,
+    bind_context,
+    context_matches_record,
+    record_cas,
+    intent_digest,
+    retain_stronger_context,
+    parse_context,
 )
 from .storage_fabric import (
     DatabaseFileBinding,
@@ -2402,7 +2413,9 @@ class SessionStore:
                 recovery_last_attempt_at TEXT,
                 recovery_last_error TEXT,
                 recovery_intent TEXT NOT NULL DEFAULT 'legacy',
-                automatic_name INTEGER CHECK (automatic_name IN (0, 1))
+                automatic_name INTEGER CHECK (automatic_name IN (0, 1)),
+                recovery_authority_context TEXT,
+                recovery_authority_context_sha256 TEXT
             )
             """
         )
@@ -2444,6 +2457,10 @@ class SessionStore:
         self._ensure_column("auth_changed_at", "TEXT")
         self._ensure_column("recovery_recipe", "TEXT")
         self._ensure_column("recovery_recipe_sha256", "TEXT")
+        # No historical context backfill: a recipe/header cannot establish
+        # original home, SQLite or qualified effective-launcher authority.
+        self._ensure_column("recovery_authority_context", "TEXT")
+        self._ensure_column("recovery_authority_context_sha256", "TEXT")
         self._ensure_column(
             "restart_policy",
             "TEXT NOT NULL DEFAULT 'on-failure'",
@@ -2763,6 +2780,27 @@ class SessionStore:
             recovery_attempts=max(0, int(getattr(record, "recovery_attempts", 0))),
         )
 
+    @staticmethod
+    def _record_with_authority_context(record: SessionRecord, existing: SessionRecord | None) -> SessionRecord:
+        pair = (record.recovery_authority_context, record.recovery_authority_context_sha256)
+        if pair == (None, None) and existing is not None:
+            # Ordinary tuple/record callers do not make a new observation.
+            # Retain existing evidence only for the identical recipe and home.
+            if (record.recovery_recipe_sha256 == existing.recovery_recipe_sha256
+                    and intent_digest(record) == intent_digest(existing) and context_matches_record(existing)):
+                return replace(record, recovery_authority_context=existing.recovery_authority_context,
+                               recovery_authority_context_sha256=existing.recovery_authority_context_sha256)
+        if context_matches_record(record):
+            if pair != (None, None) and (existing is None or pair != (
+                    existing.recovery_authority_context, existing.recovery_authority_context_sha256)):
+                raise RecoveryAuthorityError("new context requires the observed metadata CAS path")
+            return record
+        if (existing is not None and pair == (existing.recovery_authority_context, existing.recovery_authority_context_sha256)
+                and (record.recovery_recipe_sha256 != existing.recovery_recipe_sha256 or intent_digest(record) != intent_digest(existing))):
+            # An intentional task/recipe change invalidates its old binding.
+            return replace(record, recovery_authority_context=None, recovery_authority_context_sha256=None)
+        raise RecoveryAuthorityError("authority context contradicts session recipe")
+
     def _recipe_values_for_update(
         self,
         current: SessionRecord,
@@ -2978,6 +3016,7 @@ class SessionStore:
         else:
             record = replace(record, auth_scope_id=None, codex_home=None)
         record = self._record_with_recovery_recipe(record)
+        record = self._record_with_authority_context(record, existing)
         if not bool(getattr(record, "external", False)) and record.pane_target is not None:
             record = replace(record, pane_target=None)
         payload = dict(record.__dict__)
@@ -2995,7 +3034,8 @@ class SessionStore:
                 recovery_command, recovery_cwd, auth_scope_id, codex_home, selected_account,
                 pending_account, auth_restart_required, auth_changed_at,
                 recovery_recipe, recovery_recipe_sha256, restart_policy, recovery_attempts,
-                recovery_last_attempt_at, recovery_last_error, recovery_intent, automatic_name
+                recovery_last_attempt_at, recovery_last_error, recovery_intent, automatic_name,
+                recovery_authority_context, recovery_authority_context_sha256
             )
             VALUES (
                 :id, :name, :tag, :command, :cwd, :tmux_name, :created_at, :last_opened_at,
@@ -3003,7 +3043,8 @@ class SessionStore:
                 :recovery_command, :recovery_cwd, :auth_scope_id, :codex_home, :selected_account,
                 :pending_account, :auth_restart_required, :auth_changed_at,
                 :recovery_recipe, :recovery_recipe_sha256, :restart_policy, :recovery_attempts,
-                :recovery_last_attempt_at, :recovery_last_error, :recovery_intent, :automatic_name
+                :recovery_last_attempt_at, :recovery_last_error, :recovery_intent, :automatic_name,
+                :recovery_authority_context, :recovery_authority_context_sha256
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -3034,7 +3075,9 @@ class SessionStore:
                 recovery_last_attempt_at = excluded.recovery_last_attempt_at,
                 recovery_last_error = excluded.recovery_last_error,
                 recovery_intent = excluded.recovery_intent,
-                automatic_name = excluded.automatic_name
+                automatic_name = excluded.automatic_name,
+                recovery_authority_context = excluded.recovery_authority_context,
+                recovery_authority_context_sha256 = excluded.recovery_authority_context_sha256
             """,
             payload,
         )
@@ -3161,6 +3204,101 @@ class SessionStore:
     def mark_recovery_inactive(self, session_id: str) -> SessionRecord:
         return self.set_recovery_intent(session_id, RECOVERY_INTENT_INACTIVE)
 
+    @staticmethod
+    def session_row_sha256(row: Mapping[str, object]) -> str:
+        """Bind every stored field, including legacy NULL values, for repair CAS."""
+        encoded = json.dumps(dict(row), sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def reenroll_recovery_receipts(
+        self,
+        expected_row_sha256: Mapping[str, str],
+        *,
+        assert_quiescent: Callable[[list[SessionRecord]], None],
+    ) -> dict[str, str]:
+        """Explicitly enroll unchanged canonical payloads under full-row CAS.
+
+        The operator must hold the shared recovery target writer locks and
+        provide an authoritative quiescence assertion, executed while the
+        SQLite write lock is held. This operation preserves every other raw
+        session field and all remembered-window/lifecycle tables. It neither
+        starts terminals nor provisions or changes authentication.
+        """
+        expected = dict(expected_row_sha256)
+        if not expected or len(expected) > 1000 or not callable(assert_quiescent):
+            raise ValueError("receipt reenrollment selection is invalid")
+        if any(not isinstance(key, str) or not key or
+               not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+               for key, value in expected.items()):
+            raise ValueError("receipt reenrollment preimages are invalid")
+        if self.conn.in_transaction:
+            raise ValueError("receipt reenrollment requires its own transaction")
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            records: list[SessionRecord] = []
+            updates: list[tuple[str, str, str]] = []
+            for session_id in sorted(expected):
+                row = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+                if row is None or self.session_row_sha256(row) != expected[session_id]:
+                    raise ValueError("receipt reenrollment preimage changed")
+                record = self._row_to_record(row)
+                encoded, digest = receipt_reenrollment(record)
+                records.append(record)
+                updates.append((encoded, digest, session_id))
+            assert_quiescent(records)
+            self.conn.executemany(
+                "UPDATE sessions SET recovery_recipe = ?, recovery_recipe_sha256 = ? WHERE id = ?",
+                updates,
+            )
+            self.conn.commit()
+            return {session_id: digest for _encoded, digest, session_id in updates}
+        except BaseException:
+            self.conn.rollback()
+            raise
+
+    def rollback_receipt_reenrollment(
+        self,
+        preimages: Mapping[str, Mapping[str, object]],
+        *,
+        assert_quiescent: Callable[[list[SessionRecord]], None],
+    ) -> set[str]:
+        """Restore quarantined receipts only while every enrolled row is unchanged.
+
+        This explicit inverse has the same writer/quiescence requirements as
+        reenrollment. It deliberately restores the invalid original receipt;
+        normal startup will reject it again. No later lifecycle or user edits
+        can be overwritten by this rollback.
+        """
+        if (not preimages or len(preimages) > 1000 or not callable(assert_quiescent)
+                or self.conn.in_transaction):
+            raise ValueError("receipt rollback selection or transaction is invalid")
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            records = []
+            updates = []
+            for session_id, preimage in sorted(preimages.items()):
+                row = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+                if row is None or preimage.get("id") != session_id:
+                    raise ValueError("receipt rollback preimage is invalid")
+                original = self._row_to_record(preimage)
+                encoded, digest = receipt_reenrollment(original)
+                expected = dict(preimage, recovery_recipe=encoded, recovery_recipe_sha256=digest)
+                if dict(row) != expected:
+                    raise ValueError("receipt rollback enrolled row changed")
+                records.append(self._row_to_record(row))
+                updates.append((preimage["recovery_recipe"], preimage["recovery_recipe_sha256"], session_id))
+            assert_quiescent(records)
+            self.conn.executemany(
+                "UPDATE sessions SET recovery_recipe = ?, recovery_recipe_sha256 = ? WHERE id = ?",
+                updates,
+            )
+            self.conn.commit()
+            return set(preimages)
+        except BaseException:
+            self.conn.rollback()
+            raise
+
     def reconcile_runtime_states(
         self,
         updates: Iterable[tuple[str, str, bool, int | None]],
@@ -3251,6 +3389,8 @@ class SessionStore:
     def update_recovery_metadata(
         self,
         updates: Iterable[tuple[str, str | None, str | None]],
+        *,
+        authority_observations: Mapping[str, AuthorityObservation] | None = None,
     ) -> int:
         """Persist changed crash-relaunch commands and cwd values atomically."""
 
@@ -3279,6 +3419,13 @@ class SessionStore:
                 current = existing.get(session_id)
                 if current is None:
                     continue
+                observation = (authority_observations or {}).get(session_id)
+                if observation is not None and observation.expected_record_sha256 != record_cas(current):
+                    # An asynchronous observation may not overwrite a newer
+                    # intent, receipt, account selection or runtime generation.
+                    continue
+                if observation is not None and observation.is_current is not None and not observation.is_current():
+                    continue
                 if (
                     command is not None
                     and recovery_command_specificity(current.recovery_command)
@@ -3286,7 +3433,9 @@ class SessionStore:
                 ):
                     # Preserve the more-specific opaque resume target. A
                     # positive None observation still clears ended metadata.
-                    continue
+                    if observation is None:
+                        continue
+                    command, cwd = current.recovery_command, current.recovery_cwd
                 changed_fields = {
                     field
                     for field, value in (
@@ -3294,15 +3443,37 @@ class SessionStore:
                     )
                     if value != getattr(current, field)
                 }
-                if not changed_fields:
+                if not changed_fields and observation is None:
                     continue
                 updated = replace(current, recovery_command=command, recovery_cwd=cwd)
-                encoded, digest, policy = self._recipe_values_for_update(
-                    current, updated, changed_fields
-                )
+                if changed_fields:
+                    encoded, digest, policy = self._recipe_values_for_update(current, updated, changed_fields)
+                else:
+                    encoded, digest, policy = self._recipe_values_for_record(current)
+                context = current.recovery_authority_context
+                context_digest = current.recovery_authority_context_sha256
+                if observation is not None:
+                    if observation.encoded is None and observation.sha256 is None:
+                        # Lost/weak or reused-owner observations cannot silently
+                        # promote a prior generation's context to the new one.
+                        context = context_digest = None
+                    else:
+                        value = parse_context(observation.encoded, observation.sha256)
+                        if value["native_producer"] is not None and observation.is_current is None:
+                            raise RecoveryAuthorityError("native enrollment requires current observed owner proof")
+                        context, context_digest = bind_context(observation.encoded, observation.sha256,
+                                                              updated, encoded, digest)
+                        if current.recovery_authority_context is not None:
+                            context, context_digest = retain_stronger_context(
+                                (current.recovery_authority_context, current.recovery_authority_context_sha256),
+                                (context, context_digest))
+                elif changed_fields:
+                    context = context_digest = None
+                if not changed_fields and (context, context_digest) == (current.recovery_authority_context, current.recovery_authority_context_sha256):
+                    continue
                 rows.append(
                     (
-                        command, cwd, encoded, digest, policy, session_id,
+                        command, cwd, encoded, digest, policy, context, context_digest, session_id,
                     )
                 )
                 existing[session_id] = replace(
@@ -3310,6 +3481,8 @@ class SessionStore:
                     recovery_recipe=encoded,
                     recovery_recipe_sha256=digest,
                     restart_policy=policy,
+                    recovery_authority_context=context,
+                    recovery_authority_context_sha256=context_digest,
                 )
             # Validate every changed recipe before the first write, then commit
             # legacy metadata and canonical authority in the same statement.
@@ -3317,7 +3490,8 @@ class SessionStore:
                 """
                 UPDATE sessions
                 SET recovery_command = ?, recovery_cwd = ?,
-                    recovery_recipe = ?, recovery_recipe_sha256 = ?, restart_policy = ?
+                    recovery_recipe = ?, recovery_recipe_sha256 = ?, restart_policy = ?,
+                    recovery_authority_context = ?, recovery_authority_context_sha256 = ?
                 WHERE id = ? AND external = 0
                 """,
                 rows,
@@ -3618,4 +3792,6 @@ class SessionStore:
             recovery_last_attempt_at=row["recovery_last_attempt_at"],
             recovery_last_error=row["recovery_last_error"],
             recovery_intent=normalise_recovery_intent(row["recovery_intent"]),
+            recovery_authority_context=row["recovery_authority_context"] if "recovery_authority_context" in row.keys() else None,
+            recovery_authority_context_sha256=row["recovery_authority_context_sha256"] if "recovery_authority_context_sha256" in row.keys() else None,
         )

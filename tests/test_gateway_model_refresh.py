@@ -125,7 +125,8 @@ def test_exact_live_payload_refresh_respawns_same_pane_and_waits_for_resume(tmp_
     respawn = run.call_args_list[0].args[0]
     assert respawn[:4] == ["respawn-pane", "-k", "-t", "%42"]
     assert "MODEL_CACHE=fresh" in respawn
-    assert respawn[-3:] == ["-c", str(tmp_path), exact]
+    assert respawn[respawn.index("-c") + 1] == str(tmp_path)
+    assert respawn[-5:] == ["/bin/bash", "--noprofile", "--norc", "-c", exact]
     kill_old.assert_called_once_with(((100, 123, False),))
     await_ready.assert_called_once_with(
         record,
@@ -217,7 +218,9 @@ def test_clean_exit_bridges_old_payload_to_shell_without_resuming_agent(tmp_path
     assert respawn[:3] == ["respawn-pane", "-t", "%42"]
     assert "-k" not in respawn
     assert "SHELL_MODE=fallback" in respawn
-    assert respawn[-3:] == ["-c", str(tmp_path), "/bin/bash -i"]
+    assert respawn[respawn.index("-c") + 1] == str(tmp_path)
+    assert respawn[-2:] == ["/bin/bash", "-i"]
+    assert "/usr/bin/env" in respawn
     await_pid.assert_called_once_with(record, pane_id="%42")
     create.assert_not_called()
 

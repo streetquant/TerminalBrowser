@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import stat
 
 import pytest
 
@@ -106,10 +107,28 @@ def _pending(fixture):
     fixture.record = fixture.preimages["generated:build-receipt.json"]
 
 
+def _tls_incarnations(fixture):
+    root = fixture.consumer / "tls"
+    info = root.lstat()
+    assert stat.S_ISDIR(info.st_mode)
+
+    def identity(observed):
+        return (observed.st_dev, observed.st_ino, observed.st_mode,
+                observed.st_uid, observed.st_gid, observed.st_nlink)
+
+    leaves = {}
+    for path in sorted(root.iterdir()):
+        observed = path.lstat()
+        assert stat.S_ISREG(observed.st_mode) and observed.st_nlink == 1
+        leaves[path.name] = (identity(observed), path.read_bytes())
+    return identity(info), leaves
+
+
 def test_runtime_only_rollback_preserves_tls_historical_intent_and_readonly_repeat(runtime_only):
     f = runtime_only
     checkpoints = []
     old_consumer_tls = copy.deepcopy(f.record["consumer_tls_publication"])
+    tls_before = _tls_incarnations(f)
     assert _restore(f, checkpoints.append)
     assert f.calls == ["none", "verify"]
     assert checkpoints == ["intent:rollback:runtime-reprepare", "intent:rollback:runtime-reprepare-request", "rollback:runtime-reprepare"]
@@ -119,7 +138,10 @@ def test_runtime_only_rollback_preserves_tls_historical_intent_and_readonly_repe
     assert restored["tls_publication"] == f.old["tls_publication"] == f.failed["tls_publication"]
     assert restored["files"] == f.old["files"] != f.failed["files"]
     assert restored["runtime_publication"]["generation"] not in {f.old["runtime_publication"]["generation"], f.failed["runtime_publication"]["generation"]}
-    assert f.record["consumer_tls_rollback"]["current"]["identity"] != old_consumer_tls["current"]["identity"]
+    assert f.record["consumer_tls_rollback"]["current"] == old_consumer_tls["current"]
+    assert _tls_incarnations(f) == tls_before
+    # Consumer identities remain distinct from the signed producer identities.
+    assert old_consumer_tls["current"]["identity"] != restored["tls_publication"]["current"]["identity"]
     for relative in activation.GENERATED_RUNTIME:
         record = f.preimages["generated:" + relative]
         assert record["rollback_postimage"] == _postimage(f, record)
@@ -128,6 +150,7 @@ def test_runtime_only_rollback_preserves_tls_historical_intent_and_readonly_repe
     before = copy.deepcopy(f.preimages)
     assert _restore(f, lambda _: pytest.fail("completed replay wrote state"))
     assert f.calls == [] and f.preimages == before
+    assert _tls_incarnations(f) == tls_before
 
 
 @pytest.mark.parametrize("boundary", ["intent", "after-publish", "completed"])

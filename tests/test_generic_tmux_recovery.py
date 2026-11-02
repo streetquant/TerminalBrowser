@@ -120,7 +120,7 @@ class GenericTmuxRecoveryTests(unittest.TestCase):
 
             launch = run.call_args_list[0].args[0]
             self.assertEqual(launch[:4], ["new-session", "-d", "-s", record.tmux_name])
-            self.assertEqual(launch[-3:-1], ["-c", str(Path(tmp).resolve())])
+            self.assertEqual(launch[launch.index("-c") + 1], str(Path(tmp).resolve()))
             self.assertIn(record.command, launch[-1])
             self.assertIn("__termdeck_status=$?", launch[-1])
             self.assertIn("interactive shell ready", launch[-1])
@@ -220,7 +220,7 @@ class GenericTmuxRecoveryTests(unittest.TestCase):
 
             respawn = run.call_args_list[0].args[0]
             self.assertEqual(respawn[:3], ["respawn-pane", "-t", "%42"])
-            self.assertEqual(respawn[-3:-1], ["-c", tmp])
+            self.assertEqual(respawn[respawn.index("-c") + 1], tmp)
             self.assertNotIn("-k", respawn)
             self.assertIn(record.command, respawn[-1])
             self.assertIn("__termdeck_status=$?", respawn[-1])
@@ -238,7 +238,10 @@ class GenericTmuxRecoveryTests(unittest.TestCase):
             ) as run:
                 backend.create_or_resume(record)
 
-            self.assertEqual(run.call_args_list[0].args[0][-1], record.command)
+            launch = run.call_args_list[0].args[0]
+            self.assertEqual(launch[-2:], ["/bin/bash", "-l"])
+            self.assertIn("/usr/bin/env", launch)
+            self.assertNotIn("--norc", launch)
 
     def test_shell_command_string_is_supervised_like_an_application(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

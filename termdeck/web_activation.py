@@ -771,9 +771,17 @@ def _wrapper_runtime_root(paths: ActivationPaths) -> Path:
 
 
 def _wrapper_kwargs(paths: ActivationPaths) -> dict[str, object]:
+    """Bind production wrapper identity independently of the clean build checkout."""
+
+    runtime_root = _wrapper_runtime_root(paths)
+    source_root = (
+        service_wrappers.CANONICAL_SOURCE_ROOT
+        if runtime_root == service_wrappers.CANONICAL_RUNTIME_ROOT
+        else paths.target
+    )
     return {
-        "source_root": paths.target,
-        "runtime_root": _wrapper_runtime_root(paths),
+        "source_root": source_root,
+        "runtime_root": runtime_root,
         "state_root": paths.database.parent,
         "managed_root": paths.managed_root,
         "managed_bin": paths.managed_bin,
@@ -5373,7 +5381,10 @@ def _web_service_start_ready(
         pid_path = service_wrappers._runtime_paths(layout)["nginx_pid"]
         if not os.path.lexists(pid_path):
             return False
-        if service_wrappers._read_nginx_pid(layout) != pid:
+        nginx_pid = service_wrappers._read_nginx_pid(layout, allow_empty=True)
+        if nginx_pid is None:
+            return False
+        if nginx_pid != pid:
             raise WebActivationError("web startup LAN process does not own its pidfile")
     return service_wrappers.verify_process_identity(expected)
 
@@ -6229,6 +6240,84 @@ def _b_services_may_be_live(receipt: Mapping[str, object]) -> bool:
     )
 
 
+
+def _observed_primary_lan_ipv4(paths: ActivationPaths) -> str:
+    """Mirror the fixed preparer's route selection without changing the host."""
+    route = _run(
+        ["/usr/bin/ip", "-4", "route", "get", "1.1.1.1"],
+        cwd=paths.target, timeout=5, check=False,
+    )
+    first = route.stdout.splitlines()[:1]
+    fields = first[0].split() if first else []
+    value = ""
+    for index, field in enumerate(fields[:-1]):
+        if field == "src":
+            value = fields[index + 1]
+            break
+    if not value:
+        addresses = _run(
+            ["/usr/bin/ip", "-4", "-o", "address", "show", "scope", "global"],
+            cwd=paths.target, timeout=5,
+        )
+        first = addresses.stdout.splitlines()[:1]
+        fields = first[0].split() if first else []
+        value = fields[3].split("/", 1)[0] if len(fields) >= 4 else ""
+    return _runtime_private_ipv4(value)
+
+
+def _installed_tls_reuse_publisher_sha256(paths: ActivationPaths) -> str:
+    """Require the reviewed fixed root-owned TLS-preserving publisher."""
+    installed, capture = _read_regular(
+        Path("/usr/libexec/termdeck-preparer-publication"),
+        label="privileged TLS publisher",
+    )
+    info = installed.lstat()
+    if (
+        info.st_uid != 0 or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o755
+        or capture.identity is None
+        or _runtime_tls_leaf_identity(info, label="privileged TLS publisher")
+        != tuple(getattr(capture.identity, field) for field in _FILE_IDENTITY_FIELDS)
+    ):
+        raise WebActivationError("privileged TLS publisher ownership or identity is unsafe")
+    digest = hashlib.sha256(capture.snapshot.content).hexdigest()
+    if digest != _sha(paths.target / "deploy" / "termdeck-preparer-publication"):
+        raise WebActivationError("privileged TLS publisher differs from the reviewed source")
+    return digest
+
+
+def _require_preserved_tls_preparation(paths: ActivationPaths) -> dict[str, object] | None:
+    """Refuse a predictable protected TLS change before activation mutation."""
+    if paths.runtime != service_wrappers.CANONICAL_RUNTIME_ROOT:
+        return None
+    publisher_digest = _installed_tls_reuse_publisher_sha256(paths)
+    signed, _identity, publication = _broker_runtime_receipt(paths)
+    consumer_tls = _consumer_tls_publication(publication)
+    _runtime_tls_publication(paths, consumer_tls)
+    if _observed_primary_lan_ipv4(paths) != signed["lan_ip"]:
+        raise WebActivationError("activation would rotate protected TLS for a changed LAN address")
+    _certificate, capture = _read_regular(
+        paths.runtime / "tls" / "server.crt", label="protected TLS certificate",
+    )
+    try:
+        expiry = subprocess.run(
+            ["/usr/bin/openssl", "x509", "-noout", "-checkend", "2592000"],
+            input=capture.snapshot.content, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False, timeout=10,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WebActivationError("protected TLS expiration could not be verified") from exc
+    if expiry.returncode != 0:
+        raise WebActivationError("activation would rotate invalid or expiring protected TLS")
+    _runtime_tls_publication(paths, consumer_tls)
+    return {
+        "publisher_sha256": publisher_digest,
+        "lan_ip": signed["lan_ip"],
+        "consumer_tls": consumer_tls,
+    }
+
+
 def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
     tx, receipt = load_transaction(paths, tx)
     if receipt.get("status") != "artifacts-staged":
@@ -6237,6 +6326,9 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
         raise WebActivationError("live activation requires TERMDECK_ACTIVATION_APPROVED=1 after review")
     if paths.evidence != paths.database.parent / "recovery" / "activation-v2":
         raise WebActivationError("execute requires the recovery wrapper's canonical activation-v2 evidence root; prepare a new transaction there")
+    from . import forward_recovery
+    forward_recovery.admit(paths, tx, receipt)
+    tls_admission = _require_preserved_tls_preparation(paths)
     from . import legacy_activation
     legacy_bootstrap = legacy_activation.prepare(paths, tx, receipt)
     if legacy_bootstrap is not None:
@@ -6250,6 +6342,8 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
     receipt["processes_before"] = process_snapshot()
     preimages: dict[str, dict[str, object]] = {}
     receipt["preimages"] = preimages
+    if tls_admission is not None:
+        receipt["tls_preservation_admission"] = tls_admission
     for relative in _sources(paths, tx):
         preimages["runtime:" + relative] = _preimage(
             paths.runtime / relative, tx, "runtime-" + relative.replace("/", "-"),
@@ -6276,6 +6370,7 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
         preimages["wrapper:" + str(path)] = _preimage(path, tx, backup_name)
     receipt["old_release_id"] = _managed_release_id(paths)
     receipt["package_before"] = {"current_release_id": receipt["old_release_id"]}
+    forward_recovery.admit(paths, tx, receipt)
     _persist(paths, tx, receipt, "mutation-start")
 
     def checkpoint(record: str) -> None:
@@ -6426,6 +6521,8 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
             preimages,
             checkpoint=checkpoint,
         )
+        if tls_admission is not None:
+            _runtime_tls_publication(paths, tls_admission["consumer_tls"])
         receipt["health"] = _health()
         receipt["post_checks"] = {"database": verify_database(paths, tx, before), "processes": process_observation(receipt["processes_before"])}
         _disarm()
@@ -6436,7 +6533,7 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
         watchdog["armed_after_activation"] = False
         watchdog["disarmed_after_activation"] = True
         _persist(paths, tx, receipt, "activated")
-        return {"ok": True, "action": "activated", "transaction": str(tx), "receipt": receipt}
+        result = {"ok": True, "action": "activated", "transaction": str(tx), "receipt": receipt}
     except Exception as exc:
         if thread.is_alive():
             stop_heartbeat.set()
@@ -6481,6 +6578,11 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
         stop_heartbeat.set()
         if thread.is_alive():
             thread.join()
+    # This boundary follows durable activation, outside its rollback handler.
+    # A failed marker CAS leaves healthy B and the old failure gate intact;
+    # --stabilize on the activated transaction resumes only this discharge.
+    forward_recovery.complete(paths, tx, receipt)
+    return result
 
 
 def _clear_owned_recovery_marker(paths: ActivationPaths, tx: Path) -> None:
@@ -7241,6 +7343,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     actions.add_argument("--execute", action="store_true")
     actions.add_argument("--rollback", action="store_true")
     actions.add_argument("--watchdog", action="store_true")
+    actions.add_argument("--stabilize", action="store_true")
+    parser.add_argument("--recover-from", type=Path)
+    parser.add_argument("--failed-receipt-sha256")
     parser.add_argument("--transaction", type=Path)
     parser.add_argument("--latest", action="store_true")
     parser.add_argument("--reuse-web-binary", type=Path)
@@ -7251,6 +7356,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.add_argument("--" + name)
     args = parser.parse_args(argv)
     try:
+        if (args.recover_from is not None or args.failed_receipt_sha256 is not None) and not args.stabilize:
+            raise WebActivationError("failed recovery pins belong to --stabilize")
         if not args.prepare and (args.migrate_from_root is not None or args.migrate_from_bin_dir is not None):
             raise WebActivationError("migration paths belong to --prepare; execute and rollback use that bound request")
         paths = _paths(args)
@@ -7269,6 +7376,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         migrate_from_root=args.migrate_from_root,
                         migrate_from_bin_dir=args.migrate_from_bin_dir,
                     )
+                elif args.stabilize:
+                    if not args.transaction or not args.recover_from or not args.failed_receipt_sha256:
+                        raise WebActivationError("--stabilize requires --transaction, --recover-from and --failed-receipt-sha256")
+                    from . import forward_recovery
+                    result = forward_recovery.stabilize(paths, args.transaction, args.recover_from, args.failed_receipt_sha256)
                 elif args.execute:
                     if not args.transaction:
                         raise WebActivationError("--execute requires --transaction")

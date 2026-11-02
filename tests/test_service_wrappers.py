@@ -442,6 +442,7 @@ def _immutable_execution_site(tmp_path: Path) -> tuple[Path, dict[str, object]]:
         ),
         "termdeck/web_activation.py": b"# selected immutable recovery module\n",
         "termdeck/storage_fabric.py": b"# selected immutable storage module\n",
+        "termdeck/startup_recovery.py": b"# selected immutable terminal recovery module\n",
     }
     binding: dict[str, object] = {}
     for relative, content in modules.items():
@@ -524,6 +525,61 @@ def test_immutable_execution_binding_uses_selected_release_site(
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_backend_start_runs_release_bound_cold_recovery_after_admission(layout_dirs, monkeypatch):
+    _published(layout_dirs)
+    order = []
+
+    def preflight(spec, _layout):
+        assert spec.kind == "backend"
+        order.append("admitted")
+        return ("/usr/bin/true",)
+
+    class StopExec(Exception):
+        pass
+
+    def exec_backend(_program, _argv):
+        order.append("http-exec")
+        raise StopExec()
+
+    monkeypatch.setattr(wrappers, "_preflight_unit_start", preflight)
+    monkeypatch.setattr(wrappers, "_record_start_identity", lambda *_args: order.append("identity"))
+    monkeypatch.setattr(wrappers, "_start_backend_recovery", lambda _layout: order.append("recovery-worker"))
+    monkeypatch.setattr(wrappers.os, "execv", exec_backend)
+    with pytest.raises(StopExec):
+        wrappers.run_wrapper("termdeck-web-backend.service", "start", release_id="release-a", **layout_dirs)
+    assert order == ["admitted", "identity", "recovery-worker", "http-exec"]
+
+
+def test_backend_worker_imports_only_bound_selected_site(layout_dirs, tmp_path, monkeypatch):
+    site, binding = _immutable_execution_site(tmp_path)
+    layout = wrappers.resolve_layout(**layout_dirs, execution_root=site, execution_binding=binding)
+    observed = []
+    monkeypatch.setattr(wrappers.subprocess, "Popen", lambda argv, **options: observed.append((argv, options)))
+    wrappers._start_backend_recovery(layout)
+    argv, options = observed[0]
+    assert argv[:4] == ["/usr/bin/python3", "-I", "-B", "-c"]
+    assert argv[5:] == [str(site), "--db", str(layout.state_root / "sessions.sqlite3"),
+                       "--managed-root", str(layout.managed_root)]
+    assert "termdeck.startup_recovery" in argv[4]
+    assert options == {"stdin": subprocess.DEVNULL, "close_fds": True}
+    bad_binding = {key: value for key, value in binding.items() if key != "termdeck/startup_recovery.py"}
+    bad = wrappers.resolve_layout(**layout_dirs, execution_root=site, execution_binding=bad_binding)
+    with pytest.raises(wrappers.WrapperError, match="omits saved terminal recovery"):
+        wrappers._start_backend_recovery(bad)
+    assert len(observed) == 1
+
+
+def test_historical_inverse_without_worker_keeps_exact_old_binding(layout_dirs, tmp_path):
+    site, binding = _immutable_execution_site(tmp_path)
+    package = site / "termdeck"
+    package.chmod(0o755)
+    (package / "startup_recovery.py").unlink()
+    package.chmod(0o555)
+    del binding["termdeck/startup_recovery.py"]
+    layout = wrappers.resolve_layout(**layout_dirs, execution_root=site, execution_binding=binding)
+    assert wrappers._start_backend_recovery(layout) is None
 
 
 def test_recovery_command_runs_module_from_selected_execution_root(
@@ -3228,6 +3284,7 @@ def test_exec_failure_does_not_mark_an_intervening_start_failed(
         original_write(destination, value, **kwargs)
 
     monkeypatch.setattr(wrappers, "_preflight_unit_start", lambda *_args: ("/usr/bin/true",))
+    monkeypatch.setattr(wrappers, "_start_backend_recovery", lambda *_args: None)
     monkeypatch.setattr(wrappers.os, "execv", failed_exec)
     monkeypatch.setattr(wrappers, "_atomic_write_json", replace_before_failed_write)
     with pytest.raises(wrappers.WrapperError, match="could not exec|changed after preflight"):

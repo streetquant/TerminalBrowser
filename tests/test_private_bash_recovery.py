@@ -253,7 +253,7 @@ class PrivateBashRecoveryTests(unittest.TestCase):
                 else:
                     rc.symlink_to(self.private / "auth.json")
                 before = rc.lstat()
-                with self.assertRaisesRegex(TmuxError, "private Bash environment"):
+                with self.assertRaisesRegex(TmuxError, "private Bash environment|saved private Bash scope requires repair"):
                     self.backend._launch_spec(self.record)
                 self.assertEqual(rc.lstat().st_ino, before.st_ino)
                 rc.unlink()

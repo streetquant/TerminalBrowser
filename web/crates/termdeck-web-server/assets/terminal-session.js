@@ -13,6 +13,7 @@ window.T1000TerminalSession = (() => {
     const MAX_FRAME_BYTES = 32 * 1024;
     const MAX_IN_FLIGHT_FRAMES = 64;
     const INPUT_BATCH_MS = 3;
+    const RESIZE_SETTLE_MS = 80;
     const MAX_RECONNECT_MS = 5000;
     const MAX_SOCKET_BUFFERED_BYTES = 512 * 1024;
     const SOCKET_DRAIN_MS = 8;
@@ -28,6 +29,8 @@ window.T1000TerminalSession = (() => {
     const MIN_ROWS = 2;
     const MAX_ROWS = 500;
     let active = true;
+    let paneState = { status: "unknown", hasTerminal: false, terminalTarget: null };
+    let recoveryInputNotice = "";
     let lastStatus = ["Connecting…", "connecting"];
     let appearanceKey = JSON.stringify(window.T1000UI.preferences());
     const terminalApi = library.createTerminal(host, {
@@ -48,7 +51,10 @@ window.T1000TerminalSession = (() => {
     let nextSequence = 1;
     let reconnectAttempt = 0;
     let reconnectTimer = 0;
-    let resizeTimer = 0;
+    let resizeFrame = 0;
+    let viewportResizeTimer = 0;
+    let pendingResize = null;
+    let resizeInFlight = false;
     let webglTimer = 0;
     let helloTimer = 0;
     let heartbeatTimer = 0;
@@ -70,16 +76,97 @@ window.T1000TerminalSession = (() => {
     let outputChain = Promise.resolve();
     let outputChunks = [];
     let outputBytes = 0;
+    let pendingOutputBytes = 0;
+    let outputBackpressured = false;
     let outputWrites = 0;
     let canonicalGeometry = null;
     let lastViewportGeometry = null;
     let focusRequested = false;
+    let wheelBatch = null;
     const scroll = window.T1000TerminalScroll.install(host, terminalApi,
       {isController: () => active && ready && mine && socketOpen(),
+        onMouseWheelBatch: dispatchWheelBatch,
         onApplicationScroll: (direction, count = 1) => enqueueWheel(new TextEncoder().encode((direction === "up" ? "\x1b[5~" : "\x1b[6~").repeat(count)), 3)});
 
+    function streamAllowed() {
+      return paneState.hasTerminal && (paneState.status === "running" || paneState.status === "paused");
+    }
+
+    function recoveryMessage() {
+      const messages = {
+        "recovery-pending": ["Recovery pending", "This saved tab is waiting for recovery. Resolve its recovery blocker before relaunching."],
+        missing: ["Recovery needed", "This saved tab has no live terminal. Its saved launch state must be recovered before connecting."],
+        "start-error": ["Terminal could not start", "Check this tab’s saved launch settings before relaunching."],
+        stopped: ["Terminal stopped", "This saved tab is stopped. It will connect after you explicitly relaunch it."],
+        archived: ["Terminal archived", "Restore this saved tab before relaunching it."],
+        dead: ["Terminal ended", "This terminal has ended. It will connect after it is relaunched."],
+        new: ["Terminal starting", "Waiting for this tab’s live terminal to become available."],
+        unknown: ["Checking terminal availability", "Waiting for a current terminal snapshot."],
+      };
+      return messages[paneState.status] || ["Waiting for recovery", "This saved tab has no live terminal yet. Waiting for recovery."];
+    }
+
+    function retireStream(reason) {
+      const previous = socket;
+      socketGeneration += 1;
+      socket = null;
+      clearViewportResize();
+      ready = false;
+      mine = false;
+      controlEpoch = null;
+      focusPending = false;
+      focusRequested = false;
+      window.clearTimeout(reconnectTimer);
+      window.clearTimeout(helloTimer);
+      window.clearTimeout(stableTimer);
+      window.clearTimeout(socketDrainTimer);
+      window.clearTimeout(inputBatchTimer);
+      socketDrainTimer = 0;
+      inputBatchTimer = 0;
+      if (inFlight.size || queue.length || batchBytes) {
+        recoveryInputNotice = " Pending input was discarded and will not be replayed automatically.";
+      }
+      discardAmbiguousInput();
+      queue = [];
+      batchChunks = [];
+      batchBytes = 0;
+      queuedBytes = 0;
+      inFlight.clear();
+      flushTerminalOutput();
+      if (previous) previous.close(1000, reason);
+    }
+
+    function setPaneState(value) {
+      if (disposed) return;
+      const statuses = ["new", "running", "paused", "missing", "recovery-pending", "start-error", "dead", "stopped", "archived", "unknown"];
+      if (!isRecord(value) || !statuses.includes(value.status) || typeof value.hasTerminal !== "boolean"
+        || (value.terminalTarget != null && (typeof value.terminalTarget !== "string" || !value.terminalTarget.length))) {
+        throw new Error("Invalid terminal availability state.");
+      }
+      const terminalTarget = value.terminalTarget ?? null;
+      const wasAllowed = streamAllowed();
+      const targetChanged = paneState.terminalTarget !== terminalTarget;
+      const changed = paneState.status !== value.status || paneState.hasTerminal !== value.hasTerminal || targetChanged;
+      paneState = { status: value.status, hasTerminal: value.hasTerminal, terminalTarget };
+      if (streamAllowed()) {
+        if (!wasAllowed || targetChanged) {
+          if (wasAllowed && targetChanged) retireStream("saved terminal target changed");
+          recoveryInputNotice = "";
+          reconnectAttempt = 0;
+          window.clearTimeout(reconnectTimer);
+          setOverlay("");
+          connect();
+        }
+        return;
+      }
+      if (changed || socket) retireStream("saved terminal unavailable");
+      const [message, detail] = recoveryMessage();
+      setStatus(message, "recovery");
+      setOverlay(detail + recoveryInputNotice);
+    }
+
     function requestControl() {
-      if (!active || disposed) return;
+      if (!active || disposed || !streamAllowed()) return;
       if (ready && socketOpen()) {
         if (!focusPending) focusPending = sendJson({ type: "focus" });
       } else {
@@ -126,16 +213,39 @@ window.T1000TerminalSession = (() => {
       return { cols: value.cols, rows: value.rows };
     }
 
+    function scheduleViewportResize() {
+      window.clearTimeout(viewportResizeTimer);
+      viewportResizeTimer = 0;
+      if (!pendingResize || resizeInFlight || !active || !ready || !mine || !socketOpen()) return;
+      viewportResizeTimer = window.setTimeout(() => {
+        viewportResizeTimer = 0;
+        if (!pendingResize || resizeInFlight || !active || !ready || !mine || !socketOpen()) return;
+        if (sendJson({ type: "resize", ...pendingResize })) {
+          lastViewportGeometry = pendingResize;
+          pendingResize = null;
+          resizeInFlight = true;
+        } else scheduleViewportResize();
+      }, RESIZE_SETTLE_MS);
+    }
+
+    function clearViewportResize() {
+      window.clearTimeout(viewportResizeTimer);
+      viewportResizeTimer = 0;
+      pendingResize = null;
+      resizeInFlight = false;
+    }
+
     function fitViewport() {
       if (!active) return canonicalGeometry || terminalApi.dimensions();
       const dimensions = boundedGeometry(terminalApi.fit());
-      if (ready && socketOpen() && (
-        !lastViewportGeometry
-        || lastViewportGeometry.cols !== dimensions.cols
-        || lastViewportGeometry.rows !== dimensions.rows
-      )) {
-        lastViewportGeometry = dimensions;
-        sendJson({ type: "resize", ...dimensions });
+      if (ready && mine && socketOpen()) {
+        pendingResize = !lastViewportGeometry
+          || lastViewportGeometry.cols !== dimensions.cols
+          || lastViewportGeometry.rows !== dimensions.rows ? dimensions : null;
+        // Dragging a sidebar used to send a full history replay per frame.
+        // Fit locally immediately; publish the settled grid once and retain
+        // only the newest geometry while the previous request is in flight.
+        scheduleViewportResize();
       }
       if (canonicalGeometry && !mine) {
         return terminalApi.fitGrid(canonicalGeometry.cols, canonicalGeometry.rows);
@@ -163,7 +273,7 @@ window.T1000TerminalSession = (() => {
     }
 
     function sendJson(value) {
-      if (!socketOpen()) {
+      if (!streamAllowed() || !socketOpen()) {
         return false;
       }
       if (socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) {
@@ -191,6 +301,8 @@ window.T1000TerminalSession = (() => {
       const changedLease = controlEpoch !== null && epoch !== controlEpoch;
       controlEpoch = epoch;
       mine = value.mine === true;
+      if (!mine) clearViewportResize();
+      else if (!previouslyMine && ready) resizeViewport();
       if (changedLease) discardAmbiguousInput("Terminal control generation changed while input was pending.");
       const remoteNext = remoteNextSequence(value);
       if (remoteNext !== null) {
@@ -238,7 +350,7 @@ window.T1000TerminalSession = (() => {
     }
 
     function sendAvailable() {
-      if (!ready || !mine || focusPending || !socketOpen()) {
+      if (!streamAllowed() || !ready || !mine || focusPending || !socketOpen()) {
         return;
       }
       if (socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) {
@@ -277,16 +389,21 @@ window.T1000TerminalSession = (() => {
         }
         return;
       }
-      const combined = new Uint8Array(batchBytes);
-      let cursor = 0;
-      for (const chunk of batchChunks) {
-        combined.set(chunk, cursor);
-        cursor += chunk.length;
+      let combined;
+      if (batchChunks.length === 1) {
+        [combined] = batchChunks;
+      } else {
+        combined = new Uint8Array(batchBytes);
+        let cursor = 0;
+        for (const chunk of batchChunks) {
+          combined.set(chunk, cursor);
+          cursor += chunk.length;
+        }
       }
       batchChunks = [];
       batchBytes = 0;
       for (let offset = 0; offset < combined.length; offset += MAX_FRAME_BYTES) {
-        queueFrame(combined.slice(offset, Math.min(combined.length, offset + MAX_FRAME_BYTES)));
+        queueFrame(combined.subarray(offset, Math.min(combined.length, offset + MAX_FRAME_BYTES)));
       }
       if (dispatch) {
         sendAvailable();
@@ -294,6 +411,7 @@ window.T1000TerminalSession = (() => {
     }
 
     function enqueue(bytes) {
+      if (!streamAllowed()) return;
       if (!active || !(bytes instanceof Uint8Array) || bytes.length === 0 || disposed) {
         return;
       }
@@ -303,7 +421,7 @@ window.T1000TerminalSession = (() => {
       }
       queuedBytes += bytes.length;
       for (let offset = 0; offset < bytes.length; offset += MAX_FRAME_BYTES) {
-        const chunk = bytes.slice(offset, Math.min(bytes.length, offset + MAX_FRAME_BYTES));
+        const chunk = bytes.subarray(offset, Math.min(bytes.length, offset + MAX_FRAME_BYTES));
         if (batchBytes > 0 && batchBytes + chunk.length > MAX_FRAME_BYTES) {
           flushInputBatch(false);
         }
@@ -320,9 +438,29 @@ window.T1000TerminalSession = (() => {
       }
     }
 
+    function dispatchWheelBatch(dispatch) {
+      const reports = [];
+      wheelBatch = reports;
+      try { dispatch(); } finally { wheelBatch = null; }
+      // A homogeneous wheel burst remains passive, sequenced and mode-fenced.
+      // One authorization/command/ack now carries up to eight native reports.
+      for (let i = 0; i < reports.length;) {
+        const first = reports[i];
+        let count = 1;
+        while (count < 8 && i + count < reports.length
+            && reports[i + count].length === first.length
+            && first.every((byte, offset) => reports[i + count][offset] === byte)) count++;
+        const bytes = new Uint8Array(first.length * count);
+        for (let n = 0; n < count; n++) bytes.set(first, n * first.length);
+        enqueueWheel(bytes);
+        i += count;
+      }
+    }
+
     function enqueueWheel(bytes, type = 2) {
+      if (!streamAllowed()) return;
       if (!active || !ready || !mine || !socketOpen() || disposed || !(bytes instanceof Uint8Array)
-          || !bytes.length || bytes.length > 64 || queuedBytes + bytes.length > MAX_PENDING_BYTES) return false;
+          || !bytes.length || bytes.length > (type === 2 ? 512 : 32) || queuedBytes + bytes.length > MAX_PENDING_BYTES) return false;
       flushInputBatch(true);
       if (queue.length || inFlight.size >= MAX_IN_FLIGHT_FRAMES
           || socket.bufferedAmount > MAX_SOCKET_BUFFERED_BYTES) return false;
@@ -353,17 +491,23 @@ window.T1000TerminalSession = (() => {
       const generation = outputGeneration;
       outputChunks = [];
       outputBytes = 0;
-      const combined = new Uint8Array(bytes);
-      let cursor = 0;
-      for (const chunk of chunks) {
-        combined.set(chunk, cursor);
-        cursor += chunk.length;
+      let combined;
+      if (chunks.length === 1) {
+        [combined] = chunks;
+      } else {
+        combined = new Uint8Array(bytes);
+        let cursor = 0;
+        for (const chunk of chunks) {
+          combined.set(chunk, cursor);
+          cursor += chunk.length;
+        }
       }
       outputWrites += 1;
       outputChain = outputChain.then(
         () => new Promise((resolve) => {
           const done = () => {
             outputWrites -= 1;
+            pendingOutputBytes = Math.max(0, pendingOutputBytes - bytes);
             resolve();
           };
           if (disposed || generation !== outputGeneration) {
@@ -402,6 +546,7 @@ window.T1000TerminalSession = (() => {
       const geometry = requiredGeometry(geometryValue);
       flushTerminalOutput();
       outputGeneration += 1;
+      outputBackpressured = false;
       const generation = outputGeneration;
       outputChain = outputChain.then(() => {
         if (!disposed && generation === outputGeneration) {
@@ -414,11 +559,16 @@ window.T1000TerminalSession = (() => {
     }
 
     function queueTerminalWrite(value) {
-      const bytes = value instanceof Uint8Array ? value.slice() : new Uint8Array(value);
-      if (bytes.length === 0 || disposed) {
+      const bytes = value instanceof Uint8Array
+        ? (value.byteOffset === 0 && value.byteLength === value.buffer.byteLength ? value : value.slice())
+        : new Uint8Array(value);
+      if (bytes.length === 0 || disposed || outputBackpressured) {
         return outputChain;
       }
-      if (outputBytes + bytes.length > MAX_OUTPUT_QUEUE_BYTES) {
+      // Include writes waiting in outputChain and the currently parsing write;
+      // counting only outputChunks lets a busy stream hide unlimited backlog.
+      if (pendingOutputBytes + bytes.length > MAX_OUTPUT_QUEUE_BYTES) {
+        outputBackpressured = true;
         setOverlay("Terminal output exceeded the bounded browser queue. Reconnecting to resynchronize.");
         if (socketOpen()) {
           socket.close(4009, "terminal output backpressure");
@@ -427,6 +577,7 @@ window.T1000TerminalSession = (() => {
       }
       outputChunks.push(bytes);
       outputBytes += bytes.length;
+      pendingOutputBytes += bytes.length;
       scheduleOutputFlush();
       return outputChain;
     }
@@ -467,6 +618,7 @@ window.T1000TerminalSession = (() => {
       window.clearTimeout(helloTimer);
       setOverlay("");
       ready = true;
+      scheduleViewportResize();
       if (active && focusRequested) {
         focusRequested = false;
         requestControl();
@@ -492,6 +644,7 @@ window.T1000TerminalSession = (() => {
         return;
       }
       if (event.type === "ready" || event.type === "resynced") {
+        resizeInFlight = false;
         finishReady(event);
         flushTerminalOutput();
         return;
@@ -540,7 +693,7 @@ window.T1000TerminalSession = (() => {
     }
 
     function scheduleReconnect() {
-      if (disposed || !active) {
+      if (disposed || !active || !streamAllowed()) {
         return;
       }
       window.clearTimeout(reconnectTimer);
@@ -581,6 +734,7 @@ window.T1000TerminalSession = (() => {
     }
 
     function connect() {
+      if (!streamAllowed()) return;
       if (disposed || !active || !networkOnline) {
         if (!networkOnline) {
           setStatus("Offline", "offline");
@@ -593,6 +747,7 @@ window.T1000TerminalSession = (() => {
       window.clearTimeout(reconnectTimer);
       window.clearTimeout(helloTimer);
       window.clearTimeout(stableTimer);
+      clearViewportResize();
       ready = false;
       mine = false;
       controlEpoch = null;
@@ -637,6 +792,7 @@ window.T1000TerminalSession = (() => {
         flushInputBatch(false);
         flushTerminalOutput();
         socket = null;
+        clearViewportResize();
         ready = false;
         mine = false;
         focusPending = false;
@@ -656,13 +812,21 @@ window.T1000TerminalSession = (() => {
       });
     }
 
-    terminalApi.onData(bytes => scroll.isWheelInput() ? enqueueWheel(bytes) : enqueue(bytes));
+    terminalApi.onData(bytes => {
+      if (scroll.isWheelInput()) {
+        if (wheelBatch) wheelBatch.push(bytes);
+        else enqueueWheel(bytes);
+      } else enqueue(bytes);
+    });
     host.addEventListener("pointerdown", () => {
       if (active && !disposed) terminalApi.focus();
     });
     const observer = new ResizeObserver(() => {
-      window.clearTimeout(resizeTimer);
-      resizeTimer = window.setTimeout(resizeViewport, 80);
+      if (resizeFrame) return;
+      resizeFrame = window.requestAnimationFrame(() => {
+        resizeFrame = 0;
+        resizeViewport();
+      });
     });
     observer.observe(host);
     const reconnectNow = () => {
@@ -680,7 +844,7 @@ window.T1000TerminalSession = (() => {
     const pauseOffline = () => {
       networkOnline = false;
       window.clearTimeout(reconnectTimer);
-      setStatus("Offline", "offline");
+      if (streamAllowed()) setStatus("Offline", "offline");
       if (socketOpen()) {
         socket.close(4005, "browser offline");
       }
@@ -717,15 +881,19 @@ window.T1000TerminalSession = (() => {
       }
       sendJson({ type: "ping" });
     }, HEARTBEAT_INTERVAL_MS);
-    connect();
+    setPaneState(context.initialPaneState || { status: "running", hasTerminal: true });
 
     return {
+      setPaneState,
       deactivate() {
         flushInputBatch(true);
         active = false;
+        window.clearTimeout(viewportResizeTimer);
+        viewportResizeTimer = 0;
         focusRequested = false;
         terminalApi.terminal.blur();
-        window.clearTimeout(resizeTimer);
+        window.cancelAnimationFrame(resizeFrame);
+        resizeFrame = 0;
         window.clearTimeout(webglTimer);
         window.clearTimeout(reconnectTimer);
       },
@@ -749,9 +917,11 @@ window.T1000TerminalSession = (() => {
           return;
         }
         disposed = true;
+        clearViewportResize();
         observer.disconnect();
         window.clearTimeout(reconnectTimer);
-        window.clearTimeout(resizeTimer);
+        window.cancelAnimationFrame(resizeFrame);
+        resizeFrame = 0;
         window.clearTimeout(webglTimer);
         window.clearTimeout(helloTimer);
         window.clearTimeout(inputBatchTimer);
@@ -837,6 +1007,11 @@ window.T1000TerminalSession = (() => {
         current = entry;
         count();
         return entry;
+      },
+      updatePaneStates(panes) {
+        for (const pane of panes) {
+          entries.get(pane.id)?.mount.setPaneState?.(pane);
+        }
       },
       prune(paneIds) {
         const visible = new Set(paneIds);

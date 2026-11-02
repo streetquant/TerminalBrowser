@@ -9,6 +9,200 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
   });
 };
 
+// Keep the Tabs pane's width within the space left for the terminal and persist
+// only settled widths. The shell's data-sidebar-side controls drag direction.
+window.T1000SidebarResize = (shell, sidebar, { initial = 280, min = 220, max = 560, reset = 280, onChange = () => {} } = {}) => {
+  const viewportLimit = () => {
+    const viewport = Number.isFinite(window.innerWidth) ? window.innerWidth : 1024;
+    const desktop = window.matchMedia ? window.matchMedia("(min-width: 760px)").matches : viewport >= 760;
+    return Math.max(min, Math.min(max, desktop ? viewport - 320 : Math.floor(viewport * .86)));
+  };
+  const clamp = value => Math.max(min, Math.min(Number.isFinite(value) ? value : initial, viewportLimit()));
+  const handle = document.createElement("div");
+  handle.className = "workspace-sidebar-resize";
+  handle.setAttribute("role", "separator");
+  handle.setAttribute("aria-orientation", "vertical");
+  handle.setAttribute("aria-label", "Resize Tabs pane");
+  handle.setAttribute("aria-valuemin", String(min));
+  handle.tabIndex = 0;
+  handle.title = "Drag to resize Tabs pane. Arrow keys adjust; double-click resets.";
+  sidebar.append(handle);
+  let width = Number.isFinite(initial) ? initial : 280, start = null;
+  function apply(value = width) {
+    if (Number.isFinite(value)) width = value;
+    const applied = clamp(width);
+    shell.style.setProperty("--td-sidebar-width", `${applied}px`);
+    handle.setAttribute("aria-valuenow", String(Math.round(applied)));
+    handle.setAttribute("aria-valuemax", String(Math.round(viewportLimit())));
+  }
+  handle.addEventListener("pointerdown", event => {
+    if (event.button !== 0) return;
+    start = { x: event.clientX, width: sidebar.getBoundingClientRect().width };
+    if (event.pointerId !== undefined) handle.setPointerCapture?.(event.pointerId);
+    shell.dataset.resizing = "true";
+  });
+  handle.addEventListener("pointermove", event => {
+    if (!start) return;
+    const direction = shell.dataset.sidebarSide === "left" ? 1 : -1;
+    apply(start.width + direction * (event.clientX - start.x));
+  });
+  function finish(event) {
+    if (!start) return;
+    start = null;
+    delete shell.dataset.resizing;
+    if (event?.pointerId !== undefined && handle.hasPointerCapture?.(event.pointerId)) {
+      handle.releasePointerCapture(event.pointerId);
+    }
+    width = clamp(width);
+    apply();
+    onChange(width);
+  }
+  handle.addEventListener("pointerup", finish);
+  handle.addEventListener("pointercancel", finish);
+  handle.addEventListener("keydown", event => {
+    const step = event.shiftKey ? 64 : 16;
+    let next = null;
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      const direction = shell.dataset.sidebarSide === "left" ? 1 : -1;
+      next = width + (event.key === "ArrowRight" ? 1 : -1) * direction * step;
+    } else if (event.key === "Home") next = min;
+    else if (event.key === "End") next = max;
+    if (next === null) return;
+    event.preventDefault();
+    apply(next);
+    width = clamp(width);
+    onChange(width);
+  });
+  handle.addEventListener("dblclick", () => { apply(reset); width = clamp(width); onChange(width); });
+  window.addEventListener("resize", () => apply());
+  apply();
+  return { apply, get: () => clamp(width), set: value => { apply(value); width = clamp(width); onChange(width); } };
+};
+
+// Own the list DOM, retaining controls by pane ID. Normalized snapshot arrays are
+// immutable: a selection within the same snapshot touches only old/new controls.
+window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, openMenu }) => {
+  const entries = new Map();
+  let lastPanes = null, activeId = "", focusId = "", pending = false;
+  function element(tag, className = "", text = "") {
+    const item = document.createElement(tag);
+    item.className = className;
+    if (text) item.textContent = text;
+    return item;
+  }
+  const empty = sidebar ? element("p", "subtle", "No matching tabs") : null;
+  function create(pane) {
+    const row = element(sidebar ? "button" : "div", sidebar ? "workspace-sidebar-tab" : "workspace-tab");
+    row.dataset.paneId = pane.id;
+    const select = sidebar ? row : element("button", "workspace-tab-select");
+    select.type = "button";
+    select.dataset.paneId = pane.id;
+    const title = element(sidebar ? "strong" : "span", sidebar ? "" : "workspace-tab-title");
+    const cwd = sidebar ? element("span") : null;
+    const close = sidebar ? null : element("button", "workspace-tab-close", "×");
+    const entry = { row, select, title, cwd, close, pin: null, pane: null };
+    select.append(title);
+    if (sidebar) row.append(cwd);
+    else {
+      row.setAttribute("role", "presentation");
+      select.setAttribute("role", "tab");
+      select.setAttribute("aria-controls", "terminal-shell");
+      select.id = `termdeck-tab-${pane.id}`;
+      close.type = "button";
+      row.append(select, close);
+      close.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        runAction("hide", entry.pane);
+      });
+    }
+    select.addEventListener("click", () => selectPane(entry.pane.id));
+    select.addEventListener("dblclick", event => {
+      event.preventDefault();
+      runAction("rename", entry.pane);
+    });
+    row.addEventListener("contextmenu", event => {
+      event.preventDefault();
+      if (sidebar || entry.pane.id !== activeId) selectPane(entry.pane.id);
+      openMenu();
+    });
+    return entry;
+  }
+  function mark(entry, selected, focusable) {
+    if (!entry) return;
+    if (entry.selected !== selected) {
+      entry.selected = selected;
+      entry.select.setAttribute(sidebar ? "aria-current" : "aria-selected", String(selected));
+      if (!sidebar) entry.row.classList.toggle("workspace-tab-active", selected);
+    }
+    if (!sidebar && entry.focusable !== focusable) {
+      entry.focusable = focusable;
+      entry.select.setAttribute("tabindex", focusable ? "0" : "-1");
+    }
+  }
+  return {
+    get: id => entries.get(id)?.select,
+    render(panes, selectedId, isPending = false) {
+      const changed = panes !== lastPanes;
+      const nextFocus = selectedId || panes[0]?.id || "";
+      if (changed) {
+        const focused = container.contains(document.activeElement) ? document.activeElement : null;
+        if (lastPanes === null) container.replaceChildren(); // Remove the loading placeholder once.
+        if (empty?.parentNode) empty.remove();
+        const retained = new Set(panes.map(pane => pane.id));
+        for (const [id, entry] of entries) {
+          if (!retained.has(id)) { entry.row.remove(); entries.delete(id); }
+        }
+        let cursor = container.firstChild;
+        for (const pane of panes) {
+          let entry = entries.get(pane.id);
+          if (!entry) { entry = create(pane); entries.set(pane.id, entry); }
+          const previous = entry.pane;
+          if (!previous || previous.title !== pane.title || previous.pinned !== pane.pinned) {
+            entry.title.textContent = `${sidebar && pane.pinned ? "◆ " : ""}${pane.title}`;
+            if (!sidebar) {
+              entry.close.title = `Hide ${pane.title} without stopping it`;
+              entry.close.setAttribute("aria-label", `Hide ${pane.title}`);
+              entry.select.title = pane.pinned ? "Pinned tab" : "";
+              if (pane.pinned && !entry.pin) {
+                entry.pin = element("span", "workspace-tab-pin", "◆");
+                entry.pin.setAttribute("aria-hidden", "true");
+                entry.select.prepend(entry.pin);
+              } else if (!pane.pinned && entry.pin) {
+                entry.pin.remove(); entry.pin = null;
+              }
+            }
+          }
+          if (sidebar && (!previous || previous.cwd !== pane.cwd)) entry.cwd.textContent = pane.cwd;
+          if (!previous || previous.title !== pane.title || previous.cwd !== pane.cwd || (sidebar && previous.status !== pane.status)) {
+            entry.row.title = `${pane.title}\n${pane.cwd}${sidebar ? `\n${pane.status}` : ""}`;
+          }
+          entry.pane = pane; // Event handlers always observe the latest normalized metadata.
+          mark(entry, pane.id === selectedId, pane.id === nextFocus);
+          if (entry.row !== cursor) container.insertBefore(entry.row, cursor);
+          cursor = entry.row.nextSibling;
+        }
+        if (empty && !panes.length) container.append(empty);
+        // Moving a focused node may blur it. Unchanged polling never moves nodes.
+        if (focused && document.activeElement !== focused && container.contains(focused)) focused.focus({ preventScroll: true });
+      } else if (selectedId !== activeId || nextFocus !== focusId) {
+        for (const id of new Set([activeId, selectedId, focusId, nextFocus])) {
+          mark(entries.get(id), id === selectedId, id === nextFocus);
+        }
+      }
+      if (!sidebar && (changed || Boolean(isPending) !== pending)) {
+        for (const entry of entries.values()) {
+          if (entry.close.disabled !== Boolean(isPending)) entry.close.disabled = Boolean(isPending);
+        }
+      }
+      lastPanes = panes;
+      activeId = selectedId;
+      focusId = nextFocus;
+      pending = Boolean(isPending);
+    },
+  };
+};
+
 (() => {
   const root = document.getElementById("termdeck-app");
   if (!root || typeof window.fetch !== "function") {
@@ -127,12 +321,15 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
     if (!STATUS_NAMES.has(status)) {
       throw new Error("Unknown pane status.");
     }
+    const terminalTarget = optionalString(value.tmux_target, MAX_ID_CHARS, "terminal target");
     return {
       id: requiredString(value.id, MAX_ID_CHARS, "pane id"),
       sessionId: optionalString(value.session_id, MAX_ID_CHARS, "session id"),
       title: requiredString(value.title, MAX_NAME_CHARS, "pane title"),
       cwd: requiredString(value.cwd, MAX_CWD_CHARS, "pane cwd"),
       status,
+      hasTerminal: Boolean(terminalTarget),
+      terminalTarget,
       pinned: value.pinned === true,
       automaticTitle: value.automatic_title === true,
       controllerActive: normalizeController(value.controller),
@@ -390,8 +587,9 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
     refresh();
   }
 
-  function mountTerminal(...args) {
-    return window.T1000TerminalSession.mount(...args, { appPath, isRecord, nonNegativeInteger, errorMessage });
+  function mountTerminal(windowSlug, paneId, host, status, overlay, initialPaneState) {
+    return window.T1000TerminalSession.mount(windowSlug, paneId, host, status, overlay,
+      { appPath, isRecord, nonNegativeInteger, errorMessage, initialPaneState });
   }
 
   function startWorkspace(initialPaneId) {
@@ -569,15 +767,19 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
     const terminalViews = window.T1000TerminalSession.createCache({
       parent: shell, before: actionNotice,
       initial: { shell: xtermShell, host: terminalHost, overlay: terminalOverlay },
-      create: view => mountTerminal(routeSlug, view.paneId, view.host, terminalStatus, view.overlay),
+      create: view => mountTerminal(routeSlug, view.paneId, view.host, terminalStatus, view.overlay,
+        envelope?.window.panes.find(pane => pane.id === view.paneId) || {status: "unknown", hasTerminal: false}),
     });
     let refreshTimer = 0;
     let refreshInFlight = false;
     let refreshRequested = false;
     let disposed = false;
-    let lastTabSignature = "";
     let lastActionSignature = "";
     let pendingAction = "";
+    const tabChrome = window.T1000TabChrome(tabbar, {
+      selectPane: id => switchPane(id, true), runAction: runTabAction,
+      openMenu: () => { actionMenu.open = true; actionSummary.focus(); },
+    });
     const workspaceTools = window.T1000UI.attachWorkspace({
       root, toolbar: leftTools, menu: actionMenu,
       getPanes: () => envelope?.window.panes || [],
@@ -636,14 +838,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
     }
 
     function focusTabButton(paneId) {
-      window.requestAnimationFrame(() => {
-        for (const tab of tabbar.querySelectorAll("[role=tab]")) {
-          if (tab.dataset.paneId === paneId) {
-            tab.focus();
-            return;
-          }
-        }
-      });
+      window.requestAnimationFrame(() => tabChrome.get(paneId)?.focus());
     }
 
     function switchPane(paneId, updateHistory, focusTab = false) {
@@ -670,6 +865,7 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
         if (pane && envelope) {
           document.title = `${pane.title} · ${envelope.window.name} · t1000`;
         }
+        terminalMount.setPaneState(pane || {status: "unknown", hasTerminal: false});
         terminalMount.focus(updateHistory);
         if (focusTab) {
           focusTabButton(paneId);
@@ -688,87 +884,13 @@ window.T1000Backdrop = (dialog, mayClose = () => true) => {
       }
     }
 
-    function tabButton(pane, index) {
-      const tab = node("div", "workspace-tab", "");
-      tab.dataset.paneId = pane.id;
-      tab.setAttribute("role", "presentation");
-      if (pane.id === activePaneId) {
-        tab.classList.add("workspace-tab-active");
-      }
-      const select = node("button", "workspace-tab-select", "");
-      select.type = "button";
-      select.setAttribute("role", "tab");
-      select.setAttribute("aria-selected", pane.id === activePaneId ? "true" : "false");
-      select.setAttribute("tabindex", pane.id === activePaneId || (!activePaneId && index === 0) ? "0" : "-1");
-      select.dataset.paneId = pane.id;
-      select.id = `termdeck-tab-${pane.id}`;
-      select.setAttribute("aria-controls", "terminal-shell");
-      select.append(node("span", "workspace-tab-title", pane.title));
-      if (pane.pinned) {
-        select.prepend(node("span", "workspace-tab-pin", "◆"));
-        select.title = "Pinned tab";
-      }
-      const close = node("button", "workspace-tab-close", "×");
-      close.type = "button";
-      close.title = `Hide ${pane.title} without stopping it`;
-      close.setAttribute("aria-label", `Hide ${pane.title}`);
-      close.disabled = Boolean(pendingAction);
-      tab.append(select, close);
-      tab.title = `${pane.title}
-${pane.cwd}`;
-      select.addEventListener("click", () => switchPane(pane.id, true));
-      select.addEventListener("dblclick", (event) => {
-        event.preventDefault();
-        runTabAction("rename", pane);
-      });
-      close.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        runTabAction("hide", pane);
-      });
-      tab.addEventListener("contextmenu", (event) => {
-        event.preventDefault();
-        if (pane.id !== activePaneId) {
-          switchPane(pane.id, true);
-        }
-        actionMenu.open = true;
-        actionSummary.focus();
-      });
-      return tab;
-    }
-
-    function renderTabs(preserveFocus = true) {
-      if (!envelope) {
-        return;
-      }
-      windowTitle.textContent = envelope.window.name;
-      workspaceStatus.textContent = `${envelope.window.panes.length} tabs`;
-      const signature = JSON.stringify({
-        activePaneId,
-        pendingAction,
-        windowName: envelope.window.name,
-        panes: envelope.window.panes.map((pane) => ({
-          id: pane.id,
-          title: pane.title,
-          cwd: pane.cwd,
-          status: pane.status,
-          pinned: pane.pinned,
-          sessionId: pane.sessionId,
-          controllerActive: pane.controllerActive,
-        })),
-      });
-      if (signature === lastTabSignature) {
-        return;
-      }
+    function renderTabs() {
+      if (!envelope) return;
+      if (windowTitle.textContent !== envelope.window.name) windowTitle.textContent = envelope.window.name;
+      const count = `${envelope.window.panes.length} tabs`;
+      if (workspaceStatus.textContent !== count) workspaceStatus.textContent = count;
+      tabChrome.render(envelope.window.panes, activePaneId, Boolean(pendingAction));
       workspaceTools.updateTabs(envelope.window.panes, activePaneId);
-      const focusedPaneId = preserveFocus && document.activeElement?.getAttribute("role") === "tab"
-        ? document.activeElement.dataset.paneId
-        : "";
-      lastTabSignature = signature;
-      tabbar.replaceChildren(...envelope.window.panes.map(tabButton));
-      if (focusedPaneId && envelope.window.panes.some((pane) => pane.id === focusedPaneId)) {
-        focusTabButton(focusedPaneId);
-      }
     }
 
     function actionButton(action) {
@@ -960,6 +1082,7 @@ ${pane.cwd}`;
         }
         envelope = next;
         terminalViews.prune(next.window.panes.map(pane => pane.id));
+        terminalViews.updatePaneStates(next.window.panes);
         const selected = chooseActivePane(next.window);
         renderTabs();
         if (selected && (!terminalMount || selected !== activePaneId)) {

@@ -234,6 +234,36 @@ def parse_session_recipe(encoded: object, digest: object) -> SessionRecipe:
     return recipe
 
 
+def receipt_reenrollment(record: object) -> tuple[str, str]:
+    """Validate an explicit reenrollment without accepting the old receipt.
+
+    Only the digest may be replaced. The complete old canonical JSON must
+    independently agree with the currently recorded command, cwd and policy;
+    its explicit environment and origin remain byte-for-byte unchanged.
+    Normal startup continues to reject an invalid stored digest.
+    """
+    encoded = getattr(record, "recovery_recipe", None)
+    if not isinstance(encoded, str) or not encoded:
+        raise SessionRecipeError("reenrollment requires an existing recipe payload")
+    digest = recipe_digest(encoded)
+    recipe = parse_session_recipe(encoded, digest)
+    try:
+        parse_session_recipe(encoded, getattr(record, "recovery_recipe_sha256", None))
+    except SessionRecipeError:
+        pass
+    else:
+        raise SessionRecipeError("the recorded receipt is already valid")
+    command = str(getattr(record, "recovery_command", None) or
+                  getattr(record, "command", "") or "").strip()
+    cwd = str(getattr(record, "recovery_cwd", None) or
+              getattr(record, "cwd", "") or "").strip()
+    policy = str(getattr(record, "restart_policy", DEFAULT_RESTART_POLICY)
+                 or DEFAULT_RESTART_POLICY).strip().casefold()
+    if recipe.command != command or recipe.cwd != cwd or recipe.restart_policy != policy:
+        raise SessionRecipeError("recipe payload disagrees with recorded launch inputs")
+    return encoded, digest
+
+
 def recovery_command_specificity(command: str | None) -> int:
     """Rank opaque recovery commands without knowing the owning application.
 

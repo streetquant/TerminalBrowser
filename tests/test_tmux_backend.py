@@ -264,6 +264,10 @@ class FakeCheckpointManager:
 
 
 class TmuxBackendTests(unittest.TestCase):
+    def _temporary_gate_path(self) -> Path:
+        directory = tempfile.TemporaryDirectory(prefix="t1000-auth-gate-test-")
+        self.addCleanup(directory.cleanup)
+        return Path(directory.name) / "switch.gate"
     def assert_supervised_command(
         self,
         command: str,
@@ -390,7 +394,7 @@ class TmuxBackendTests(unittest.TestCase):
                     record.tmux_name,
                 ],
             )
-            self.assertEqual(launch[-3:-1], ["-c", str(recovery_cwd.resolve())])
+            self.assertEqual(launch[launch.index("-c") + 1], str(recovery_cwd.resolve()))
             self.assert_supervised_command(
                 launch[-1],
                 f"cc-go-ulw --resume {session_id}",
@@ -430,7 +434,7 @@ class TmuxBackendTests(unittest.TestCase):
                     record.tmux_name,
                 ],
             )
-            self.assertEqual(launch[-3:-1], ["-c", str(recovery_cwd.resolve())])
+            self.assertEqual(launch[launch.index("-c") + 1], str(recovery_cwd.resolve()))
             self.assert_supervised_command(
                 launch[-1],
                 f"codex --yolo resume {session_id}",
@@ -1041,7 +1045,7 @@ class TmuxBackendTests(unittest.TestCase):
             backend.create_or_resume(record)
 
         launch = run.call_args_list[0].args[0]
-        self.assertEqual(launch[-3:-1], ["-c", str(Path("/checkpoints") / record.id)])
+        self.assertEqual(launch[launch.index("-c") + 1], str(Path("/checkpoints") / record.id))
         self.assert_supervised_command(launch[-1], "restart-image")
         self.assertNotIn("python worker.py", launch[-1])
 
@@ -1153,10 +1157,12 @@ class TmuxBackendTests(unittest.TestCase):
             self.assertIn("TERMDECK_AUTH_SCOPE_ID=auth-one", launch)
             path_entry = next(item for item in launch if item.startswith("PATH="))
             self.assertTrue(path_entry.split("=", 1)[1].startswith(str(codex_home.resolve() / "bin")))
-            self.assertEqual(launch[-3:-1], ["-c", tmp])
+            self.assertEqual(launch[launch.index("-c") + 1], tmp)
+            self.assertEqual(launch[-5:-1], ["/bin/bash", "--noprofile", "--norc", "-c"])
             self.assertIn("bash --noprofile --rcfile", launch[-1])
             self.assertIn(str(codex_home / "bin" / ".termdeck-bashrc"), launch[-1])
             self.assertTrue(launch[-1].endswith(" -i"))
+            self.assertIn("/usr/bin/env", launch)
 
     def test_private_bash_recipe_uses_private_rcfile_across_equivalent_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1188,10 +1194,12 @@ class TmuxBackendTests(unittest.TestCase):
                 backend.create_or_resume(record)
 
             launch = run.call_args_list[0].args[0]
-            self.assertEqual(launch[-3:-1], ["-c", tmp])
+            self.assertEqual(launch[launch.index("-c") + 1], tmp)
+            self.assertEqual(launch[-5:-1], ["/bin/bash", "--noprofile", "--norc", "-c"])
             self.assertIn("bash --noprofile --rcfile", launch[-1])
             self.assertIn(str(codex_home / "bin" / ".termdeck-bashrc"), launch[-1])
             self.assertTrue(launch[-1].endswith(" -i"))
+            self.assertIn("/usr/bin/env", launch)
             self.assertIn(f"CODEX_HOME={codex_home.resolve()}", launch)
             self.assertIn("TERMDECK_AUTH_SCOPE_ID=auth-one", launch)
 
@@ -1861,6 +1869,8 @@ class TmuxBackendTests(unittest.TestCase):
         ), mock.patch.object(
             backend, "_auth_session_exists", return_value=True
         ), mock.patch.object(
+            backend, "_pane_lifecycle", return_value=None
+        ), mock.patch.object(
             backend, "_recover_exact_over_idle_placeholder"
         ) as recover, mock.patch.object(
             backend, "_create_or_resume_unlocked"
@@ -1890,7 +1900,10 @@ class TmuxBackendTests(unittest.TestCase):
 
     def test_exact_recovery_respawns_same_idle_pane_without_tmux_gap(self):
         recovery = "codex --yolo resume 019f71b3-fa32-7251-bac3-c628f34dd154"
-        record = _auth_record(
+        codex_home = self._temporary_gate_path().parent / "auth-test"
+        record = _record(
+            auth_scope_id="auth-test",
+            codex_home=str(codex_home),
             command="/bin/bash",
             status="recovery-pending",
             recovery_command=recovery,
@@ -1949,17 +1962,17 @@ class TmuxBackendTests(unittest.TestCase):
         self.assertEqual(events[0], "lease-release")
         respawn = events[1][1]
         self.assertEqual(respawn[:5], ["respawn-pane", "-k", "-t", "%1", "-e"])
-        self.assertIn("CODEX_HOME=/tmp/auth-test", respawn)
+        self.assertIn(f"CODEX_HOME={codex_home}", respawn)
         self.assertIn("TERMDECK_AUTH_SCOPE_ID=auth-test", respawn)
-        self.assertIn("CODEX_TERMDECK_GATE_ROOT=/tmp/auth-test/.termdeck-codex-lifetime", respawn)
-        self.assertEqual(respawn[-3:-1], ["-c", "/tmp"])
-        self.assertIn("/tmp/auth-test/bin/codex", respawn[-1])
+        self.assertIn(f"CODEX_TERMDECK_GATE_ROOT={codex_home / '.termdeck-codex-lifetime'}", respawn)
+        self.assertEqual(respawn[respawn.index("-c") + 1], "/tmp")
+        self.assertIn(str(codex_home / "bin" / "codex"), respawn[-1])
         self.assertIn("TERMDECK_AUTH_SCOPE_ID=auth-test", respawn[-1])
         self.assertIn("--dangerously-bypass-hook-trust", respawn[-1])
         self.assertNotIn("/tmp/other-scope/bin/codex", respawn[-1])
         self.assertIn("; exec ", respawn[-1])
         self.assertIn("bash --noprofile --rcfile", respawn[-1])
-        self.assertIn("/tmp/auth-test/bin/.termdeck-bashrc", respawn[-1])
+        self.assertIn(str(codex_home / "bin" / ".termdeck-bashrc"), respawn[-1])
         self.assertTrue(respawn[-1].endswith(" -i"))
         hydrate.assert_called_once_with(record, recovery)
         kill_old.assert_called_once_with(suspended)
@@ -2362,7 +2375,7 @@ class TmuxBackendTests(unittest.TestCase):
         identity = _auth_pane_identity(command="codex")
         placeholder = _auth_pane_identity(command="bash", pane_pid=4241)
         ready = _auth_pane_identity(command="codex", pane_pid=4242)
-        gate = Path("/tmp/termdeck-auth-test-gate")
+        gate = self._temporary_gate_path()
         launch_spec = mock.Mock(name="launch_spec")
         old_tree = ((100, 1, False),)
 
@@ -2429,6 +2442,8 @@ class TmuxBackendTests(unittest.TestCase):
             "termdeck.tmux_backend.observe_recovery_metadata", return_value=(True, None, None)
         ), mock.patch.object(
             backend, "private_auth_environment_ready", return_value=True
+        ), mock.patch.object(
+            backend, "_private_auth_process_tree_environment_ready", return_value=True
         ), mock.patch(
             "termdeck.tmux_backend.process_tree_contains_codex", return_value=False
         ), mock.patch.object(
@@ -2529,7 +2544,7 @@ class TmuxBackendTests(unittest.TestCase):
         identity = _auth_pane_identity(cwd="/tmp")
         placeholder = _auth_pane_identity(command="bash", cwd="/tmp", pane_pid=4242)
         ready = _auth_pane_identity(command="bash", cwd="/tmp", pane_pid=4243)
-        gate = Path("/tmp/termdeck-auth-legacy-gate")
+        gate = self._temporary_gate_path()
         launch_spec = mock.Mock(name="launch_spec")
 
         with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
@@ -2619,7 +2634,7 @@ class TmuxBackendTests(unittest.TestCase):
         ), mock.patch.object(
             backend, "_snapshot_auth_process_tree", return_value=((100, 1, False),)
         ), mock.patch.object(
-            backend, "_auth_switch_gate_path", return_value=Path("/tmp/termdeck-auth-fail-gate")
+            backend, "_auth_switch_gate_path", return_value=self._temporary_gate_path()
         ), mock.patch.object(
             backend, "_launch_spec", return_value=mock.Mock(name="launch_spec")
         ), mock.patch.object(
@@ -2681,7 +2696,7 @@ class TmuxBackendTests(unittest.TestCase):
             recovery_command=recovery,
             recovery_cwd="/workspace/repo",
         )
-        gate = Path("/tmp/termdeck-auth-verified-recovery-gate")
+        gate = self._temporary_gate_path()
 
         with mock.patch.object(
             backend, "_inspect_auth_pane", return_value=identity
@@ -2759,7 +2774,7 @@ class TmuxBackendTests(unittest.TestCase):
             recovery_command=recovery,
             recovery_cwd="/workspace/repo",
         )
-        gate = Path("/tmp/termdeck-auth-unverified-recovery-gate")
+        gate = self._temporary_gate_path()
 
         with mock.patch.object(
             backend, "_inspect_auth_pane", return_value=identity
@@ -3084,7 +3099,7 @@ class TmuxBackendTests(unittest.TestCase):
         identity = _auth_pane_identity(command="codex")
         placeholder = _auth_pane_identity(command="bash", pane_pid=4241)
         failed = _auth_pane_identity(command="codex", pane_pid=4242)
-        gate = Path("/tmp/termdeck-auth-readiness-gate")
+        gate = self._temporary_gate_path()
 
         with mock.patch.object(backend, "_auth_session_exists", return_value=True), mock.patch(
             "termdeck.tmux_backend.observe_recovery_metadata",

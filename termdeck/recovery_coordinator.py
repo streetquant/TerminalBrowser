@@ -23,7 +23,7 @@ from .auth_scope_rebind import AuthScopeRebindProof, rebind_auth_scope
 from .models import RECOVERY_INTENT_ACTIVE
 from .session_reconcile import startup_recovery_allowed
 from .resources import process_tree_contains_codex
-from .session_recipe import record_recipe_fields
+from .session_recipe import SessionRecipeError, recipe_from_record, record_recipe_fields
 from .session_store import SessionStore, utc_now
 from .tmux_backend import TmuxError
 
@@ -178,6 +178,8 @@ class RecoveryCoordinator:
         sleeper: Callable[[float], object] = time.sleep,
         claim_ttl: float | None = None,
         wall_clock: Callable[[], float] = time.time,
+        allow_auth_scope_rebind: bool = True,
+        readiness_failure_grace: float = 0.0,
     ) -> None:
         if max_workers is None:
             max_workers = os.environ.get(
@@ -209,6 +211,10 @@ class RecoveryCoordinator:
             claim_ttl = os.environ.get(self.CLAIM_TTL_ENV, str(self.DEFAULT_CLAIM_TTL))
         self.claim_ttl = self._configured_claim_ttl(claim_ttl)
         self.wall_clock = wall_clock
+        self.allow_auth_scope_rebind = bool(allow_auth_scope_rebind)
+        if not math.isfinite(readiness_failure_grace) or readiness_failure_grace < 0:
+            raise ValueError("invalid readiness failure grace")
+        self.readiness_failure_grace = min(float(readiness_failure_grace), self.readiness_timeout)
         self.owner_id = self._new_owner_id()
         self.max_workers = max_workers
         self._lock = threading.RLock()
@@ -814,7 +820,10 @@ class RecoveryCoordinator:
             expected=request,
         )
 
-    def shutdown(self, *, wait: bool = False) -> None:
+    def shutdown(self, *, wait: bool = False, timeout: float | None = None,
+                 persist_cancelled: bool = True) -> bool:
+        if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
+            raise ValueError("invalid recovery shutdown timeout")
         with self._lock:
             self._closed = True
             follower_thread = self._follower_thread
@@ -835,7 +844,7 @@ class RecoveryCoordinator:
                 attempt=request.attempt,
                 error="recovery coordinator shut down before execution",
             )
-            if request.claim_token:
+            if request.claim_token and persist_cancelled:
                 try:
                     self._persist_failure(
                         self.store,
@@ -848,9 +857,18 @@ class RecoveryCoordinator:
                 except Exception:
                     pass
             self._complete_inflight(session_id, result, expected=request)
-        self._executor.shutdown(wait=wait, cancel_futures=True)
+        self._executor.shutdown(wait=wait and timeout is None, cancel_futures=True)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        threads = tuple(self._executor._threads)
+        if wait and deadline is not None:
+            for thread in threads:
+                if thread is not threading.current_thread():
+                    thread.join(timeout=max(0, deadline - time.monotonic()))
         if wait and follower_thread is not None and follower_thread is not threading.current_thread():
-            follower_thread.join(timeout=max(1.0, self.poll_interval * 4.0))
+            follower_thread.join(timeout=(max(1.0, self.poll_interval * 4.0) if deadline is None
+                                         else max(0, deadline - time.monotonic())))
+        return not any(thread.is_alive() for thread in threads) and not (
+            follower_thread is not None and follower_thread.is_alive())
 
     close = shutdown
 
@@ -973,7 +991,7 @@ class RecoveryCoordinator:
         return Path(os.path.abspath(os.fspath(database))).parent / "recovery-writer-locks"
 
     @contextmanager
-    def _writer_scope(self, store, request: _Request):
+    def _writer_scope(self, store, request: _Request, *, timeout: float | None = None):
         """Hold crash-released locks for only this request's target identities."""
 
         root = self._writer_lock_root(store)
@@ -1000,6 +1018,7 @@ class RecoveryCoordinator:
             ) from exc
 
         locks: list[int] = []
+        deadline = time.monotonic() + timeout if timeout is not None else None
         try:
             for target_key in sorted(request.target_keys):
                 name = hashlib.sha256(
@@ -1037,6 +1056,8 @@ class RecoveryCoordinator:
                             )
                             break
                         except BlockingIOError:
+                            if deadline is not None and time.monotonic() >= deadline:
+                                raise _AdmissionUnavailable("recovery target writer is busy")
                             request.cancelled.wait(min(self.poll_interval, 0.05))
                     locks.append(descriptor)
                     descriptor = -1
@@ -1054,6 +1075,37 @@ class RecoveryCoordinator:
                     os.close(descriptor)
                 except OSError:
                     pass
+
+    @contextmanager
+    def metadata_writer_guard(self, records, *, timeout: float = 1.0):
+        """Share GTK/headless target locks for an explicit metadata-only repair."""
+        records = list(records)
+        if not records or not 0 < timeout <= 60:
+            raise _AdmissionUnavailable("metadata writer selection is invalid")
+        request = _Request(record=records[0], mode="metadata-repair", initial_grid=None,
+                           listeners=[], target_keys=tuple(sorted({
+                               key for record in records for key in self._single_flight_keys(record)
+                           })))
+        with self._writer_scope(self.store, request, timeout=timeout):
+            yield
+
+    def assert_metadata_quiescent(self, records) -> None:
+        """Reject live or unverifiable owners, even if their lease has expired."""
+        connection = getattr(self.store, "conn", None)
+        if connection is None:
+            raise _AdmissionUnavailable("metadata writer has no durable store")
+        keys = sorted({key for record in records for key in self._single_flight_keys(record)})
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recovery_claims'"
+        ).fetchone()
+        if not exists or not keys:
+            return
+        owners = connection.execute(
+            f"SELECT owner_id FROM recovery_claims WHERE target_key IN ({','.join('?' for _ in keys)})",
+            keys,
+        ).fetchall()
+        if any(self._claim_owner_alive(row["owner_id"]) for row in owners):
+            raise _AdmissionUnavailable("recovery target has an active or unverifiable owner")
 
     @staticmethod
     def _target_key(kind: str, value: object) -> str | None:
@@ -1579,6 +1631,25 @@ class RecoveryCoordinator:
             and self._private_owned_directory(expected_home)
         )
 
+    def _record_uses_saved_auth_scope(self, record, store) -> bool:
+        """Preserve validated historical direct Bash homes without rebinding."""
+        if self._record_uses_exact_managed_auth_scope(record, store):
+            return True
+        from .codex_config_scope import CodexConfigScopeError, validate_existing_private_bash_scope
+        try:
+            recipe = recipe_from_record(record)
+            direct_bash = getattr(self.backend, "_saved_direct_bash_command", None)
+            if (recipe is None or recipe.origin not in {"launch", "legacy-launch"}
+                    or not callable(direct_bash)
+                    or not direct_bash(record, recipe.command)
+                    or not getattr(record, "codex_home", None)
+                    or not getattr(record, "auth_scope_id", None)):
+                return False
+            validate_existing_private_bash_scope(record.codex_home, auth_scope_id=record.auth_scope_id)
+            return True
+        except (SessionRecipeError, CodexConfigScopeError, OSError, ValueError):
+            return False
+
     def _rebind_legacy_auth_scope(
         self,
         record,
@@ -1615,16 +1686,25 @@ class RecoveryCoordinator:
     def _maybe_rebind_auth_scope(self, record, request: _Request, worker_store):
         """Move only an unbound exact Codex resume onto managed SSD state."""
 
+        managed_stores = (worker_store, self.store)
+        if not self.allow_auth_scope_rebind and (
+            getattr(record, "codex_home", None)
+            or getattr(record, "auth_scope_id", None)
+        ) and not any(
+            candidate is not None
+            and self._record_uses_saved_auth_scope(record, candidate)
+            for candidate in managed_stores
+        ):
+            raise TmuxError("saved private Codex auth scope is unavailable; automatic rebind is disabled")
         if not getattr(record, "codex_home", None):
             return record
         if not getattr(record, "auth_scope_id", None):
             return record
         if not self._is_codex_recovery(record):
             return record
-        managed_stores = (worker_store, self.store)
         if any(
             candidate is not None
-            and self._record_uses_exact_managed_auth_scope(record, candidate)
+            and self._record_uses_saved_auth_scope(record, candidate)
             for candidate in managed_stores
         ):
             return record
@@ -1790,6 +1870,8 @@ class RecoveryCoordinator:
         request: _Request | None = None,
     ) -> int | None:
         deadline = self.clock() + self.readiness_timeout
+        idle_failure = None
+        idle_since = None
         seen_target = False
         last_detail = ""
         while True:
@@ -1804,9 +1886,17 @@ class RecoveryCoordinator:
             if state_detail:
                 last_detail = state_detail
             if state == "failed":
-                raise TmuxError(
-                    last_detail or "managed recovery launcher reported failure"
-                )
+                transient_idle = (self.readiness_failure_grace > 0
+                    and last_detail == "managed Codex launcher exited to an idle shell")
+                marker = (state_pid, last_detail)
+                if not transient_idle:
+                    raise TmuxError(last_detail or "managed recovery launcher reported failure")
+                if idle_failure != marker:
+                    idle_failure, idle_since = marker, self.clock()
+                if self.clock() - idle_since >= self.readiness_failure_grace:
+                    raise TmuxError(last_detail)
+            else:
+                idle_failure, idle_since = None, None
             if state == "ready" and state_pid is not None and int(state_pid) > 1:
                 return int(state_pid)
             try:

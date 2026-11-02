@@ -18,7 +18,10 @@ function mockModulesPlugin() {
           this._data = new Set();
           this._binary = new Set();
           this._resize = new Set();
-          this.stats = { resizeDisposals: 0, dataDisposals: 0, binaryDisposals: 0 };
+          this._render = new Set();
+          this.parser = Object.fromEntries(['registerCsiHandler','registerEscHandler','registerDcsHandler']
+            .map(name => [name, () => ({ dispose() {} })]));
+          this.stats = { resizeDisposals: 0, dataDisposals: 0, binaryDisposals: 0, renderDisposals: 0 };
         }
         loadAddon(addon) { addon.activate?.(this); }
         open(element) { this.element = { parentElement: element }; }
@@ -33,6 +36,7 @@ function mockModulesPlugin() {
         clear() {}
         paste(_text) {}
         getSelection() { return ""; }
+        onRender(callback) { return this._subscribe(this._render, callback, "renderDisposals"); }
         onData(callback) { return this._subscribe(this._data, callback, "dataDisposals"); }
         onBinary(callback) { return this._subscribe(this._binary, callback, "binaryDisposals"); }
         onResize(callback) { return this._subscribe(this._resize, callback, "resizeDisposals"); }
@@ -271,7 +275,9 @@ test("terminal listeners are removed exactly once across individual and owner di
       paddingRight: "0px",
     }),
   };
-  globalThis.document = { fonts: { status: "loaded" } };
+  globalThis.document = { fonts: { status: "loaded" }, createElement: () => ({getContext: () => ({
+    RENDERER: 1, getParameter: () => "NVIDIA GPU", getExtension: () => null,
+  })}) };
   globalThis.HTMLElement = class HTMLElement {};
   globalThis.__termdeckFitProposals = 0;
   const { createTerminal } = await loadTerminalEntry();
@@ -291,46 +297,83 @@ test("terminal listeners are removed exactly once across individual and owner di
   assert.equal(api.terminal.stats.binaryDisposals, 1);
 });
 
+function hardwareEnvironment() {
+  const frames=new Map();let now=0,nextFrame=0,canceled=0;
+  globalThis.window={devicePixelRatio:1,location:{href:"http://termdeck.test/"},
+    performance:{now:()=>now},getComputedStyle:()=>({width:"800px",height:"600px"}),
+    requestAnimationFrame(callback){frames.set(++nextFrame,callback);return nextFrame},
+    cancelAnimationFrame(id){if(frames.delete(id))canceled++}};
+  globalThis.document={hidden:false,fonts:{status:"loaded"},createElement:()=>({getContext:()=>({
+    RENDERER:1,getParameter:()=>"Hardware GPU",getExtension:()=>null})})};
+  globalThis.HTMLElement=class HTMLElement {};
+  globalThis.__termdeckWebglCols=80;globalThis.__termdeckFitProposals=0;
+  const host=new globalThis.HTMLElement();Object.assign(host,{clientWidth:800,clientHeight:600,dataset:{},style:{setProperty(){}}});
+  return {host,frames,get canceled(){return canceled},advance(ms){now+=ms},
+    tick(ms=16){now+=ms;const callbacks=[...frames.values()];frames.clear();for(const callback of callbacks)callback(now)}};
+}
+
 test("WebGL cell-width change refits the controller and context loss refits again", async () => {
-  const frames = [];
-  globalThis.window = {
-    devicePixelRatio: 1,
-    location: { href: "http://termdeck.test/" },
-    getComputedStyle: () => ({ width: "800px", height: "600px" }),
-    requestAnimationFrame(callback) { frames.push(callback); return frames.length; },
-  };
-  globalThis.document = { fonts: { status: "loaded" } };
-  globalThis.HTMLElement = class HTMLElement {};
-  globalThis.__termdeckWebglCols = 80;
-  globalThis.__termdeckFitProposals = 0;
-  const { createTerminal } = await loadTerminalEntry();
-  const host = new globalThis.HTMLElement();
-  host.clientWidth = 800;
-  host.clientHeight = 600;
-  host.dataset = {};
-  host.style = { setProperty() {} };
-  let layoutChanges = 0;
-  let api;
-  api = createTerminal(host, {
-    onLayoutChange() { layoutChanges += 1; api.fit(); },
-  });
-  assert.deepEqual(api.dimensions(), { cols: 80, rows: 24 });
-  api.activateWebgl();
-  assert.deepEqual(api.dimensions(), { cols: 80, rows: 24 });
-  frames.shift()();
-  assert.deepEqual(api.dimensions(), { cols: 100, rows: 24 });
-  assert.equal(layoutChanges, 1);
-  api.activateWebgl();
-  assert.equal(frames.length, 0, "an already active renderer does not refit twice");
-  api.terminal.webglAddon.loss();
-  frames.shift()();
-  assert.deepEqual(api.dimensions(), { cols: 80, rows: 24 });
-  assert.equal(layoutChanges, 2);
-  api.dispose();
+  const env=hardwareEnvironment();
+  const {createTerminal}=await loadTerminalEntry();let layoutChanges=0,api;
+  api=createTerminal(env.host,{onLayoutChange(){layoutChanges++;api.fit()}});
+  assert.deepEqual(api.dimensions(),{cols:80,rows:24});
+  api.activateWebgl();env.tick();
+  assert.deepEqual(api.dimensions(),{cols:100,rows:24});assert.equal(layoutChanges,1);
+  const pending=env.frames.size;api.activateWebgl();assert.equal(env.frames.size,pending);
+  api.terminal.webglAddon.loss();env.tick();
+  assert.deepEqual(api.dimensions(),{cols:80,rows:24});assert.equal(layoutChanges,2);
+  assert.equal(env.frames.size,0);assert.equal(env.canceled,1);api.dispose();
 });
 
 test("input encoding uses one shared encoder", async () => {
   const source = await readFile(sourcePath, "utf8");
   assert.equal((source.match(/new TextEncoder\(\)/g) || []).length, 1);
   assert.match(source, /TEXT_ENCODER\.encode\(value\)/);
+});
+
+for (const renderer of ["SwiftShader Device (Subzero)", "llvmpipe", "Microsoft Basic Render Driver", null]) {
+  test(`software/unavailable WebGL keeps the responsive DOM renderer: ${renderer}`, async () => {
+    globalThis.window = { devicePixelRatio: 1, location: { href: "http://termdeck.test/" },
+      getComputedStyle: () => ({ width: "800px", height: "600px" }) };
+    let probes=0, released=0;
+    globalThis.document = { fonts: {status:"loaded"}, createElement: () => ({getContext: (_kind, opts) => {
+      probes++; assert.equal(opts.failIfMajorPerformanceCaveat,true);
+      return renderer===null ? null : {RENDERER:1, getParameter:()=>renderer,
+        getExtension: name => name==='WEBGL_lose_context' ? {loseContext(){released++}} : null};
+    }}) };
+    globalThis.HTMLElement=class HTMLElement {};
+    globalThis.__termdeckWebglCols=80;globalThis.__termdeckFitProposals=0;
+    const {createTerminal}=await loadTerminalEntry();
+    const host=new globalThis.HTMLElement();Object.assign(host,{clientWidth:800,clientHeight:600,dataset:{},style:{setProperty(){}}});
+    const api=createTerminal(host);api.activateWebgl();api.activateWebgl();
+    assert.equal(host.dataset.termdeckRenderer,'dom');assert.equal(api.terminal.webglAddon,undefined);
+    assert.equal(probes,1);assert.equal(released,renderer===null?0:1);api.dispose();
+  });
+}
+
+
+test("repeated slow render frames fall back once despite fast intervening frames; idle/hidden frames do not", async () => {
+  const env=hardwareEnvironment();const {createTerminal}=await loadTerminalEntry();
+  const api=createTerminal(env.host);api.activateWebgl();env.tick();
+  const renderFrame=delay=>{env.advance(delay);for(const cb of api.terminal._render)cb();env.tick(0)};
+  for(let i=0;i<5;i++)renderFrame(16);
+  assert.equal(env.host.dataset.termdeckRenderer,"webgl","fast hardware remains enabled");
+  for(let i=0;i<4;i++)env.tick(500);
+  assert.equal(env.host.dataset.termdeckRenderer,"webgl","idle gaps are not rendering stalls");
+  document.hidden=true;for(let i=0;i<4;i++)renderFrame(500);
+  assert.equal(env.host.dataset.termdeckRenderer,"webgl","background throttling is ignored");
+  document.hidden=false;renderFrame(16);
+  const compositeStall=()=>{for(const cb of api.terminal._render)cb();env.tick(130)};
+  compositeStall();renderFrame(16);compositeStall();renderFrame(16);
+  assert.equal(env.host.dataset.termdeckRenderer,"webgl");compositeStall();
+  assert.equal(env.host.dataset.termdeckRenderer,"dom");
+  assert.equal(api.terminal._render.size,0);assert.equal(api.terminal.stats.renderDisposals,1);
+  env.tick();api.activateWebgl();assert.equal(env.frames.size,0,"a rejected accelerator is not retried");
+  api.dispose();assert.equal(api.terminal.stats.renderDisposals,1);
+});
+
+test("disposing an accelerated view cancels its renderer watchdog", async () => {
+  const env=hardwareEnvironment();const {createTerminal}=await loadTerminalEntry();
+  const api=createTerminal(env.host);api.activateWebgl();env.tick();assert.equal(env.frames.size,1);
+  api.dispose();assert.equal(env.frames.size,0);assert.equal(api.terminal._render.size,0);assert.equal(env.canceled,1);
 });

@@ -58,6 +58,7 @@ const MOUSE_WHEEL_FRAME_TYPE: u8 = 2;
 const APPLICATION_SCROLL_FRAME_TYPE: u8 = 3;
 const MAX_APPLICATION_SCROLL_PAGES: usize = 8;
 const MAX_MOUSE_WHEEL_BYTES: usize = 64;
+const MAX_MOUSE_WHEEL_REPORTS: usize = 8;
 const MOUSE_REPORTING_FORMAT: &str =
     "#{||:#{mouse_standard_flag},#{||:#{mouse_button_flag},#{mouse_all_flag}}}";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -626,11 +627,23 @@ fn parse_input_frame(frame: &[u8]) -> Result<(u64, &[u8], InputKind), StreamErro
     Ok((sequence, bytes, kind))
 }
 
-/// Admit one vertical wheel report, never keys or a concatenated paste. xterm
-/// emits SGR (also used by pixel mouse mode) or the six-byte legacy encoding.
+/// Admit a small batch of identical vertical reports, never keys, mixed
+/// encodings/directions/coordinates, or an unbounded pasted mouse stream.
 fn is_mouse_wheel_packet(bytes: &[u8]) -> bool {
-    mouse_packet(bytes)
-        .is_some_and(|(button, length)| length == bytes.len() && matches!(button & !28, 64 | 65))
+    if bytes.is_empty() || bytes.len() > MAX_MOUSE_WHEEL_BYTES * MAX_MOUSE_WHEEL_REPORTS {
+        return false;
+    }
+    let Some((button, length)) = mouse_packet(bytes) else {
+        return false;
+    };
+    if !matches!(button & !28, 64 | 65)
+        || bytes.len() % length != 0
+        || bytes.len() / length > MAX_MOUSE_WHEEL_REPORTS
+    {
+        return false;
+    }
+    let packet = &bytes[..length];
+    bytes.chunks_exact(length).all(|chunk| chunk == packet)
 }
 
 fn is_mouse_motion_payload(mut bytes: &[u8]) -> bool {
@@ -2176,7 +2189,7 @@ mod tests {
     }
 
     #[test]
-    fn wheel_frames_admit_only_one_bounded_vertical_mouse_report() {
+    fn wheel_frames_admit_bounded_identical_vertical_mouse_reports() {
         for packet in [
             &b"\x1b[<64;1;2M"[..],
             &b"\x1b[<65;1000;500M"[..],
@@ -2219,6 +2232,33 @@ mod tests {
             ));
         }
         assert!(!is_mouse_wheel_packet(&[b'0'; 65]));
+        for packet in [&b"\x1b[<64;1;2M"[..], &b"\x1b[M\x61\x22\x23"[..]] {
+            for count in 1..=8 {
+                let batch = packet.repeat(count);
+                assert!(is_mouse_wheel_packet(&batch));
+                let mut frame = vec![2];
+                frame.extend_from_slice(&9_u64.to_be_bytes());
+                frame.extend_from_slice(&batch);
+                let (_, parsed, kind) = parse_input_frame(&frame).expect("bounded wheel batch");
+                assert_eq!(parsed, batch);
+                assert_eq!(kind, InputKind::MouseWheel);
+            }
+            assert!(!is_mouse_wheel_packet(&packet.repeat(9)));
+            let mut truncated = packet.repeat(2);
+            truncated.pop();
+            assert!(!is_mouse_wheel_packet(&truncated));
+        }
+        for tail in [
+            &b"\x1b[<65;1;2M"[..],
+            &b"\x1b[<64;2;2M"[..],
+            &b"\x1b[<68;1;2M"[..],
+            &b"\x1b[M\x60\x21\x22"[..],
+            b"typed input",
+        ] {
+            let mut mixed = b"\x1b[<64;1;2M".to_vec();
+            mixed.extend_from_slice(tail);
+            assert!(!is_mouse_wheel_packet(&mixed));
+        }
     }
 
     #[test]

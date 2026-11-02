@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pwd
@@ -41,6 +42,39 @@ _CONFIG_BACKUP_ROOT = ".termdeck-config-backups"
 _AUTH_SCOPE_PATTERN = re.compile(r"auth-[A-Za-z0-9_-]+\Z")
 _MANAGED_CODEX_LAUNCHER = "codex-contained-user"
 _MANAGED_CODEX_HELPER = "codex-contained-user.sh"
+_MANAGED_CODEX_ROUTER = "codex-session-router"
+_MANAGED_CODEX_ROUTER_SHA256 = "e06749c7ffb8fe9c9b6aed5bb3b827cf3294ba0fe453f50e19f53a9492ed0c14"
+_MANAGED_CODEX_ROUTER_SUCCESSOR_SHA256 = "22a3bd8401798a92750a4f71ca47156eeca6bf6fee4d9ffe8d311c7c59e3cb7a"
+_MANAGED_CODEX_ROUTER_GLOBAL_SETTINGS_SHA256 = "8dac99dfd3579874142c3a16eb039b53d2eefb38f700f8326aaf4c0268447abf"
+_MANAGED_CODEX_GLOBAL_SETTINGS_HELPER_SHA256 = "58b65c566c824de46d80504ac0216a8debca0ea74837998e345c8fd3fd46a408"
+_MANAGED_CODEX_APPROVED_RUNTIME_HELPER_SHA256 = "587bd42367b7cd6fe1475a0a7bde489e51eae3fa1b469226b345b9d4e451faa3"
+_MANAGED_CODEX_COMPILED_SHA256 = "7e41c251e2cf30e35b79d28c9496690c309a7551732da422217bc9f760f297c6"
+_MANAGED_CODEX_NPM_HELPER_SHA256 = frozenset({
+    "297e0aa3492fa132b663cf4c1bf6c8254f1c74ae4d22a50a0a8d9feecafbd8cc",
+    "e437262271adb4044eee1863ca89e224b98d21c2a9b88aef0ae7cd0c81d39ab5",
+    "2d3f7a02099d6185cf57515fa4a57309fd339e7a7268518249fc4db4f183013f",
+    _MANAGED_CODEX_GLOBAL_SETTINGS_HELPER_SHA256,
+})
+_MANAGED_CODEX_ROUTER_OVERRIDES = (
+    'CODEX_CONTAINED_USER',
+    'CODEX_OPENROUTER',
+    'CODEX_CANONICAL_WORKSPACE_HELPER',
+    'CODEX_RUNTIME_SCOPE_HELPER',
+    'CODEX_NESTED_LAUNCH_BROKER',
+    'CODEX_RESUME_RUNTIME_HELPER',
+    'CODEX_RESUME_CATALOG_HELPER',
+    'CODEX_WORKSPACE_HISTORY_HELPER',
+    'CODEX_SHARED_APP_SERVER_CONTROL',
+    'CODEX_SSD_UPDATE_HELPER',
+    'CODEX_NATIVE_SESSION_CAPTURE_HELPER',
+    'CODEX_DIRECT_REAL',
+    'CODEX_NPM_BIN',
+    'CODEX_NPM_GLOBAL_PREFIX',
+    'CODEX_NESTED_LAUNCH',
+    'CODEX_BROKER_CHILD',
+    'CODEX_APPROVED_RUNTIME_PATH',
+    'CODEX_APPROVED_RUNTIME_CACHE',
+)
 
 LauncherAttestor = Callable[[Path], bool]
 
@@ -153,30 +187,64 @@ def _validated_launcher(candidate: Path, private_home: Path) -> Path | None:
 
 
 def _read_small_regular(path: Path, *, maximum: int) -> bytes | None:
+    descriptor = None
     try:
-        metadata = path.lstat()
+        before = path.lstat()
         if (
-            path.is_symlink()
-            or not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-            or metadata.st_size > maximum
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or before.st_nlink != 1
+            or before.st_size > maximum
         ):
             return None
-        return path.read_bytes()
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
+        opened = os.fstat(descriptor)
+        if _scope_metadata_identity(opened) != _scope_metadata_identity(before):
+            return None
+        chunks = []
+        remaining = maximum + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > maximum:
+            return None
+        if (
+            _scope_metadata_identity(os.fstat(descriptor))
+            != _scope_metadata_identity(before)
+            or _scope_metadata_identity(path.lstat())
+            != _scope_metadata_identity(before)
+        ):
+            return None
+        return data
     except OSError:
         return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _read_managed_helper(path: Path, *, maximum: int) -> bytes | None:
     try:
-        link_metadata = path.lstat()
-        if link_metadata.st_uid != os.geteuid():
+        before = path.lstat()
+        if before.st_uid != os.geteuid() or before.st_nlink != 1:
             return None
         resolved = path.resolve(strict=True)
+        data = _read_small_regular(resolved, maximum=maximum)
+        if (
+            _scope_metadata_identity(path.lstat()) != _scope_metadata_identity(before)
+            or path.resolve(strict=True) != resolved
+        ):
+            return None
+        return data
     except (OSError, RuntimeError):
         return None
-    return _read_small_regular(resolved, maximum=maximum)
 
 
 def _is_managed_codex_launcher(
@@ -184,35 +252,119 @@ def _is_managed_codex_launcher(
     resolved: Path,
     _search_home: Path,
 ) -> bool:
-    """Recognize the installed contained launcher, not a same-named binary."""
+    """Recognize the owned contained entry or its exact reviewed router chain."""
 
     try:
         trusted_home = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=True)
+        expected_entry = trusted_home / ".local" / "bin" / "codex"
+        expected_target = trusted_home / ".local" / "bin" / _MANAGED_CODEX_LAUNCHER
+        expected_router = trusted_home / ".local" / "bin" / _MANAGED_CODEX_ROUTER
+        expected_helper = trusted_home / ".local" / "libexec" / _MANAGED_CODEX_HELPER
+        if Path(os.path.abspath(candidate)) != expected_entry:
+            return False
+        entry_metadata = expected_entry.lstat()
+        if (
+            not stat.S_ISLNK(entry_metadata.st_mode)
+            or entry_metadata.st_uid != os.geteuid()
+            or entry_metadata.st_nlink != 1
+            or expected_entry.resolve(strict=True) != resolved
+        ):
+            return False
+        routed = resolved == expected_router
+        if not routed and resolved != expected_target:
+            return False
+        directories = (
+            trusted_home, trusted_home / ".local",
+            expected_target.parent, expected_helper.parent,
+        )
+        directory_identities = {}
+        for directory in directories:
+            metadata = directory.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                return False
+            directory_identities[directory] = _scope_metadata_identity(metadata)
+        helper_target = expected_helper.resolve(strict=True)
+        paths = {expected_entry, expected_target, expected_helper, helper_target}
+        if routed:
+            paths.add(expected_router)
+        identities = {path: _scope_metadata_identity(path.lstat()) for path in paths}
+        target_metadata = expected_target.lstat()
+        if not target_metadata.st_mode & stat.S_IXUSR:
+            return False
+        launcher = _read_small_regular(expected_target, maximum=1024 * 1024)
+        helper = _read_managed_helper(expected_helper, maximum=1024 * 1024)
+        if launcher is None or helper is None:
+            return False
+        helper_digest = hashlib.sha256(helper).hexdigest()
+        if routed and hashlib.sha256(launcher).hexdigest() != _MANAGED_CODEX_COMPILED_SHA256:
+            return False
+        if not (
+            os.fsencode(expected_helper) in launcher
+            and helper.startswith(b"#!/usr/bin/env bash\nset -Eeuo pipefail\n")
+            and b"CODEX_CANONICAL_WORKSPACE_HELPER" in helper
+            and b"CODEX_RUNTIME_SCOPE_HELPER" in helper
+            and (
+                (not routed and b"CODEX_VENDOR_RUNTIME_ROOT" in helper)
+                or (
+                    b"CODEX_NPM_GLOBAL_PREFIX" in helper
+                    and helper_digest in _MANAGED_CODEX_NPM_HELPER_SHA256
+                )
+            )
+        ):
+            return False
+        if routed:
+            router = _read_small_regular(expected_router, maximum=1024 * 1024)
+            router_digest = hashlib.sha256(router).hexdigest() if router is not None else None
+            dispatch = (
+                b'readonly contained_codex="${CODEX_CONTAINED_USER:-'
+                + os.fsencode(expected_target) + b'}"'
+            )
+            if (
+                router is None
+                or router_digest not in {
+                    _MANAGED_CODEX_ROUTER_SHA256,
+                    _MANAGED_CODEX_ROUTER_SUCCESSOR_SHA256,
+                    _MANAGED_CODEX_ROUTER_GLOBAL_SETTINGS_SHA256,
+                }
+                or dispatch not in router
+            ):
+                return False
+            if router_digest == _MANAGED_CODEX_ROUTER_GLOBAL_SETTINGS_SHA256:
+                approved_helper = expected_helper.parent / "codex-approved-runtime.py"
+                identities[approved_helper] = _scope_metadata_identity(approved_helper.lstat())
+                approved_payload = _read_small_regular(approved_helper, maximum=1024 * 1024)
+                approved_binding = (
+                    b'readonly approved_runtime_helper="' + os.fsencode(approved_helper) + b'"'
+                )
+                if (
+                    helper_digest != _MANAGED_CODEX_GLOBAL_SETTINGS_HELPER_SHA256
+                    or approved_payload is None
+                    or hashlib.sha256(approved_payload).hexdigest()
+                    != _MANAGED_CODEX_APPROVED_RUNTIME_HELPER_SHA256
+                    or approved_binding not in router
+                    or b'readonly approved_runtime_role="direct-runtime-codex"' not in router
+                ):
+                    return False
+            elif helper_digest == _MANAGED_CODEX_GLOBAL_SETTINGS_HELPER_SHA256:
+                return False
+        return (
+            expected_entry.resolve(strict=True) == resolved
+            and expected_helper.resolve(strict=True) == helper_target
+            and all(
+                _scope_metadata_identity(path.lstat()) == identity
+                for path, identity in identities.items()
+            )
+            and all(
+                _scope_metadata_identity(path.lstat()) == identity
+                for path, identity in directory_identities.items()
+            )
+        )
     except (KeyError, OSError, RuntimeError):
         return False
-    expected_entry = trusted_home / ".local" / "bin" / "codex"
-    expected_target = trusted_home / ".local" / "bin" / _MANAGED_CODEX_LAUNCHER
-    expected_helper = trusted_home / ".local" / "libexec" / _MANAGED_CODEX_HELPER
-    try:
-        if Path(os.path.abspath(candidate)) != Path(os.path.abspath(expected_entry)):
-            return False
-        if not candidate.is_symlink():
-            return False
-        if resolved != expected_target.resolve(strict=True):
-            return False
-    except (OSError, RuntimeError):
-        return False
-    launcher = _read_small_regular(expected_target, maximum=1024 * 1024)
-    helper = _read_managed_helper(expected_helper, maximum=1024 * 1024)
-    if launcher is None or helper is None:
-        return False
-    return (
-        os.fsencode(expected_helper) in launcher
-        and helper.startswith(b"#!/usr/bin/env bash\nset -Eeuo pipefail\n")
-        and b"CODEX_CANONICAL_WORKSPACE_HELPER" in helper
-        and b"CODEX_RUNTIME_SCOPE_HELPER" in helper
-        and b"CODEX_VENDOR_RUNTIME_ROOT" in helper
-    )
 
 
 def _launcher_is_attested(
@@ -695,6 +847,29 @@ def _remove_created_link(destination: Path, target: Path) -> None:
         return
 
 
+def _managed_router_environment_guard(launcher: Path) -> tuple[str, ...]:
+    if launcher.name != _MANAGED_CODEX_ROUTER:
+        return ()
+    try:
+        trusted_home = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=True)
+    except (KeyError, OSError, RuntimeError) as exc:
+        raise CodexConfigScopeError("managed router identity is unavailable") from exc
+    expected_router = trusted_home / ".local" / "bin" / _MANAGED_CODEX_ROUTER
+    if launcher != expected_router:
+        return ()
+    if not _is_managed_codex_launcher(expected_router.parent / "codex", launcher, trusted_home):
+        raise CodexConfigScopeError("managed router chain changed before private wrapper publication")
+    overrides = " || ".join(
+        '[ "${' + name + '+x}" = x ]' for name in _MANAGED_CODEX_ROUTER_OVERRIDES
+    )
+    return (
+        f"if {overrides}; then",
+        "    printf '%s\\n' 'codex: router dispatch overrides or runtime helper overrides are not allowed in a TermDeck private scope' >&2",
+        "    exit 64",
+        "fi",
+    )
+
+
 def _wrapper_content(private_home: Path, launcher: Path) -> str:
     sqlite_override = f"sqlite_home={json.dumps(str(private_home))}"
     # Keep the private override before all user arguments as a Codex root
@@ -706,6 +881,7 @@ def _wrapper_content(private_home: Path, launcher: Path) -> str:
             "#!/bin/sh",
             _WRAPPER_MARKER,
             "set -eu",
+            *_managed_router_environment_guard(launcher),
             f"export CODEX_HOME={shlex.quote(str(private_home))}",
             f"export CODEX_TERMDECK_GATE_ROOT={shlex.quote(str(private_home / '.termdeck-codex-lifetime'))}",
             "termdeck_expect_config=0",
@@ -792,55 +968,123 @@ def preserved_private_launcher(home: Path) -> Path:
     return launcher
 
 
+def _private_bash_rc_content(home: Path, scope_id: str) -> str:
+    private_bin = home / "bin"
+    return "\n".join((
+        _BASH_RC_MARKER,
+        '# Source the user configuration first; TermDeck owns only the final scope tuple.',
+        'if [ -n "${HOME:-}" ] && [ -r "$HOME/.bashrc" ]; then',
+        '    . "$HOME/.bashrc"',
+        "fi",
+        f"export CODEX_HOME={shlex.quote(str(home))}",
+        f"export TERMDECK_AUTH_SCOPE_ID={shlex.quote(scope_id)}",
+        f"export CODEX_TERMDECK_GATE_ROOT={shlex.quote(str(home / '.termdeck-codex-lifetime'))}",
+        f'export PATH={shlex.quote(str(private_bin))}:"${{PATH:-/usr/bin:/bin}}"',
+        "",
+    ))
+
+
+def _existing_bash_rc_proof(home: Path, scope_id: str):
+    path = home / "bin" / ".termdeck-bashrc"
+    if not os.path.lexists(path):
+        return None  # The existing owning launch writer may publish this exact managed rc.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                    or before.st_nlink != 1 or before.st_mode & 0o022
+                    or before.st_size > 65536):
+                raise CodexConfigScopeError("saved private Bash rc has unsafe authority")
+            content = stream.read(65537).decode("utf-8")
+            identity = _scope_metadata_identity(before)
+            if (content != _private_bash_rc_content(home, scope_id)
+                    or _scope_metadata_identity(os.fstat(stream.fileno())) != identity
+                    or _scope_metadata_identity(path.lstat()) != identity):
+                raise CodexConfigScopeError("saved private Bash rc is not the exact managed rc")
+            return identity
+    except (OSError, UnicodeError) as exc:
+        raise CodexConfigScopeError("saved private Bash rc cannot be inspected safely") from exc
+
+
+def _saved_bash_configuration_proof(home: Path):
+    """Pin saved link authority, independently of optional Codex readiness."""
+    binding = home / _CANONICAL_HOME_BINDING
+    metadata = binding.lstat()
+    if (not stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1):
+        raise CodexConfigScopeError("saved private Bash canonical binding is unsafe")
+    raw_source = os.readlink(binding)
+    source = Path(raw_source)
+    if (not source.is_absolute() or Path(os.path.abspath(source)) != source
+            or _is_within(source, home)):
+        raise CodexConfigScopeError("saved private Bash canonical binding target is unsafe")
+    proof = [(_scope_metadata_identity(metadata), raw_source)]
+    if os.path.lexists(source):
+        _validate_canonical_root(source)
+        proof.append(_scope_metadata_identity(source.stat()))
+    else:
+        proof.append(None)  # Preserve a retired binding; do not repair or qualify Codex.
+    for name in (*_SHARED_FILES, *_SHARED_DIRECTORIES):
+        destination = home / name
+        target = source / name
+        if not os.path.lexists(destination):
+            proof.append((name, None))
+            continue
+        info = destination.lstat()
+        if not stat.S_ISLNK(info.st_mode):
+            raise CodexConfigScopeError("saved private Bash configuration requires explicit repair")
+        raw_target = os.readlink(destination)
+        if (info.st_uid != os.geteuid() or info.st_nlink != 1
+                or Path(raw_target) != target):
+            raise CodexConfigScopeError("saved private Bash configuration link has unsafe authority")
+        target_identity = None
+        if os.path.lexists(target):
+            _validate_canonical_authority(target, directory=name in _SHARED_DIRECTORIES)
+            target_identity = _scope_metadata_identity(target.stat())
+        proof.append((name, _scope_metadata_identity(info), raw_target, target_identity))
+    return tuple(proof)
+
+
 def validate_existing_private_bash_scope(
     private_home: str | Path, *, auth_scope_id: str
 ) -> Path:
-    """Read-only admission for restoring a saved direct Bash terminal.
+    """Admit the exact saved direct shell, without qualifying Codex execution.
 
-    Require its existing, fully shared configuration and exact managed wrapper.
-    This neither qualifies Codex execution nor provisions auth or history state.
-    The backend holds the scope transaction and quiescent lifetime fences.
+    Its physical private home, managed wrapper and existing link/rc authority
+    must hold. New optional shared assets and a retired canonical source do not
+    prevent Bash restoration. No home, configuration, auth or history is repaired.
     """
-
-    home = _existing_private_home(private_home)
-    if _AUTH_SCOPE_PATTERN.fullmatch(auth_scope_id) is None or home.name != auth_scope_id:
+    requested = Path(private_home)
+    home = _existing_private_home(requested)
+    if (Path(os.path.abspath(requested)) != home
+            or _AUTH_SCOPE_PATTERN.fullmatch(auth_scope_id) is None
+            or home.name != auth_scope_id):
         raise CodexConfigScopeError("saved private Bash scope identity does not match its home")
+    physical = []
+    for ancestor in (home, *home.parents):
+        info = ancestor.lstat()
+        if not stat.S_ISDIR(info.st_mode):
+            raise CodexConfigScopeError("saved private Bash home has a nonphysical ancestor")
+        physical.append((ancestor, info.st_dev, info.st_ino))
     home_identity = _scope_metadata_identity(home.lstat())
-    source = _bound_canonical_home(home)
-    plan = _configuration_plan(home, source)
-    if (
-        plan.binding_status != "shared"
-        or plan.private_native_config
-        or plan.legacy_only_paths
-        or any(status != "shared" for _target, _destination, _directory, status in plan.assets)
-    ):
-        raise CodexConfigScopeError("saved private Bash configuration requires explicit repair")
-    for target, destination, _directory, _status in plan.assets:
-        metadata = destination.lstat()
-        if (
-            not stat.S_ISLNK(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_nlink != 1
-            or _is_within(target.resolve(strict=True), home)
-        ):
-            raise CodexConfigScopeError(f"saved private Bash configuration link is unsafe: {destination}")
+    if stat.S_IMODE(home.lstat().st_mode) != 0o700:
+        raise CodexConfigScopeError("saved private Bash home has unsafe authority")
+    proof = _saved_bash_configuration_proof(home)
     directory = (home / "bin").lstat()
-    if (
-        not stat.S_ISDIR(directory.st_mode)
-        or directory.st_uid != os.geteuid()
-        or directory.st_mode & 0o022
-    ):
+    if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid()
+            or directory.st_mode & 0o022):
         raise CodexConfigScopeError("saved private Bash wrapper directory is unsafe")
     preserved_private_launcher(home)
-    if (
-        _scope_metadata_identity(home.lstat()) != home_identity
-        or _bound_canonical_home(home) != source
-        or _configuration_plan(home, source) != plan
-        or _scope_metadata_identity((home / "bin").lstat()) != _scope_metadata_identity(directory)
-    ):
+    rc_proof = _existing_bash_rc_proof(home, auth_scope_id)
+    if (_scope_metadata_identity(home.lstat()) != home_identity
+            or _saved_bash_configuration_proof(home) != proof
+            or _existing_bash_rc_proof(home, auth_scope_id) != rc_proof
+            or _scope_metadata_identity((home / "bin").lstat()) != _scope_metadata_identity(directory)
+            or any((path.lstat().st_dev, path.lstat().st_ino) != (device, inode)
+                   or not stat.S_ISDIR(path.lstat().st_mode) for path, device, inode in physical)):
         raise CodexConfigScopeError("saved private Bash configuration changed during inspection")
     return home
-
 
 def _open_wrapper_directory(
     path: Path, *, require_existing: bool = False
@@ -1040,20 +1284,7 @@ def prepare_private_bash_launch_command(
     private_bin = home / "bin"
     gate_root = home / ".termdeck-codex-lifetime"
     rc_path = private_bin / ".termdeck-bashrc"
-    content = "\n".join(
-        (
-            _BASH_RC_MARKER,
-            '# Source the user configuration first; TermDeck owns only the final scope tuple.',
-            'if [ -n "${HOME:-}" ] && [ -r "$HOME/.bashrc" ]; then',
-            '    . "$HOME/.bashrc"',
-            "fi",
-            f"export CODEX_HOME={shlex.quote(str(home))}",
-            f"export TERMDECK_AUTH_SCOPE_ID={shlex.quote(scope_id)}",
-            f"export CODEX_TERMDECK_GATE_ROOT={shlex.quote(str(gate_root))}",
-            f"export PATH={shlex.quote(str(private_bin))}:\"${{PATH:-/usr/bin:/bin}}\"",
-            "",
-        )
-    )
+    content = _private_bash_rc_content(home, scope_id)
     _write_wrapper(rc_path, content, require_existing_directory=require_existing_scope)
     return shlex.join(
         [
@@ -1495,3 +1726,107 @@ def migrate_quiescent_codex_configuration(
             backup_path=backup,
             migrated_paths=migration_paths,
         )
+
+def prepare_private_native_configuration(
+    store,
+    session_id: str,
+    *,
+    backend,
+    expected_source_sha256: str,
+) -> str:
+    """Prepare only configuration for one explicitly selected stopped scope.
+
+    The concrete registry and backend bind ownership and hold both native
+    lifetime generations through publication. No account, history, SQLite,
+    launcher or session field is provisioned or changed. This operation does
+    not admit a confined launch or qualify an installed service.
+    """
+    from .agent_launch import _shared_asset_path, _validate_shared_location
+    from .client_files import StagingError
+    from .codex_credentials import CredentialError, _read
+    from .native_config_view import prepare_private_config
+    from .session_store import SessionStore
+    from .tmux_backend import TmuxBackend
+
+    if type(store) is not SessionStore or type(backend) is not TmuxBackend:
+        raise CodexConfigScopeError("A concrete owning SessionStore and TmuxBackend are required")
+    if not isinstance(expected_source_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_source_sha256
+    ):
+        raise CodexConfigScopeError("An exact expected configuration source digest is required")
+    if store.conn.in_transaction:
+        raise CodexConfigScopeError("Private configuration preparation requires an idle registry connection")
+    record = store.get(session_id)
+    if record is None or record.external or not record.auth_scope_id or not record.codex_home:
+        raise CodexConfigScopeError("An internal saved terminal with an existing private scope is required")
+
+    def authority():
+        binding = store._database_binding
+        if binding is not None:
+            binding.revalidate()
+        if store.get(session_id) != record:
+            raise CodexConfigScopeError("Saved terminal changed before private configuration preparation")
+        duplicate = store.conn.execute(
+            "SELECT id FROM sessions WHERE id != ? AND (codex_home = ? OR auth_scope_id = ?) LIMIT 1",
+            (record.id, record.codex_home, record.auth_scope_id),
+        ).fetchone()
+        if duplicate is not None:
+            raise CodexConfigScopeError("Private scope is also bound to another saved terminal")
+        if record.last_pid and Path(f"/proc/{record.last_pid}").exists():
+            raise CodexConfigScopeError("Saved terminal process is still present; stopped ownership is unproven")
+        root = _existing_private_home(store.auth_root)
+        home = _existing_private_home(record.codex_home)
+        if (
+            root != store.auth_root or home != Path(record.codex_home)
+            or home.parent != root or home.name != record.auth_scope_id
+            or not _AUTH_SCOPE_PATTERN.fullmatch(record.auth_scope_id)
+        ):
+            raise CodexConfigScopeError("Private scope is not the physical child of its owning auth root")
+        if _read(home / ".termdeck-private-history", limit=64) != b"private-history-v1\n":
+            raise CodexConfigScopeError("Explicit private-history provenance is required")
+        source = _bound_canonical_home(home)
+        if source != store.account_source.resolve(strict=True):
+            raise CodexConfigScopeError("Private configuration binding differs from the owning account source")
+        workspace = Path(record.cwd)
+        if not workspace.is_absolute() or not workspace.is_dir() or workspace.resolve(strict=True) != workspace:
+            raise CodexConfigScopeError("Saved terminal workspace must be an existing physical directory")
+        assets = [asset for asset in _canonical_assets(source) if asset[0] != ".env"]
+        canonical = next((path for name, path, _directory in assets if name == "config.toml"), None)
+        if canonical is None:
+            raise CodexConfigScopeError("The authorized configuration source is missing")
+        checks = dict(
+            state_root=store.path.parent.resolve(strict=True), auth_directory=root,
+            account_source=source, private_home=home, workspace=workspace,
+            shared_names={name for name, _path, _directory in assets},
+        )
+        target = _shared_asset_path(canonical, **checks)
+        _validate_shared_location(canonical, **checks)
+        identities = []
+        for directory in (root, home, source, workspace):
+            info = directory.lstat()
+            identities.append((info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid))
+        for node in (home / ".termdeck-private-history", home / _CANONICAL_HOME_BINDING,
+                     canonical, Path(target)):
+            identities.append(_scope_metadata_identity(node.lstat()))
+        return home, source, target, tuple(identities)
+
+    try:
+        expected = authority()
+        with backend.auth_scope_writer_quiescence(record) as observation:
+            if observation.get("quiescent") is not True:
+                raise CodexConfigScopeError("Terminal writer is still live; private configuration preparation refused")
+            store.conn.execute("BEGIN IMMEDIATE")
+            try:
+                if authority() != expected:
+                    raise CodexConfigScopeError("Private configuration authority changed during quiescence")
+                result = prepare_private_config(
+                    *expected[:3], expected_source_sha256=expected_source_sha256
+                )
+                if authority() != expected:
+                    raise CodexConfigScopeError("Private configuration authority changed during publication")
+                return result
+            finally:
+                # Only excludes other registry writers; no row is inserted or updated.
+                store.conn.rollback()
+    except (CredentialError, StagingError, OSError) as exc:
+        raise CodexConfigScopeError("Private configuration authority cannot be validated safely") from exc

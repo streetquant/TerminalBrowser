@@ -357,3 +357,27 @@ is absent, a claim or administrator authorization is missing, ownership is
 ambiguous, a key or receipt conflicts, a test fails, the host differs from the
 captured model, or verification would require touching live user sessions.
 Cloudflare changes and unrelated Warp infrastructure remain outside this gate.
+
+### Preserve TLS during application activation
+
+A reviewed application activation first authenticates the current producer
+receipt and its separate consumer TLS observation. It requires the installed
+fixed root-owned publisher to match the reviewed source, the detected LAN
+address to match the signed policy, and the server certificate to satisfy the
+preparer's 30-day validity check. A pending LAN or certificate rotation blocks
+activation before package or service mutation; qualify that TLS change as a
+separate operation.
+
+Publication retains the complete existing consumer TLS directory and leaf
+inodes when its validated bytes, owners and modes exactly match the producer.
+It holds and rechecks those identities through publication. Unsafe leaves,
+unexpected entries or a concurrent replacement fail closed, preserving the
+concurrent writer. A changed, separately authorized TLS generation continues
+to use the existing directory transaction and authenticated inverse; copied
+producer inodes never become consumer authority.
+
+A successful rotation by an older publisher may already have deleted its prior
+consumer inodes during commit cleanup. Retained producer bytes do not prove
+restoration of those original consumer inodes. Record that preservation gate
+as failed and retain the failed transaction rather than claiming a complete
+inverse or replaying a rejected service restart.

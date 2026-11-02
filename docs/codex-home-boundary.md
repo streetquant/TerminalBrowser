@@ -88,6 +88,35 @@ position is not trust evidence and is rejected. An injected launcher attestor
 exists for release verification and deterministic tests; it is not a
 user-configurable production contract.
 
+The physical user-owned `codex` entry can resolve directly to
+`codex-contained-user` or to the reviewed `codex-session-router` payload.
+Router recognition requires its exact reviewed SHA-256, the compiled contained
+entry's exact reviewed SHA-256, and the fixed trusted
+paths, safe ownership and permissions, the contained entry and helper contract,
+and unchanged file and directory identities through the read. The existing
+vendor helper contract remains supported for a direct contained entry; a router
+chain and its ordinary npm helper require the helper's
+exact reviewed payload hash instead of the retired vendor-root marker. Reads use
+no-follow descriptors, reject hard links and oversized payloads, and refuse
+replacement during attestation. Other router revisions require explicit source
+qualification; copying a known router to another location does not grant trust.
+Both the previously qualified router `e06749c7` and its published option-parser
+successor `22a3bd84` retain these checks. Their complete payload digests are
+pinned in source; other revisions remain unavailable until separately qualified.
+The independently qualified global-settings router `8dac99df` and current native
+helper `58b65c56` retain these checks. This router must use that exact native
+helper and the physical, owner-safe approved-runtime verifier `587bd423` for
+the `direct-runtime-codex` role. Missing, changed, writable, aliased or replaced
+verifiers fail closed; the native helper cannot borrow an older router's pin.
+Approved-runtime path and cache override names are rejected for both set and
+empty values before private dispatch. No verifier or model is executed during
+launcher recognition.
+A router-backed private wrapper rejects both set and empty
+`CODEX_CONTAINED_USER` or `CODEX_OPENROUTER` dispatch overrides before execution,
+so caller configuration cannot substitute another executable for that chain.
+This source qualification does not activate a live TermDeck bundle or qualify
+the separate native resume catalog's SQLite forwarding contract.
+
 Reconciliation is intentionally non-destructive. Missing canonical assets are
 linked, and existing links must resolve to the expected canonical target. An
 existing regular file, directory, or custom `bin/codex` is left untouched and
@@ -195,3 +224,37 @@ The safety boundary assumes the per-terminal home remains a mode-`0700`,
 current-user-owned directory. Publication revalidates relevant paths and uses
 the per-home lock; it is not intended to defend against the same OS user
 concurrently renaming the entire private home behind TermDeck.
+
+
+The routed private wrapper also refuses caller-supplied runtime helper, nested
+dispatch, native executable and npm-selection overrides before execution.
+Physical private home, runtime, history and state roots remain supported.
+A separately qualified caller may use the contained helper's override API outside
+this managed private wrapper; inherited override values do not attest this chain.
+
+
+## Explicit private native configuration
+
+The prepare_private_native_configuration(store, session_id, backend=backend,
+expected_source_sha256=digest) entry prepares only the configuration of the
+selected existing private-history scope. It requires the concrete owning
+SessionStore and TmuxBackend, a physical home directly under that store's auth
+root, the saved canonical source binding and an exact SHA-256 of the authorized
+source configuration. A live tmux session, present saved process, or either
+native writer lifetime lease refuses preparation. The normal auth transaction
+lock, both lifetime leases and a registry transaction remain held during
+publication; session rows, credentials, account catalogue, histories, native
+SQLite and launchers are preserved.
+
+The entry reuses native_config_view.prepare_private_config: it replaces the
+validated source config link with an owner-only physical file and its existing
+provenance receipt. Native automatic config edits then remain in the private
+home. Ready views retain those edits; changed defaults plus private edits
+require explicit reconciliation and are never merged or overwritten. The
+optional source digest is checked before publication. Unsafe links, ownership
+changes and substituted homes fail closed.
+
+This is explicit opt-in provisioning. Ordinary shared/legacy preparation keeps
+its existing behavior, and recognizing a private config receipt supplies no
+confined-launch or installed-service admission. Root TLS/assets deployment and
+actual native terminal acceptance have their own gates.

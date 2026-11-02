@@ -214,20 +214,77 @@ def test_start_refuses_foreign_nginx_pidfile(startup, monkeypatch):
     # then replace only the disposable pidfile before its observation.
     original = wrappers._read_nginx_pid
 
-    def change(layout):
+    def change(layout, **kwargs):
         path = startup.paths.runtime / "nginx/nginx.pid"
         path.write_text(str(os.getpid()) + "\n")
-        return original(layout)
+        return original(layout, **kwargs)
 
     monkeypatch.setattr(wrappers, "_read_nginx_pid", change)
     with pytest.raises(activation.WebActivationError, match="does not own its pidfile"):
         activation._start_web(startup.paths)
 
 
-def test_pending_wrapper_cannot_extend_the_90_second_deadline(startup, monkeypatch):
-    startup.block = True
+def test_start_waits_for_empty_nginx_pidfile_then_checks_its_owner(startup, monkeypatch):
+    original = wrappers._read_nginx_pid
+    observations = []
+
+    def observe(layout, **kwargs):
+        path = wrappers._runtime_paths(layout)["nginx_pid"]
+        if not observations:
+            # nginx opens/truncates the file before writing its PID. Reproduce
+            # that window after the real child has exec'd into nginx.
+            contents = path.read_bytes()
+            path.write_bytes(b"")
+            try:
+                value = original(layout, **kwargs)
+            finally:
+                path.write_bytes(contents)
+        else:
+            value = original(layout, **kwargs)
+        observations.append(value)
+        return value
+
+    monkeypatch.setattr(wrappers, "_read_nginx_pid", observe)
+    activation._start_web(startup.paths)
+    assert observations[0] is None
+    assert observations[-1] == startup.children["termdeck-web-lan.service"].pid
+    assert len(observations) >= 2
+
+
+@pytest.mark.parametrize("contents", (b" ", b"\n", b"not-a-pid", b"0\n"))
+def test_start_refuses_nonempty_malformed_nginx_pidfile(startup, monkeypatch, contents):
+    original = wrappers._read_nginx_pid
+
+    def observe(layout, **kwargs):
+        wrappers._runtime_paths(layout)["nginx_pid"].write_bytes(contents)
+        return original(layout, **kwargs)
+
+    monkeypatch.setattr(wrappers, "_read_nginx_pid", observe)
+    with pytest.raises(activation.WebActivationError, match="malformed|invalid PID"):
+        activation._start_web(startup.paths)
+
+
+def test_nginx_pidfile_remains_strict_outside_startup(startup):
+    wrappers._runtime_paths(startup.layout)["nginx_pid"].write_bytes(b"")
+    with pytest.raises(wrappers.WrapperError, match="malformed"):
+        wrappers._read_nginx_pid(startup.layout)
+
+
+@pytest.mark.parametrize("pending", ("wrapper", "empty-pidfile"))
+def test_pending_wrapper_cannot_extend_the_90_second_deadline(startup, monkeypatch, pending):
+    startup.block = pending == "wrapper"
     elapsed = 0.0
     sleeps = []
+    empty_reads = []
+    original = wrappers._read_nginx_pid
+
+    if pending == "empty-pidfile":
+        def empty_pid(layout, **kwargs):
+            wrappers._runtime_paths(layout)["nginx_pid"].write_bytes(b"")
+            empty_reads.append(True)
+            return original(layout, **kwargs)
+
+        monkeypatch.setattr(wrappers, "_read_nginx_pid", empty_pid)
 
     def advance(seconds):
         nonlocal elapsed
@@ -241,6 +298,8 @@ def test_pending_wrapper_cannot_extend_the_90_second_deadline(startup, monkeypat
     assert elapsed == 90.0
     assert max(sleeps) <= 0.25
     assert max(startup.timeouts) == 90
+    if pending == "empty-pidfile":
+        assert empty_reads
 
 
 def test_start_does_not_rebind_to_canonical_paths(startup):
