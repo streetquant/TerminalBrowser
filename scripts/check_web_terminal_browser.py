@@ -1782,7 +1782,7 @@ def main() -> int:
             tools_dialog.get_by_label("Terminal text size (px)").fill("16")
             tools_dialog.get_by_label("Terminal text size (px)").press("Tab")
             tools_dialog.get_by_label("Cursor shape").select_option("bar")
-            tools_dialog.get_by_label("Blink cursor").uncheck()
+            assert tools_dialog.get_by_label("Blink cursor").count() == 0
             tools_dialog.get_by_label("Terminal palette").select_option("nord")
             tools_dialog.get_by_label("Terminal font", exact=True).select_option("liberation")
             wait_until(

@@ -20,7 +20,7 @@ window.T1000UI = (() => {
       return {
         fontSize: Number.isInteger(value?.fontSize) && value.fontSize >= 10 && value.fontSize <= 72 ? value.fontSize : 13,
         cursorStyle: ["block", "bar", "underline"].includes(value?.cursorStyle) ? value.cursorStyle : "block",
-        cursorBlink: typeof value?.cursorBlink === "boolean" ? value.cursorBlink : true,
+        cursorBlink: false,
         palette: choices?.palettes.some(item => item.value === value?.palette) ? value.palette : "t1000",
         font: choices?.fonts.some(item => item.value === value?.font) ? value.font : "auto",
         fontFamily: typeof value?.fontFamily === "string" && value.fontFamily.length <= 128 ? value.fontFamily : "",
@@ -33,7 +33,7 @@ window.T1000UI = (() => {
         reduceMotion: value?.reduceMotion === true,
       };
     } catch (_) {
-      return { fontSize: 13, cursorStyle: "block", cursorBlink: true, palette: "t1000", font: "auto", fontFamily: "", cursorColor: "", scrollback: 20000, chrome: "noir", density: "compact", uiFont: "", uiScale: 1, reduceMotion: false };
+      return { fontSize: 13, cursorStyle: "block", cursorBlink: false, palette: "t1000", font: "auto", fontFamily: "", cursorColor: "", scrollback: 20000, chrome: "noir", density: "compact", uiFont: "", uiScale: 1, reduceMotion: false };
     }
   }
   function applyChrome(settings = preferences()) {
@@ -346,9 +346,6 @@ window.T1000UI = (() => {
         cursor.append(option);
       }
       cursor.value = settings.cursorStyle;
-      const blink = element("input", "");
-      blink.type = "checkbox";
-      blink.checked = settings.cursorBlink;
       const number = (value, min, max, step = 1) => { const input = element("input"); input.type = "number"; input.value = value; input.min = min; input.max = max; input.step = step; return input; };
       const text = value => { const input = element("input"); input.value = value || ""; input.maxLength = 128; return input; };
       const chrome = select(["noir", "dark", "light", "system"].map(value => ({value, label: {noir: "Graphite · amber", dark: "Slate · amber", light: "Warm paper · ochre", system: "Follow system"}[value]})), settings.chrome);
@@ -361,9 +358,9 @@ window.T1000UI = (() => {
       const side = select(["left", "right"].map(value => ({value, label: value})), shell.dataset.sidebarSide);
       const paneVisible = element("input"); paneVisible.type = "checkbox"; paneVisible.checked = !sidebar.hidden;
       body.append(element("h3", "settings-section", "Terminal"));
-      for (const [text, control] of [["Terminal palette", palette], ["Terminal font", font], ["Terminal text size (px)", size], ["Cursor shape", cursor], ["Blink cursor", blink]]) {
+      for (const [text, control] of [["Terminal palette", palette], ["Terminal font", font], ["Terminal text size (px)", size], ["Cursor shape", cursor]]) {
         control.setAttribute("aria-label", text);
-        const label = element("label", control === blink ? "workspace-check" : "workspace-field");
+        const label = element("label", "workspace-field");
         label.append(element("span", "", text), control);
         body.append(label);
       }
@@ -380,7 +377,7 @@ window.T1000UI = (() => {
       body.append(status);
       function apply() {
         if (![size, scale, scrollback, color].every(control => control.reportValidity()) || !Number.isInteger(Number(size.value))) return;
-        const next = { fontSize: Number(size.value), cursorStyle: cursor.value, cursorBlink: blink.checked, palette: palette.value, font: font.value,
+        const next = { fontSize: Number(size.value), cursorStyle: cursor.value, cursorBlink: false, palette: palette.value, font: font.value,
           fontFamily: customFont.value.trim(), cursorColor: color.value, scrollback: Number(scrollback.value), chrome: chrome.value, density: density.value, uiFont: uiFont.value.trim(), uiScale: Number(scale.value), reduceMotion: motion.checked };
         getTerminal()?.setAppearance(next);
         applyChrome(next);
@@ -392,9 +389,9 @@ window.T1000UI = (() => {
         catch (_) { status.textContent = "Applied for this tab. Browser storage is unavailable, so this cannot be saved."; }
         return next;
       }
-      for (const control of [size, cursor, blink, palette, font, customFont, color, scrollback, chrome, density, uiFont, scale, motion, side, paneVisible]) control.addEventListener("change", apply);
+      for (const control of [size, cursor, palette, font, customFont, color, scrollback, chrome, density, uiFont, scale, motion, side, paneVisible]) control.addEventListener("change", apply);
       body.append(button("Reset to defaults", () => {
-        size.value = "13"; cursor.value = "block"; blink.checked = true;
+        size.value = "13"; cursor.value = "block";
         palette.value = "t1000"; font.value = "auto"; customFont.value = ""; color.value = ""; scrollback.value = "20000";
         chrome.value = "noir"; density.value = "compact"; uiFont.value = ""; scale.value = "1"; motion.checked = false; side.value = "right"; paneVisible.checked = false; apply();
       }));
@@ -409,7 +406,7 @@ window.T1000UI = (() => {
         try {
           const data = await window.T1000Management.appearance({mode: "read"}); revision = data.revision;
           const value = data.values;
-          size.value = value.fontSize; cursor.value = value.cursorStyle; blink.checked = value.cursorBlink;
+          size.value = value.fontSize; cursor.value = value.cursorStyle;
           palette.value = value.palette; font.value = value.font; customFont.value = value.fontFamily;
           color.value = value.cursorColor; scrollback.value = value.scrollback; chrome.value = value.chrome;
           density.value = value.density; uiFont.value = value.uiFont; scale.value = value.uiScale;

@@ -88,9 +88,11 @@ def main():
                     height: min(685px, calc(100vh - 16px)); overflow: auto;}
                 #terminal .xterm {height: max-content; width: max-content;}
             """)
-            for asset in ("terminal.js", "codex-palette.js", "workspace-ui.js"):
+            for asset in ("terminal.js", "app.js", "codex-palette.js", "workspace-ui.js"):
                 page.add_script_tag(path=str(ASSETS / asset))
+            page.evaluate("localStorage.setItem('t1000.appearance', JSON.stringify({cursorBlink:true}))")
             attach(page)
+            assert state(page)["blink"] is False
             menu_names = page.locator("#menu button").all_text_contents()
             assert menu_names.count("Settings · themes and fonts") == 1, menu_names
             assert "Codex accounts" in menu_names and "Client files" in menu_names, menu_names
@@ -125,7 +127,7 @@ def main():
             assert page.locator("html").get_attribute("data-chrome") == "light"
             page.get_by_label("Cursor color").fill("#abcdef")
             page.get_by_label("Cursor color").dispatch_event("change")
-            page.get_by_label("Blink cursor").uncheck()
+            assert page.get_by_label("Blink cursor").count() == 0
             applied = state(page)
             assert applied["fontSize"] == 24 and applied["saved"]["fontSize"] == 24, applied
             assert applied["columns"] == 160 and applied["rows"] == 45, applied
@@ -166,7 +168,7 @@ def main():
                     height: min(685px, calc(100vh - 16px)); overflow: auto;}
                 #terminal .xterm {height: max-content; width: max-content;}
             """)
-            for asset in ("terminal.js", "codex-palette.js", "workspace-ui.js"):
+            for asset in ("terminal.js", "app.js", "codex-palette.js", "workspace-ui.js"):
                 page.add_script_tag(path=str(ASSETS / asset))
             attach(page)
             restored = state(page)
@@ -189,6 +191,7 @@ def main():
             assert "Liberation Sans" in page.get_by_role("status").first.inner_text()
             page.get_by_role("button", name="Reset to defaults").click()
             reset = state(page)
+            assert reset["blink"] is False and reset["saved"]["cursorBlink"] is False, reset
             assert reset["fontSize"] == 13 and reset["cursorStyle"] == "block", reset
             assert reset["scrollback"] == 20000 and reset["saved"]["fontSize"] == 13, reset
             print(json.dumps({"ok": True, "applied": applied, "restored": restored, "reset": reset}))

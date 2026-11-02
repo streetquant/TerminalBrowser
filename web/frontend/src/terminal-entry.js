@@ -82,7 +82,7 @@ export function createTerminal(element, options = {}) {
     allowProposedApi: false,
     allowTransparency: false,
     convertEol: false,
-    cursorBlink: options.cursorBlink !== false,
+    cursorBlink: false,
     cursorStyle: ["block", "bar", "underline"].includes(options.cursorStyle) ? options.cursorStyle : "block",
     disableStdin: false,
     drawBoldTextInBrightColors: true,
@@ -96,7 +96,9 @@ export function createTerminal(element, options = {}) {
     letterSpacing: 0,
     lineHeight: 1.1,
     macOptionIsMeta: true,
-    minimumContrastRatio: 1,
+    // Correct app-defined indexed/RGB text against its actual cell background,
+    // including TUI panels. xterm caches adjustments and preserves dim/graphics.
+    minimumContrastRatio: 4.5,
     overviewRulerWidth: 0,
     rightClickSelectsWord: false,
     scrollback: Number.isSafeInteger(options.scrollback) ? options.scrollback : 10000,
@@ -362,6 +364,30 @@ export function createTerminal(element, options = {}) {
     subscriptions.add(tracked);
     return tracked;
   };
+  // Keep application cursor-shape requests, but never admit blinking. Handle
+  // these rare control sequences, without filtering output or watching frames.
+  let preferredCursorStyle = terminal.options.cursorStyle;
+  let pendingCursorBlinkReset = null;
+  trackSubscription(terminal.parser.registerCsiHandler({ intermediates: " ", final: "q" }, (params) => {
+    const style = params[0] || 0;
+    if (style === 0) terminal.options.cursorStyle = preferredCursorStyle;
+    else if (Number.isInteger(style) && style >= 1 && style <= 6) terminal.options.cursorStyle = ["block", "block", "underline", "underline", "bar", "bar"][style - 1];
+    terminal.options.cursorBlink = false;
+    return true;
+  }));
+  trackSubscription(terminal.parser.registerCsiHandler({ prefix: "?", final: "h" }, (params) => {
+    if (!params.includes(12)) return false;
+    if (params.every(mode => mode === 12)) return true;
+    // Let xterm apply all other combined DEC modes, then restore the steady
+    // cursor before rendering. The one-shot listener exists only for this case.
+    if (!pendingCursorBlinkReset) pendingCursorBlinkReset = terminal.onWriteParsed(() => {
+      terminal.options.cursorBlink = false;
+      pendingCursorBlinkReset.dispose();
+      pendingCursorBlinkReset = null;
+    });
+    return false;
+  }));
+  trackSubscription({ dispose() { pendingCursorBlinkReset?.dispose(); pendingCursorBlinkReset = null; } });
   // This view renders a tmux pane's raw output, including queries tmux has
   // already answered. A second reply can arrive after an app exits and become
   // shell input. Consume query instructions in the output parser; never filter
@@ -440,8 +466,9 @@ export function createTerminal(element, options = {}) {
       }
       const grid = lastGridFit && { columns: lastGridFit.columns, rows: lastGridFit.rows };
       options.fontSize = value.fontSize;
+      preferredCursorStyle = value.cursorStyle;
       terminal.options.cursorStyle = value.cursorStyle;
-      terminal.options.cursorBlink = value.cursorBlink;
+      terminal.options.cursorBlink = false;
       if (value.palette !== undefined) terminal.options.theme = paletteTheme(value.palette);
       if (value.font !== undefined) terminal.options.fontFamily = FONTS[value.font][1];
       if (value.fontFamily) terminal.options.fontFamily = `${value.fontFamily}, monospace`;
