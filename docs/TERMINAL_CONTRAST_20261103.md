@@ -102,3 +102,38 @@ page reload or interruption of user terminals was performed.
 Detailed source, binary, browser, performance and preservation evidence is private
 under `.termdeck/qualification/contrast-20261103/`. Local and remote publication
 use the existing `main`, with no new branch or PR.
+
+## Cursor visibility regression
+
+The user subsequently reported that the cursor disappeared in every application,
+including the plain terminal, and clicking inside did not restore it. The earlier
+idle screenshot equality check did not positively establish cursor visibility;
+an invisible cursor also passes that check. BR `t1000-bhw` was reopened.
+
+Read-only pane metadata reported all 290 cursors as shown. A new disposable live
+terminal showed the default cursor, so the exact user's browser state was not
+recovered. A concrete rendering failure was reproduced with a saved cursor color
+equal to the selected palette background: both renderers produced zero cursor
+pixels. The prior one-pixel bar and underline were also easy to overlook.
+
+The correction validates the cursor color against the selected terminal palette
+when appearance is created or changed. A requested color below 3:1 contrast falls
+back to the palette foreground, or a contrasting black/white fallback if needed.
+Readable custom colors retain their value. Cursor text also retains a contrasting
+accent. The bar is now two CSS pixels wide. Application hiding, application cursor
+shapes and the no-blink policy are preserved. No input/output handler, recurring
+frame work or polling was introduced by this correction.
+
+The new checker compares shown-cursor pixels with deliberately hidden-cursor
+pixels and proves that showing restores the original image. It passes 63 cases
+per renderer (seven palettes, three shapes and three requested colors), plus 21
+unfocused cases per renderer. Every case has visible pixels; minimum cursor
+contrast is 4.33:1 in this matrix. All 28 original text configurations still pass,
+including the 5.28:1 prompt. The 87 frontend tests and 152 Rust tests pass; the
+final rebuilt server passes all 42 browser integration checks. Its SHA-256 is
+`fcf9e558aeeac224ab021bea6a41191afd492471ef5b537b7fc11f2ffd87a26e`.
+
+Fresh regression evidence is private under
+`.termdeck/qualification/cursor-20261103/`, including the original start commit,
+task-start snapshot, native runtime operation export and completion audit.
+Installed correction results are recorded after supported activation.

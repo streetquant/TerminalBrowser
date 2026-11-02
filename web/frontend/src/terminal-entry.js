@@ -31,6 +31,34 @@ function paletteTheme(name) {
   };
 }
 
+// Resolve only when appearance changes. A saved cursor color can otherwise
+// disappear into a newly selected palette, even though cursorBlink is false.
+function visibleCursorTheme(theme, requestedColor) {
+  const luminance = (color) => {
+    if (!/^#[0-9a-f]{6}$/i.test(color)) return null;
+    const channels = [1, 3, 5].map(offset => parseInt(color.slice(offset, offset + 2), 16) / 255)
+      .map(value => value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4);
+    return channels[0] * .2126 + channels[1] * .7152 + channels[2] * .0722;
+  };
+  const contrast = (first, second) => (Math.max(first, second) + .05) / (Math.min(first, second) + .05);
+  const background = luminance(theme.background);
+  let cursor = requestedColor || theme.cursor;
+  if (background !== null) {
+    const current = luminance(cursor);
+    if (current !== null && contrast(current, background) < 3) {
+      const foreground = luminance(theme.foreground);
+      cursor = foreground !== null && contrast(foreground, background) >= 3
+        ? theme.foreground : (contrast(1, background) >= contrast(0, background) ? "#ffffff" : "#000000");
+    }
+  }
+  let cursorAccent = theme.cursorAccent;
+  const fill = luminance(cursor), accent = luminance(cursorAccent);
+  if (fill !== null && accent !== null && contrast(fill, accent) < 3) {
+    cursorAccent = contrast(1, fill) >= contrast(0, fill) ? "#ffffff" : "#000000";
+  }
+  return { ...theme, cursor, cursorAccent };
+}
+
 export function appearanceOptions() {
   return {
     palettes: Object.entries(palettePacks).map(([value, pack]) => ({ value, label: pack.label })),
@@ -84,6 +112,7 @@ export function createTerminal(element, options = {}) {
     convertEol: false,
     cursorBlink: false,
     cursorStyle: ["block", "bar", "underline"].includes(options.cursorStyle) ? options.cursorStyle : "block",
+    cursorWidth: 2,
     disableStdin: false,
     drawBoldTextInBrightColors: true,
     fastScrollModifier: "alt",
@@ -103,7 +132,7 @@ export function createTerminal(element, options = {}) {
     rightClickSelectsWord: false,
     scrollback: Number.isSafeInteger(options.scrollback) ? options.scrollback : 10000,
     smoothScrollDuration: 0,
-    theme: { ...paletteTheme(options.palette), ...(options.cursorColor ? {cursor: options.cursorColor} : {}), ...(options.theme || {}) },
+    theme: visibleCursorTheme({ ...paletteTheme(options.palette), ...(options.cursorColor ? {cursor: options.cursorColor} : {}), ...(options.theme || {}) }),
     windowsMode: false,
   });
   const fitAddon = new FitAddon();
@@ -469,10 +498,14 @@ export function createTerminal(element, options = {}) {
       preferredCursorStyle = value.cursorStyle;
       terminal.options.cursorStyle = value.cursorStyle;
       terminal.options.cursorBlink = false;
-      if (value.palette !== undefined) terminal.options.theme = paletteTheme(value.palette);
+      if (value.palette !== undefined || value.cursorColor) {
+        terminal.options.theme = visibleCursorTheme(
+          value.palette !== undefined ? paletteTheme(value.palette) : terminal.options.theme,
+          value.cursorColor,
+        );
+      }
       if (value.font !== undefined) terminal.options.fontFamily = FONTS[value.font][1];
       if (value.fontFamily) terminal.options.fontFamily = `${value.fontFamily}, monospace`;
-      if (value.cursorColor) terminal.options.theme = {...terminal.options.theme, cursor: value.cursorColor};
       syncBackground();
       if (value.scrollback !== undefined) terminal.options.scrollback = value.scrollback;
       invalidateFontMetrics();

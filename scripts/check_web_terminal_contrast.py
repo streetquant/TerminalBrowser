@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import subprocess
 
-from PIL import Image
+from PIL import Image, ImageChops
 from playwright.sync_api import sync_playwright
 
 
@@ -117,6 +117,48 @@ def check_cursor(page):
     assert page.locator(".xterm-screen").screenshot() == first, "cursor appearance changed while idle"
 
 
+def visible_cursor_pixels(page):
+    """Compare shown and intentionally hidden cursor pixels, not just options."""
+    def show(sequence):
+        page.evaluate("text => new Promise(resolve => api.write(text, resolve))", sequence)
+        page.evaluate("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
+        return Image.open(io.BytesIO(page.locator(".xterm-screen").screenshot())).convert("RGB")
+
+    shown = show("\x1b[?25h")
+    hidden = show("\x1b[?25l")
+    difference = ImageChops.difference(shown, hidden)
+    pixels = sum(1 for color in difference.getdata() if max(color) > 8)
+    restored = show("\x1b[?25h")
+    assert ImageChops.difference(shown, restored).getbbox() is None, "shown cursor did not restore"
+    return pixels
+
+
+def check_cursor_visibility(page):
+    results = []
+    for palette, pack in PALETTES.items():
+        for shape in ("block", "bar", "underline"):
+            for color in ("", pack["background"], "#181818"):
+                page.evaluate("""settings => api.setAppearance({fontSize:20,
+                    cursorBlink:true, ...settings})""",
+                    {"palette": palette, "cursorStyle": shape, "cursorColor": color})
+                page.evaluate("text => new Promise(r => api.write(text, r))",
+                              "\x1b[0m\x1b[10;1H\x1b[2K$ ")
+                page.evaluate("api.focus(false)")
+                pixels = visible_cursor_pixels(page)
+                assert pixels > 0, ("invisible cursor", palette, shape, color, pixels)
+                state = page.evaluate("({cursor:api.terminal.options.theme.cursor, blink:api.terminal.options.cursorBlink, width:api.terminal.options.cursorWidth})")
+                ratio = contrast(rgb(state["cursor"]), rgb(pack["background"]))
+                assert ratio >= 3, ("cursor contrast", palette, shape, color, ratio)
+                assert state["blink"] is False, state
+                assert state["width"] >= 2, state
+                results.append({"palette": palette, "shape": shape, "requested_color": color,
+                                "actual_color": state["cursor"], "ratio": ratio, "pixels": pixels})
+            page.evaluate("api.terminal.blur()")
+            assert visible_cursor_pixels(page) > 0, ("invisible unfocused cursor", palette, shape)
+            page.evaluate("api.focus(false)")
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence-dir", type=Path, required=True)
@@ -167,6 +209,7 @@ def main():
                 if phase == "candidate":
                     check_cursor(page)
                     evidence.setdefault("steady_cursor", []).append(renderer)
+                    evidence.setdefault("visible_cursor", {})[renderer] = check_cursor_visibility(page)
                 assert not errors, errors
                 api_disposed = page.evaluate("() => {api.dispose(); return document.querySelector('#terminal').children.length}")
                 assert api_disposed == 0
