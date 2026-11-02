@@ -46,24 +46,32 @@ function byteStringToUint8Array(value) {
   return bytes;
 }
 
-// A software WebGL context can be much slower than xterm's DOM renderer,
-// especially for full-screen apps. A successful context alone is insufficient.
+// Cache only a hardware-capability Boolean per document, never a GL context.
+const WEBGL_PROBE_TTL_MS = 30_000;
+const webglProbeCache = new WeakMap();
 function acceleratedWebglAvailable() {
+  const checkedAt = Date.now();
+  const cached = webglProbeCache.get(document);
+  if (cached && checkedAt - cached.checkedAt >= 0
+      && checkedAt - cached.checkedAt < WEBGL_PROBE_TTL_MS) return cached.available;
   let gl;
+  let available = false;
   try {
     gl = document.createElement("canvas").getContext("webgl2", {
       antialias: false, depth: false, failIfMajorPerformanceCaveat: true,
     });
-    if (!gl) return false;
-    const info = gl.getExtension("WEBGL_debug_renderer_info");
-    const renderer = String(gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER));
-    return !/swiftshader|llvmpipe|softpipe|software|basic render/i.test(renderer);
+    if (gl) {
+      const info = gl.getExtension("WEBGL_debug_renderer_info");
+      const renderer = String(gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER));
+      available = !/swiftshader|llvmpipe|softpipe|software|basic render/i.test(renderer);
+    }
   } catch (_ignored) {
-    return false;
+    available = false;
   } finally {
-    // This probe owns its context; do not retain one per cached terminal.
     try { gl?.getExtension("WEBGL_lose_context")?.loseContext(); } catch (_ignored) { /* Best effort */ }
   }
+  webglProbeCache.set(document, { checkedAt, available });
+  return available;
 }
 
 export function createTerminal(element, options = {}) {
@@ -115,16 +123,20 @@ export function createTerminal(element, options = {}) {
   let webglBlocked = false;
   let renderMonitor = null;
   element.dataset.termdeckRenderer = "dom";
+  let pendingLayoutFrame = 0;
+  let disposed = false;
   const notifyRendererLayout = () => {
-    // WebGL and canvas can measure a different cell width. Refit after the
-    // renderer has had a frame to settle, so the controller advertises the
-    // grid that actually fills its viewport to tmux.
-    window.requestAnimationFrame(() => {
+    // Coalesce mode changes and never update a disposed terminal's geometry.
+    if (disposed || pendingLayoutFrame) return;
+    pendingLayoutFrame = window.requestAnimationFrame(() => {
+      pendingLayoutFrame = 0;
+      if (disposed) return;
       invalidateFontMetrics();
       options.onLayoutChange?.();
     });
   };
   const useDomRenderer = () => {
+    webglProbeCache.delete(document);
     renderMonitor?.dispose();
     renderMonitor = null;
     try { webglAddon?.dispose(); } catch (_ignored) { /* DOM fallback */ }
@@ -136,12 +148,22 @@ export function createTerminal(element, options = {}) {
   const monitorRenderer = () => {
     let frame = 0;
     let previous = window.performance.now();
-    let lastRender = -Infinity;
+    const IDLE_MONITOR_MS = 250;
+    let lastRender = previous;
     let renders = 0;
     let previousRenders = 0;
     let wasHidden = document.hidden;
     let slowFrames = [];
-    const rendered = terminal.onRender(() => { renders++; lastRender = window.performance.now(); });
+    const rendered = terminal.onRender(() => {
+      const now = window.performance.now();
+      if (now - lastRender > 1000) slowFrames = [];
+      renders++;
+      lastRender = now;
+      if (!frame && webglAddon) {
+        previous = now; // Exclude time spent idle from the frame-stall window.
+        frame = window.requestAnimationFrame(sample);
+      }
+    });
     const sample = () => {
       frame = 0;
       if (!webglAddon) return;
@@ -164,7 +186,10 @@ export function createTerminal(element, options = {}) {
       wasHidden = document.hidden;
       previousRenders = renders;
       previous = now;
-      frame = window.requestAnimationFrame(sample);
+      // Do not schedule repeated monitor frames after output settles.
+      if (now - lastRender <= IDLE_MONITOR_MS) {
+        frame = window.requestAnimationFrame(sample);
+      }
     };
     frame = window.requestAnimationFrame(sample);
     renderMonitor = { dispose() {
@@ -453,6 +478,9 @@ export function createTerminal(element, options = {}) {
       return lines.join("\n");
     },
     dispose() {
+      disposed = true;
+      if (pendingLayoutFrame) window.cancelAnimationFrame(pendingLayoutFrame);
+      pendingLayoutFrame = 0;
       renderMonitor?.dispose();
       renderMonitor = null;
       for (const subscription of subscriptions) {

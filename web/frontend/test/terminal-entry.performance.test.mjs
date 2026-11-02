@@ -377,3 +377,81 @@ test("disposing an accelerated view cancels its renderer watchdog", async () => 
   const api=createTerminal(env.host);api.activateWebgl();env.tick();assert.equal(env.frames.size,1);
   api.dispose();assert.equal(env.frames.size,0);assert.equal(api.terminal._render.size,0);assert.equal(env.canceled,1);
 });
+
+test("WebGL watchdog parks after idle and wakes on new output", async () => {
+  const env = hardwareEnvironment();
+  const { createTerminal } = await loadTerminalEntry();
+  const api = createTerminal(env.host);
+  api.activateWebgl();
+  let callbacks = 0;
+  for (let i = 0; i < 1000; i++) {
+    callbacks += env.frames.size;
+    env.tick(16);
+  }
+  assert.ok(callbacks <= 20, "idle watchdog callbacks must remain bounded");
+  assert.equal(env.frames.size, 0, "idle terminal should not schedule another frame");
+  for (const callback of api.terminal._render) callback();
+  assert.equal(env.frames.size, 1, "render activity must rearm the watchdog");
+  env.tick(16);
+  assert.equal(env.frames.size, 1, "monitor must follow resumed output");
+  api.dispose();
+  assert.equal(env.frames.size, 0);
+  assert.equal(api.terminal.stats.renderDisposals, 1);
+});
+
+test("WebGL capability probe is cached per document and invalidated by context loss", async () => {
+  const env = hardwareEnvironment();
+  let probes = 0, contextReleases = 0;
+  document.createElement = () => ({ getContext: () => {
+    probes++;
+    return { RENDERER: 1, getParameter: () => "NVIDIA GPU", getExtension: name =>
+      name === "WEBGL_lose_context" ? { loseContext() { contextReleases++; } } : null };
+  } });
+  const { createTerminal } = await loadTerminalEntry();
+  const host = () => {
+    const view = new HTMLElement();
+    Object.assign(view, { clientWidth:800, clientHeight:600, dataset:{}, style:{setProperty(){}} });
+    return view;
+  };
+  const first = createTerminal(host()), second = createTerminal(host());
+  first.activateWebgl(); second.activateWebgl();
+  assert.equal(probes, 1, "one shared hardware capability probe");
+  assert.equal(contextReleases, 1, "temporary probe context is released");
+  assert.ok(first.terminal.webglAddon && second.terminal.webglAddon);
+  first.terminal.webglAddon.loss();
+  env.tick();
+  const third = createTerminal(host()); third.activateWebgl();
+  assert.equal(probes, 2, "context loss invalidates the shared capability result");
+  first.dispose(); second.dispose(); third.dispose();
+  assert.equal(env.frames.size, 0, "all pending layout and monitor frames are cancelled");
+});
+
+test("software WebGL capability is shared without retaining a context", async () => {
+  const env = hardwareEnvironment();
+  let probes = 0;
+  document.createElement = () => ({ getContext: () => {
+    probes++;
+    return { RENDERER: 1, getParameter: () => "llvmpipe", getExtension: () => null };
+  } });
+  const { createTerminal } = await loadTerminalEntry();
+  const first = createTerminal(env.host);
+  const second = createTerminal(env.host);
+  first.activateWebgl(); second.activateWebgl();
+  assert.equal(probes, 1);
+  assert.equal(first.terminal.webglAddon, undefined);
+  assert.equal(second.terminal.webglAddon, undefined);
+  first.dispose(); second.dispose();
+});
+
+test("disposing a terminal cancels pending renderer layout callbacks", async () => {
+  const env = hardwareEnvironment();
+  const { createTerminal } = await loadTerminalEntry();
+  let layoutCalls = 0;
+  const api = createTerminal(env.host, { onLayoutChange() { layoutCalls++; } });
+  api.activateWebgl();
+  assert.ok(env.frames.size > 0);
+  api.dispose();
+  assert.equal(env.frames.size, 0);
+  env.tick();
+  assert.equal(layoutCalls, 0, "disposed terminals never receive stale layout notifications");
+});

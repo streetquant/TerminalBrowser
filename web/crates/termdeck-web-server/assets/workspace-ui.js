@@ -89,10 +89,14 @@ window.T1000UI = (() => {
     }
     if (!rows.length) rows.push(element("p", "subtle", query ? "No matching windows or tabs." : "No windows yet. Choose New window to get started."));
     if (list.dataset.signature !== signature) {
-      const focused = document.activeElement?.closest(".window-list-entry")?.dataset.id;
+      const focus = document.activeElement;
+      const id = focus?.closest(".window-list-entry")?.dataset.id;
       list.replaceChildren(...rows);
       list.dataset.signature = signature;
-      if (focused) rows.find(row => row.dataset.id === focused)?.firstChild.focus();
+      if (id) {
+        const row = rows.find(row => row.dataset.id === id);
+        (focus?.matches(".window-list-kill") ? row?.lastChild : row?.firstChild)?.focus();
+      }
     }
   }
   function attachWorkspace({ root, toolbar, menu, getPanes, selectPane, getTerminal, newTab, runAction, loadHidden, restoreHidden, getWindow, refresh, snapshot, appPath }) {
