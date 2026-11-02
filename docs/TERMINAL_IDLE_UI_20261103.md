@@ -113,6 +113,53 @@ by this release. The already failed saved-terminal recovery unit must not be
 started. Existing tmux applications, databases, authentication, TLS and shared
 Cloudflare routes remain preservation gates.
 
-Installed verification and publication results are recorded after those gates
-complete. Source tests alone do not establish deployed performance or physical
-client acceptance.
+Product source is committed and pushed on `main` at
+`e50e51f520bc256d1ef4fea9406289c3e6ce1eab`. The incorporated draft PR is closed,
+and the incorporated remote review branch is removed. Verified local and remote
+branch listings contain only `main`; the original review history remains in the
+verified private bundle.
+
+The supported web activation transaction
+`tx-20261102T215710Z-d1df5fefe3` installed the qualified binary with SHA-256
+`c27dcd5991fbfadde7c5cf1e3a212e113aa9837da5ea891b0045be9c4e7ade50`.
+The exact final binary passes the 42-assertion browser fixture.
+
+The user explicitly authorized the scoped service-unit effects. The supported
+transaction completed with status `activated`. Both web services are active; the
+preexisting failed saved-terminal recovery unit was temporarily masked and then
+unmasked without starting it. All preservation comparisons passed for 308 saved
+sessions, 16 remembered windows, 290 pane process identities, three active
+authentication records, eight protected password/TLS files, and shared tunnels.
+The installed binary matches the hash above. All 84 installed Python modules
+remain identical to the preceding qualified payload.
+
+Fresh trusted-key Bash trials use 45 keys per route/version, with no command
+submission. These are headless render observations, not physical-display timing:
+
+| Installed route | Baseline median / p95 | Candidate median / p95 |
+| --- | --- | --- |
+| LAN | 31.9 / 32.6 ms | 31.8 / 32.4 ms |
+| Public | 148.6 / 149.4 ms | 148.2 / 153.7 ms |
+
+The public candidate trial included one 431.8 ms maximum. It is retained in the
+evidence rather than omitted. A subsequent control using the accepted baseline
+renderer against the same deployed transport also produced a 458.4 ms maximum:
+444.0 ms elapsed from socket submission to inbound output, followed by 0.4 ms
+from inbound output to parsing. That control shows the long public tail also
+occurs with the prior renderer. Public RTT changed across runs, so the public
+aggregate distributions cannot establish a JavaScript speedup or precise overhead.
+Neither version reported a browser long task. The controlled LAN result and
+isolated comparisons support no material application performance regression.
+
+Both routes pass direct TLS verification and health checks. Authenticated live
+homepage validation additionally verifies retained destructive-control focus
+after an inventory update, search, narrow-screen reflow and exact served asset
+bytes. Temporary test terminals and devices are removed/revoked; original pane
+identities remain unchanged. Source, installed, route and physical-client
+evidence remain distinct.
+
+The final consolidation records this existing implementation and its completed
+validation on `main`. No further product changes are part of this checkpoint.
+Local and remote branch inventories and open pull requests are checked after
+publication; private backups, original review history and raw evidence remain
+preserved outside the published source.
