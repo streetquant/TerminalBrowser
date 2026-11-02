@@ -56,11 +56,49 @@ version. These are headless observations and include frame-polling variation:
 | Input-to-buffer echo | 11.80 / 13.60 ms | 12.05 / 15.50 ms |
 
 The small echo-tail increase is retained, rather than described as a speedup or
-zero variation. Installed LAN typing is checked separately before/after activation.
-These measurements do not establish physical-display latency or a public-route
-speedup.
+zero variation. These measurements do not establish physical-display latency or
+a public-route speedup.
+
+## Installed validation
+
+The source and portable BR record were published on existing `main` in
+`475e1d3f464012f84e67ff0ef96ae5062befea2b`. Supported activation transaction
+`tx-20261102T223958Z-4401a29f84` completed with status `activated`. The installed
+backend matches the qualified binary SHA-256
+`8f9e77acf00bd9f19e5584925e3326db4140a85380acaa46e4bb9522f8956ab5`.
+The LAN service remains the existing nginx proxy. All 84 installed Python modules
+are byte-identical to the preceding qualified installation.
+
+Fresh LAN and public-route browser checks each pass six acceptance groups:
+readable prompt and steady cursor across all seven live palettes; legacy blinking
+preferences remain steady after reload; both served assets match `main`; no
+browser errors; the test's temporary device is revoked; and original pane
+identities remain intact. The live screenshot-like prompt measures 5.28:1 in every
+palette. Direct LAN and public HTTPS health checks pass TLS verification.
+
+Matched live LAN Bash typing uses 45 trusted key presses per version, without
+submitting a command. The browser rendering observation and dispatch measurements
+are:
+
+| Observation | Before median / p95 | After median / p95 |
+| --- | --- | --- |
+| Key to rendering observation | 31.7 / 32.5 ms | 32.1 / 32.5 ms |
+| Input dispatch | 0.3 / 0.4 ms | 0.2 / 0.4 ms |
+
+There are no observed long tasks or browser errors in either typing run. The live
+rendering p95 is unchanged; this does not erase the separate headless echo-tail
+increase above or establish zero variation for every workload.
+
+Post-activation and post-test preservation checks pass for all 308 saved sessions,
+16 remembered windows, 290 existing pane process identities, three active
+authentication records, eight protected password/TLS files, two tunnel units and
+two shared cloudflared processes. The already-failed saved-terminal recovery unit
+was temporarily masked during activation, unmasked afterward and never started.
+Only disposable test terminals and temporary devices were used for validation.
+
+An already-open browser page needs one reload to load the new renderer. No forced
+page reload or interruption of user terminals was performed.
 
 Detailed source, binary, browser, performance and preservation evidence is private
-under `.termdeck/qualification/contrast-20261103/`. Installation and publication
-results are recorded after their gates pass. Existing saved sessions, live pane
-processes, authentication, TLS and shared tunnels remain preservation gates.
+under `.termdeck/qualification/contrast-20261103/`. Local and remote publication
+use the existing `main`, with no new branch or PR.
