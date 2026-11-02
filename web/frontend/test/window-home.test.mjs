@@ -119,3 +119,24 @@ test('untrusted window title stays text and duplicate IDs do not produce extra c
  assert.equal(rows(f).length,1);
  assert.equal(rows(f)[0].querySelector('strong').textContent,'<img src=x onerror=evil()>');
 });
+
+test('same-revision host remount restores cached controls without reconstructing them', () => {
+  const f = fixture();
+  const state = snap(7, [wnd('a', 'Alpha')]);
+  f.render(state);
+  const header = f.root.querySelector('.window-list-header');
+  const cachedList = list(f);
+  const originalRow = rows(f)[0];
+  const kill = originalRow.querySelector('.window-list-kill');
+  const created = f.updates.creates;
+  // A host may clear DOM content while retaining its original main element.
+  cachedList.replaceChildren();
+  f.root.replaceChildren();
+  assert.equal(f.root.querySelector('.window-list'), null);
+  f.render(state); // unchanged revision must still restore the detached view
+  assert.equal(f.root.querySelector('.window-list-header'), header);
+  assert.equal(list(f), cachedList);
+  assert.equal(rows(f)[0], originalRow);
+  assert.equal(f.updates.creates, created);
+  assert.equal(kill.listeners.size, 1);
+});

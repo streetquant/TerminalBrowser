@@ -61,9 +61,16 @@ window.T1000WindowHome = (() => {
       header.append(brand, element("h1", "", "Windows"), search, status);
       window.T1000Management.home(header);
       root.replaceChildren(header, list);
-      view = { search, status, list, rows: new Map(), empty: element("p", "subtle"), signature: null };
+      view = { header, search, status, list, rows: new Map(), empty: element("p", "subtle"), signature: null };
       views.set(root, view);
       search.addEventListener("input", () => renderHome(root, root.t1000Host, root.t1000Stale, appPath));
+    } else if (!root.contains(view.header) || !root.contains(view.list)) {
+      // A host may detach its contents without replacing the root node.
+      // Reattach retained controls and invalidate the row signature so an
+      // identical host revision cannot leave the Windows list invisible.
+      root.className = "window-list-main";
+      root.replaceChildren(view.header, view.list);
+      view.signature = null;
     }
     root.t1000Host = host;
     root.t1000Stale = stale;
