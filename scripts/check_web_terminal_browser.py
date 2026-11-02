@@ -1093,6 +1093,22 @@ def main() -> int:
                 )
                 raise
             xterm_ms = (time.monotonic_ns() - started) / 1_000_000
+            # Render the workspace promptly, but do not claim input readiness
+            # until a current snapshot confirms the saved terminal is live.
+            page_one.wait_for_function(
+                "() => document.querySelector('#terminal-status')?.textContent === 'Checking terminal availability'",
+                timeout=5_000,
+            )
+            if result["websockets"]["one"]:
+                raise AssertionError("terminal connected before current availability was established")
+            if urllib.parse.urlparse(page_one.url).path != "/random":
+                raise AssertionError(f"window route changed unexpectedly: {page_one.url}")
+            # The normal retry interval is deliberately independent of the
+            # terminal's initialization work. Record total recovery below and
+            # time stream readiness from the successful snapshot response.
+            with page_one.expect_response(lambda response: response.url == api_url and response.ok, timeout=10_000):
+                page_one.unroute(api_url)
+            snapshot_available = time.monotonic_ns()
             try:
                 page_one.wait_for_function(
                     "() => document.querySelector('#terminal-status')?.textContent === 'Live'",
@@ -1105,14 +1121,12 @@ def main() -> int:
                 }
                 raise
             live_ms = (time.monotonic_ns() - started) / 1_000_000
-            result["timings_ms"].update({"xterm_visible": round(xterm_ms, 3), "terminal_live": round(live_ms, 3)})
-            if xterm_ms > args.max_live_ms or live_ms > args.max_live_ms:
+            snapshot_live_ms = (time.monotonic_ns() - snapshot_available) / 1_000_000
+            result["timings_ms"].update({"xterm_visible": round(xterm_ms, 3), "terminal_live": round(live_ms, 3), "live_after_current_snapshot": round(snapshot_live_ms, 3)})
+            if xterm_ms > args.max_live_ms or snapshot_live_ms > args.max_live_ms:
                 raise AssertionError(
-                    f"terminal startup exceeded {args.max_live_ms:g} ms: xterm={xterm_ms:.1f}, live={live_ms:.1f}"
+                    f"terminal startup exceeded {args.max_live_ms:g} ms: xterm={xterm_ms:.1f}, live after snapshot={snapshot_live_ms:.1f}"
                 )
-            if urllib.parse.urlparse(page_one.url).path != "/random":
-                raise AssertionError(f"window route changed unexpectedly: {page_one.url}")
-            page_one.unroute(api_url)
             page_one.wait_for_function(
                 """() => {
                   const shell = document.querySelector('.workspace-shell');
@@ -1122,7 +1136,7 @@ def main() -> int:
                 }""",
                 timeout=10_000,
             )
-            result["assertions"]["terminal_starts_without_window_api"] = True
+            result["assertions"]["terminal_visible_without_api_and_streams_after_current_snapshot"] = True
             try:
                 page_one.wait_for_function(
                     "() => document.querySelector('#terminal-xterm')?.termdeckTerminal?.readBuffer().includes('KEYBOARD_PASTE_MOUSE_RESIZE_READY')",

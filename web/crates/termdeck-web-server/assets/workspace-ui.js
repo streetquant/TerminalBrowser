@@ -43,58 +43,6 @@ window.T1000UI = (() => {
     document.documentElement.style.setProperty("--td-ui-scale", String(settings.uiScale));
     document.documentElement.style.setProperty("--td-ui-font", settings.uiFont || 'Cantarell, "Noto Sans", system-ui, sans-serif');
   }
-  function renderHome(root, host, stale, appPath) {
-    let header = root.querySelector(".window-list-header");
-    if (!header) {
-      root.className = "window-list-main";
-      header = element("header", "window-list-header");
-      const brand = element("a", "workspace-home", "t1000");
-      brand.href = appPath("/");
-      const title = element("h1", "", "Windows");
-      const search = element("input", "window-filter");
-      search.type = "search";
-      search.placeholder = "Find a window or tab";
-      search.setAttribute("aria-label", search.placeholder);
-      const status = element("p", "window-list-status");
-      status.setAttribute("role", "status");
-      const list = element("nav", "window-list");
-      list.setAttribute("aria-label", "t1000 windows");
-      header.append(brand, title, search, status);
-      window.T1000Management.home(header);
-      root.replaceChildren(header, list);
-      search.addEventListener("input", () => renderHome(root, root.t1000Host, root.t1000Stale, appPath));
-    }
-    root.t1000Host = host;
-    root.t1000Stale = stale;
-    const query = header.querySelector("input").value.trim().toLocaleLowerCase();
-    header.querySelector(".window-list-status").textContent = stale
-      ? "Connection interrupted. Showing the last known windows."
-      : `${host.windows.length} windows · ${host.totalPanes} tabs`;
-    const list = root.querySelector(".window-list");
-    const signature = JSON.stringify([query, host.revision]);
-    if (list.dataset.signature === signature) return;
-    const rows = [];
-    for (const data of host.windows) {
-      if (query && ![data.name, ...data.panes.map(pane => `${pane.title} ${pane.cwd}`)].join(" ").toLocaleLowerCase().includes(query)) continue;
-      const entry = element("div", "window-list-entry");
-      entry.dataset.id = data.id;
-      const row = element("a", "window-list-row");
-      row.href = appPath(data.path);
-      const description = element("span", "window-list-description");
-      description.append(element("strong", "", data.name), element("span", "", data.panes.map(pane => pane.title).join(" · ") || "No visible tabs"));
-      row.append(element("span", "window-list-icon", ">_"), description, element("span", "window-list-count", `${data.panes.length} tabs`));
-      const kill = button("Kill window…", () => window.T1000Management.killWindow(data.id));
-      kill.className = "window-list-kill danger"; kill.setAttribute("aria-label", `Kill ${data.name} window permanently`);
-      entry.append(row, kill); rows.push(entry);
-    }
-    if (!rows.length) rows.push(element("p", "subtle", query ? "No matching windows or tabs." : "No windows yet. Choose New window to get started."));
-    if (list.dataset.signature !== signature) {
-      const focused = document.activeElement?.closest(".window-list-entry")?.dataset.id;
-      list.replaceChildren(...rows);
-      list.dataset.signature = signature;
-      if (focused) rows.find(row => row.dataset.id === focused)?.firstChild.focus();
-    }
-  }
   function attachWorkspace({ root, toolbar, menu, getPanes, selectPane, getTerminal, newTab, runAction, loadHidden, restoreHidden, getWindow, refresh, snapshot, appPath }) {
     const management = window.T1000Management.workspace({root, toolbar, menu, getWindow, refresh, getTerminal});
     const modal = element("dialog", "workspace-dialog workspace-tools-dialog");
@@ -515,7 +463,7 @@ window.T1000UI = (() => {
       isOpen: () => modal.open,
     };
   }
-  return { renderHome, attachWorkspace, preferences, applyChrome };
+  return { attachWorkspace, preferences, applyChrome };
 })();
 
 window.T1000Management = (() => {

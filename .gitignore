@@ -27,6 +27,8 @@ web/target/
 .termdeck/
 *.sqlite
 *.sqlite3
+# Preserve local database recovery copies without publishing their contents.
+/sessions.sqlite3.pre-*
 *.db
 
 # Editor/OS noise
