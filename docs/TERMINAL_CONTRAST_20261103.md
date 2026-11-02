@@ -154,3 +154,31 @@ integration assertions, 28 text configurations, 126 focused cursor cases and 42
 unfocused cursor cases pass. The settings/apply/reload/reset browser test confirms
 foreground-colored cursors and the automatic color control. The new backend
 SHA-256 is `42b6d4c039bd093a884cea00d4aeaa85ecaeb8f7deb97e6b6e065c557a7e7168`.
+
+Supported activation `tx-20261102T233823Z-ee8244cc65` installed that exact binary.
+The live backend SHA-256 matches the qualified build. LAN and public routes each
+pass nine acceptance groups, including 21 positive cursor visibility cases with
+text-color equality, reload with stale saved colors, matching served assets and
+original pane preservation. The 84 installed Python modules remain unchanged.
+
+The final matched LAN comparison uses 45 trusted keys per version:
+
+| Observation | Before median / p95 | After median / p95 |
+| --- | --- | --- |
+| Key to rendering observation | 31.9 / 32.5 ms | 31.8 / 32.4 ms |
+| Input dispatch | 0.3 / 0.4 ms | 0.3 / 0.4 ms |
+
+No long tasks or browser errors were observed. The maximum rendering observation
+was 32.7 ms before and 37.2 ms after; these samples do not guarantee zero variation
+or physical-display latency. All preservation groups still pass: 308 sessions,
+16 windows, 290 pane identities, three active auth records, eight protected files,
+two tunnel units and two shared cloudflared processes. Only disposable test
+resources were removed. Existing browser pages need one voluntary reload.
+
+Source is published on existing `main` in `c6d56f8066c1d6d8160467dbd384c696f195d6e4`.
+No branch or PR was created. Final qualification records are private under
+`.termdeck/qualification/cursor-20261103/text-color/`. The completion audit uses
+the unchanged canonical deterministic gates with the user-authorized portable
+BR path explicitly allowed; other paths are restricted to the exact task scope,
+and original instruction pins remain unchanged. Native runtime records retain
+the original session and tool identities; no independent reviewer is claimed.
