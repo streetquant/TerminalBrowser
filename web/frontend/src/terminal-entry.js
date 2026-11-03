@@ -32,7 +32,7 @@ function paletteTheme(name) {
 }
 
 // Follow the terminal text color, including when legacy saved colors exist.
-// Resolve at appearance changes; no extra work on input or rendering frames.
+// Initialize from appearance; native application color changes are bound below.
 function textCursorTheme(theme) {
   return { ...theme, cursor: theme.foreground, cursorAccent: theme.background };
 }
@@ -371,6 +371,25 @@ export function createTerminal(element, options = {}) {
     subscriptions.add(tracked);
     return tracked;
   };
+  // xterm 6's OSC 10/11/12 (including stacked values) change native colors
+  // without updating options.theme. Bind to its pinned color service so an
+  // application cannot leave a dark cursor behind. Do not reset the theme:
+  // that would discard the application's foreground/background/ANSI changes.
+  // This subscription runs only on color changes, never on input or frames.
+  const nativeTheme = terminal._core?._themeService;
+  if (nativeTheme) {
+    const syncCursorColors = () => {
+      const colors = nativeTheme.colors;
+      if (colors.cursor.rgba === colors.foreground.rgba
+          && colors.cursorAccent.rgba === colors.background.rgba) return;
+      nativeTheme.modifyColors((current) => {
+        current.cursor = current.foreground;
+        current.cursorAccent = current.background;
+      });
+    };
+    trackSubscription(nativeTheme.onChangeColors(syncCursorColors));
+    syncCursorColors();
+  }
   // Keep application cursor-shape requests, but never admit blinking. Handle
   // these rare control sequences, without filtering output or watching frames.
   let preferredCursorStyle = terminal.options.cursorStyle;

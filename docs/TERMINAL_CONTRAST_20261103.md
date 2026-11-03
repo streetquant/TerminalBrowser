@@ -182,3 +182,47 @@ the unchanged canonical deterministic gates with the user-authorized portable
 BR path explicitly allowed; other paths are restricted to the exact task scope,
 and original instruction pins remain unchanged. Native runtime records retain
 the original session and tool identities; no independent reviewer is claimed.
+
+## Application color override regression
+
+A later user screenshot still shows a dark block after the text-matching change.
+The exact existing browser state was not captured. A read-only match of the known
+composer row confirmed an application-defined RGB panel; no input, resize or new
+attachment was sent to the user's pane. Its tmux cursor-color metadata was unset,
+so the screenshot alone does not establish which application or cached client
+state introduced the dark color.
+
+The previous tests had a concrete gap: `options.theme.cursor` can remain light
+while xterm's native cursor becomes dark after OSC 12. Positive pixel differences
+alone also accept this near-invisible block. A new regression test fails against
+`c933f63`: actual cursor `#252829`, foreground `#dfe6f2`. The same composer fixture
+has 242 changed cursor pixels both before and after, but its measured cursor-to-
+cell contrast improves from **1.12:1 to 13.29:1**.
+
+The renderer now subscribes to the pinned xterm 6 color service. Only native color
+changes synchronize cursor to foreground and cursor accent to background. This
+covers OSC 12, stacked OSC 10/11 cursor values, foreground/background changes and
+color restoration. An equality guard bounds re-entrant notifications. Native
+foreground/background/ANSI colors remain intact, and intentional cursor hiding
+and steady block/bar/underline shapes retain their behavior. The subscription is
+disposed with the view. There is no polling, frame loop, per-key handler or output
+rewriting. The private pinned xterm interface is deliberately covered by tests of
+the real bundle; an xterm upgrade must pass those checks.
+
+Source qualification passes all 87 frontend tests and 42 integration assertions
+on rebuilt server SHA-256
+`87d3805f3c8df1d4d82e9f07a8a9142e041d3dce6a15665a11bce910119ca18e`.
+The original 28 text configurations and 126 focused/42 unfocused cursor checks
+still pass. An additional 112 application-color cases check actual native colors
+and raster contrast in DOM and software WebGL, plus 28 bar/underline and 14
+unfocused cases after a dark override. Minimum measured block cursor contrast in
+that new matrix is 5.27:1. Both renderers remain steady while idle; color changes
+produce no terminal input, and ANSI restoration/intentional hiding still work.
+The pre-install LAN baseline records 45 trusted keys: render median/p95
+32.0/32.7 ms and dispatch median/p95 0.3/0.4 ms. Installed comparison follows.
+
+Evidence for this continuation, its task-start snapshot at `c933f63`, retained
+original policy pins and native runtime receipts is private under
+`.termdeck/qualification/cursor-stream-20261103/`. The original cursor goal base
+and prior receipts remain preserved. Existing browser pages still require a
+voluntary reload to load new renderer code.

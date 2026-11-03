@@ -117,7 +117,7 @@ def check_cursor(page):
     assert page.locator(".xterm-screen").screenshot() == first, "cursor appearance changed while idle"
 
 
-def visible_cursor_pixels(page):
+def cursor_raster(page):
     """Compare shown and intentionally hidden cursor pixels, not just options."""
     def show(sequence):
         page.evaluate("text => new Promise(resolve => api.write(text, resolve))", sequence)
@@ -130,7 +130,80 @@ def visible_cursor_pixels(page):
     pixels = sum(1 for color in difference.getdata() if max(color) > 8)
     restored = show("\x1b[?25h")
     assert ImageChops.difference(shown, restored).getbbox() is None, "shown cursor did not restore"
-    return pixels
+    pairs = Counter((a, b) for a, b in zip(shown.getdata(), hidden.getdata())
+                    if max(abs(x - y) for x, y in zip(a, b)) > 8)
+    foreground, background = pairs.most_common(1)[0][0] if pairs else ((0, 0, 0), (0, 0, 0))
+    return {"pixels": pixels, "foreground": foreground, "background": background,
+            "ratio": contrast(foreground, background)}
+
+
+def visible_cursor_pixels(page):
+    return cursor_raster(page)["pixels"]
+
+
+def check_application_cursor(page, renderer, evidence_dir):
+    """Exercise native renderer colors: theme options alone miss OSC overrides."""
+    cases = [
+        ("OSC12_BEL", "\x1b]12;#252829\x07", None, None),
+        ("OSC12_ST", "\x1b]12;rgb:25/28/29\x1b\\", None, None),
+        ("OSC10_stacked", "\x1b]10;#d0d0d0;#181818;#252829\x07", "#d0d0d0", "#181818"),
+        ("OSC11_stacked", "\x1b]11;#1e1e1e;#252829\x07", None, "#1e1e1e"),
+        ("foreground_change", "\x1b]10;#c4c4c4\x07", "#c4c4c4", None),
+        ("restore_foreground", "\x1b]10;#c4c4c4\x07\x1b]110\x07", None, None),
+        ("restore_background", "\x1b]11;#181818\x07\x1b]111\x07", None, None),
+        ("restore_cursor", "\x1b]12;#252829\x07\x1b]112\x07", None, None),
+    ]
+    results = []
+    page.evaluate("window.cursorPolicyInput = []; window.cursorPolicyData = api.terminal.onData(s => cursorPolicyInput.push(s))")
+    for palette, pack in PALETTES.items():
+        for name, sequence, foreground, background in cases:
+            page.evaluate("p => api.setAppearance({palette:p, fontSize:20, cursorStyle:'block', cursorBlink:false})", palette)
+            # The reported composer has an explicit dark RGB panel. Put the
+            # cursor on its next blank cell, independently of the palette bg.
+            payload = ("\x1b[0m\x1b[10;1H\x1b[2K\x1b[1m\x1b[38;2;219;153;56m›"
+                       "\x1b[0m\x1b[48;2;30;30;30m shhshhhhhhh "
+                       "\x1b[10;14H\x1b[?25h" + sequence)
+            page.evaluate("s => new Promise(r => api.write(s, r))", payload)
+            page.evaluate("api.focus(false)")
+            state = page.evaluate("""() => {
+                const c = api.terminal._core._themeService.colors;
+                return {cursor:c.cursor.css, foreground:c.foreground.css, accent:c.cursorAccent.css,
+                    background:c.background.css, blink:api.terminal.options.cursorBlink,
+                    cols:api.terminal.cols, rows:api.terminal.rows};
+            }""")
+            expected = foreground or pack["foreground"]
+            assert rgb(state["cursor"]) == rgb(expected), ("native cursor color", renderer, palette, name, state)
+            assert rgb(state["foreground"]) == rgb(expected), ("foreground changed", state)
+            assert rgb(state["background"]) == rgb(background or pack["background"]), state
+            assert rgb(state["accent"]) == rgb(state["background"]), state
+            assert not state["blink"] and (state["cols"], state["rows"]) == (72, 10), state
+            sample = cursor_raster(page)
+            assert sample["pixels"] > 0 and sample["ratio"] >= 3, (renderer, palette, name, sample)
+            assert max(abs(a-b) for a,b in zip(sample["foreground"], rgb(expected))) <= 1, (renderer, palette, name, sample, expected)
+            if name == "OSC12_BEL":
+                for shape in ("bar", "underline"):
+                    page.evaluate("shape => api.setAppearance({fontSize:20, cursorStyle:shape, cursorBlink:true})", shape)
+                    shaped = cursor_raster(page)
+                    assert shaped["pixels"] > 0 and shaped["ratio"] >= 3, (renderer, palette, shape, shaped)
+                page.evaluate("shape => api.setAppearance({fontSize:20, cursorStyle:shape, cursorBlink:false})", "block")
+                page.evaluate("api.terminal.blur()")
+                assert cursor_raster(page)["ratio"] >= 3, ("unfocused", renderer, palette)
+                page.evaluate("api.focus(false)")
+                if palette == "t1000":
+                    page.screenshot(path=str(evidence_dir / f"application-cursor-{renderer}.png"))
+                    first = page.locator(".xterm-screen").screenshot()
+                    page.wait_for_timeout(750)
+                    assert page.locator(".xterm-screen").screenshot() == first, "application cursor blinked"
+            results.append({"palette":palette, "case":name, "state":state, "raster":sample})
+        # ANSI palette updates still apply; the policy changes only the cursor.
+        page.evaluate("s => new Promise(r => api.write(s, r))", "\x1b]4;1;#aabbcc\x07")
+        assert page.evaluate("api.terminal._core._themeService.colors.ansi[1].css") == "#aabbcc"
+        page.evaluate("s => new Promise(r => api.write(s, r))", "\x1b]104;1\x07\x1b[?25l")
+        assert page.evaluate("api.terminal._core.coreService.isCursorHidden") is True
+        assert page.evaluate("api.terminal._core._themeService.colors.ansi[1].css") == pack["palette"][1]
+    assert page.evaluate("cursorPolicyInput") == [], "color policy emitted terminal input"
+    page.evaluate("cursorPolicyData.dispose()")
+    return results
 
 
 def check_cursor_visibility(page):
@@ -211,6 +284,7 @@ def main():
                     check_cursor(page)
                     evidence.setdefault("steady_cursor", []).append(renderer)
                     evidence.setdefault("visible_cursor", {})[renderer] = check_cursor_visibility(page)
+                    evidence.setdefault("application_cursor", {})[renderer] = check_application_cursor(page, renderer, args.evidence_dir)
                 assert not errors, errors
                 api_disposed = page.evaluate("() => {api.dispose(); return document.querySelector('#terminal').children.length}")
                 assert api_disposed == 0
