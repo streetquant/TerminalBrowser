@@ -226,3 +226,36 @@ original policy pins and native runtime receipts is private under
 `.termdeck/qualification/cursor-stream-20261103/`. The original cursor goal base
 and prior receipts remain preserved. Existing browser pages still require a
 voluntary reload to load new renderer code.
+
+## Latest requirement: fixed plain white
+
+The user explicitly replaced text matching with: “Make the cursor just plain
+white all the time.” The final policy is therefore fixed **`#ffffff`**, independent
+of palette foreground, old saved cursor colors, or application color commands.
+The native color-change guard retains the initially white color and restores it
+when required, without resetting application foreground/background/ANSI colors.
+Cursor accent follows the background so characters inside a white block retain
+contrast. The no-blink policy, shapes and two-pixel bar remain unchanged.
+Settings shows disabled `#ffffff` with “Always white”; there is no obsolete
+text-matching claim or editable override.
+
+Strict native and pixel checks now require white rather than theme-foreground
+matching. Foreground/background preservation checks still exercise application
+color changes. The existing frontend test changes its expected value to exactly
+`#ffffff`; no assertions or coverage are removed. The real settings test verifies
+fixed white, disabled editing, apply, theme changes, reload and reset.
+
+The changed requirement was snapshotted before edits at `95aed6c` in private
+`white-start-snapshot.json`. Original task-start `c933f63`, earlier goal provenance,
+policy pins and previous qualification records remain preserved. Fresh fixed-white
+build, installation and performance evidence is under
+`.termdeck/qualification/cursor-stream-20261103/white/`.
+
+Fixed-white source qualification passes all 87 frontend tests, 42 rebuilt-server
+integration assertions, real appearance apply/reload/reset checks, 28 text
+configurations and all previous cursor visibility checks. All 112 native color
+cases preserve a `#ffffff` cursor; minimum measured block cursor contrast against
+the fixture panel is 16.67:1. Additional shapes, unfocused cursors, application
+color restoration, intentional hiding and the no-blink policy also pass in both
+DOM and software WebGL. Qualified fixed-white server SHA-256:
+`8ea77149eb5bc90c04350617482967b0910f583cca0101d58e48ad5b306428f2`.

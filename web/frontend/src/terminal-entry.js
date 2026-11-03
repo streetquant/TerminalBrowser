@@ -8,6 +8,7 @@ import palettePacks from "./terminal-palettes.json";
 
 const DEFAULT_FONT_SIZE = 13;
 const MIN_FONT_SIZE = 7;
+const CURSOR_COLOR = "#ffffff";
 const TEXT_ENCODER = new TextEncoder();
 
 const FONTS = Object.freeze({
@@ -31,10 +32,10 @@ function paletteTheme(name) {
   };
 }
 
-// Follow the terminal text color, including when legacy saved colors exist.
+// Keep a plain white cursor, including when legacy saved colors exist.
 // Initialize from appearance; native application color changes are bound below.
-function textCursorTheme(theme) {
-  return { ...theme, cursor: theme.foreground, cursorAccent: theme.background };
+function steadyCursorTheme(theme) {
+  return { ...theme, cursor: CURSOR_COLOR, cursorAccent: theme.background };
 }
 
 export function appearanceOptions() {
@@ -110,7 +111,7 @@ export function createTerminal(element, options = {}) {
     rightClickSelectsWord: false,
     scrollback: Number.isSafeInteger(options.scrollback) ? options.scrollback : 10000,
     smoothScrollDuration: 0,
-    theme: textCursorTheme({ ...paletteTheme(options.palette), ...(options.theme || {}) }),
+    theme: steadyCursorTheme({ ...paletteTheme(options.palette), ...(options.theme || {}) }),
     windowsMode: false,
   });
   const fitAddon = new FitAddon();
@@ -378,12 +379,13 @@ export function createTerminal(element, options = {}) {
   // This subscription runs only on color changes, never on input or frames.
   const nativeTheme = terminal._core?._themeService;
   if (nativeTheme) {
+    const whiteCursor = nativeTheme.colors.cursor;
     const syncCursorColors = () => {
       const colors = nativeTheme.colors;
-      if (colors.cursor.rgba === colors.foreground.rgba
+      if (colors.cursor.rgba === whiteCursor.rgba
           && colors.cursorAccent.rgba === colors.background.rgba) return;
       nativeTheme.modifyColors((current) => {
-        current.cursor = current.foreground;
+        current.cursor = whiteCursor;
         current.cursorAccent = current.background;
       });
     };
@@ -496,7 +498,7 @@ export function createTerminal(element, options = {}) {
       terminal.options.cursorStyle = value.cursorStyle;
       terminal.options.cursorBlink = false;
       if (value.palette !== undefined || value.cursorColor) {
-        terminal.options.theme = textCursorTheme(value.palette !== undefined ? paletteTheme(value.palette) : terminal.options.theme);
+        terminal.options.theme = steadyCursorTheme(value.palette !== undefined ? paletteTheme(value.palette) : terminal.options.theme);
       }
       if (value.font !== undefined) terminal.options.fontFamily = FONTS[value.font][1];
       if (value.fontFamily) terminal.options.fontFamily = `${value.fontFamily}, monospace`;

@@ -172,14 +172,14 @@ def check_application_cursor(page, renderer, evidence_dir):
                     cols:api.terminal.cols, rows:api.terminal.rows};
             }""")
             expected = foreground or pack["foreground"]
-            assert rgb(state["cursor"]) == rgb(expected), ("native cursor color", renderer, palette, name, state)
+            assert rgb(state["cursor"]) == (255, 255, 255), ("native cursor color", renderer, palette, name, state)
             assert rgb(state["foreground"]) == rgb(expected), ("foreground changed", state)
             assert rgb(state["background"]) == rgb(background or pack["background"]), state
             assert rgb(state["accent"]) == rgb(state["background"]), state
             assert not state["blink"] and (state["cols"], state["rows"]) == (72, 10), state
             sample = cursor_raster(page)
             assert sample["pixels"] > 0 and sample["ratio"] >= 3, (renderer, palette, name, sample)
-            assert max(abs(a-b) for a,b in zip(sample["foreground"], rgb(expected))) <= 1, (renderer, palette, name, sample, expected)
+            assert max(abs(a-b) for a,b in zip(sample["foreground"], (255, 255, 255))) <= 1, (renderer, palette, name, sample, expected)
             if name == "OSC12_BEL":
                 for shape in ("bar", "underline"):
                     page.evaluate("shape => api.setAppearance({fontSize:20, cursorStyle:shape, cursorBlink:true})", shape)
@@ -222,7 +222,7 @@ def check_cursor_visibility(page):
                 state = page.evaluate("({cursor:api.terminal.options.theme.cursor, blink:api.terminal.options.cursorBlink, width:api.terminal.options.cursorWidth})")
                 ratio = contrast(rgb(state["cursor"]), rgb(pack["background"]))
                 assert ratio >= 3, ("cursor contrast", palette, shape, color, ratio)
-                assert state["cursor"] == pack["foreground"], state
+                assert state["cursor"] == "#ffffff", state
                 assert state["blink"] is False, state
                 assert state["width"] >= 2, state
                 results.append({"palette": palette, "shape": shape, "requested_color": color,

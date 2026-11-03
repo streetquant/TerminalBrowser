@@ -231,7 +231,7 @@ test("canonical fit suppresses stable remeasurement and invalidates font/layout 
   assert.deepEqual([api.terminal.cols, api.terminal.rows], [80, 24]);
   api.setAppearance({ ...appearance, palette: "nord", fontFamily: "Test Mono", cursorColor: "#abcdef", scrollback: 30000 });
   assert.equal(api.terminal.options.fontFamily, "Test Mono, monospace");
-  assert.equal(api.terminal.options.theme.cursor, api.terminal.options.theme.foreground);
+  assert.equal(api.terminal.options.theme.cursor, "#ffffff");
   assert.equal(api.terminal.options.theme.cursorAccent, api.terminal.options.theme.background);
   assert.equal(api.terminal.options.scrollback, 30000);
   assert.deepEqual([api.terminal.cols, api.terminal.rows], [80, 24]);

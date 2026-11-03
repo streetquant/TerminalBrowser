@@ -353,7 +353,7 @@ window.T1000UI = (() => {
       const uiFont = text(settings.uiFont), customFont = text(settings.fontFamily);
       uiFont.placeholder = "System interface font"; customFont.placeholder = "Optional installed font family";
       const scale = number(settings.uiScale, .75, 1.75, .05), scrollback = number(settings.scrollback, 100, 500000, 100);
-      const color = text(""); color.placeholder = "Matches terminal text"; color.disabled = true;
+      const color = text("#ffffff"); color.placeholder = "Always white"; color.disabled = true;
       const motion = element("input"); motion.type = "checkbox"; motion.checked = settings.reduceMotion;
       const side = select(["left", "right"].map(value => ({value, label: value})), shell.dataset.sidebarSide);
       const paneVisible = element("input"); paneVisible.type = "checkbox"; paneVisible.checked = !sidebar.hidden;
