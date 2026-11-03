@@ -259,3 +259,71 @@ the fixture panel is 16.67:1. Additional shapes, unfocused cursors, application
 color restoration, intentional hiding and the no-blink policy also pass in both
 DOM and software WebGL. Qualified fixed-white server SHA-256:
 `8ea77149eb5bc90c04350617482967b0910f583cca0101d58e48ad5b306428f2`.
+
+Fixed-white source is published on existing `main` in `164cef5`. Supported
+activation `tx-20261103T001349Z-c1810a173f` installs the exact qualified binary;
+all 84 Python modules are unchanged. Fresh LAN/public browsers each pass ten
+acceptance groups, including an actual dark OSC 12 command delivered through the
+live socket, 21 white/visible cursor cases per route, stale saved settings and
+reload. Both HTTPS health checks return 200 with TLS verification. These checks
+are fresh contexts, not proof that an already-open page loaded the new code.
+
+Matched LAN Bash typing uses 45 trusted keys per version: render observation
+median/p95 31.9/32.4 ms before and 31.7/32.4 ms after; dispatch 0.3/0.4 ms both.
+Maximum rendering observation is 35.3 ms before and 32.6 ms after, with no long
+tasks or browser errors. This establishes no p95 regression in that workload;
+it does not guarantee physical-display latency or every application's latency.
+
+The raw activation preservation check is retained as failed: one session changed
+visible 1 to 0 and its pane disappeared. Access logs show a separate authenticated
+LAN client successfully posting a tab mutation for that exact session during
+activation. The request body/action is not logged, so its precise action is not
+claimed. All other 289 original pane identities and 307 other session records are
+identical. Final verification admits only that specific evidenced concurrent
+change; no other discrepancy is allowed. All 308 session records, remembered
+windows, auth/TLS files, tunnel units and shared processes remain present. No old
+database was restored and the removed pane was not recreated. The saved-terminal
+recovery service was temporarily masked/unmasked and never started.
+
+The user's subsequent report that existing applications still have an invisible
+cursor exposed an installation/loaded-client distinction: at investigation, the
+active LAN client last requested `terminal.js` at 23:45:15 UTC, before either new
+color-service or fixed-white update. Opening an application or reconnecting the
+socket does not replace already-executing JavaScript. The user was asked to hard
+refresh once with Ctrl+Shift+R. Loaded-client fetch evidence is retained privately;
+actual user-visible acceptance after that reload remains pending until confirmed.
+
+
+### Existing-browser acceptance and style-override diagnosis
+
+The first requested hard refresh did not resolve the report. A fresh client
+`terminal.js` response at 00:23:38 UTC ruled out stale JavaScript as the complete
+explanation. Read-only diagnostics supplied by the user then confirmed DOM
+rendering, an initialized and enabled cursor, `#ffffff`, block style, and no
+blinking. The cursor was inside the visible grid, but its computed outline was
+`rgb(48, 52, 54)` against `rgb(30, 30, 30)`. This is a real styling mismatch,
+independent of the renderer's white color setting.
+
+The user's Console confirmed Dark Reader styles were present. The user explained
+that the extension was enabled globally but excluded on this site, then directly
+confirmed “yeah now its working” and “I did ctrl shift r”. This is consistent
+with residual extension styling despite the site exclusion. No post-refresh
+extension lifecycle or style-removal measurement is claimed. Physical cursor
+acceptance is now confirmed by the affected user; no additional renderer patch,
+service restart, or extension setting change was performed for this diagnosis.
+
+A separate fresh live-shell check covered startup, ordinary clicking, typing and
+reload without writing terminal controls or calling the terminal focus API.
+The same check covered a real OpenCode fixture and software WebGL activation.
+Every checked normal cursor cell was fully white; original panes were unchanged
+and only the tests' own terminals and temporary devices were removed. These
+checks address the earlier fixture limitation: forced cursor-show sequences
+alone cannot establish that normal startup and typing display the cursor.
+
+Private evidence: `white/affected-client-diagnostics.json`, `white/normal-cursor.json`,
+`white/normal-cursor-dom-opencode.json`, `white/normal-cursor-webgl-shell.json`,
+and the native session export under the existing `cursor-stream-20261103` evidence
+root. The fixed-white implementation remains source commit `164cef5`. The latest
+matched performance comparison remains 32.4 ms p95 rendering observation and
+0.4 ms p95 dispatch both before and after; this diagnosis made no product-code
+change. Final audit receipt: `cursor-stream-20261103/final-compliance-receipt.json`.
