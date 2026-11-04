@@ -679,10 +679,113 @@ def _primary_claude_session_id(pid: int) -> str | None:
     return candidates[0][2]
 
 
+def _owned_regular_prefix(path: Path, limit: int) -> tuple[bytes, os.stat_result]:
+    if not path.is_absolute() or path.resolve() != path:
+        raise OSError("native session path is not physical")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or info.st_mode & 0o022):
+            raise OSError("unsafe native session identity")
+        content = os.read(fd, limit)
+        after = os.fstat(fd)
+        named = path.lstat()
+        keys = ("st_dev", "st_ino", "st_uid", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(info, key) != getattr(after, key) or getattr(after, key) != getattr(named, key) for key in keys):
+            raise OSError("native session changed while reading")
+        return content, info
+    finally:
+        os.close(fd)
+
+
+def _omp_recovery_metadata(pid: int, argv: Sequence[str]) -> tuple[str, str] | None:
+    """Bind OMP's native terminal breadcrumb to a foreground process generation.
+
+    Never choose a recent session by cwd. Unknown profile layouts and stale
+    breadcrumbs fail closed. --resume opens the saved conversation; --restore
+    (which may execute an unfinished turn) is deliberately never emitted.
+    """
+    if not argv or not (Path(argv[0]).name == "omp" or any(
+            value.endswith("/@oh-my-pi/pi-coding-agent/dist/cli.js") for value in argv[:3])):
+        return None
+    if not Path(argv[0]).is_absolute():
+        return None  # A future PATH lookup could select a different program.
+    launch = [argv[0]]
+    if Path(argv[0]).name != "omp":
+        index = next(i for i, value in enumerate(argv[:3])
+                     if value.endswith("/@oh-my-pi/pi-coding-agent/dist/cli.js"))
+        if not Path(argv[index]).is_absolute():
+            return None
+        launch = list(argv[:index + 1])
+    before = _parse_stat(pid)
+    if (not before or not before["tty_nr"] or before["pgrp"] != before["tpgid"]
+            or int(before["pgrp"]) != pid):
+        return None
+    try:
+        tty = os.readlink(f"{_PROC}/{pid}/fd/0")
+        if not re.fullmatch(r"/dev/pts/[0-9]+", tty):
+            return None
+        env = _process_environment(pid)
+        # Profile/XDG resolution is version-specific. Do not silently resume
+        # using another profile's models, tools, credentials or session tree.
+        if env is None or any(env.get(key) for key in (
+                "OMP_PROFILE", "PI_PROFILE", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME")):
+            return None
+        home = Path(env.get("HOME", ""))
+        agent = Path(env.get("PI_CODING_AGENT_DIR") or home / ".omp" / "agent")
+        breadcrumb = agent / "terminal-sessions" / tty.removeprefix("/dev/").replace("/", "-")
+        data, info = _owned_regular_prefix(breadcrumb, 8193)
+        if len(data) > 8192:
+            return None
+        lines = data.decode("utf-8").splitlines()
+        if len(lines) < 2:
+            return None
+        cwd = _process_cwd(pid)
+        if cwd is None or Path(lines[0]).resolve() != Path(cwd).resolve():
+            return None
+        cwd_info = Path(cwd).stat()
+        if f"cwdstat {cwd_info.st_dev} {cwd_info.st_ino}" not in lines[2:]:
+            return None
+        started = _boot_time() + int(before["starttime"]) / _CLK_TCK
+        if info.st_mtime < started:
+            return None
+        native = Path(lines[1])
+        content, native_info = _owned_regular_prefix(native, 128 * 1024)
+        headers = content.splitlines()[:2]
+        parsed = [json.loads(line) for line in headers]
+        header = next((entry for entry in parsed if isinstance(entry, dict) and entry.get("type") == "session"), None)
+        if not header or not isinstance(header.get("id"), str):
+            return None
+        session_id = str(uuid.UUID(header["id"]))
+        if header["id"] != session_id or Path(str(header.get("cwd", ""))).resolve() != Path(cwd).resolve():
+            return None
+        after = _parse_stat(pid)
+        reread, current_info = _owned_regular_prefix(breadcrumb, 8193)
+        native_again, current_native = _owned_regular_prefix(native, 128 * 1024)
+        if native_again.splitlines()[:2] != headers or (current_native.st_dev, current_native.st_ino) != (native_info.st_dev, native_info.st_ino):
+            return None
+        if (after is None or any(after[key] != before[key] for key in ("starttime", "tty_nr", "pgrp", "tpgid")) or os.readlink(f"{_PROC}/{pid}/fd/0") != tty or reread != data
+                or current_info.st_ino != info.st_ino):
+            return None
+        keys = ("st_dev", "st_ino", "st_uid", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+        for path, captured in ((breadcrumb, current_info), (native, current_native)):
+            final = path.lstat()
+            if any(getattr(final, key) != getattr(captured, key) for key in keys):
+                return None
+        if not home.is_absolute() or not agent.is_absolute():
+            return None
+        prefix = ["env", "HOME=" + str(home), "PI_CODING_AGENT_DIR=" + str(agent)]
+        return shlex.join([*prefix, *launch, "--resume", str(native)]), cwd
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return None
+
+
 def observe_recovery_metadata(
     root_pid: int,
     *,
     authority_callback=None,
+    owner_callback=None,
 ) -> tuple[bool, str | None, str | None]:
     """Observe a safe resumable command and its cwd below a managed pane.
 
@@ -702,6 +805,20 @@ def observe_recovery_metadata(
         if argv is None:
             continue
         observed = True
+        omp_identity = _parse_stat(pid)
+        omp = _omp_recovery_metadata(pid, argv)
+        if omp is not None:
+            if owner_callback is not None:
+                # Carry the observed generation to the SQLite write boundary;
+                # a row CAS alone cannot detect an application exit/exec race.
+                def current(proc_pid=pid, identity=omp_identity, arguments=tuple(argv), metadata=omp):
+                    after = _parse_stat(proc_pid)
+                    return bool(identity and after and all(after.get(key) == identity.get(key)
+                        for key in ("starttime", "tty_nr", "pgrp", "tpgid"))
+                        and tuple(_process_argv(proc_pid) or ()) == arguments
+                        and _omp_recovery_metadata(proc_pid, arguments) == metadata)
+                owner_callback(current)
+            return True, *omp
         managed_argv = _managed_codex_observation_argv(pid, argv)
         managed_name = Path(managed_argv[0]).name.casefold() if managed_argv else ""
         session_id = (
@@ -763,7 +880,7 @@ def observe_recovery_metadata(
     return observed, None, None
 
 
-def observe_recovery_metadata_with_context(record, root_pid: int, *, native_observer=None):
+def observe_recovery_metadata_with_context(record, root_pid: int, *, native_observer=None, owner_callback=None):
     """Observe context at the same primary-native boundary; keep tuple callers."""
     from .recovery_authority_context import RecoveryAuthorityError, capture_codex_context
     context = None
@@ -773,7 +890,8 @@ def observe_recovery_metadata_with_context(record, root_pid: int, *, native_obse
         context = capture_codex_context(record, pid, command, cwd, proc=_PROC, native_observer=native_observer)
 
     try:
-        observed, command, cwd = observe_recovery_metadata(root_pid, authority_callback=capture)
+        observed, command, cwd = observe_recovery_metadata(root_pid, authority_callback=capture,
+                                                         owner_callback=owner_callback)
     except RecoveryAuthorityError as exc:
         if str(exc) in {"native process generation changed during observation", "foreign process owner"}:
             # Positive reused/foreign owner evidence invalidates its transient

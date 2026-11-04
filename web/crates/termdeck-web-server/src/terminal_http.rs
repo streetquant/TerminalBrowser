@@ -30,6 +30,7 @@ pub struct TerminalService {
     tmux_executable: Arc<PathBuf>,
     command_timeout: Duration,
     operation_slots: Arc<Semaphore>,
+    pub(crate) output_journal_root: Option<PathBuf>,
 }
 
 struct ControlState {
@@ -292,6 +293,7 @@ impl TerminalService {
             termdeck_web_core::MAX_CONTROLLED_PANES,
         )?;
         Ok(Self {
+            output_journal_root: None,
             owner_id,
             state: Arc::new(Mutex::new(ControlState {
                 registry,
@@ -301,6 +303,11 @@ impl TerminalService {
             command_timeout,
             operation_slots: Arc::new(Semaphore::new(MAX_TERMINAL_OPERATIONS)),
         })
+    }
+
+    pub(crate) fn with_output_journal(mut self, root: PathBuf) -> Self {
+        self.output_journal_root = Some(root);
+        self
     }
 
     pub async fn status(

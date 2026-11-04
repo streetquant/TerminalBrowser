@@ -14,6 +14,7 @@ mod staging_http;
 mod tab_actions;
 mod terminal_http;
 mod terminal_stream;
+mod output_journal;
 mod tmux_runtime;
 
 use auth_http::{
@@ -24,7 +25,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -96,7 +97,7 @@ const WINDOW_HOME_PATH: &str = "/_termdeck/assets/v8/window-home.js";
 const CODEX_PALETTE_PATH: &str = "/_termdeck/assets/v8/codex-palette.js";
 const TERMINAL_COPY_PATH: &str = "/_termdeck/assets/v8/terminal-copy.js";
 const TERMINAL_SCROLL_PATH: &str = "/_termdeck/assets/v8/terminal-scroll.js";
-const TERMINAL_SESSION_PATH: &str = "/_termdeck/assets/v8/terminal-session.js";
+const TERMINAL_SESSION_PATH: &str = "/_termdeck/assets/v9/terminal-session.js";
 const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v8/terminal.css";
 const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v8/terminal.js";
 const EXTERNAL_BASE_PATH: &str = "/t1000";
@@ -952,7 +953,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
             config.owner_id.clone(),
             config.tmux_executable.clone(),
             config.tmux_timeout,
-        )?))
+        )?.with_output_journal(config.database_path.parent().ok_or_else(|| std::io::Error::other("database parent missing"))?.join("durability"))))
     } else {
         None
     };
@@ -1104,6 +1105,7 @@ fn build_router(state: AppState) -> Router {
             "/_termdeck/api/v1/windows/{slug}/panes/{pane_id}/tab",
             axum::routing::post(tab_mutate),
         )
+        .route("/_termdeck/api/v1/windows/{slug}/panes/{pane_id}/recording", get(terminal_recording))
         .route(
             "/_termdeck/api/v1/windows/{slug}/panes/{pane_id}/capture",
             get(terminal_capture),
@@ -1887,7 +1889,15 @@ fn stream_controller_actor(context: &SessionContext) -> Result<String, Box<Respo
     Ok(actor)
 }
 
-fn resolve_pane(
+fn resolve_pane(cache: &SnapshotCache, slug: &str, pane_id: &str) -> Result<ResolvedPane, Box<Response>> {
+    let pane = resolve_saved_pane(cache, slug, pane_id)?;
+    if pane.tmux_target.is_empty() {
+        return Err(Box::new(json_error_response(StatusCode::CONFLICT, "pane-has-no-tmux-target")));
+    }
+    Ok(pane)
+}
+
+fn resolve_saved_pane(
     cache: &SnapshotCache,
     slug: &str,
     pane_id: &str,
@@ -1931,12 +1941,7 @@ fn resolve_pane(
             "pane-not-found",
         )));
     };
-    let Some(tmux_target) = pane.tmux_target() else {
-        return Err(Box::new(json_error_response(
-            StatusCode::CONFLICT,
-            "pane-has-no-tmux-target",
-        )));
-    };
+    let tmux_target = pane.tmux_target().unwrap_or("");
     Ok(ResolvedPane {
         window_name: window.name().to_owned(),
         session_id: pane.session_id().map(|value| value.as_str().to_owned()),
@@ -2315,6 +2320,7 @@ async fn terminal_websocket(
                 socket,
                 terminal,
                 StreamPane {
+                    journal_id: pane.session_id.unwrap_or_else(|| pane_id.clone()),
                     pane_id,
                     tmux_target: pane.tmux_target,
                 },
@@ -2323,6 +2329,38 @@ async fn terminal_websocket(
                 context,
             )
         })
+}
+
+async fn terminal_recording(
+    State(state): State<AppState>,
+    context: Option<Extension<SessionContext>>,
+    AxumPath((slug, pane_id)): AxumPath<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let (terminal, context) = match terminal_context(&state, context) { Ok(value) => value, Err(response) => return *response };
+    let pane = match resolve_saved_pane(&state.cache, &slug, &pane_id) { Ok(value) => value, Err(response) => return *response };
+    let journal_id = pane.session_id.unwrap_or(pane_id);
+    let mut generation = None;
+    let mut offset = None;
+    for part in query.as_deref().unwrap_or("").split('&').filter(|part| !part.is_empty()) {
+        match part.split_once('=') {
+            Some(("generation", value)) if generation.is_none() && value.len() <= 128 => generation = Some(value.to_owned()),
+            Some(("offset", value)) if offset.is_none() => match value.parse::<u64>() { Ok(value) => offset = Some(value), Err(_) => return json_error_response(StatusCode::BAD_REQUEST, "invalid-recording-position") },
+            _ => return json_error_response(StatusCode::BAD_REQUEST, "invalid-recording-position"),
+        }
+    }
+    let Some(root) = terminal.output_journal_root.clone() else { return json_error_response(StatusCode::SERVICE_UNAVAILABLE, "recording-unavailable"); };
+    let result = tokio::task::spawn_blocking(move || output_journal::read_page(&root, &journal_id, generation, offset.unwrap_or(8))).await;
+    let Some(auth) = state.auth.as_ref() else { return json_error_response(StatusCode::UNAUTHORIZED, "authentication-required"); };
+    let auth = Arc::clone(auth);
+    if !matches!(tokio::task::spawn_blocking(move || auth.require_session(&context, unix_ms())).await, Ok(Ok(_))) {
+        return json_error_response(StatusCode::UNAUTHORIZED, "authentication-required");
+    }
+    match result {
+        Ok(Ok(page)) => json_response(StatusCode::OK, &page),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => json_error_response(StatusCode::NOT_FOUND, "recording-not-found"),
+        _ => json_error_response(StatusCode::CONFLICT, "recording-unreadable"),
+    }
 }
 
 async fn terminal_capture(
@@ -6049,6 +6087,46 @@ mod auth_integration_tests {
                 let value = expect_json(super::terminal_error_response(error), status).await;
                 assert_eq!(value, serde_json::json!({"error":message}));
             }
+        });
+    }
+
+    #[test]
+    fn archived_recordings_require_login_and_saved_membership_without_live_tmux() {
+        runtime().block_on(async {
+            let mut fixture = fixture(&["Owner"]);
+            let root = fixture._directory.path().join("durability");
+            let journal = super::output_journal::Journal::new(&root, "session-one")
+                .unwrap_or_else(|error| panic!("journal fixture: {error}"));
+            // Use shared async writer to exercise the durable publication path.
+            let journal = Arc::new(std::sync::Mutex::new(journal));
+            super::output_journal::append(&journal, b"saved private output", Some((80,24))).await
+                .unwrap_or_else(|error| panic!("journal commit: {error}"));
+            fixture.state.terminal = Some(Arc::new(super::TerminalService::new(
+                id(OwnerId::new("owner-test")), PathBuf::from("/absent-tmux"), Duration::from_millis(10))
+                .unwrap_or_else(|error| panic!("terminal fixture: {error}")).with_output_journal(root)));
+            // This saved pane has no live tmux target at all.
+            let window_id = id(WindowId::new("window-random"));
+            let pane = PaneSnapshot::new(id(PaneId::new("pane-one")), Some(id(SessionId::new("session-one"))),
+                "Missing app", "/tmp", PaneStatus::Missing, None, None)
+                .unwrap_or_else(|error| panic!("missing pane fixture: {error}"));
+            let window = WindowSnapshot::new(window_id.clone(), "Random",
+                WindowRoute::restored(window_id, "random").unwrap_or_else(|error| panic!("route: {error}")), vec![pane], None)
+                .unwrap_or_else(|error| panic!("window: {error}"));
+            let snapshot = HostSnapshot::new(id(HostId::new("host-test")),id(OwnerId::new("owner-test")),2,unix_ms(),vec![window])
+                .unwrap_or_else(|error| panic!("snapshot: {error}"));
+            fixture.state.cache.publish(RenderedSnapshot::new(snapshot, None).unwrap_or_else(|error| panic!("render: {error}")))
+                .unwrap_or_else(|error| panic!("publish: {error}"));
+            let router = build_router(fixture.state.clone());
+            let path = "/_termdeck/api/v1/windows/random/panes/pane-one/recording";
+            assert_error(call(&router, request(Method::GET,path,Body::empty())).await,
+                StatusCode::UNAUTHORIZED,"authentication-required").await;
+            let cookies = pair(&router, fixture.invitations[0].as_str()).await;
+            let mut req = request(Method::GET,path,Body::empty()); req.headers_mut().insert(header::COOKIE,cookies.header.clone());
+            let value = expect_json(call(&router,req).await,StatusCode::OK).await;
+            assert_eq!(value["events"][0]["data_hex"],"73617665642070726976617465206f7574707574");
+            let mut req = request(Method::GET,"/_termdeck/api/v1/windows/random/panes/other-tab/recording",Body::empty());
+            req.headers_mut().insert(header::COOKIE,cookies.header);
+            assert_error(call(&router,req).await,StatusCode::NOT_FOUND,"pane-not-found").await;
         });
     }
 

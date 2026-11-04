@@ -1,4 +1,5 @@
 use crate::auth_http::HttpAuth;
+use crate::output_journal::{self, Journal, SharedJournal};
 use crate::terminal_http::{
     InputDecision, InputOutcome, MAX_CAPTURE_HISTORY_LINES, MAX_TERMINAL_INPUT_BYTES,
     TerminalControlView, TerminalError, TerminalService,
@@ -73,6 +74,7 @@ const PANE_STATE_FORMAT: &str = "#{pane_id}\t#{pane_pid}\t#{pane_width}\t#{pane_
 #[derive(Clone)]
 pub(crate) struct StreamPane {
     pub pane_id: String,
+    pub journal_id: String,
     pub tmux_target: String,
 }
 
@@ -83,6 +85,7 @@ pub(crate) enum StreamError {
     ControlClosed,
     ControlProtocol(&'static str),
     Io(std::io::Error),
+    Recording(std::io::Error),
     Json(serde_json::Error),
     SessionUnavailable,
     Terminal(TerminalError),
@@ -99,6 +102,7 @@ impl fmt::Display for StreamError {
             Self::ControlProtocol(detail) => {
                 write!(formatter, "tmux control protocol failed: {detail}")
             }
+            Self::Recording(error) => write!(formatter, "terminal recording failed; output paused: {error}"),
             Self::Io(error) => write!(formatter, "terminal stream I/O failed: {error}"),
             Self::Json(error) => write!(formatter, "terminal stream JSON failed: {error}"),
             Self::SessionUnavailable => {
@@ -116,7 +120,7 @@ impl fmt::Display for StreamError {
 impl Error for StreamError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Io(error) => Some(error),
+            Self::Io(error) | Self::Recording(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Terminal(error) => Some(error),
             _ => None,
@@ -295,6 +299,10 @@ async fn run_terminal_socket_inner(
                 .await?
         }
     };
+    let root = terminal.output_journal_root.clone().ok_or_else(|| StreamError::Recording(std::io::Error::other("recording root unavailable")))?;
+    let id = pane.journal_id.clone();
+    let journal: SharedJournal = Arc::new(std::sync::Mutex::new(tokio::task::spawn_blocking(move || Journal::new(&root, &id))
+        .await.map_err(|_| StreamError::Recording(std::io::Error::other("recording worker failed")))?.map_err(StreamError::Recording)?));
     let mut control = TmuxControl::spawn(
         terminal.tmux_executable(),
         pane.tmux_target.clone(),
@@ -310,6 +318,8 @@ async fn run_terminal_socket_inner(
     // the replay is sent stays queued (byte-bounded) and follows it in order.
     let replay = control.initial_replay().await?;
     let mut geometry = replay.geometry;
+    output_journal::append(&journal, &replay.bytes, Some((geometry.cols, geometry.rows))).await.map_err(StreamError::Recording)?;
+    require_stream_session(&auth, &context).await?;
     send_json(
         socket,
         &ResetEvent {
@@ -345,6 +355,8 @@ async fn run_terminal_socket_inner(
                 match notification {
                     ControlNotification::Output(output) => {
                         let output = control.coalesce_output(output);
+                        output_journal::append(&journal, &output, None).await.map_err(StreamError::Recording)?;
+                        require_stream_session(&auth, &context).await?;
                         send_sink_message(&mut sender, Message::Binary(output.into())).await?;
                     }
                     ControlNotification::ReplayBarrier(_) => {}
@@ -356,6 +368,7 @@ async fn run_terminal_socket_inner(
                                 &mut control,
                                 &control_view,
                                 viewport_geometry,
+                                &journal, &auth, &context,
                             )
                             .await?;
                         }
@@ -441,6 +454,7 @@ async fn run_terminal_socket_inner(
                                             &mut control,
                                             &control_view,
                                             viewport_geometry,
+                                &journal, &auth, &context,
                                         ).await?;
                                     } else {
                                         send_sink_json(&mut sender, &ResyncedEvent {
@@ -458,6 +472,7 @@ async fn run_terminal_socket_inner(
                                     &mut control,
                                     &control_view,
                                     viewport_geometry,
+                                &journal, &auth, &context,
                                 )
                                 .await?;
                             }
@@ -509,6 +524,9 @@ async fn send_sink_resync<S>(
     control: &mut TmuxControl,
     control_view: &TerminalControlView,
     viewport_geometry: TerminalGeometry,
+    journal: &SharedJournal,
+    auth: &Arc<HttpAuth>,
+    context: &SessionContext,
 ) -> Result<TerminalGeometry, StreamError>
 where
     S: futures_util::Sink<Message> + Unpin,
@@ -522,6 +540,8 @@ where
         .await?;
     let replay = control.initial_replay().await?;
     let geometry = replay.geometry;
+    output_journal::append(journal, &replay.bytes, Some((geometry.cols, geometry.rows))).await.map_err(StreamError::Recording)?;
+    require_stream_session(auth, context).await?;
     send_sink_json(
         sender,
         &ResetEvent {
@@ -545,6 +565,7 @@ where
 
 fn error_code(error: &StreamError) -> &'static str {
     match error {
+        StreamError::Recording(_) => "terminal-recording-failed",
         StreamError::SessionUnavailable => "authentication-required",
         StreamError::Backpressure => "viewer-backpressure",
         StreamError::ClientProtocol(_) | StreamError::Json(_) => "invalid-client-message",
@@ -2239,7 +2260,8 @@ mod tests {
                 let mut frame = vec![2];
                 frame.extend_from_slice(&9_u64.to_be_bytes());
                 frame.extend_from_slice(&batch);
-                let (_, parsed, kind) = parse_input_frame(&frame).expect("bounded wheel batch");
+                let (_, parsed, kind) = parse_input_frame(&frame)
+                    .unwrap_or_else(|error| panic!("bounded wheel batch: {error}"));
                 assert_eq!(parsed, batch);
                 assert_eq!(kind, InputKind::MouseWheel);
             }

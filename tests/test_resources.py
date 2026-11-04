@@ -654,3 +654,77 @@ class ResourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_omp_resume_requires_current_foreground_breadcrumb_and_native_identity(tmp_path, monkeypatch):
+    import shlex
+    executable = str(tmp_path / "bin" / "omp")
+    agent = tmp_path / ".omp" / "agent"
+    breadcrumbs = agent / "terminal-sessions"
+    breadcrumbs.mkdir(parents=True)
+    cwd = tmp_path / "work space"
+    cwd.mkdir()
+    native = agent / "exact session.jsonl"
+    native.write_text(json.dumps({"type": "title", "title": "private"}) + "\n" +
+        json.dumps({"type": "session", "id": "d2a7ed1b-d6fd-45de-8342-5f10cfed3c07", "cwd": str(cwd)}) + "\n")
+    native.chmod(0o600)
+    cwdstat = cwd.stat()
+    breadcrumb = breadcrumbs / "pts-17"
+    breadcrumb.write_text(f"{cwd}\n{native}\ncwdstat {cwdstat.st_dev} {cwdstat.st_ino}\n")
+    breadcrumb.chmod(0o600)
+    identity = {"tty_nr": 17, "pgrp": 123, "tpgid": 123, "starttime": 100}
+    monkeypatch.setattr(resources_module, "_parse_stat", lambda _: dict(identity))
+    monkeypatch.setattr(resources_module, "_process_cwd", lambda _: str(cwd))
+    monkeypatch.setattr(resources_module, "_process_environment", lambda _: {"HOME": str(tmp_path)})
+    monkeypatch.setattr(resources_module, "_boot_time", lambda: int(time.time()) - 30)
+    monkeypatch.setattr(resources_module.os, "readlink", lambda _: "/dev/pts/17")
+    result = resources_module._omp_recovery_metadata(123, [executable])
+    assert result == (shlex.join(["env", "HOME=" + str(tmp_path), "PI_CODING_AGENT_DIR=" + str(agent),
+                                 executable, "--resume", str(native)]), str(cwd))
+    identity["tpgid"] = 456
+    assert resources_module._omp_recovery_metadata(123, [executable]) is None
+    identity["tpgid"] = 123
+    os.utime(breadcrumb, (1, 1))
+    assert resources_module._omp_recovery_metadata(123, [executable]) is None
+    os.utime(breadcrumb, None)
+    original_header = native.read_bytes()
+    read_prefix = resources_module._owned_regular_prefix
+    def replace_native_after_read(path, limit):
+        value = read_prefix(path, limit)
+        if path == native:
+            native.write_text(json.dumps({"type": "session", "id": "e3a7ed1b-d6fd-45de-8342-5f10cfed3c07", "cwd": str(cwd)}) + "\n")
+        return value
+    with mock.patch.object(resources_module, "_owned_regular_prefix", side_effect=replace_native_after_read):
+        assert resources_module._omp_recovery_metadata(123, [executable]) is None
+    native.write_bytes(original_header)
+    assert resources_module._omp_recovery_metadata(123, [executable]) == result
+    reads = 0
+    def replace_after_final_read(path, limit):
+        nonlocal reads
+        value = read_prefix(path, limit)
+        if path == native:
+            reads += 1
+            if reads == 2:
+                native.write_text(json.dumps({"type": "session", "id": "e3a7ed1b-d6fd-45de-8342-5f10cfed3c07", "cwd": str(cwd)}) + "\n")
+        return value
+    with mock.patch.object(resources_module, "_owned_regular_prefix", side_effect=replace_after_final_read):
+        assert resources_module._omp_recovery_metadata(123, [executable]) is None
+    native.write_bytes(original_header)
+    native.write_text(json.dumps({"type": "session", "id": "not-an-id", "cwd": str(cwd)}) + "\n")
+    assert resources_module._omp_recovery_metadata(123, [executable]) is None
+    assert resources_module._omp_recovery_metadata(123, ["sh", "-c", "omp"]) is None
+
+
+
+def test_omp_owner_revalidator_rejects_process_generation_change(monkeypatch):
+    identity = {"starttime": 100, "tty_nr": 17, "pgrp": 123, "tpgid": 123}
+    monkeypatch.setattr(resources_module, "process_tree", lambda _: [123])
+    monkeypatch.setattr(resources_module, "_process_argv", lambda _: ["omp"])
+    monkeypatch.setattr(resources_module, "_parse_stat", lambda _: dict(identity))
+    metadata = ("omp --resume /exact/native.jsonl", "/work")
+    monkeypatch.setattr(resources_module, "_omp_recovery_metadata", lambda *_: metadata)
+    checks = []
+    assert resources_module.observe_recovery_metadata(123, owner_callback=checks.append) == (True, *metadata)
+    assert len(checks) == 1 and checks[0]()
+    identity["starttime"] += 1
+    assert not checks[0]()

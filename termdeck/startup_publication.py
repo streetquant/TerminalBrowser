@@ -154,6 +154,12 @@ def _launcher(site: Path, entries: dict) -> bytes:
             "    finally: os.close(fd)\n"
             "if sys.argv[1:] == ['--verify-only']: raise SystemExit(0)\n"
             "sys.path.insert(0, str(root))\n"
+            "if sys.argv[1:2] == ['--record-output']:\n"
+            "    from termdeck.output_journal import pipe_main\n"
+            "    raise SystemExit(pipe_main(sys.argv[2:]))\n"
+            "if sys.argv[1:2] == ['--mirror-recordings']:\n"
+            "    from termdeck.output_journal import mirror_main\n"
+            "    raise SystemExit(mirror_main(sys.argv[2:]))\n"
             "from termdeck.startup_recovery import main\n"
             "raise SystemExit(main())\n").encode()
 
@@ -252,7 +258,7 @@ def _unit(bundle: Path, managed: Path, state: Path, *,
             or any(not isinstance(name, str) or not name.strip()
                    for name in deferred_native_accounts)):
         raise StartupPublicationError("deferred native account list is invalid")
-    argv = ["/usr/bin/python3", "-I", "-B", bundle / "launch.py", "--db",
+    argv = ["/usr/bin/python3", "-I", "-B", bundle / "launch.py", "--watch", "--db",
             state / "sessions.sqlite3", "--managed-root", managed]
     for name in deferred_native_accounts:
         argv.extend(("--defer-native-account", name))
@@ -262,7 +268,7 @@ def _unit(bundle: Path, managed: Path, state: Path, *,
     return ("[Unit]\nDescription=Restore saved TermDeck terminals\n"
         "After=termdeck-web-backend.service\nPartOf=termdeck-web-backend.service\n"
         "BindsTo=termdeck-web-backend.service\n"
-        "[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=infinity\n"
+        "[Service]\nType=simple\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=15\n"
         "KillMode=control-group\n"
         f"UnsetEnvironment={' '.join(SELECTORS)}\n"
         f"Environment=HOME={argument(owner.pw_dir)}\n"

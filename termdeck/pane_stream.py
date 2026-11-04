@@ -689,11 +689,18 @@ class PaneStreamController:
         command_timeout: float = 5.0,
         client_factory: Callable[..., ControlModeClient] | None = None,
         setup_gate: StreamSetupGate | None = None,
+        observer_only: bool = False,
+        output_journal=None,
+        on_recording_error: Callable[[Exception], None] | None = None,
     ) -> None:
         self._attach_argv = list(attach_argv)
         self._target = attach_target(self._attach_argv)
         self._environment = dict(environment) if environment is not None else None
         self._cwd = cwd
+        self._observer_only = observer_only
+        self._output_journal = output_journal
+        self._on_recording_error = on_recording_error
+        self._recording_lock = threading.Lock()
         self._on_output = on_output
         self._on_pane_dead = on_pane_dead
         self._on_state_change = on_state_change
@@ -727,6 +734,7 @@ class PaneStreamController:
         self._ready = False
         self._pane_id: str | None = None
         self._pane_root_pid: int | None = None
+        self._observer_window_id: str | None = None
         self._pane_dead_reported = False
         self._replayed_history = False
         self._pending_output: list[bytes] = []
@@ -805,8 +813,14 @@ class PaneStreamController:
             self._unsent_input_chunks = 0
         if retry_timer is not None:
             retry_timer.cancel()
+        if self._observer_only:
+            # Detach through tmux's protocol before closing the transport.
+            # A fleet shutdown must not strand control clients in tmux's
+            # asynchronous exit path. This command targets this client only.
+            self._client.send_command("detach-client", timeout=0.25)
         self._client.stop()
         self._tasks.put(None)
+        # The last callback releases the journal; close after the worker drains.
         worker = self._worker
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=2.0)
@@ -821,6 +835,8 @@ class PaneStreamController:
         instead of replaying an ambiguous suffix after setup completes.
         """
 
+        if self._observer_only:
+            return False
         if not data:
             return True
         payload = bytes(data)
@@ -870,8 +886,11 @@ class PaneStreamController:
     # ------------------------------------------------------- event plumbing
 
     def _spawn_transport(self) -> subprocess.Popen[bytes]:
+        argv = control_attach_argv(self._attach_argv)
+        if self._observer_only:
+            argv += ["-f", "ignore-size,no-detach-on-destroy"]
         return spawn_control_transport(
-            control_attach_argv(self._attach_argv),
+            argv,
             self._environment,
             self._cwd,
         )
@@ -909,6 +928,16 @@ class PaneStreamController:
 
     def _handle_event(self, event: ControlEvent) -> None:
         if event.kind == "output":
+            if self._observer_only:
+                # Journal at ingress, including startup/replay and congestion.
+                # A slow consumer never drops bytes from this recording path.
+                with self._lock:
+                    if self._pane_id is not None and event.pane_id != self._pane_id:
+                        return
+                payload = (event.payload or "").encode("latin-1", "strict")
+                if payload:
+                    self._emit_output(payload)
+                return
             with self._lock:
                 if self._pane_id is not None and event.pane_id != self._pane_id:
                     return
@@ -935,6 +964,14 @@ class PaneStreamController:
                     return
             self._emit_output(payload)
             return
+        if self._observer_only and event.kind == "layout-change":
+            # Other sessions' layout notifications must never trigger another
+            # capture transaction for every recorder in a large fleet.
+            with self._lock:
+                matches = bool(event.args and event.args[0] == self._observer_window_id)
+            if matches:
+                self._tasks.put(("observer-geometry", None))
+            return
         if event.kind == "pane-exited":
             self._report_pane_dead()
             return
@@ -957,11 +994,25 @@ class PaneStreamController:
             except Exception:
                 pass
 
-    def _emit_output(self, payload: bytes) -> None:
-        try:
-            self._on_output(payload)
-        except Exception:
-            pass
+    def _emit_output(self, payload: bytes, *, geometry=None, reset=True) -> None:
+        # Serialize persistence and callbacks together: concurrent reader and
+        # setup-worker output must retain exactly the display order.
+        with self._recording_lock:
+            if self._stopped:
+                return
+            try:
+                if self._output_journal is not None:
+                    self._output_journal.append(payload, geometry=geometry, reset=reset)
+            except Exception as exc:
+                # Detach this observer only. Never stop the pane/application.
+                self.stop()
+                if self._on_recording_error is not None:
+                    self._on_recording_error(exc)
+                return
+            try:
+                self._on_output(payload)
+            except Exception:
+                pass
 
     # -------------------------------------------------------------- worker
 
@@ -981,6 +1032,8 @@ class PaneStreamController:
                     self._run_resize()
                 elif kind == "input":
                     self._run_input(argument)  # type: ignore[arg-type]
+                elif kind == "observer-geometry":
+                    self._observe_geometry()
             except Exception:
                 # The worker is the only consumer of this queue; it must
                 # survive any single failing command to keep input flowing.
@@ -988,6 +1041,20 @@ class PaneStreamController:
 
     def _command(self, command: str):
         return self._client.send_command(command, timeout=self._command_timeout)
+
+    def _observe_geometry(self):
+        reply = self._command(f"display-message -p -t {self._target} '#{{window_id}} #{{pane_width}} #{{pane_height}}'")
+        if not reply.ok or not reply.lines:
+            return None
+        window, cols, rows = reply.lines[0].split()
+        geometry = (int(cols), int(rows))
+        with self._lock:
+            changed = geometry != self._size
+            self._size = geometry
+            self._observer_window_id = window
+        if changed and self._ready:
+            self._emit_output(b"", geometry=geometry, reset=False)
+        return geometry
 
     def _release_unsent_input(self, data: bytes) -> None:
         with self._lock:
@@ -1045,12 +1112,15 @@ class PaneStreamController:
         return columns, rows
 
     def _run_resize(self) -> None:
+        if self._observer_only:
+            return
         with self._lock:
             self._resize_queued = False
             columns, rows = self._size
             pane_root_pid = self._pane_root_pid
         result = self._command(f"refresh-client -C {columns}x{rows}")
         if result.ok:
+            self._emit_output(b"", geometry=(columns, rows), reset=False)
             self._notify_resize_applied(
                 pane_root_pid=pane_root_pid,
                 columns=columns,
@@ -1140,7 +1210,17 @@ class PaneStreamController:
         repair_this_setup = self._on_resize_applied is not None and (
             self._repair_on_setup or self._replayed_history
         )
-        if not repair_this_setup:
+        if self._observer_only:
+            pane_state = read_pane_state()
+            if pane_state is None:
+                return False
+            pane_id = pane_state["pane_id"]
+            pane_root_pid = int(pane_state["pane_pid"])
+            geometry = self._observe_geometry()
+            if geometry is None:
+                return False
+            columns, rows = geometry
+        elif not repair_this_setup:
             # Preserve the historical one-resize/one-state-query transaction for
             # generic controllers and for the first attach of an exact-grid new
             # payload. Subsequent reconnects repair before replay.
@@ -1230,9 +1310,10 @@ class PaneStreamController:
         # Session-scoped subscription (empty "what" field). Pane-scoped
         # subscriptions never emit reliably on tmux 3.7; each managed session
         # hosts one pane, so the active-pane context is exact.
-        self._command(
-            f"refresh-client -B '{_DEAD_SUBSCRIPTION}::" "#{pane_dead}'"
-        )
+        if not self._observer_only:
+            self._command(
+                f"refresh-client -B '{_DEAD_SUBSCRIPTION}::" "#{pane_dead}'"
+            )
 
         replay = self._build_replay(pane_state, rows)
         if replay is None:
@@ -1254,9 +1335,11 @@ class PaneStreamController:
             self._replayed_history = True
             self._ready = True
         if replay:
-            self._emit_output(replay)
+            self._emit_output(replay, geometry=(columns, rows))
         if buffered:
             self._emit_output(buffered)
+        if self._stopped:
+            return True
         for index, data in enumerate(pending_input):
             try:
                 sent = self._send_input_bytes(pane_id, data)

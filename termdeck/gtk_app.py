@@ -570,8 +570,12 @@ class AttachTerminal(Gtk.Box):
         resize_applied_handler=None,
         repair_on_setup: bool = True,
         connect_enabled: bool = True,
+        output_journal_root: Path | None = None,
+        output_journal_session_id: str | None = None,
     ):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self._output_journal_root = output_journal_root
+        self._output_journal_session_id = output_journal_session_id
         self.argv = argv
         self.cwd = cwd
         self.theme = theme
@@ -1055,7 +1059,17 @@ class AttachTerminal(Gtk.Box):
         self._sync_stream_geometry(columns=columns, rows=rows, force=True)
         self._stream_generation += 1
         generation = self._stream_generation
+        from .output_journal import OutputJournal
+        try:
+            if self._output_journal_root is None or self._output_journal_session_id is None:
+                raise OSError("terminal recording identity unavailable")
+            journal = OutputJournal(self._output_journal_root, self._output_journal_session_id, primary=False)
+        except (OSError, ValueError) as exc:
+            self._recording_failed(exc)
+            return
         self.controller = PaneStreamController(
+            output_journal=journal,
+            on_recording_error=self._recording_failed,
             attach_argv=list(self.argv),
             environment=dict(self._child_environment),
             cwd=self.cwd,
@@ -1078,6 +1092,14 @@ class AttachTerminal(Gtk.Box):
                 # liveness boundary and must continue if promotion ever fails.
                 pass
         self.controller.start(columns=columns, rows=rows)
+
+    def _recording_failed(self, error):
+        def show_error():
+            label = Gtk.Label(label="Terminal output paused: recording failed. " + str(error))
+            label.set_wrap(True)
+            self.prepend(label)
+            return False
+        GLib.idle_add(show_error)
 
     def _remember_stream_scheduling_error(self, error: str) -> None:
         self._last_stream_scheduling_error = str(error or "")[-2000:]
@@ -6907,6 +6929,8 @@ class TermDeckWindow(Gtk.ApplicationWindow):
             ),
             font_override=self.zoomed_font(),
             child_environment=attach_environment,
+            output_journal_root=self.app_context.store.path.parent / "durability",
+            output_journal_session_id=record.id,
             prepare_target_handler=(prepare_target if launch_after_allocation else None),
             prepare_target_error_handler=(
                 prepare_target_failed if launch_after_allocation else None

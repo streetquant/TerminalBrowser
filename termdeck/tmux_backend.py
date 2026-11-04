@@ -3904,8 +3904,10 @@ class TmuxBackend:
                 if _authority_observations is not None and record.tag != "web-agent":
                     from .resources import observe_recovery_metadata_with_context
                     from .recovery_authority_context import AuthorityObservation, observation_is_current, record_cas
+                    owner_checks = []
                     observed, command, cwd, context = observe_recovery_metadata_with_context(
-                        record, pid, native_observer=self.native_context_observer)
+                        record, pid, native_observer=self.native_context_observer,
+                        owner_callback=owner_checks.append)
                     if observed and context is not None:
                         check = None
                         if context[0] is not None:
@@ -3916,6 +3918,9 @@ class TmuxBackend:
                             check = lambda r=check_record, pair=context, proc=resources._PROC, native=self.native_context_observer: observation_is_current(r, *pair, proc=proc, native_observer=native)
                         _authority_observations[record.id] = AuthorityObservation(
                             record_cas(record), *(context or (None, None)), is_current=check)
+                    elif observed and owner_checks:
+                        _authority_observations[record.id] = AuthorityObservation(
+                            record_cas(record), None, None, is_current=owner_checks[-1])
                 else:
                     observed, command, cwd = self._auth_recovery_metadata(record, pid)
             except (OSError, TmuxError, ValueError):

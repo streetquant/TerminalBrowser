@@ -1695,7 +1695,7 @@ os._exit(0)
                 busy_timeout = store.conn.execute("PRAGMA busy_timeout").fetchone()[0]
 
                 self.assertEqual(str(journal_mode).casefold(), "wal")
-                self.assertEqual(int(synchronous), 1)  # SQLite NORMAL
+                self.assertEqual(int(synchronous), 2)  # SQLite FULL: committed metadata is durable.
                 self.assertEqual(int(busy_timeout), 1000)
             finally:
                 store.close()

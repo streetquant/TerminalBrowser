@@ -3,7 +3,7 @@ import {readFileSync} from "node:fs";
 import {test} from "node:test";
 import vm from "node:vm";
 const source = readFileSync(process.env.TERMINAL_SESSION_SOURCE || new URL("../../crates/termdeck-web-server/assets/terminal-session.js", import.meta.url), "utf8");
-function fixture() {
+function fixture(options = {}) {
   let now=0, next=0, geometry={cols:80,rows:24}, layout, input, scrollOptions, wheelInput=false;
   const timers=new Map(), sockets=[], writes=[], callbacks=[];
   const timeout=(fn,ms=0)=>{timers.set(++next,{fn,at:now+ms});return next};
@@ -16,17 +16,17 @@ function fixture() {
     send(v){this.sent.push(typeof v==='string'?JSON.parse(v):v)}
     close(code,reason){this.closed={code,reason};this.readyState=3}
   }
-  class Element {constructor(){this.dataset={};this.hidden=true;this.textContent=''} addEventListener(){} setAttribute(){} contains(){return false}}
+  class Element {constructor(){this.dataset={};this.hidden=true;this.textContent=''} addEventListener(){} setAttribute(){} contains(){return false} append(){} before(){} remove(){} replaceChildren(){}}
   const host=new Element(), status=new Element(), overlay=new Element();
   const api={terminal:{rows:24,blur(){},resize(){},refresh(){}},
     fit:()=>({...geometry}),dimensions:()=>({...geometry}),fitGrid(){},reset(){},
     write(bytes,done){writes.push(bytes);callbacks.push(done)},onData(fn){input=fn},focus(){},dispose(){},activateWebgl(){}};
-  const window={TermDeckTerminal:{createTerminal(_host,options){layout=options.onLayoutChange;return api}},T1000UI:{preferences:()=>({})},
+  const window={fetch:options.fetch || (async()=>({ok:false,status:404})),TermDeckTerminal:{createTerminal(_host,options){layout=options.onLayoutChange;return api}},T1000UI:{preferences:()=>({})},
     T1000TerminalCopy:{install:()=>()=>{}},T1000TerminalScroll:{install:(_host,_api,options)=>{scrollOptions=options;return {isWheelInput:()=>wheelInput,dispose(){}}}},
     setTimeout:timeout,clearTimeout:id=>timers.delete(id),requestAnimationFrame:fn=>timeout(fn,16),cancelAnimationFrame:id=>timers.delete(id),
     setInterval:()=>++next,clearInterval(){},addEventListener(){},removeEventListener(){},navigator:{onLine:true},location:{protocol:'http:',host:'fixture'}};
-  const document={visibilityState:'visible',hidden:false,body:new Element(),addEventListener(){},removeEventListener(){},hasFocus:()=>false};
-  vm.runInNewContext(source,{window,document,WebSocket:Socket,ResizeObserver:class{observe(){} disconnect(){}},Uint8Array,ArrayBuffer,TextEncoder,DataView,Map,Date});
+  const document={createElement:()=>new Element(),visibilityState:'visible',hidden:false,body:new Element(),addEventListener(){},removeEventListener(){},hasFocus:()=>false};
+  vm.runInNewContext(source,{window,document,WebSocket:Socket,ResizeObserver:class{observe(){} disconnect(){}},Uint8Array,ArrayBuffer,TextEncoder,DataView,Map,Date,URLSearchParams});
   const mount=window.T1000TerminalSession.mount('fixture','td-test',host,status,overlay,{appPath:s=>s,isRecord:v=>v && typeof v==='object',nonNegativeInteger:v=>v,errorMessage:e=>e.message});
   const ws=sockets[0];ws.readyState=1;ws.emit('open',{});
   const control={schema:'termdeck.terminal-control.v1',mine:true,epoch:1,next_sequence:1};
@@ -87,4 +87,29 @@ test('viewer, deactivated and unavailable streams cannot send a passive wheel ba
  f.event({type:'control',control:{schema:'termdeck.terminal-control.v1',mine:true,epoch:3,next_sequence:1}});await tick();
  f.mount.deactivate();f.wheel([wheelUp]);assert.equal(frames(f).length,0);
  f.mount.setPaneState({status:'stopped',hasTerminal:false});f.wheel([wheelUp]);assert.equal(frames(f).length,0);f.mount.dispose();
+});
+
+
+test('saved output replays after pane loss and never authorizes terminal input',async()=>{
+ const pages=[{generation:'g',generations:['g'],next_offset:64,complete:true,truncated_tail:false,
+ events:[{kind:0,cols:80,rows:24,data_hex:'7361766564206f7574707574'}]}];
+ let requests=[];
+ const f=fixture({fetch:async(path,options)=>{requests.push({path,options});return {ok:true,json:async()=>pages.shift()}}});
+ f.mount.setPaneState({status:'missing',hasTerminal:false});
+ for(let i=0;i<5;i++)await tick();
+ assert.equal(f.writes.length,1);assert.equal(new TextDecoder().decode(f.writes[0]),'saved output');
+ f.callbacks.shift()();await tick();
+ f.type('must not send');f.advance(100);
+ assert.equal(frames(f).length,0);assert.equal(f.ws.closed.code,1000);
+ assert.match(requests[0].path,/panes\/td-test\/recording/);assert.equal(requests[0].options.credentials,'same-origin');
+ assert.equal(f.overlay.hidden,true);f.mount.dispose();
+});
+
+test('missing recording preserves the existing display and keeps input disabled',async()=>{
+ const f=fixture({fetch:async()=>({ok:false,status:404})});
+ f.bytes(5);await tick();f.callbacks.shift()();await tick();
+ f.mount.setPaneState({status:'missing',hasTerminal:false});
+ await tick();await tick();
+ assert.equal(f.writes.length,1);assert.match(f.overlay.textContent,/No saved output/);
+ f.type('forbidden');f.advance(100);assert.equal(frames(f).length,0);f.mount.dispose();
 });

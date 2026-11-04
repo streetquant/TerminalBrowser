@@ -106,7 +106,7 @@ def test_publication_and_inverse_preserve_unrelated_files(layout):
     unit = (layout[3] / publication.SERVICE).read_text()
     assert "WantedBy=termdeck-web-backend.service" in unit
     assert "PartOf=termdeck-web-backend.service" in unit
-    assert "RemainAfterExit=yes" in unit
+    assert "Type=simple" in unit and '"--watch"' in unit and "Restart=on-failure" in unit
     assert "restart" not in unit
     assert all(selector in unit for selector in publication.SELECTORS)
     owner = publication.pwd.getpwuid(os.geteuid())

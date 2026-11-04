@@ -938,3 +938,41 @@ class TransportParentDeathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_durable_commit_precedes_output_and_failure_detaches_only_viewer(tmp_path):
+    from termdeck.output_journal import OutputJournal, read_page
+    seen = []
+    journal = OutputJournal(tmp_path / "durability", "tab")
+    def output(data):
+        page = read_page(tmp_path / "durability", "tab")
+        assert bytes.fromhex(page["events"][-1]["data_hex"]) == data
+        seen.append(data)
+    errors = []
+    controller = PaneStreamController(attach_argv=["tmux", "attach-session", "-t", "test"],
+        on_output=output, output_journal=journal, on_recording_error=errors.append,
+        client_factory=FakeControlClient)
+    controller._emit_output(b"committed")
+    assert seen == [b"committed"]
+    with mock.patch.object(journal, "append", side_effect=OSError("ENOSPC")):
+        controller._emit_output(b"must not display")
+    assert seen == [b"committed"] and len(errors) == 1
+    assert not controller.send_bytes(b"must not reach app")
+    assert not controller._pane_dead_reported
+    journal.close()
+
+
+def test_headless_recorder_records_output_at_ingress_before_setup(tmp_path):
+    from termdeck.output_journal import OutputJournal, read_page
+    journal = OutputJournal(tmp_path / "durability", "tab")
+    controller = PaneStreamController(attach_argv=["tmux", "attach-session", "-t", "test"],
+        on_output=lambda _: None, output_journal=journal, observer_only=True,
+        client_factory=FakeControlClient)
+    assert not controller._ready
+    controller._handle_event(ControlEvent("output", "", (), "%1", "background output"))
+    assert bytes.fromhex(read_page(tmp_path / "durability", "tab")["events"][0]["data_hex"]) == b"background output"
+    assert not controller.send_bytes(b"forbidden")
+    with mock.patch.object(controller, "_command") as command:
+        controller._run_resize()
+        command.assert_not_called()
+    controller.stop(); journal.close()

@@ -88,6 +88,97 @@ window.T1000TerminalSession = (() => {
         onMouseWheelBatch: dispatchWheelBatch,
         onApplicationScroll: (direction, count = 1) => enqueueWheel(new TextEncoder().encode((direction === "up" ? "\x1b[5~" : "\x1b[6~").repeat(count)), 3)});
 
+    let archiveMode = false;
+    let archiveRequest = 0;
+    const recordingControls = document.createElement("div");
+    const recordingButton = document.createElement("button");
+    recordingButton.textContent = "Saved output";
+    recordingButton.type = "button";
+    const recordingSelect = document.createElement("select");
+    recordingSelect.setAttribute("aria-label", "Saved output generation");
+    recordingSelect.hidden = true;
+    const liveButton = document.createElement("button");
+    liveButton.textContent = "Live terminal";
+    liveButton.type = "button";
+    liveButton.hidden = true;
+    recordingControls.append(recordingButton, recordingSelect, liveButton);
+    host.before(recordingControls);
+    recordingButton.addEventListener("click", () => showRecording());
+    recordingSelect.addEventListener("change", () => showRecording(recordingSelect.value));
+    liveButton.addEventListener("click", () => {
+      archiveRequest += 1;
+      archiveMode = false;
+      liveButton.hidden = true;
+      setOverlay("");
+      connect();
+    });
+
+    async function showRecording(selectedGeneration) {
+      const request = ++archiveRequest;
+      archiveMode = true;
+      retireStream("viewing saved output");
+      liveButton.hidden = !streamAllowed();
+      setStatus("Loading saved output…", "recovery");
+      let generation = selectedGeneration;
+      let offset = 8;
+      try {
+        while (!disposed && request === archiveRequest) {
+          const query = new URLSearchParams({offset: String(offset)});
+          if (generation) query.set("generation", generation);
+          const path = `/_termdeck/api/v1/windows/${encodeURIComponent(windowSlug)}/panes/${encodeURIComponent(paneId)}/recording?${query}`;
+          const response = await window.fetch(appPath(path), {credentials: "same-origin", cache: "no-store"});
+          if (!response.ok) throw new Error(response.status === 404 ? "No saved output is available for this tab yet." : "Saved output could not be read.");
+          const page = await response.json();
+          if (disposed || request !== archiveRequest) return;
+          if (!isRecord(page) || !Array.isArray(page.events) || typeof page.generation !== "string"
+            || !Number.isSafeInteger(page.next_offset) || page.next_offset < offset) throw new Error("Invalid saved output response.");
+          generation = page.generation;
+          if (offset === 8) {
+            recordingSelect.replaceChildren();
+            for (const name of page.generations || [generation]) {
+              const option = document.createElement("option");
+              option.value = name;
+              option.textContent = name;
+              recordingSelect.append(option);
+            }
+            recordingSelect.value = generation;
+            recordingSelect.hidden = false;
+            // Wait for pending live writes before the first archived reset.
+            flushTerminalOutput();
+            await outputChain;
+          }
+          setOverlay("");
+          for (const event of page.events) {
+            if (disposed || request !== archiveRequest) return;
+            if (![0, 1, 2].includes(event.kind) || typeof event.data_hex !== "string" || event.data_hex.length % 2
+              || !/^[0-9a-f]*$/.test(event.data_hex) || event.data_hex.length > 2 * 8 * 1024 * 1024) throw new Error("Invalid saved output frame.");
+            if (event.kind === 0) queueTerminalReset({cols: event.cols, rows: event.rows});
+            if (event.kind === 2) {
+              const geometry = requiredGeometry({cols: event.cols, rows: event.rows});
+              canonicalGeometry = geometry;
+              fitCanonical(geometry);
+            }
+            const bytes = new Uint8Array(event.data_hex.length / 2);
+            for (let i = 0; i < bytes.length; i += 1) bytes[i] = parseInt(event.data_hex.slice(i * 2, i * 2 + 2), 16);
+            queueTerminalWrite(bytes);
+            flushTerminalOutput();
+            await outputChain;
+          }
+          if (page.complete) {
+            setStatus(page.truncated_tail ? "Saved output · incomplete final write omitted · read only" : "Saved output · read only", "recovery");
+            return;
+          }
+          if (page.next_offset <= offset) throw new Error("Saved output did not advance.");
+          offset = page.next_offset;
+        }
+      } catch (error) {
+        if (!disposed && request === archiveRequest) {
+          setStatus("Saved output unavailable", "recovery");
+          setOverlay(errorMessage(error));
+        }
+      }
+    }
+
     function streamAllowed() {
       return paneState.hasTerminal && (paneState.status === "running" || paneState.status === "paused");
     }
@@ -150,6 +241,9 @@ window.T1000TerminalSession = (() => {
       paneState = { status: value.status, hasTerminal: value.hasTerminal, terminalTarget };
       if (streamAllowed()) {
         if (!wasAllowed || targetChanged) {
+          archiveRequest += 1;
+          archiveMode = false;
+          liveButton.hidden = true;
           if (wasAllowed && targetChanged) retireStream("saved terminal target changed");
           recoveryInputNotice = "";
           reconnectAttempt = 0;
@@ -163,10 +257,11 @@ window.T1000TerminalSession = (() => {
       const [message, detail] = recoveryMessage();
       setStatus(message, "recovery");
       setOverlay(detail + recoveryInputNotice);
+      if (changed && paneState.status !== "unknown") void showRecording();
     }
 
     function requestControl() {
-      if (!active || disposed || !streamAllowed()) return;
+      if (!active || disposed || archiveMode || !streamAllowed()) return;
       if (ready && socketOpen()) {
         if (!focusPending) focusPending = sendJson({ type: "focus" });
       } else {
@@ -734,7 +829,7 @@ window.T1000TerminalSession = (() => {
     }
 
     function connect() {
-      if (!streamAllowed()) return;
+      if (archiveMode || !streamAllowed()) return;
       if (disposed || !active || !networkOnline) {
         if (!networkOnline) {
           setStatus("Offline", "offline");
@@ -885,6 +980,7 @@ window.T1000TerminalSession = (() => {
 
     return {
       setPaneState,
+      showRecording,
       deactivate() {
         flushInputBatch(true);
         active = false;
@@ -917,6 +1013,8 @@ window.T1000TerminalSession = (() => {
           return;
         }
         disposed = true;
+        archiveRequest += 1;
+        recordingControls.remove();
         clearViewportResize();
         observer.disconnect();
         window.clearTimeout(reconnectTimer);

@@ -44,10 +44,27 @@ def test_only_explicit_quiescent_retry_can_reconcile_absent_prior_owner(store, t
     path = _dead_attempt(tmp_path, item, state, legacy)
     backend = Backend()
     normal = run(store, backend, tmp_path)
-    assert normal["counts"] == {"blocked": 1}
-    assert backend.created == []
+    auto_ready = state in {"ready", "pending"} and not legacy
+    assert normal["counts"] == ({"ready": 1} if auto_ready else {"blocked": 1})
+    assert backend.created == ([item.id] if auto_ready else [])
     repaired = run(store, backend, tmp_path, session_ids={item.id}, retry_quiescent=True)
-    assert repaired["counts"] == {"ready": 1}
+    assert repaired["counts"] == ({"blocked": 1} if auto_ready else {"ready": 1})
+    assert backend.created == [item.id]
+    assert json.loads(path.read_text())["attempts"][item.id]["state"] == "ready"
+    assert run(store, backend, tmp_path, session_ids={item.id}, retry_quiescent=True)["counts"] == {"blocked": 1}
+    assert backend.created == [item.id]
+
+
+def test_interrupted_automatic_retry_has_a_finite_budget(store, tmp_path):
+    item = record(store, tmp_path)
+    path = _dead_attempt(tmp_path, item, "pending")
+    payload = json.loads(path.read_text())
+    payload["attempts"][item.id]["interrupted_retries"] = 1
+    path.write_text(json.dumps(payload))
+    backend = Backend()
+    assert run(store, backend, tmp_path)["counts"] == {"blocked": 1}
+    assert backend.created == []
+    assert run(store, backend, tmp_path, session_ids={item.id}, retry_quiescent=True)["counts"] == {"ready": 1}
     assert backend.created == [item.id]
     assert json.loads(path.read_text())["attempts"][item.id]["state"] == "ready"
     assert run(store, backend, tmp_path, session_ids={item.id}, retry_quiescent=True)["counts"] == {"blocked": 1}

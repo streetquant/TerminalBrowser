@@ -15,6 +15,7 @@ license = "MIT"
 authors = ["t1000 contributors"]
 
 [workspace.dependencies]
+fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash", "zeroize"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "ws"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }

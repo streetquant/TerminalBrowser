@@ -110,6 +110,9 @@ def _load_attempts(path: Path, boot: str) -> dict[str, dict[str, object]]:
                 or entry.get("owner_boot") != payload.get("boot_id")
             ):
                 raise StartupRecoveryError("startup recovery attempt owner is invalid")
+            if (type(entry.get("interrupted_retries", 0)) is not int
+                    or not 0 <= entry.get("interrupted_retries", 0) <= 1):
+                raise StartupRecoveryError("startup recovery retry budget is invalid")
     else:
         raise StartupRecoveryError("startup recovery attempt record is invalid")
     return dict(attempts) if payload.get("boot_id") == boot else {}
@@ -186,9 +189,10 @@ def recover_saved_terminals(store, backend, *, runtime_root: Path,
                             overall_timeout: float = 1800) -> dict[str, object]:
     """Recover durably eligible missing panes through the shared owner.
 
-    Live panes receive no input or lifecycle action. A failed or interrupted
-    attempt is observable and can be retried only with exact operator selection,
-    an absent prior process generation, native writer locks and missing-pane proof.
+    Live panes receive no input or lifecycle action. Previously ready attempts
+    may recover after their owner disappears and the pane is authoritatively
+    lost. Interrupted attempts have one automatic quiescent retry per input and
+    boot. Failed/legacy attempts still require exact operator selection.
     """
     if (not math.isfinite(overall_timeout) or overall_timeout <= 0
             or not math.isfinite(readiness_timeout) or readiness_timeout <= 0):
@@ -310,16 +314,24 @@ def recover_saved_terminals(store, backend, *, runtime_root: Path,
                     continue
                 digest = _input_digest(record)
                 entry = attempts.get(record.id)
+                interrupted_retries = 0
                 if entry is not None and entry["digest"] == digest:
-                    if not retry_quiescent or not _retry_is_quiescent(
+                    interrupted_retries = entry.get("interrupted_retries", 0)
+                    interrupted = entry["state"] == "pending" and interrupted_retries < 1
+                    if not (retry_quiescent or entry["state"] == "ready" or interrupted) or not _retry_is_quiescent(
                         record, entry, digest, boot, store, backend, coordinator
                     ):
                         outcomes[record.id] = {"id": record.id, "state": "blocked",
                                               "reason": "already-attempted-this-boot",
                                               "attempt_state": entry["state"]}
                         continue
+                    if interrupted and not retry_quiescent:
+                        interrupted_retries += 1
+                    elif entry["state"] == "ready":
+                        interrupted_retries = 0
                 with condition:
-                    attempts[record.id] = {"digest": digest, "state": "pending", **owner}
+                    attempts[record.id] = {"digest": digest, "state": "pending",
+                                          "interrupted_retries": interrupted_retries, **owner}
                     _save_attempts(attempts_path, boot, attempts)
                     pending.add(record.id)
                 try:
@@ -421,9 +433,18 @@ def _worker_deadline():
 def main(argv=None) -> int:
     import sys
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["--record-output"]:
+        from .output_journal import pipe_main
+        return pipe_main(arguments[1:])
+    if arguments[:1] == ["--mirror-recordings"]:
+        from .output_journal import mirror_main
+        return mirror_main(arguments[1:])
     if arguments[:1] == ["--track-directories"]:
         from .directory_tracking import main as track_directories
         return track_directories(arguments[1:])
+    if arguments[:1] == ["--watch"]:
+        from .session_durability import watch_recovery
+        return watch_recovery(arguments[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=None)
     parser.add_argument("--managed-root", type=Path, required=True)

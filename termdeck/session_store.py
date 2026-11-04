@@ -2323,8 +2323,8 @@ class SessionStore:
         if self.provision_auth_scopes:
             self.auth_root.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.auth_root.chmod(0o700)
-        # Keep the GUI responsive if a second TermDeck/CLI process briefly
-        # holds the registry, and avoid a full fsync for every tab-state update.
+        # Keep lock waits bounded while making committed launch/layout state
+        # durable across power loss, rather than only across process crashes.
         sqlite_path = (
             self._database_binding.sqlite_path
             if self._database_binding is not None
@@ -2361,9 +2361,7 @@ class SessionStore:
         try:
             mode = self.conn.execute("PRAGMA journal_mode = WAL").fetchone()
             if mode and str(mode[0]).casefold() == "wal":
-                # WAL + NORMAL preserves database consistency while avoiding
-                # a storage flush on every small UI metadata transaction.
-                self.conn.execute("PRAGMA synchronous = NORMAL")
+                self.conn.execute("PRAGMA synchronous = FULL")
         except sqlite3.DatabaseError:
             # Some unusual filesystems cannot host WAL sidecars. SQLite's
             # default journal remains a safe compatibility fallback.

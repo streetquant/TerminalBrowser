@@ -9,6 +9,7 @@ description = "Bounded loopback HTTP server for the read-only t1000 state mirror
 publish = false
 
 [dependencies]
+fs4.workspace = true
 axum.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
