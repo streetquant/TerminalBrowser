@@ -281,3 +281,63 @@ def test_mirror_does_not_block_new_appends_or_copy_future_watermark(tmp_path):
     mirror_journals(root, target)
     assert len(read_page(target, "tab")["events"]) == 2
     journal.close()
+
+
+def test_stalled_writer_backlog_closes_only_disposable_sink(tmp_path):
+    import shlex
+    import time
+    runtime = tmp_path / 'tmux'
+    runtime.mkdir(mode=0o700)
+    env = dict(os.environ, TMUX_TMPDIR=str(runtime))
+    for key in ('TMUX', 'TMUX_PANE', 'TERMDECK_TMUX_RUNTIME', 'TERMDECK_TMUX_IDENTITY'):
+        env.pop(key, None)
+    def tmux(*args):
+        return subprocess.check_output(['/usr/bin/tmux', *args], env=env, text=True, timeout=5).strip()
+    def rss(pid):
+        return next(int(line.split()[1]) for line in Path(f'/proc/{pid}/status').read_text().splitlines()
+                    if line.startswith('VmRSS:'))
+    script = tmp_path / 'stalled-sink.py'
+    script.write_text('''import os,sys,time
+sys.path.insert(0,sys.argv[3])
+from pathlib import Path
+from termdeck.output_journal import OutputJournal,_pipe_input
+j=OutputJournal(Path(sys.argv[1]),'tab')
+j.append(b'committed before stalled writer')
+pending=_pipe_input(0)
+Path(sys.argv[2]).write_text(str(os.getpid()))
+time.sleep(30) # Disk writer intentionally makes no progress; reader must bound it.
+''')
+    root, identity = tmp_path / 'durability', tmp_path / 'sink-pid'
+    try:
+        tmux('new-session', '-d', '-s', 'disposable', '-x', '91', '-y', '27',
+             '/bin/bash --noprofile --norc')
+        before = tmux('display-message', '-p', '-t', 'disposable', '#{pane_pid} #{pane_width} #{pane_height}')
+        server = int(tmux('display-message', '-p', '#{pid}'))
+        initial_rss = peak_rss = rss(server)
+        command = 'exec ' + shlex.join([sys.executable, str(script), str(root), str(identity), str(Path(__file__).resolve().parents[1])])
+        tmux('pipe-pane', '-O', '-t', 'disposable', command)
+        deadline = time.monotonic() + 10
+        while not identity.exists():
+            assert time.monotonic() < deadline
+            time.sleep(.005)
+        tmux('send-keys', '-t', 'disposable', '-l', "head -c 16777216 /dev/zero | tr '\\000' Q")
+        tmux('send-keys', '-t', 'disposable', 'Enter')
+        while tmux('display-message', '-p', '-t', 'disposable', '#{pane_pipe}') != '0':
+            peak_rss = max(peak_rss, rss(server))
+            assert time.monotonic() < deadline
+            time.sleep(.005)
+        assert peak_rss - initial_rss < 64 * 1024
+        assert not Path('/proc/' + identity.read_text()).exists()
+        marker = 'APP_STILL_RUNNING_AFTER_BACKLOG'
+        escaped = ''.join(f'\\x{byte:02x}' for byte in marker.encode())
+        tmux('send-keys', '-t', 'disposable', '-l', "printf '\\n" + escaped + "\\n'")
+        tmux('send-keys', '-t', 'disposable', 'Enter')
+        while marker not in tmux('capture-pane', '-p', '-t', 'disposable'):
+            peak_rss = max(peak_rss, rss(server))
+            assert time.monotonic() < deadline
+            time.sleep(.005)
+        assert peak_rss - initial_rss < 64 * 1024
+        assert tmux('display-message', '-p', '-t', 'disposable', '#{pane_pid} #{pane_width} #{pane_height}') == before
+        assert [bytes.fromhex(e['data_hex']) for e in read_page(root, 'tab')['events']] == [b'committed before stalled writer']
+    finally:
+        subprocess.run(['/usr/bin/tmux', 'kill-server'], env=env, capture_output=True, timeout=5)

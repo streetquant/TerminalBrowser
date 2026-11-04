@@ -55,7 +55,11 @@ and web writers. Killing the whole server/account can still lose background
 bytes in flight. Recording starts at attachment; earlier output exists only to
 the extent retained by tmux or snapshots. A failed sink leaves the application
 running and its committed history intact. Retry is bounded and never removes an
-ambiguous or user-owned pipe.
+ambiguous or user-owned pipe. A separate input reader bounds queued recording
+bytes to 4 MiB (plus one 64 KiB read). If storage cannot keep up, it closes only
+the recording sink so tmux can discard that pipe's backlog; the application
+continues and the last committed prefix remains readable. Output past that
+failure point is not claimed as recorded.
 
 Independent tabs may flush concurrently through `.journal-copy.lock`. The normal
 SSD mirror copies and validates each generation's committed prefix without

@@ -228,7 +228,12 @@ def maintain_recorders(store, backend, root, recorders, *, recorder_launcher=Non
         commands = shlex.join(["pipe-pane", "-O", "-t", pane_id, command]) + " ; " + shlex.join([
             "capture-pane", "-p", "-e", "-J", "-t", pane_id, "-S", "-10000"])
         install = backend._run(["if-shell", "-F", "-t", pane_id,
-                               "#{==:#{pane_pipe},0}", commands], check=False, timeout=2)
+                               "#{==:#{pane_pipe},0}", commands,
+                               "display-message -p T1000_RECORDING_PIPE_OCCUPIED"], check=False, timeout=2)
+        if install.stdout.strip() == "T1000_RECORDING_PIPE_OCCUPIED":
+            print(json.dumps({"action": "record-output", "session_id": record.id,
+                "coverage": "existing-unowned-pipe", "preserved": True}), flush=True)
+            continue
         replay = b""
         if not install.returncode and len(install.stdout.encode()) <= MAX_SCREEN_BYTES:
             replay = b"\x1b[0m\x1b[2J\x1b[H" + install.stdout.replace("\n", "\r\n").encode()

@@ -351,6 +351,7 @@ def test_pipe_restart_preserves_user_pipe_and_live_writer_lease(tmp_path, monkey
         monkeypatch.setattr(backend, '_run', occupy_after_inventory)
         maintain_recorders(store, backend, root, recorders, recorder_launcher=launcher)
         assert user.id not in recorders and own.id in recorders
+        assert racing.id not in recorders
         output(racing, 'RACING_USER_PIPE_SURVIVED')
         wait_for(lambda: race_log.exists() and 'RACING_USER_PIPE_SURVIVED' in race_log.read_text())
         assert not list((root / 'journals' / racing.id).glob('*.tdj'))

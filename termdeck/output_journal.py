@@ -235,6 +235,30 @@ def pipe_owner(root: Path, session_id: str, pane_id: str, server_pid: int, serve
         return None
 
 
+def _pipe_input(fd):
+    """Drain independently of disk I/O; fail the sink at a finite backlog.
+
+    Closing the input on overflow lets tmux discard this pipe's output buffer.
+    Never let a stalled fsync turn our pipe into an unbounded server buffer.
+    The last published watermark remains the only advertised durable prefix.
+    """
+    import queue
+    pending = queue.Queue(maxsize=64)  # At most 4 MiB plus one 64 KiB read.
+    def collect():
+        try:
+            while data := os.read(fd, 64 * 1024):
+                try:
+                    pending.put_nowait(data)
+                except queue.Full:
+                    os.close(fd)
+                    print("terminal recording failed: output backlog exceeded 4 MiB", file=sys.stderr, flush=True)
+                    os._exit(1)  # Only this sink; the pane/app stays untouched.
+        finally:
+            pending.put(None)
+    threading.Thread(target=collect, name="terminal-recording-input", daemon=True).start()
+    return pending
+
+
 def pipe_main(argv=None):
     """A tmux-owned output sink; it outlives every UI and observer process."""
     from .resources import _parse_stat
@@ -259,6 +283,7 @@ def pipe_main(argv=None):
         if (pane is None or server is None or pane["starttime"] != args.pane_start
                 or server["starttime"] != args.server_start or os.getppid() != args.server_pid):
             raise OSError("recording pane/server generation changed")
+        pending = _pipe_input(0)
         directory = journal_directory(args.root, args.session_id)
         lease_fd = os.open(directory / ".primary.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         primary_lease = os.fdopen(lease_fd, "rb", buffering=0)
@@ -295,12 +320,15 @@ def pipe_main(argv=None):
             pid=os.getpid(), starttime=own["starttime"], argv=_process_argv(os.getpid()),
             token=args.token, generation=journal.generation)
         _atomic(journal.directory / "pipe-owner.json", json.dumps(owner).encode())
-        import select
+        import queue
         import termios
         geometry = (args.columns, args.rows)
         current_pid, current_start = args.pane_pid, args.pane_start
         while True:
-            ready, _, _ = select.select([0], [], [], 1)
+            try:
+                data = pending.get(timeout=1)
+            except queue.Empty:
+                data = b""
             try:
                 with _open_read(journal.directory / "pane-current.json") as stream:
                     current_pane = json.loads(stream.read(4096))
@@ -326,12 +354,10 @@ def pipe_main(argv=None):
                 finally:
                     if fd is not None:
                         os.close(fd)
-            if not ready:
-                continue
-            data = os.read(0, 64 * 1024)
-            if not data:
+            if data is None:
                 break
-            journal.append(data)
+            if data:
+                journal.append(data)
         return 0
     except (OSError, ValueError, KeyError, TypeError) as exc:
         # A dead sink is detected by the observer without touching the pane.
