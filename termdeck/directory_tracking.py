@@ -140,8 +140,8 @@ class PipeObserver:
 def maintain_recorders(store, backend, root, recorders, *, recorder_launcher=None):
     """Install output-only pipes without clients, resize, input or app lifecycle.
 
-    `-o` refuses to replace an occupied pipe, including a race with another
-    installer. Existing user pipes are reported and never toggled or removed.
+    A synchronous server-side condition checks the pipe immediately before
+    installation. Existing user pipes are reported and never toggled or removed.
     Verified sinks remain owned by tmux across observer restarts.
     """
     import shlex
@@ -221,10 +221,14 @@ def maintain_recorders(store, backend, root, recorders, *, recorder_launcher=Non
             "--pane-id", pane_id, "--pane-pid", str(pid), "--pane-start", str(pane["starttime"]),
             "--server-pid", str(server_pid), "--server-start", str(server_start),
             "--columns", cols, "--rows", rows, "--token", token])
-        # One server-side command list prevents a capture-before-attach gap.
-        install = backend._run(["pipe-pane", "-o", "-O", "-t", pane_id, command,
-            ";", "capture-pane", "-p", "-e", "-J", "-t", pane_id, "-S", "-10000"],
-            check=False, timeout=2)
+        # tmux -o TOGGLES an occupied pipe; a client-side inventory is not
+        # sufficient. The synchronous format condition inserts both commands
+        # into this client's server queue, before another client's queue runs.
+        # Attach before capture so there is no capture-before-attach gap.
+        commands = shlex.join(["pipe-pane", "-O", "-t", pane_id, command]) + " ; " + shlex.join([
+            "capture-pane", "-p", "-e", "-J", "-t", pane_id, "-S", "-10000"])
+        install = backend._run(["if-shell", "-F", "-t", pane_id,
+                               "#{==:#{pane_pipe},0}", commands], check=False, timeout=2)
         replay = b""
         if not install.returncode and len(install.stdout.encode()) <= MAX_SCREEN_BYTES:
             replay = b"\x1b[0m\x1b[2J\x1b[H" + install.stdout.replace("\n", "\r\n").encode()

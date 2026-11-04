@@ -42,7 +42,9 @@ The background observer installs output-only tmux pipes while no UI is open.
 It adds no tmux clients, sends no input and does not resize or stop applications.
 A pipe and its initial bounded screen capture are requested in one server-side
 command list, with the pipe first. A private lifetime lease prevents overlapping
-canonical writers. Existing user pipes are preserved and reported as coverage
+canonical writers. A synchronous server-side `pane_pipe` condition protects
+against another pipe appearing after inventory; `pipe-pane -o` is never used to
+install recorders because it toggles occupied pipes. Existing user pipes are preserved and reported as coverage
 gaps. Inventory timeouts retain existing sinks; restarting the observer does not
 stop tmux-owned sinks. The stable pane's sink continues across an explicit pane
 respawn, with the observer publishing the new process identity for size tracking.

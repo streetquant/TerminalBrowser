@@ -319,12 +319,13 @@ def test_pipe_restart_preserves_user_pipe_and_live_writer_lease(tmp_path, monkey
         tmux('send-keys', '-t', record.tmux_name, 'Enter')
     own = store.create(name='owned', tag='test', cwd=str(tmp_path), command='/bin/bash --noprofile --norc')
     user = store.create(name='user pipe', tag='test', cwd=str(tmp_path), command='/bin/bash --noprofile --norc')
+    racing = store.create(name='racing user pipe', tag='test', cwd=str(tmp_path), command='/bin/bash --noprofile --norc')
     stopped_sink = None
     try:
-        for record in (own, user):
+        for record in (own, user, racing):
             store.update(record.id, status='running')
             tmux('new-session', '-d', '-s', record.tmux_name, '-x', '91', '-y', '27', record.command)
-        identities = {r.id: tmux('display-message', '-p', '-t', r.tmux_name, '#{pane_pid} #{pane_width} #{pane_height}') for r in (own, user)}
+        identities = {r.id: tmux('display-message', '-p', '-t', r.tmux_name, '#{pane_pid} #{pane_width} #{pane_height}') for r in (own, user, racing)}
         user_log = tmp_path / 'user-output'
         tmux('pipe-pane', '-o', '-O', '-t', user.tmux_name, 'exec /usr/bin/cat >> ' + shlex.quote(str(user_log)))
         server_pid = int(tmux('display-message', '-p', '#{pid}'))
@@ -338,8 +339,21 @@ def test_pipe_restart_preserves_user_pipe_and_live_writer_lease(tmp_path, monkey
              "for ((i=0;i<100;i++)); do printf 'ATTACH_BURST_%04d\\n' \"$i\"; sleep .002; done")
         tmux('send-keys', '-t', own.tmux_name, 'Enter')
         recorders = {}
-        maintain_recorders(store, TmuxBackend(), root, recorders, recorder_launcher=launcher)
+        race_pane = tmux('display-message', '-p', '-t', racing.tmux_name, '#{pane_id}')
+        race_log = tmp_path / 'racing-output'
+        backend = TmuxBackend()
+        original_run = backend._run
+        def occupy_after_inventory(args, **kwargs):
+            if args[:4] == ['if-shell', '-F', '-t', race_pane]:
+                tmux('pipe-pane', '-O', '-t', racing.tmux_name,
+                     'exec /usr/bin/tee -a ' + shlex.quote(str(race_log)) + ' >/dev/null')
+            return original_run(args, **kwargs)
+        monkeypatch.setattr(backend, '_run', occupy_after_inventory)
+        maintain_recorders(store, backend, root, recorders, recorder_launcher=launcher)
         assert user.id not in recorders and own.id in recorders
+        output(racing, 'RACING_USER_PIPE_SURVIVED')
+        wait_for(lambda: race_log.exists() and 'RACING_USER_PIPE_SURVIVED' in race_log.read_text())
+        assert not list((root / 'journals' / racing.id).glob('*.tdj'))
         wait_for(lambda: recorders[own.id][0]._ready)
         observer = recorders[own.id][0]
         owner = pipe_owner(root, own.id, observer.pane_id, server_pid, observer.server_start)
@@ -406,7 +420,7 @@ def test_pipe_restart_preserves_user_pipe_and_live_writer_lease(tmp_path, monkey
             assert 'APPLICATION_ALIVE_DURING_DISK_FAILURE' in tmux('capture-pane', '-p', '-t', own.tmux_name)
         finally:
             directory.chmod(0o700)
-        for record in (own, user):
+        for record in (own, user, racing):
             assert tmux('display-message', '-p', '-t', record.tmux_name, '#{pane_pid} #{pane_width} #{pane_height}') == identities[record.id]
         assert _parse_stat(user_pid)['starttime'] == user_start
     finally:
