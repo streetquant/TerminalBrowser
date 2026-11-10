@@ -189,6 +189,9 @@ edit the receipt to make recovery proceed.
 
 ## Cloudflare
 
+Full data path, tunnel inventory, route ordering, admission rules and the
+verification procedure: [CLOUDFLARE_HOSTING.md](CLOUDFLARE_HOSTING.md).
+
 The selected public endpoint is `https://maxchat.semiotech.org/t1000/`, using
 the existing shared tunnel. Its TermDeck path rule precedes the hostname's
 MaxChat catch-all. Preserve that ordering and the unrelated root route when
