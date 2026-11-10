@@ -51,3 +51,8 @@ codex-session-id.txt
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# Local workspace guard state and exported session artefacts
+.br-workspace-guard/
+omp-session-*.html
+opencode-user-prompt.md
