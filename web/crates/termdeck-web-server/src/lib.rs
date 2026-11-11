@@ -87,6 +87,7 @@ pub const MAX_TMUX_ROWS: usize = MAX_DATABASE_ROWS * 4;
 pub const MAX_FRONTEND_ASSET_BYTES: usize = 64 * 1024;
 pub const MAX_TERMINAL_ASSET_BYTES: usize = 1024 * 1024;
 pub const MAX_HTTP_REQUEST_BYTES: usize = MAX_TERMINAL_INPUT_BYTES + 1_024;
+const AUTH_FENCE_ADVANCE_INTERVAL: Duration = Duration::from_secs(15);
 
 const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v8/app.css";
 const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v8/app.js";
@@ -708,6 +709,29 @@ impl RefreshEngine {
     }
 }
 
+/// Advances the authentication store's time fence on a fixed interval.
+///
+/// The request path only reads the fence, so this task is what keeps the
+/// persisted fence moving forward when no request traffic arrives.
+async fn advance_auth_time_fence(auth: Arc<HttpAuth>, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let auth = Arc::clone(&auth);
+        match tokio::task::spawn_blocking(move || auth.advance_time_fence(unix_ms())).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                eprintln!("t1000 authentication time fence advance failed: {error}")
+            }
+            Err(error) => {
+                eprintln!("t1000 authentication time fence advance task failed: {error}")
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SnapshotCache {
     inner: Arc<RwLock<CacheInner>>,
@@ -977,6 +1001,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
             std::env::var_os("TERMDECK_NATIVE_CONTEXT_CONFIG_SHA256")),
     };
     engine.refresh().await?;
+    let fence_auth = auth.clone();
     let state = AppState {
         cache,
         request_slots: Arc::new(Semaphore::new(config.max_connections)),
@@ -992,6 +1017,8 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
         listener.local_addr()?
     );
     let refresher = tokio::spawn(engine.run_periodic(config.refresh_interval));
+    let fence_advancer = fence_auth
+        .map(|auth| tokio::spawn(advance_auth_time_fence(auth, AUTH_FENCE_ADVANCE_INTERVAL)));
     // WebSocket echo and input acknowledgements are small adjacent writes.
     // Nagle otherwise holds the second frame behind a delayed TCP ACK.
     let listener = listener.tap_io(|stream| {
@@ -1003,6 +1030,9 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
         .with_graceful_shutdown(shutdown_signal())
         .await;
     refresher.abort();
+    if let Some(advancer) = fence_advancer {
+        advancer.abort();
+    }
     result.map_err(ServerError::Io)
 }
 
@@ -1261,16 +1291,41 @@ async fn auth_gate(State(state): State<AppState>, mut request: Request, next: Ne
         }
         return next.run(request).await;
     }
-    let context = match auth.authenticate(request.headers(), unix_ms()) {
-        Ok(value) => value,
-        Err(error) => return authentication_error_response(error, path.as_str()),
+    // The authentication store performs blocking SQLite work, so it runs on a
+    // blocking thread instead of a Tokio worker.
+    let headers = Arc::new(request.headers().clone());
+    let authenticate = Arc::clone(auth);
+    let authenticate_headers = Arc::clone(&headers);
+    let context = match tokio::task::spawn_blocking(move || {
+        authenticate.authenticate(&authenticate_headers, unix_ms())
+    })
+    .await
+    {
+        Ok(Ok(context)) => context,
+        Ok(Err(error)) => return authentication_error_response(error, path.as_str()),
+        Err(error) => {
+            eprintln!("t1000 authentication task failed: {error}");
+            return internal_error_response();
+        }
     };
     if method != Method::GET && method != Method::HEAD {
         if !unsafe_request_metadata_allowed(request.headers(), auth.secure_cookies()) {
             return forbidden_response("request metadata is not allowed");
         }
-        if let Err(error) = auth.verify_csrf(request.headers(), &context, unix_ms()) {
-            return authentication_error_response(error, path.as_str());
+        let verify = Arc::clone(auth);
+        let verify_headers = Arc::clone(&headers);
+        let verify_context = context.clone();
+        match tokio::task::spawn_blocking(move || {
+            verify.verify_csrf(&verify_headers, &verify_context, unix_ms())
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return authentication_error_response(error, path.as_str()),
+            Err(error) => {
+                eprintln!("t1000 csrf verification task failed: {error}");
+                return internal_error_response();
+            }
         }
     }
     request.extensions_mut().insert(context);
@@ -4603,10 +4658,10 @@ mod auth_integration_tests {
     use super::auth_http::CSRF_HEADER_NAME;
     use super::{
         APP_CSS, AppState, ConfigAction, EXTERNAL_BASE_PATH, FORWARDED_HOST_HEADER,
-        FORWARDED_PREFIX_HEADER, FORWARDED_PROTO_HEADER, HttpAuth, LOGIN_PATH,
+        FORWARDED_PREFIX_HEADER, FORWARDED_PROTO_HEADER, HttpAuth, LOGIN_PATH, LOGOUT_PATH,
         MAX_PASSWORD_OPERATIONS, PAIRING_PATH, RenderedSnapshot, SESSION_PATH, SETUP_PATH,
-        ServerConfig, ServerError, SnapshotCache, TERMINAL_JS_PATH, build_router,
-        ensure_auth_directory, loopback_authority, parse_pairing_form, unix_ms,
+        ServerConfig, ServerError, SnapshotCache, TERMINAL_JS_PATH, advance_auth_time_fence,
+        build_router, ensure_auth_directory, loopback_authority, parse_pairing_form, unix_ms,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
@@ -4895,13 +4950,17 @@ mod auth_integration_tests {
         assert_eq!(value["error"], message);
     }
 
+    /// Expires the fixture sessions by advancing the persisted time fence.
+    ///
+    /// `now_ms` only reads the fence now, so the expiry needs the explicit
+    /// write the background task uses.
     fn expire_sessions(fixture: &AuthFixture) {
         fixture
             .state
             .auth
             .as_ref()
             .unwrap_or_else(|| panic!("fixture authentication missing"))
-            .now_ms(unix_ms() + TEST_AUTH_TTL_MS + 1)
+            .advance_time_fence(unix_ms() + TEST_AUTH_TTL_MS + 1)
             .unwrap_or_else(|error| panic!("could not expire fixture sessions: {error}"));
     }
 
@@ -5435,6 +5494,104 @@ mod auth_integration_tests {
         });
     }
 
+    /// The persisted authentication fence lives in the auth store, so the
+    /// observable effect of an authenticated request is that the auth database
+    /// file is not rewritten.
+    fn auth_database_bytes(fixture: &AuthFixture) -> Vec<u8> {
+        let path = fixture
+            .state
+            .auth
+            .as_ref()
+            .unwrap_or_else(|| panic!("fixture authentication missing"))
+            .machine_stores()
+            .0
+            .database_path()
+            .to_owned();
+        fs::read(&path).unwrap_or_else(|error| panic!("could not read the auth database: {error}"))
+    }
+
+    #[test]
+    fn an_authenticated_get_does_not_advance_the_stored_authentication_fence() {
+        runtime().block_on(async {
+            let fixture = fixture(&["Fence"]);
+            let router = build_router(fixture.state.clone());
+            let owner = pair(&router, fixture.invitations[0].as_str()).await;
+            let before = auth_database_bytes(&fixture);
+            let response = call(&router, authenticated_get(SESSION_PATH, &owner)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let after = auth_database_bytes(&fixture);
+            assert_eq!(
+                before, after,
+                "an authenticated GET must not write the authentication database"
+            );
+        });
+    }
+
+    #[test]
+    fn the_auth_gate_answers_on_the_blocking_pool_and_keeps_its_status_codes() {
+        runtime().block_on(async {
+            let fixture = fixture(&["Gate"]);
+            let router = build_router(fixture.state.clone());
+            let anonymous = router
+                .clone()
+                .oneshot(request(Method::GET, SESSION_PATH, Body::empty()))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_error(
+                anonymous,
+                StatusCode::UNAUTHORIZED,
+                "authentication-required",
+            )
+            .await;
+            let owner = pair(&router, fixture.invitations[0].as_str()).await;
+            let authenticated = router
+                .clone()
+                .oneshot(authenticated_get(SESSION_PATH, &owner))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(authenticated.status(), StatusCode::OK);
+            let rejected = router
+                .clone()
+                .oneshot(unsafe_request(
+                    Method::POST,
+                    LOGOUT_PATH,
+                    Body::empty(),
+                    Some(&owner),
+                    false,
+                ))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_error(rejected, StatusCode::FORBIDDEN, "request-forbidden").await;
+        });
+    }
+
+    #[test]
+    fn the_background_fence_advance_task_starts_and_stops_cleanly() {
+        runtime().block_on(async {
+            let fixture = fixture(&["Fence"]);
+            let before = auth_database_bytes(&fixture);
+            let handle = tokio::spawn(advance_auth_time_fence(
+                fixture
+                    .state
+                    .auth
+                    .clone()
+                    .unwrap_or_else(|| panic!("fixture authentication missing")),
+                Duration::from_millis(20),
+            ));
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            handle.abort();
+            assert!(
+                handle.await.is_err(),
+                "the fence task must stop when aborted"
+            );
+            let after = auth_database_bytes(&fixture);
+            assert_ne!(
+                before, after,
+                "the background task must advance the persisted authentication fence"
+            );
+        });
+    }
+
     #[test]
     fn pairing_protects_state_and_logout_requires_exact_csrf_metadata() {
         runtime().block_on(async {
@@ -5666,7 +5823,7 @@ mod auth_integration_tests {
             let listed: serde_json::Value=serde_json::from_str(&body_text(machines).await).unwrap_or_else(|e| panic!("JSON: {e}"));
             assert_eq!(listed["machines"].as_array().map(Vec::len),Some(1));
             let auth=fixture.state.auth.as_ref().unwrap_or_else(|| panic!("auth missing"));
-            auth.now_ms(unix_ms()+TEST_AUTH_TTL_MS+1).unwrap_or_else(|e| panic!("time: {e}"));
+            auth.advance_time_fence(unix_ms()+TEST_AUTH_TTL_MS+1).unwrap_or_else(|e| panic!("time: {e}"));
             assert_eq!(router.clone().oneshot(mutation(&body,Some(&a),true)).await.unwrap_or_else(|e| match e {}).status(),StatusCode::UNAUTHORIZED);
         });
     }

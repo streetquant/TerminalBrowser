@@ -12,6 +12,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use termdeck_web_core::{HostId, OwnerId};
 
@@ -306,13 +307,20 @@ pub struct AuthStore {
     owner_id: OwnerId,
     limits: AuthLimits,
     connection: Mutex<Connection>,
+    /// Process-local high-water mark of every observed time.
+    ///
+    /// The persisted fence in `auth_metadata.last_observed_at_ms` only advances on
+    /// genuine writes and background advances, so the read path keeps its own
+    /// monotonic mark to preserve the clock-rollback fence between those advances.
+    observed_fence_ms: AtomicU64,
 }
 
 impl AuthStore {
     pub fn require_context(&self, context: &SessionContext, now_ms: u64) -> Result<(), AuthError> {
-        let now_ms = self.observe_time(now_ms)?;
-        let connection = self.lock_connection()?;
-        let valid = connection
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction()?;
+        let now_ms = self.read_time_fence_in(&transaction, now_ms)?;
+        let valid = transaction
             .query_row(
                 "SELECT 1 FROM auth_sessions s JOIN devices d ON d.device_id=s.device_id
              WHERE s.session_id=?1 AND s.device_id=?2 AND s.revoked_at_ms IS NULL
@@ -325,6 +333,7 @@ impl AuthStore {
                 |_| Ok(()),
             )
             .optional()?;
+        transaction.commit()?;
         valid.ok_or(AuthError::Unauthenticated)
     }
     pub fn open_or_create(
@@ -364,6 +373,7 @@ impl AuthStore {
             owner_id,
             limits,
             connection: Mutex::new(connection),
+            observed_fence_ms: AtomicU64::new(0),
         };
         let _observed_at_ms = store.observe_time(created_at_ms)?;
         Ok(store)
@@ -385,8 +395,67 @@ impl AuthStore {
         validate_timestamp(candidate_ms)?;
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let observed_at_ms = observe_time_transaction(&transaction, candidate_ms)?;
+        let observed_at_ms = self.observe_time_in_transaction(&transaction, candidate_ms)?;
         transaction.commit()?;
+        Ok(observed_at_ms)
+    }
+
+    /// Read the stored time fence and return max(stored, candidate_ms) WITHOUT writing.
+    ///
+    /// This is the read-path counterpart of [`Self::observe_time`]: it never opens a
+    /// write transaction and never touches `auth_metadata.last_observed_at_ms`, so it
+    /// costs no rollback journal and no fsync. The returned time is clamped by the
+    /// process-local fence, so a rolled-back clock cannot lower it.
+    pub fn read_time_fence(&self, candidate_ms: u64) -> Result<u64, AuthError> {
+        validate_timestamp(candidate_ms)?;
+        let connection = self.lock_connection()?;
+        let stored = read_stored_fence(&connection)?;
+        let observed_at_ms = self.effective_fence(stored, candidate_ms);
+        self.raise_observed_fence(observed_at_ms);
+        Ok(observed_at_ms)
+    }
+
+    /// Advance the stored time fence (the current write behaviour), for a background task.
+    pub fn advance_time_fence(&self, candidate_ms: u64) -> Result<u64, AuthError> {
+        self.observe_time(candidate_ms)
+    }
+
+    /// Effective time for a request: never below the stored fence, the process-local
+    /// fence, or the candidate clock.
+    fn effective_fence(&self, stored: u64, candidate_ms: u64) -> u64 {
+        stored
+            .max(self.observed_fence_ms.load(Ordering::Acquire))
+            .max(candidate_ms)
+    }
+
+    /// Raise the process-local fence high-water mark.
+    fn raise_observed_fence(&self, observed_at_ms: u64) {
+        self.observed_fence_ms
+            .fetch_max(observed_at_ms, Ordering::AcqRel);
+    }
+
+    /// Observe the effective time on the read path without writing to the database.
+    fn read_time_fence_in(
+        &self,
+        connection: &Connection,
+        candidate_ms: u64,
+    ) -> Result<u64, AuthError> {
+        validate_timestamp(candidate_ms)?;
+        let stored = read_stored_fence(connection)?;
+        let observed_at_ms = self.effective_fence(stored, candidate_ms);
+        self.raise_observed_fence(observed_at_ms);
+        Ok(observed_at_ms)
+    }
+
+    /// Observe the effective time on the write path and persist the advanced fence.
+    fn observe_time_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        candidate_ms: u64,
+    ) -> Result<u64, AuthError> {
+        let floor = self.observed_fence_ms.load(Ordering::Acquire);
+        let observed_at_ms = observe_time_transaction(transaction, candidate_ms, floor)?;
+        self.raise_observed_fence(observed_at_ms);
         Ok(observed_at_ms)
     }
 
@@ -402,7 +471,7 @@ impl AuthStore {
         let digest = secret.digest();
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let now_ms = self.observe_time_in_transaction(&transaction, now_ms)?;
         let expires_at_ms = checked_expiry(now_ms, ttl_ms, self.limits.max_invitation_ttl_ms)?;
         prune_expired_auth_state(&transaction, now_ms)?;
         enforce_capacity(
@@ -455,7 +524,7 @@ impl AuthStore {
         let csrf_digest = csrf_secret.digest();
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let now_ms = self.observe_time_in_transaction(&transaction, now_ms)?;
         let expires_at_ms = checked_expiry(now_ms, session_ttl_ms, self.limits.max_session_ttl_ms)?;
         let invitation = transaction
             .query_row(
@@ -561,7 +630,7 @@ impl AuthStore {
         let csrf_digest = csrf_secret.digest();
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let now_ms = self.observe_time_in_transaction(&transaction, now_ms)?;
         let expires_at_ms = checked_expiry(now_ms, session_ttl_ms, self.limits.max_session_ttl_ms)?;
         prune_expired_auth_state(&transaction, now_ms)?;
         enforce_capacity(&transaction, "devices", self.limits.max_devices, "devices")?;
@@ -615,8 +684,8 @@ impl AuthStore {
     ) -> Result<SessionContext, AuthError> {
         let digest = credential_digest(SecretKind::Session, session_secret)?;
         let mut connection = self.lock_connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let transaction = connection.transaction()?;
+        let now_ms = self.read_time_fence_in(&transaction, now_ms)?;
         let row = transaction
             .query_row(
                 "SELECT s.session_id, s.device_id, d.label, s.created_at_ms, s.expires_at_ms
@@ -660,8 +729,8 @@ impl AuthStore {
     ) -> Result<(), AuthError> {
         let digest = credential_digest(SecretKind::Csrf, csrf_secret)?;
         let mut connection = self.lock_connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let transaction = connection.transaction()?;
+        let now_ms = self.read_time_fence_in(&transaction, now_ms)?;
         let valid = transaction
             .query_row(
                 "SELECT 1
@@ -698,7 +767,7 @@ impl AuthStore {
         let new_csrf_digest = new_csrf_secret.digest();
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let now_ms = self.observe_time_in_transaction(&transaction, now_ms)?;
         let expires_at_ms = checked_expiry(now_ms, ttl_ms, self.limits.max_session_ttl_ms)?;
         let old = transaction
             .query_row(
@@ -773,7 +842,7 @@ impl AuthStore {
     ) -> Result<bool, AuthError> {
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let now_ms = self.observe_time_in_transaction(&transaction, now_ms)?;
         let device_id = transaction
             .query_row(
                 "SELECT device_id FROM auth_sessions WHERE session_id = ?1",
@@ -811,7 +880,7 @@ impl AuthStore {
     ) -> Result<bool, AuthError> {
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now_ms = observe_time_transaction(&transaction, now_ms)?;
+        let now_ms = self.observe_time_in_transaction(&transaction, now_ms)?;
         let changed = transaction.execute(
             "UPDATE devices SET revoked_at_ms = ?1
              WHERE device_id = ?2 AND revoked_at_ms IS NULL",
@@ -2184,6 +2253,7 @@ fn credential_digest(kind: SecretKind, value: &str) -> Result<[u8; 32], AuthErro
 fn observe_time_transaction(
     transaction: &Transaction<'_>,
     candidate_ms: u64,
+    floor_ms: u64,
 ) -> Result<u64, AuthError> {
     validate_timestamp(candidate_ms)?;
     let stored: i64 = transaction.query_row(
@@ -2192,7 +2262,7 @@ fn observe_time_transaction(
         |row| row.get(0),
     )?;
     let stored = host_timestamp(stored)?;
-    let observed_at_ms = stored.max(candidate_ms);
+    let observed_at_ms = stored.max(floor_ms).max(candidate_ms);
     if observed_at_ms > stored {
         let changed = transaction.execute(
             "UPDATE auth_metadata SET last_observed_at_ms = ?1
@@ -2206,6 +2276,16 @@ fn observe_time_transaction(
         }
     }
     Ok(observed_at_ms)
+}
+
+/// Read the persisted time fence without writing.
+fn read_stored_fence(connection: &Connection) -> Result<u64, AuthError> {
+    let stored: i64 = connection.query_row(
+        "SELECT last_observed_at_ms FROM auth_metadata WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    host_timestamp(stored)
 }
 
 fn checked_expiry(now_ms: u64, ttl_ms: u64, maximum_ttl_ms: u64) -> Result<u64, AuthError> {
@@ -3323,5 +3403,226 @@ mod tests {
     fn identifier_parsers_reject_corrupt_database_values() {
         assert!(AuthSessionId::from_database("bad".to_owned()).is_err());
         assert!(AuthenticatedDeviceId::from_database("bad".to_owned()).is_err());
+    }
+
+    fn journal_path(database_path: &Path) -> PathBuf {
+        let mut path = database_path.as_os_str().to_os_string();
+        path.push("-journal");
+        PathBuf::from(path)
+    }
+
+    fn stored_fence_ms(value: &AuthStore) -> u64 {
+        let connection = match value.lock_connection() {
+            Ok(value) => value,
+            Err(error) => panic!("could not lock the auth store: {error}"),
+        };
+        let stored: i64 = match connection.query_row(
+            "SELECT last_observed_at_ms FROM auth_metadata WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("could not read the auth time fence: {error}"),
+        };
+        drop(connection);
+        match u64::try_from(stored) {
+            Ok(value) => value,
+            Err(_) => panic!("the auth time fence is negative"),
+        }
+    }
+
+    fn database_bytes(database_path: &Path) -> Vec<u8> {
+        match fs::read(database_path) {
+            Ok(value) => value,
+            Err(error) => panic!("could not read the auth database: {error}"),
+        }
+    }
+
+    #[test]
+    fn read_path_authentication_does_not_write_the_time_fence_or_a_journal() {
+        let directory = TestDirectory::new("read-path-fence");
+        let value = store(&directory);
+        let invitation = match value.create_invitation("Read path", 100, 1_000) {
+            Ok(value) => value,
+            Err(error) => panic!("could not create invitation: {error}"),
+        };
+        let raw_invitation = invitation.secret().expose_secret().to_owned();
+        let session = match value.redeem_invitation(&raw_invitation, 200, 100_000) {
+            Ok(value) => value,
+            Err(error) => panic!("could not redeem invitation: {error}"),
+        };
+        let database_path = value.database_path().to_owned();
+        let journal = journal_path(&database_path);
+        let fence_before = stored_fence_ms(&value);
+        assert_eq!(fence_before, 200);
+        assert!(!journal.exists());
+        let bytes_before = database_bytes(&database_path);
+
+        let context = match value.authenticate(session.session_secret().expose_secret(), 500) {
+            Ok(value) => value,
+            Err(error) => panic!("could not authenticate session: {error}"),
+        };
+        assert_eq!(context.session_id(), session.session_id());
+        assert_eq!(stored_fence_ms(&value), fence_before);
+        assert!(
+            value
+                .verify_csrf(
+                    session.session_id(),
+                    session.csrf_secret().expose_secret(),
+                    600
+                )
+                .is_ok()
+        );
+        assert_eq!(stored_fence_ms(&value), fence_before);
+        assert!(value.require_context(&context, 700).is_ok());
+        assert_eq!(stored_fence_ms(&value), fence_before);
+
+        assert!(!journal.exists());
+        assert_eq!(bytes_before, database_bytes(&database_path));
+
+        // The write path changes the same bytes, so the comparison above has detection power.
+        match value.advance_time_fence(800) {
+            Ok(observed) => assert_eq!(observed, 800),
+            Err(error) => panic!("could not advance the time fence: {error}"),
+        }
+        assert_eq!(stored_fence_ms(&value), 800);
+        assert_ne!(bytes_before, database_bytes(&database_path));
+    }
+
+    #[test]
+    fn advance_time_fence_advances_the_stored_fence_monotonically() {
+        let directory = TestDirectory::new("advance-fence");
+        let value = store(&directory);
+        assert_eq!(stored_fence_ms(&value), 1);
+        match value.advance_time_fence(5_000) {
+            Ok(observed) => assert_eq!(observed, 5_000),
+            Err(error) => panic!("could not advance the time fence: {error}"),
+        }
+        assert_eq!(stored_fence_ms(&value), 5_000);
+        match value.advance_time_fence(1_000) {
+            Ok(observed) => assert_eq!(observed, 5_000),
+            Err(error) => panic!("could not advance the time fence: {error}"),
+        }
+        assert_eq!(stored_fence_ms(&value), 5_000);
+        match value.read_time_fence(1_000) {
+            Ok(observed) => assert_eq!(observed, 5_000),
+            Err(error) => panic!("could not read the time fence: {error}"),
+        }
+        assert_eq!(stored_fence_ms(&value), 5_000);
+        match value.read_time_fence(9_000) {
+            Ok(observed) => assert_eq!(observed, 9_000),
+            Err(error) => panic!("could not read the time fence: {error}"),
+        }
+        assert_eq!(stored_fence_ms(&value), 5_000);
+    }
+
+    #[test]
+    fn a_rolled_back_clock_cannot_lower_the_effective_time_or_write() {
+        let directory = TestDirectory::new("rollback-fence");
+        let value = store(&directory);
+        let invitation = match value.create_invitation("Rollback", 100, 1_000) {
+            Ok(value) => value,
+            Err(error) => panic!("could not create invitation: {error}"),
+        };
+        let raw_invitation = invitation.secret().expose_secret().to_owned();
+        let session = match value.redeem_invitation(&raw_invitation, 200, 100) {
+            Ok(value) => value,
+            Err(error) => panic!("could not redeem invitation: {error}"),
+        };
+        let database_path = value.database_path().to_owned();
+        let journal = journal_path(&database_path);
+        let stored_fence = stored_fence_ms(&value);
+        assert_eq!(stored_fence, 200);
+        let bytes_before = database_bytes(&database_path);
+
+        // A read-path call observes a much later clock. It must not write the fence.
+        assert!(matches!(
+            value.authenticate(session.session_secret().expose_secret(), 20_000),
+            Err(AuthError::Unauthenticated)
+        ));
+        assert_eq!(stored_fence_ms(&value), stored_fence);
+        assert_eq!(bytes_before, database_bytes(&database_path));
+        assert!(!journal.exists());
+
+        // A rolled-back clock is clamped to the already observed time, never lowered.
+        match value.read_time_fence(1_000) {
+            Ok(observed) => assert_eq!(observed, 20_000),
+            Err(error) => panic!("could not read the time fence: {error}"),
+        }
+        match value.read_time_fence(0) {
+            Ok(observed) => assert_eq!(observed, 20_000),
+            Err(error) => panic!("could not read the time fence: {error}"),
+        }
+        assert_eq!(stored_fence_ms(&value), stored_fence);
+        assert_eq!(bytes_before, database_bytes(&database_path));
+        assert!(!journal.exists());
+
+        // The background advance persists the fence and never lowers it.
+        match value.advance_time_fence(30_000) {
+            Ok(observed) => assert_eq!(observed, 30_000),
+            Err(error) => panic!("could not advance the time fence: {error}"),
+        }
+        assert_eq!(stored_fence_ms(&value), 30_000);
+        match value.advance_time_fence(25_000) {
+            Ok(observed) => assert_eq!(observed, 30_000),
+            Err(error) => panic!("could not advance the time fence: {error}"),
+        }
+        assert_eq!(stored_fence_ms(&value), 30_000);
+    }
+
+    #[test]
+    fn read_path_rejects_unauthenticated_revoked_expired_and_csrf_mismatch() {
+        let directory = TestDirectory::new("read-path-failures");
+        let value = store(&directory);
+        let invitation = match value.create_invitation("Laptop", 100, 1_000) {
+            Ok(value) => value,
+            Err(error) => panic!("could not create invitation: {error}"),
+        };
+        let raw_invitation = invitation.secret().expose_secret().to_owned();
+        let session = match value.redeem_invitation(&raw_invitation, 200, 5_000) {
+            Ok(value) => value,
+            Err(error) => panic!("could not redeem invitation: {error}"),
+        };
+        let expiring = match value.create_invitation("Expiring", 200, 1_000) {
+            Ok(value) => value,
+            Err(error) => panic!("could not create invitation: {error}"),
+        };
+        let raw_expiring = expiring.secret().expose_secret().to_owned();
+        let expiring_session = match value.redeem_invitation(&raw_expiring, 200, 100) {
+            Ok(value) => value,
+            Err(error) => panic!("could not redeem invitation: {error}"),
+        };
+        let wrong_session =
+            match crate::secret::SecretToken::generate(crate::secret::SecretKind::Session) {
+                Ok(value) => value,
+                Err(error) => panic!("could not generate a session capability: {error}"),
+            };
+        let wrong_csrf = match crate::secret::SecretToken::generate(crate::secret::SecretKind::Csrf)
+        {
+            Ok(value) => value,
+            Err(error) => panic!("could not generate a CSRF capability: {error}"),
+        };
+
+        assert!(matches!(
+            value.authenticate(wrong_session.expose_secret(), 300),
+            Err(AuthError::Unauthenticated)
+        ));
+        assert!(matches!(
+            value.verify_csrf(session.session_id(), wrong_csrf.expose_secret(), 300),
+            Err(AuthError::CsrfMismatch)
+        ));
+        assert!(matches!(
+            value.authenticate(expiring_session.session_secret().expose_secret(), 400),
+            Err(AuthError::Unauthenticated)
+        ));
+        assert!(
+            value
+                .revoke_device(session.device_id(), 500)
+                .is_ok_and(|changed| changed)
+        );
+        assert!(matches!(
+            value.authenticate(session.session_secret().expose_secret(), 501),
+            Err(AuthError::Unauthenticated)
+        ));
     }
 }

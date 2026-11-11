@@ -217,6 +217,7 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
   const REFRESH_VISIBLE_MS = 2000;
   const REFRESH_HIDDEN_MS = 15000;
   const REQUEST_TIMEOUT_MS = 5000;
+  const ABORTED_REQUEST_MESSAGE = "The server took too long to answer.";
   const STATUS_NAMES = new Set([
     "new",
     "running",
@@ -455,13 +456,31 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
         "tab-action-timeout": "The server took too long to respond. Check the tab before trying again; the action may still have completed.",
         "tab-action-busy": "Other tab actions are still running. Wait for them to finish, then try again.",
         "tab-action-internal": "The tab service is unavailable. Check the server before trying again.",
+        "signal is aborted without reason": ABORTED_REQUEST_MESSAGE,
       };
       if (explanations[error.message]) {
         return explanations[error.message];
       }
+      if (isAbortedRequest(error)) {
+        return ABORTED_REQUEST_MESSAGE;
+      }
       return error.message.slice(0, 240);
     }
+    if (isAbortedRequest(error)) {
+      return ABORTED_REQUEST_MESSAGE;
+    }
     return "Request failed.";
+  }
+
+  function isAbortedRequest(error) {
+    if (!error || typeof error !== "object") {
+      return false;
+    }
+    const name = typeof error.name === "string" ? error.name : "";
+    const message = typeof error.message === "string" ? error.message : "";
+    return name === "AbortError"
+      || message === "signal is aborted without reason"
+      || message.toLowerCase().includes("aborted");
   }
 
   function cookieValue(names) {
@@ -1119,7 +1138,12 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
         workspaceStatus.textContent = "Refresh failed";
         updateShellState(terminalMount ? "degraded" : "error");
         root.dataset.termdeckState = "error";
-        showClientNotice(`Window refresh failed. ${errorMessage(error)}`, "notice-error");
+        showClientNotice(
+          isAbortedRequest(error)
+            ? `Window refresh timed out. ${ABORTED_REQUEST_MESSAGE} Retrying.`
+            : `Window refresh failed. ${errorMessage(error)}`,
+          "notice-error",
+        );
       } finally {
         refreshInFlight = false;
         root.setAttribute("aria-busy", "false");

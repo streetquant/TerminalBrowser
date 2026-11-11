@@ -92,9 +92,23 @@ impl HttpAuth {
         })
     }
 
+    /// Read the authentication time fence without writing to the database.
+    ///
+    /// The request path stays read-only so a request never commits a fence
+    /// write; the background task advances the persisted fence instead.
     pub fn now_ms(&self, wall_clock_ms: u64) -> Result<u64, HttpAuthError> {
         self.store
-            .observe_time(wall_clock_ms)
+            .read_time_fence(wall_clock_ms)
+            .map_err(HttpAuthError::Auth)
+    }
+
+    /// Advance the persisted authentication time fence.
+    ///
+    /// This is the only write that moves the fence, and the server runs it
+    /// from a background task so the fence never depends on request traffic.
+    pub(crate) fn advance_time_fence(&self, wall_clock_ms: u64) -> Result<u64, HttpAuthError> {
+        self.store
+            .advance_time_fence(wall_clock_ms)
             .map_err(HttpAuthError::Auth)
     }
 
