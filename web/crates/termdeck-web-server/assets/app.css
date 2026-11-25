@@ -978,6 +978,9 @@ body.workspace-page {
 .workspace-shell[data-sidebar-side="left"] > .workspace-sidebar { inset: 0 auto 0 0; border-left: 0; border-right: 1px solid var(--td-border); }
 .workspace-shell[data-sidebar-side="right"] > .workspace-sidebar > .workspace-sidebar-resize { left: -4px; }
 .workspace-shell[data-sidebar-side="left"] > .workspace-sidebar > .workspace-sidebar-resize { right: -4px; }
+.workspace-shell > .xterm-shell { position: absolute; inset: 0; }
+.workspace-shell > .xterm-shell[data-termdeck-active="false"] { visibility: hidden; pointer-events: none; z-index: 0; }
+.workspace-shell > .xterm-shell[data-termdeck-active="true"] { pointer-events: auto; z-index: 1; }
 @media (min-width: 760px) {
   .workspace-shell[data-sidebar="open"] > .xterm-shell { right: var(--td-sidebar-width, 280px); }
   .workspace-shell[data-sidebar="open"][data-sidebar-side="left"] > .xterm-shell { left: var(--td-sidebar-width, 280px); right: 0; }

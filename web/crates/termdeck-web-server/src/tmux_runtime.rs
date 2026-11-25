@@ -6,10 +6,19 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 use tokio::process::Command;
+
+const PEER_VALIDATION_TTL: Duration = Duration::from_secs(2);
+
+#[derive(Debug)]
+struct CachedPeer {
+    socket_dev: u64,
+    socket_ino: u64,
+    validated_at: Instant,
+}
 
 #[derive(Debug)]
 struct Runtime {
@@ -17,6 +26,7 @@ struct Runtime {
     device: u64,
     inode: u64,
     uid: u32,
+    cached_peer: Mutex<Option<CachedPeer>>,
 }
 
 fn refused(message: &str) -> io::Error {
@@ -58,6 +68,7 @@ impl Runtime {
             uid: parts[2]
                 .parse()
                 .map_err(|_| refused("invalid tmux owner"))?,
+            cached_peer: Mutex::new(None),
         };
         if result.uid != fs::metadata("/proc/self")?.uid() {
             return Err(refused("managed tmux owner differs from service user"));
@@ -71,6 +82,10 @@ impl Runtime {
     }
 
     fn validate(&self, require_socket: bool) -> io::Result<()> {
+        self.validate_socket_identity(require_socket).map(|_| ())
+    }
+
+    fn validate_socket_identity(&self, require_socket: bool) -> io::Result<Option<(u64, u64)>> {
         if !self.root.is_absolute()
             || self
                 .root
@@ -103,11 +118,12 @@ impl Runtime {
         let parent = socket
             .parent()
             .ok_or_else(|| refused("invalid tmux socket path"))?;
+        let mut socket_identity = None;
         for (path, is_socket) in [(parent, false), (socket.as_path(), true)] {
             let info = match fs::symlink_metadata(path) {
                 Ok(info) => info,
                 Err(error) if error.kind() == io::ErrorKind::NotFound && !require_socket => {
-                    return Ok(());
+                    return Ok(None);
                 }
                 Err(error) => return Err(error),
             };
@@ -122,8 +138,11 @@ impl Runtime {
                     "tmux socket owner, type, device or permissions are unsafe",
                 ));
             }
+            if is_socket {
+                socket_identity = Some((info.dev(), info.ino()));
+            }
         }
-        Ok(())
+        Ok(socket_identity)
     }
 
     async fn validate_peer(&self, executable: &Path) -> io::Result<()> {
@@ -164,6 +183,36 @@ impl Runtime {
         }
         self.validate(true)
     }
+
+    async fn validate_peer_cached(
+        &self,
+        executable: &Path,
+        socket_identity: Option<(u64, u64)>,
+    ) -> io::Result<()> {
+        if let Some((socket_dev, socket_ino)) = socket_identity {
+            if let Ok(guard) = self.cached_peer.lock() {
+                if let Some(cached) = guard.as_ref() {
+                    if cached.socket_dev == socket_dev
+                        && cached.socket_ino == socket_ino
+                        && cached.validated_at.elapsed() < PEER_VALIDATION_TTL
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        self.validate_peer(executable).await?;
+        if let Some((socket_dev, socket_ino)) = socket_identity {
+            if let Ok(mut guard) = self.cached_peer.lock() {
+                *guard = Some(CachedPeer {
+                    socket_dev,
+                    socket_ino,
+                    validated_at: Instant::now(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 static RUNTIME: OnceLock<Result<Option<Runtime>, String>> = OnceLock::new();
@@ -183,8 +232,8 @@ pub(crate) async fn command(executable: &Path) -> io::Result<Command> {
     let mut command = Command::new(executable);
     command.env_remove("TMUX");
     if let Some(runtime) = admitted()? {
-        runtime.validate(true)?;
-        runtime.validate_peer(executable).await?;
+        let socket_identity = runtime.validate_socket_identity(true)?;
+        runtime.validate_peer_cached(executable, socket_identity).await?;
         command.arg("-S").arg(runtime.socket());
         command.env("TMUX_TMPDIR", &runtime.root);
     }
@@ -217,6 +266,7 @@ mod tests {
                 device: info.dev(),
                 inode: info.ino(),
                 uid: info.uid(),
+                cached_peer: Mutex::new(None),
             }))
         }
 

@@ -11,8 +11,8 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use termdeck_web_core::{HostId, OwnerId};
 
@@ -308,6 +308,7 @@ struct SessionSnapshot {
     stored_fence_ms: u64,
     by_id: BTreeMap<AuthSessionId, SessionContext>,
     by_digest: BTreeMap<[u8; DIGEST_BYTES], AuthSessionId>,
+    csrf_by_id: BTreeMap<AuthSessionId, [u8; DIGEST_BYTES]>,
 }
 
 #[cfg(target_os = "linux")]
@@ -324,11 +325,12 @@ impl SessionSnapshot {
             stored_fence_ms,
             by_id: BTreeMap::new(),
             by_digest: BTreeMap::new(),
+            csrf_by_id: BTreeMap::new(),
         };
         {
             let mut statement = transaction.prepare(
                 "SELECT s.session_id, s.device_id, d.label, s.created_at_ms, s.expires_at_ms,
-                        s.secret_hash
+                        s.secret_hash, s.csrf_hash
                  FROM auth_sessions s JOIN devices d ON d.device_id = s.device_id
                  WHERE s.revoked_at_ms IS NULL AND d.revoked_at_ms IS NULL AND s.expires_at_ms > ?1
                  LIMIT ?2",
@@ -349,6 +351,10 @@ impl SessionSnapshot {
                     row.get(4)?,
                 )?;
                 let digest: [u8; DIGEST_BYTES] = row.get(5)?;
+                let csrf_digest: [u8; DIGEST_BYTES] = row.get(6)?;
+                snapshot
+                    .csrf_by_id
+                    .insert(context.session_id.clone(), csrf_digest);
                 snapshot
                     .by_digest
                     .insert(digest, context.session_id.clone());
@@ -357,6 +363,15 @@ impl SessionSnapshot {
         }
         transaction.commit()?;
         Ok(Some(snapshot))
+    }
+
+    fn with_advanced_fence(&self, stored_fence_ms: u64) -> Self {
+        Self {
+            stored_fence_ms: self.stored_fence_ms.max(stored_fence_ms),
+            by_id: self.by_id.clone(),
+            by_digest: self.by_digest.clone(),
+            csrf_by_id: self.csrf_by_id.clone(),
+        }
     }
 }
 
@@ -377,7 +392,7 @@ struct SessionCache {
     identity: DatabaseIdentity,
     uid: u32,
     sidecars: [PathBuf; 3],
-    snapshot: Option<(DatabaseGeneration, SessionSnapshot)>,
+    snapshot: Option<(DatabaseGeneration, Arc<SessionSnapshot>)>,
 }
 
 #[cfg(target_os = "linux")]
@@ -525,6 +540,7 @@ pub struct AuthStore {
     read_connection: Mutex<Connection>,
     #[cfg(target_os = "linux")]
     session_cache: Mutex<Option<SessionCache>>,
+    in_process_fence_writes: AtomicUsize,
     /// Process-local high-water mark of every observed time.
     ///
     /// The persisted fence in `auth_metadata.last_observed_at_ms` only advances on
@@ -532,6 +548,23 @@ pub struct AuthStore {
     /// monotonic mark to preserve the clock-rollback fence between those advances.
     observed_fence_ms: AtomicU64,
 }
+
+struct FenceWriteGuard<'a>(&'a AtomicUsize);
+
+impl<'a> FenceWriteGuard<'a> {
+    fn enter(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for FenceWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub type AuthSessionResult = Result<SessionContext, AuthError>;
 
 impl AuthStore {
     pub fn require_context(&self, context: &SessionContext, now_ms: u64) -> Result<(), AuthError> {
@@ -561,6 +594,24 @@ impl AuthStore {
             .optional()?;
         transaction.commit()?;
         valid.ok_or(AuthError::Unauthenticated)
+    }
+
+    pub fn require_context_cached_or_none(
+        &self,
+        context: &SessionContext,
+        now_ms: u64,
+    ) -> Result<Option<Result<(), AuthError>>, AuthError> {
+        #[cfg(target_os = "linux")]
+        if let Some(valid) = self.with_session_snapshot_mode(now_ms, false, |snapshot, now_ms| {
+            snapshot.by_id.get(context.session_id()).is_some_and(|row| {
+                row.device_id() == context.device_id() && row.expires_at_ms() > now_ms
+            })
+        })? {
+            return Ok(Some(valid.then_some(()).ok_or(AuthError::Unauthenticated)));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (context, now_ms);
+        Ok(None)
     }
     pub fn open_or_create(
         secure_directory: &Path,
@@ -620,6 +671,7 @@ impl AuthStore {
             read_connection: Mutex::new(read_connection),
             #[cfg(target_os = "linux")]
             session_cache,
+            in_process_fence_writes: AtomicUsize::new(0),
             observed_fence_ms: AtomicU64::new(0),
         };
         let _observed_at_ms = store.observe_time(created_at_ms)?;
@@ -666,7 +718,59 @@ impl AuthStore {
 
     /// Advance the stored time fence (the current write behaviour), for a background task.
     pub fn advance_time_fence(&self, candidate_ms: u64) -> Result<u64, AuthError> {
-        self.observe_time(candidate_ms)
+        validate_timestamp(candidate_ms)?;
+        let mut connection = self.lock_connection()?;
+        #[cfg(target_os = "linux")]
+        let preserve_snapshot = {
+            let mut cache = self
+                .session_cache
+                .lock()
+                .map_err(|_| AuthError::LockPoisoned)?;
+            if let Some(cache) = cache.as_mut() {
+                let generation = cache.generation(&self.database_path)?;
+                let changed = cache.drain_changes();
+                let clean = changed == Some(false)
+                    && cache.has_no_sidecars()
+                    && cache
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|(saved, _)| *saved == generation);
+                if !clean {
+                    cache.snapshot = None;
+                }
+                clean
+            } else {
+                false
+            }
+        };
+        let _guard = FenceWriteGuard::enter(&self.in_process_fence_writes);
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let observed_at_ms = self.observe_time_in_transaction(&transaction, candidate_ms)?;
+        transaction.commit()?;
+        #[cfg(target_os = "linux")]
+        if preserve_snapshot {
+            let mut cache = self
+                .session_cache
+                .lock()
+                .map_err(|_| AuthError::LockPoisoned)?;
+            if let Some(cache) = cache.as_mut() {
+                if cache.has_no_sidecars() && cache.drain_changes().is_some() {
+                    if let Ok(new_generation) = cache.generation(&self.database_path) {
+                        if let Some((_, previous)) = cache.snapshot.take() {
+                            cache.snapshot = Some((
+                                new_generation,
+                                Arc::new(previous.with_advanced_fence(observed_at_ms)),
+                            ));
+                        }
+                    } else {
+                        cache.snapshot = None;
+                    }
+                } else {
+                    cache.snapshot = None;
+                }
+            }
+        }
+        Ok(observed_at_ms)
     }
 
     /// Effective time for a request: never below the stored fence, the process-local
@@ -702,6 +806,16 @@ impl AuthStore {
         candidate_ms: u64,
         lookup: impl FnOnce(&SessionSnapshot, u64) -> T,
     ) -> Result<Option<T>, AuthError> {
+        self.with_session_snapshot_mode(candidate_ms, true, lookup)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_session_snapshot_mode<T>(
+        &self,
+        candidate_ms: u64,
+        allow_sqlite_reload: bool,
+        lookup: impl FnOnce(&SessionSnapshot, u64) -> T,
+    ) -> Result<Option<T>, AuthError> {
         validate_timestamp(candidate_ms)?;
         let mut cache = self
             .session_cache
@@ -710,6 +824,14 @@ impl AuthStore {
         let Some(cache) = cache.as_mut() else {
             return Ok(None);
         };
+        if self.in_process_fence_writes.load(Ordering::Acquire) > 0 {
+            return Ok(cache.snapshot.as_ref().map(|(_, snapshot)| {
+                lookup(
+                    snapshot,
+                    self.observe_read_time(snapshot.stored_fence_ms, candidate_ms),
+                )
+            }));
+        }
         let generation = cache.generation(&self.database_path)?;
         let changed = cache.drain_changes();
         if changed != Some(false)
@@ -724,7 +846,7 @@ impl AuthStore {
             return Ok(None);
         }
         if cache.snapshot.is_none() {
-            if !cache.has_no_sidecars() {
+            if !allow_sqlite_reload || !cache.has_no_sidecars() {
                 return Ok(None);
             }
             let snapshot = SessionSnapshot::load(&mut *self.lock_read_connection()?, self.limits)?;
@@ -736,7 +858,7 @@ impl AuthStore {
             {
                 return Ok(None);
             }
-            cache.snapshot = snapshot.map(|snapshot| (generation, snapshot));
+            cache.snapshot = snapshot.map(|snapshot| (generation, Arc::new(snapshot)));
         }
         Ok(cache.snapshot.as_ref().map(|(_, snapshot)| {
             lookup(
@@ -1030,6 +1152,57 @@ impl AuthStore {
         )
     }
 
+    pub fn authenticate_with_fence_cached_or_none(
+        &self,
+        session_secret: &str,
+        candidate_ms: u64,
+    ) -> Result<Option<(u64, AuthSessionResult)>, AuthError> {
+        #[cfg(target_os = "linux")]
+        {
+            let digest = credential_digest(SecretKind::Session, session_secret).ok();
+            self.with_session_snapshot_mode(candidate_ms, false, |snapshot, now_ms| {
+                let auth_result = match digest {
+                    Some(digest) => snapshot
+                        .by_digest
+                        .get(&digest)
+                        .and_then(|session_id| snapshot.by_id.get(session_id))
+                        .filter(|row| row.expires_at_ms() > now_ms)
+                        .cloned()
+                        .ok_or(AuthError::Unauthenticated),
+                    None => Err(AuthError::Unauthenticated),
+                };
+                (now_ms, auth_result)
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (session_secret, candidate_ms);
+            Ok(None)
+        }
+    }
+
+    pub fn verify_csrf_cached_or_none(
+        &self,
+        session_id: &AuthSessionId,
+        csrf_secret: &str,
+        candidate_ms: u64,
+    ) -> Result<Option<Result<(), AuthError>>, AuthError> {
+        let digest = credential_digest(SecretKind::Csrf, csrf_secret)?;
+        #[cfg(target_os = "linux")]
+        if let Some(valid) = self.with_session_snapshot_mode(candidate_ms, false, |snapshot, now_ms| {
+            snapshot
+                .by_id
+                .get(session_id)
+                .is_some_and(|row| row.expires_at_ms() > now_ms)
+                && snapshot.csrf_by_id.get(session_id) == Some(&digest)
+        })? {
+            return Ok(Some(valid.then_some(()).ok_or(AuthError::CsrfMismatch)));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (session_id, digest, candidate_ms);
+        Ok(None)
+    }
+
     pub fn verify_csrf(
         &self,
         session_id: &AuthSessionId,
@@ -1037,6 +1210,16 @@ impl AuthStore {
         now_ms: u64,
     ) -> Result<(), AuthError> {
         let digest = credential_digest(SecretKind::Csrf, csrf_secret)?;
+        #[cfg(target_os = "linux")]
+        if let Some(valid) = self.with_session_snapshot(now_ms, |snapshot, now_ms| {
+            snapshot
+                .by_id
+                .get(session_id)
+                .is_some_and(|row| row.expires_at_ms() > now_ms)
+                && snapshot.csrf_by_id.get(session_id) == Some(&digest)
+        })? {
+            return valid.then_some(()).ok_or(AuthError::CsrfMismatch);
+        }
         let mut connection = self.lock_read_connection()?;
         let transaction = connection.transaction()?;
         let now_ms = self.read_time_fence_in(&transaction, now_ms)?;
@@ -2899,7 +3082,10 @@ mod tests {
             let result = receive.recv_timeout(std::time::Duration::from_secs(1));
             drop(transaction);
             drop(writer);
-            result.expect("auth reads waited for the writer")
+            match result {
+                Ok(value) => value,
+                Err(error) => panic!("auth reads waited for the writer: {error}"),
+            }
         })
     }
 
@@ -4022,5 +4208,67 @@ mod tests {
             value.authenticate(session.session_secret().expose_secret(), 501),
             Err(AuthError::Unauthenticated)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_reads_never_stall_or_hit_busy_during_advance_time_fence() {
+        let directory = TestDirectory::new("fence-concurrency");
+        let value = std::sync::Arc::new(store(&directory));
+        let invitation = value
+            .create_invitation("Concurrent", 100, 1_000)
+            .unwrap_or_else(|error| panic!("create invitation: {error}"));
+        let session = value
+            .redeem_invitation(invitation.secret().expose_secret(), 200, 100_000)
+            .unwrap_or_else(|error| panic!("redeem invitation: {error}"));
+        let secret = session.session_secret().expose_secret().to_owned();
+        let csrf = session.csrf_secret().expose_secret().to_owned();
+        let context = value
+            .authenticate(&secret, 300)
+            .unwrap_or_else(|error| panic!("warm snapshot: {error}"));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_store = std::sync::Arc::clone(&value);
+        let writer_stop = std::sync::Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            for step in 0..20_u64 {
+                if writer_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                writer_store
+                    .advance_time_fence(400 + step * 10)
+                    .unwrap_or_else(|error| panic!("advance fence {step}: {error}"));
+            }
+        });
+        let start = std::time::Instant::now();
+        for i in 0..2_000_u64 {
+            let now = 400 + (i % 100);
+            assert!(
+                value
+                    .authenticate_with_fence_cached_or_none(&secret, now)
+                    .unwrap_or_else(|error| panic!("auth cached: {error}"))
+                    .is_some_and(|(_, res)| res.is_ok())
+            );
+            assert!(
+                value
+                    .require_context_cached_or_none(&context, now)
+                    .unwrap_or_else(|error| panic!("require cached: {error}"))
+                    .is_some_and(|res| res.is_ok())
+            );
+            assert!(
+                value
+                    .verify_csrf_cached_or_none(context.session_id(), &csrf, now)
+                    .unwrap_or_else(|error| panic!("csrf cached: {error}"))
+                    .is_some_and(|res| res.is_ok())
+            );
+        }
+        let elapsed = start.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        writer
+            .join()
+            .unwrap_or_else(|_| panic!("writer thread panicked"));
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "2000 cached checks during fence writes took too long: {elapsed:?}"
+        );
     }
 }

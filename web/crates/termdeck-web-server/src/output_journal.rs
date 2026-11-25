@@ -1,16 +1,23 @@
-//! Append and fsync before terminal output is forwarded. See output_journal.py.
+//! Durable terminal output journal with bounded async coalescing for web streams. See output_journal.py.
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::oneshot;
 
 const MAGIC: &[u8] = b"T1000J1\n";
 const MAX_RECORD: usize = 8 * 1024 * 1024 + 4;
 const NOFOLLOW: i32 = 0x20000;
+const MAX_JOURNAL_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+const COALESCE_WINDOW: Duration = Duration::from_millis(50);
+const MAX_COALESCE_BATCH_BYTES: usize = 256 * 1024;
+const FINISH_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
@@ -187,22 +194,227 @@ impl Journal {
         let directory = File::open(&self.directory)?;
         if !self.published_initial_commit {
             // A new latest-view must always reference a generation with a
-            // durable watermark. Subsequent updates can share one directory
-            // flush because either watermark describes a durable prefix.
+            // durable watermark.
             directory.sync_all()?;
         }
-        publish(
-            &self.directory.join("latest-view"),
-            self.generation.as_bytes(),
-            &self.generation,
-        )?;
-        directory.sync_all()?;
+        let pointer_path = self.directory.join("latest-view");
+        let pointer_current = self.published_initial_commit
+            && read_file(&pointer_path).is_ok_and(|pointer| {
+                let mut value = String::new();
+                pointer.take(128).read_to_string(&mut value).is_ok()
+                    && value.as_bytes() == self.generation.as_bytes()
+            });
+        if !pointer_current {
+            publish(
+                &pointer_path,
+                self.generation.as_bytes(),
+                &self.generation,
+            )?;
+            directory.sync_all()?;
+        }
         self.published_initial_commit = true;
         Ok(())
     }
 }
 
+enum AsyncJournalCommand {
+    Append {
+        data: Vec<u8>,
+        geometry: Option<(u16, u16)>,
+    },
+    Finish(oneshot::Sender<io::Result<()>>),
+}
+
+/// Bounded asynchronous output journal writer that keeps disk `fsync()` latency
+/// off the live WebSocket display path while still failing closed on errors or overflow.
+pub(crate) struct AsyncJournal {
+    tx: Option<std_mpsc::Sender<AsyncJournalCommand>>,
+    queued_bytes: Arc<AtomicUsize>,
+    failed: Arc<Mutex<Option<String>>>,
+}
+
+impl AsyncJournal {
+    pub(crate) fn spawn(root: PathBuf, id: String) -> Self {
+        let (tx, rx) = std_mpsc::channel();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(Mutex::new(None));
+        let worker_queued = Arc::clone(&queued_bytes);
+        let worker_failed = Arc::clone(&failed);
+        tokio::task::spawn_blocking(move || {
+            async_journal_worker(root, id, rx, worker_queued, worker_failed);
+        });
+        Self {
+            tx: Some(tx),
+            queued_bytes,
+            failed,
+        }
+    }
+
+    pub(crate) fn enqueue(&self, bytes: &[u8], geometry: Option<(u16, u16)>) -> io::Result<()> {
+        if let Some(message) = self
+            .failed
+            .lock()
+            .map_err(|_| invalid("terminal recording state lock failed"))?
+            .clone()
+        {
+            return Err(invalid(&message));
+        }
+        let cost = bytes.len().max(1);
+        let previous = self.queued_bytes.fetch_add(cost, Ordering::AcqRel);
+        if previous.saturating_add(cost) > MAX_JOURNAL_QUEUE_BYTES {
+            self.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
+            let message = String::from("terminal recording queue exceeded 4 MiB");
+            record_journal_failure(&self.failed, &message);
+            return Err(invalid(&message));
+        }
+        let Some(tx) = self.tx.as_ref() else {
+            self.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
+            return Err(invalid("terminal recording writer closed"));
+        };
+        if tx
+            .send(AsyncJournalCommand::Append {
+                data: bytes.to_vec(),
+                geometry,
+            })
+            .is_err()
+        {
+            self.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
+            let message = self
+                .failed
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .unwrap_or_else(|| String::from("terminal recording writer exited"));
+            record_journal_failure(&self.failed, &message);
+            return Err(invalid(&message));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finish(&mut self) {
+        let Some(tx) = self.tx.take() else {
+            return;
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx.send(AsyncJournalCommand::Finish(reply_tx)).is_ok() {
+            let _result = tokio::time::timeout(FINISH_TIMEOUT, reply_rx).await;
+        }
+    }
+}
+
+fn record_journal_failure(slot: &Arc<Mutex<Option<String>>>, message: &str) {
+    if let Ok(mut guard) = slot.lock() {
+        if guard.is_none() {
+            *guard = Some(message.to_owned());
+        }
+    }
+}
+
+fn async_journal_worker(
+    root: PathBuf,
+    id: String,
+    rx: std_mpsc::Receiver<AsyncJournalCommand>,
+    queued_bytes: Arc<AtomicUsize>,
+    failed: Arc<Mutex<Option<String>>>,
+) {
+    let mut journal = match Journal::new(&root, &id) {
+        Ok(value) => value,
+        Err(error) => {
+            let message = format!("terminal recording initialization failed: {error}");
+            record_journal_failure(&failed, &message);
+            while let Ok(command) = rx.try_recv() {
+                if let AsyncJournalCommand::Finish(reply) = command {
+                    let _sent = reply.send(Err(invalid(&message)));
+                }
+            }
+            return;
+        }
+    };
+
+    let mut pending: Option<AsyncJournalCommand> = None;
+    loop {
+        let command = match pending.take() {
+            Some(value) => value,
+            None => match rx.recv() {
+                Ok(value) => value,
+                Err(_) => break,
+            },
+        };
+        match command {
+            AsyncJournalCommand::Finish(reply) => {
+                let _sent = reply.send(Ok(()));
+                break;
+            }
+            AsyncJournalCommand::Append { data, geometry } => {
+                queued_bytes.fetch_sub(data.len().max(1), Ordering::AcqRel);
+                let result = if geometry.is_some() {
+                    journal.append(&data, geometry)
+                } else {
+                    let mut batch = data;
+                    let mut finish_reply = None;
+                    let deadline = Instant::now() + COALESCE_WINDOW;
+                    while batch.len() < MAX_COALESCE_BATCH_BYTES {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        match rx.recv_timeout(remaining) {
+                            Ok(AsyncJournalCommand::Append {
+                                data: next,
+                                geometry: None,
+                            }) if batch.len().saturating_add(next.len())
+                                <= MAX_COALESCE_BATCH_BYTES =>
+                            {
+                                queued_bytes.fetch_sub(next.len().max(1), Ordering::AcqRel);
+                                batch.extend_from_slice(&next);
+                            }
+                            Ok(other) => {
+                                match other {
+                                    AsyncJournalCommand::Finish(reply) => {
+                                        finish_reply = Some(reply);
+                                    }
+                                    item => pending = Some(item),
+                                }
+                                break;
+                            }
+                            Err(std_mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                    let append_result = journal.append(&batch, None);
+                    if let Some(reply) = finish_reply {
+                        let status = match &append_result {
+                            Ok(()) => Ok(()),
+                            Err(error) => Err(invalid(&error.to_string())),
+                        };
+                        let _sent = reply.send(status);
+                        if append_result.is_ok() {
+                            return;
+                        }
+                    }
+                    append_result
+                };
+                if let Err(error) = result {
+                    let message = format!("terminal recording failed: {error}");
+                    record_journal_failure(&failed, &message);
+                    if let Some(AsyncJournalCommand::Finish(reply)) = pending.take() {
+                        let _sent = reply.send(Err(invalid(&message)));
+                    }
+                    while let Ok(next) = rx.try_recv() {
+                        if let AsyncJournalCommand::Finish(reply) = next {
+                            let _sent = reply.send(Err(invalid(&message)));
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) type SharedJournal = Arc<Mutex<Journal>>;
+#[cfg(test)]
 pub(crate) async fn append(
     journal: &SharedJournal,
     bytes: &[u8],
@@ -446,6 +658,63 @@ mod tests {
         assert!(journal.append(b"cannot retry silently", None).is_err());
         assert!(Journal::new(&fixture.0, "../escape").is_err());
         assert!(read_page(&fixture.0, "tab", Some("../../secret".into()), 8).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn async_journal_coalesces_bursts_and_drains_on_finish() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let mut journal = AsyncJournal::spawn(fixture.0.clone(), "async-tab".to_owned());
+            journal.enqueue(b"reset", Some((80, 24)))?;
+            for index in 0..50_usize {
+                journal.enqueue(format!("chunk-{index}-").as_bytes(), None)?;
+            }
+            journal.finish().await;
+            let page = read_page(&fixture.0, "async-tab", None, 8)?;
+            assert!(page.complete);
+            assert!(!page.truncated_tail);
+            assert!(page.events.len() < 51, "burst should coalesce frames");
+            let mut combined = Vec::new();
+            for event in &page.events {
+                combined.extend_from_slice(&decode_hex(&event.data_hex));
+            }
+            let mut expected = b"reset".to_vec();
+            for index in 0..50_usize {
+                expected.extend_from_slice(format!("chunk-{index}-").as_bytes());
+            }
+            assert_eq!(combined, expected);
+            Ok::<(), io::Error>(())
+        })
+    }
+
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(hex.len() / 2);
+        let bytes = hex.as_bytes();
+        let mut index = 0;
+        while index + 1 < bytes.len() {
+            let pair = std::str::from_utf8(&bytes[index..index + 2]).unwrap_or("00");
+            out.push(u8::from_str_radix(pair, 16).unwrap_or(0));
+            index += 2;
+        }
+        out
+    }
+
+    #[test]
+    fn async_journal_fails_closed_on_queue_overflow() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let mut journal = AsyncJournal {
+            tx: None,
+            queued_bytes: Arc::new(AtomicUsize::new(MAX_JOURNAL_QUEUE_BYTES)),
+            failed: Arc::new(Mutex::new(None)),
+        };
+        assert!(journal.enqueue(b"overflow", None).is_err());
+        assert!(journal.enqueue(b"poisoned", None).is_err());
+        let _unused = &fixture;
+        drop(journal.tx.take());
         Ok(())
     }
 }

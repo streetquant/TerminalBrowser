@@ -128,11 +128,110 @@ impl HttpAuth {
             .map_err(HttpAuthError::Auth)
     }
 
+    /// Non-blocking in-memory session revalidation using the warm snapshot.
+    /// Returns `None` if the SQLite fallback is required.
+    pub(crate) fn try_require_session_fast(
+        &self,
+        context: &SessionContext,
+        wall_clock_ms: u64,
+    ) -> Option<Result<(), HttpAuthError>> {
+        match self.store.require_context_cached_or_none(context, wall_clock_ms) {
+            Ok(Some(Ok(()))) => Some(Ok(())),
+            Ok(Some(Err(error))) => Some(Err(HttpAuthError::Auth(error))),
+            Ok(None) => None,
+            Err(error) => Some(Err(HttpAuthError::Auth(error))),
+        }
+    }
+
+    pub fn try_authenticate_fast(
+        &self,
+        headers: &HeaderMap,
+        wall_clock_ms: u64,
+    ) -> Option<Result<SessionContext, HttpAuthError>> {
+        let session_secret = match cookie_value(headers, self.session_cookie_name()) {
+            Ok(Some(value)) => value,
+            Ok(None) => return Some(Err(HttpAuthError::Unauthenticated)),
+            Err(error) => return Some(Err(error)),
+        };
+        let (now_ms, auth_result) = match self
+            .store
+            .authenticate_with_fence_cached_or_none(session_secret.as_str(), wall_clock_ms)
+        {
+            Ok(Some(value)) => value,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(HttpAuthError::Auth(error))),
+        };
+        if let Err(error) = self.check_rate(SESSION_RATE_SCOPE, now_ms) {
+            return Some(Err(error));
+        }
+        match auth_result {
+            Ok(context) => {
+                if let Err(error) = self.clear_rate(SESSION_RATE_SCOPE) {
+                    return Some(Err(error));
+                }
+                Some(Ok(context))
+            }
+            Err(AuthError::Unauthenticated | AuthError::Secret(_)) => {
+                if let Err(error) = self.record_failure(SESSION_RATE_SCOPE, now_ms) {
+                    return Some(Err(error));
+                }
+                Some(Err(HttpAuthError::Unauthenticated))
+            }
+            Err(error) => Some(Err(HttpAuthError::Auth(error))),
+        }
+    }
+
+    pub fn try_verify_csrf_fast(
+        &self,
+        headers: &HeaderMap,
+        context: &SessionContext,
+        wall_clock_ms: u64,
+    ) -> Option<Result<(), HttpAuthError>> {
+        let now_ms = match self.now_ms(wall_clock_ms) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(error)),
+        };
+        let cookie = match cookie_value(headers, self.csrf_cookie_name()) {
+            Ok(Some(value)) => value,
+            Ok(None) => return Some(Err(HttpAuthError::CsrfRejected)),
+            Err(error) => return Some(Err(error)),
+        };
+        let header_value = match one_header(headers, CSRF_HEADER_NAME) {
+            Ok(Some(value)) => value,
+            Ok(None) => return Some(Err(HttpAuthError::CsrfRejected)),
+            Err(error) => return Some(Err(error)),
+        };
+        let Ok(header_value) = header_value.to_str() else {
+            return Some(Err(HttpAuthError::CsrfRejected));
+        };
+        if cookie.as_str() != header_value {
+            return Some(Err(HttpAuthError::CsrfRejected));
+        }
+        match self
+            .store
+            .verify_csrf_cached_or_none(context.session_id(), header_value, now_ms)
+        {
+            Ok(Some(Ok(()))) => Some(Ok(())),
+            Ok(Some(Err(AuthError::CsrfMismatch | AuthError::Unauthenticated | AuthError::Secret(_)))) => {
+                Some(Err(HttpAuthError::CsrfRejected))
+            }
+            Ok(Some(Err(error))) => Some(Err(HttpAuthError::Auth(error))),
+            Ok(None) => None,
+            Err(AuthError::CsrfMismatch | AuthError::Unauthenticated | AuthError::Secret(_)) => {
+                Some(Err(HttpAuthError::CsrfRejected))
+            }
+            Err(error) => Some(Err(HttpAuthError::Auth(error))),
+        }
+    }
+
     pub fn authenticate(
         &self,
         headers: &HeaderMap,
         wall_clock_ms: u64,
     ) -> Result<SessionContext, HttpAuthError> {
+        if let Some(result) = self.try_authenticate_fast(headers, wall_clock_ms) {
+            return result;
+        }
         let session_secret = cookie_value(headers, self.session_cookie_name())?
             .ok_or(HttpAuthError::Unauthenticated)?;
         let now_ms = self.now_ms(wall_clock_ms)?;
@@ -245,6 +344,9 @@ impl HttpAuth {
         context: &SessionContext,
         wall_clock_ms: u64,
     ) -> Result<(), HttpAuthError> {
+        if let Some(result) = self.try_verify_csrf_fast(headers, context, wall_clock_ms) {
+            return result;
+        }
         let now_ms = self.now_ms(wall_clock_ms)?;
         let cookie =
             cookie_value(headers, self.csrf_cookie_name())?.ok_or(HttpAuthError::CsrfRejected)?;

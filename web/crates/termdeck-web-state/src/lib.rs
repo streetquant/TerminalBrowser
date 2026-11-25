@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use termdeck_web_core::{
@@ -296,11 +298,21 @@ struct DatabaseWindow {
 }
 
 #[derive(Debug)]
+struct CachedDatabaseConnection {
+    connection: Connection,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug)]
 pub struct ReadOnlyStateMirror {
     database_path: PathBuf,
     host_id: HostId,
     owner_id: OwnerId,
     routes: RouteRegistry,
+    cached_connection: Option<CachedDatabaseConnection>,
 }
 
 impl ReadOnlyStateMirror {
@@ -315,6 +327,7 @@ impl ReadOnlyStateMirror {
             host_id,
             owner_id,
             routes: RouteRegistry::new(),
+            cached_connection: None,
         })
     }
 
@@ -323,12 +336,54 @@ impl ReadOnlyStateMirror {
         &self.database_path
     }
 
+    fn load_windows_cached(&mut self) -> Result<Vec<DatabaseWindow>, StateError> {
+        let metadata = fs::symlink_metadata(&self.database_path)?;
+        if metadata.file_type().is_symlink() {
+            self.cached_connection = None;
+            return Err(StateError::DatabasePathIsSymlink(self.database_path.clone()));
+        }
+        if !metadata.is_file() {
+            self.cached_connection = None;
+            return Err(StateError::DatabasePathIsNotFile(self.database_path.clone()));
+        }
+        #[cfg(unix)]
+        let (device, inode) = (metadata.dev(), metadata.ino());
+        #[cfg(unix)]
+        let matches = self
+            .cached_connection
+            .as_ref()
+            .is_some_and(|cached| cached.device == device && cached.inode == inode);
+        #[cfg(not(unix))]
+        let matches = self.cached_connection.is_some();
+
+        if matches {
+            if let Some(cached) = self.cached_connection.as_mut() {
+                if let Ok(windows) = load_database_windows_from_connection(&mut cached.connection) {
+                    return Ok(windows);
+                }
+            }
+            self.cached_connection = None;
+        }
+
+        let mut connection = open_read_only(&self.database_path)?;
+        verify_schema(&connection)?;
+        let windows = load_database_windows_from_connection(&mut connection)?;
+        self.cached_connection = Some(CachedDatabaseConnection {
+            connection,
+            #[cfg(unix)]
+            device,
+            #[cfg(unix)]
+            inode,
+        });
+        Ok(windows)
+    }
+
     pub fn load(
         &mut self,
         inventory: &TmuxInventory,
         generated_at_unix_ms: u64,
     ) -> Result<HostSnapshot, StateError> {
-        let windows = load_database_windows(&self.database_path)?;
+        let windows = self.load_windows_cached()?;
         let route_inputs: Vec<WindowRouteInput> = windows
             .iter()
             .map(|window| {
@@ -365,6 +420,7 @@ impl ReadOnlyStateMirror {
                         target,
                         None,
                     )?
+                    .with_tmux_pane_id(live.map(|value| value.pane_id().as_str().to_owned()))?
                     .with_pinned(pane.pinned)
                     .with_automatic_title(automatic_title),
                 );
@@ -419,9 +475,9 @@ fn open_read_only(path: &Path) -> Result<Connection, StateError> {
     Ok(connection)
 }
 
-fn load_database_windows(path: &Path) -> Result<Vec<DatabaseWindow>, StateError> {
-    let mut connection = open_read_only(path)?;
-    verify_schema(&connection)?;
+fn load_database_windows_from_connection(
+    connection: &mut Connection,
+) -> Result<Vec<DatabaseWindow>, StateError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
 
     let mut windows: BTreeMap<String, DatabaseWindow> = BTreeMap::new();
@@ -700,6 +756,7 @@ fn stable_revision(
             hash.byte(u8::from(pane.pinned()));
             hash.byte(u8::from(pane.automatic_title()));
             hash.text(pane.tmux_target().unwrap_or(""));
+            hash.text(pane.tmux_pane_id().unwrap_or(""));
         }
     }
     hash.finish_nonzero()

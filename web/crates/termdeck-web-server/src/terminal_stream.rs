@@ -1,5 +1,5 @@
 use crate::auth_http::HttpAuth;
-use crate::output_journal::{self, Journal, SharedJournal};
+use crate::output_journal::AsyncJournal;
 use crate::terminal_http::{
     InputDecision, InputOutcome, MAX_CAPTURE_HISTORY_LINES, MAX_TERMINAL_INPUT_BYTES,
     TerminalControlView, TerminalError, TerminalService,
@@ -76,6 +76,7 @@ pub(crate) struct StreamPane {
     pub pane_id: String,
     pub journal_id: String,
     pub tmux_target: String,
+    pub tmux_pane_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -300,12 +301,11 @@ async fn run_terminal_socket_inner(
         }
     };
     let root = terminal.output_journal_root.clone().ok_or_else(|| StreamError::Recording(std::io::Error::other("recording root unavailable")))?;
-    let id = pane.journal_id.clone();
-    let journal: SharedJournal = Arc::new(std::sync::Mutex::new(tokio::task::spawn_blocking(move || Journal::new(&root, &id))
-        .await.map_err(|_| StreamError::Recording(std::io::Error::other("recording worker failed")))?.map_err(StreamError::Recording)?));
+    let mut journal = AsyncJournal::spawn(root, pane.journal_id.clone());
     let mut control = TmuxControl::spawn(
         terminal.tmux_executable(),
         pane.tmux_target.clone(),
+        pane.tmux_pane_id.clone(),
         terminal.command_timeout(),
     )
     .await?;
@@ -318,7 +318,9 @@ async fn run_terminal_socket_inner(
     // the replay is sent stays queued (byte-bounded) and follows it in order.
     let replay = control.initial_replay().await?;
     let mut geometry = replay.geometry;
-    output_journal::append(&journal, &replay.bytes, Some((geometry.cols, geometry.rows))).await.map_err(StreamError::Recording)?;
+    journal
+        .enqueue(&replay.bytes, Some((geometry.cols, geometry.rows)))
+        .map_err(StreamError::Recording)?;
     require_stream_session(&auth, &context).await?;
     send_json(
         socket,
@@ -355,7 +357,7 @@ async fn run_terminal_socket_inner(
                 match notification {
                     ControlNotification::Output(output) => {
                         let output = control.coalesce_output(output);
-                        output_journal::append(&journal, &output, None).await.map_err(StreamError::Recording)?;
+                        journal.enqueue(&output, None).map_err(StreamError::Recording)?;
                         require_stream_session(&auth, &context).await?;
                         send_sink_message(&mut sender, Message::Binary(output.into())).await?;
                     }
@@ -503,7 +505,7 @@ async fn run_terminal_socket_inner(
             }
         }
     }
-    control.shutdown().await;
+    tokio::join!(control.shutdown(), journal.finish());
     Ok(())
 }
 
@@ -511,6 +513,9 @@ async fn require_stream_session(
     auth: &Arc<HttpAuth>,
     context: &SessionContext,
 ) -> Result<(), StreamError> {
+    if let Some(result) = auth.try_require_session_fast(context, unix_ms()) {
+        return result.map_err(|_| StreamError::SessionUnavailable);
+    }
     let auth = Arc::clone(auth);
     let context = context.clone();
     tokio::task::spawn_blocking(move || auth.require_session(&context, unix_ms()))
@@ -524,7 +529,7 @@ async fn send_sink_resync<S>(
     control: &mut TmuxControl,
     control_view: &TerminalControlView,
     viewport_geometry: TerminalGeometry,
-    journal: &SharedJournal,
+    journal: &AsyncJournal,
     auth: &Arc<HttpAuth>,
     context: &SessionContext,
 ) -> Result<TerminalGeometry, StreamError>
@@ -540,7 +545,9 @@ where
         .await?;
     let replay = control.initial_replay().await?;
     let geometry = replay.geometry;
-    output_journal::append(journal, &replay.bytes, Some((geometry.cols, geometry.rows))).await.map_err(StreamError::Recording)?;
+    journal
+        .enqueue(&replay.bytes, Some((geometry.cols, geometry.rows)))
+        .map_err(StreamError::Recording)?;
     require_stream_session(auth, context).await?;
     send_sink_json(
         sender,
@@ -877,11 +884,15 @@ impl TmuxControl {
     async fn spawn(
         tmux_executable: Arc<PathBuf>,
         target: String,
+        known_pane_id: Option<String>,
         command_timeout: Duration,
     ) -> Result<Self, StreamError> {
         validate_tmux_target(target.as_str())?;
-        let pane_id =
-            resolve_pane_id(tmux_executable.as_ref(), target.as_str(), command_timeout).await?;
+        let pane_id = match known_pane_id.filter(|id| validate_tmux_pane_id(id.as_str()).is_ok()) {
+            Some(id) => id,
+            None => resolve_pane_id(tmux_executable.as_ref(), target.as_str(), command_timeout)
+                .await?,
+        };
         let mut command = crate::tmux_runtime::command(tmux_executable.as_ref()).await?;
         command
             .arg(CONTROL_MODE_ARGUMENT)

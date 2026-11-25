@@ -85,6 +85,10 @@ def save_screens(store, backend, root: Path) -> dict:
         observations = backend.reconciliation_snapshot(records)
         boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         deadline = time.monotonic() + 5
+        screen_hashes = getattr(backend, "_durability_screen_hashes", None)
+        if not isinstance(screen_hashes, dict):
+            screen_hashes = {}
+            backend._durability_screen_hashes = screen_hashes
         for index, record in enumerate(records):
             if time.monotonic() >= deadline:
                 failed += 1  # Keep the observer/shutdown bounded; retain old copies.
@@ -105,12 +109,19 @@ def save_screens(store, backend, root: Path) -> dict:
                     raise OSError("screen owner changed during capture")
                 generation = hashlib.sha256(json.dumps([boot, before], sort_keys=True).encode()).hexdigest()
                 directory = _directory(root / "screens" / record.id)
+                target = directory / (generation + ".json")
+                text_sha256 = hashlib.sha256(result.stdout.encode()).hexdigest()
+                cache_key = (record.id, generation)
+                if screen_hashes.get(cache_key) == text_sha256 and target.exists():
+                    saved += 1
+                    continue
                 payload = {"schema": "termdeck.saved-screen.v1", "session_id": record.id,
                            "generation": generation, "boot_id": boot, "owner": before,
                            "captured_at": datetime.now(timezone.utc).isoformat(),
                            "history_line_limit": 10000, "text": result.stdout,
-                           "text_sha256": hashlib.sha256(result.stdout.encode()).hexdigest()}
-                _atomic(directory / (generation + ".json"), (json.dumps(payload) + "\n").encode())
+                           "text_sha256": text_sha256}
+                _atomic(target, (json.dumps(payload) + "\n").encode())
+                screen_hashes[cache_key] = text_sha256
                 saved += 1
             except (OSError, ValueError, RuntimeError):
                 failed += 1

@@ -87,9 +87,9 @@ pub const MAX_TMUX_ROWS: usize = MAX_DATABASE_ROWS * 4;
 pub const MAX_FRONTEND_ASSET_BYTES: usize = 64 * 1024;
 pub const MAX_TERMINAL_ASSET_BYTES: usize = 1024 * 1024;
 pub const MAX_HTTP_REQUEST_BYTES: usize = MAX_TERMINAL_INPUT_BYTES + 1_024;
-const AUTH_FENCE_ADVANCE_INTERVAL: Duration = Duration::from_secs(15);
+const AUTH_FENCE_ADVANCE_INTERVAL: Duration = Duration::from_secs(60);
 
-const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v8/app.css";
+const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v9/app.css";
 const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v8/app.js";
 const CLIENT_FILES_PATH: &str = "/_termdeck/assets/v8/client-files.js";
 const ACCOUNTS_PATH: &str = "/_termdeck/assets/v8/accounts.js";
@@ -98,7 +98,7 @@ const WINDOW_HOME_PATH: &str = "/_termdeck/assets/v8/window-home.js";
 const CODEX_PALETTE_PATH: &str = "/_termdeck/assets/v8/codex-palette.js";
 const TERMINAL_COPY_PATH: &str = "/_termdeck/assets/v8/terminal-copy.js";
 const TERMINAL_SCROLL_PATH: &str = "/_termdeck/assets/v8/terminal-scroll.js";
-const TERMINAL_SESSION_PATH: &str = "/_termdeck/assets/v9/terminal-session.js";
+const TERMINAL_SESSION_PATH: &str = "/_termdeck/assets/v10/terminal-session.js";
 const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v8/terminal.css";
 const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v8/terminal.js";
 const EXTERNAL_BASE_PATH: &str = "/t1000";
@@ -585,6 +585,7 @@ struct RefreshEngine {
     tmux_executable: PathBuf,
     tmux_timeout: Duration,
     recovery_context: Option<RecoveryContextRefresh>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Optional observation inside the existing mirror refresh lifecycle. The CLI
@@ -667,6 +668,7 @@ impl RecoveryContextRefresh {
 
 impl RefreshEngine {
     async fn refresh(&self) -> Result<(), ServerError> {
+        let _guard = self.refresh_lock.lock().await;
         let (inventory, tmux_warning) =
             match load_tmux_inventory(&self.tmux_executable, self.tmux_timeout).await {
                 Ok(value) => (value, None),
@@ -674,15 +676,25 @@ impl RefreshEngine {
             };
         let generated_at = unix_ms();
         let mirror = Arc::clone(&self.mirror);
+        let previous = self.cache.current_signature();
         let publication = tokio::task::spawn_blocking(move || {
             let snapshot = mirror
                 .lock()
                 .map_err(|_| ServerError::MirrorLockPoisoned)?
                 .load(&inventory, generated_at)?;
-            RenderedSnapshot::new(snapshot, tmux_warning)
+            if let Some((previous_revision, previous_warning)) = previous {
+                if previous_revision == snapshot.revision() && previous_warning == tmux_warning {
+                    return Ok(None);
+                }
+            }
+            RenderedSnapshot::new(snapshot, tmux_warning).map(Some)
         })
         .await??;
-        self.cache.publish(publication)?;
+        if let Some(publication) = publication {
+            self.cache.publish(publication)?;
+        } else {
+            self.cache.clear_error()?;
+        }
         Ok(())
     }
 
@@ -778,6 +790,25 @@ impl SnapshotCache {
         Ok(())
     }
 
+    fn clear_error(&self) -> Result<(), ServerError> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| ServerError::CacheLockPoisoned)?;
+        guard.last_error = None;
+        Ok(())
+    }
+
+    fn current_signature(&self) -> Option<(u64, Option<String>)> {
+        let Ok(guard) = self.inner.read() else {
+            return None;
+        };
+        guard
+            .current
+            .as_ref()
+            .map(|rendered| (rendered.snapshot.revision(), rendered.tmux_warning.clone()))
+    }
+
     fn record_error(&self, message: String, at_unix_ms: u64) -> Result<bool, ServerError> {
         let mut guard = self
             .inner
@@ -836,6 +867,7 @@ impl SnapshotCache {
 
 struct RenderedSnapshot {
     snapshot: Arc<HostSnapshot>,
+    tmux_warning: Option<String>,
     full_json: Bytes,
     homepage_html: Bytes,
     windows: BTreeMap<String, RenderedWindow>,
@@ -873,6 +905,7 @@ impl RenderedSnapshot {
         }
         Ok(Self {
             snapshot,
+            tmux_warning,
             full_json: Bytes::from(full_json),
             homepage_html: Bytes::from(homepage_html),
             windows,
@@ -888,6 +921,7 @@ struct AppState {
     auth: Option<Arc<HttpAuth>>,
     terminal: Option<Arc<TerminalService>>,
     tab_actions: Option<Arc<TabActionService>>,
+    refresh: Option<RefreshEngine>,
 }
 
 #[derive(Serialize)]
@@ -906,7 +940,12 @@ pub fn run_from_env() -> Result<(), ServerError> {
         }
         ConfigAction::CreateInvitation(config) => create_pairing_invitation(config),
         ConfigAction::Run(config) => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
+            let workers = std::thread::available_parallelism()
+                .map(|count| count.get().clamp(2, 4))
+                .unwrap_or(3);
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .max_blocking_threads(32)
                 .enable_all()
                 .build()?;
             runtime.block_on(serve(config))
@@ -999,6 +1038,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
         recovery_context: RecoveryContextRefresh::configured(
             &config, std::env::var_os("TERMDECK_NATIVE_CONTEXT_CONFIG"),
             std::env::var_os("TERMDECK_NATIVE_CONTEXT_CONFIG_SHA256")),
+        refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     engine.refresh().await?;
     let fence_auth = auth.clone();
@@ -1009,6 +1049,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
         auth,
         terminal,
         tab_actions,
+        refresh: Some(engine.clone()),
     };
     let application = build_router(state);
     let listener = TcpListener::bind(config.listen).await?;
@@ -1293,38 +1334,52 @@ async fn auth_gate(State(state): State<AppState>, mut request: Request, next: Ne
     }
     // The authentication store performs blocking SQLite work, so it runs on a
     // blocking thread instead of a Tokio worker.
-    let headers = Arc::new(request.headers().clone());
-    let authenticate = Arc::clone(auth);
-    let authenticate_headers = Arc::clone(&headers);
-    let context = match tokio::task::spawn_blocking(move || {
-        authenticate.authenticate(&authenticate_headers, unix_ms())
-    })
-    .await
-    {
-        Ok(Ok(context)) => context,
-        Ok(Err(error)) => return authentication_error_response(error, path.as_str()),
-        Err(error) => {
-            eprintln!("t1000 authentication task failed: {error}");
-            return internal_error_response();
+    let headers = request.headers();
+    let context = if let Some(result) = auth.try_authenticate_fast(headers, unix_ms()) {
+        match result {
+            Ok(context) => context,
+            Err(error) => return authentication_error_response(error, path.as_str()),
+        }
+    } else {
+        let headers = Arc::new(headers.clone());
+        let authenticate = Arc::clone(auth);
+        let authenticate_headers = Arc::clone(&headers);
+        match tokio::task::spawn_blocking(move || {
+            authenticate.authenticate(&authenticate_headers, unix_ms())
+        })
+        .await
+        {
+            Ok(Ok(context)) => context,
+            Ok(Err(error)) => return authentication_error_response(error, path.as_str()),
+            Err(error) => {
+                eprintln!("t1000 authentication task failed: {error}");
+                return internal_error_response();
+            }
         }
     };
     if method != Method::GET && method != Method::HEAD {
         if !unsafe_request_metadata_allowed(request.headers(), auth.secure_cookies()) {
             return forbidden_response("request metadata is not allowed");
         }
-        let verify = Arc::clone(auth);
-        let verify_headers = Arc::clone(&headers);
-        let verify_context = context.clone();
-        match tokio::task::spawn_blocking(move || {
-            verify.verify_csrf(&verify_headers, &verify_context, unix_ms())
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return authentication_error_response(error, path.as_str()),
-            Err(error) => {
-                eprintln!("t1000 csrf verification task failed: {error}");
-                return internal_error_response();
+        if let Some(result) = auth.try_verify_csrf_fast(request.headers(), &context, unix_ms()) {
+            if let Err(error) = result {
+                return authentication_error_response(error, path.as_str());
+            }
+        } else {
+            let verify = Arc::clone(auth);
+            let verify_headers = Arc::new(request.headers().clone());
+            let verify_context = context.clone();
+            match tokio::task::spawn_blocking(move || {
+                verify.verify_csrf(&verify_headers, &verify_context, unix_ms())
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return authentication_error_response(error, path.as_str()),
+                Err(error) => {
+                    eprintln!("t1000 csrf verification task failed: {error}");
+                    return internal_error_response();
+                }
             }
         }
     }
@@ -1905,6 +1960,7 @@ struct ResolvedPane {
     pane_title: String,
     cwd: String,
     tmux_target: String,
+    tmux_pane_id: Option<String>,
 }
 
 fn terminal_context(
@@ -2003,6 +2059,7 @@ fn resolve_saved_pane(
         pane_title: pane.title().to_owned(),
         cwd: pane.cwd().to_owned(),
         tmux_target: tmux_target.to_owned(),
+        tmux_pane_id: pane.tmux_pane_id().map(ToOwned::to_owned),
     })
 }
 
@@ -2121,7 +2178,12 @@ async fn management(
         Err(response) => return *response,
     };
     match actions.manage(request).await {
-        Ok(value) => json_response(StatusCode::OK, &value),
+        Ok(value) => {
+            if let Some(engine) = state.refresh.as_ref() {
+                let _refresh = engine.refresh().await;
+            }
+            json_response(StatusCode::OK, &value)
+        }
         Err(error) => tab_action_error_response(error),
     }
 }
@@ -2158,7 +2220,12 @@ async fn tab_create(
         )
         .await
     {
-        Ok(value) => json_response(StatusCode::CREATED, &value),
+        Ok(value) => {
+            if let Some(engine) = state.refresh.as_ref() {
+                let _refresh = engine.refresh().await;
+            }
+            json_response(StatusCode::CREATED, &value)
+        }
         Err(error) => tab_action_error_response(error),
     }
 }
@@ -2196,7 +2263,12 @@ async fn tab_restore(
         Err(response) => return *response,
     };
     match actions.restore(&window.id, &window.name, &session_id).await {
-        Ok(value) => json_response(StatusCode::OK, &value),
+        Ok(value) => {
+            if let Some(engine) = state.refresh.as_ref() {
+                let _refresh = engine.refresh().await;
+            }
+            json_response(StatusCode::OK, &value)
+        }
         Err(error) => tab_action_error_response(error),
     }
 }
@@ -2223,7 +2295,12 @@ async fn tab_mutate(
             return json_error_response(StatusCode::BAD_REQUEST, "tab-name-required");
         };
         return match actions.rename(session_id, name).await {
-            Ok(value) => json_response(StatusCode::OK, &value),
+            Ok(value) => {
+                if let Some(engine) = state.refresh.as_ref() {
+                    let _refresh = engine.refresh().await;
+                }
+                json_response(StatusCode::OK, &value)
+            }
             Err(error) => tab_action_error_response(error),
         };
     }
@@ -2235,7 +2312,12 @@ async fn tab_mutate(
         .existing(session_id, action, request.confirmation.as_deref())
         .await
     {
-        Ok(value) => json_response(StatusCode::OK, &value),
+        Ok(value) => {
+            if let Some(engine) = state.refresh.as_ref() {
+                let _refresh = engine.refresh().await;
+            }
+            json_response(StatusCode::OK, &value)
+        }
         Err(error) => tab_action_error_response(error),
     }
 }
@@ -2378,6 +2460,7 @@ async fn terminal_websocket(
                     journal_id: pane.session_id.unwrap_or_else(|| pane_id.clone()),
                     pane_id,
                     tmux_target: pane.tmux_target,
+                    tmux_pane_id: pane.tmux_pane_id,
                 },
                 actor,
                 auth,
@@ -2768,7 +2851,7 @@ fn password_page_response(
     let mut output = String::with_capacity(2_048);
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>");
     escape_html_into(&mut output, title);
-    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v8/app.css\"></head><body class=\"auth-page\"><main class=\"auth-main\"><p class=\"auth-brand\"><span class=\"auth-mark\" aria-hidden=\"true\">&gt;_</span>t1000</p><h1>");
+    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v9/app.css\"></head><body class=\"auth-page\"><main class=\"auth-main\"><p class=\"auth-brand\"><span class=\"auth-mark\" aria-hidden=\"true\">&gt;_</span>t1000</p><h1>");
     escape_html_into(&mut output, heading);
     output.push_str("</h1><p class=\"subtle\">");
     escape_html_into(&mut output, description);
@@ -2868,7 +2951,7 @@ fn password_error_response(
 
 fn render_pairing_page(base_path: RequestBasePath) -> String {
     let output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Recovery pairing · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v8/app.css\"></head><body><main><p class=\"eyebrow\">t1000 recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Recovery pairing · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v9/app.css\"></head><body><main><p class=\"eyebrow\">t1000 recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
     );
     html_for_base(prefix_html_template(output), base_path)
 }
@@ -3575,7 +3658,7 @@ fn render_window_page(
 
 fn render_not_found_page(slug: &str, base_path: RequestBasePath) -> String {
     let mut output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Not found · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v8/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored t1000 window owns this route",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Not found · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v9/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored t1000 window owns this route",
     );
     if !slug.is_empty() {
         output.push_str(": <code>/");
@@ -3881,7 +3964,8 @@ mod recovery_context_tests {
         let engine = RefreshEngine { mirror: Arc::new(Mutex::new(mirror)),
             cache: SnapshotCache::new(Duration::from_secs(1)).unwrap_or_else(|error| panic!("fixture cache: {error}")),
             tmux_executable: PathBuf::from("/absent-fixture-tmux"), tmux_timeout: Duration::from_millis(10),
-            recovery_context: Some(capture) };
+            recovery_context: Some(capture),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())) };
         run(async {
             let job = tokio::spawn(engine.run_periodic(Duration::from_millis(20)));
             assert!(timeout(Duration::from_secs(1), async {
@@ -3992,6 +4076,7 @@ mod tests {
             auth: None,
             terminal: None,
             tab_actions: None,
+            refresh: None,
         }
     }
 
@@ -4144,7 +4229,7 @@ mod tests {
             );
             let home_text = body_text(home).await;
             assert!(home_text.contains(r#"data-termdeck-base="/t1000""#));
-            assert!(home_text.contains(r#"href="/t1000/_termdeck/assets/v8/app.css""#));
+            assert!(home_text.contains(r#"href="/t1000/_termdeck/assets/v9/app.css""#));
             assert!(home_text.contains(r#"src="/t1000/_termdeck/assets/v8/app.js""#));
             assert!(home_text.contains(r#"href="/t1000/random""#));
             assert!(!home_text.contains("__TERMDECK_BASE_PATH__"));
@@ -4159,7 +4244,7 @@ mod tests {
             let window_text = body_text(window).await;
             assert!(window_text.contains(r#"data-termdeck-base="/t1000""#));
             assert!(window_text.contains(r#"href="/t1000/random/t/session-one""#));
-            assert!(window_text.contains(r#"href="/t1000/_termdeck/assets/v8/app.css""#));
+            assert!(window_text.contains(r#"href="/t1000/_termdeck/assets/v9/app.css""#));
 
             let asset = router
                 .clone()
@@ -4804,6 +4889,7 @@ mod auth_integration_tests {
             _directory: directory,
             state: AppState {
                 cache,
+                refresh: None,
                 request_slots: Arc::new(Semaphore::new(64)),
                 password_slots: Arc::new(Semaphore::new(MAX_PASSWORD_OPERATIONS)),
                 auth: Some(Arc::new(auth)),
@@ -5092,6 +5178,7 @@ mod auth_integration_tests {
                 auth: None,
                 terminal: None,
                 tab_actions: None,
+                refresh: None,
             });
             let home = router
                 .clone()
@@ -5170,7 +5257,7 @@ mod auth_integration_tests {
                 .unwrap_or_else(|error| match error {});
             assert_eq!(setup_page.status(), StatusCode::OK);
             let setup_text = body_text(setup_page).await;
-            assert!(setup_text.contains(r#"href="/t1000/_termdeck/assets/v8/app.css""#));
+            assert!(setup_text.contains(r#"href="/t1000/_termdeck/assets/v9/app.css""#));
             assert!(setup_text.contains(r#"action="/t1000/_termdeck/setup""#));
             assert!(!setup_text.contains("__TERMDECK_BASE_PATH__"));
 
@@ -5633,7 +5720,7 @@ mod auth_integration_tests {
                 .clone()
                 .oneshot(request(
                     Method::GET,
-                    "/_termdeck/assets/v8/app.css",
+                    "/_termdeck/assets/v9/app.css",
                     Body::empty(),
                 ))
                 .await

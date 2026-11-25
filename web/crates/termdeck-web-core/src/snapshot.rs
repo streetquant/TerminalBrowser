@@ -74,6 +74,7 @@ pub struct PaneSnapshot {
     pinned: bool,
     automatic_title: bool,
     tmux_target: Option<String>,
+    tmux_pane_id: Option<String>,
     controller: Option<ControllerView>,
 }
 
@@ -103,6 +104,7 @@ impl PaneSnapshot {
             pinned: false,
             automatic_title: false,
             tmux_target,
+            tmux_pane_id: None,
             controller,
         })
     }
@@ -159,6 +161,19 @@ impl PaneSnapshot {
     #[must_use]
     pub fn tmux_target(&self) -> Option<&str> {
         self.tmux_target.as_deref()
+    }
+
+    pub fn with_tmux_pane_id(mut self, pane_id: Option<String>) -> Result<Self, SnapshotError> {
+        if let Some(value) = pane_id.as_deref() {
+            validate_text("tmux pane id", value, MAX_TMUX_TARGET_BYTES)?;
+        }
+        self.tmux_pane_id = pane_id;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn tmux_pane_id(&self) -> Option<&str> {
+        self.tmux_pane_id.as_deref()
     }
 
     #[must_use]

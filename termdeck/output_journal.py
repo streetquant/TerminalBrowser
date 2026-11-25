@@ -61,6 +61,7 @@ class OutputJournal:
         self._lock = threading.Lock()
         self._failed = False
         self._pointer = "latest" if primary else "latest-view"
+        self._pointer_published = False
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         self._stream = os.fdopen(fd, "wb", buffering=0)
         self._backup_lock = None
@@ -113,7 +114,17 @@ class OutputJournal:
                 # append. Publish its committed boundary before advertising it.
                 _atomic(self.path.with_suffix(".tdj.commit"), str(self._stream.tell()).encode("ascii"))
                 # Non-hidden pointer is included in the second-SSD mirror.
-                _atomic(self.directory / self._pointer, self.generation.encode("ascii"))
+                pointer_path = self.directory / self._pointer
+                if not self._pointer_published:
+                    _atomic(pointer_path, self.generation.encode("ascii"))
+                    self._pointer_published = True
+                else:
+                    other_name = "latest-view" if self._pointer == "latest" else "latest"
+                    try:
+                        if os.stat(self.directory / other_name).st_mtime_ns >= os.stat(pointer_path).st_mtime_ns:
+                            _atomic(pointer_path, self.generation.encode("ascii"))
+                    except FileNotFoundError:
+                        pass
             except BaseException:
                 self._failed = True
                 raise
@@ -324,40 +335,67 @@ def pipe_main(argv=None):
         import termios
         geometry = (args.columns, args.rows)
         current_pid, current_start = args.pane_pid, args.pane_start
+        last_geometry_check = time.monotonic() - 1.0
         while True:
+            eof = False
             try:
                 data = pending.get(timeout=1)
             except queue.Empty:
                 data = b""
-            try:
-                with _open_read(journal.directory / "pane-current.json") as stream:
-                    current_pane = json.loads(stream.read(4096))
-                if (current_pane["pane_id"], current_pane["server_pid"], current_pane["server_start"]) == (
-                        args.pane_id, args.server_pid, args.server_start):
-                    current_pid, current_start = current_pane["pid"], current_pane["starttime"]
-            except (OSError, ValueError, KeyError, TypeError):
-                pass
-            current = _parse_stat(current_pid)
-            if current is not None and current["starttime"] == current_start:
-                # Inspect size only; never retain a slave fd, read input,
-                # resize, or become the terminal's controlling process.
-                fd = None
-                try:
-                    fd = os.open(f"/proc/{current_pid}/fd/0", os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
-                    if os.isatty(fd):
-                        rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, bytes(8)))
-                        if (cols, rows) != geometry and 2 <= cols <= 1000 and 2 <= rows <= 500:
-                            geometry = (cols, rows)
-                            journal.append(b"", geometry=geometry, reset=False)
-                except OSError:
-                    pass  # Output remains durable even if size is unavailable.
-                finally:
-                    if fd is not None:
-                        os.close(fd)
             if data is None:
-                break
+                eof = True
+                data = b""
+            elif data:
+                chunks = [data]
+                total = len(data)
+                window_deadline = time.monotonic() + 0.05
+                while total < 256 * 1024:
+                    remaining = window_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        nxt = pending.get(timeout=remaining)
+                    except queue.Empty:
+                        break
+                    if nxt is None:
+                        eof = True
+                        break
+                    if nxt:
+                        chunks.append(nxt)
+                        total += len(nxt)
+                data = b"".join(chunks)
+            now = time.monotonic()
+            if eof or now - last_geometry_check >= 1.0:
+                last_geometry_check = now
+                try:
+                    with _open_read(journal.directory / "pane-current.json") as stream:
+                        current_pane = json.loads(stream.read(4096))
+                    if (current_pane["pane_id"], current_pane["server_pid"], current_pane["server_start"]) == (
+                            args.pane_id, args.server_pid, args.server_start):
+                        current_pid, current_start = current_pane["pid"], current_pane["starttime"]
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass
+                current = _parse_stat(current_pid)
+                if current is not None and current["starttime"] == current_start:
+                    # Inspect size only; never retain a slave fd, read input,
+                    # resize, or become the terminal's controlling process.
+                    fd = None
+                    try:
+                        fd = os.open(f"/proc/{current_pid}/fd/0", os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+                        if os.isatty(fd):
+                            rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, bytes(8)))
+                            if (cols, rows) != geometry and 2 <= cols <= 1000 and 2 <= rows <= 500:
+                                geometry = (cols, rows)
+                                journal.append(b"", geometry=geometry, reset=False)
+                    except OSError:
+                        pass  # Output remains durable even if size is unavailable.
+                    finally:
+                        if fd is not None:
+                            os.close(fd)
             if data:
                 journal.append(data)
+            if eof:
+                break
         return 0
     except (OSError, ValueError, KeyError, TypeError) as exc:
         # A dead sink is detected by the observer without touching the pane.

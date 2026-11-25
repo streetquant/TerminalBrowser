@@ -29,10 +29,14 @@ The output recorder adds these private recovery artifacts:
 - `journals/<session-id>/latest`: the canonical unattended generation;
   `latest-view` is a separate GTK/browser generation. Saved output defaults to
   the most recently published pointer, so a stopped sink cannot hide newer
-  displayed output. Both histories remain separately selectable. Publication
-  flushes both the sidecar and its directory before forwarding output to GTK
-  or a browser. A storage failure pauses that renderer and reports the error;
-  it does not kill the application or pretend its output is safely recorded.
+  displayed output. Both histories remain separately selectable. The GTK writer
+  flushes both the sidecar and its directory before forwarding output; the web
+  server uses a bounded (4 MiB) background `AsyncJournal` writer that coalesces
+  bursts (up to 50 ms / 256 KiB), fsyncs and publishes watermarks off the
+  WebSocket display path, drains synchronously on stream disconnect, and fails
+  closed if storage errors or the queue overflows. A storage failure pauses that
+  renderer and reports the error; it does not kill the application or pretend
+  its output is safely recorded.
 - `applications/<session-id>/<time>-<random>.json`: observed exact native
   recovery commands and working directories. New observations are saved before
   updating the registry, and older observations survive a return to an idle
@@ -50,8 +54,11 @@ stop tmux-owned sinks. The stable pane's sink continues across an explicit pane
 respawn, with the observer publishing the new process identity for size tracking.
 
 The unattended pipe is asynchronous: it cannot delay tmux or another client
-until storage has flushed. Strict flush-before-display applies to the new GTK
-and web writers. Killing the whole server/account can still lose background
+until storage has flushed. Strict flush-before-display applies to the GTK writer;
+the web writer coalesces frames into bounded ~50 ms / 256 KiB background flushes
+(with fail-closed error and 4 MiB queue bounds) so keystroke echo does not wait
+for NVMe flushes while primary raw output remains independently recorded by the
+tmux pipe. Killing the whole server/account can still lose background/buffered
 bytes in flight. Recording starts at attachment; earlier output exists only to
 the extent retained by tmux or snapshots. A failed sink leaves the application
 running and its committed history intact. Retry is bounded and never removes an
@@ -62,7 +69,7 @@ continues and the last committed prefix remains readable. Output past that
 failure point is not claimed as recorded.
 
 Each web writer appends to its own generation and publishes its durable watermark
-atomically before forwarding output. Python journal writers still honor
+atomically before advertising that prefix. Python journal writers still honor
 `.journal-copy.lock` for explicit quiescent copies of those writers. The normal SSD
 mirror copies and validates each generation's committed prefix while writers are
 active, publishes durable data before its watermark, and retains older generations.

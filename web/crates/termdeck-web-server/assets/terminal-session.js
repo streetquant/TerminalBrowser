@@ -81,6 +81,8 @@ window.T1000TerminalSession = (() => {
     let outputWrites = 0;
     let canonicalGeometry = null;
     let lastViewportGeometry = null;
+    let lastActiveSize = null;
+    let needsFitOnActivate = false;
     let focusRequested = false;
     let wheelBatch = null;
     const scroll = window.T1000TerminalScroll.install(host, terminalApi,
@@ -526,7 +528,7 @@ window.T1000TerminalSession = (() => {
           flushInputBatch(false);
         }
       }
-      if (bytes.length >= 1024 || batchBytes >= 4096 || (!inputBatchTimer && inFlight.size === 0)) {
+      if (bytes.length <= 64 || bytes.length >= 1024 || batchBytes >= 4096 || (!inputBatchTimer && inFlight.size === 0)) {
         flushInputBatch(true);
       } else if (!inputBatchTimer) {
         inputBatchTimer = window.setTimeout(() => flushInputBatch(true), INPUT_BATCH_MS);
@@ -688,14 +690,17 @@ window.T1000TerminalSession = (() => {
 
     function fitCanonical(geometry) {
       if (active) terminalApi.fitGrid(geometry.cols, geometry.rows);
-      else terminalApi.terminal.resize(geometry.cols, geometry.rows);
+      else {
+        needsFitOnActivate = true;
+        terminalApi.terminal.resize(geometry.cols, geometry.rows);
+      }
     }
 
     function scheduleRenderer() {
       window.clearTimeout(webglTimer);
       webglTimer = window.setTimeout(() => {
         if (active && !disposed) terminalApi.activateWebgl();
-      }, 1200);
+      }, 50);
     }
 
     function finishReady(event) {
@@ -983,6 +988,7 @@ window.T1000TerminalSession = (() => {
       showRecording,
       deactivate() {
         flushInputBatch(true);
+        lastActiveSize = { w: host.clientWidth, h: host.clientHeight };
         active = false;
         window.clearTimeout(viewportResizeTimer);
         viewportResizeTimer = 0;
@@ -1003,8 +1009,16 @@ window.T1000TerminalSession = (() => {
           appearanceKey = key;
         }
         setStatus(...lastStatus);
-        resizeViewport();
-        terminalApi.terminal.refresh(0, terminalApi.terminal.rows - 1);
+        const sizeChanged = !lastActiveSize
+          || host.clientWidth !== lastActiveSize.w
+          || host.clientHeight !== lastActiveSize.h;
+        if (sizeChanged || needsFitOnActivate) {
+          needsFitOnActivate = false;
+          resizeViewport();
+          if (canonicalGeometry) fitCanonical(canonicalGeometry);
+          terminalApi.terminal.refresh(0, terminalApi.terminal.rows - 1);
+        }
+        if (outputBytes > 0) flushTerminalOutput();
         scheduleRenderer();
         if (!socketOpen()) connect();
       },
@@ -1058,13 +1072,28 @@ window.T1000TerminalSession = (() => {
     };
   }
 
-  function createCache({ parent, before, initial, create, limit = 4 }) {
-    if (!Number.isInteger(limit) || limit < 1 || limit > 4) throw new Error("Invalid terminal cache bound");
+  function createCache({ parent, before, initial, create, limit = 16 }) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 16) throw new Error("Invalid terminal cache bound");
     const entries = new Map();
     let current = null;
     let initialUsed = false;
     const count = () => { parent.dataset.termdeckCachedTerminals = String(entries.size); };
+    const setEntryActive = (entry, isActive) => {
+      if (!entry) return;
+      entry.shell.dataset.termdeckActive = isActive ? "true" : "false";
+      entry.shell.setAttribute?.("aria-hidden", isActive ? "false" : "true");
+      if (isActive) {
+        entry.shell.id = "terminal-shell";
+        entry.host.id = "terminal-xterm";
+        entry.overlay.id = "terminal-overlay";
+      } else {
+        if (entry.shell.id === "terminal-shell") entry.shell.id = "";
+        if (entry.host.id === "terminal-xterm") entry.host.id = "";
+        if (entry.overlay.id === "terminal-overlay") entry.overlay.id = "";
+      }
+    };
     const discard = (id, entry) => {
+      setEntryActive(entry, false);
       entry.mount.dispose();
       entry.shell.remove();
       entries.delete(id);
@@ -1076,17 +1105,20 @@ window.T1000TerminalSession = (() => {
         initialUsed = true;
         return { ...initial, paneId };
       }
-      const shell = document.createElement("div"); shell.className = "xterm-shell"; shell.id = "terminal-shell";
-      const host = document.createElement("div"); host.className = "xterm-host"; host.id = "terminal-xterm";
+      const shell = document.createElement("div"); shell.className = "xterm-shell";
+      const host = document.createElement("div"); host.className = "xterm-host";
       host.dataset.termdeckTerminal = "1";
-      const overlay = document.createElement("div"); overlay.className = "terminal-overlay"; overlay.id = "terminal-overlay"; overlay.hidden = true;
+      const overlay = document.createElement("div"); overlay.className = "terminal-overlay"; overlay.hidden = true;
       shell.append(host, overlay);
       return { paneId, shell, host, overlay };
     }
     return {
       select(paneId) {
         if (current?.paneId === paneId) return current;
-        if (current) { current.mount.deactivate(); current.shell.remove(); }
+        if (current) {
+          current.mount.deactivate();
+          setEntryActive(current, false);
+        }
         let entry = entries.get(paneId);
         if (!entry) {
           if (entries.size >= limit) {
@@ -1094,10 +1126,13 @@ window.T1000TerminalSession = (() => {
             discard(id, oldest);
           }
           entry = view(paneId);
-          parent.insertBefore(entry.shell, before);
+          setEntryActive(entry, true);
+          if (entry.shell.parentNode !== parent && entry.shell.parent !== parent) {
+            parent.insertBefore(entry.shell, before);
+          }
           entry.mount = create(entry);
         } else {
-          parent.insertBefore(entry.shell, before);
+          setEntryActive(entry, true);
           entry.mount.activate();
         }
         entries.delete(paneId);
