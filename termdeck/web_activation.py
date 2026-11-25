@@ -38,6 +38,11 @@ RELEASE_PUBLICATION_SCHEMA = "termdeck.web-activation-release-publication.v1"
 WATCHDOG_UNIT = "termdeck-web-recovery.service"
 WATCHDOG_TIMEOUT = 120.0
 SERVICES = ("termdeck-web-backend.service", "termdeck-web-lan.service")
+_USER_RUNTIME_ROOT = Path("/run/user")
+_SYSTEMD_CPU_WEIGHT_HEADER = (
+    b'# This is a drop-in unit file extension, created via "systemctl set-property"\n'
+    b"# or an equivalent operation. Do not edit.\n"
+)
 # Activation receipts observe stable TermDeck runtime processes only. Model and
 # client executables remain opaque and are handled by session metadata.
 PROCESS_OBSERVATION_NAMES = ("tmux", "t1000")
@@ -5304,6 +5309,33 @@ def _stop_web() -> None:
         raise WebActivationError("TermDeck web units did not stop in the bounded timeout")
 
 
+def _web_runtime_dropin(unit: str, values: Mapping[str, str]) -> dict[str, object] | None:
+    """Allow only the user manager's runtime CPUWeight property for our web units."""
+    reported = values.get("DropInPaths")
+    if reported == "":
+        return None
+    uid = os.getuid()
+    path = _USER_RUNTIME_ROOT / str(uid) / "systemd/user.control" / f"{unit}.d/50-CPUWeight.conf"
+    weight = values.get("CPUWeight", "")
+    error = f"web startup unit binding changed: {unit} (unexpected systemd drop-in)"
+    if unit not in SERVICES or reported != str(path) or not re.fullmatch(r"[1-9][0-9]{0,3}|10000", weight):
+        raise WebActivationError(error)
+    label = "systemd runtime CPUWeight drop-in"
+    try:
+        _, capture = _read_regular(path, label=label)
+        info = path.lstat()
+        identity = release_manager._file_identity(info, label=label)
+    except (WebActivationError, release_manager.ReleaseError, OSError) as exc:
+        raise WebActivationError(error) from exc
+    expected = _SYSTEMD_CPU_WEIGHT_HEADER + b"[Service]\nCPUWeight=" + weight.encode("ascii") + b"\n"
+    if (
+        not stat.S_ISREG(info.st_mode) or info.st_uid != uid or identity.mode != 0o644
+        or identity.nlink != 1 or identity != capture.identity or capture.snapshot.content != expected
+    ):
+        raise WebActivationError(error)
+    return {**_fingerprint_from_capture(path, capture), "identity": _file_identity_payload(identity)}
+
+
 def _web_service_start_ready(
     paths: ActivationPaths,
     unit: str,
@@ -5325,12 +5357,12 @@ def _web_service_start_ready(
     spec = service_wrappers.UNIT_SPEC_BY_NAME[unit]
     if (
         values.get("FragmentPath") != str(paths.unit_dir / unit)
-        or values.get("DropInPaths") != ""
         or values.get("NeedDaemonReload") != "no"
         or values.get("LoadState") != "loaded"
         or values.get("Type") != "simple"
     ):
         raise WebActivationError(f"web startup unit binding changed: {unit}")
+    _web_runtime_dropin(unit, values)
     if values.get("ActiveState") == "activating":
         if unit in observed:
             raise WebActivationError(f"web startup invocation changed: {unit}")
@@ -5448,7 +5480,7 @@ def _start_web(paths: ActivationPaths) -> None:
             ready = True
             for unit, (path, capture, guards, command, managed) in contracts.items():
                 _assert_runtime_capture_current(path, capture, guards, label="web startup unit")
-                info = systemd("show", unit, "-p", "MainPID", "-p", "InvocationID", "-p", "ActiveState", "-p", "SubState", "-p", "LoadState", "-p", "Type", "-p", "FragmentPath", "-p", "DropInPaths", "-p", "NeedDaemonReload", "--no-pager")
+                info = systemd("show", unit, "-p", "MainPID", "-p", "InvocationID", "-p", "ActiveState", "-p", "SubState", "-p", "LoadState", "-p", "Type", "-p", "FragmentPath", "-p", "DropInPaths", "-p", "CPUWeight", "-p", "NeedDaemonReload", "--no-pager")
                 values = dict(line.partition("=")[::2] for line in info.stdout.splitlines() if "=" in line)
                 ready = _web_service_start_ready(
                     paths, unit, values, layout=layout, command=command, managed=managed,
@@ -6329,6 +6361,13 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
     from . import forward_recovery
     forward_recovery.admit(paths, tx, receipt)
     tls_admission = _require_preserved_tls_preparation(paths)
+    if paths.runtime == service_wrappers.CANONICAL_RUNTIME_ROOT:
+        for unit in SERVICES:
+            info = _systemd("show", unit, "-p", "DropInPaths", "-p", "CPUWeight", "-p", "NeedDaemonReload", "--no-pager")
+            values = dict(line.partition("=")[::2] for line in info.stdout.splitlines() if "=" in line)
+            if values.get("NeedDaemonReload") != "no":
+                raise WebActivationError(f"web startup unit binding changed: {unit} (daemon reload pending)")
+            _web_runtime_dropin(unit, values)
     from . import legacy_activation
     legacy_bootstrap = legacy_activation.prepare(paths, tx, receipt)
     if legacy_bootstrap is not None:
@@ -6897,13 +6936,14 @@ def _rollback_service_restart(
         def services_observation() -> dict[str, object]:
             result = {}
             for unit, spec in specs.items():
-                info = _systemd("show", unit, "-p", "MainPID", "-p", "InvocationID", "-p", "ActiveState", "-p", "SubState", "-p", "FragmentPath", "-p", "DropInPaths", "-p", "NeedDaemonReload", "--no-pager")
+                info = _systemd("show", unit, "-p", "MainPID", "-p", "InvocationID", "-p", "ActiveState", "-p", "SubState", "-p", "FragmentPath", "-p", "DropInPaths", "-p", "CPUWeight", "-p", "NeedDaemonReload", "--no-pager")
                 values = dict(line.partition("=")[::2] for line in info.stdout.splitlines() if "=" in line)
                 if (
                     values.get("FragmentPath") != str(paths.unit_dir / unit)
-                    or values.get("DropInPaths") != "" or values.get("NeedDaemonReload") != "no"
+                    or values.get("NeedDaemonReload") != "no"
                 ):
                     raise WebActivationError("rollback restarted service is not its exact restored unit")
+                _web_runtime_dropin(unit, values)
                 if mode == "legacy-direct":
                     raw_pid = values.get("MainPID", "")
                     if not raw_pid.isascii() or not raw_pid.isdecimal():

@@ -150,6 +150,40 @@ def test_canonical_runtime_layout_uses_the_explicit_paths(startup, monkeypatch):
     assert wrappers._read_nginx_pid(startup.layout) == startup.children["termdeck-web-lan.service"].pid
 
 
+@pytest.fixture
+def cpu_weight_dropin(startup, monkeypatch, tmp_path):
+    monkeypatch.setattr(activation, "_USER_RUNTIME_ROOT", tmp_path)
+    unit = activation.SERVICES[0]
+    path = tmp_path / str(os.getuid()) / "systemd/user.control" / f"{unit}.d/50-CPUWeight.conf"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(activation._SYSTEMD_CPU_WEIGHT_HEADER + b"[Service]\nCPUWeight=1000\n")
+    path.chmod(0o644)
+    startup.info_changes[unit] = {"DropInPaths": str(path), "CPUWeight": "1000"}
+    return path
+
+
+def test_start_accepts_systemd_runtime_cpu_weight(startup, cpu_weight_dropin):
+    activation._start_web(startup.paths)
+    assert startup.starts == list(activation.SERVICES)
+
+
+@pytest.mark.parametrize("change", ("directive", "weight", "symlink", "second-file"))
+def test_start_rejects_an_unverified_cpu_weight_dropin(startup, cpu_weight_dropin, change):
+    values = startup.info_changes[activation.SERVICES[0]]
+    if change == "directive":
+        cpu_weight_dropin.write_bytes(cpu_weight_dropin.read_bytes() + b"ExecStartPost=/usr/bin/false\n")
+    elif change == "weight":
+        values["CPUWeight"] = "2000"
+    elif change == "symlink":
+        moved = cpu_weight_dropin.with_name("replacement.conf")
+        cpu_weight_dropin.rename(moved)
+        cpu_weight_dropin.symlink_to(moved)
+    else:
+        values["DropInPaths"] += " /some/other.conf"
+    with pytest.raises(activation.WebActivationError, match="unexpected systemd drop-in"):
+        activation._start_web(startup.paths)
+
+
 def test_wrong_release_config_is_refused_before_any_start(startup):
     spec = wrappers.UNIT_SPEC_BY_NAME[activation.SERVICES[0]]
     config = wrappers._initial_config(spec, startup.layout, "foreign-release")

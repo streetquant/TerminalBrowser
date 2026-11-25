@@ -156,7 +156,7 @@ def _baseline(paths):
     for unit in api.SERVICES:
         result = api._systemd("show", unit, "--no-pager", *[v for key in (
             "MainPID", "InvocationID", "ActiveState", "SubState", "LoadState", "Type",
-            "FragmentPath", "DropInPaths", "NeedDaemonReload") for v in ("-p", key)])
+            "FragmentPath", "DropInPaths", "CPUWeight", "NeedDaemonReload") for v in ("-p", key)])
         values = dict(line.partition("=")[::2] for line in result.stdout.splitlines() if "=" in line)
         spec = service_wrappers.UNIT_SPEC_BY_NAME[unit]
         command = service_wrappers.build_start_command(spec, **api._wrapper_kwargs(paths))
@@ -164,7 +164,8 @@ def _baseline(paths):
                 command=command, managed=True, release_id=state["release_id"], observed=observed):
             raise api.WebActivationError("forward recovery service is not ready")
         services[unit] = {"properties": values, "identity": observed[unit],
-                          "unit": _image(paths.unit_dir / unit)[0]}
+                          "unit": _image(paths.unit_dir / unit)[0],
+                          "runtime_dropin": api._web_runtime_dropin(unit, values)}
     tls = _tls(paths)
     health = api._health()
     if api._managed_release_state_snapshot(paths, require_generation=True) != state:
@@ -172,7 +173,8 @@ def _baseline(paths):
     for unit, expected in services.items():
         pid, ticks, _invocation = observed[unit]
         current = service_wrappers.process_identity(pid)
-        if current["start_ticks"] != ticks or _image(paths.unit_dir / unit)[0] != expected["unit"]:
+        if (current["start_ticks"] != ticks or _image(paths.unit_dir / unit)[0] != expected["unit"]
+                or api._web_runtime_dropin(unit, expected["properties"]) != expected["runtime_dropin"]):
             raise api.WebActivationError("forward recovery service changed while verifying")
     # Normalize tuple/path values before a durable receipt round-trip.
     import json
