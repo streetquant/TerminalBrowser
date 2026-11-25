@@ -5574,6 +5574,18 @@ def _health() -> dict[str, str]:
     return {"backend": "ok"}
 
 
+def _wait_health(timeout: float = 30.0) -> dict[str, str]:
+    """Wait for a freshly exec'd backend to finish startup refresh and bind."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return _health()
+        except WebActivationError as exc:
+            if "command failed: curl:" not in str(exc) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.25)
+
+
 def _install(
     paths: ActivationPaths,
     package: Mapping[str, object],
@@ -6562,7 +6574,7 @@ def execute(paths: ActivationPaths, tx: Path) -> dict[str, object]:
         )
         if tls_admission is not None:
             _runtime_tls_publication(paths, tls_admission["consumer_tls"])
-        receipt["health"] = _health()
+        receipt["health"] = _wait_health()
         receipt["post_checks"] = {"database": verify_database(paths, tx, before), "processes": process_observation(receipt["processes_before"])}
         _disarm()
         watchdog = receipt.get("watchdog")

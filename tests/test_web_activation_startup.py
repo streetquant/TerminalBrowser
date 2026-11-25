@@ -184,6 +184,52 @@ def test_start_rejects_an_unverified_cpu_weight_dropin(startup, cpu_weight_dropi
         activation._start_web(startup.paths)
 
 
+def test_wait_health_retries_transient_curl_connection_failure(monkeypatch):
+    calls = 0
+
+    def flaky():
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise activation.WebActivationError("command failed: curl: curl: (7) Failed to connect")
+        return {"backend": "ok"}
+
+    monkeypatch.setattr(activation, "_health", flaky)
+    monkeypatch.setattr(activation.time, "sleep", lambda _seconds: None)
+    assert activation._wait_health(timeout=5.0) == {"backend": "ok"}
+    assert calls == 3
+
+
+def test_wait_health_stops_on_contract_mismatch_or_deadline(monkeypatch):
+    calls = 0
+
+    def bad_contract():
+        nonlocal calls
+        calls += 1
+        raise activation.WebActivationError("backend health contract failed")
+
+    monkeypatch.setattr(activation, "_health", bad_contract)
+    with pytest.raises(activation.WebActivationError, match="backend health contract failed"):
+        activation._wait_health(timeout=5.0)
+    assert calls == 1
+
+    now = 0.0
+
+    def fake_monotonic():
+        return now
+
+    def always_refused():
+        nonlocal now
+        now += 1.0
+        raise activation.WebActivationError("command failed: curl: curl: (7) Failed to connect")
+
+    monkeypatch.setattr(activation, "_health", always_refused)
+    monkeypatch.setattr(activation.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(activation.time, "sleep", lambda _seconds: None)
+    with pytest.raises(activation.WebActivationError, match="Failed to connect"):
+        activation._wait_health(timeout=2.0)
+
+
 def test_wrong_release_config_is_refused_before_any_start(startup):
     spec = wrappers.UNIT_SPEC_BY_NAME[activation.SERVICES[0]]
     config = wrappers._initial_config(spec, startup.layout, "foreign-release")
