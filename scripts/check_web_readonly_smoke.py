@@ -39,12 +39,12 @@ EXPECTED_AUTH_DEPENDENCIES: Final = {
     "termdeck-web-core",
     "zeroize",
 }
+EXPECTED_AUTH_TARGET_DEPENDENCIES: Final = {
+    ('cfg(target_os = "linux")', "dependencies", "rustix"),
+}
 FRONTEND_EXPECTED_TEXT: Final = (
     "/_termdeck/api/v1/snapshot",
     "/_termdeck/api/v1/windows/",
-    "/_termdeck/ws/v1/windows/",
-    "termdeck.terminal.v1",
-    "new WebSocket",
     "terminal-xterm",
     "workspace-headerbar",
     "workspace-tab-close",
@@ -53,6 +53,11 @@ FRONTEND_EXPECTED_TEXT: Final = (
     "textContent",
     "AbortController",
     "revision_text",
+)
+TERMINAL_SESSION_EXPECTED_TEXT: Final = (
+    "/_termdeck/ws/v1/windows/",
+    "termdeck.terminal.v1",
+    "new WebSocket",
 )
 FRONTEND_FORBIDDEN_TEXT: Final = (
     "innerHTML",
@@ -281,11 +286,13 @@ def _validate_frontend_assets(
     app_javascript_bytes = javascript_path.read_bytes()
     workspace_path = javascript_path.with_name("workspace-ui.js")
     workspace_bytes = workspace_path.read_bytes()
+    session_bytes = javascript_path.with_name("terminal-session.js").read_bytes()
     app_stylesheet_bytes = stylesheet_path.read_bytes()
     terminal_javascript_bytes = terminal_javascript_path.read_bytes()
     terminal_stylesheet_bytes = terminal_stylesheet_path.read_bytes()
     for label, data in (
         ("application JavaScript", app_javascript_bytes),
+        ("terminal session JavaScript", session_bytes),
         ("workspace tools JavaScript", workspace_bytes),
         ("application stylesheet", app_stylesheet_bytes),
     ):
@@ -303,6 +310,7 @@ def _validate_frontend_assets(
             )
     try:
         javascript = app_javascript_bytes.decode("utf-8")
+        session = session_bytes.decode("utf-8")
         workspace = workspace_bytes.decode("utf-8")
         app_stylesheet_bytes.decode("utf-8")
         terminal_javascript = terminal_javascript_bytes.decode("utf-8")
@@ -310,7 +318,8 @@ def _validate_frontend_assets(
     except UnicodeDecodeError as exc:
         raise RuntimeError("frontend assets must be UTF-8") from exc
     missing = [value for value in FRONTEND_EXPECTED_TEXT if value not in javascript]
-    forbidden = [value for value in FRONTEND_FORBIDDEN_TEXT if value in javascript]
+    missing.extend(value for value in TERMINAL_SESSION_EXPECTED_TEXT if value not in session)
+    forbidden = [value for value in FRONTEND_FORBIDDEN_TEXT if value in javascript or value in session]
     if missing:
         raise RuntimeError(f"frontend JavaScript is missing required contracts: {missing}")
     if forbidden:
@@ -431,6 +440,14 @@ def _validate_auth_foundation(auth_root: Path) -> dict[str, object]:
             f"observed={sorted(dependencies)} "
             f"expected={sorted(EXPECTED_AUTH_DEPENDENCIES)}"
         )
+    target_dependencies = {
+        (target, kind, name)
+        for target, section in manifest.get("target", {}).items()
+        for kind in ("dependencies", "build-dependencies", "dev-dependencies")
+        for name in section.get(kind, {})
+    }
+    if target_dependencies != EXPECTED_AUTH_TARGET_DEPENDENCIES:
+        raise RuntimeError(f"unexpected auth target dependencies: {sorted(target_dependencies)}")
     if "bin" in manifest or "build-dependencies" in manifest:
         raise RuntimeError("authentication foundation must remain library-only")
 
@@ -624,6 +641,7 @@ def main() -> int:
         server_root / "assets" / "app.css",
         server_root / "assets" / "app.js",
         server_root / "assets" / "workspace-ui.js",
+        server_root / "assets" / "terminal-session.js",
         server_root / "assets" / "terminal.css",
         server_root / "assets" / "terminal.js",
         server_root / "assets" / "terminal-assets.json",
@@ -703,15 +721,15 @@ def main() -> int:
         ]
         node = shutil.which("node")
         if node is not None:
-            for asset in (server_root / "assets" / "app.js", server_root / "assets" / "workspace-ui.js", server_root / "assets" / "terminal.js"):
+            for asset in ("app.js", "workspace-ui.js", "terminal-session.js", "terminal.js"):
                 receipts.append(
                     _run(
-                        [node, "--check", str(asset)],
+                        [node, "--check", str(server_root / "assets" / asset)],
                         cwd=root,
                         environment=environment,
                     )
                 )
-            frontend["syntax_check"] = "node --check app.js, workspace-ui.js and terminal.js"
+            frontend["syntax_check"] = "node --check app.js, workspace-ui.js, terminal-session.js and terminal.js"
         else:
             frontend["syntax_check"] = "static and Rust-embedded checks only"
 
@@ -738,12 +756,24 @@ def main() -> int:
         auth_package = auth_packages[0]
         auth_dependencies = {
             str(item["name"]) for item in auth_package.get("dependencies", [])
+            if item.get("target") is None
         }
         if auth_dependencies != EXPECTED_AUTH_DEPENDENCIES:
             raise RuntimeError(
                 "unexpected TermDeck authentication dependency set: "
                 f"{sorted(auth_dependencies)}"
             )
+        auth_target_dependencies = {
+            (
+                str(item["target"]),
+                f"{item['kind']}-dependencies" if item.get("kind") else "dependencies",
+                str(item["name"]),
+            )
+            for item in auth_package.get("dependencies", [])
+            if item.get("target") is not None
+        }
+        if auth_target_dependencies != EXPECTED_AUTH_TARGET_DEPENDENCIES:
+            raise RuntimeError(f"unexpected auth target dependencies: {sorted(auth_target_dependencies)}")
         target_kinds = [list(target["kind"]) for target in auth_package.get("targets", [])]
         _validate_auth_target_kinds(target_kinds)
         consumers = sorted(

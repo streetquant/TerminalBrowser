@@ -61,12 +61,13 @@ the recording sink so tmux can discard that pipe's backlog; the application
 continues and the last committed prefix remains readable. Output past that
 failure point is not claimed as recorded.
 
-Independent tabs may flush concurrently through `.journal-copy.lock`. The normal
-SSD mirror copies and validates each generation's committed prefix without
-pausing writers, publishes durable data before its watermark, and retains older
-generations. Screen/SQLite snapshots use the separate `.lock`. Ordinary rsync
-excludes `journals/`; copying an active journal and its watermark independently
-would not provide a consistent recovery point.
+Each web writer appends to its own generation and publishes its durable watermark
+atomically before forwarding output. Python journal writers still honor
+`.journal-copy.lock` for explicit quiescent copies of those writers. The normal SSD
+mirror copies and validates each generation's committed prefix while writers are
+active, publishes durable data before its watermark, and retains older generations.
+Screen/SQLite snapshots use the separate `.lock`. Ordinary rsync excludes `journals/`.
+Use the committed-prefix mirror for active journals.
 
 All snapshots are private to the owning OS account. Terminal output can contain
 secrets; do not put this directory in Git or expose it as an unauthenticated

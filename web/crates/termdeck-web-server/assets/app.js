@@ -390,6 +390,16 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
     };
   }
 
+  function sameWindow(previous, next) {
+    return previous.id === next.id && previous.name === next.name &&
+      previous.slug === next.slug && previous.path === next.path &&
+      previous.activePaneId === next.activePaneId && previous.panes.length === next.panes.length &&
+      next.panes.every((pane, index) => {
+        const previousPane = previous.panes[index];
+        return Object.keys(pane).every((field) => pane[field] === previousPane[field]);
+      });
+  }
+
   function node(tagName, className, text) {
     const element = document.createElement(tagName);
     if (className) {
@@ -1083,6 +1093,7 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
         return;
       }
       refreshInFlight = true;
+      const previousState = root.dataset.termdeckState;
       try {
         root.dataset.termdeckState = "refreshing";
         root.setAttribute("aria-busy", "true");
@@ -1099,39 +1110,46 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
           root.dataset.termdeckState = "stale";
           return;
         }
+        // The host revision can change for another window and omits some
+        // displayed state. Compare the actual normalized window instead.
+        const unchanged = envelope && sameWindow(envelope.window, next.window);
+        if (unchanged) next.window = envelope.window;
         envelope = next;
-        terminalViews.prune(next.window.panes.map(pane => pane.id));
-        terminalViews.updatePaneStates(next.window.panes);
         const selected = chooseActivePane(next.window);
-        renderTabs();
-        if (selected && (!terminalMount || selected !== activePaneId)) {
-          switchPane(selected, false);
-        } else if (selected) {
-          const pane = currentPane();
-          terminalIdentity.textContent = pane
-            ? `${pane.title} · ${pane.cwd}`
-            : `Pane ${selected}`;
-          terminalIdentity.title = terminalIdentity.textContent;
-          renderActions();
-          if (pane) {
-            document.title = `${pane.title} · ${next.window.name} · t1000`;
+        if (!unchanged || previousState !== "ready" || selected !== activePaneId || (selected && !terminalMount)) {
+          terminalViews.prune(next.window.panes.map(pane => pane.id));
+          terminalViews.updatePaneStates(next.window.panes);
+          renderTabs();
+          if (selected && (!terminalMount || selected !== activePaneId)) {
+            switchPane(selected, false);
+          } else if (selected) {
+            const pane = currentPane();
+            terminalIdentity.textContent = pane
+              ? `${pane.title} · ${pane.cwd}`
+              : `Pane ${selected}`;
+            terminalIdentity.title = terminalIdentity.textContent;
+            renderActions();
+            if (pane) {
+              document.title = `${pane.title} · ${next.window.name} · t1000`;
+            }
+          } else {
+            if (terminalMount) {
+              terminalViews.clear();
+              terminalMount = null;
+            }
+            activePaneId = "";
+            terminalHost.replaceChildren();
+            terminalIdentity.textContent = "No tab selected";
+            terminalStatus.textContent = "No active terminal";
+            terminalStatus.dataset.state = "offline";
+            renderActions();
+            updateShellState("empty");
           }
-        } else {
-          if (terminalMount) {
-            terminalViews.clear();
-            terminalMount = null;
-          }
-          activePaneId = "";
-          terminalHost.replaceChildren();
-          terminalIdentity.textContent = "No tab selected";
-          terminalStatus.textContent = "No active terminal";
-          terminalStatus.dataset.state = "offline";
-          renderActions();
-          updateShellState("empty");
         }
-        workspaceStatus.textContent = pendingAction ? `${pendingAction}…` : response.headers.get("x-termdeck-stale") === "1"
+        const statusText = pendingAction ? `${pendingAction}…` : response.headers.get("x-termdeck-stale") === "1"
           ? `${next.window.panes.length} tabs · reconnecting`
           : `${next.window.panes.length} tabs`;
+        if (workspaceStatus.textContent !== statusText) workspaceStatus.textContent = statusText;
         clearClientNotice();
         root.dataset.termdeckState = "ready";
       } catch (error) {

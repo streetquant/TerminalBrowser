@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use termdeck_web_core::{HostId, OwnerId};
 
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -301,12 +303,228 @@ pub struct AuditRecord {
     pub event_hash: [u8; 32],
 }
 
+#[cfg(target_os = "linux")]
+struct SessionSnapshot {
+    stored_fence_ms: u64,
+    by_id: BTreeMap<AuthSessionId, SessionContext>,
+    by_digest: BTreeMap<[u8; DIGEST_BYTES], AuthSessionId>,
+}
+
+#[cfg(target_os = "linux")]
+impl SessionSnapshot {
+    fn load(connection: &mut Connection, limits: AuthLimits) -> Result<Option<Self>, AuthError> {
+        let transaction = connection.transaction()?;
+        let stored_fence_ms = read_stored_fence(&transaction)?;
+        let mode: String =
+            transaction.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("delete") {
+            return Ok(None);
+        }
+        let mut snapshot = Self {
+            stored_fence_ms,
+            by_id: BTreeMap::new(),
+            by_digest: BTreeMap::new(),
+        };
+        {
+            let mut statement = transaction.prepare(
+                "SELECT s.session_id, s.device_id, d.label, s.created_at_ms, s.expires_at_ms,
+                        s.secret_hash
+                 FROM auth_sessions s JOIN devices d ON d.device_id = s.device_id
+                 WHERE s.revoked_at_ms IS NULL AND d.revoked_at_ms IS NULL AND s.expires_at_ms > ?1
+                 LIMIT ?2",
+            )?;
+            let mut rows = statement.query(params![
+                db_timestamp(stored_fence_ms)?,
+                db_count(limits.max_sessions + 1)?
+            ])?;
+            while let Some(row) = rows.next()? {
+                if snapshot.by_id.len() == limits.max_sessions {
+                    return Ok(None);
+                }
+                let context = stored_session_context(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                )?;
+                let digest: [u8; DIGEST_BYTES] = row.get(5)?;
+                snapshot
+                    .by_digest
+                    .insert(digest, context.session_id.clone());
+                snapshot.by_id.insert(context.session_id.clone(), context);
+            }
+        }
+        transaction.commit()?;
+        Ok(Some(snapshot))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct DatabaseGeneration {
+    modified: (i64, i64),
+    changed: (i64, i64),
+    len: u64,
+}
+
+/// The SQLite connection still owns all writes. The snapshot is valid only
+/// while the local DELETE-journal database has no observed change. Check for
+/// writes from this process and from independent CLI connections on every read.
+#[cfg(target_os = "linux")]
+struct SessionCache {
+    watch: Option<rustix::fd::OwnedFd>,
+    identity: DatabaseIdentity,
+    uid: u32,
+    sidecars: [PathBuf; 3],
+    snapshot: Option<(DatabaseGeneration, SessionSnapshot)>,
+}
+
+#[cfg(target_os = "linux")]
+impl SessionCache {
+    fn open(
+        directory: &Path,
+        database: &Path,
+        identity: DatabaseIdentity,
+    ) -> Result<Option<Self>, AuthError> {
+        use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
+
+        let Ok(filesystem) = rustix::fs::statfs(database) else {
+            return Ok(None);
+        };
+        // Linux filesystem magic values for XFS, ext2/3/4, Btrfs, and tmpfs.
+        // Remote filesystems can change without delivering local inotify events.
+        if !matches!(
+            filesystem.f_type,
+            0x5846_5342 | 0xEF53 | 0x9123_683E | 0x0102_1994
+        ) {
+            return Ok(None);
+        }
+        let Ok(watch) = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK) else {
+            return Ok(None);
+        };
+        let flags = WatchFlags::MODIFY
+            | WatchFlags::ATTRIB
+            | WatchFlags::DELETE_SELF
+            | WatchFlags::MOVE_SELF
+            | WatchFlags::DONT_FOLLOW;
+        let directory_flags = flags
+            | WatchFlags::ONLYDIR
+            | WatchFlags::CREATE
+            | WatchFlags::DELETE
+            | WatchFlags::MOVE;
+        let metadata = fs::symlink_metadata(database)?;
+        if database_identity(&metadata)? != identity {
+            return Err(AuthError::InsecurePath(
+                "auth database identity changed while it was being opened",
+            ));
+        }
+        if inotify::add_watch(&watch, database, flags).is_err()
+            || inotify::add_watch(&watch, directory, directory_flags).is_err()
+        {
+            return Ok(None);
+        }
+        let sidecars = ["-journal", "-wal", "-shm"]
+            .map(|suffix| directory.join(format!("{AUTH_DATABASE_FILENAME}{suffix}")));
+        Ok(Some(Self {
+            watch: Some(watch),
+            identity,
+            uid: metadata.uid(),
+            sidecars,
+            snapshot: None,
+        }))
+    }
+
+    fn generation(&self, database: &Path) -> Result<DatabaseGeneration, AuthError> {
+        let metadata = fs::symlink_metadata(database)?;
+        if database_identity(&metadata)? != self.identity
+            || !metadata.is_file()
+            || metadata.uid() != self.uid
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.len() > MAX_AUTH_DATABASE_BYTES
+        {
+            return Err(AuthError::InsecurePath(
+                "auth database identity or permissions changed",
+            ));
+        }
+        Ok(DatabaseGeneration {
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            len: metadata.len(),
+        })
+    }
+
+    fn has_no_sidecars(&self) -> bool {
+        self.sidecars.iter().all(|path| {
+            fs::symlink_metadata(path).is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+        })
+    }
+
+    fn drain_changes(&mut self) -> Option<bool> {
+        use rustix::fs::inotify::{ReadFlags, Reader};
+        use rustix::io::Errno;
+
+        let mut changed = false;
+        let mut buffer = [std::mem::MaybeUninit::uninit(); 4096];
+        let mut reader = Reader::new(self.watch.as_ref()?, &mut buffer);
+        // A busy directory, overflow, or watch loss must fall back to SQLite.
+        for _ in 0..4096 {
+            match reader.next() {
+                Ok(event) => {
+                    if event.events().intersects(
+                        ReadFlags::IGNORED
+                            | ReadFlags::UNMOUNT
+                            | ReadFlags::QUEUE_OVERFLOW
+                            | ReadFlags::MOVE_SELF
+                            | ReadFlags::DELETE_SELF,
+                    ) {
+                        break;
+                    }
+                    changed |= event.file_name().is_none_or(|name| {
+                        matches!(
+                            name.to_bytes()
+                                .strip_prefix(AUTH_DATABASE_FILENAME.as_bytes()),
+                            Some(b"" | b"-journal" | b"-wal" | b"-shm")
+                        )
+                    });
+                }
+                Err(Errno::AGAIN) => return Some(changed),
+                Err(Errno::INTR) => continue,
+                Err(_) => break,
+            }
+        }
+        self.watch = None;
+        None
+    }
+}
+
+fn stored_session_context(
+    session_id: String,
+    device_id: String,
+    device_label: String,
+    created_at_ms: i64,
+    expires_at_ms: i64,
+) -> Result<SessionContext, AuthError> {
+    validate_label(&device_label)?;
+    Ok(SessionContext {
+        session_id: AuthSessionId::from_database(session_id)?,
+        device_id: AuthenticatedDeviceId::from_database(device_id)?,
+        device_label,
+        created_at_ms: host_timestamp(created_at_ms)?,
+        expires_at_ms: host_timestamp(expires_at_ms)?,
+    })
+}
+
 pub struct AuthStore {
     database_path: PathBuf,
     host_id: HostId,
     owner_id: OwnerId,
     limits: AuthLimits,
     connection: Mutex<Connection>,
+    read_connection: Mutex<Connection>,
+    #[cfg(target_os = "linux")]
+    session_cache: Mutex<Option<SessionCache>>,
     /// Process-local high-water mark of every observed time.
     ///
     /// The persisted fence in `auth_metadata.last_observed_at_ms` only advances on
@@ -317,7 +535,15 @@ pub struct AuthStore {
 
 impl AuthStore {
     pub fn require_context(&self, context: &SessionContext, now_ms: u64) -> Result<(), AuthError> {
-        let mut connection = self.lock_connection()?;
+        #[cfg(target_os = "linux")]
+        if let Some(valid) = self.with_session_snapshot(now_ms, |snapshot, now_ms| {
+            snapshot.by_id.get(context.session_id()).is_some_and(|row| {
+                row.device_id() == context.device_id() && row.expires_at_ms() > now_ms
+            })
+        })? {
+            return valid.then_some(()).ok_or(AuthError::Unauthenticated);
+        }
+        let mut connection = self.lock_read_connection()?;
         let transaction = connection.transaction()?;
         let now_ms = self.read_time_fence_in(&transaction, now_ms)?;
         let valid = transaction
@@ -367,12 +593,33 @@ impl AuthStore {
         }
         migrate_schema_if_needed(&connection, &host_id, &owner_id, limits)?;
         validate_schema(&connection, &host_id, &owner_id, limits)?;
+        // Keep live session checks off the writer mutex. Read/write open mode
+        // allows SQLite to recover a hot rollback journal, while query_only
+        // prevents auth checks from modifying database rows.
+        let read_connection = Connection::open_with_flags(&database_path, flags)?;
+        validate_database_file(&database_path)?;
+        if database_identity(&fs::symlink_metadata(&database_path)?)? != expected_identity {
+            return Err(AuthError::InsecurePath(
+                "auth database identity changed while it was being opened",
+            ));
+        }
+        configure_connection(&read_connection)?;
+        read_connection.pragma_update(None, "query_only", true)?;
+        #[cfg(target_os = "linux")]
+        let session_cache = Mutex::new(SessionCache::open(
+            secure_directory,
+            &database_path,
+            expected_identity,
+        )?);
         let store = Self {
             database_path,
             host_id,
             owner_id,
             limits,
             connection: Mutex::new(connection),
+            read_connection: Mutex::new(read_connection),
+            #[cfg(target_os = "linux")]
+            session_cache,
             observed_fence_ms: AtomicU64::new(0),
         };
         let _observed_at_ms = store.observe_time(created_at_ms)?;
@@ -407,12 +654,14 @@ impl AuthStore {
     /// costs no rollback journal and no fsync. The returned time is clamped by the
     /// process-local fence, so a rolled-back clock cannot lower it.
     pub fn read_time_fence(&self, candidate_ms: u64) -> Result<u64, AuthError> {
+        #[cfg(target_os = "linux")]
+        if let Some(now_ms) = self.with_session_snapshot(candidate_ms, |_, now_ms| now_ms)? {
+            return Ok(now_ms);
+        }
         validate_timestamp(candidate_ms)?;
-        let connection = self.lock_connection()?;
+        let connection = self.lock_read_connection()?;
         let stored = read_stored_fence(&connection)?;
-        let observed_at_ms = self.effective_fence(stored, candidate_ms);
-        self.raise_observed_fence(observed_at_ms);
-        Ok(observed_at_ms)
+        Ok(self.observe_read_time(stored, candidate_ms))
     }
 
     /// Advance the stored time fence (the current write behaviour), for a background task.
@@ -422,10 +671,12 @@ impl AuthStore {
 
     /// Effective time for a request: never below the stored fence, the process-local
     /// fence, or the candidate clock.
-    fn effective_fence(&self, stored: u64, candidate_ms: u64) -> u64 {
-        stored
-            .max(self.observed_fence_ms.load(Ordering::Acquire))
-            .max(candidate_ms)
+    fn observe_read_time(&self, stored: u64, candidate_ms: u64) -> u64 {
+        let observed_at_ms = stored.max(candidate_ms);
+        observed_at_ms.max(
+            self.observed_fence_ms
+                .fetch_max(observed_at_ms, Ordering::AcqRel),
+        )
     }
 
     /// Raise the process-local fence high-water mark.
@@ -442,9 +693,57 @@ impl AuthStore {
     ) -> Result<u64, AuthError> {
         validate_timestamp(candidate_ms)?;
         let stored = read_stored_fence(connection)?;
-        let observed_at_ms = self.effective_fence(stored, candidate_ms);
-        self.raise_observed_fence(observed_at_ms);
-        Ok(observed_at_ms)
+        Ok(self.observe_read_time(stored, candidate_ms))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_session_snapshot<T>(
+        &self,
+        candidate_ms: u64,
+        lookup: impl FnOnce(&SessionSnapshot, u64) -> T,
+    ) -> Result<Option<T>, AuthError> {
+        validate_timestamp(candidate_ms)?;
+        let mut cache = self
+            .session_cache
+            .lock()
+            .map_err(|_| AuthError::LockPoisoned)?;
+        let Some(cache) = cache.as_mut() else {
+            return Ok(None);
+        };
+        let generation = cache.generation(&self.database_path)?;
+        let changed = cache.drain_changes();
+        if changed != Some(false)
+            || cache
+                .snapshot
+                .as_ref()
+                .is_some_and(|(saved, _)| *saved != generation)
+        {
+            cache.snapshot = None;
+        }
+        if changed.is_none() {
+            return Ok(None);
+        }
+        if cache.snapshot.is_none() {
+            if !cache.has_no_sidecars() {
+                return Ok(None);
+            }
+            let snapshot = SessionSnapshot::load(&mut *self.lock_read_connection()?, self.limits)?;
+            // A concurrent commit can land while the SQLite read transaction is
+            // being released. Publish the snapshot only across a stable generation.
+            if cache.generation(&self.database_path)? != generation
+                || !cache.has_no_sidecars()
+                || cache.drain_changes() != Some(false)
+            {
+                return Ok(None);
+            }
+            cache.snapshot = snapshot.map(|snapshot| (generation, snapshot));
+        }
+        Ok(cache.snapshot.as_ref().map(|(_, snapshot)| {
+            lookup(
+                snapshot,
+                self.observe_read_time(snapshot.stored_fence_ms, candidate_ms),
+            )
+        }))
     }
 
     /// Observe the effective time on the write path and persist the advanced fence.
@@ -683,7 +982,18 @@ impl AuthStore {
         now_ms: u64,
     ) -> Result<SessionContext, AuthError> {
         let digest = credential_digest(SecretKind::Session, session_secret)?;
-        let mut connection = self.lock_connection()?;
+        #[cfg(target_os = "linux")]
+        if let Some(context) = self.with_session_snapshot(now_ms, |snapshot, now_ms| {
+            snapshot
+                .by_digest
+                .get(&digest)
+                .and_then(|session_id| snapshot.by_id.get(session_id))
+                .filter(|row| row.expires_at_ms() > now_ms)
+                .cloned()
+        })? {
+            return context.ok_or(AuthError::Unauthenticated);
+        }
+        let mut connection = self.lock_read_connection()?;
         let transaction = connection.transaction()?;
         let now_ms = self.read_time_fence_in(&transaction, now_ms)?;
         let row = transaction
@@ -711,14 +1021,13 @@ impl AuthStore {
         let Some((session_id, device_id, device_label, created_at_ms, expires_at_ms)) = row else {
             return Err(AuthError::Unauthenticated);
         };
-        validate_label(&device_label)?;
-        Ok(SessionContext {
-            session_id: AuthSessionId::from_database(session_id)?,
-            device_id: AuthenticatedDeviceId::from_database(device_id)?,
+        stored_session_context(
+            session_id,
+            device_id,
             device_label,
-            created_at_ms: host_timestamp(created_at_ms)?,
-            expires_at_ms: host_timestamp(expires_at_ms)?,
-        })
+            created_at_ms,
+            expires_at_ms,
+        )
     }
 
     pub fn verify_csrf(
@@ -728,7 +1037,7 @@ impl AuthStore {
         now_ms: u64,
     ) -> Result<(), AuthError> {
         let digest = credential_digest(SecretKind::Csrf, csrf_secret)?;
-        let mut connection = self.lock_connection()?;
+        let mut connection = self.lock_read_connection()?;
         let transaction = connection.transaction()?;
         let now_ms = self.read_time_fence_in(&transaction, now_ms)?;
         let valid = transaction
@@ -997,6 +1306,12 @@ impl AuthStore {
 
     fn lock_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, AuthError> {
         self.connection.lock().map_err(|_| AuthError::LockPoisoned)
+    }
+
+    fn lock_read_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, AuthError> {
+        self.read_connection
+            .lock()
+            .map_err(|_| AuthError::LockPoisoned)
     }
 }
 
@@ -2556,6 +2871,39 @@ mod tests {
     }
 
     #[test]
+    fn live_session_checks_can_read_while_the_writer_holds_its_mutex() -> Result<(), AuthError> {
+        let directory = TestDirectory::new("read-concurrency");
+        let value = store(&directory);
+        let invitation = value.create_invitation("Laptop", 100, 1_000)?;
+        let session = value.redeem_invitation(invitation.secret().expose_secret(), 200, 5_000)?;
+        thread::scope(|scope| {
+            let mut writer = value.lock_connection()?;
+            let transaction =
+                writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let (send, receive) = std::sync::mpsc::channel();
+            let auth = &value;
+            scope.spawn(move || {
+                let result = (|| {
+                    let now = auth.read_time_fence(300)?;
+                    let context =
+                        auth.authenticate(session.session_secret().expose_secret(), now)?;
+                    auth.verify_csrf(
+                        context.session_id(),
+                        session.csrf_secret().expose_secret(),
+                        now,
+                    )?;
+                    auth.require_context(&context, now)
+                })();
+                let _sent = send.send(result);
+            });
+            let result = receive.recv_timeout(std::time::Duration::from_secs(1));
+            drop(transaction);
+            drop(writer);
+            result.expect("auth reads waited for the writer")
+        })
+    }
+
+    #[test]
     fn invite_redeem_authenticate_csrf_rotate_and_revoke_are_fail_closed() {
         let directory = TestDirectory::new("lifecycle");
         let value = store(&directory);
@@ -3429,6 +3777,56 @@ mod tests {
             Ok(value) => value,
             Err(_) => panic!("the auth time fence is negative"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_session_snapshot_tracks_independent_commits_and_ignores_rollback()
+    -> Result<(), AuthError> {
+        let directory = TestDirectory::new("session-snapshot");
+        let reader = store(&directory);
+        let writer = store(&directory);
+        let invitation = writer.create_invitation("Independent writer", 100, 1_000)?;
+        let session = writer.redeem_invitation(invitation.secret().expose_secret(), 200, 5_000)?;
+        let secret = session.session_secret().expose_secret();
+        let context = reader.authenticate(secret, 300)?;
+        {
+            let cache = reader
+                .session_cache
+                .lock()
+                .map_err(|_| AuthError::LockPoisoned)?;
+            if let Some(cache) = cache.as_ref() {
+                assert!(cache.snapshot.is_some());
+            }
+        }
+
+        {
+            let mut connection = writer.lock_connection()?;
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "UPDATE auth_sessions SET revoked_at_ms=301 WHERE session_id=?1",
+                [session.session_id().as_str()],
+            )?;
+            reader.require_context(&context, 301)?;
+            transaction.rollback()?;
+        }
+        assert_eq!(reader.authenticate(secret, 302)?, context);
+
+        writer.advance_time_fence(400)?;
+        assert_eq!(reader.read_time_fence(302)?, 400);
+        reader.require_context(&context, 400)?;
+
+        assert!(writer.revoke_device(session.device_id(), 500)?);
+        assert!(matches!(
+            reader.require_context(&context, 400),
+            Err(AuthError::Unauthenticated)
+        ));
+        assert!(matches!(
+            reader.authenticate(secret, 400),
+            Err(AuthError::Unauthenticated)
+        ));
+        assert_eq!(reader.read_time_fence(400)?, 500);
+        Ok(())
     }
 
     fn database_bytes(database_path: &Path) -> Vec<u8> {

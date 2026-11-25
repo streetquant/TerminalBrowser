@@ -674,14 +674,14 @@ impl RefreshEngine {
             };
         let generated_at = unix_ms();
         let mirror = Arc::clone(&self.mirror);
-        let snapshot = tokio::task::spawn_blocking(move || {
-            let mut guard = mirror.lock().map_err(|_| ServerError::MirrorLockPoisoned)?;
-            guard
-                .load(&inventory, generated_at)
-                .map_err(ServerError::from)
+        let publication = tokio::task::spawn_blocking(move || {
+            let snapshot = mirror
+                .lock()
+                .map_err(|_| ServerError::MirrorLockPoisoned)?
+                .load(&inventory, generated_at)?;
+            RenderedSnapshot::new(snapshot, tmux_warning)
         })
         .await??;
-        let publication = RenderedSnapshot::new(snapshot, tmux_warning)?;
         self.cache.publish(publication)?;
         Ok(())
     }
@@ -5578,15 +5578,19 @@ mod auth_integration_tests {
                     .unwrap_or_else(|| panic!("fixture authentication missing")),
                 Duration::from_millis(20),
             ));
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            let advanced = tokio::time::timeout(Duration::from_secs(5), async {
+                while auth_database_bytes(&fixture) == before {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
             handle.abort();
             assert!(
                 handle.await.is_err(),
                 "the fence task must stop when aborted"
             );
-            let after = auth_database_bytes(&fixture);
-            assert_ne!(
-                before, after,
+            assert!(
+                advanced.is_ok(),
                 "the background task must advance the persisted authentication fence"
             );
         });

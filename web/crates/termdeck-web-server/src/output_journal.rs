@@ -105,12 +105,7 @@ fn publish(path: &Path, content: &[u8], generation: &str) -> io::Result<()> {
             .open(&temporary)?;
         file.write_all(content)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        File::open(
-            path.parent()
-                .ok_or_else(|| invalid("missing recording directory"))?,
-        )?
-        .sync_all()
+        fs::rename(&temporary, path)
     })();
     let _cleanup = fs::remove_file(temporary);
     result
@@ -118,30 +113,14 @@ fn publish(path: &Path, content: &[u8], generation: &str) -> io::Result<()> {
 
 pub(crate) struct Journal {
     file: File,
-    backup_lock: File,
     directory: PathBuf,
     generation: String,
+    published_initial_commit: bool,
     failed: bool,
 }
 impl Journal {
     pub(crate) fn new(root: &Path, id: &str) -> io::Result<Self> {
         let directory = tab_directory(root, id)?;
-        let backup_lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(NOFOLLOW)
-            .open(root.join(".journal-copy.lock"))?;
-        let meta = backup_lock.metadata()?;
-        if !meta.is_file()
-            || meta.nlink() != 1
-            || meta.uid() != uid()?
-            || meta.permissions().mode() & 0o777 != 0o600
-        {
-            return Err(invalid("unsafe recording backup lock"));
-        }
         let mut random = [0_u8; 16];
         getrandom::fill(&mut random).map_err(|_| invalid("recording randomness unavailable"))?;
         let millis = SystemTime::now()
@@ -160,9 +139,9 @@ impl Journal {
         File::open(&directory)?.sync_all()?;
         Ok(Self {
             file,
-            backup_lock,
             directory,
             generation,
+            published_initial_commit: false,
             failed: false,
         })
     }
@@ -170,12 +149,10 @@ impl Journal {
         if self.failed {
             return Err(invalid("terminal recording previously failed"));
         }
-        // Independent tabs flush concurrently; the SSD copier takes this
-        // dedicated lock exclusively across data and commit sidecars.
-        fs4::fs_std::FileExt::lock_shared(&self.backup_lock)?;
+        // Each writer owns an append-only generation. The SSD mirror reads the
+        // atomic watermark first and validates that durable prefix, even while
+        // more bytes are appended to this generation.
         let result = self.append_inner(data, geometry);
-        let unlocked = fs4::fs_std::FileExt::unlock(&self.backup_lock);
-        let result = result.and(unlocked);
         if result.is_err() {
             self.failed = true;
         }
@@ -207,11 +184,21 @@ impl Journal {
             committed.to_string().as_bytes(),
             &self.generation,
         )?;
+        let directory = File::open(&self.directory)?;
+        if !self.published_initial_commit {
+            // A new latest-view must always reference a generation with a
+            // durable watermark. Subsequent updates can share one directory
+            // flush because either watermark describes a durable prefix.
+            directory.sync_all()?;
+        }
         publish(
             &self.directory.join("latest-view"),
             self.generation.as_bytes(),
             &self.generation,
-        )
+        )?;
+        directory.sync_all()?;
+        self.published_initial_commit = true;
+        Ok(())
     }
 }
 
@@ -417,6 +404,7 @@ mod tests {
             first.generation.as_bytes(),
             &first.generation,
         )?;
+        File::open(&first.directory)?.sync_all()?;
         let mut second = Journal::new(&fixture.0, "tab")?;
         second.append(b"new shell", Some((80, 24)))?;
         let old = read_page(&fixture.0, "tab", Some(first.generation.clone()), 8)?;
