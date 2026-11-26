@@ -32,6 +32,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::serve::ListenerExt;
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
@@ -40,7 +41,7 @@ use std::fs::{self, DirBuilder};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tab_actions::{ExistingTabAction, TabActionError, TabActionService};
@@ -90,7 +91,7 @@ pub const MAX_HTTP_REQUEST_BYTES: usize = MAX_TERMINAL_INPUT_BYTES + 1_024;
 const AUTH_FENCE_ADVANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v9/app.css";
-const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v8/app.js";
+const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v9/app.js";
 const CLIENT_FILES_PATH: &str = "/_termdeck/assets/v8/client-files.js";
 const ACCOUNTS_PATH: &str = "/_termdeck/assets/v8/accounts.js";
 const WORKSPACE_UI_PATH: &str = "/_termdeck/assets/v8/workspace-ui.js";
@@ -98,7 +99,7 @@ const WINDOW_HOME_PATH: &str = "/_termdeck/assets/v8/window-home.js";
 const CODEX_PALETTE_PATH: &str = "/_termdeck/assets/v8/codex-palette.js";
 const TERMINAL_COPY_PATH: &str = "/_termdeck/assets/v8/terminal-copy.js";
 const TERMINAL_SCROLL_PATH: &str = "/_termdeck/assets/v8/terminal-scroll.js";
-const TERMINAL_SESSION_PATH: &str = "/_termdeck/assets/v10/terminal-session.js";
+const TERMINAL_SESSION_PATH: &str = "/_termdeck/assets/v11/terminal-session.js";
 const TERMINAL_CSS_PATH: &str = "/_termdeck/assets/v8/terminal.css";
 const TERMINAL_JS_PATH: &str = "/_termdeck/assets/v8/terminal.js";
 const EXTERNAL_BASE_PATH: &str = "/t1000";
@@ -1445,11 +1446,148 @@ async fn security_headers(request: Request, next: Next) -> Response {
         HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=()"),
     );
     // Release URLs can be reused by clients and intermediate caches. A stale
-    // script must never hide current controls or call an outdated API.
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store, max-age=0"),
-    );
+    // script must never hide current controls or call an outdated API. Static
+    // assets that explicitly verified their content hash may opt into immutable
+    // caching via `static_asset_response`.
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, max-age=0"),
+        );
+    }
+    response
+}
+
+struct AssetMeta {
+    hash12: String,
+    etag: HeaderValue,
+    etag_str: String,
+    href: String,
+}
+
+fn compute_asset_meta(path: &'static str, bytes: &'static [u8]) -> AssetMeta {
+    let digest = sha2::Sha256::digest(bytes);
+    let mut hex = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    let hash12 = hex[..12].to_owned();
+    let etag_str = format!("\"{hex}\"");
+    let etag = HeaderValue::from_str(etag_str.as_str())
+        .unwrap_or_else(|_| HeaderValue::from_static("\"0\""));
+    let href = format!("{path}?h={hash12}");
+    AssetMeta {
+        hash12,
+        etag,
+        etag_str,
+        href,
+    }
+}
+
+fn app_css_asset() -> &'static AssetMeta {
+    static META: OnceLock<AssetMeta> = OnceLock::new();
+    META.get_or_init(|| compute_asset_meta(FRONTEND_CSS_PATH, APP_CSS))
+}
+
+fn app_js_asset() -> &'static AssetMeta {
+    static META: OnceLock<AssetMeta> = OnceLock::new();
+    META.get_or_init(|| compute_asset_meta(FRONTEND_JS_PATH, APP_JS))
+}
+
+fn client_files_asset() -> &'static AssetMeta {
+    static META: OnceLock<AssetMeta> = OnceLock::new();
+    META.get_or_init(|| compute_asset_meta(CLIENT_FILES_PATH, CLIENT_FILES_JS))
+}
+
+fn accounts_asset() -> &'static AssetMeta {
+    static META: OnceLock<AssetMeta> = OnceLock::new();
+    META.get_or_init(|| compute_asset_meta(ACCOUNTS_PATH, ACCOUNTS_JS))
+}
+
+fn workspace_ui_asset() -> &'static AssetMeta {
+    static META: OnceLock<AssetMeta> = OnceLock::new();
+    META.get_or_init(|| compute_asset_meta(WORKSPACE_UI_PATH, WORKSPACE_UI_JS))
+}
+
+fn window_home_asset() -> &'static AssetMeta {
+    static META: OnceLock<AssetMeta> = OnceLock::new();
+    META.get_or_init(|| compute_asset_meta(WINDOW_HOME_PATH, WINDOW_HOME_JS))
+}
+
+fn codex_palette_asset() -> &'static AssetMeta {
+    static META: OnceLock<AssetMeta> = OnceLock::new();
+    META.get_or_init(|| compute_asset_meta(CODEX_PALETTE_PATH, CODEX_PALETTE_JS))
+}
+
+fn terminal_copy_asset() -> &'static AssetMeta {
+    static META: OnceLock<AssetMeta> = OnceLock::new();
+    META.get_or_init(|| compute_asset_meta(TERMINAL_COPY_PATH, TERMINAL_COPY_JS))
+}
+
+fn terminal_scroll_asset() -> &'static AssetMeta {
+    static META: OnceLock<AssetMeta> = OnceLock::new();
+    META.get_or_init(|| compute_asset_meta(TERMINAL_SCROLL_PATH, TERMINAL_SCROLL_JS))
+}
+
+fn terminal_session_asset() -> &'static AssetMeta {
+    static META: OnceLock<AssetMeta> = OnceLock::new();
+    META.get_or_init(|| compute_asset_meta(TERMINAL_SESSION_PATH, TERMINAL_SESSION_JS))
+}
+
+fn terminal_css_asset() -> &'static AssetMeta {
+    static META: OnceLock<AssetMeta> = OnceLock::new();
+    META.get_or_init(|| compute_asset_meta(TERMINAL_CSS_PATH, TERMINAL_CSS))
+}
+
+fn terminal_js_asset() -> &'static AssetMeta {
+    static META: OnceLock<AssetMeta> = OnceLock::new();
+    META.get_or_init(|| compute_asset_meta(TERMINAL_JS_PATH, TERMINAL_JS))
+}
+
+fn static_asset_response(
+    headers: &HeaderMap,
+    raw_query: &RawQuery,
+    content_type: &'static str,
+    meta: &'static AssetMeta,
+    body: &'static [u8],
+) -> Response {
+    let matched_hash = raw_query
+        .0
+        .as_deref()
+        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("h=")))
+        .is_some_and(|value| value == meta.hash12);
+    if matched_hash {
+        let etag_matches = headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.split(',').map(str::trim).any(|tag| {
+                    tag == "*" || tag.trim_start_matches("W/") == meta.etag_str.as_str()
+                })
+            });
+        if etag_matches {
+            let mut response = StatusCode::NOT_MODIFIED.into_response();
+            response
+                .headers_mut()
+                .insert(header::ETAG, meta.etag.clone());
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            );
+            return response;
+        }
+    }
+    let mut response = text_response(StatusCode::OK, content_type, Bytes::from_static(body));
+    response
+        .headers_mut()
+        .insert(header::ETAG, meta.etag.clone());
+    if matched_hash {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    }
     response
 }
 
@@ -1465,99 +1603,123 @@ async fn homepage(
     })
 }
 
-async fn frontend_css() -> Response {
-    text_response(
-        StatusCode::OK,
+async fn frontend_css(headers: HeaderMap, raw_query: RawQuery) -> Response {
+    static_asset_response(
+        &headers,
+        &raw_query,
         "text/css; charset=utf-8",
-        Bytes::from_static(APP_CSS),
+        app_css_asset(),
+        APP_CSS,
     )
 }
 
-async fn frontend_js() -> Response {
-    text_response(
-        StatusCode::OK,
+async fn frontend_js(headers: HeaderMap, raw_query: RawQuery) -> Response {
+    static_asset_response(
+        &headers,
+        &raw_query,
         "text/javascript; charset=utf-8",
-        Bytes::from_static(APP_JS),
+        app_js_asset(),
+        APP_JS,
     )
 }
 
-async fn client_files_js() -> Response {
-    text_response(
-        StatusCode::OK,
+async fn client_files_js(headers: HeaderMap, raw_query: RawQuery) -> Response {
+    static_asset_response(
+        &headers,
+        &raw_query,
         "text/javascript; charset=utf-8",
-        Bytes::from_static(CLIENT_FILES_JS),
+        client_files_asset(),
+        CLIENT_FILES_JS,
     )
 }
 
-async fn accounts_js() -> Response {
-    text_response(
-        StatusCode::OK,
+async fn accounts_js(headers: HeaderMap, raw_query: RawQuery) -> Response {
+    static_asset_response(
+        &headers,
+        &raw_query,
         "text/javascript; charset=utf-8",
-        Bytes::from_static(ACCOUNTS_JS),
+        accounts_asset(),
+        ACCOUNTS_JS,
     )
 }
 
-async fn workspace_ui_js() -> Response {
-    text_response(
-        StatusCode::OK,
+async fn workspace_ui_js(headers: HeaderMap, raw_query: RawQuery) -> Response {
+    static_asset_response(
+        &headers,
+        &raw_query,
         "text/javascript; charset=utf-8",
-        Bytes::from_static(WORKSPACE_UI_JS),
+        workspace_ui_asset(),
+        WORKSPACE_UI_JS,
     )
 }
 
-async fn window_home_js() -> Response {
-    text_response(
-        StatusCode::OK,
+async fn window_home_js(headers: HeaderMap, raw_query: RawQuery) -> Response {
+    static_asset_response(
+        &headers,
+        &raw_query,
         "text/javascript; charset=utf-8",
-        Bytes::from_static(WINDOW_HOME_JS),
+        window_home_asset(),
+        WINDOW_HOME_JS,
     )
 }
 
-async fn codex_palette_js() -> Response {
-    text_response(
-        StatusCode::OK,
+async fn codex_palette_js(headers: HeaderMap, raw_query: RawQuery) -> Response {
+    static_asset_response(
+        &headers,
+        &raw_query,
         "text/javascript; charset=utf-8",
-        Bytes::from_static(CODEX_PALETTE_JS),
+        codex_palette_asset(),
+        CODEX_PALETTE_JS,
     )
 }
 
-async fn terminal_copy_js() -> Response {
-    text_response(
-        StatusCode::OK,
+async fn terminal_copy_js(headers: HeaderMap, raw_query: RawQuery) -> Response {
+    static_asset_response(
+        &headers,
+        &raw_query,
         "text/javascript; charset=utf-8",
-        Bytes::from_static(TERMINAL_COPY_JS),
+        terminal_copy_asset(),
+        TERMINAL_COPY_JS,
     )
 }
 
-async fn terminal_scroll_js() -> Response {
-    text_response(
-        StatusCode::OK,
+async fn terminal_scroll_js(headers: HeaderMap, raw_query: RawQuery) -> Response {
+    static_asset_response(
+        &headers,
+        &raw_query,
         "text/javascript; charset=utf-8",
-        Bytes::from_static(TERMINAL_SCROLL_JS),
+        terminal_scroll_asset(),
+        TERMINAL_SCROLL_JS,
     )
 }
 
-async fn terminal_session_js() -> Response {
-    text_response(
-        StatusCode::OK,
+async fn terminal_session_js(headers: HeaderMap, raw_query: RawQuery) -> Response {
+    static_asset_response(
+        &headers,
+        &raw_query,
         "text/javascript; charset=utf-8",
-        Bytes::from_static(TERMINAL_SESSION_JS),
+        terminal_session_asset(),
+        TERMINAL_SESSION_JS,
     )
 }
 
-async fn terminal_css() -> Response {
-    text_response(
-        StatusCode::OK,
+async fn terminal_css(headers: HeaderMap, raw_query: RawQuery) -> Response {
+    static_asset_response(
+        &headers,
+        &raw_query,
         "text/css; charset=utf-8",
-        Bytes::from_static(TERMINAL_CSS),
+        terminal_css_asset(),
+        TERMINAL_CSS,
     )
 }
 
-async fn terminal_js() -> Response {
-    text_response(
-        StatusCode::OK,
+async fn terminal_js(headers: HeaderMap, raw_query: RawQuery) -> Response {
+    static_asset_response(
+        &headers,
+        &raw_query,
         "text/javascript; charset=utf-8",
-        Bytes::from_static(TERMINAL_JS),
+        terminal_js_asset(),
+        TERMINAL_JS,
     )
 }
 
@@ -2369,27 +2531,27 @@ async fn terminal_page(
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,interactive-widget=resizes-content,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#070a10\"><title>");
     escape_html_into(&mut output, pane.pane_title.as_str());
     output.push_str(" · t1000</title><link rel=\"stylesheet\" href=\"");
-    output.push_str(FRONTEND_CSS_PATH);
+    output.push_str(app_css_asset().href.as_str());
     output.push_str("\"><link rel=\"stylesheet\" href=\"");
-    output.push_str(TERMINAL_CSS_PATH);
+    output.push_str(terminal_css_asset().href.as_str());
     output.push_str("\"><script defer src=\"");
-    output.push_str(TERMINAL_JS_PATH);
+    output.push_str(terminal_js_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(CLIENT_FILES_PATH);
+    output.push_str(client_files_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(ACCOUNTS_PATH);
+    output.push_str(accounts_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(CODEX_PALETTE_PATH);
+    output.push_str(codex_palette_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(WORKSPACE_UI_PATH);
+    output.push_str(workspace_ui_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(TERMINAL_COPY_PATH);
+    output.push_str(terminal_copy_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(TERMINAL_SCROLL_PATH);
+    output.push_str(terminal_scroll_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(TERMINAL_SESSION_PATH);
+    output.push_str(terminal_session_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(FRONTEND_JS_PATH);
+    output.push_str(app_js_asset().href.as_str());
     output.push_str("\"></script></head><body class=\"terminal-page\"><main id=\"termdeck-app\" class=\"terminal-page-main\" data-termdeck-page=\"terminal\" data-termdeck-slug=\"");
     escape_html_into(&mut output, slug.as_str());
     output.push_str("\" data-termdeck-pane=\"");
@@ -2851,7 +3013,9 @@ fn password_page_response(
     let mut output = String::with_capacity(2_048);
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>");
     escape_html_into(&mut output, title);
-    output.push_str("</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v9/app.css\"></head><body class=\"auth-page\"><main class=\"auth-main\"><p class=\"auth-brand\"><span class=\"auth-mark\" aria-hidden=\"true\">&gt;_</span>t1000</p><h1>");
+    output.push_str("</title><link rel=\"stylesheet\" href=\"");
+    output.push_str(app_css_asset().href.as_str());
+    output.push_str("\"></head><body class=\"auth-page\"><main class=\"auth-main\"><p class=\"auth-brand\"><span class=\"auth-mark\" aria-hidden=\"true\">&gt;_</span>t1000</p><h1>");
     escape_html_into(&mut output, heading);
     output.push_str("</h1><p class=\"subtle\">");
     escape_html_into(&mut output, description);
@@ -2950,9 +3114,11 @@ fn password_error_response(
 }
 
 fn render_pairing_page(base_path: RequestBasePath) -> String {
-    let output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Recovery pairing · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v9/app.css\"></head><body><main><p class=\"eyebrow\">t1000 recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>",
+    let mut output = String::from(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Recovery pairing · t1000</title><link rel=\"stylesheet\" href=\"",
     );
+    output.push_str(app_css_asset().href.as_str());
+    output.push_str("\"></head><body><main><p class=\"eyebrow\">t1000 recovery</p><h1>Recovery pairing</h1><p class=\"subtle\">Normal browser access uses the owner password. A locally generated recovery invitation may be entered here.</p><form method=\"post\" action=\"/_termdeck/pair\"><label>Recovery invitation<input name=\"invitation\" type=\"password\" required autocomplete=\"off\" maxlength=\"128\"></label><button type=\"submit\">Pair recovery device</button></form></main></body></html>");
     html_for_base(prefix_html_template(output), base_path)
 }
 
@@ -3504,25 +3670,25 @@ fn render_homepage(
 ) -> Result<String, ServerError> {
     let mut output = String::with_capacity(8_192 + snapshot.total_panes().saturating_mul(32));
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>t1000</title><link rel=\"stylesheet\" href=\"");
-    output.push_str(FRONTEND_CSS_PATH);
+    output.push_str(app_css_asset().href.as_str());
     output.push_str("\"><script defer src=\"");
-    output.push_str(CLIENT_FILES_PATH);
+    output.push_str(client_files_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(ACCOUNTS_PATH);
+    output.push_str(accounts_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(CODEX_PALETTE_PATH);
+    output.push_str(codex_palette_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(WORKSPACE_UI_PATH);
+    output.push_str(workspace_ui_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(WINDOW_HOME_PATH);
+    output.push_str(window_home_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(TERMINAL_COPY_PATH);
+    output.push_str(terminal_copy_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(TERMINAL_SCROLL_PATH);
+    output.push_str(terminal_scroll_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(TERMINAL_SESSION_PATH);
+    output.push_str(terminal_session_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(FRONTEND_JS_PATH);
+    output.push_str(app_js_asset().href.as_str());
     output.push_str("\"></script></head><body><main id=\"termdeck-app\" aria-busy=\"false\" data-termdeck-page=\"home\"><header class=\"host-header\"><p class=\"eyebrow\">t1000 host</p><h1>Windows</h1><p class=\"subtle\">");
     output.push_str(&snapshot.windows().len().to_string());
     output.push_str(" windows · ");
@@ -3576,27 +3742,27 @@ fn render_window_page(
     output.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>");
     escape_html_into(&mut output, window.name());
     output.push_str(" · t1000</title><link rel=\"stylesheet\" href=\"");
-    output.push_str(FRONTEND_CSS_PATH);
+    output.push_str(app_css_asset().href.as_str());
     output.push_str("\"><link rel=\"stylesheet\" href=\"");
-    output.push_str(TERMINAL_CSS_PATH);
+    output.push_str(terminal_css_asset().href.as_str());
     output.push_str("\"><script defer src=\"");
-    output.push_str(TERMINAL_JS_PATH);
+    output.push_str(terminal_js_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(CLIENT_FILES_PATH);
+    output.push_str(client_files_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(ACCOUNTS_PATH);
+    output.push_str(accounts_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(CODEX_PALETTE_PATH);
+    output.push_str(codex_palette_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(WORKSPACE_UI_PATH);
+    output.push_str(workspace_ui_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(TERMINAL_COPY_PATH);
+    output.push_str(terminal_copy_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(TERMINAL_SCROLL_PATH);
+    output.push_str(terminal_scroll_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(TERMINAL_SESSION_PATH);
+    output.push_str(terminal_session_asset().href.as_str());
     output.push_str("\"></script><script defer src=\"");
-    output.push_str(FRONTEND_JS_PATH);
+    output.push_str(app_js_asset().href.as_str());
     output.push_str("\"></script></head><body><main id=\"termdeck-app\" aria-busy=\"false\" data-termdeck-page=\"window\" data-termdeck-slug=\"");
     escape_html_into(&mut output, window.route().slug());
     if let Some(initial_pane) = window
@@ -3658,8 +3824,10 @@ fn render_window_page(
 
 fn render_not_found_page(slug: &str, base_path: RequestBasePath) -> String {
     let mut output = String::from(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Not found · t1000</title><link rel=\"stylesheet\" href=\"/_termdeck/assets/v9/app.css\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored t1000 window owns this route",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\"><meta name=\"theme-color\" content=\"#090c12\"><title>Not found · t1000</title><link rel=\"stylesheet\" href=\"",
     );
+    output.push_str(app_css_asset().href.as_str());
+    output.push_str("\"></head><body><main><h1>Window not found</h1><p class=\"subtle\">No mirrored t1000 window owns this route");
     if !slug.is_empty() {
         output.push_str(": <code>/");
         escape_html_into(&mut output, slug);
@@ -3987,7 +4155,7 @@ mod tests {
         RenderedSnapshot, ServerConfig, ServerError, SnapshotCache, TERMINAL_COPY_JS,
         TERMINAL_COPY_PATH, TERMINAL_JS_PATH, TERMINAL_SCROLL_JS, TERMINAL_SCROLL_PATH,
         TERMINAL_SESSION_JS, TERMINAL_SESSION_PATH, WINDOW_HOME_JS, WINDOW_HOME_PATH,
-        WORKSPACE_UI_JS, WORKSPACE_UI_PATH, build_router, unix_ms,
+        WORKSPACE_UI_JS, WORKSPACE_UI_PATH, app_js_asset, build_router, unix_ms,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
@@ -4212,6 +4380,68 @@ mod tests {
     }
 
     #[test]
+    fn static_assets_use_immutable_caching_only_with_matching_content_hash() {
+        runtime().block_on(async {
+            let router = build_router(state(30_000, unix_ms()));
+            let js_href = app_js_asset().href.as_str();
+            let hit = router
+                .clone()
+                .oneshot(request(Method::GET, js_href, "127.0.0.1"))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(hit.status(), StatusCode::OK);
+            assert_eq!(
+                hit.headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("public, max-age=31536000, immutable")
+            );
+            let etag = hit
+                .headers()
+                .get(header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+                .unwrap_or_default();
+            assert!(!etag.is_empty());
+
+            let mut conditional = request(Method::GET, js_href, "127.0.0.1");
+            if let Ok(value) = HeaderValue::from_str(etag.as_str()) {
+                conditional.headers_mut().insert(header::IF_NONE_MATCH, value);
+            }
+            let not_modified = router
+                .clone()
+                .oneshot(conditional)
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+            assert_eq!(
+                not_modified
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("public, max-age=31536000, immutable")
+            );
+
+            let mismatch = router
+                .oneshot(request(
+                    Method::GET,
+                    format!("{FRONTEND_JS_PATH}?h=000000000000").as_str(),
+                    "127.0.0.1",
+                ))
+                .await
+                .unwrap_or_else(|error| match error {});
+            assert_eq!(mismatch.status(), StatusCode::OK);
+            assert_eq!(
+                mismatch
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store, max-age=0")
+            );
+        });
+    }
+
+    #[test]
     fn trusted_forwarded_prefix_is_exact_and_rewrites_all_browser_paths() {
         runtime().block_on(async {
             let router = build_router(state(30_000, unix_ms()));
@@ -4229,8 +4459,8 @@ mod tests {
             );
             let home_text = body_text(home).await;
             assert!(home_text.contains(r#"data-termdeck-base="/t1000""#));
-            assert!(home_text.contains(r#"href="/t1000/_termdeck/assets/v9/app.css""#));
-            assert!(home_text.contains(r#"src="/t1000/_termdeck/assets/v8/app.js""#));
+            assert!(home_text.contains(r#"href="/t1000/_termdeck/assets/v9/app.css?h="#));
+            assert!(home_text.contains(r#"src="/t1000/_termdeck/assets/v9/app.js?h="#));
             assert!(home_text.contains(r#"href="/t1000/random""#));
             assert!(!home_text.contains("__TERMDECK_BASE_PATH__"));
             assert!(!home_text.contains(r#"href="/_termdeck/"#));
@@ -4244,7 +4474,7 @@ mod tests {
             let window_text = body_text(window).await;
             assert!(window_text.contains(r#"data-termdeck-base="/t1000""#));
             assert!(window_text.contains(r#"href="/t1000/random/t/session-one""#));
-            assert!(window_text.contains(r#"href="/t1000/_termdeck/assets/v9/app.css""#));
+            assert!(window_text.contains(r#"href="/t1000/_termdeck/assets/v9/app.css?h="#));
 
             let asset = router
                 .clone()
@@ -5257,7 +5487,7 @@ mod auth_integration_tests {
                 .unwrap_or_else(|error| match error {});
             assert_eq!(setup_page.status(), StatusCode::OK);
             let setup_text = body_text(setup_page).await;
-            assert!(setup_text.contains(r#"href="/t1000/_termdeck/assets/v9/app.css""#));
+            assert!(setup_text.contains(r#"href="/t1000/_termdeck/assets/v9/app.css?h="#));
             assert!(setup_text.contains(r#"action="/t1000/_termdeck/setup""#));
             assert!(!setup_text.contains("__TERMDECK_BASE_PATH__"));
 

@@ -28,7 +28,8 @@ window.T1000TerminalSession = (() => {
     const MAX_COLUMNS = 1000;
     const MIN_ROWS = 2;
     const MAX_ROWS = 500;
-    let active = true;
+    let active = context.initialActive !== false;
+    let warmConnect = !active;
     let paneState = { status: "unknown", hasTerminal: false, terminalTarget: null };
     let recoveryInputNotice = "";
     let lastStatus = ["Connecting…", "connecting"];
@@ -689,8 +690,13 @@ window.T1000TerminalSession = (() => {
     }
 
     function fitCanonical(geometry) {
-      if (active) terminalApi.fitGrid(geometry.cols, geometry.rows);
-      else {
+      if (active || (host.clientWidth > 0 && host.clientHeight > 0)) {
+        terminalApi.fitGrid(geometry.cols, geometry.rows);
+        if (host.clientWidth > 0 && host.clientHeight > 0) {
+          lastActiveSize = { w: host.clientWidth, h: host.clientHeight };
+        }
+        if (!active) needsFitOnActivate = false;
+      } else {
         needsFitOnActivate = true;
         terminalApi.terminal.resize(geometry.cols, geometry.rows);
       }
@@ -718,21 +724,23 @@ window.T1000TerminalSession = (() => {
       window.clearTimeout(helloTimer);
       setOverlay("");
       ready = true;
-      scheduleViewportResize();
-      if (active && focusRequested) {
-        focusRequested = false;
-        requestControl();
-      }
-      window.requestAnimationFrame(() => {
-        const focused = document.activeElement;
-        if (active && !disposed && document.visibilityState === "visible" && document.hasFocus()
-          && (!focused || focused === document.body || host.contains(focused))) {
-          terminalApi.focus(false);
+      if (active) {
+        scheduleViewportResize();
+        if (focusRequested) {
+          focusRequested = false;
+          requestControl();
         }
-      });
-      flushInputBatch(false);
-      sendAvailable();
-      scheduleRenderer();
+        window.requestAnimationFrame(() => {
+          const focused = document.activeElement;
+          if (active && !disposed && document.visibilityState === "visible" && document.hasFocus()
+            && (!focused || focused === document.body || host.contains(focused))) {
+            terminalApi.focus(false);
+          }
+        });
+        flushInputBatch(false);
+        sendAvailable();
+        scheduleRenderer();
+      }
     }
 
     function applyServerEvent(event) {
@@ -816,7 +824,8 @@ window.T1000TerminalSession = (() => {
       ) {
         return;
       }
-      const dimensions = boundedGeometry(active ? terminalApi.fit() : lastViewportGeometry || terminalApi.dimensions());
+      const hasBox = host.clientWidth > 0 && host.clientHeight > 0;
+      const dimensions = boundedGeometry((active || hasBox) ? terminalApi.fit() : lastViewportGeometry || terminalApi.dimensions());
       lastViewportGeometry = dimensions;
       candidate.send(JSON.stringify({ type: "hello", cols: dimensions.cols, rows: dimensions.rows }));
       helloTimer = window.setTimeout(() => {
@@ -835,7 +844,7 @@ window.T1000TerminalSession = (() => {
 
     function connect() {
       if (archiveMode || !streamAllowed()) return;
-      if (disposed || !active || !networkOnline) {
+      if (disposed || (!active && !warmConnect) || !networkOnline) {
         if (!networkOnline) {
           setStatus("Offline", "offline");
         }
@@ -1002,6 +1011,7 @@ window.T1000TerminalSession = (() => {
       activate() {
         if (disposed) return;
         active = true;
+        warmConnect = false;
         const preferences = window.T1000UI.preferences();
         const key = JSON.stringify(preferences);
         if (key !== appearanceKey) {
@@ -1130,7 +1140,7 @@ window.T1000TerminalSession = (() => {
           if (entry.shell.parentNode !== parent && entry.shell.parent !== parent) {
             parent.insertBefore(entry.shell, before);
           }
-          entry.mount = create(entry);
+          entry.mount = create(entry, { initialActive: true });
         } else {
           setEntryActive(entry, true);
           entry.mount.activate();
@@ -1138,6 +1148,48 @@ window.T1000TerminalSession = (() => {
         entries.delete(paneId);
         entries.set(paneId, entry);
         current = entry;
+        count();
+        return entry;
+      },
+      has(paneId) {
+        return entries.has(paneId);
+      },
+      warm(paneId, { evict = false } = {}) {
+        if (typeof paneId !== "string" || !paneId.length) return null;
+        if (entries.has(paneId)) return entries.get(paneId);
+        if (entries.size >= limit) {
+          if (!evict) return null;
+          let oldestId = null;
+          let oldestEntry = null;
+          for (const [id, candidate] of entries) {
+            if (candidate !== current) {
+              oldestId = id;
+              oldestEntry = candidate;
+              break;
+            }
+          }
+          if (!oldestEntry) return null;
+          discard(oldestId, oldestEntry);
+        }
+        const entry = view(paneId);
+        setEntryActive(entry, false);
+        if (entry.shell.parentNode !== parent && entry.shell.parent !== parent) {
+          parent.insertBefore(entry.shell, before);
+        }
+        entry.mount = create(entry, { initialActive: false });
+        if (!evict) {
+          const snapshot = [...entries];
+          entries.clear();
+          entries.set(paneId, entry);
+          for (const [id, existing] of snapshot) entries.set(id, existing);
+        } else if (current && entries.has(current.paneId)) {
+          const currentId = current.paneId;
+          entries.delete(currentId);
+          entries.set(paneId, entry);
+          entries.set(currentId, current);
+        } else {
+          entries.set(paneId, entry);
+        }
         count();
         return entry;
       },

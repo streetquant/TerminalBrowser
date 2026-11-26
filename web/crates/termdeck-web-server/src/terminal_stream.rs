@@ -287,8 +287,16 @@ async fn run_terminal_socket_inner(
 ) -> Result<(), StreamError> {
     validate_termdeck_id(pane.pane_id.as_str())?;
     validate_tmux_target(pane.tmux_target.as_str())?;
-    let mut viewport_geometry = receive_hello(socket).await?;
     require_stream_session(&auth, &context).await?;
+    let (mut viewport_geometry, mut control) = tokio::try_join!(
+        receive_hello(socket),
+        TmuxControl::spawn(
+            terminal.tmux_executable(),
+            pane.tmux_target.clone(),
+            pane.tmux_pane_id.clone(),
+            terminal.command_timeout(),
+        ),
+    )?;
     let mut control_view = match terminal
         .acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), false)
         .await
@@ -302,18 +310,13 @@ async fn run_terminal_socket_inner(
     };
     let root = terminal.output_journal_root.clone().ok_or_else(|| StreamError::Recording(std::io::Error::other("recording root unavailable")))?;
     let mut journal = AsyncJournal::spawn(root, pane.journal_id.clone());
-    let mut control = TmuxControl::spawn(
-        terminal.tmux_executable(),
-        pane.tmux_target.clone(),
-        pane.tmux_pane_id.clone(),
-        terminal.command_timeout(),
-    )
-    .await?;
-    // Only the active browser writer contributes a size to tmux.  Viewers
-    // retain the canonical pane grid without resizing another user's TUI.
-    control
-        .set_writer_mode(control_view.mine, viewport_geometry)
-        .await?;
+    // `TmuxControl::spawn` attaches with `CONTROL_FLAGS_VIEWER`; only the
+    // controller needs an explicit mode switch before initial replay.
+    if control_view.mine {
+        control
+            .set_writer_mode(true, viewport_geometry)
+            .await?;
+    }
     // Output resumes inside the replay transaction; anything tmux emits while
     // the replay is sent stays queued (byte-bounded) and follows it in order.
     let replay = control.initial_replay().await?;

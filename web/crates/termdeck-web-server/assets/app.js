@@ -616,9 +616,9 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
     refresh();
   }
 
-  function mountTerminal(windowSlug, paneId, host, status, overlay, initialPaneState) {
+  function mountTerminal(windowSlug, paneId, host, status, overlay, initialPaneState, options) {
     return window.T1000TerminalSession.mount(windowSlug, paneId, host, status, overlay,
-      { appPath, isRecord, nonNegativeInteger, errorMessage, initialPaneState });
+      { appPath, isRecord, nonNegativeInteger, errorMessage, initialPaneState, initialActive: options?.initialActive !== false });
   }
 
   function startWorkspace(initialPaneId) {
@@ -796,9 +796,41 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
     const terminalViews = window.T1000TerminalSession.createCache({
       parent: shell, before: actionNotice,
       initial: { shell: xtermShell, host: terminalHost, overlay: terminalOverlay },
-      create: view => mountTerminal(routeSlug, view.paneId, view.host, terminalStatus, view.overlay,
-        envelope?.window.panes.find(pane => pane.id === view.paneId) || {status: "unknown", hasTerminal: false}),
+      create: (view, options) => mountTerminal(routeSlug, view.paneId, view.host, terminalStatus, view.overlay,
+        envelope?.window.panes.find(pane => pane.id === view.paneId) || {status: "unknown", hasTerminal: false}, options),
     });
+    let warmTimers = [];
+    function clearWarmTimers() {
+      for (const timer of warmTimers) window.clearTimeout(timer);
+      warmTimers = [];
+    }
+    function warmPane(paneId, evict = false) {
+      if (disposed || typeof paneId !== "string" || !paneId || paneId === activePaneId) return;
+      if (terminalViews.has?.(paneId)) return;
+      const pane = envelope?.window.panes.find(item => item.id === paneId);
+      if (!pane || !pane.hasTerminal || (pane.status !== "running" && pane.status !== "paused")) return;
+      terminalViews.warm?.(paneId, { evict });
+    }
+    function scheduleNeighborWarm() {
+      clearWarmTimers();
+      if (disposed || document.hidden || !envelope || !activePaneId) return;
+      const panes = envelope.window.panes;
+      const idx = panes.findIndex(item => item.id === activePaneId);
+      if (idx < 0) return;
+      const candidates = [];
+      for (let delta = 1; delta <= 3 && candidates.length < 6; delta += 1) {
+        for (const next of [idx + delta, idx - delta]) {
+          const pane = panes[next];
+          if (pane && pane.hasTerminal && (pane.status === "running" || pane.status === "paused")
+            && !terminalViews.has?.(pane.id)) {
+            candidates.push(pane.id);
+          }
+        }
+      }
+      candidates.slice(0, 6).forEach((id, order) => {
+        warmTimers.push(window.setTimeout(() => warmPane(id, false), 150 + order * 80));
+      });
+    }
     let refreshTimer = 0;
     let refreshInFlight = false;
     let refreshRequested = false;
@@ -911,6 +943,7 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
       if (focusTab) {
         focusTabButton(paneId);
       }
+      scheduleNeighborWarm();
     }
 
     function renderTabs() {
@@ -1132,6 +1165,7 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
             if (pane) {
               document.title = `${pane.title} · ${next.window.name} · t1000`;
             }
+            scheduleNeighborWarm();
           } else {
             if (terminalMount) {
               terminalViews.clear();
@@ -1280,8 +1314,20 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
       window.clearTimeout(refreshTimer);
       refreshTimer = window.setTimeout(() => refreshWindow(false), 100);
     });
+    const warmFromEvent = (event) => {
+      const target = event.target instanceof Element
+        ? event.target.closest(".workspace-tab-select[data-pane-id], .workspace-sidebar-tab[data-pane-id]")
+        : null;
+      const paneId = target?.dataset?.paneId;
+      if (paneId) warmPane(paneId, true);
+    };
+    tabbar.addEventListener("pointerenter", warmFromEvent, true);
+    tabbar.addEventListener("pointerdown", warmFromEvent, true);
+    shell.addEventListener("pointerenter", warmFromEvent, true);
+    shell.addEventListener("pointerdown", warmFromEvent, true);
     window.addEventListener("beforeunload", () => {
       disposed = true;
+      clearWarmTimers();
       window.clearTimeout(refreshTimer);
       terminalViews.clear();
     }, { once: true });

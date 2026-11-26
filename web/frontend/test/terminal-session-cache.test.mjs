@@ -27,9 +27,9 @@ function fixture(limit = 16) {
   const host = new Element(), overlay = new Element(); shell.append(host, overlay); parent.append(shell, before);
   const mounts = new Map();
   const cache = window.T1000TerminalSession.createCache({parent, before, initial: {shell, host, overlay}, limit,
-    create(view) {
+    create(view, options) {
       assert.equal(view.shell.parent, parent, "mount must measure an attached view");
-      assert.equal(view.shell.dataset.termdeckActive, "true");
+      assert.equal(view.shell.dataset.termdeckActive, options?.initialActive === false ? "false" : "true");
       const mount = {activated: 0, deactivated: 0, disposed: 0,
         activate() { this.activated++; }, deactivate() { this.deactivated++; }, dispose() { this.disposed++; }};
       const previous = mounts.get(view.paneId) || []; previous.push(mount); mounts.set(view.paneId, previous);
@@ -95,4 +95,38 @@ test("navigation shutdown releases all renderers and streams exactly once", () =
 
 test("invalid resource bounds are rejected", () => {
   for (const limit of [0, 17, -1, 1.5, "4", null]) assert.throws(() => fixture(limit), /cache bound/);
+});
+
+test("speculative warm mounts passive views, respects LRU priority, and activates cleanly", () => {
+  const {cache, parent, mounts} = fixture(3);
+  const a = cache.select("a");
+  const w1 = cache.warm("w1");
+  assert.ok(w1);
+  assert.equal(w1.shell.parent, parent);
+  assert.equal(w1.shell.dataset.termdeckActive, "false");
+  assert.equal(w1.shell.id || "", "");
+  assert.equal(a.shell.dataset.termdeckActive, "true");
+  assert.equal(a.shell.id, "terminal-shell");
+  assert.equal(cache.has("w1"), true);
+  assert.equal(cache.warm("w1"), w1);
+
+  const b = cache.select("b");
+  assert.equal(cache.warm("c"), null, "idle warm does not evict when full");
+  assert.equal(cache.has("c"), false);
+  assert.equal(b.mount.disposed, 0);
+
+  // Hover warm with evict=true evicts idle-warmed w1 before user-visited a or b.
+  const c = cache.warm("c", {evict: true});
+  assert.ok(c);
+  assert.equal(w1.mount.disposed, 1);
+  assert.equal(a.mount.disposed, 0);
+  assert.equal(b.mount.disposed, 0);
+
+  // Selecting pre-warmed c activates existing mount without recreating.
+  const activatedC = cache.select("c");
+  assert.equal(activatedC, c);
+  assert.equal(c.mount.activated, 1);
+  assert.equal(mounts.get("c").length, 1);
+  assert.equal(c.shell.dataset.termdeckActive, "true");
+  assert.equal(c.shell.id, "terminal-shell");
 });
