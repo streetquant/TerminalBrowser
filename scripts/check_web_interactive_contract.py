@@ -69,7 +69,9 @@ def main() -> None:
         "terminalViews.select(paneId)",
         "if (activePaneId) {",
         "switchPane(activePaneId, false);",
-        "terminalApi.onData(bytes => scroll.isWheelInput() ? enqueueWheel(bytes) : enqueue(bytes))",
+        "if (scroll.isWheelInput()) {",
+        "if (wheelBatch) wheelBatch.push(bytes);",
+        "else enqueueWheel(bytes);",
         "new ResizeObserver",
         "fitViewport()",
         'new WebSocket(streamUrl(), "termdeck.terminal.v1")',
@@ -80,7 +82,7 @@ def main() -> None:
         '["Kill process…", "kill"]',
         '["rename", "pause", "pin", "hide", "kill"].map(actionButton)',
         'actionConfirm.textContent = rename ? "Save name" : "Kill process"',
-        'node("button", "workspace-tab-close", "×")',
+        'element("button", "workspace-tab-close", "×")',
         'sendJson({ type: "ping" })',
         'window.addEventListener("online", reconnectNow)',
         "let refreshRequested = false;",
@@ -93,7 +95,7 @@ def main() -> None:
         'data-termdeck-pane=\\"',
         ".active_pane_id()",
         ".or_else(|| window.panes().first().map(PaneSnapshot::id))",
-        "/_termdeck/assets/v8/app.css",
+        "/_termdeck/assets/v9/app.css",
         "no-store, max-age=0",
     ):
         require(server_production, needle, "immediate pane bootstrap")
@@ -123,12 +125,12 @@ def main() -> None:
     require(browser, "INPUT_BATCH_MS = 3", "interactive input batching")
     require(browser, "inFlight = new Map()", "multi-frame acknowledgement tracking")
     require(browser, "window.T1000TerminalScroll.install(host, terminalApi", "scroll owner wiring")
-    require(text["session"], "limit > 4", "recent terminal resource bound")
-    require(text["session"], "if (!active || disposed) return;", "inactive terminal focus isolation")
+    require(text["session"], "limit > 16", "recent terminal resource bound")
+    require(text["session"], "if (!active || disposed || archiveMode || !streamAllowed()) return;", "inactive terminal focus isolation")
     require(text["session"], "if (!active || !(bytes instanceof Uint8Array)", "inactive terminal input isolation")
     require(text["app"], "terminalViews.prune(next.window.panes.map(pane => pane.id))", "removed terminal cleanup")
-    require(text["server"], 'const TERMINAL_SESSION_PATH: &str = "/_termdeck/assets/v8/terminal-session.js"', "session asset route")
-    require(text["terminal_scroll"], 'host.addEventListener("wheel", wheel, { capture: true, passive: false })', "wheel interception")
+    require(text["server"], 'const TERMINAL_SESSION_PATH: &str = "/_termdeck/assets/v11/terminal-session.js"', "session asset route")
+    require(text["terminal_scroll"], 'host.addEventListener("wheel", wheel, {capture: true, passive: false})', "wheel interception")
     require(text["terminal_copy"], "navigator.clipboard.writeText", "explicit selection clipboard")
     require(text["terminal_source"], "fitGrid", "canonical-grid viewport fit")
     require(text["app"], "workspace-headerbar", "native compact workspace header")
