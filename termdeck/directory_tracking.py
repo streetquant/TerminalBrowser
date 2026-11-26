@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import sqlite3
 import threading
 import time
@@ -18,17 +19,28 @@ from .tmux_backend import TmuxBackend
 SERVICE = "termdeck-directory-tracker.service"
 
 
-def save_directories(store: SessionStore, backend: TmuxBackend) -> dict:
+def _notify_watchdog():
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address or not os.environ.get("WATCHDOG_USEC"):
+        return
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_NONBLOCK) as notifier:
+        notifier.sendto(b"WATCHDOG=1", address)
+
+
+def save_directories(store: SessionStore, backend: TmuxBackend, *, records=None) -> dict:
     """Use one live pane snapshot; never infer a missing pane's cwd as HOME.
 
     Read each record again under the write lock so unrelated lifecycle/name
     changes cannot be overwritten by an earlier inventory. Store.update owns
     the canonical recipe, digest and recovery-authority invalidation.
     """
-    records = [r for r in store.list() if not r.external and r.status == "running"]
-    directories = backend.current_directories(records)
+    source_records = records if records is not None else store.list()
+    running = [r for r in source_records if not r.external and r.status == "running"]
+    directories = backend.current_directories(running)
     changed = failed = 0
-    for observed in records:
+    for observed in running:
         directory = directories.get(observed.id)
         if not directory or directory == observed.cwd or not Path(observed.cwd).is_dir():
             # A reboot may temporarily fall back while a mount/directory is
@@ -53,24 +65,61 @@ def save_directories(store: SessionStore, backend: TmuxBackend) -> dict:
         except (OSError, ValueError, sqlite3.Error):
             store.conn.rollback()
             failed += 1
-    return {"selected": len(records), "updated": changed, "failed": failed}
+    return {"selected": len(running), "updated": changed, "failed": failed}
 
 
-def save_recovery_metadata(store, backend, root):
+def save_recovery_metadata(store, backend, root, *, records=None, force_all: bool = False):
     """Observe app-native IDs without a UI; retain history before recipe changes."""
     from .session_durability import _atomic, _directory, _sync
     from uuid import uuid4
     from .recovery_authority_context import record_cas
-    records = [r for r in store.list() if not r.external and r.status == "running"]
-    batch = backend.recovery_observations(records, native_capture=True)
+    source_records = records if records is not None else store.list()
+    running = [r for r in source_records if not r.external and r.status == "running"]
+    if not running:
+        return 0
+    now_mono = time.monotonic()
+    fp_cache = getattr(backend, "_recovery_fp_cache", None)
+    if not isinstance(fp_cache, dict):
+        fp_cache = {}
+        backend._recovery_fp_cache = fp_cache
+    live_fps = (
+        backend.process_tree_fingerprints(running)
+        if not force_all and hasattr(backend, "process_tree_fingerprints")
+        else None
+    )
+    if live_fps is not None:
+        candidates = []
+        for record in running:
+            fp = live_fps.get(record.id)
+            if fp is None:
+                continue
+            cached = fp_cache.get(record.id)
+            if cached is not None and cached[0] == fp and (now_mono - cached[1]) < 30.0:
+                continue
+            candidates.append(record)
+    else:
+        candidates = running
+    if not candidates:
+        return 0
+    batch = backend.recovery_observations(candidates, native_capture=True)
+    if live_fps is not None:
+        observed_at = time.monotonic()
+        for record in candidates:
+            if record.id in batch.metadata and record.id in live_fps:
+                fp_cache[record.id] = (live_fps[record.id], observed_at)
+    if not batch.metadata:
+        return 0
     updates = []
-    by_id = {record.id: record for record in records}
+    by_id = {record.id: record for record in candidates}
     try:
         store.conn.execute("BEGIN IMMEDIATE")
         for session_id, (command, cwd) in batch.metadata.items():
             previous = by_id.get(session_id)
             current = store.get(session_id)
             if previous is None or current is None or record_cas(current) != record_cas(previous):
+                continue
+            changed = (command != previous.recovery_command or (cwd if command else None) != previous.recovery_cwd)
+            if not changed and live_fps is not None:
                 continue
             observation = batch.authority.get(session_id)
             if observation is not None and observation.is_current is not None and not observation.is_current():
@@ -81,6 +130,9 @@ def save_recovery_metadata(store, backend, root):
                 _atomic(directory / (str(time.time_ns()) + "-" + uuid4().hex + ".json"),
                         json.dumps(dict(session_id=session_id, command=command, cwd=cwd)).encode())
             updates.append((session_id, command, cwd))
+        if not updates:
+            store.conn.rollback()
+            return 0
         count = store.update_recovery_metadata(updates, authority_observations=batch.authority)
         store.conn.commit()
         return count
@@ -137,7 +189,7 @@ class PipeObserver:
         self._stopped = True
 
 
-def maintain_recorders(store, backend, root, recorders, *, recorder_launcher=None):
+def maintain_recorders(store, backend, root, recorders, *, recorder_launcher=None, records=None):
     """Install output-only pipes without clients, resize, input or app lifecycle.
 
     A synchronous server-side condition checks the pipe immediately before
@@ -150,7 +202,8 @@ def maintain_recorders(store, backend, root, recorders, *, recorder_launcher=Non
     from .output_journal import pipe_owner, journal_directory
     from .session_durability import _atomic, MAX_SCREEN_BYTES
     from .startup_publication import verify_bundle
-    records = [r for r in store.list() if not r.external and r.status in ("running", "recovery-pending")]
+    source_records = records if records is not None else store.list()
+    records = [r for r in source_records if not r.external and r.status in ("running", "recovery-pending")]
     result = backend._run(["list-panes", "-a", "-F",
         "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_pipe}\t#{pid}"],
         check=False, timeout=2)
@@ -264,10 +317,11 @@ def install(source: Path, managed_root: Path, state_root: Path, unit_dir: Path,
     unit = publication._unit(bundle, managed_root, state)
     unit = unit.replace(b"Description=Restore saved TermDeck terminals",
                         b"Description=Save live TermDeck working directories")
-    unit = unit.replace(b"Type=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=infinity",
-                        b"Type=simple\nRestart=on-failure\nRestartSec=2\nTimeoutStopSec=10")
-    unit = b"\n".join(b"TimeoutStopSec=30" if line.startswith(b"TimeoutStopSec=") else line
-                      for line in unit.splitlines()) + b"\n"
+    unit = unit.replace(b"PartOf=termdeck-web-backend.service\nBindsTo=termdeck-web-backend.service\n", b"")
+    unit = unit.replace(b"WantedBy=termdeck-web-backend.service\n", b"WantedBy=default.target\n")
+    unit = unit.replace(b"Restart=on-failure\nRestartSec=5\nTimeoutStopSec=15\n",
+                        b"Restart=always\nRestartSec=5\nTimeoutStopSec=30\n"
+                        b"WatchdogSec=90s\nNotifyAccess=main\nTimeoutAbortSec=10s\nLimitCORE=0\n")
     command = next(line for line in unit.splitlines() if line.startswith(b"ExecStart="))
     launch_argument = os.fsencode(bundle / "launch.py") + b'"'
     command = command[:command.index(launch_argument) + len(launch_argument)]
@@ -321,20 +375,18 @@ def main(argv=None) -> int:
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, stop_signal)
     with closing(SessionStore(args.db, provision_auth_scopes=False)) as store:
-        backend = TmuxBackend(pane_cache_ttl=0)
+        backend = TmuxBackend(pane_cache_ttl=0.85)
         from .session_durability import save_screens, backup_registry
         next_screen = next_backup = 0.0
         recorders = {}
         while True:
-            result = save_directories(store, backend)
+            backend.invalidate_cache()
+            records = store.list()
+            result = save_directories(store, backend, records=records)
+            if result["updated"]:
+                records = store.list()
             now = time.monotonic()
-            try:
-                maintain_recorders(store, backend, args.db.parent / "durability", recorders)
-                save_recovery_metadata(store, backend, args.db.parent / "durability")
-            except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-                result["failed"] += 1
-                print(json.dumps({"action": "record-output", "failed": True, "error_type": type(exc).__name__}), flush=True)
-            for action, due, period in (("screens", next_screen, 5), ("registry", next_backup, 60)):
+            for action, due, period in (("registry", next_backup, 60), ("screens", next_screen, 5)):
                 if now < due:
                     continue
                 try:
@@ -355,6 +407,13 @@ def main(argv=None) -> int:
                         next_screen = now + period
                     else:
                         next_backup = now + period
+            try:
+                maintain_recorders(store, backend, args.db.parent / "durability", recorders, records=records)
+                save_recovery_metadata(store, backend, args.db.parent / "durability", records=records)
+            except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                result["failed"] += 1
+                print(json.dumps({"action": "record-output", "failed": True, "error_type": type(exc).__name__}), flush=True)
+            _notify_watchdog()
             if args.once or result["updated"] or result["failed"]:
                 print(json.dumps({"action": "save-directories", **result}), flush=True)
             if args.once or stopped.wait(args.interval):
@@ -371,9 +430,9 @@ def main(argv=None) -> int:
                                 final_backend = TmuxBackend(pane_cache_ttl=0)
                                 save_directories(final_store, final_backend)
                                 if time.monotonic() < deadline:
-                                    save_screens(final_store, final_backend, args.db.parent / "durability")
-                                if time.monotonic() < deadline:
                                     backup_registry(final_store, args.db.parent / "durability")
+                                if time.monotonic() < deadline:
+                                    save_screens(final_store, final_backend, args.db.parent / "durability")
                         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
                             final_errors.append(type(exc).__name__)
                     final_worker = threading.Thread(target=final_save, daemon=True)

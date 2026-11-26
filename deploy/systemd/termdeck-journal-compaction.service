@@ -1,0 +1,19 @@
+[Unit]
+Description=Weekly low-priority TermDeck output journal compaction
+After=termdeck-directory-tracker.service
+
+[Service]
+Type=oneshot
+UMask=0077
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=50%
+AllowedCPUs=0-2,7-26,31-47
+MemoryMax=1G
+NoNewPrivileges=yes
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+WorkingDirectory=/warp/projects/softwares/termdeck
+Environment=PYTHONPATH=/warp/projects/softwares/termdeck
+ExecStart="/usr/bin/python3" "-B" "-m" "termdeck.output_journal" "--compact" "--root" "/warp/projects/softwares/termdeck/.termdeck/state/durability" "--keep-recent" "8" "--min-age-seconds" "3600"
+ExecStart=-"/usr/bin/python3" "-B" "-m" "termdeck.output_journal" "--compact" "--root" "/cyber-a/.termdeck-backups/termdeck" "--keep-recent" "8" "--min-age-seconds" "3600"

@@ -173,3 +173,55 @@ finally: store.close()
         assert store.get(item.id).window_id == "preserved-window"
     finally:
         subprocess.run(["/usr/bin/tmux", "kill-server"], capture_output=True, timeout=5)
+
+
+def test_save_screens_batches_reconciliation_and_skips_unchanged_idle_panes(saved):
+    store, first_item, root = saved
+    items = [first_item]
+    for idx in range(4):
+        rec = store.create(f"extra-{idx}", "test", "/bin/bash", first_item.cwd)
+        items.append(store.update(rec.id, status="running"))
+
+    class CountingBackend(ScreenBackend):
+        def __init__(self):
+            self.reconcile_calls = 0
+            self.capture_calls = 0
+            self.sigs = {r.id: ("sig-v1", r.id) for r in items}
+            self.texts = {r.id: f"screen-{r.id}-v1\n" for r in items}
+
+        def reconciliation_snapshot(self, records):
+            self.reconcile_calls += 1
+            return {r.id: dict(self.owner) for r in records}
+
+        def pane_screen_signatures(self, records, _root=None):
+            return {r.id: self.sigs[r.id] for r in records if r.id in self.sigs}
+
+        def _run(self, argv, **kwargs):
+            assert argv[0] == "capture-pane"
+            self.capture_calls += 1
+            target = argv[argv.index("-t") + 1]
+            rec = next(r for r in items if self.pane_target(r) == target)
+            return SimpleNamespace(returncode=0, stdout=self.texts[rec.id])
+
+    backend = CountingBackend()
+    assert save_screens(store, backend, root) == {"saved": 5, "failed": 0}
+    assert backend.reconcile_calls == 2  # O(1) before + after batch, not N + 1 = 6.
+    assert backend.capture_calls == 5
+
+    # Idle pass: all 5 signatures match -> 0 capture-pane subprocesses and 1 snapshot call.
+    backend.reconcile_calls = 0
+    backend.capture_calls = 0
+    assert save_screens(store, backend, root) == {"saved": 5, "failed": 0}
+    assert backend.capture_calls == 0
+    assert backend.reconcile_calls == 1
+
+    # Single active pane: only that pane spawns capture-pane.
+    backend.reconcile_calls = 0
+    backend.capture_calls = 0
+    backend.sigs[items[2].id] = ("sig-v2", items[2].id)
+    backend.texts[items[2].id] = "screen-updated-v2\n"
+    assert save_screens(store, backend, root) == {"saved": 5, "failed": 0}
+    assert backend.capture_calls == 1
+    assert backend.reconcile_calls == 2
+    saved_payload = json.loads(next((root / "screens" / items[2].id).glob("*.json")).read_text())
+    assert saved_payload["text"] == "screen-updated-v2\n"

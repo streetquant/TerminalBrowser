@@ -80,51 +80,91 @@ def save_screens(store, backend, root: Path) -> dict:
     saved = failed = 0
     with _lock(root):
         records = [r for r in store.list(include_archived=True) if not r.external]
-        start = getattr(backend, "_durability_screen_cursor", 0) % max(1, len(records))
+        if not records:
+            return {"saved": 0, "failed": 0}
+        start = getattr(backend, "_durability_screen_cursor", 0) % len(records)
         records = records[start:] + records[:start]
         observations = backend.reconciliation_snapshot(records)
         boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        deadline = time.monotonic() + 5
+        now_mono = time.monotonic()
+        deadline = now_mono + 5
         screen_hashes = getattr(backend, "_durability_screen_hashes", None)
         if not isinstance(screen_hashes, dict):
             screen_hashes = {}
             backend._durability_screen_hashes = screen_hashes
+        screen_sigs = getattr(backend, "_durability_screen_sigs", None)
+        if not isinstance(screen_sigs, dict):
+            screen_sigs = {}
+            backend._durability_screen_sigs = screen_sigs
+        live_sigs = (
+            backend.pane_screen_signatures(records, root)
+            if hasattr(backend, "pane_screen_signatures")
+            else None
+        )
+        staged = []
         for index, record in enumerate(records):
             if time.monotonic() >= deadline:
                 failed += 1  # Keep the observer/shutdown bounded; retain old copies.
                 break
-            backend._durability_screen_cursor = (start + index + 1) % max(1, len(records))
+            backend._durability_screen_cursor = (start + index + 1) % len(records)
             before = observations.get(record.id, {})
             if before.get("state") != "live":
                 continue  # Absence must never replace a previously saved screen.
             try:
                 if not _ID.fullmatch(record.id) or not backend.reconciliation_identity_current(before):
                     raise OSError("screen owner changed")
+                generation = hashlib.sha256(json.dumps([boot, before], sort_keys=True).encode()).hexdigest()
+                directory = _directory(root / "screens" / record.id)
+                target = directory / (generation + ".json")
+                cache_key = (record.id, generation)
+                pane_sig = live_sigs.get(record.id) if live_sigs is not None else None
+                if (
+                    pane_sig is not None
+                    and cache_key in screen_hashes
+                    and target.exists()
+                ):
+                    prev_sig, last_verified = screen_sigs.get(cache_key, (None, 0.0))
+                    if prev_sig == pane_sig and (now_mono - last_verified) < 60.0:
+                        saved += 1
+                        continue
                 result = backend._run(["capture-pane", "-p", "-t", backend.pane_target(record),
                                        "-S", "-10000"], check=False)
                 if result.returncode or len(result.stdout.encode()) > MAX_SCREEN_BYTES:
                     raise OSError("screen capture unavailable or oversized")
-                after = backend.reconciliation_snapshot([record]).get(record.id, {})
-                if before != after or not backend.reconciliation_identity_current(after):
-                    raise OSError("screen owner changed during capture")
-                generation = hashlib.sha256(json.dumps([boot, before], sort_keys=True).encode()).hexdigest()
-                directory = _directory(root / "screens" / record.id)
-                target = directory / (generation + ".json")
-                text_sha256 = hashlib.sha256(result.stdout.encode()).hexdigest()
-                cache_key = (record.id, generation)
-                if screen_hashes.get(cache_key) == text_sha256 and target.exists():
-                    saved += 1
-                    continue
-                payload = {"schema": "termdeck.saved-screen.v1", "session_id": record.id,
-                           "generation": generation, "boot_id": boot, "owner": before,
-                           "captured_at": datetime.now(timezone.utc).isoformat(),
-                           "history_line_limit": 10000, "text": result.stdout,
-                           "text_sha256": text_sha256}
-                _atomic(target, (json.dumps(payload) + "\n").encode())
-                screen_hashes[cache_key] = text_sha256
-                saved += 1
+                staged.append((record, before, generation, target, cache_key, result.stdout, pane_sig))
             except (OSError, ValueError, RuntimeError):
                 failed += 1
+
+        if staged:
+            try:
+                after_observations = backend.reconciliation_snapshot([item[0] for item in staged])
+            except (OSError, ValueError, RuntimeError):
+                failed += len(staged)
+                return {"saved": saved, "failed": failed}
+            verified_at = time.monotonic()
+            for record, before, generation, target, cache_key, stdout_text, pane_sig in staged:
+                try:
+                    after = after_observations.get(record.id, {})
+                    if before != after or not backend.reconciliation_identity_current(after):
+                        raise OSError("screen owner changed during capture")
+                    text_sha256 = hashlib.sha256(stdout_text.encode()).hexdigest()
+                    if screen_hashes.get(cache_key) == text_sha256 and target.exists():
+                        if pane_sig is not None:
+                            screen_sigs[cache_key] = (pane_sig, verified_at)
+                        saved += 1
+                        continue
+                    payload = {"schema": "termdeck.saved-screen.v1", "session_id": record.id,
+                               "generation": generation, "boot_id": boot, "owner": before,
+                               "captured_at": datetime.now(timezone.utc).isoformat(),
+                               "history_line_limit": 10000, "text": stdout_text,
+                               "text_sha256": text_sha256}
+                    _atomic(target, (json.dumps(payload) + "\n").encode())
+                    screen_hashes[cache_key] = text_sha256
+                    if pane_sig is not None:
+                        screen_sigs[cache_key] = (pane_sig, verified_at)
+                    saved += 1
+                except (OSError, ValueError, RuntimeError):
+                    failed += 1
     return {"saved": saved, "failed": failed}
 
 

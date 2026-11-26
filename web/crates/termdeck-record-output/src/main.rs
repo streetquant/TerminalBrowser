@@ -68,6 +68,40 @@ struct FailureNotice<'a> {
     error: &'a str,
     #[serde(rename = "type")]
     error_type: &'a str,
+    reason: &'a str,
+}
+
+#[derive(serde::Deserialize)]
+struct PreviousPipeOwner {
+    session_id: String,
+    pane_id: String,
+    pane_pid: u32,
+    pane_start: u64,
+    server_pid: u32,
+    server_start: u64,
+    token: String,
+    generation: String,
+}
+
+#[derive(serde::Deserialize)]
+struct StoredFailureNotice {
+    reason: Option<String>,
+    #[serde(rename = "type")]
+    error_type: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RecordingLineageEvent<'a> {
+    schema: &'static str,
+    event: &'static str,
+    gap_detected: bool,
+    session_id: &'a str,
+    pane_id: &'a str,
+    previous_generation: &'a str,
+    new_generation: &'a str,
+    prior_failure_reason: &'a str,
+    gap_ms: Option<u64>,
+    timestamp_ms: u64,
 }
 
 #[derive(serde::Deserialize)]
@@ -398,8 +432,132 @@ enum PipeEvent {
     Eof,
 }
 
+#[derive(Clone)]
+struct OverflowNoticeTarget {
+    directory: PathBuf,
+    token: String,
+}
+
+fn write_overflow_notice_bounded(target: Option<OverflowNoticeTarget>) {
+    let Some(target) = target else {
+        return;
+    };
+    let handle = thread::spawn(move || {
+        if let Ok(bytes) = serde_json::to_vec(&FailureNotice {
+            error: "output backlog exceeded 4 MiB",
+            error_type: "BacklogOverflow",
+            reason: "backlog_overflow",
+        }) {
+            let mut random = [0_u8; 8];
+            let suffix = if getrandom::fill(&mut random).is_ok() {
+                hex(&random)
+            } else {
+                process::id().to_string()
+            };
+            let dest = target.directory.join(format!("{}.failed.json", target.token));
+            let tmp = target
+                .directory
+                .join(format!(".{}.failed.json.{suffix}", target.token));
+            if let Ok(mut f) = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&tmp)
+            {
+                if f.write_all(&bytes).is_ok() {
+                    let _ = fs::rename(&tmp, &dest);
+                }
+                let _ = fs::remove_file(&tmp);
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn record_reattachment_if_same_pane(directory: &Path, args: &Args, new_generation: &str) {
+    let Ok(prev_file) = open_read_safe(&directory.join("pipe-owner.json")) else {
+        return;
+    };
+    let mut raw = Vec::new();
+    if prev_file.take(16_384).read_to_end(&mut raw).is_err() {
+        return;
+    }
+    let Ok(prev) = serde_json::from_slice::<PreviousPipeOwner>(&raw) else {
+        return;
+    };
+    if prev.session_id != args.session_id
+        || prev.pane_id != args.pane_id
+        || prev.pane_pid != args.pane_pid
+        || prev.pane_start != args.pane_start
+        || prev.server_pid != args.server_pid
+        || prev.server_start != args.server_start
+    {
+        return;
+    }
+    let mut prior_reason = String::from("unclean_exit_or_sigkill");
+    if valid_token(&prev.token)
+        && let Ok(fail_file) = open_read_safe(&directory.join(format!("{}.failed.json", prev.token)))
+    {
+        let mut fail_raw = Vec::new();
+        if fail_file.take(8_192).read_to_end(&mut fail_raw).is_ok()
+            && let Ok(doc) = serde_json::from_slice::<StoredFailureNotice>(&fail_raw)
+            && let Some(reason) = doc.reason.or(doc.error_type)
+            && !reason.is_empty()
+        {
+            prior_reason = reason;
+        }
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let gap_ms = fs::symlink_metadata(directory.join(format!("{}.commit", prev.generation)))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .map(|commit_ms| now_ms.saturating_sub(commit_ms));
+
+    let event = RecordingLineageEvent {
+        schema: "termdeck.recording-event.v1",
+        event: "sink_reattached",
+        gap_detected: true,
+        session_id: &args.session_id,
+        pane_id: &args.pane_id,
+        previous_generation: &prev.generation,
+        new_generation,
+        prior_failure_reason: &prior_reason,
+        gap_ms,
+        timestamp_ms: now_ms,
+    };
+    let Ok(mut line) = serde_json::to_vec(&event) else {
+        return;
+    };
+    line.push(b'\n');
+    if let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join("recording-events.jsonl"))
+        && let Ok(meta) = log.metadata()
+        && meta.is_file()
+        && meta.nlink() == 1
+        && self_uid().is_ok_and(|u| meta.uid() == u)
+        && meta.permissions().mode() & 0o777 == 0o600
+    {
+        let _ = log.write_all(&line);
+        let _ = log.sync_all();
+    }
+}
+
 fn spawn_pipe_reader<R: Read + Send + 'static>(
     mut reader: R,
+    overflow_notice: Option<OverflowNoticeTarget>,
 ) -> (mpsc::Receiver<PipeEvent>, Arc<AtomicUsize>) {
     let (tx, rx) = mpsc::sync_channel(4096);
     let queued_bytes = Arc::new(AtomicUsize::new(0));
@@ -418,11 +576,13 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
                         let current = worker_bytes.fetch_add(n, Ordering::AcqRel);
                         if current.saturating_add(n) > MAX_PIPE_BACKLOG_BYTES {
                             drop(reader);
+                            write_overflow_notice_bounded(overflow_notice);
                             eprintln!("terminal recording failed: output backlog exceeded 4 MiB");
                             process::exit(1);
                         }
                         if tx.try_send(PipeEvent::Data(buf[..n].to_vec())).is_err() {
                             drop(reader);
+                            write_overflow_notice_bounded(overflow_notice);
                             eprintln!("terminal recording failed: output backlog exceeded 4 MiB");
                             process::exit(1);
                         }
@@ -613,8 +773,14 @@ fn record_pipe(args: &Args) -> io::Result<()> {
         return Err(invalid("recording pane/server generation changed"));
     }
 
-    let (rx, queued_bytes) = spawn_pipe_reader(io::stdin());
     let directory = journal_directory(&args.root, &args.session_id)?;
+    let (rx, queued_bytes) = spawn_pipe_reader(
+        io::stdin(),
+        Some(OverflowNoticeTarget {
+            directory: directory.clone(),
+            token: args.token.clone(),
+        }),
+    );
     let primary_lease = open_lock_safe(&directory.join(".primary.lock"))?;
     flock_op(&primary_lease, libc::LOCK_EX | libc::LOCK_NB)
         .map_err(|err| invalid(format!("primary recording lease busy: {err}")))?;
@@ -622,6 +788,7 @@ fn record_pipe(args: &Args) -> io::Result<()> {
     let mut journal = PrimaryJournal::open(&args.root, &args.session_id)?;
     let replay = read_initial_replay(&journal.directory, &args.token)?;
     journal.append(&replay, Some((args.columns, args.rows)), true)?;
+    record_reattachment_if_same_pane(&journal.directory, args, &journal.generation);
 
     let owner = PipeOwner {
         session_id: args.session_id.clone(),
@@ -715,6 +882,7 @@ fn write_failure_notice(args: &Args, error: &io::Error) {
         if let Ok(bytes) = serde_json::to_vec(&FailureNotice {
             error: &msg,
             error_type: "OSError",
+            reason: "io_error",
         }) {
             let _ = atomic_write(
                 &directory.join(format!("{}.failed.json", args.token)),
@@ -856,7 +1024,7 @@ mod tests {
     #[test]
     fn pipe_reader_delivers_chunks_then_eof() -> io::Result<()> {
         let payload = b"chunk-1|chunk-2|chunk-3".to_vec();
-        let (rx, queued) = spawn_pipe_reader(io::Cursor::new(payload.clone()));
+        let (rx, queued) = spawn_pipe_reader(io::Cursor::new(payload.clone()), None);
         let mut out = Vec::new();
         while let Ok(event) = rx.recv_timeout(Duration::from_secs(2)) {
             match event {
@@ -869,6 +1037,87 @@ mod tests {
         }
         assert_eq!(out, payload);
         assert_eq!(queued.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn overflow_notice_records_structured_backlog_failure_json() -> io::Result<()> {
+        let fixture = Fixture::new("overflow")?;
+        let directory = journal_directory(&fixture.0, "td-overflow")?;
+        let token = "abcdef0123456789abcdef0123456789".to_owned();
+        write_overflow_notice_bounded(Some(OverflowNoticeTarget {
+            directory: directory.clone(),
+            token: token.clone(),
+        }));
+        let raw = fs::read_to_string(directory.join(format!("{token}.failed.json")))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| invalid(e.to_string()))?;
+        assert_eq!(parsed["type"], "BacklogOverflow");
+        assert_eq!(parsed["reason"], "backlog_overflow");
+        Ok(())
+    }
+
+    #[test]
+    fn reattachment_lineage_records_gap_only_when_same_pane_generation_continues() -> io::Result<()> {
+        let fixture = Fixture::new("lineage")?;
+        let mut first = PrimaryJournal::open(&fixture.0, "td-gap")?;
+        first.append(b"gen-1", Some((80, 24)), true)?;
+        let token1 = "11111111111111111111111111111111".to_owned();
+        write_overflow_notice_bounded(Some(OverflowNoticeTarget {
+            directory: first.directory.clone(),
+            token: token1.clone(),
+        }));
+        let owner1 = PipeOwner {
+            session_id: "td-gap".to_owned(),
+            pane_id: "%9".to_owned(),
+            pane_pid: 4242,
+            pane_start: 9001,
+            server_pid: 100,
+            server_start: 200,
+            pid: 5555,
+            starttime: 9005,
+            argv: vec!["termdeck-record-output".to_owned()],
+            token: token1,
+            generation: first.generation.clone(),
+        };
+        atomic_write(
+            &first.directory.join("pipe-owner.json"),
+            &serde_json::to_vec(&owner1).map_err(|e| invalid(e.to_string()))?,
+            true,
+        )?;
+
+        let same_pane_args = Args {
+            root: fixture.0.clone(),
+            session_id: "td-gap".to_owned(),
+            pane_id: "%9".to_owned(),
+            pane_pid: 4242,
+            pane_start: 9001,
+            server_pid: 100,
+            server_start: 200,
+            columns: 80,
+            rows: 24,
+            token: "22222222222222222222222222222222".to_owned(),
+        };
+        let second = PrimaryJournal::open(&fixture.0, "td-gap")?;
+        record_reattachment_if_same_pane(&second.directory, &same_pane_args, &second.generation);
+
+        // A brand-new pane process (different pane_start) must not emit a false gap record.
+        let mut restarted_args = same_pane_args;
+        restarted_args.pane_start = 9999;
+        record_reattachment_if_same_pane(&second.directory, &restarted_args, "00000000000000000003-ffffffffffffffffffffffffffffffff.tdj");
+
+        let lines: Vec<String> = fs::read_to_string(second.directory.join("recording-events.jsonl"))?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(lines.len(), 1);
+        let ev: serde_json::Value =
+            serde_json::from_str(&lines[0]).map_err(|e| invalid(e.to_string()))?;
+        assert_eq!(ev["event"], "sink_reattached");
+        assert_eq!(ev["gap_detected"], true);
+        assert_eq!(ev["previous_generation"], first.generation);
+        assert_eq!(ev["new_generation"], second.generation);
+        assert_eq!(ev["prior_failure_reason"], "backlog_overflow");
         Ok(())
     }
 }

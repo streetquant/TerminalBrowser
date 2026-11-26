@@ -1399,6 +1399,125 @@ class TmuxBackend:
                     and process["ppid"] == evidence.get("server_pid")
                     and process["starttime"] == evidence.get("start_time"))
 
+    def pane_screen_signatures(
+        self,
+        records: Sequence[SessionRecord],
+        durability_root: Path | None = None,
+    ) -> dict[str, tuple[object, ...]]:
+        """Return lightweight per-pane activity tokens from one all-pane query."""
+        if not records or not self.available:
+            return {}
+        result = self._run(
+            [
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_dead}\t"
+                "#{pane_width}\t#{pane_height}\t#{alternate_on}\t#{cursor_x}\t#{cursor_y}\t"
+                "#{history_size}\t#{history_bytes}\t#{pane_tty}",
+            ],
+            check=False,
+            timeout=self._query_timeout_for(len(records)),
+        )
+        if result.returncode != 0:
+            return {}
+        by_target: dict[str, tuple[str, ...]] = {}
+        by_session: dict[str, tuple[str, ...]] = {}
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) != 14 or parts[5] != "0":
+                continue
+            session_name, win_idx, pane_idx, pane_id = parts[0], parts[1], parts[2], parts[3]
+            tty_path = parts[13]
+            tty_mtime = 0
+            if tty_path.startswith("/dev/"):
+                try:
+                    tty_mtime = os.stat(tty_path).st_mtime_ns
+                except OSError:
+                    tty_mtime = 0
+            token = (*parts[4:13], str(tty_mtime))
+            by_target[f"{session_name}:{win_idx}.{pane_idx}"] = token
+            if pane_id.startswith("%"):
+                by_target[pane_id] = token
+            by_session.setdefault(session_name, token)
+
+        journals_root = durability_root / "journals" if durability_root is not None else None
+        out: dict[str, tuple[object, ...]] = {}
+        for record in records:
+            target = self.pane_target(record)
+            token = by_target.get(target)
+            if token is None and target == f"{record.tmux_name}:0.0":
+                token = by_session.get(record.tmux_name)
+            if token is None:
+                continue
+            journal_stamp: tuple[object, ...] = ()
+            if journals_root is not None:
+                tab_dir = journals_root / record.id
+                try:
+                    gen = (tab_dir / "latest").read_bytes()[:128].decode("ascii", "ignore").strip()
+                    if gen:
+                        commit_st = (tab_dir / f"{gen}.commit").lstat()
+                        tdj_st = (tab_dir / gen).lstat()
+                        journal_stamp = (gen, commit_st.st_mtime_ns, tdj_st.st_size)
+                except OSError:
+                    pass
+            out[record.id] = (*token, journal_stamp)
+        return out
+
+    def process_tree_fingerprints(
+        self,
+        records: Sequence[SessionRecord],
+    ) -> dict[str, tuple[object, ...]]:
+        """Build fast /proc process-tree fingerprints without spawning subprocesses."""
+        if not records or not self.available:
+            return {}
+        pids = self.pane_pids(records)
+        if self._pane_snapshot_stale:
+            return {}
+        out: dict[str, tuple[object, ...]] = {}
+        for record in records:
+            root_pid = pids.get(record.id)
+            if not root_pid:
+                continue
+            root_stat = _parse_stat(root_pid)
+            if root_stat is None:
+                continue
+            target = self.pane_target(record)
+            cwd = self._pane_cwd_by_target.get(target)
+            if cwd is None and target == f"{record.tmux_name}:0.0":
+                cwd = self._pane_cwd_by_session_active.get(record.tmux_name)
+            nodes: list[tuple[int, int]] = [(root_pid, int(root_stat["starttime"]))]
+            frontier = [root_pid]
+            seen = {root_pid}
+            depth = 0
+            while frontier and depth < 3 and len(nodes) < 32:
+                next_frontier: list[int] = []
+                for cur in frontier:
+                    try:
+                        children_raw = Path(f"/proc/{cur}/task/{cur}/children").read_text()
+                    except OSError:
+                        continue
+                    for tok in children_raw.split():
+                        try:
+                            cpid = int(tok)
+                        except ValueError:
+                            continue
+                        if cpid in seen:
+                            continue
+                        seen.add(cpid)
+                        cstat = _parse_stat(cpid)
+                        if cstat is not None and cstat.get("state") not in {"Z", "X", "x"}:
+                            nodes.append((cpid, int(cstat["starttime"])))
+                            if len(nodes) >= 32:
+                                break
+                            next_frontier.append(cpid)
+                    if len(nodes) >= 32:
+                        break
+                frontier = next_frontier
+                depth += 1
+            out[record.id] = (cwd or "", tuple(nodes))
+        return out
+
     @staticmethod
     def _resume_uuid(command: str) -> str | None:
         try:

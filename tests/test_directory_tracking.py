@@ -100,11 +100,31 @@ def test_directory_service_uses_verified_immutable_payload_and_preserves_web(tmp
     result = install(source, managed, state, units, tmp_path / "backup.json")
     unit = Path(result["unit_path"]).read_text()
     assert '"--track-directories"' in unit and "Type=simple" in unit
-    assert "Restart=on-failure" in unit and "RemainAfterExit" not in unit
-    assert "WantedBy=termdeck-web-backend.service" in unit
+    assert "Restart=always" in unit and "RemainAfterExit" not in unit
+    assert "WatchdogSec=90s" in unit and "NotifyAccess=main" in unit
+    assert "WantedBy=default.target" in unit
+    assert "After=termdeck-web-backend.service" in unit
+    assert "PartOf=" not in unit and "BindsTo=" not in unit and "Requires=" not in unit
     assert web.read_text() == "unchanged\n"
     subprocess.run(("/usr/bin/python3", "-I", "-B", str(Path(result["bundle"]) / "launch.py"),
                     "--verify-only"), check=True)
+
+
+def test_directory_tracker_notifies_configured_watchdog(tmp_path, monkeypatch):
+    import socket
+
+    from termdeck.directory_tracking import _notify_watchdog
+
+    path = str(tmp_path / "notify")
+    monkeypatch.setenv("NOTIFY_SOCKET", path)
+    monkeypatch.delenv("WATCHDOG_USEC", raising=False)
+    _notify_watchdog()
+    monkeypatch.setenv("WATCHDOG_USEC", "90000000")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as receiver:
+        receiver.bind(path)
+        receiver.settimeout(1)
+        _notify_watchdog()
+        assert receiver.recv(128) == b"WATCHDOG=1"
 
 
 def test_headless_recording_survives_observer_sigkill_without_app_loss(tmp_path, monkeypatch):

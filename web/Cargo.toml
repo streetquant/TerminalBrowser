@@ -35,3 +35,7 @@ unsafe_code = "forbid"
 all = { level = "deny", priority = -1 }
 expect_used = "deny"
 unwrap_used = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

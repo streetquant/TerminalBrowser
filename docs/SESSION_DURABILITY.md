@@ -93,7 +93,25 @@ python -m termdeck.output_journal --root .termdeck/state/durability \
   --session-id <saved-tab-id> --list
 python -m termdeck.output_journal --root .termdeck/state/durability \
   --session-id <saved-tab-id> --generation <listed-generation> --export saved-ansi.txt
+python -m termdeck.output_journal --root .termdeck/state/durability --audit-health
+python -m termdeck.output_journal --root .termdeck/state/durability --compact
 ```
+
+Historical closed `.tdj` generations older than `min_age_seconds` (default 1 hour,
+retaining the newest `keep_recent=8` plain files plus active `latest`,
+`latest-view`, and `pipe-owner.json` generations) can be compacted to `.tdj.zst`
+via `compact_journals` or the weekly `deploy/systemd/termdeck-journal-compaction.timer`
+(`Nice=19`, `IOSchedulingClass=idle`, `CPUQuota=50%`, `AllowedCPUs=0-2,7-26,31-47`
+excluding TermDeck's reserved CPUs `3-6,27-30`). Compaction holds an exclusive
+non-blocking `.compact.lock`, verifies that the decompressed `.zst` stream matches
+the original `.tdj` SHA-256 digest and byte length before unlinking `.tdj`,
+resumes safely if interrupted at any stage, persists `compaction-status.json`,
+and exits non-zero if any generation fails verification. Whenever a recorder
+reattaches to an unchanged live pane process after a crash or 4 MiB backlog
+overflow, it appends a structured lineage entry to
+`journals/<session-id>/recording-events.jsonl` (`gap_detected: true`,
+`prior_failure_reason`, `gap_ms`), surfaced alongside failure counts and disk
+pressure by `--audit-health`.
 
 The journal exporter creates a new mode-0600 file and refuses to overwrite one.
 The browser's Saved output view uses an authenticated, same-account saved-pane

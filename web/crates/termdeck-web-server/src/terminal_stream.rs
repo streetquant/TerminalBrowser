@@ -23,6 +23,7 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const REVOKED_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_CLIENT_TEXT_BYTES: usize = 4 * 1024;
 const MAX_CONTROL_COMMAND_BYTES: usize = 256 * 1024;
 const MAX_CONTROL_NOTIFICATION_LINE_BYTES: usize = 256 * 1024;
@@ -267,6 +268,9 @@ pub(crate) async fn run_terminal_socket(
     if let Err(error) =
         run_terminal_socket_inner(&mut socket, terminal, pane, actor, auth, context).await
     {
+        if matches!(error, StreamError::Backpressure) {
+            return;
+        }
         let message = error.to_string();
         let event = ErrorEvent {
             r#type: "error",
@@ -277,9 +281,16 @@ pub(crate) async fn run_terminal_socket(
                 StreamError::ClientProtocol(_) | StreamError::SessionUnavailable
             ),
         };
+        if matches!(error, StreamError::SessionUnavailable) {
+            if let Ok(text) = serde_json::to_string(&event) {
+                let _ = timeout(REVOKED_CLOSE_TIMEOUT, socket.send(Message::Text(text.into()))).await;
+            }
+            let _ = timeout(REVOKED_CLOSE_TIMEOUT, socket.send(Message::Close(None))).await;
+            return;
+        }
         let _result = send_json(&mut socket, &event).await;
     }
-    let _result = socket.send(Message::Close(None)).await;
+    let _result = timeout(WEBSOCKET_SEND_TIMEOUT, socket.send(Message::Close(None))).await;
 }
 
 async fn run_terminal_socket_inner(
@@ -387,7 +398,13 @@ async fn run_terminal_socket_inner(
                                 .map_err(StreamError::Recording)?;
                         }
                         require_stream_session(&auth, &context).await?;
-                        send_sink_message(&mut sender, Message::Binary(output.into())).await?;
+                        send_sink_message_authed(
+                            &mut sender,
+                            Message::Binary(output.into()),
+                            &auth,
+                            &context,
+                        )
+                        .await?;
                     }
                     ControlNotification::ReplayBarrier(_) => {}
                     ControlNotification::LayoutChanged => {
@@ -545,7 +562,13 @@ async fn run_terminal_socket_inner(
                     } else if writer_active {
                         control.set_writer_mode(true, viewport_geometry).await?;
                     }
-                    send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view, focused: false }).await?;
+                    send_sink_json_authed(
+                        &mut sender,
+                        &ControlEvent { r#type: "control", control: &control_view, focused: false },
+                        &auth,
+                        &context,
+                    )
+                    .await?;
                 }
             }
             _ = session_check.tick() => {
@@ -603,22 +626,26 @@ where
             .map_err(StreamError::Recording)?;
     }
     require_stream_session(auth, context).await?;
-    send_sink_json(
+    send_sink_json_authed(
         sender,
         &ResetEvent {
             r#type: "reset",
             geometry,
         },
+        auth,
+        context,
     )
     .await?;
-    send_sink_message(sender, Message::Binary(replay.bytes.into())).await?;
-    send_sink_json(
+    send_sink_message_authed(sender, Message::Binary(replay.bytes.into()), auth, context).await?;
+    send_sink_json_authed(
         sender,
         &ResyncedEvent {
             r#type: "resynced",
             control: control_view,
             geometry,
         },
+        auth,
+        context,
     )
     .await?;
     Ok(geometry)
@@ -859,6 +886,91 @@ where
         .await
         .map_err(|_| StreamError::Backpressure)?
         .map_err(|_| StreamError::ControlClosed)
+}
+
+async fn send_sink_json_authed<S>(
+    sink: &mut S,
+    value: &impl Serialize,
+    auth: &Arc<HttpAuth>,
+    context: &SessionContext,
+) -> Result<(), StreamError>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: fmt::Debug,
+{
+    let text = serde_json::to_string(value)?;
+    send_sink_message_authed(sink, Message::Text(text.into()), auth, context).await
+}
+
+async fn send_sink_message_authed<S>(
+    sink: &mut S,
+    message: Message,
+    auth: &Arc<HttpAuth>,
+    context: &SessionContext,
+) -> Result<(), StreamError>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: fmt::Debug,
+{
+    send_sink_message_checked(sink, message, || require_stream_session(auth, context)).await
+}
+
+async fn send_sink_message_checked<S, F, Fut>(
+    sink: &mut S,
+    message: Message,
+    check_session: F,
+) -> Result<(), StreamError>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), StreamError>>,
+{
+    send_sink_message_with_intervals(
+        sink,
+        message,
+        WEBSOCKET_SEND_TIMEOUT,
+        SESSION_CHECK_INTERVAL,
+        check_session,
+    )
+    .await
+}
+
+async fn send_sink_message_with_intervals<S, F, Fut>(
+    sink: &mut S,
+    message: Message,
+    send_timeout: Duration,
+    check_interval: Duration,
+    mut check_session: F,
+) -> Result<(), StreamError>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), StreamError>>,
+{
+    let send_fut = sink.send(message);
+    tokio::pin!(send_fut);
+    let send_deadline = tokio::time::sleep(send_timeout);
+    tokio::pin!(send_deadline);
+    let mut session_check = interval(check_interval);
+    session_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Consume the initial immediate tick; subsequent ticks fire every check_interval while blocked.
+    session_check.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            _ = session_check.tick() => {
+                check_session().await?;
+            }
+            _ = &mut send_deadline => {
+                return Err(StreamError::Backpressure);
+            }
+            result = &mut send_fut => {
+                return result.map_err(|_| StreamError::ControlClosed);
+            }
+        }
+    }
 }
 
 struct TmuxControl {
@@ -1191,37 +1303,31 @@ impl TmuxControl {
     /// the pause). Output queued before the pause is already part of the
     /// capture and is discarded up to the replay barrier.
     async fn initial_replay(&mut self) -> Result<ReplaySnapshot, StreamError> {
-        let sizing = self.current_state().await?;
-        let requested_history =
-            initial_replay_history_lines(sizing.history_size, sizing.geometry.cols);
+        let requested_history = initial_replay_history_lines(
+            u32::try_from(MAX_INITIAL_REPLAY_HISTORY_LINES).unwrap_or(u32::MAX),
+            MAX_COLUMNS,
+        );
         self.next_barrier = self.next_barrier.wrapping_add(1);
         let barrier = self.next_barrier;
-        let mut commands = vec![
+        let commands = [
             refresh_pane_action(self.pane_id.as_str(), "pause")?,
             self.state_command(),
-        ];
-        if requested_history > 0 {
-            commands.push(format!(
+            format!(
                 "capture-pane -epq -t {} -J -S -{} -E -1",
                 self.pane_id, requested_history
-            ));
-        }
-        commands.push(format!("capture-pane -epq -t {} -N", self.pane_id));
-        commands.push(refresh_pane_action(self.pane_id.as_str(), "continue")?);
+            ),
+            format!("capture-pane -epq -t {} -N", self.pane_id),
+            refresh_pane_action(self.pane_id.as_str(), "continue")?,
+        ];
         let count = commands.len();
         let mut replies = self
             .command_blocks(commands.join(" ; "), count, Some(barrier))
             .await?;
         self.discard_until_barrier(barrier)?;
         let visible = std::mem::take(&mut replies[count - 2].lines);
-        let mut history = if requested_history > 0 {
-            std::mem::take(&mut replies[2].lines)
-        } else {
-            Vec::new()
-        };
+        let mut history = std::mem::take(&mut replies[2].lines);
         let state = self.select_state(replies[1].lines.as_slice())?;
         let geometry = state.geometry;
-        // The pane may have been resized between sizing and the transaction.
         let history_bound = initial_replay_history_lines(state.history_size, geometry.cols);
         if history.len() > history_bound {
             history.drain(..history.len() - history_bound);
@@ -2176,6 +2282,92 @@ mod tests {
         assert_eq!(initial_replay_history_lines(7, 1_000), 7);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_replay_executes_single_control_round_trip_and_bounds_history() {
+        for (history_size, raw_history) in [
+            (0_u32, vec![b"spurious-row-0".to_vec()]),
+            (2_u32, vec![b"old-0".to_vec(), b"old-1".to_vec(), b"old-2".to_vec()]),
+        ] {
+            let state_line = format!(
+                "%7\t123\t80\t24\t0\t0\t0\t0\t1\t0\t1\t0\t0\t0\t0\t0\t0\t0\t{history_size}"
+            )
+            .into_bytes();
+            let (request_tx, mut request_rx) =
+                tokio::sync::mpsc::channel::<super::CommandRequest>(2);
+            let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
+            let _ = output_tx.send(ControlNotification::ReplayBarrier(1));
+            let actor = tokio::spawn(async move {
+                let request = request_rx
+                    .recv()
+                    .await
+                    .unwrap_or_else(|| panic!("replay block was not sent"));
+                assert!(request.command.contains("refresh-client -A '%7:pause'"));
+                assert!(request.command.contains("capture-pane -epq -t %7 -J -S -4000 -E -1"));
+                assert!(request.command.contains("capture-pane -epq -t %7 -N"));
+                assert!(request.command.contains("refresh-client -A '%7:continue'"));
+                assert!(
+                    request
+                        .reply
+                        .send(Ok(vec![
+                            super::ControlReply { lines: Vec::new() },
+                            super::ControlReply {
+                                lines: vec![state_line],
+                            },
+                            super::ControlReply { lines: raw_history },
+                            super::ControlReply {
+                                lines: vec![b"visible-live-row".to_vec()],
+                            },
+                            super::ControlReply { lines: Vec::new() },
+                        ]))
+                        .is_ok()
+                );
+                assert!(request_rx.try_recv().is_err());
+            });
+            let mut control = super::TmuxControl {
+                request_tx,
+                output_rx,
+                pending_output: Arc::new(AtomicUsize::new(0)),
+                deferred: None,
+                next_barrier: 0,
+                shutdown_tx: None,
+                actor,
+                command_timeout: std::time::Duration::from_secs(1),
+                pane_id: "%7".to_owned(),
+                target: "%7".to_owned(),
+            };
+            let snapshot = control
+                .initial_replay()
+                .await
+                .unwrap_or_else(|error| panic!("single-trip replay: {error}"));
+            assert_eq!(
+                snapshot.geometry,
+                TerminalGeometry {
+                    cols: 80,
+                    rows: 24
+                }
+            );
+            assert!(
+                snapshot
+                    .bytes
+                    .windows(b"visible-live-row".len())
+                    .any(|w| w == b"visible-live-row")
+            );
+            if history_size == 0 {
+                assert!(
+                    !snapshot
+                        .bytes
+                        .windows(b"spurious-row-0".len())
+                        .any(|w| w == b"spurious-row-0")
+                );
+            } else {
+                assert!(!snapshot.bytes.windows(b"old-0".len()).any(|w| w == b"old-0"));
+                assert!(snapshot.bytes.windows(b"old-1".len()).any(|w| w == b"old-1"));
+                assert!(snapshot.bytes.windows(b"old-2".len()).any(|w| w == b"old-2"));
+            }
+            control.shutdown().await;
+        }
+    }
+
     #[test]
     fn replay_keeps_distant_normal_screen_history_in_one_terminal_stream() {
         let state = PaneState {
@@ -2740,5 +2932,79 @@ mod tests {
             serde_json::from_str(r#"{"type":"hello","cols":80,"rows":24,"warm":true}"#)
                 .unwrap_or_else(|error| panic!("warm hello: {error}"));
         assert!(matches!(warm, super::ClientEvent::Hello { cols: 80, rows: 24, warm: true }));
+    }
+
+    struct PendingSink;
+    impl futures_util::Sink<axum::extract::ws::Message> for PendingSink {
+        type Error = std::io::Error;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _item: axum::extract::ws::Message,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn revoked_session_aborts_blocked_websocket_write_within_one_second() {
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let revoked_flag = Arc::clone(&revoked);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            revoked_flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let start = tokio::time::Instant::now();
+        let mut sink = PendingSink;
+        // Exercise the exact production 5s send timeout + 1s session check interval.
+        let result = super::send_sink_message_checked(
+            &mut sink,
+            axum::extract::ws::Message::Binary(vec![b'x'; 1024].into()),
+            || {
+                let is_revoked = revoked.load(std::sync::atomic::Ordering::Acquire);
+                async move {
+                    if is_revoked {
+                        Err(StreamError::SessionUnavailable)
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+        let elapsed = start.elapsed();
+        assert!(matches!(result, Err(StreamError::SessionUnavailable)));
+        assert!(
+            elapsed <= std::time::Duration::from_millis(1_250),
+            "revocation took {elapsed:?} instead of <= 1s during backpressured send"
+        );
+
+        // When session stays valid, a stalled peer hits the send timeout cleanly as Backpressure.
+        let bp_result = super::send_sink_message_with_intervals(
+            &mut sink,
+            axum::extract::ws::Message::Binary(vec![b'y'; 64].into()),
+            std::time::Duration::from_millis(120),
+            std::time::Duration::from_millis(40),
+            || async { Ok(()) },
+        )
+        .await;
+        assert!(matches!(bp_result, Err(StreamError::Backpressure)));
     }
 }
