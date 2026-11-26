@@ -42,7 +42,17 @@ flowchart TD
     style T6 fill:#1e1e2e,color:#f38ba8,stroke:#45475a
 ```
 
-Each **Window** is a named group (like a browser window). Each **Tab** is a live terminal shell backed by tmux — close the app, reopen it, everything is still running.
+Each **Window** is a named group (like a browser window). Each **Tab** is a live terminal shell backed by tmux — close the desktop app or browser tab, reopen it anywhere, and everything is still running.
+
+### Runtime components
+
+| Layer | Implementation | Role |
+|---|---|---|
+| **Desktop & CLI** | Python (`termdeck/`, `t1000`) | GTK3/VTE native workspace UI, headless fleet CLI, session registry (`SQLite` WAL), per-tab Codex auth scopes, and transactional release/bundle managers |
+| **Web server & WSS stream** | Rust (`web/crates/termdeck-web-*`) | `axum`/`tokio` HTTPS/WSS server (`termdeck.terminal.v1`), Argon2id + strict-cookie/CSRF auth, single-round-trip `tmux -C` attach, pipelined input, and content-hashed immutable assets |
+| **Browser terminal client** | JS + `xterm.js` (`web/frontend/`) | WebGL-accelerated terminal viewport, automatic focus-driven writer takeover, passive viewer geometry isolation, and speculative hover/neighbor tab pre-warming |
+| **Output journal recorder** | Rust (`web/crates/termdeck-record-output`) | Per-pane `pipe-pane -O` crash-safe frame writer with `150 ms` / `256 KiB` coalescing, SHA-256 frame digests, and `4 MiB` fail-closed backlog protection |
+| **Durability & observer** | Python + systemd (`session_durability.py`, `directory_tracking.py`) | `90s`-watchdog live CWD/recipe tracker, change-aware screen snapshots, hourly online SQLite backups, Zstandard journal compaction, and incremental dual-SSD mirroring |
 
 ## Platform support
 
@@ -286,10 +296,80 @@ Install t1000 from https://github.com/streetquant/TerminalBrowser by:
 4. Verifying with: t1000 --version
 ```
 
+## Web terminal, durability, and fleet performance
+
+### Authenticated browser terminal (`termdeck-web-server`)
+
+t1000 ships a native Rust browser workspace (`web/crates/termdeck-web-server`) alongside the desktop app so you can drive your live tmux fleet over LAN HTTPS/WSS, Tailscale/Headscale, or an authenticated `/t1000` reverse proxy / Cloudflare Tunnel:
+
+- **Zero-ceremony single-writer control** — focusing a terminal claims writer authority automatically with generation-safe lease handoff; passive viewers attach with `ignore-size` so background browsers or mobile viewports never resize active panes.
+- **Pipelined low-latency I/O** — `3 ms` client input batching (`64` in-flight frames), concurrent session-auth + `tmux -C` attach, single-round-trip atomic replay (`pause` + pane state + bounded scrollback + visible screen + `continue`), and `1 s` session-revocation enforcement even under stalled WebSocket backpressure.
+- **Speculative tab pre-warming & immutable assets** — hovering a tab and idle neighbor staggering (`±1..±3`) warm background viewer sockets without allocating WebGL contexts until activation, while static assets are served with SHA-256 `?h=` content hashes (`Cache-Control: public, max-age=31536000, immutable`) and `ETag`/`304` window snapshots.
+
+See **[docs/termdeck-web-deployment.md](docs/termdeck-web-deployment.md)** and **[docs/CLOUDFLARE_HOSTING.md](docs/CLOUDFLARE_HOSTING.md)** for TLS provisioning, `nginx` WebSocket edge configuration, threat model, and transactional rollback.
+
+### Crash-safe session durability and output journals
+
+Every managed tab is protected across GUI restarts, observer restarts, `tmux` server crashes, and disk failures without injecting synthetic bytes into live PTYs (full specification in **[docs/SESSION_DURABILITY.md](docs/SESSION_DURABILITY.md)**):
+
+- **Per-pane Rust output journals (`.tdj`)** — `termdeck-record-output` records length-prefixed, SHA-256-checksummed frames per process generation with `150 ms` / `256 KiB` write coalescing and atomic `.tdj.commit` watermarks. If storage stalls beyond `4 MiB`, only the isolated recorder exits (persisting `<token>.failed.json` and `recording-events.jsonl` gap lineage) while the live pane keeps running and `termdeck-directory-tracker` automatically reattaches a fresh generation.
+- **Change-aware screen & registry snapshots** — `termdeck-directory-tracker.service` (`WatchdogSec=90s`) shares one iteration-scoped pane snapshot per tick, gates `/proc` foreground command/UUID discovery behind lightweight process-tree fingerprints, skips `capture-pane` subprocesses on unchanged idle panes (with `60 s` rolling verification), and writes hourly online SQLite WAL backups (`PRAGMA quick_check` verified).
+- **Verified Zstandard compaction & incremental dual-SSD mirroring** — completed `.tdj` generations older than `1 h` (retaining the `8` newest generations plus `latest`/`latest-view` active pointers) compress to `.tdj.zst` (`~13–17x` smaller) only after decompressed byte-length and SHA-256 readback match the source, with Stage-B crash resume and off-hours scheduling via [`deploy/systemd/termdeck-journal-compaction.service`](deploy/systemd/termdeck-journal-compaction.service) and [`deploy/systemd/termdeck-journal-compaction.timer`](deploy/systemd/termdeck-journal-compaction.timer). Secondary-SSD backups (`--mirror-recordings`) replicate only newly committed frame suffixes and skip already-compacted `.tdj.zst` archives.
+
+```bash
+# Audit journal footprint, compression ratios, and gap/failure lineage
+python3 -m termdeck.output_journal --audit-health --root ~/.local/share/termdeck/durability
+
+# Compact eligible historical generations to SHA-256-verified .tdj.zst archives
+python3 -m termdeck.output_journal --compact --root ~/.local/share/termdeck/durability \
+  --keep-recent 8 --min-age-seconds 3600
+
+# Incrementally mirror committed journal suffixes and .tdj.zst archives to a backup SSD
+python3 -m termdeck.output_journal --mirror-recordings \
+  --root ~/.local/share/termdeck/durability \
+  --destination /mnt/backup-ssd/termdeck
+```
+
+### Measured performance at fleet scale (289 live panes)
+
+| Metric | Pre-Optimization Baseline | Current (Waves 1–5) | Improvement |
+|---|---|---|---|
+| **Keystroke parse latency (p50)** | `184.4 ms` | **`1.7–2.4 ms`** | **~77–108x faster** |
+| **Keystroke-to-paint latency (p50)** | `195.1 ms` | **`15.5–15.7 ms`** (1 frame) | **~12.5x faster** |
+| **Window snapshot refresh (p50)** | `133.5 ms` | **`1.2–1.4 ms`** (`ETag` / `304`) | **~95–111x faster** |
+| **Tab switch to live terminal** | `138.7 ms` | **`27–35 ms`** (`11.5–13.3 ms` in-page rAF) | **~4–5x faster** |
+| **`termdeck-directory-tracker` CPU** | `46.01%` | **`3.58%`** | **12.8x lower** |
+| **`tmux` server steady-state CPU** | `44.64%` | **`22.89%`** | **~2.0x lower** |
+| **All 289 Rust output recorders** | Python per-pane sinks | **`1.29%` CPU · `112.5 MiB` total PSS** | Isolated native sinks |
+| **Per-minute dual-SSD backup run** | `45.4 s` wall · `218 MiB` RSS | **`3.96 s` wall · `33.1 MiB` RSS** | **11.5x faster · 6.6x lower RAM** |
+| **Historical journal disk footprint** | `118.0 GB` (plain `.tdj`) | **`8.8 GB`** (`.tdj.zst` + active `.tdj`) | **13.4x smaller** |
+
+## Building, testing, and transactional activation
+
+```bash
+# Build ThinLTO release binaries (termdeck-web-server + termdeck-record-output)
+cargo build --manifest-path web/Cargo.toml --release --workspace
+
+# Run static lints, Rust unit/integration tests, frontend tests, and Python suites
+cargo clippy --manifest-path web/Cargo.toml --workspace --all-targets -- -D warnings
+cargo test --manifest-path web/Cargo.toml --workspace
+npm --prefix web/frontend test
+pytest
+
+# Prepare and execute a fail-closed, watchdog-guarded web cutover from a clean checkout
+python3 scripts/termdeck-web-activate.py --prepare --target /path/to/clean-checkout
+TERMDECK_ACTIVATION_APPROVED=1 python3 scripts/termdeck-web-activate.py \
+  --execute --target /path/to/clean-checkout --transaction <tx-dir>
+```
+
+### Documentation map
+
+- **[AGENTS.md](AGENTS.md)** & **[docs/BEADS_WORKFLOW.md](docs/BEADS_WORKFLOW.md)** — contributor workflow, safety invariants, and BR/BV issue tracking
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — core package, registry, and `tmux` backend architecture
+- **[docs/SESSION_DURABILITY.md](docs/SESSION_DURABILITY.md)** — `.tdj` / `.tdj.zst` journal format, overflow receipts, gap lineage, compaction, and recovery contracts
+- **[docs/termdeck-web-deployment.md](docs/termdeck-web-deployment.md)** & **[docs/CLOUDFLARE_HOSTING.md](docs/CLOUDFLARE_HOSTING.md)** — HTTPS/WSS deployment, TLS, `nginx` proxy rules, and Cloudflare Tunnel hosting
+- **[docs/codex-home-boundary.md](docs/codex-home-boundary.md)** & **[docs/termdeck-account-lifecycle.md](docs/termdeck-account-lifecycle.md)** — per-terminal Codex auth isolation and account switching
+
 ## License
 
 MIT
-
-## Web deployment and remote access
-
-t1000 includes an authenticated browser terminal with persistent LAN HTTPS/WSS services, a validated `/t1000` reverse-proxy contract, and optional Cloudflare Tunnel exposure. See [docs/termdeck-web-deployment.md](docs/termdeck-web-deployment.md) for the threat model, service topology, dynamic-address certificate handling, deployment contracts, and rollback requirements.
