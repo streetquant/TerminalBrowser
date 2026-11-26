@@ -827,7 +827,9 @@ window.T1000TerminalSession = (() => {
       const hasBox = host.clientWidth > 0 && host.clientHeight > 0;
       const dimensions = boundedGeometry((active || hasBox) ? terminalApi.fit() : lastViewportGeometry || terminalApi.dimensions());
       lastViewportGeometry = dimensions;
-      candidate.send(JSON.stringify({ type: "hello", cols: dimensions.cols, rows: dimensions.rows }));
+      const hello = { type: "hello", cols: dimensions.cols, rows: dimensions.rows };
+      if (!active) hello.warm = true;
+      candidate.send(JSON.stringify(hello));
       helloTimer = window.setTimeout(() => {
         if (candidate === socket && !ready) {
           candidate.close(4001, "terminal hello timeout");
@@ -1006,6 +1008,8 @@ window.T1000TerminalSession = (() => {
         window.cancelAnimationFrame(resizeFrame);
         resizeFrame = 0;
         window.clearTimeout(webglTimer);
+        webglTimer = 0;
+        terminalApi.deactivateWebgl?.();
         window.clearTimeout(reconnectTimer);
       },
       activate() {

@@ -528,12 +528,15 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
         throw new Error("Authentication expired.");
       }
       const type = response.headers.get("content-type") || "";
+      if (response.status === 304) {
+        return { payload: null, response, notModified: true };
+      }
       const payload = type.includes("application/json") ? await response.json() : null;
       if (!response.ok) {
         const detail = isRecord(payload) && typeof payload.error === "string" ? payload.error : `HTTP ${response.status}`;
         throw new Error(detail);
       }
-      return { payload, response };
+      return { payload, response, notModified: false };
     } finally {
       window.clearTimeout(timeoutId);
     }
@@ -567,6 +570,8 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
     let requestInFlight = false;
     let refreshTimer = 0;
     let failureCount = 0;
+    let lastEtag = "";
+    let hasSnapshot = false;
 
     function nextDelay() {
       if (document.hidden) {
@@ -591,11 +596,22 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
       root.dataset.termdeckState = "refreshing";
       root.setAttribute("aria-busy", "true");
       try {
-        const { payload, response } = await fetchJson(endpoint, {
-          headers: { Accept: "application/json" },
+        const headers = { Accept: "application/json" };
+        if (lastEtag && hasSnapshot) headers["If-None-Match"] = lastEtag;
+        const { payload, response, notModified } = await fetchJson(endpoint, {
+          headers,
           method: "GET",
         });
         const stale = response.headers.get("x-termdeck-stale") === "1";
+        if (notModified) {
+          failureCount = 0;
+          root.dataset.termdeckState = stale ? "stale" : "ready";
+          root.setAttribute("aria-busy", "false");
+          if (!stale) clearClientNotice();
+          return;
+        }
+        lastEtag = (!stale && response.headers.get("etag")) || "";
+        hasSnapshot = true;
         renderHome(payload, stale);
         failureCount = 0;
         if (!stale) {
@@ -834,6 +850,7 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
     let refreshTimer = 0;
     let refreshInFlight = false;
     let refreshRequested = false;
+    let lastWindowEtag = "";
     let disposed = false;
     let lastActionSignature = "";
     let pendingAction = "";
@@ -1130,24 +1147,36 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
       try {
         root.dataset.termdeckState = "refreshing";
         root.setAttribute("aria-busy", "true");
-        const { payload, response } = await fetchJson(
+        const headers = { Accept: "application/json" };
+        if (lastWindowEtag && envelope && previousState !== "error") {
+          headers["If-None-Match"] = lastWindowEtag;
+        }
+        const { payload, response, notModified } = await fetchJson(
           appPath(`/_termdeck/api/v1/windows/${encodeURIComponent(routeSlug)}`),
-          { headers: { Accept: "application/json" }, method: "GET" },
+          { headers, method: "GET" },
         );
-        const next = normalizeWindowEnvelope(payload);
-        if (next.window.slug !== routeSlug) {
-          throw new Error("Window identity changed unexpectedly.");
+        const stale = response.headers.get("x-termdeck-stale") === "1";
+        let next = envelope;
+        let unchanged = false;
+        if (notModified && envelope) {
+          unchanged = true;
+        } else {
+          next = normalizeWindowEnvelope(payload);
+          if (next.window.slug !== routeSlug) {
+            throw new Error("Window identity changed unexpectedly.");
+          }
+          if (envelope && next.generatedAt < envelope.generatedAt) {
+            workspaceStatus.textContent = `${envelope.window.panes.length} tabs · reconnecting`;
+            root.dataset.termdeckState = "stale";
+            return;
+          }
+          lastWindowEtag = (!stale && response.headers.get("etag")) || "";
+          // The host revision can change for another window and omits some
+          // displayed state. Compare the actual normalized window instead.
+          unchanged = envelope && sameWindow(envelope.window, next.window);
+          if (unchanged) next.window = envelope.window;
+          envelope = next;
         }
-        if (envelope && next.generatedAt < envelope.generatedAt) {
-          workspaceStatus.textContent = `${envelope.window.panes.length} tabs · reconnecting`;
-          root.dataset.termdeckState = "stale";
-          return;
-        }
-        // The host revision can change for another window and omits some
-        // displayed state. Compare the actual normalized window instead.
-        const unchanged = envelope && sameWindow(envelope.window, next.window);
-        if (unchanged) next.window = envelope.window;
-        envelope = next;
         const selected = chooseActivePane(next.window);
         if (!unchanged || previousState !== "ready" || selected !== activePaneId || (selected && !terminalMount)) {
           terminalViews.prune(next.window.panes.map(pane => pane.id));
@@ -1180,7 +1209,7 @@ window.T1000TabChrome = (container, { sidebar = false, selectPane, runAction, op
             updateShellState("empty");
           }
         }
-        const statusText = pendingAction ? `${pendingAction}…` : response.headers.get("x-termdeck-stale") === "1"
+        const statusText = pendingAction ? `${pendingAction}…` : stale
           ? `${next.window.panes.length} tabs · reconnecting`
           : `${next.window.panes.length} tabs`;
         if (workspaceStatus.textContent !== statusText) workspaceStatus.textContent = statusText;

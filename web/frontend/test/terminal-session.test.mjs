@@ -115,7 +115,7 @@ test('missing recording preserves the existing display and keeps input disabled'
 });
 
 test('background pre-warmed mount connects passively without touching status or claiming control',async()=>{
- let now=0,next=0,webglCalls=0,focusCalls=0;
+ let now=0,next=0,webglCalls=0,deactivateWebglCalls=0,focusCalls=0;
  const timers=new Map(),sockets=[];
  const timeout=(fn,ms=0)=>{timers.set(++next,{fn,at:now+ms});return next};
  function advance(ms){const end=now+ms;for(;;){const due=[...timers].filter(([,t])=>t.at<=end).sort((a,b)=>a[1].at-b[1].at)[0];if(!due)break;timers.delete(due[0]);now=due[1].at;due[1].fn()}now=end}
@@ -123,7 +123,7 @@ test('background pre-warmed mount connects passively without touching status or 
  class Element{constructor(){this.dataset={};this.hidden=true;this.textContent='';this.clientWidth=800;this.clientHeight=400}addEventListener(){}setAttribute(){}contains(){return false}append(){}before(){}remove(){}replaceChildren(){}}
  const host=new Element(),status=new Element(),overlay=new Element();
  status.textContent='Active tab live';status.dataset.state='live';
- const api={terminal:{rows:24,blur(){},resize(){},refresh(){}},fit:()=>({cols:80,rows:24}),dimensions:()=>({cols:80,rows:24}),fitGrid(){},reset(){},write(_b,done){done()},onData(){},focus(){focusCalls++},dispose(){},activateWebgl(){webglCalls++}};
+ const api={terminal:{rows:24,blur(){},resize(){},refresh(){}},fit:()=>({cols:80,rows:24}),dimensions:()=>({cols:80,rows:24}),fitGrid(){},reset(){},write(_b,done){done()},onData(){},focus(){focusCalls++},dispose(){},activateWebgl(){webglCalls++},deactivateWebgl(){deactivateWebglCalls++}};
  const window={fetch:async()=>({ok:false,status:404}),TermDeckTerminal:{createTerminal:()=>api},T1000UI:{preferences:()=>({})},
   T1000TerminalCopy:{install:()=>()=>{}},T1000TerminalScroll:{install:()=>({isWheelInput:()=>false,dispose(){}})},
   setTimeout:timeout,clearTimeout:id=>timers.delete(id),requestAnimationFrame:fn=>timeout(fn,16),cancelAnimationFrame:id=>timers.delete(id),
@@ -133,15 +133,19 @@ test('background pre-warmed mount connects passively without touching status or 
  const mount=window.T1000TerminalSession.mount('fixture','td-warm',host,status,overlay,{appPath:s=>s,isRecord:v=>v&&typeof v==='object',nonNegativeInteger:v=>v,errorMessage:e=>e.message,initialActive:false});
  assert.equal(sockets.length,1,'warm mount opens WS in background');
  const ws=sockets[0];ws.readyState=1;ws.emit('open',{});
- ws.emit('message',{data:JSON.stringify({type:'ready',geometry:{cols:80,rows:24},control:{schema:'termdeck.terminal-control.v1',mine:true,epoch:1,next_sequence:1}})});
+ assert.equal(ws.sent[0].type,'hello');
+ assert.equal(ws.sent[0].warm,true,'warm mount must advertise warm:true in hello');
+ ws.emit('message',{data:JSON.stringify({type:'ready',geometry:{cols:80,rows:24},control:{schema:'termdeck.terminal-control.v1',mine:false,epoch:1,next_sequence:1}})});
  advance(200);
  assert.equal(status.textContent,'Active tab live','hidden warm mount must not overwrite active tab status');
  assert.equal(webglCalls,0,'hidden warm mount must not allocate WebGL before activation');
  assert.equal(focusCalls,0,'hidden warm mount must not steal focus');
  assert.equal(ws.sent.filter(x=>x.type==='focus').length,0,'hidden warm mount must not claim control');
  mount.activate();
- assert.equal(status.dataset.state,'live');
+ assert.equal(status.dataset.state,'viewer');
  advance(60);
  assert.equal(webglCalls,1,'activation schedules WebGL after 50ms');
+ mount.deactivate();
+ assert.equal(deactivateWebglCalls,1,'deactivation releases active WebGL context');
  mount.dispose();
 });

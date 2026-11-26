@@ -208,6 +208,14 @@ export function createTerminal(element, options = {}) {
       frame = 0;
     } };
   };
+  const deactivateWebgl = () => {
+    renderMonitor?.dispose();
+    renderMonitor = null;
+    if (!webglAddon) return;
+    try { webglAddon.dispose(); } catch (_ignored) { /* DOM fallback */ }
+    webglAddon = null;
+    element.dataset.termdeckRenderer = "dom";
+  };
   const activateWebgl = () => {
     if (options.webgl === false || webglAddon || webglBlocked) {
       return;
@@ -457,6 +465,7 @@ export function createTerminal(element, options = {}) {
       if (claimControl) options.onFocusIntent?.();
     },
     activateWebgl,
+    deactivateWebgl,
     write(data, callback) {
       terminal.write(data, callback);
     },

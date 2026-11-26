@@ -1,5 +1,5 @@
 use crate::auth_http::HttpAuth;
-use crate::output_journal::AsyncJournal;
+use crate::output_journal::{AsyncJournal, primary_pipe_sink_alive};
 use crate::terminal_http::{
     InputDecision, InputOutcome, MAX_CAPTURE_HISTORY_LINES, MAX_TERMINAL_INPUT_BYTES,
     TerminalControlView, TerminalError, TerminalService,
@@ -150,7 +150,12 @@ impl From<TerminalError> for StreamError {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 enum ClientEvent {
-    Hello { cols: u16, rows: u16 },
+    Hello {
+        cols: u16,
+        rows: u16,
+        #[serde(default)]
+        warm: bool,
+    },
     Focus,
     Ping,
     Resize { cols: u16, rows: u16 },
@@ -288,7 +293,7 @@ async fn run_terminal_socket_inner(
     validate_termdeck_id(pane.pane_id.as_str())?;
     validate_tmux_target(pane.tmux_target.as_str())?;
     require_stream_session(&auth, &context).await?;
-    let (mut viewport_geometry, mut control) = tokio::try_join!(
+    let ((mut viewport_geometry, is_warm), mut control) = tokio::try_join!(
         receive_hello(socket),
         TmuxControl::spawn(
             terminal.tmux_executable(),
@@ -297,22 +302,36 @@ async fn run_terminal_socket_inner(
             terminal.command_timeout(),
         ),
     )?;
-    let mut control_view = match terminal
-        .acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), false)
-        .await
-    {
-        Ok(value) => value,
-        Err(_error) => {
-            terminal
-                .status(pane.pane_id.as_str(), actor.as_str(), unix_ms())
-                .await?
+    // Background warm connections stay passive viewers until explicit focus or input.
+    let mut control_view = if is_warm {
+        terminal
+            .status(pane.pane_id.as_str(), actor.as_str(), unix_ms())
+            .await?
+    } else {
+        match terminal
+            .acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), false)
+            .await
+        {
+            Ok(value) => value,
+            Err(_error) => {
+                terminal
+                    .status(pane.pane_id.as_str(), actor.as_str(), unix_ms())
+                    .await?
+            }
         }
     };
     let root = terminal.output_journal_root.clone().ok_or_else(|| StreamError::Recording(std::io::Error::other("recording root unavailable")))?;
-    let mut journal = AsyncJournal::spawn(root, pane.journal_id.clone());
-    // `TmuxControl::spawn` attaches with `CONTROL_FLAGS_VIEWER`; only the
+    // Skip redundant latest-view journal writes when warm-connected or when a
+    // verified primary pipe-pane recorder is already capturing this pane.
+    let mut journal = if !is_warm && !primary_pipe_sink_alive(&root, &pane.journal_id) {
+        Some(AsyncJournal::spawn(root.clone(), pane.journal_id.clone()))
+    } else {
+        None
+    };
+    // `TmuxControl::spawn` attaches with `CONTROL_FLAGS_VIEWER`; only an active
     // controller needs an explicit mode switch before initial replay.
-    if control_view.mine {
+    let mut writer_active = !is_warm && control_view.mine;
+    if writer_active {
         control
             .set_writer_mode(true, viewport_geometry)
             .await?;
@@ -321,9 +340,11 @@ async fn run_terminal_socket_inner(
     // the replay is sent stays queued (byte-bounded) and follows it in order.
     let replay = control.initial_replay().await?;
     let mut geometry = replay.geometry;
-    journal
-        .enqueue(&replay.bytes, Some((geometry.cols, geometry.rows)))
-        .map_err(StreamError::Recording)?;
+    if let Some(active_journal) = journal.as_ref() {
+        active_journal
+            .enqueue(&replay.bytes, Some((geometry.cols, geometry.rows)))
+            .map_err(StreamError::Recording)?;
+    }
     require_stream_session(&auth, &context).await?;
     send_json(
         socket,
@@ -360,7 +381,11 @@ async fn run_terminal_socket_inner(
                 match notification {
                     ControlNotification::Output(output) => {
                         let output = control.coalesce_output(output);
-                        journal.enqueue(&output, None).map_err(StreamError::Recording)?;
+                        if let Some(active_journal) = journal.as_ref() {
+                            active_journal
+                                .enqueue(&output, None)
+                                .map_err(StreamError::Recording)?;
+                        }
                         require_stream_session(&auth, &context).await?;
                         send_sink_message(&mut sender, Message::Binary(output.into())).await?;
                     }
@@ -373,7 +398,9 @@ async fn run_terminal_socket_inner(
                                 &mut control,
                                 &control_view,
                                 viewport_geometry,
-                                &journal, &auth, &context,
+                                journal.as_ref(),
+                                &auth,
+                                &context,
                             )
                             .await?;
                         }
@@ -394,11 +421,15 @@ async fn run_terminal_socket_inner(
                         // Passive mouse input must never take a pane from another
                         // controller, including when the browser's lease view
                         // is stale. authorize_input checks the current lease.
-                        if kind == InputKind::Raw && !control_view.mine {
+                        if kind == InputKind::Raw && (!control_view.mine || !writer_active) {
+                            if journal.is_none() && !primary_pipe_sink_alive(&root, &pane.journal_id) {
+                                journal = Some(AsyncJournal::spawn(root.clone(), pane.journal_id.clone()));
+                            }
                             control_view = terminal
                                 .acquire(pane.pane_id.as_str(), actor.as_str(), unix_ms(), true)
                                 .await?;
-                            control.set_writer_mode(true, viewport_geometry).await?;
+                            writer_active = control_view.mine;
+                            control.set_writer_mode(writer_active, viewport_geometry).await?;
                             send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view, focused: false }).await?;
                         }
                         let decision = terminal
@@ -444,13 +475,18 @@ async fn run_terminal_socket_inner(
                             ClientEvent::Focus => {
                                 // The cached view can predate HTTP management or
                                 // another stream. Focus must check current ownership.
+                                if journal.is_none() && !primary_pipe_sink_alive(&root, &pane.journal_id) {
+                                    journal = Some(AsyncJournal::spawn(root.clone(), pane.journal_id.clone()));
+                                }
                                 control_view = terminal.focus(pane.pane_id.as_str(), actor.as_str(), unix_ms()).await?;
-                                control.set_writer_mode(control_view.mine, viewport_geometry).await?;
+                                writer_active = control_view.mine;
+                                control.set_writer_mode(writer_active, viewport_geometry).await?;
                                 send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view, focused: true }).await?;
                             }
                             ClientEvent::Resize { cols, rows } => {
                                 viewport_geometry = TerminalGeometry::new(cols, rows)?;
                                 if control_view.mine {
+                                    writer_active = true;
                                     control.set_writer_mode(true, viewport_geometry).await?;
                                     let observed = control.current_geometry().await?;
                                     if observed != geometry {
@@ -459,7 +495,9 @@ async fn run_terminal_socket_inner(
                                             &mut control,
                                             &control_view,
                                             viewport_geometry,
-                                &journal, &auth, &context,
+                                            journal.as_ref(),
+                                            &auth,
+                                            &context,
                                         ).await?;
                                     } else {
                                         send_sink_json(&mut sender, &ResyncedEvent {
@@ -477,7 +515,9 @@ async fn run_terminal_socket_inner(
                                     &mut control,
                                     &control_view,
                                     viewport_geometry,
-                                &journal, &auth, &context,
+                                    journal.as_ref(),
+                                    &auth,
+                                    &context,
                                 )
                                 .await?;
                             }
@@ -499,7 +539,12 @@ async fn run_terminal_socket_inner(
                         Ok(value) => value,
                         Err(_error) => terminal.status(pane.pane_id.as_str(), actor.as_str(), unix_ms()).await?,
                     };
-                    control.set_writer_mode(control_view.mine, viewport_geometry).await?;
+                    if !control_view.mine {
+                        writer_active = false;
+                        control.set_writer_mode(false, viewport_geometry).await?;
+                    } else if writer_active {
+                        control.set_writer_mode(true, viewport_geometry).await?;
+                    }
                     send_sink_json(&mut sender, &ControlEvent { r#type: "control", control: &control_view, focused: false }).await?;
                 }
             }
@@ -508,7 +553,11 @@ async fn run_terminal_socket_inner(
             }
         }
     }
-    tokio::join!(control.shutdown(), journal.finish());
+    if let Some(mut active_journal) = journal.take() {
+        tokio::join!(control.shutdown(), active_journal.finish());
+    } else {
+        control.shutdown().await;
+    }
     Ok(())
 }
 
@@ -532,7 +581,7 @@ async fn send_sink_resync<S>(
     control: &mut TmuxControl,
     control_view: &TerminalControlView,
     viewport_geometry: TerminalGeometry,
-    journal: &AsyncJournal,
+    journal: Option<&AsyncJournal>,
     auth: &Arc<HttpAuth>,
     context: &SessionContext,
 ) -> Result<TerminalGeometry, StreamError>
@@ -548,9 +597,11 @@ where
         .await?;
     let replay = control.initial_replay().await?;
     let geometry = replay.geometry;
-    journal
-        .enqueue(&replay.bytes, Some((geometry.cols, geometry.rows)))
-        .map_err(StreamError::Recording)?;
+    if let Some(active_journal) = journal {
+        active_journal
+            .enqueue(&replay.bytes, Some((geometry.cols, geometry.rows)))
+            .map_err(StreamError::Recording)?;
+    }
     require_stream_session(auth, context).await?;
     send_sink_json(
         sender,
@@ -590,7 +641,7 @@ fn error_code(error: &StreamError) -> &'static str {
     }
 }
 
-async fn receive_hello(socket: &mut WebSocket) -> Result<TerminalGeometry, StreamError> {
+async fn receive_hello(socket: &mut WebSocket) -> Result<(TerminalGeometry, bool), StreamError> {
     let message = timeout(HELLO_TIMEOUT, socket.recv())
         .await
         .map_err(|_| StreamError::Timeout("client hello"))?
@@ -604,12 +655,12 @@ async fn receive_hello(socket: &mut WebSocket) -> Result<TerminalGeometry, Strea
     if text.len() > MAX_CLIENT_TEXT_BYTES {
         return Err(StreamError::ClientProtocol("hello is too large"));
     }
-    let ClientEvent::Hello { cols, rows } = serde_json::from_str(text.as_str())? else {
+    let ClientEvent::Hello { cols, rows, warm } = serde_json::from_str(text.as_str())? else {
         return Err(StreamError::ClientProtocol(
             "first frame must be hello JSON",
         ));
     };
-    TerminalGeometry::new(cols, rows)
+    Ok((TerminalGeometry::new(cols, rows)?, warm))
 }
 
 fn validate_geometry(columns: u16, rows: u16) -> Result<(), StreamError> {
@@ -2678,5 +2729,16 @@ mod tests {
             ])),
             Err(StreamError::Backpressure)
         ));
+    }
+
+    #[test]
+    fn hello_warm_flag_defaults_false_and_parses_true() {
+        let active: super::ClientEvent = serde_json::from_str(r#"{"type":"hello","cols":80,"rows":24}"#)
+            .unwrap_or_else(|error| panic!("active hello: {error}"));
+        assert!(matches!(active, super::ClientEvent::Hello { cols: 80, rows: 24, warm: false }));
+        let warm: super::ClientEvent =
+            serde_json::from_str(r#"{"type":"hello","cols":80,"rows":24,"warm":true}"#)
+                .unwrap_or_else(|error| panic!("warm hello: {error}"));
+        assert!(matches!(warm, super::ClientEvent::Hello { cols: 80, rows: 24, warm: true }));
     }
 }

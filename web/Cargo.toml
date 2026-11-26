@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/termdeck-record-output",
     "crates/termdeck-web-auth",
     "crates/termdeck-web-core",
     "crates/termdeck-web-state",

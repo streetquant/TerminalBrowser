@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import stat
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -137,6 +138,36 @@ class OutputJournal:
             self._backup_lock.close()
 
 
+def _read_exact(stream, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _open_journal_stream(directory: Path, generation: str):
+    path = directory / generation
+    try:
+        stream = _open_read(path)
+        return stream, os.fstat(stream.fileno()).st_size, None
+    except FileNotFoundError:
+        zst_path = directory / (generation + ".zst")
+        compressed = _open_read(zst_path)
+        proc = subprocess.Popen(
+            ["/usr/bin/zstd", "-dc", "-q"],
+            stdin=compressed,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        compressed.close()
+        return proc.stdout, None, proc
+
+
 def read_page(root: Path, session_id: str, generation: str | None = None,
               offset: int = len(MAGIC), limit: int = 256 * 1024) -> dict:
     directory = journal_directory(root, session_id)
@@ -158,23 +189,37 @@ def read_page(root: Path, session_id: str, generation: str | None = None,
     complete = truncated = False
     with _open_read((directory / generation).with_suffix(".tdj.commit")) as commit:
         value = commit.read(32)
-    with _open_read(directory / generation) as stream:
-        if stream.read(len(MAGIC)) != MAGIC:
+    if not value.isdigit():
+        raise ValueError("invalid recording commit boundary")
+    committed = int(value)
+    stream, physical_size, proc = _open_journal_stream(directory, generation)
+    try:
+        if _read_exact(stream, len(MAGIC)) != MAGIC:
             raise ValueError("invalid terminal recording header")
-        size = os.fstat(stream.fileno()).st_size
-        if not value.isdigit():
-            raise ValueError("invalid recording commit boundary")
-        committed = int(value)
-        if not len(MAGIC) <= offset <= committed <= size:
-            raise ValueError("terminal recording position past committed end")
-        truncated = size > committed
-        stream.seek(offset)
+        if physical_size is not None:
+            size = physical_size
+            if not len(MAGIC) <= offset <= committed <= size:
+                raise ValueError("terminal recording position past committed end")
+            truncated = size > committed
+            stream.seek(offset)
+            pos = offset
+        else:
+            # Compressed archived stream: validate committed bound and skip forward sequentially.
+            if not len(MAGIC) <= offset <= committed:
+                raise ValueError("terminal recording position past committed end")
+            skip = offset - len(MAGIC)
+            while skip > 0:
+                chunk = _read_exact(stream, min(65536, skip))
+                if not chunk:
+                    raise ValueError("truncated compressed recording")
+                skip -= len(chunk)
+            pos = offset
         while total < limit:
-            start = stream.tell()
+            start = pos
             if start == committed:
                 complete = True
                 break
-            header = stream.read(min(5, committed - start))
+            header = _read_exact(stream, min(5, committed - start))
             if not header:
                 complete = True
                 break
@@ -186,8 +231,8 @@ def read_page(root: Path, session_id: str, generation: str | None = None,
                 raise ValueError("corrupt terminal recording frame")
             if start + 5 + length + 32 > committed:
                 raise ValueError("corrupt terminal recording commit boundary")
-            data = stream.read(length)
-            digest = stream.read(32)
+            data = _read_exact(stream, length)
+            digest = _read_exact(stream, 32)
             if len(data) != length or len(digest) != 32:
                 complete = truncated = True
                 break
@@ -203,8 +248,14 @@ def read_page(root: Path, session_id: str, generation: str | None = None,
             event["data_hex"] = data.hex()
             events.append(event)
             total += length
-            offset = stream.tell()
-    return dict(generation=generation, next_offset=offset, complete=complete,
+            pos += 5 + length + 32
+    finally:
+        if stream is not None:
+            stream.close()
+        if proc is not None:
+            proc.terminate()
+            proc.wait(timeout=5)
+    return dict(generation=generation, next_offset=pos, complete=complete,
                 truncated_tail=truncated, events=events)
 
 
@@ -228,19 +279,26 @@ def pipe_owner(root: Path, session_id: str, pane_id: str, server_pid: int, serve
                 or _process_argv(owner["pid"]) != tuple(owner["argv"])):
             return None
         arguments = owner["argv"]
-        if arguments[:3] != ["/usr/bin/python3", "-I", "-B"] or arguments[4] != "--record-output":
+        if len(arguments) >= 6 and arguments[:3] == ["/usr/bin/python3", "-I", "-B"] and arguments[4] == "--record-output":
+            bundle_entry = Path(arguments[3])
+            flag_args = arguments[5:]
+        elif len(arguments) >= 3 and Path(arguments[0]).name == "termdeck-record-output" and arguments[1] == "--record-output":
+            bundle_entry = Path(arguments[0])
+            if bundle_entry != bundle_entry.parent / "termdeck-record-output":
+                return None
+            flag_args = arguments[2:]
+        else:
             return None
-        flags = dict(zip(arguments[5::2], arguments[6::2]))
+        flags = dict(zip(flag_args[::2], flag_args[1::2]))
         if any(flags.get(key) != value for key, value in {
                 "--root": str(root), "--session-id": session_id, "--pane-id": pane_id,
                 "--server-pid": str(server_pid), "--server-start": str(server_start),
                 "--token": owner["token"]}.items()):
             return None
-        launcher = Path(arguments[3])
-        if launcher not in _PIPE_BUNDLES:
+        if bundle_entry not in _PIPE_BUNDLES:
             from .startup_publication import verify_bundle
-            verify_bundle(launcher.parent)
-            _PIPE_BUNDLES.add(launcher)
+            verify_bundle(bundle_entry.parent)
+            _PIPE_BUNDLES.add(bundle_entry)
         return owner
     except (OSError, ValueError, KeyError, TypeError, IndexError, RuntimeError):
         return None
@@ -497,6 +555,126 @@ def mirror_main(argv=None):
     parser.add_argument("--destination", type=Path, required=True)
     args = parser.parse_args(argv)
     print(json.dumps(mirror_journals(args.root, args.destination)), flush=True)
+    return 0
+
+
+def compact_journals(
+    root: Path,
+    *,
+    keep_recent: int = 8,
+    min_age_seconds: int = 3600,
+    max_files: int | None = None,
+) -> dict:
+    """Losslessly compress closed historical `.tdj` generations to `.tdj.zst`."""
+    source = _directory(root) / "journals"
+    compressed = skipped = failed = 0
+    bytes_before = bytes_after = 0
+    if not source.exists():
+        return dict(compressed=0, skipped=0, failed=0, bytes_before=0, bytes_after=0)
+    cutoff = time.time() - max(0, min_age_seconds)
+    for tab in sorted(source.iterdir(), key=lambda p: p.name):
+        if not _ID.fullmatch(tab.name) or not tab.is_dir() or tab.is_symlink():
+            continue
+        directory = journal_directory(root, tab.name)
+        protected = set()
+        for pointer_name in ("latest", "latest-view"):
+            try:
+                with _open_read(directory / pointer_name) as pointer:
+                    protected.add(pointer.read(128).decode("ascii").strip())
+            except FileNotFoundError:
+                pass
+        try:
+            with _open_read(directory / "pipe-owner.json") as owner_file:
+                owner = json.loads(owner_file.read(16384))
+            gen = owner.get("generation")
+            if isinstance(gen, str):
+                protected.add(gen)
+        except (FileNotFoundError, ValueError, OSError):
+            pass
+
+        generations = sorted(
+            (p for p in directory.iterdir() if _GENERATION.fullmatch(p.name) and not p.is_symlink()),
+            key=lambda p: p.name,
+        )
+        if keep_recent > 0:
+            protected.update(p.name for p in generations[-keep_recent:])
+        for path in generations:
+            if max_files is not None and compressed >= max_files:
+                return dict(compressed=compressed, skipped=skipped, failed=failed,
+                            bytes_before=bytes_before, bytes_after=bytes_after)
+            if path.name in protected:
+                skipped += 1
+                continue
+            commit_path = path.with_suffix(".tdj.commit")
+            try:
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid():
+                    skipped += 1
+                    continue
+                if info.st_mtime > cutoff:
+                    skipped += 1
+                    continue
+                with _open_read(commit_path) as commit:
+                    cval = commit.read(32)
+                if not cval.isdigit() or int(cval) < len(MAGIC) or info.st_size < int(cval):
+                    skipped += 1
+                    continue
+            except (FileNotFoundError, OSError):
+                skipped += 1
+                continue
+
+            final_zst = directory / (path.name + ".zst")
+            temporary = directory / ("." + path.name + ".zst-" + uuid4().hex)
+            try:
+                fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                try:
+                    with open(path, "rb") as raw_in, os.fdopen(fd, "wb") as raw_out:
+                        subprocess.run(
+                            ["/usr/bin/zstd", "-3", "-q", "--no-progress"],
+                            stdin=raw_in,
+                            stdout=raw_out,
+                            stderr=subprocess.PIPE,
+                            check=True,
+                        )
+                        raw_out.flush()
+                        os.fsync(raw_out.fileno())
+                    with open(temporary, "rb") as check_stream:
+                        subprocess.run(
+                            ["/usr/bin/zstd", "-t", "-q"],
+                            stdin=check_stream,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            check=True,
+                        )
+                    zst_size = temporary.lstat().st_size
+                    os.replace(temporary, final_zst)
+                    _sync(directory)
+                    path.unlink()
+                    _sync(directory)
+                    compressed += 1
+                    bytes_before += info.st_size
+                    bytes_after += zst_size
+                finally:
+                    temporary.unlink(missing_ok=True)
+            except (OSError, subprocess.SubprocessError):
+                failed += 1
+    return dict(compressed=compressed, skipped=skipped, failed=failed,
+                bytes_before=bytes_before, bytes_after=bytes_after)
+
+
+def compact_main(argv=None):
+    parser = argparse.ArgumentParser(description=compact_journals.__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--keep-recent", type=int, default=8)
+    parser.add_argument("--min-age-seconds", type=int, default=3600)
+    parser.add_argument("--max-files", type=int)
+    args = parser.parse_args(argv)
+    print(json.dumps(compact_journals(
+        args.root,
+        keep_recent=args.keep_recent,
+        min_age_seconds=args.min_age_seconds,
+        max_files=args.max_files,
+    )), flush=True)
     return 0
 
 

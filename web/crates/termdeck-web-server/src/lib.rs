@@ -42,7 +42,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tab_actions::{ExistingTabAction, TabActionError, TabActionService};
 use termdeck_web_auth::{
@@ -89,6 +89,8 @@ pub const MAX_FRONTEND_ASSET_BYTES: usize = 64 * 1024;
 pub const MAX_TERMINAL_ASSET_BYTES: usize = 1024 * 1024;
 pub const MAX_HTTP_REQUEST_BYTES: usize = MAX_TERMINAL_INPUT_BYTES + 1_024;
 const AUTH_FENCE_ADVANCE_INTERVAL: Duration = Duration::from_secs(60);
+const REFRESH_ACTIVE_WINDOW_MS: u64 = 15_000;
+const REFRESH_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 
 const FRONTEND_CSS_PATH: &str = "/_termdeck/assets/v9/app.css";
 const FRONTEND_JS_PATH: &str = "/_termdeck/assets/v9/app.js";
@@ -580,6 +582,64 @@ impl From<TerminalError> for ServerError {
 }
 
 #[derive(Clone)]
+struct RefreshActivity {
+    last_activity_unix_ms: Arc<AtomicU64>,
+    active_streams: Arc<AtomicUsize>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl Default for RefreshActivity {
+    fn default() -> Self {
+        Self {
+            last_activity_unix_ms: Arc::new(AtomicU64::new(unix_ms())),
+            active_streams: Arc::new(AtomicUsize::new(0)),
+            wake: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+impl RefreshActivity {
+    fn touch(&self, now_unix_ms: u64) {
+        let previous = self.last_activity_unix_ms.swap(now_unix_ms, Ordering::AcqRel);
+        if now_unix_ms.saturating_sub(previous) >= REFRESH_ACTIVE_WINDOW_MS {
+            self.wake.notify_one();
+        }
+    }
+
+    fn interval_for(&self, now_unix_ms: u64, base: Duration) -> Duration {
+        let recently_active = now_unix_ms
+            .saturating_sub(self.last_activity_unix_ms.load(Ordering::Acquire))
+            < REFRESH_ACTIVE_WINDOW_MS;
+        if recently_active || self.active_streams.load(Ordering::Acquire) > 0 {
+            base
+        } else {
+            base.max(REFRESH_IDLE_INTERVAL)
+        }
+    }
+
+    fn enter_stream(&self) -> StreamActivityGuard {
+        self.active_streams.fetch_add(1, Ordering::AcqRel);
+        self.touch(unix_ms());
+        StreamActivityGuard {
+            activity: self.clone(),
+        }
+    }
+}
+
+struct StreamActivityGuard {
+    activity: RefreshActivity,
+}
+
+impl Drop for StreamActivityGuard {
+    fn drop(&mut self) {
+        self.activity.active_streams.fetch_sub(1, Ordering::AcqRel);
+        self.activity
+            .last_activity_unix_ms
+            .store(unix_ms(), Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
 struct RefreshEngine {
     mirror: Arc<Mutex<ReadOnlyStateMirror>>,
     cache: SnapshotCache,
@@ -587,6 +647,7 @@ struct RefreshEngine {
     tmux_timeout: Duration,
     recovery_context: Option<RecoveryContextRefresh>,
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    activity: RefreshActivity,
 }
 
 /// Optional observation inside the existing mirror refresh lifecycle. The CLI
@@ -701,11 +762,12 @@ impl RefreshEngine {
 
     async fn run_periodic(self, refresh_interval: Duration) {
         let mut observation_jobs = JoinSet::new();
-        let mut interval = tokio::time::interval(refresh_interval);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        interval.tick().await;
         loop {
-            interval.tick().await;
+            let delay = self.activity.interval_for(unix_ms(), refresh_interval);
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = self.activity.wake.notified() => {}
+            }
             if let Some(capture) = &self.recovery_context {
                 capture.refresh_tick(&mut observation_jobs);
             }
@@ -870,6 +932,8 @@ struct RenderedSnapshot {
     snapshot: Arc<HostSnapshot>,
     tmux_warning: Option<String>,
     full_json: Bytes,
+    full_etag: HeaderValue,
+    full_etag_str: String,
     homepage_html: Bytes,
     windows: BTreeMap<String, RenderedWindow>,
 }
@@ -877,6 +941,21 @@ struct RenderedSnapshot {
 struct RenderedWindow {
     html: Bytes,
     json: Bytes,
+    etag: HeaderValue,
+    etag_str: String,
+}
+
+fn json_etag(bytes: &[u8]) -> (HeaderValue, String) {
+    let digest = sha2::Sha256::digest(bytes);
+    let mut hex = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    let etag_str = format!("\"{hex}\"");
+    let etag = HeaderValue::from_str(etag_str.as_str())
+        .unwrap_or_else(|_| HeaderValue::from_static("\"0\""));
+    (etag, etag_str)
 }
 
 impl RenderedSnapshot {
@@ -884,6 +963,7 @@ impl RenderedSnapshot {
         let snapshot = Arc::new(snapshot);
         let full_json = serde_json::to_vec(&host_dto(snapshot.as_ref()))?;
         ensure_response_bound(full_json.len())?;
+        let (full_etag, full_etag_str) = json_etag(&full_json);
         let homepage_html = render_homepage(snapshot.as_ref(), tmux_warning.as_deref())?;
         let mut windows = BTreeMap::new();
         for window in snapshot.windows() {
@@ -895,12 +975,15 @@ impl RenderedSnapshot {
                 window: window_dto(window),
             })?;
             ensure_response_bound(json.len())?;
+            let (etag, etag_str) = json_etag(&json);
             let html = render_window_page(snapshot.as_ref(), window, tmux_warning.as_deref())?;
             windows.insert(
                 window.route().slug().to_owned(),
                 RenderedWindow {
                     html: Bytes::from(html),
                     json: Bytes::from(json),
+                    etag,
+                    etag_str,
                 },
             );
         }
@@ -908,6 +991,8 @@ impl RenderedSnapshot {
             snapshot,
             tmux_warning,
             full_json: Bytes::from(full_json),
+            full_etag,
+            full_etag_str,
             homepage_html: Bytes::from(homepage_html),
             windows,
         })
@@ -923,6 +1008,7 @@ struct AppState {
     terminal: Option<Arc<TerminalService>>,
     tab_actions: Option<Arc<TabActionService>>,
     refresh: Option<RefreshEngine>,
+    activity: RefreshActivity,
 }
 
 #[derive(Serialize)]
@@ -1031,6 +1117,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
         None
     };
     let cache = SnapshotCache::new(config.max_stale)?;
+    let activity = RefreshActivity::default();
     let engine = RefreshEngine {
         mirror: Arc::new(Mutex::new(mirror)),
         cache: cache.clone(),
@@ -1040,6 +1127,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
             &config, std::env::var_os("TERMDECK_NATIVE_CONTEXT_CONFIG"),
             std::env::var_os("TERMDECK_NATIVE_CONTEXT_CONFIG_SHA256")),
         refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+        activity: activity.clone(),
     };
     engine.refresh().await?;
     let fence_auth = auth.clone();
@@ -1051,6 +1139,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
         terminal,
         tab_actions,
         refresh: Some(engine.clone()),
+        activity,
     };
     let application = build_router(state);
     let listener = TcpListener::bind(config.listen).await?;
@@ -1299,6 +1388,12 @@ async fn request_gate(State(state): State<AppState>, request: Request, next: Nex
             Bytes::from_static(b"request authority is not allowed\n"),
         );
     }
+    let path = request.uri().path();
+    if !matches!(path, "/_termdeck/healthz" | "/_termdeck/readyz")
+        && !path.starts_with("/_termdeck/assets/")
+    {
+        state.activity.touch(unix_ms());
+    }
     let permit = match Arc::clone(&state.request_slots).try_acquire_owned() {
         Ok(value) => value,
         Err(_) => {
@@ -1545,6 +1640,18 @@ fn terminal_js_asset() -> &'static AssetMeta {
     META.get_or_init(|| compute_asset_meta(TERMINAL_JS_PATH, TERMINAL_JS))
 }
 
+fn header_matches_etag(headers: &HeaderMap, etag_str: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|tag| tag == "*" || tag.trim_start_matches("W/") == etag_str)
+        })
+}
+
 fn static_asset_response(
     headers: &HeaderMap,
     raw_query: &RawQuery,
@@ -1557,26 +1664,16 @@ fn static_asset_response(
         .as_deref()
         .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("h=")))
         .is_some_and(|value| value == meta.hash12);
-    if matched_hash {
-        let etag_matches = headers
-            .get(header::IF_NONE_MATCH)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value.split(',').map(str::trim).any(|tag| {
-                    tag == "*" || tag.trim_start_matches("W/") == meta.etag_str.as_str()
-                })
-            });
-        if etag_matches {
-            let mut response = StatusCode::NOT_MODIFIED.into_response();
-            response
-                .headers_mut()
-                .insert(header::ETAG, meta.etag.clone());
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=31536000, immutable"),
-            );
-            return response;
-        }
+    if matched_hash && header_matches_etag(headers, meta.etag_str.as_str()) {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        response
+            .headers_mut()
+            .insert(header::ETAG, meta.etag.clone());
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+        return response;
     }
     let mut response = text_response(StatusCode::OK, content_type, Bytes::from_static(body));
     response
@@ -2067,27 +2164,40 @@ async fn window_page(
     .with_status_if_missing(&state.cache, &slug, false)
 }
 
-async fn api_snapshot(State(state): State<AppState>) -> Response {
-    publication_response(&state.cache, |publication| {
-        (
-            "application/json; charset=utf-8",
-            publication.full_json.clone(),
-        )
-    })
+async fn api_snapshot(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    snapshot_json_response(
+        &headers,
+        &state.cache,
+        |publication| {
+            Some((
+                publication.full_json.clone(),
+                &publication.full_etag,
+                publication.full_etag_str.as_str(),
+            ))
+        },
+        b"",
+    )
 }
 
-async fn api_window(State(state): State<AppState>, AxumPath(slug): AxumPath<String>) -> Response {
-    publication_response(&state.cache, |publication| {
-        publication.windows.get(&slug).map_or_else(
-            || {
+async fn api_window(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(slug): AxumPath<String>,
+) -> Response {
+    snapshot_json_response(
+        &headers,
+        &state.cache,
+        |publication| {
+            publication.windows.get(&slug).map(|window| {
                 (
-                    "application/json; charset=utf-8",
-                    Bytes::from_static(b"{\"error\":\"window-not-found\"}\n"),
+                    window.json.clone(),
+                    &window.etag,
+                    window.etag_str.as_str(),
                 )
-            },
-            |window| ("application/json; charset=utf-8", window.json.clone()),
-        )
-    })
+            })
+        },
+        b"{\"error\":\"window-not-found\"}\n",
+    )
     .with_status_if_missing(&state.cache, &slug, true)
 }
 
@@ -2612,9 +2722,11 @@ async fn terminal_websocket(
     let Some(auth) = state.auth else {
         return internal_error_response();
     };
+    let activity = state.activity.clone();
     websocket
         .protocols(["termdeck.terminal.v1"])
-        .on_upgrade(move |socket| {
+        .on_upgrade(move |socket| async move {
+            let _stream_guard = activity.enter_stream();
             run_terminal_socket(
                 socket,
                 terminal,
@@ -2628,6 +2740,7 @@ async fn terminal_websocket(
                 auth,
                 context,
             )
+            .await;
         })
 }
 
@@ -3502,6 +3615,60 @@ impl MissingStatus for Response {
     }
 }
 
+fn snapshot_json_response(
+    headers: &HeaderMap,
+    cache: &SnapshotCache,
+    select: impl FnOnce(&RenderedSnapshot) -> Option<(Bytes, &HeaderValue, &str)>,
+    missing_body: &'static [u8],
+) -> Response {
+    match cache.availability(unix_ms()) {
+        CacheAvailability::Ready(publication) => match select(&publication) {
+            Some((body, etag, etag_str)) => {
+                if header_matches_etag(headers, etag_str) {
+                    let mut response = StatusCode::NOT_MODIFIED.into_response();
+                    response.headers_mut().insert(header::ETAG, etag.clone());
+                    return response;
+                }
+                let mut response =
+                    text_response(StatusCode::OK, "application/json; charset=utf-8", body);
+                response.headers_mut().insert(header::ETAG, etag.clone());
+                response
+            }
+            None => text_response(
+                StatusCode::OK,
+                "application/json; charset=utf-8",
+                Bytes::from_static(missing_body),
+            ),
+        },
+        CacheAvailability::Degraded { snapshot, error } => {
+            let body = select(&snapshot)
+                .map_or_else(|| Bytes::from_static(missing_body), |(body, _, _)| body);
+            let mut response =
+                text_response(StatusCode::OK, "application/json; charset=utf-8", body);
+            response.headers_mut().insert(
+                HeaderName::from_static("x-termdeck-stale"),
+                HeaderValue::from_static("1"),
+            );
+            let _error_detail = error;
+            response.headers_mut().insert(
+                HeaderName::from_static("warning"),
+                HeaderValue::from_static("199 termdeck \"snapshot refresh failed\""),
+            );
+            response
+        }
+        CacheAvailability::Expired => text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application/json; charset=utf-8",
+            Bytes::from_static(b"{\"error\":\"snapshot-stale-expired\"}\n"),
+        ),
+        CacheAvailability::Unavailable => text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application/json; charset=utf-8",
+            Bytes::from_static(b"{\"error\":\"snapshot-unavailable\"}\n"),
+        ),
+    }
+}
+
 fn publication_response(
     cache: &SnapshotCache,
     select: impl FnOnce(&RenderedSnapshot) -> (&'static str, Bytes),
@@ -4133,7 +4300,9 @@ mod recovery_context_tests {
             cache: SnapshotCache::new(Duration::from_secs(1)).unwrap_or_else(|error| panic!("fixture cache: {error}")),
             tmux_executable: PathBuf::from("/absent-fixture-tmux"), tmux_timeout: Duration::from_millis(10),
             recovery_context: Some(capture),
-            refresh_lock: Arc::new(tokio::sync::Mutex::new(())) };
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            activity: RefreshActivity::default(),
+        };
         run(async {
             let job = tokio::spawn(engine.run_periodic(Duration::from_millis(20)));
             assert!(timeout(Duration::from_secs(1), async {
@@ -4152,10 +4321,10 @@ mod tests {
         CODEX_PALETTE_PATH, CONTENT_SECURITY_POLICY, CacheAvailability, ConfigAction,
         EXTERNAL_BASE_PATH, FORWARDED_HOST_HEADER, FORWARDED_PREFIX_HEADER, FORWARDED_PROTO_HEADER,
         FRONTEND_CSS_PATH, FRONTEND_JS_PATH, MAX_FRONTEND_ASSET_BYTES, MAX_PASSWORD_OPERATIONS,
-        RenderedSnapshot, ServerConfig, ServerError, SnapshotCache, TERMINAL_COPY_JS,
-        TERMINAL_COPY_PATH, TERMINAL_JS_PATH, TERMINAL_SCROLL_JS, TERMINAL_SCROLL_PATH,
-        TERMINAL_SESSION_JS, TERMINAL_SESSION_PATH, WINDOW_HOME_JS, WINDOW_HOME_PATH,
-        WORKSPACE_UI_JS, WORKSPACE_UI_PATH, app_js_asset, build_router, unix_ms,
+        RefreshActivity, RenderedSnapshot, ServerConfig, ServerError, SnapshotCache,
+        TERMINAL_COPY_JS, TERMINAL_COPY_PATH, TERMINAL_JS_PATH, TERMINAL_SCROLL_JS,
+        TERMINAL_SCROLL_PATH, TERMINAL_SESSION_JS, TERMINAL_SESSION_PATH, WINDOW_HOME_JS,
+        WINDOW_HOME_PATH, WORKSPACE_UI_JS, WORKSPACE_UI_PATH, app_js_asset, build_router, unix_ms,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
@@ -4245,6 +4414,7 @@ mod tests {
             terminal: None,
             tab_actions: None,
             refresh: None,
+            activity: RefreshActivity::default(),
         }
     }
 
@@ -4966,6 +5136,62 @@ mod tests {
         );
         assert!(matches!(help, Ok(ConfigAction::Help)));
     }
+
+    #[test]
+    fn snapshot_and_window_json_support_etag_304_and_idle_backoff() {
+        runtime().block_on(async {
+            let state = state(30_000, unix_ms());
+            let router = build_router(state.clone());
+            for path in ["/_termdeck/api/v1/snapshot", "/_termdeck/api/v1/windows/random"] {
+                let first = router
+                    .clone()
+                    .oneshot(request(Method::GET, path, "127.0.0.1"))
+                    .await
+                    .unwrap_or_else(|error| match error {});
+                assert_eq!(first.status(), StatusCode::OK);
+                let etag = first
+                    .headers()
+                    .get(header::ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+                    .unwrap_or_default();
+                assert!(!etag.is_empty());
+
+                let mut conditional = request(Method::GET, path, "127.0.0.1");
+                if let Ok(value) = HeaderValue::from_str(etag.as_str()) {
+                    conditional.headers_mut().insert(header::IF_NONE_MATCH, value);
+                }
+                let cached = router
+                    .clone()
+                    .oneshot(conditional)
+                    .await
+                    .unwrap_or_else(|error| match error {});
+                assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+                assert_eq!(
+                    cached.headers().get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+                    Some("no-store, max-age=0")
+                );
+            }
+
+            let base = Duration::from_millis(750);
+            let now = unix_ms();
+            state.activity.touch(now);
+            assert_eq!(state.activity.interval_for(now + 100, base), base);
+            assert_eq!(
+                state
+                    .activity
+                    .interval_for(now + super::REFRESH_ACTIVE_WINDOW_MS + 1, base),
+                super::REFRESH_IDLE_INTERVAL
+            );
+            let _guard = state.activity.enter_stream();
+            assert_eq!(
+                state
+                    .activity
+                    .interval_for(now + super::REFRESH_ACTIVE_WINDOW_MS + 10_000, base),
+                base
+            );
+        });
+    }
 }
 
 #[cfg(test)]
@@ -4974,9 +5200,10 @@ mod auth_integration_tests {
     use super::{
         APP_CSS, AppState, ConfigAction, EXTERNAL_BASE_PATH, FORWARDED_HOST_HEADER,
         FORWARDED_PREFIX_HEADER, FORWARDED_PROTO_HEADER, HttpAuth, LOGIN_PATH, LOGOUT_PATH,
-        MAX_PASSWORD_OPERATIONS, PAIRING_PATH, RenderedSnapshot, SESSION_PATH, SETUP_PATH,
-        ServerConfig, ServerError, SnapshotCache, TERMINAL_JS_PATH, advance_auth_time_fence,
-        build_router, ensure_auth_directory, loopback_authority, parse_pairing_form, unix_ms,
+        MAX_PASSWORD_OPERATIONS, PAIRING_PATH, RefreshActivity, RenderedSnapshot, SESSION_PATH,
+        SETUP_PATH, ServerConfig, ServerError, SnapshotCache, TERMINAL_JS_PATH,
+        advance_auth_time_fence, build_router, ensure_auth_directory, loopback_authority,
+        parse_pairing_form, unix_ms,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
@@ -5120,6 +5347,7 @@ mod auth_integration_tests {
             state: AppState {
                 cache,
                 refresh: None,
+                activity: RefreshActivity::default(),
                 request_slots: Arc::new(Semaphore::new(64)),
                 password_slots: Arc::new(Semaphore::new(MAX_PASSWORD_OPERATIONS)),
                 auth: Some(Arc::new(auth)),
@@ -5409,6 +5637,7 @@ mod auth_integration_tests {
                 terminal: None,
                 tab_actions: None,
                 refresh: None,
+                activity: RefreshActivity::default(),
             });
             let home = router
                 .clone()

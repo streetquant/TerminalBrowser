@@ -1,0 +1,21 @@
+[package]
+name = "termdeck-record-output"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lightweight tmux pipe-pane durable output recorder (T1000J1)"
+publish = false
+
+[dependencies]
+getrandom.workspace = true
+libc = "0.2.189"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+expect_used = "deny"
+unwrap_used = "deny"

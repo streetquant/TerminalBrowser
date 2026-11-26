@@ -1,10 +1,11 @@
 //! Durable terminal output journal with bounded async coalescing for web streams. See output_journal.py.
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
@@ -70,6 +71,66 @@ fn generation_valid(value: &str) -> bool {
             .iter()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
         && &bytes[53..] == b".tdj"
+}
+
+#[derive(Deserialize)]
+struct PipeOwnerMeta {
+    session_id: String,
+    pid: u32,
+    starttime: u64,
+    server_pid: u32,
+    server_start: u64,
+}
+
+fn proc_stat_ppid_start(pid: u32) -> Option<(u32, u64)> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest_text) = text.rsplit_once(')')?;
+    let rest: Vec<&str> = rest_text.split_whitespace().collect();
+    if rest.len() < 20 {
+        return None;
+    }
+    let ppid = rest[1].parse::<u32>().ok()?;
+    let starttime = rest[19].parse::<u64>().ok()?;
+    Some((ppid, starttime))
+}
+
+/// Returns true if a verified primary pipe-pane recorder is actively capturing `id`.
+pub(crate) fn primary_pipe_sink_alive(root: &Path, id: &str) -> bool {
+    let Ok(directory) = tab_directory(root, id) else {
+        return false;
+    };
+    if read_file(&directory.join("latest")).is_err() {
+        return false;
+    }
+    let Ok(owner_file) = read_file(&directory.join("pipe-owner.json")) else {
+        return false;
+    };
+    let mut raw = Vec::new();
+    if owner_file.take(16_385).read_to_end(&mut raw).is_err() || raw.len() > 16_384 {
+        return false;
+    }
+    let Ok(owner) = serde_json::from_slice::<PipeOwnerMeta>(&raw) else {
+        return false;
+    };
+    if owner.session_id != id {
+        return false;
+    }
+    let Ok(expected_uid) = uid() else {
+        return false;
+    };
+    let Ok(proc_meta) = fs::metadata(format!("/proc/{}", owner.pid)) else {
+        return false;
+    };
+    if proc_meta.uid() != expected_uid {
+        return false;
+    }
+    let Some((ppid, starttime)) = proc_stat_ppid_start(owner.pid) else {
+        return false;
+    };
+    let Some((_, server_start)) = proc_stat_ppid_start(owner.server_pid) else {
+        return false;
+    };
+    ppid == owner.server_pid && starttime == owner.starttime && server_start == owner.server_start
 }
 fn hex(data: &[u8]) -> String {
     const DIGITS: &[u8] = b"0123456789abcdef";
@@ -450,6 +511,53 @@ pub(crate) struct Page {
     truncated_tail: bool,
     events: Vec<Event>,
 }
+enum JournalStream {
+    Plain { file: File, size: u64 },
+    Zstd { stdout: ChildStdout, child: Child },
+}
+
+impl Read for JournalStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain { file, .. } => file.read(buf),
+            Self::Zstd { stdout, .. } => stdout.read(buf),
+        }
+    }
+}
+
+impl Drop for JournalStream {
+    fn drop(&mut self) {
+        if let Self::Zstd { child, .. } = self {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn open_journal_stream(directory: &Path, generation: &str) -> io::Result<JournalStream> {
+    match read_file(&directory.join(generation)) {
+        Ok(file) => {
+            let size = file.metadata()?.len();
+            Ok(JournalStream::Plain { file, size })
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let compressed = read_file(&directory.join(format!("{generation}.zst")))?;
+            let mut child = Command::new("/usr/bin/zstd")
+                .args(["-dc", "-q"])
+                .stdin(Stdio::from(compressed))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| invalid("zstd stdout unavailable"))?;
+            Ok(JournalStream::Zstd { stdout, child })
+        }
+        Err(err) => Err(err),
+    }
+}
+
 pub(crate) fn read_page(
     root: &Path,
     id: &str,
@@ -485,28 +593,48 @@ pub(crate) fn read_page(
     read_file(&directory.join(format!("{generation}.commit")))?
         .take(32)
         .read_to_string(&mut watermark)?;
-    let mut file = read_file(&directory.join(&generation))?;
+    let mut stream = open_journal_stream(&directory, &generation)?;
     let mut magic = [0; 8];
-    file.read_exact(&mut magic)?;
-    let size = file.metadata()?.len();
+    stream.read_exact(&mut magic)?;
     let committed = watermark
         .parse::<u64>()
         .map_err(|_| invalid("invalid recording commit boundary"))?;
-    if magic != MAGIC || offset > committed || committed > size || committed < 8 {
-        return Err(invalid("invalid recording header or position"));
-    }
-    file.seek(SeekFrom::Start(offset))?;
+    let (truncated_tail, mut pos) = match &mut stream {
+        JournalStream::Plain { file, size } => {
+            if magic != MAGIC || offset > committed || committed > *size || committed < 8 {
+                return Err(invalid("invalid recording header or position"));
+            }
+            file.seek(SeekFrom::Start(offset))?;
+            (*size > committed, offset)
+        }
+        JournalStream::Zstd { stdout, .. } => {
+            if magic != MAGIC || offset > committed || committed < 8 {
+                return Err(invalid("invalid recording header or position"));
+            }
+            let mut skip = offset - 8;
+            let mut scratch = [0_u8; 8192];
+            while skip > 0 {
+                let want = usize::try_from(skip.min(scratch.len() as u64)).unwrap_or(scratch.len());
+                let n = stdout.read(&mut scratch[..want])?;
+                if n == 0 {
+                    return Err(invalid("truncated compressed recording"));
+                }
+                skip -= n as u64;
+            }
+            (false, offset)
+        }
+    };
     let mut page = Page {
         generation,
         generations: vec![],
         next_offset: offset,
         complete: false,
-        truncated_tail: size > committed,
+        truncated_tail,
         events: vec![],
     };
     let mut total = 0;
     while total < 256 * 1024 {
-        let start = file.stream_position()?;
+        let start = pos;
         if start == committed {
             page.complete = true;
             break;
@@ -515,12 +643,12 @@ pub(crate) fn read_page(
             return Err(invalid("corrupt recording commit boundary"));
         }
         let mut header = [0; 5];
-        let count = file.read(&mut header)?;
+        let count = stream.read(&mut header)?;
         if count == 0 {
             page.complete = true;
             break;
         }
-        if let Err(error) = file.read_exact(&mut header[count..]) {
+        if let Err(error) = stream.read_exact(&mut header[count..]) {
             if error.kind() != io::ErrorKind::UnexpectedEof {
                 return Err(error);
             }
@@ -539,9 +667,9 @@ pub(crate) fn read_page(
         let mut body = vec![0; length + 1];
         body[0] = kind;
         let mut digest = [0; 32];
-        if let Err(error) = file
+        if let Err(error) = stream
             .read_exact(&mut body[1..])
-            .and_then(|()| file.read_exact(&mut digest))
+            .and_then(|()| stream.read_exact(&mut digest))
         {
             if error.kind() != io::ErrorKind::UnexpectedEof {
                 return Err(error);
@@ -570,12 +698,17 @@ pub(crate) fn read_page(
             data_hex: hex(&body[start..]),
         });
         total += length;
-        page.next_offset = file.stream_position()?;
+        pos += 5 + length as u64 + 32;
+        page.next_offset = pos;
     }
     // Bounded memory; explicit generation IDs remain usable even if older.
     let mut names = std::collections::BTreeSet::new();
     for item in fs::read_dir(&directory)? {
-        let name = item?.file_name().to_string_lossy().into_owned();
+        let raw_name = item?.file_name().to_string_lossy().into_owned();
+        let name = raw_name
+            .strip_suffix(".zst")
+            .map_or(raw_name.as_str(), |base| base)
+            .to_owned();
         if generation_valid(&name) {
             names.insert(name);
             if names.len() > 64 {
@@ -715,6 +848,86 @@ mod tests {
         assert!(journal.enqueue(b"poisoned", None).is_err());
         let _unused = &fixture;
         drop(journal.tx.take());
+        Ok(())
+    }
+
+    #[test]
+    fn primary_pipe_sink_alive_verifies_live_owner_and_rejects_missing_or_stale() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        assert!(!primary_pipe_sink_alive(&fixture.0, "tab-x"));
+        let mut journal = Journal::new(&fixture.0, "tab-x")?;
+        journal.append(b"initial", Some((80, 24)))?;
+        let pid = std::process::id();
+        let (ppid, starttime) = proc_stat_ppid_start(pid)
+            .ok_or_else(|| invalid("self stat unavailable"))?;
+        let (_, server_start) = proc_stat_ppid_start(ppid)
+            .ok_or_else(|| invalid("parent stat unavailable"))?;
+        let owner = serde_json::json!({
+            "session_id": "tab-x",
+            "pid": pid,
+            "starttime": starttime,
+            "server_pid": ppid,
+            "server_start": server_start,
+        });
+        publish(
+            &journal.directory.join("pipe-owner.json"),
+            owner.to_string().as_bytes(),
+            "owner-missing-latest",
+        )?;
+        // No `latest` pointer yet -> must still return false.
+        assert!(!primary_pipe_sink_alive(&fixture.0, "tab-x"));
+
+        publish(
+            &journal.directory.join("latest"),
+            journal.generation.as_bytes(),
+            "latest",
+        )?;
+        assert!(primary_pipe_sink_alive(&fixture.0, "tab-x"));
+
+        let stale_owner = serde_json::json!({
+            "session_id": "tab-x",
+            "pid": pid,
+            "starttime": starttime.wrapping_add(1),
+            "server_pid": ppid,
+            "server_start": server_start,
+        });
+        publish(
+            &journal.directory.join("pipe-owner.json"),
+            stale_owner.to_string().as_bytes(),
+            "owner-stale",
+        )?;
+        assert!(!primary_pipe_sink_alive(&fixture.0, "tab-x"));
+        Ok(())
+    }
+
+    #[test]
+    fn read_page_supports_zstd_archived_generations() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let mut journal = Journal::new(&fixture.0, "tab-zst")?;
+        journal.append(b"archived-hello", Some((90, 30)))?;
+        journal.append(b"-world", None)?;
+        let tdj_path = journal.directory.join(&journal.generation);
+        let zst_path = journal.directory.join(format!("{}.zst", journal.generation));
+        let zst_out = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&zst_path)?;
+        let tdj_in = File::open(&tdj_path)?;
+        let status = Command::new("/usr/bin/zstd")
+            .args(["-3", "-q"])
+            .stdin(Stdio::from(tdj_in))
+            .stdout(Stdio::from(zst_out))
+            .status()?;
+        assert!(status.success());
+        fs::remove_file(&tdj_path)?;
+
+        let page = read_page(&fixture.0, "tab-zst", Some(journal.generation.clone()), 8)?;
+        assert!(page.complete && !page.truncated_tail);
+        assert_eq!(page.events.len(), 2);
+        assert!(page.generations.contains(&journal.generation));
+        assert_eq!(decode_hex(&page.events[0].data_hex), b"archived-hello");
+        assert_eq!(decode_hex(&page.events[1].data_hex), b"-world");
         Ok(())
     }
 }

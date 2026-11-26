@@ -456,3 +456,26 @@ test("disposing a terminal cancels pending renderer layout callbacks", async () 
   env.tick();
   assert.equal(layoutCalls, 0, "disposed terminals never receive stale layout notifications");
 });
+
+test("deactivateWebgl releases the addon while allowing re-activation", async () => {
+  const env = hardwareEnvironment();
+  const { createTerminal } = await loadTerminalEntry();
+  const api = createTerminal(env.host);
+  api.activateWebgl();
+  env.tick();
+  assert.equal(env.host.dataset.termdeckRenderer, "webgl");
+  assert.equal(globalThis.__termdeckWebglCols, 100);
+  const firstAddon = api.terminal.webglAddon;
+  assert.ok(firstAddon);
+  api.deactivateWebgl();
+  assert.equal(globalThis.__termdeckWebglCols, 80);
+  assert.equal(api.terminal.stats.renderDisposals, 1);
+  assert.equal(env.host.dataset.termdeckRenderer, "dom");
+  assert.equal(env.frames.size, 0);
+  api.activateWebgl();
+  env.tick();
+  assert.equal(env.host.dataset.termdeckRenderer, "webgl");
+  assert.equal(globalThis.__termdeckWebglCols, 100);
+  assert.ok(api.terminal.webglAddon && api.terminal.webglAddon !== firstAddon);
+  api.dispose();
+});

@@ -131,11 +131,59 @@ def _source_files(source: Path):
     return result
 
 
-def _launcher(site: Path, entries: dict) -> bytes:
+def _read_recorder_source(path: Path) -> dict:
+    """Read a compiled recorder binary inside a trusted build tree (may be Cargo-hardlinked)."""
+    _physical(path.parent)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise StartupPublicationError("recorder binary has unsafe ownership or mode")
+        chunks = []
+        while chunk := os.read(fd, 131072):
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        if not content:
+            raise StartupPublicationError("recorder binary is empty")
+        return {"name": "termdeck-record-output", "content": content,
+                "size": len(content), "sha256": _digest(content)}
+    finally:
+        os.close(fd)
+
+
+def _launcher(site: Path, entries: dict, recorder: dict | None = None) -> bytes:
     # No credential values or private terminal commands belong in this file.
+    fast_record = ""
+    recorder_verify = ""
+    if recorder is not None:
+        rec_name = recorder["name"]
+        rec_size = recorder["size"]
+        rec_sha256 = recorder["sha256"]
+        recorder_verify = (
+            f"rec_path = root.parent / {rec_name!r}\n"
+            "if rec_path.resolve(strict=True) != rec_path: raise RuntimeError('worker binary moved')\n"
+            "rfd = os.open(rec_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)\n"
+            "try:\n"
+            "    rb = os.fstat(rfd)\n"
+            "    if not stat.S_ISREG(rb.st_mode) or rb.st_nlink != 1 or rb.st_uid != os.geteuid() or rb.st_mode & 0o222 or not (rb.st_mode & 0o100): raise RuntimeError('unsafe worker binary')\n"
+            "    rc = bytearray()\n"
+            "    while chunk := os.read(rfd, 131072): rc.extend(chunk)\n"
+            "    ra = os.fstat(rfd)\n"
+            "    rn = rec_path.lstat()\n"
+            "    rkeys = ('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')\n"
+            "    if any(getattr(rb,k) != getattr(ra,k) or getattr(ra,k) != getattr(rn,k) for k in rkeys): raise RuntimeError('worker binary changed')\n"
+            f"    if len(rc) != {rec_size!r} or hashlib.sha256(rc).hexdigest() != {rec_sha256!r}: raise RuntimeError('worker binary mismatch')\n"
+            "finally: os.close(rfd)\n"
+        )
+        fast_record = (
+            "if sys.argv[1:2] == ['--record-output']:\n"
+            + "".join("    " + line + "\n" for line in recorder_verify.splitlines())
+            + "    os.execv(str(rec_path), [str(rec_path), *sys.argv[1:]])\n"
+        )
     return ("import hashlib, os, pathlib, stat, sys\n"
             f"root = pathlib.Path({str(site)!r})\n"
             f"entries = {entries!r}\n"
+            f"{fast_record}"
             "if root.resolve(strict=True) != root: raise RuntimeError('worker root moved')\n"
             "for relative, expected in entries.items():\n"
             "    path = root / relative\n"
@@ -152,6 +200,7 @@ def _launcher(site: Path, entries: dict) -> bytes:
             "        if any(getattr(before,k) != getattr(after,k) or getattr(after,k) != getattr(named,k) for k in keys): raise RuntimeError('worker module changed')\n"
             "        if len(content) != expected['size'] or hashlib.sha256(content).hexdigest() != expected['sha256']: raise RuntimeError('worker module mismatch')\n"
             "    finally: os.close(fd)\n"
+            f"{recorder_verify}"
             "if sys.argv[1:] == ['--verify-only']: raise SystemExit(0)\n"
             "sys.path.insert(0, str(root))\n"
             "if sys.argv[1:2] == ['--record-output']:\n"
@@ -160,18 +209,32 @@ def _launcher(site: Path, entries: dict) -> bytes:
             "if sys.argv[1:2] == ['--mirror-recordings']:\n"
             "    from termdeck.output_journal import mirror_main\n"
             "    raise SystemExit(mirror_main(sys.argv[2:]))\n"
+            "if sys.argv[1:2] == ['--compact-journals']:\n"
+            "    from termdeck.output_journal import compact_main\n"
+            "    raise SystemExit(compact_main(sys.argv[2:]))\n"
             "from termdeck.startup_recovery import main\n"
             "raise SystemExit(main())\n").encode()
 
 
-def prepare(source: Path, managed_root: Path) -> dict:
+def prepare(source: Path, managed_root: Path, *, recorder_binary: Path | None = None) -> dict:
     """Freeze exact physical source bytes; do not import or run the worker."""
     source = _directory(source)
     managed_root = _directory(managed_root)
     files = _source_files(source)
     entries = {name: {"sha256": item["sha256"], "size": item["size"]}
                for name, item in files.items()}
-    bundle_id = _digest(_json(entries))
+    if recorder_binary is None:
+        candidate = source / "web" / "target" / "release" / "termdeck-record-output"
+        if os.path.lexists(candidate) and not os.path.islink(candidate):
+            recorder_binary = candidate
+    rec_item = _read_recorder_source(recorder_binary) if recorder_binary is not None else None
+    rec_meta = (
+        {"name": rec_item["name"], "sha256": rec_item["sha256"], "size": rec_item["size"]}
+        if rec_item is not None else None
+    )
+    bundle_id = _digest(
+        _json({"files": entries, "recorder_binary": rec_meta} if rec_meta is not None else entries)
+    )
     base = _directory(managed_root / "startup-recovery", create=True)
     releases = _directory(base / "releases", create=True)
     destination = releases / bundle_id
@@ -185,6 +248,8 @@ def prepare(source: Path, managed_root: Path) -> dict:
         target = site / relative
         _directory(target.parent, create=True)
         _write_new(target, item["content"], 0o444)
+    if rec_item is not None:
+        _write_new(stage / rec_item["name"], rec_item["content"], 0o555)
     # Source drift, including newly added modules, cannot publish a mixed tree.
     fresh = _source_files(source)
     identity_keys = ("exists", "content", "mode", "device", "inode", "nlink", "size",
@@ -193,10 +258,13 @@ def prepare(source: Path, managed_root: Path) -> dict:
             for name in files for key in identity_keys)):
         raise StartupPublicationError("source changed during worker preparation")
     final_site = destination / "site"
-    launcher = _launcher(final_site, entries)
+    launcher = _launcher(final_site, entries, rec_meta)
     _write_new(stage / "launch.py", launcher, 0o444)
-    _write_new(stage / "manifest.json", _json({"schema": SCHEMA, "bundle_id": bundle_id,
-        "files": entries, "launcher_sha256": _digest(launcher)}), 0o444)
+    manifest_payload = {"schema": SCHEMA, "bundle_id": bundle_id,
+                        "files": entries, "launcher_sha256": _digest(launcher)}
+    if rec_meta is not None:
+        manifest_payload["recorder_binary"] = rec_meta
+    _write_new(stage / "manifest.json", _json(manifest_payload), 0o444)
     directories = sorted((p for p in stage.rglob("*") if p.is_dir()),
                          key=lambda path: len(path.parts), reverse=True)
     for path in directories + [stage]:
@@ -227,8 +295,19 @@ def verify_bundle(bundle: Path, entries=None) -> dict:
     if manifest.get("schema") != SCHEMA:
         raise StartupPublicationError("worker manifest schema mismatch")
     actual_entries = manifest.get("files")
+    recorder = manifest.get("recorder_binary")
+    if recorder is not None:
+        if (not isinstance(recorder, dict)
+                or recorder.get("name") != "termdeck-record-output"
+                or not isinstance(recorder.get("sha256"), str)
+                or not isinstance(recorder.get("size"), int)):
+            raise StartupPublicationError("worker recorder metadata mismatch")
+    expected_bundle_id = _digest(
+        _json({"files": actual_entries, "recorder_binary": recorder}
+              if recorder is not None else actual_entries)
+    )
     if (not isinstance(actual_entries, dict) or not actual_entries
-            or manifest.get("bundle_id") != _digest(_json(actual_entries))
+            or manifest.get("bundle_id") != expected_bundle_id
             or bundle.name != manifest["bundle_id"]
             or (entries is not None and actual_entries != entries)):
         raise StartupPublicationError("worker source identity mismatch")
@@ -240,8 +319,13 @@ def verify_bundle(bundle: Path, entries=None) -> dict:
         if (item["sha256"] != expected.get("sha256") or item["size"] != expected.get("size")
                 or item["mode"] & 0o222):
             raise StartupPublicationError("worker module identity mismatch")
+    if recorder is not None:
+        rec_item = _read(bundle / recorder["name"])
+        if (rec_item["sha256"] != recorder["sha256"] or rec_item["size"] != recorder["size"]
+                or rec_item["mode"] & 0o222 or not (rec_item["mode"] & 0o100)):
+            raise StartupPublicationError("worker recorder binary mismatch")
     launcher = _read(bundle / "launch.py")
-    if (launcher["mode"] & 0o222 or launcher["content"] != _launcher(site, actual_entries)
+    if (launcher["mode"] & 0o222 or launcher["content"] != _launcher(site, actual_entries, recorder)
             or launcher["sha256"] != manifest.get("launcher_sha256")):
         raise StartupPublicationError("worker launcher identity mismatch")
     return manifest

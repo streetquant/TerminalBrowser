@@ -341,3 +341,107 @@ time.sleep(30) # Disk writer intentionally makes no progress; reader must bound 
         assert [bytes.fromhex(e['data_hex']) for e in read_page(root, 'tab')['events']] == [b'committed before stalled writer']
     finally:
         subprocess.run(['/usr/bin/tmux', 'kill-server'], env=env, capture_output=True, timeout=5)
+
+
+def test_compact_journals_compresses_old_closed_generations_and_keeps_readable(tmp_path):
+    from termdeck.output_journal import compact_journals
+    root = tmp_path / "durability"
+    gens = []
+    for index in range(4):
+        j = OutputJournal(root, "tab")
+        j.append(f"frame-{index}-".encode() * 64, geometry=(91, 27))
+        j.append(b"second-frame", geometry=None)
+        j.close()
+        gens.append(j.generation)
+        old_ts = 1_700_000_000 + index
+        os.utime(j.directory / j.generation, (old_ts, old_ts))
+    view = OutputJournal(root, "tab", primary=False)
+    view.append(b"view-active")
+    view.close()
+    os.utime(view.directory / view.generation, (1_700_000_010, 1_700_000_010))
+
+    summary = compact_journals(root, keep_recent=1, min_age_seconds=60)
+    assert summary["failed"] == 0
+    assert summary["compressed"] >= 2
+    assert (root / "journals/tab" / gens[-1]).exists()
+    assert (root / "journals/tab" / view.generation).exists()
+    for archived in gens[:2]:
+        assert not (root / "journals/tab" / archived).exists()
+        assert (root / "journals/tab" / f"{archived}.zst").exists()
+        page = read_page(root, "tab", archived, limit=1)
+        assert not page["complete"] and not page["truncated_tail"]
+        page_tail = read_page(root, "tab", archived, offset=page["next_offset"])
+        assert page_tail["complete"]
+        data = b"".join(bytes.fromhex(e["data_hex"]) for e in (page["events"] + page_tail["events"]))
+        assert data == f"frame-{gens.index(archived)}-".encode() * 64 + b"second-frame"
+
+
+def test_pipe_owner_accepts_verified_native_recorder_bundle(tmp_path):
+    from termdeck.output_journal import pipe_owner
+    from termdeck.resources import _parse_stat, _process_argv
+    from termdeck.startup_publication import prepare
+    src = tmp_path / "src"
+    pkg = src / "termdeck"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "startup_recovery.py").write_text("def main(): return 0\n")
+    fake_bin = src / "web/target/release/termdeck-record-output"
+    fake_bin.parent.mkdir(parents=True)
+    fake_bin.write_bytes(b"#!/bin/sh\necho ok\n")
+    fake_bin.chmod(0o755)
+    managed = tmp_path / "managed"
+    managed.mkdir(mode=0o700)
+    bundle = Path(prepare(src, managed)["bundle"])
+    assert (bundle / "termdeck-record-output").exists()
+    own_pid = os.getpid()
+    own_stat = _parse_stat(own_pid)
+    parent_pid = own_stat["ppid"]
+    parent_stat = _parse_stat(parent_pid)
+    root = tmp_path / "durability"
+    tab_dir = OutputJournal(root, "tab-native")
+    tab_dir.append(b"init")
+    token = "0123456789abcdef0123456789abcdef"
+    fake_argv = [
+        str(bundle / "termdeck-record-output"),
+        "--record-output",
+        "--root", str(root),
+        "--session-id", "tab-native",
+        "--pane-id", "%1",
+        "--pane-pid", str(own_pid),
+        "--pane-start", str(own_stat["starttime"]),
+        "--server-pid", str(parent_pid),
+        "--server-start", str(parent_stat["starttime"]),
+        "--columns", "80",
+        "--rows", "24",
+        "--token", token,
+    ]
+    owner_payload = {
+        "session_id": "tab-native",
+        "pane_id": "%1",
+        "pane_pid": own_pid,
+        "pane_start": own_stat["starttime"],
+        "server_pid": parent_pid,
+        "server_start": parent_stat["starttime"],
+        "pid": own_pid,
+        "starttime": own_stat["starttime"],
+        "argv": list(_process_argv(own_pid)),
+        "token": token,
+        "generation": tab_dir.generation,
+    }
+    with mock_argv(fake_argv, owner_payload, tab_dir.directory):
+        owner = pipe_owner(root, "tab-native", "%1", parent_pid, parent_stat["starttime"])
+        assert owner is not None and owner["token"] == token
+    tab_dir.close()
+
+
+from contextlib import contextmanager
+@contextmanager
+def mock_argv(fake_argv, owner_payload, tab_dir):
+    import json
+    import termdeck.resources as res
+    from unittest import mock
+    owner_payload["argv"] = fake_argv
+    (tab_dir / "pipe-owner.json").write_text(json.dumps(owner_payload))
+    (tab_dir / "pipe-owner.json").chmod(0o600)
+    with mock.patch.object(res, "_process_argv", return_value=tuple(fake_argv)):
+        yield
